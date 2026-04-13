@@ -442,29 +442,133 @@ fn create_rotated_edge(
     Ok(edge_id)
 }
 
-/// Create a surface of revolution
+/// Create a surface of revolution from a profile curve rotated around an axis.
 fn create_revolution_surface(
-    _model: &mut BRepModel,
-    _profile_curve_id: u32,
-    _axis_origin: Point3,
-    _axis_direction: Vector3,
+    model: &mut BRepModel,
+    profile_curve_id: u32,
+    axis_origin: Point3,
+    axis_direction: Vector3,
 ) -> OperationResult<Box<dyn Surface>> {
-    Err(OperationError::NotImplemented(
-        "Surface of revolution not yet implemented".to_string(),
-    ))
+    let curve = model
+        .curves
+        .get(profile_curve_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Profile curve not found".to_string()))?;
+
+    let profile_clone = curve.clone_box();
+
+    let revolution = crate::primitives::surface::SurfaceOfRevolution::new(
+        axis_origin,
+        axis_direction,
+        profile_clone,
+        std::f64::consts::TAU, // Full 360° revolution by default
+    )
+    .map_err(|e| OperationError::NumericalError(format!("Failed to create revolution surface: {e}")))?;
+
+    Ok(Box::new(revolution))
 }
 
-/// Create a transformed copy of a face
+/// Create a transformed copy of a face.
+///
+/// Transforms the surface, creates new vertices/edges/loops for the boundary,
+/// and produces a new face referencing the transformed geometry.
 fn create_transformed_face(
     model: &mut BRepModel,
     face: &Face,
     transform: Matrix4,
 ) -> OperationResult<FaceId> {
-    // This would create a complete transformed copy of the face
-    // For now, simplified implementation
-    Err(OperationError::NotImplemented(
-        "Face transformation not yet implemented".to_string(),
-    ))
+    // Transform the surface
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
+    let new_surface = surface.transform(&transform);
+    let new_surface_id = model.surfaces.add(new_surface);
+
+    // Transform the outer loop
+    let outer_loop = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Outer loop not found".to_string()))?
+        .clone();
+
+    let mut new_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+
+    for (idx, &edge_id) in outer_loop.edges.iter().enumerate() {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+            .clone();
+
+        // Transform curve
+        let curve = model
+            .curves
+            .get(edge.curve_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+        let new_curve = curve.transform(&transform);
+        let new_curve_id = model.curves.add(new_curve);
+
+        // Transform vertices
+        let sv = model
+            .vertices
+            .get(edge.start_vertex)
+            .ok_or_else(|| {
+                OperationError::InvalidGeometry("Start vertex not found".to_string())
+            })?;
+        let ev = model
+            .vertices
+            .get(edge.end_vertex)
+            .ok_or_else(|| {
+                OperationError::InvalidGeometry("End vertex not found".to_string())
+            })?;
+
+        let new_start_pos = transform.transform_point(&Point3::new(
+            sv.position[0],
+            sv.position[1],
+            sv.position[2],
+        ));
+        let new_end_pos = transform.transform_point(&Point3::new(
+            ev.position[0],
+            ev.position[1],
+            ev.position[2],
+        ));
+
+        let new_start = model
+            .vertices
+            .add_or_find(new_start_pos.x, new_start_pos.y, new_start_pos.z, 1e-6);
+        let new_end = model
+            .vertices
+            .add_or_find(new_end_pos.x, new_end_pos.y, new_end_pos.z, 1e-6);
+
+        let new_edge = Edge::new(
+            0,
+            new_start,
+            new_end,
+            new_curve_id,
+            edge.orientation,
+            edge.param_range.clone(),
+        );
+        let new_edge_id = model.edges.add(new_edge);
+
+        let forward = outer_loop
+            .orientations
+            .get(idx)
+            .copied()
+            .unwrap_or(true);
+        new_loop.add_edge(new_edge_id, forward);
+    }
+
+    let new_loop_id = model.loops.add(new_loop);
+
+    let new_face = Face::new(
+        0,
+        new_surface_id,
+        new_loop_id,
+        face.orientation,
+    );
+    let new_face_id = model.faces.add(new_face);
+
+    Ok(new_face_id)
 }
 
 /// Create a face from a closed wire profile
