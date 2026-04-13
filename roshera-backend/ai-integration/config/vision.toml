@@ -1,0 +1,144 @@
+# Vision Pipeline Configuration
+# This file configures how the vision pipeline processes viewport captures
+# and routes them through AI models for spatial-aware command processing.
+
+# Default profile (development)
+[default]
+# Processing mode: "unified" or "separated"
+# - unified: Single multimodal model handles both vision and reasoning
+# - separated: Dedicated vision model + dedicated reasoning model
+mode = "unified"
+
+# Enable caching of vision analysis results
+enable_cache = true
+cache_ttl_secs = 300  # 5 minutes
+
+# Retry settings
+max_retries = 3
+
+# Timeouts
+vision_timeout_secs = 30
+reasoning_timeout_secs = 20
+
+# Vision model configuration
+[default.vision]
+provider = "Ollama"
+url = "http://localhost:11434/api/generate"
+model_name = "bakllava:latest"
+# api_key = ""  # Not needed for Ollama
+
+# Reasoning model configuration (only used in separated mode)
+# If not specified, uses the same as vision
+# [default.reasoning]
+# provider = "Ollama"
+# url = "http://localhost:11434/api/generate"
+# model_name = "llama3.1:latest"
+
+# Development profile - Fast local processing
+[profiles.development]
+mode = "unified"
+enable_cache = true
+cache_ttl_secs = 600  # 10 minutes
+
+[profiles.development.vision]
+provider = "Ollama"
+url = "http://localhost:11434/api/generate"
+model_name = "bakllava:7b"  # Smaller model for faster development
+
+# Production profile - High quality with separated models
+[profiles.production]
+mode = "separated"
+enable_cache = true
+cache_ttl_secs = 1800  # 30 minutes
+max_retries = 5
+vision_timeout_secs = 45
+reasoning_timeout_secs = 30
+
+[profiles.production.vision]
+provider = "Ollama"
+url = "http://localhost:11434/api/generate"
+model_name = "llava:13b"  # Larger vision model for better accuracy
+
+[profiles.production.reasoning]
+provider = "Ollama"
+url = "http://localhost:11435/api/generate"  # Different port for second instance
+model_name = "llama3.1:70b"  # Powerful reasoning model
+
+# Cloud profile - Using cloud providers
+[profiles.cloud]
+mode = "unified"
+enable_cache = true
+cache_ttl_secs = 3600  # 1 hour
+
+[profiles.cloud.vision]
+provider = "OpenAI"
+url = "https://api.openai.com/v1/chat/completions"
+model_name = "gpt-4o"
+api_key = "${OPENAI_API_KEY}"  # Environment variable
+
+# Anthropic profile
+[profiles.anthropic]
+mode = "unified"
+enable_cache = true
+
+[profiles.anthropic.vision]
+provider = "Anthropic"
+url = "https://api.anthropic.com/v1/messages"
+model_name = "claude-3-opus-20240229"
+api_key = "${ANTHROPIC_API_KEY}"
+
+# Google profile
+[profiles.google]
+mode = "unified"
+enable_cache = true
+
+[profiles.google.vision]
+provider = "Google"
+url = "https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent"
+model_name = "gemini-pro-vision"
+api_key = "${GOOGLE_API_KEY}"
+
+# Testing profile - Uses mock providers
+[profiles.test]
+mode = "unified"
+enable_cache = false
+max_retries = 1
+vision_timeout_secs = 5
+reasoning_timeout_secs = 5
+
+[profiles.test.vision]
+provider = "CustomAPI"
+url = "http://localhost:8888/mock"
+model_name = "mock-model"
+
+# Performance testing profile
+[profiles.benchmark]
+mode = "separated"
+enable_cache = false  # Disable cache for accurate benchmarks
+max_retries = 1
+
+[profiles.benchmark.vision]
+provider = "Ollama"
+url = "http://localhost:11434/api/generate"
+model_name = "llava:7b"  # Fast model
+
+[profiles.benchmark.reasoning]
+provider = "Ollama"
+url = "http://localhost:11434/api/generate"
+model_name = "llama3.1:8b"  # Fast model
+
+# Model recommendations based on use case
+# 
+# For general CAD work:
+# - bakllava:latest (unified) - Good balance of vision and reasoning
+# 
+# For complex spatial reasoning:
+# - llava:13b (vision) + llama3.1:70b (reasoning) - Best accuracy
+# 
+# For fast prototyping:
+# - bakllava:7b (unified) - Fastest response times
+# 
+# For production with cloud:
+# - gpt-4o (unified) - Best overall quality
+# - claude-3-opus (unified) - Strong reasoning
+# - gemini-pro-vision (unified) - Good for complex scenes

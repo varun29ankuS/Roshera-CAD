@@ -1,0 +1,53 @@
+# Build artifacts
+/target
+Cargo.lock
+
+# Environment files
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Export directory
+/exports/*
+!/exports/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+.project
+.classpath
+
+# Test coverage
+tarpaulin-report.html
+cobertura.xml
+coverage/
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+*.profdata
+
+# Dependencies
+node_modules/
+dist/
+
+# Documentation
+/target/doc
+/target/criterion
+
+# Temporary files
+tmp/
+temp/
+*.tmp

@@ -1,0 +1,28 @@
+[package]
+name = "shared-types"
+version = "0.1.0"
+edition = "2021"
+description = "Core data structures for Roshera CAD"
+license = "Apache-2.0"
+
+[dependencies]
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
+thiserror    = { workspace = true }
+approx       = "0.5"
+chrono       = { version = "0.4", features = ["serde"] }
+# wrappers that give f32/f64 total ordering + Eq/Hash
+ordered-float = { version = "4", default-features = false, features = ["serde"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+
+[features]
+default    = ["validation"]
+validation = []
+wasm       = ["uuid/js", "chrono/wasmbind"]
+
+[dev-dependencies]
+proptest = "1.4"

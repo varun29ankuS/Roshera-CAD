@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TurboRAG - Codebase Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 1200px;
+            height: 80vh;
+            display: flex;
+            overflow: hidden;
+        }
+        
+        .sidebar {
+            width: 300px;
+            background: #f7f7f7;
+            padding: 30px 20px;
+            border-right: 1px solid #e0e0e0;
+        }
+        
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            padding: 20px 30px;
+            border-bottom: 1px solid #e0e0e0;
+            background: #fff;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            color: #333;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .header .subtitle {
+            color: #666;
+            font-size: 14px;
+            margin-top: 5px;
+        }
+        
+        .chat-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+            background: #fafafa;
+        }
+        
+        .message {
+            margin-bottom: 20px;
+            animation: slideIn 0.3s ease;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .message.user {
+            text-align: right;
+        }
+        
+        .message.user .bubble {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin-left: auto;
+        }
+        
+        .message.assistant .bubble {
+            background: white;
+            border: 1px solid #e0e0e0;
+        }
+        
+        .bubble {
+            display: inline-block;
+            padding: 12px 18px;
+            border-radius: 18px;
+            max-width: 70%;
+            word-wrap: break-word;
+        }
+        
+        .sources {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+        
+        .source-item {
+            margin: 5px 0;
+            padding: 5px;
+            background: white;
+            border-radius: 4px;
+        }
+        
+        .confidence {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-left: 10px;
+        }
+        
+        .confidence.high { background: #4caf50; color: white; }
+        .confidence.medium { background: #ff9800; color: white; }
+        .confidence.low { background: #f44336; color: white; }
+        
+        .input-area {
+            padding: 20px 30px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+        }
+        
+        .input-wrapper {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .input-wrapper input {
+            flex: 1;
+            padding: 12px 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 25px;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        
+        .input-wrapper input:focus {
+            border-color: #667eea;
+        }
+        
+        .input-wrapper button {
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.2s;
+        }
+        
+        .input-wrapper button:hover {
+            transform: scale(1.05);
+        }
+        
+        .input-wrapper button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .stats {
+            margin-top: 30px;
+        }
+        
+        .stat-item {
+            padding: 10px;
+            margin: 10px 0;
+            background: white;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .stat-label {
+            color: #666;
+            font-size: 12px;
+        }
+        
+        .stat-value {
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .actions {
+            margin-top: 30px;
+        }
+        
+        .action-btn {
+            width: 100%;
+            padding: 10px;
+            margin: 5px 0;
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .action-btn:hover {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .status {
+            padding: 10px;
+            margin: 20px 0;
+            border-radius: 8px;
+            font-size: 12px;
+            text-align: center;
+        }
+        
+        .status.success {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h2 style="margin-bottom: 20px; color: #333;">🚀 TurboRAG</h2>
+            
+            <div class="stats">
+                <h3 style="font-size: 14px; color: #666; margin-bottom: 10px;">Index Statistics</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Documents</span>
+                    <span class="stat-value" id="stat-docs">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Chunks</span>
+                    <span class="stat-value" id="stat-chunks">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Vector Nodes</span>
+                    <span class="stat-value" id="stat-vectors">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Graph Edges</span>
+                    <span class="stat-value" id="stat-edges">0</span>
+                </div>
+            </div>
+            
+            <div class="actions">
+                <h3 style="font-size: 14px; color: #666; margin-bottom: 10px;">Actions</h3>
+                <button class="action-btn" onclick="indexCodebase()">📁 Index Codebase</button>
+                <button class="action-btn" onclick="clearIndex()">🗑️ Clear Index</button>
+                <button class="action-btn" onclick="refreshStats()">🔄 Refresh Stats</button>
+            </div>
+            
+            <div id="status" class="status" style="display: none;"></div>
+        </div>
+        
+        <div class="main">
+            <div class="header">
+                <h1>
+                    💬 Codebase Chat
+                    <span id="loading" class="loading" style="display: none;"></span>
+                </h1>
+                <div class="subtitle">Ask questions about the Roshera CAD codebase</div>
+            </div>
+            
+            <div class="chat-area" id="chat-area">
+                <div class="message assistant">
+                    <div class="bubble">
+                        👋 Hi! I'm TurboRAG, your codebase assistant. 
+                        <br><br>
+                        First, click "Index Codebase" to index all the Rust files, then ask me anything about the code!
+                        <br><br>
+                        Try questions like:
+                        <ul style="margin-top: 10px; margin-left: 20px;">
+                            <li>How does the Vamana index work?</li>
+                            <li>What's the purpose of scalar quantization?</li>
+                            <li>Show me the geometry engine architecture</li>
+                            <li>How is the timeline implemented?</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <input 
+                        type="text" 
+                        id="message-input" 
+                        placeholder="Ask about the codebase..." 
+                        onkeypress="handleKeyPress(event)"
+                    >
+                    <button onclick="sendMessage()" id="send-btn">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = 'http://localhost:3001/api';
+        
+        async function sendMessage() {
+            const input = document.getElementById('message-input');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            // Add user message to chat
+            addMessage(message, 'user');
+            input.value = '';
+            
+            // Disable input while processing
+            input.disabled = true;
+            document.getElementById('send-btn').disabled = true;
+            document.getElementById('loading').style.display = 'inline-block';
+            
+            try {
+                const response = await fetch(`${API_BASE}/chat`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ message, context_limit: 5 }),
+                });
+                
+                const result = await response.json();
+                
+                if (result.success && result.data) {
+                    addAssistantMessage(result.data.answer, result.data.sources, result.data.confidence);
+                } else {
+                    addMessage('Sorry, I encountered an error. Please try again.', 'assistant');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                addMessage('Failed to connect to the server. Is it running on port 3001?', 'assistant');
+            } finally {
+                input.disabled = false;
+                document.getElementById('send-btn').disabled = false;
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+        
+        function addMessage(text, sender) {
+            const chatArea = document.getElementById('chat-area');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${sender}`;
+            
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = text;
+            
+            messageDiv.appendChild(bubble);
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+        
+        function addAssistantMessage(text, sources, confidence) {
+            const chatArea = document.getElementById('chat-area');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.innerHTML = text.replace(/\n/g, '<br>');
+            
+            // Add confidence badge
+            if (confidence !== undefined) {
+                const confSpan = document.createElement('span');
+                confSpan.className = 'confidence ' + 
+                    (confidence > 0.7 ? 'high' : confidence > 0.4 ? 'medium' : 'low');
+                confSpan.textContent = `${Math.round(confidence * 100)}% confident`;
+                bubble.appendChild(confSpan);
+            }
+            
+            messageDiv.appendChild(bubble);
+            
+            // Add sources if available
+            if (sources && sources.length > 0) {
+                const sourcesDiv = document.createElement('div');
+                sourcesDiv.className = 'sources';
+                sourcesDiv.innerHTML = '<strong>Sources:</strong>';
+                
+                sources.slice(0, 3).forEach(source => {
+                    const sourceItem = document.createElement('div');
+                    sourceItem.className = 'source-item';
+                    sourceItem.textContent = source.content.substring(0, 100) + '...';
+                    sourcesDiv.appendChild(sourceItem);
+                });
+                
+                messageDiv.appendChild(sourcesDiv);
+            }
+            
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+        
+        async function indexCodebase() {
+            showStatus('Indexing codebase...', 'info');
+            
+            try {
+                const response = await fetch(`${API_BASE}/index/codebase`, {
+                    method: 'POST',
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStatus(`Indexed ${result.data.files_indexed} files with ${result.data.total_chunks} chunks`, 'success');
+                    refreshStats();
+                } else {
+                    showStatus('Failed to index codebase', 'error');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus('Failed to connect to server', 'error');
+            }
+        }
+        
+        async function clearIndex() {
+            if (!confirm('Are you sure you want to clear the index?')) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/clear`, {
+                    method: 'POST',
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStatus('Index cleared', 'success');
+                    refreshStats();
+                } else {
+                    showStatus('Failed to clear index', 'error');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus('Failed to connect to server', 'error');
+            }
+        }
+        
+        async function refreshStats() {
+            try {
+                const response = await fetch(`${API_BASE}/stats`);
+                const result = await response.json();
+                
+                if (result.success && result.data) {
+                    document.getElementById('stat-docs').textContent = result.data.documents || 0;
+                    document.getElementById('stat-chunks').textContent = result.data.chunks || 0;
+                    document.getElementById('stat-vectors').textContent = result.data.vector_nodes || 0;
+                    document.getElementById('stat-edges').textContent = result.data.graph_edges || 0;
+                }
+            } catch (error) {
+                console.error('Error fetching stats:', error);
+            }
+        }
+        
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = 'status ' + (type === 'error' ? 'error' : 'success');
+            status.style.display = 'block';
+            
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 3000);
+        }
+        
+        // Refresh stats on load
+        refreshStats();
+        setInterval(refreshStats, 5000);
+    </script>
+</body>
+</html>

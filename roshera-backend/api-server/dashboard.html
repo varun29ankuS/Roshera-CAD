@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Roshera CAD - Monitoring & API Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+        }
+        
+        .header h1 {
+            font-size: 3em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        .section-title {
+            color: white;
+            font-size: 1.8em;
+            margin: 30px 0 15px 0;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.2);
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .grid-full {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 25px 50px rgba(0,0,0,0.15);
+        }
+        
+        .card h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        
+        .metric {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 15px;
+            border-radius: 10px;
+        }
+        
+        .metric-label {
+            font-size: 0.85em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 1.6em;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .metric-value.small {
+            font-size: 1.2em;
+        }
+        
+        .api-endpoint {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .api-endpoint:hover {
+            background: #e9ecef;
+            transform: translateX(5px);
+        }
+        
+        .api-endpoint h3 {
+            color: #333;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .api-endpoint .method {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+            font-size: 0.85em;
+        }
+        
+        .method.get { background: #28a745; color: white; }
+        .method.post { background: #007bff; color: white; }
+        .method.put { background: #ffc107; color: black; }
+        .method.delete { background: #dc3545; color: white; }
+        .method.ws { background: #6f42c1; color: white; }
+        
+        .endpoint-path {
+            font-family: 'Courier New', monospace;
+            color: #495057;
+            flex: 1;
+        }
+        
+        .endpoint-details {
+            display: none;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #dee2e6;
+        }
+        
+        .endpoint-details.show {
+            display: block;
+        }
+        
+        .code-block {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            overflow-x: auto;
+            white-space: pre;
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+        }
+        
+        .status.healthy {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: #e9ecef;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #28a745, #20c997);
+            transition: width 0.3s ease;
+        }
+        
+        .tab-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .tab-btn {
+            padding: 8px 16px;
+            border: 2px solid #667eea;
+            background: white;
+            color: #667eea;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-btn.active {
+            background: #667eea;
+            color: white;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Roshera CAD API</h1>
+            <p>Comprehensive Monitoring & API Documentation Dashboard</p>
+        </div>
+        
+        <!-- System Health Overview -->
+        <h2 class="section-title">📊 System Health Overview</h2>
+        <div class="grid">
+            <div class="card">
+                <h2>Server Status</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Status</div>
+                        <div class="metric-value">🟢 Online</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Uptime</div>
+                        <div class="metric-value small" id="uptime">0s</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">CPU Usage</div>
+                        <div class="metric-value small" id="cpu">0%</div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="cpu-bar" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Memory</div>
+                        <div class="metric-value small" id="memory">0 MB</div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="mem-bar" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>User Activity</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Active Sessions</div>
+                        <div class="metric-value" id="active-sessions">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">WebSockets</div>
+                        <div class="metric-value" id="ws-connections">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Commands/min</div>
+                        <div class="metric-value small" id="commands-rate">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Peak Users</div>
+                        <div class="metric-value small" id="peak-users">0</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Performance Metrics</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Req/sec</div>
+                        <div class="metric-value" id="requests-rate">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Avg Response</div>
+                        <div class="metric-value small" id="avg-response">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Error Rate</div>
+                        <div class="metric-value small" id="error-rate">0%</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Cache Hit</div>
+                        <div class="metric-value small" id="cache-hit">0%</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- AI/LLM Metrics -->
+        <h2 class="section-title">🤖 AI/LLM Performance</h2>
+        <div class="grid">
+            <div class="card">
+                <h2>Ollama Status</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Status</div>
+                        <div class="metric-value" id="ollama-status">
+                            <span class="status warning">Checking...</span>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Model</div>
+                        <div class="metric-value small" id="ollama-model">mistral:7b</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Avg Response</div>
+                        <div class="metric-value small" id="ollama-response">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Success Rate</div>
+                        <div class="metric-value small" id="parse-success">0%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Command Analytics</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Total Commands</div>
+                        <div class="metric-value" id="total-commands">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Create Ops</div>
+                        <div class="metric-value small" id="create-ops">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Boolean Ops</div>
+                        <div class="metric-value small" id="boolean-ops">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Query Ops</div>
+                        <div class="metric-value small" id="query-ops">0</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Vision Pipeline</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Status</div>
+                        <div class="metric-value">
+                            <span class="status healthy">Enabled</span>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Vision Commands</div>
+                        <div class="metric-value small" id="vision-commands">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Processing Time</div>
+                        <div class="metric-value small" id="vision-time">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Accuracy</div>
+                        <div class="metric-value small" id="vision-accuracy">0%</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Geometry Engine Metrics -->
+        <h2 class="section-title">⚙️ Geometry Engine</h2>
+        <div class="grid">
+            <div class="card">
+                <h2>Entity Statistics</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Total Solids</div>
+                        <div class="metric-value" id="total-solids">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Total Faces</div>
+                        <div class="metric-value small" id="total-faces">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Total Edges</div>
+                        <div class="metric-value small" id="total-edges">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Total Vertices</div>
+                        <div class="metric-value small" id="total-vertices">0</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Operation Performance</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Create Box</div>
+                        <div class="metric-value small" id="box-time">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Boolean Union</div>
+                        <div class="metric-value small" id="union-time">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Tessellation</div>
+                        <div class="metric-value small" id="tess-time">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Cache Hits</div>
+                        <div class="metric-value small" id="tess-cache">0%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Quality Metrics</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Valid Geometry</div>
+                        <div class="metric-value" id="valid-geom">100%</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Boolean Success</div>
+                        <div class="metric-value small" id="bool-success">0%</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Invalid Detected</div>
+                        <div class="metric-value small" id="invalid-count">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Auto-Healed</div>
+                        <div class="metric-value small" id="healed-count">0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Database Metrics -->
+        <h2 class="section-title">💾 Database & Storage</h2>
+        <div class="grid">
+            <div class="card">
+                <h2>PostgreSQL Status</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Connection</div>
+                        <div class="metric-value">
+                            <span class="status healthy">Connected</span>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Query Time</div>
+                        <div class="metric-value small" id="db-query">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Active Conns</div>
+                        <div class="metric-value small" id="db-conns">0/20</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">DB Size</div>
+                        <div class="metric-value small" id="db-size">0 MB</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Timeline Storage</h2>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-label">Total Events</div>
+                        <div class="metric-value" id="timeline-events">0</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Save Time</div>
+                        <div class="metric-value small" id="save-time">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Load Time</div>
+                        <div class="metric-value small" id="load-time">0ms</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Snapshots</div>
+                        <div class="metric-value small" id="snapshots">0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- API Documentation -->
+        <h2 class="section-title">📚 API Documentation</h2>
+        <div class="grid-full">
+            <div class="card">
+                <h2>Available Endpoints</h2>
+                <div class="tab-buttons">
+                    <button class="tab-btn active" onclick="showTab('geometry', this)">Geometry</button>
+                    <button class="tab-btn" onclick="showTab('ai', this)">AI/LLM</button>
+                    <button class="tab-btn" onclick="showTab('session', this)">Sessions</button>
+                    <button class="tab-btn" onclick="showTab('export', this)">Export</button>
+                </div>
+                
+                <div id="geometry-tab" class="tab-content active">
+                    <div class="api-endpoint" onclick="toggleDetails('geom-create')">
+                        <h3>
+                            <span class="method post">POST</span>
+                            <span class="endpoint-path">/api/geometry/create</span>
+                        </h3>
+                        <p>Create primitive geometry (box, sphere, cylinder, etc.)</p>
+                        <div id="geom-create" class="endpoint-details">
+                            <p><strong>Request Body:</strong></p>
+                            <div class="code-block">{
+  "type": "box",
+  "parameters": {
+    "width": 10.0,
+    "height": 10.0,
+    "depth": 10.0
+  },
+  "position": [0, 0, 0],
+  "material": "steel"
+}</div>
+                            <p><strong>Response:</strong></p>
+                            <div class="code-block">{
+  "success": true,
+  "geometry_id": "uuid",
+  "properties": {
+    "volume": 1000.0,
+    "surface_area": 600.0,
+    "bounding_box": {...}
+  }
+}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="api-endpoint" onclick="toggleDetails('geom-boolean')">
+                        <h3>
+                            <span class="method post">POST</span>
+                            <span class="endpoint-path">/api/geometry/boolean</span>
+                        </h3>
+                        <p>Perform boolean operations (union, intersection, difference)</p>
+                        <div id="geom-boolean" class="endpoint-details">
+                            <p><strong>Request Body:</strong></p>
+                            <div class="code-block">{
+  "operation": "union",
+  "operand_a": "geometry_id_1",
+  "operand_b": "geometry_id_2"
+}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div id="ai-tab" class="tab-content">
+                    <div class="api-endpoint" onclick="toggleDetails('ai-command')">
+                        <h3>
+                            <span class="method post">POST</span>
+                            <span class="endpoint-path">/api/ai/command</span>
+                        </h3>
+                        <p>Process natural language CAD commands</p>
+                        <div id="ai-command" class="endpoint-details">
+                            <p><strong>Request Body:</strong></p>
+                            <div class="code-block">{
+  "text": "create a box 10 by 20 by 30",
+  "context": {
+    "session_id": "optional",
+    "previous_commands": []
+  }
+}</div>
+                            <p><strong>Response:</strong></p>
+                            <div class="code-block">{
+  "success": true,
+  "parsed_intent": "create_primitive",
+  "parameters": {...},
+  "geometry_created": ["uuid"]
+}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="api-endpoint" onclick="toggleDetails('ai-vision')">
+                        <h3>
+                            <span class="method post">POST</span>
+                            <span class="endpoint-path">/api/ai/vision</span>
+                        </h3>
+                        <p>Process commands with viewport context</p>
+                        <div id="ai-vision" class="endpoint-details">
+                            <p><strong>Request Body:</strong></p>
+                            <div class="code-block">{
+  "text": "select the red box",
+  "viewport": {
+    "screenshot": "base64_image",
+    "camera": {...},
+    "visible_objects": [...]
+  }
+}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div id="session-tab" class="tab-content">
+                    <div class="api-endpoint" onclick="toggleDetails('session-create')">
+                        <h3>
+                            <span class="method post">POST</span>
+                            <span class="endpoint-path">/api/sessions/create</span>
+                        </h3>
+                        <p>Create a new design session</p>
+                        <div id="session-create" class="endpoint-details">
+                            <p><strong>Request Body:</strong></p>
+                            <div class="code-block">{
+  "name": "My Project",
+  "description": "Optional description",
+  "workflow": "part_maturity"
+}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="api-endpoint">
+                        <h3>
+                            <span class="method ws">WS</span>
+                            <span class="endpoint-path">/ws</span>
+                        </h3>
+                        <p>WebSocket for real-time collaboration</p>
+                    </div>
+                </div>
+                
+                <div id="export-tab" class="tab-content">
+                    <div class="api-endpoint" onclick="toggleDetails('export-stl')">
+                        <h3>
+                            <span class="method get">GET</span>
+                            <span class="endpoint-path">/api/export/{geometry_id}/stl</span>
+                        </h3>
+                        <p>Export geometry as STL for 3D printing</p>
+                        <div id="export-stl" class="endpoint-details">
+                            <p><strong>Query Parameters:</strong></p>
+                            <div class="code-block">?format=binary&resolution=high</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let startTime = Date.now();
+        let totalCommands = 0;
+        
+        // Update uptime
+        setInterval(() => {
+            const uptime = Math.floor((Date.now() - startTime) / 1000);
+            const hours = Math.floor(uptime / 3600);
+            const minutes = Math.floor((uptime % 3600) / 60);
+            const seconds = uptime % 60;
+            document.getElementById('uptime').textContent = 
+                hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m ${seconds}s`;
+        }, 1000);
+        
+        // Fetch real metrics
+        async function updateMetrics() {
+            try {
+                const response = await fetch('/api/metrics');
+                const data = await response.json();
+                
+                // Update all metrics from server
+                if (data.system) {
+                    document.getElementById('cpu').textContent = `${data.system.cpu_usage}%`;
+                    document.getElementById('cpu-bar').style.width = `${data.system.cpu_usage}%`;
+                    document.getElementById('memory').textContent = `${data.system.memory_mb} MB`;
+                    document.getElementById('mem-bar').style.width = `${data.system.memory_percent}%`;
+                }
+                
+                if (data.users) {
+                    document.getElementById('active-sessions').textContent = data.users.active_sessions;
+                    document.getElementById('ws-connections').textContent = data.users.websocket_connections;
+                    document.getElementById('commands-rate').textContent = data.users.commands_per_minute;
+                    document.getElementById('peak-users').textContent = data.users.peak_concurrent;
+                }
+                
+                if (data.ai) {
+                    document.getElementById('ollama-status').innerHTML = 
+                        data.ai.ollama_available ? 
+                        '<span class="status healthy">Online</span>' : 
+                        '<span class="status error">Offline</span>';
+                    document.getElementById('ollama-response').textContent = `${data.ai.avg_response_ms}ms`;
+                    document.getElementById('parse-success').textContent = `${data.ai.success_rate}%`;
+                    document.getElementById('total-commands').textContent = data.ai.total_commands;
+                }
+                
+                if (data.geometry) {
+                    document.getElementById('total-solids').textContent = data.geometry.total_solids;
+                    document.getElementById('total-faces').textContent = data.geometry.total_faces;
+                    document.getElementById('total-edges').textContent = data.geometry.total_edges;
+                    document.getElementById('total-vertices').textContent = data.geometry.total_vertices;
+                }
+                
+                if (data.database) {
+                    document.getElementById('db-query').textContent = `${data.database.avg_query_ms}ms`;
+                    document.getElementById('db-conns').textContent = `${data.database.active_connections}/20`;
+                    document.getElementById('db-size').textContent = `${data.database.size_mb} MB`;
+                    document.getElementById('timeline-events').textContent = data.database.timeline_events;
+                }
+            } catch (err) {
+                // Fall back to mock data if metrics endpoint doesn't exist yet
+                mockMetrics();
+            }
+        }
+        
+        // Mock metrics for development
+        function mockMetrics() {
+            document.getElementById('cpu').textContent = `${Math.floor(Math.random() * 30 + 10)}%`;
+            document.getElementById('memory').textContent = `${Math.floor(Math.random() * 500 + 200)} MB`;
+            document.getElementById('active-sessions').textContent = Math.floor(Math.random() * 5);
+            document.getElementById('ws-connections').textContent = Math.floor(Math.random() * 10);
+            totalCommands += Math.floor(Math.random() * 3);
+            document.getElementById('total-commands').textContent = totalCommands;
+        }
+        
+        // Update metrics every 5 seconds
+        setInterval(updateMetrics, 5000);
+        updateMetrics(); // Initial load
+        
+        // Tab switching
+        function showTab(tabName, btn) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                b.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(`${tabName}-tab`).classList.add('active');
+            btn.classList.add('active');
+        }
+        
+        // Toggle endpoint details
+        function toggleDetails(id) {
+            const details = document.getElementById(id);
+            if (details) {
+                details.classList.toggle('show');
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,75 @@
+name: Security Scan
+
+on:
+  schedule:
+    - cron: '0 2 * * 1' # Weekly on Monday at 2 AM UTC
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+    
+    - name: Run cargo audit
+      run: cargo audit --json > audit-results.json
+      working-directory: ./roshera-backend
+      continue-on-error: true
+    
+    - name: Upload audit results
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-audit
+        path: roshera-backend/audit-results.json
+
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-license
+      run: cargo install cargo-license
+    
+    - name: Check licenses
+      run: |
+        cargo license --json > licenses.json
+        # Check for GPL/AGPL licenses that could affect commercial use
+        if grep -E '"license":\s*"(A?GPL|LGPL)"' licenses.json; then
+          echo "::error::GPL/AGPL license detected - commercial risk"
+          exit 1
+        fi
+      working-directory: ./roshera-backend
+
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Run secret detection
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        # For push events, compare against previous commit to avoid scanning the same commit twice
+        base: ${{ github.event_name == 'push' && github.event.before || 'main' }}
+        head: HEAD
+        extra_args: --debug --only-verified
