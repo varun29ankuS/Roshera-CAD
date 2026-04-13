@@ -4766,42 +4766,223 @@ impl Surface for GeneralNurbsSurface {
 
 // Downcast functionality is handled through the as_any method in the Surface trait
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_plane_evaluation() {
-//         let plane = Plane::xy(0.0);
-//         let eval = plane.evaluate_full(1.0, 2.0).unwrap();
-//
-//         assert_eq!(eval.position, Point3::new(1.0, 2.0, 0.0));
-//         assert_eq!(eval.normal, Vector3::Z);
-//         assert_eq!(eval.k1, 0.0);
-//         assert_eq!(eval.k2, 0.0);
-//     }
-//
-//     #[test]
-//     fn test_cylinder_curvature() {
-//         let cyl = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
-//         let eval = cyl.evaluate_full(0.0, 0.0).unwrap();
-//
-//         assert_eq!(eval.k1, 0.2); // 1/radius
-//         assert_eq!(eval.k2, 0.0); // Zero along axis
-//         assert_eq!(eval.gaussian_curvature(), 0.0);
-//         assert_eq!(eval.mean_curvature(), 0.1);
-//     }
-//
-//     #[test]
-//     fn test_surface_store_dispatch() {
-//         let mut store = SurfaceStore::new();
-//
-//         let plane_id = store.add(Box::new(Plane::xy(0.0)));
-//         let cyl_id = store.add(Box::new(
-//             Cylinder::new(Point3::ZERO, Vector3::Z, 1.0).unwrap()
-//         ));
-//
-//         assert_eq!(store.get(plane_id).unwrap().type_name(), "Plane");
-//         assert_eq!(store.get(cyl_id).unwrap().type_name(), "Cylinder");
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_tolerance() -> Tolerance {
+        Tolerance::default()
+    }
+
+    // ===== Surface evaluation tests =====
+
+    #[test]
+    fn test_plane_evaluation() {
+        let plane = Plane::xy(0.0);
+        let point = plane.point_at(1.0, 2.0).unwrap();
+        assert!((point.x - 1.0).abs() < 1e-10);
+        assert!((point.y - 2.0).abs() < 1e-10);
+        assert!((point.z).abs() < 1e-10);
+    }
+
+    // ===== Plane-Plane intersection tests =====
+
+    #[test]
+    fn test_plane_plane_perpendicular() {
+        let xy = Plane::xy(0.0);
+        let xz = Plane::from_point_normal(Point3::ZERO, Vector3::Y).unwrap();
+        let tol = default_tolerance();
+
+        let results = xy.intersect(&xz, tol);
+        assert_eq!(results.len(), 1, "Perpendicular planes should intersect in one curve");
+
+        match &results[0] {
+            SurfaceIntersectionResult::Curve(curve) => {
+                // The intersection line should lie on both planes (z=0 and y=0)
+                // i.e., along the X axis
+                let p0 = curve.point_at(0.0).unwrap();
+                let p1 = curve.point_at(1.0).unwrap();
+                // Both points should have z≈0 and y≈0
+                assert!(p0.z.abs() < 1e-6, "Point should lie on XY plane, z={}", p0.z);
+                assert!(p0.y.abs() < 1e-6, "Point should lie on XZ plane, y={}", p0.y);
+                assert!(p1.z.abs() < 1e-6, "Point should lie on XY plane, z={}", p1.z);
+                assert!(p1.y.abs() < 1e-6, "Point should lie on XZ plane, y={}", p1.y);
+            }
+            other => panic!("Expected Curve, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_plane_plane_parallel() {
+        let plane1 = Plane::xy(0.0);
+        let plane2 = Plane::xy(5.0); // Parallel, offset by 5 in Z
+        let tol = default_tolerance();
+
+        let results = plane1.intersect(&plane2, tol);
+        assert!(results.is_empty(), "Parallel non-coincident planes should not intersect");
+    }
+
+    #[test]
+    fn test_plane_plane_coincident() {
+        let plane1 = Plane::xy(0.0);
+        let plane2 = Plane::xy(0.0);
+        let tol = default_tolerance();
+
+        let results = plane1.intersect(&plane2, tol);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SurfaceIntersectionResult::Coincident));
+    }
+
+    // ===== Plane-Cylinder intersection tests =====
+
+    #[test]
+    fn test_plane_cylinder_perpendicular() {
+        // Cylinder along Z, plane at z=5 perpendicular to Z
+        let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 3.0).unwrap();
+        let plane = Plane::from_point_normal(
+            Point3::new(0.0, 0.0, 5.0),
+            Vector3::Z,
+        ).unwrap();
+        let tol = default_tolerance();
+
+        let results = cylinder.intersect(&plane, tol);
+        assert!(!results.is_empty(), "Plane perpendicular to cylinder should produce intersection");
+
+        match &results[0] {
+            SurfaceIntersectionResult::Curve(curve) => {
+                // All points should be at z≈5 and distance≈3 from Z axis
+                for t in [0.0, 0.25, 0.5, 0.75] {
+                    let p = curve.point_at(t).unwrap();
+                    assert!((p.z - 5.0).abs() < 0.1, "Point should be at z=5, got z={}", p.z);
+                    let r = (p.x * p.x + p.y * p.y).sqrt();
+                    assert!((r - 3.0).abs() < 0.1, "Point should be at r=3, got r={r}");
+                }
+            }
+            other => panic!("Expected Curve (circle), got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_plane_cylinder_parallel_two_lines() {
+        // Cylinder along Z, plane parallel to Z axis passing through center
+        let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let plane = Plane::from_point_normal(Point3::ZERO, Vector3::X).unwrap(); // YZ plane
+        let tol = default_tolerance();
+
+        let results = cylinder.intersect(&plane, tol);
+        // Plane through cylinder center parallel to axis → 2 lines
+        assert_eq!(results.len(), 2, "Should get 2 intersection lines, got {}", results.len());
+    }
+
+    #[test]
+    fn test_plane_cylinder_no_intersection() {
+        // Cylinder along Z at origin with radius 3, plane far away
+        let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 3.0).unwrap();
+        let plane = Plane::from_point_normal(
+            Point3::new(10.0, 0.0, 0.0),
+            Vector3::X,
+        ).unwrap();
+        let tol = default_tolerance();
+
+        let results = cylinder.intersect(&plane, tol);
+        assert!(results.is_empty(), "Plane far from cylinder should not intersect");
+    }
+
+    // ===== Plane-Sphere intersection tests =====
+
+    #[test]
+    fn test_plane_sphere_through_center() {
+        let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let plane = Plane::xy(0.0); // Through center
+        let tol = default_tolerance();
+
+        let results = sphere.intersect(&plane, tol);
+        assert_eq!(results.len(), 1, "Should intersect in one circle");
+
+        match &results[0] {
+            SurfaceIntersectionResult::Curve(curve) => {
+                // Great circle: all points at r=5 from origin, z=0
+                for t in [0.0, 0.25, 0.5, 0.75] {
+                    let p = curve.point_at(t).unwrap();
+                    assert!(p.z.abs() < 0.1, "Points should be at z=0, got z={}", p.z);
+                    let r = (p.x * p.x + p.y * p.y).sqrt();
+                    assert!((r - 5.0).abs() < 0.1, "Points should be at r=5, got r={r}");
+                }
+            }
+            other => panic!("Expected Curve (circle), got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_plane_sphere_tangent() {
+        let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let plane = Plane::from_point_normal(
+            Point3::new(0.0, 0.0, 5.0),
+            Vector3::Z,
+        ).unwrap();
+        let tol = default_tolerance();
+
+        let results = sphere.intersect(&plane, tol);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SurfaceIntersectionResult::Point(_)),
+            "Tangent plane should produce a point intersection");
+    }
+
+    #[test]
+    fn test_plane_sphere_no_intersection() {
+        let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let plane = Plane::from_point_normal(
+            Point3::new(0.0, 0.0, 10.0),
+            Vector3::Z,
+        ).unwrap();
+        let tol = default_tolerance();
+
+        let results = sphere.intersect(&plane, tol);
+        assert!(results.is_empty(), "Plane outside sphere should not intersect");
+    }
+
+    // ===== Sphere-Sphere intersection tests =====
+
+    #[test]
+    fn test_sphere_sphere_overlapping() {
+        let s1 = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let s2 = Sphere::new(Point3::new(6.0, 0.0, 0.0), 5.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = s1.intersect(&s2, tol);
+        assert!(!results.is_empty(), "Overlapping spheres should intersect");
+    }
+
+    #[test]
+    fn test_sphere_sphere_no_intersection() {
+        let s1 = Sphere::new(Point3::ZERO, 3.0).unwrap();
+        let s2 = Sphere::new(Point3::new(20.0, 0.0, 0.0), 3.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = s1.intersect(&s2, tol);
+        assert!(results.is_empty(), "Far-apart spheres should not intersect");
+    }
+
+    // ===== Cylinder-Cylinder intersection tests =====
+
+    #[test]
+    fn test_cylinder_cylinder_coaxial_same_radius() {
+        let c1 = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let c2 = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = c1.intersect(&c2, tol);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SurfaceIntersectionResult::Coincident));
+    }
+
+    #[test]
+    fn test_cylinder_cylinder_parallel_intersecting() {
+        let c1 = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let c2 = Cylinder::new(Point3::new(6.0, 0.0, 0.0), Vector3::Z, 5.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = c1.intersect(&c2, tol);
+        assert_eq!(results.len(), 2, "Parallel overlapping cylinders should give 2 lines");
+    }
+}
