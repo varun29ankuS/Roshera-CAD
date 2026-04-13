@@ -158,7 +158,7 @@ interface SceneState {
 }
 
 export const useSceneStore = create<SceneState>()(
-  subscribeWithSelector((set, _get) => ({
+  subscribeWithSelector((set) => ({
     objects: new Map(),
     objectOrder: [],
     selectedIds: new Set(),

@@ -327,7 +327,8 @@ export function ModelTree() {
 
   useEffect(() => {
     if (wsStatus === 'connected') {
-      fetchHierarchy()
+      // Fetch on connect — async to avoid synchronous setState in effect
+      void Promise.resolve().then(fetchHierarchy)
     }
   }, [wsStatus, fetchHierarchy])
 

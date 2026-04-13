@@ -1,6 +1,6 @@
 import { useSceneStore } from '@/stores/scene-store'
 import { useThree } from '@react-three/fiber'
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 
 /**
  * Manages selection-mode visual state and cursor changes.
@@ -10,27 +10,21 @@ import { useEffect } from 'react'
  */
 export function SelectionOverlay() {
   const selectionMode = useSceneStore((s) => s.selectionMode)
-  const { gl } = useThree()
+  const gl = useThree((s) => s.gl)
+  const canvasRef = useRef(gl.domElement)
 
   useEffect(() => {
-    const canvas = gl.domElement
-    switch (selectionMode) {
-      case 'face':
-        canvas.style.cursor = 'cell'
-        break
-      case 'edge':
-        canvas.style.cursor = 'crosshair'
-        break
-      case 'vertex':
-        canvas.style.cursor = 'crosshair'
-        break
-      default:
-        canvas.style.cursor = 'default'
-    }
-    return () => {
-      canvas.style.cursor = 'default'
-    }
-  }, [selectionMode, gl])
+    canvasRef.current = gl.domElement
+  }, [gl])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    const cursor = selectionMode === 'face' ? 'cell'
+      : selectionMode === 'edge' || selectionMode === 'vertex' ? 'crosshair'
+      : 'default'
+    canvas.style.cursor = cursor
+    return () => { canvas.style.cursor = 'default' }
+  }, [selectionMode])
 
   return null
 }
