@@ -46,9 +46,7 @@ impl RecognizedFeature {
     /// Human-readable description of the feature.
     pub fn to_description(&self) -> String {
         match self {
-            RecognizedFeature::ThroughHole {
-                diameter, axis, ..
-            } => {
+            RecognizedFeature::ThroughHole { diameter, axis, .. } => {
                 let axis_name = if axis[2].abs() > 0.9 {
                     "Z"
                 } else if axis[1].abs() > 0.9 {
@@ -58,28 +56,17 @@ impl RecognizedFeature {
                 } else {
                     "oblique"
                 };
-                format!(
-                    "through-hole ⌀{:.1}mm along {} axis",
-                    diameter, axis_name
-                )
+                format!("through-hole ⌀{:.1}mm along {} axis", diameter, axis_name)
             }
             RecognizedFeature::BlindHole {
                 diameter, depth, ..
             } => format!("blind hole ⌀{:.1}mm, {:.1}mm deep", diameter, depth),
             RecognizedFeature::Fillet {
                 radius, face_ids, ..
-            } => format!(
-                "fillet R{:.1}mm ({} faces)",
-                radius,
-                face_ids.len()
-            ),
+            } => format!("fillet R{:.1}mm ({} faces)", radius, face_ids.len()),
             RecognizedFeature::Chamfer {
                 distance, face_ids, ..
-            } => format!(
-                "chamfer {:.1}mm ({} faces)",
-                distance,
-                face_ids.len()
-            ),
+            } => format!("chamfer {:.1}mm ({} faces)", distance, face_ids.len()),
             RecognizedFeature::CylindricalBoss {
                 diameter, height, ..
             } => format!("cylindrical boss ⌀{:.1}mm, {:.1}mm tall", diameter, height),
@@ -185,12 +172,7 @@ pub fn recognize_features(solid_id: u32, model: &BRepModel) -> Vec<RecognizedFea
         let adjacent_planar_count = face
             .adjacent_faces
             .values()
-            .filter(|&&adj_id| {
-                face_surface_types
-                    .get(&adj_id)
-                    .copied()
-                    == Some(SurfaceType::Plane)
-            })
+            .filter(|&&adj_id| face_surface_types.get(&adj_id).copied() == Some(SurfaceType::Plane))
             .count();
 
         // A through-hole cylindrical face typically touches 2 planar faces (top/bottom caps)

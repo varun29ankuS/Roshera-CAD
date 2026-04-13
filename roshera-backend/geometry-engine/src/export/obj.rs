@@ -52,7 +52,11 @@ pub fn write_obj<W: Write>(mesh: &TriangleMesh, writer: &mut W) -> Result<(), Ob
 
     // Write vertex positions
     for v in &mesh.vertices {
-        writeln!(writer, "v {} {} {}", v.position.x, v.position.y, v.position.z)?;
+        writeln!(
+            writer,
+            "v {} {} {}",
+            v.position.x, v.position.y, v.position.z
+        )?;
     }
     writeln!(writer)?;
 
@@ -159,20 +163,72 @@ mod tests {
         let hw = 5.0;
 
         let faces: &[([f64; 3], [f64; 3], [f64; 3], [f64; 3], [f64; 3])] = &[
-            ([-hw, -hw, hw], [hw, -hw, hw], [hw, hw, hw], [-hw, hw, hw], [0.0, 0.0, 1.0]),
-            ([hw, -hw, -hw], [-hw, -hw, -hw], [-hw, hw, -hw], [hw, hw, -hw], [0.0, 0.0, -1.0]),
-            ([-hw, hw, hw], [hw, hw, hw], [hw, hw, -hw], [-hw, hw, -hw], [0.0, 1.0, 0.0]),
-            ([-hw, -hw, -hw], [hw, -hw, -hw], [hw, -hw, hw], [-hw, -hw, hw], [0.0, -1.0, 0.0]),
-            ([hw, -hw, hw], [hw, -hw, -hw], [hw, hw, -hw], [hw, hw, hw], [1.0, 0.0, 0.0]),
-            ([-hw, -hw, -hw], [-hw, -hw, hw], [-hw, hw, hw], [-hw, hw, -hw], [-1.0, 0.0, 0.0]),
+            (
+                [-hw, -hw, hw],
+                [hw, -hw, hw],
+                [hw, hw, hw],
+                [-hw, hw, hw],
+                [0.0, 0.0, 1.0],
+            ),
+            (
+                [hw, -hw, -hw],
+                [-hw, -hw, -hw],
+                [-hw, hw, -hw],
+                [hw, hw, -hw],
+                [0.0, 0.0, -1.0],
+            ),
+            (
+                [-hw, hw, hw],
+                [hw, hw, hw],
+                [hw, hw, -hw],
+                [-hw, hw, -hw],
+                [0.0, 1.0, 0.0],
+            ),
+            (
+                [-hw, -hw, -hw],
+                [hw, -hw, -hw],
+                [hw, -hw, hw],
+                [-hw, -hw, hw],
+                [0.0, -1.0, 0.0],
+            ),
+            (
+                [hw, -hw, hw],
+                [hw, -hw, -hw],
+                [hw, hw, -hw],
+                [hw, hw, hw],
+                [1.0, 0.0, 0.0],
+            ),
+            (
+                [-hw, -hw, -hw],
+                [-hw, -hw, hw],
+                [-hw, hw, hw],
+                [-hw, hw, -hw],
+                [-1.0, 0.0, 0.0],
+            ),
         ];
 
         for &(p0, p1, p2, p3, n) in faces {
             let normal = Vector3::new(n[0], n[1], n[2]);
-            let i0 = mesh.add_vertex(MeshVertex { position: Point3::new(p0[0], p0[1], p0[2]), normal, uv: None });
-            let i1 = mesh.add_vertex(MeshVertex { position: Point3::new(p1[0], p1[1], p1[2]), normal, uv: None });
-            let i2 = mesh.add_vertex(MeshVertex { position: Point3::new(p2[0], p2[1], p2[2]), normal, uv: None });
-            let i3 = mesh.add_vertex(MeshVertex { position: Point3::new(p3[0], p3[1], p3[2]), normal, uv: None });
+            let i0 = mesh.add_vertex(MeshVertex {
+                position: Point3::new(p0[0], p0[1], p0[2]),
+                normal,
+                uv: None,
+            });
+            let i1 = mesh.add_vertex(MeshVertex {
+                position: Point3::new(p1[0], p1[1], p1[2]),
+                normal,
+                uv: None,
+            });
+            let i2 = mesh.add_vertex(MeshVertex {
+                position: Point3::new(p2[0], p2[1], p2[2]),
+                normal,
+                uv: None,
+            });
+            let i3 = mesh.add_vertex(MeshVertex {
+                position: Point3::new(p3[0], p3[1], p3[2]),
+                normal,
+                uv: None,
+            });
             mesh.add_triangle(i0, i1, i2);
             mesh.add_triangle(i0, i2, i3);
         }

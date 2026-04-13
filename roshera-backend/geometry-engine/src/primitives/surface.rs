@@ -4834,10 +4834,7 @@ impl SurfaceOfRevolution {
     }
 
     /// Decompose a profile point into height along axis and radial components
-    fn decompose_profile_point(
-        &self,
-        profile_point: Point3,
-    ) -> (f64, f64, Vector3) {
+    fn decompose_profile_point(&self, profile_point: Point3) -> (f64, f64, Vector3) {
         let to_point = profile_point - self.axis_origin;
         let height = to_point.dot(&self.axis_direction);
         let radial_vec = to_point - self.axis_direction * height;
@@ -5017,7 +5014,11 @@ impl Surface for SurfaceOfRevolution {
             let cos_v = radial_dir.dot(&ref_dir);
             let sin_v = radial_dir.dot(&binormal);
             let angle = sin_v.atan2(cos_v);
-            if angle < 0.0 { angle + std::f64::consts::TAU } else { angle }
+            if angle < 0.0 {
+                angle + std::f64::consts::TAU
+            } else {
+                angle
+            }
         } else {
             0.0
         };
@@ -5052,7 +5053,9 @@ impl Surface for SurfaceOfRevolution {
         let offset = self.offset(distance);
         Ok(OffsetSurface {
             surface: offset,
-            quality: OffsetQuality::Approximate { max_error: f64::NAN },
+            quality: OffsetQuality::Approximate {
+                max_error: f64::NAN,
+            },
             original: self.clone_box(),
             distance,
         })
@@ -5253,7 +5256,9 @@ impl Surface for RuledSurface {
     fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
         Ok(OffsetSurface {
             surface: self.offset(distance),
-            quality: OffsetQuality::Approximate { max_error: f64::NAN },
+            quality: OffsetQuality::Approximate {
+                max_error: f64::NAN,
+            },
             original: self.clone_box(),
             distance,
         })
@@ -5308,7 +5313,11 @@ mod tests {
         let tol = default_tolerance();
 
         let results = xy.intersect(&xz, tol);
-        assert_eq!(results.len(), 1, "Perpendicular planes should intersect in one curve");
+        assert_eq!(
+            results.len(),
+            1,
+            "Perpendicular planes should intersect in one curve"
+        );
 
         match &results[0] {
             SurfaceIntersectionResult::Curve(curve) => {
@@ -5317,10 +5326,26 @@ mod tests {
                 let p0 = curve.point_at(0.0).unwrap();
                 let p1 = curve.point_at(1.0).unwrap();
                 // Both points should have z≈0 and y≈0
-                assert!(p0.z.abs() < 1e-6, "Point should lie on XY plane, z={}", p0.z);
-                assert!(p0.y.abs() < 1e-6, "Point should lie on XZ plane, y={}", p0.y);
-                assert!(p1.z.abs() < 1e-6, "Point should lie on XY plane, z={}", p1.z);
-                assert!(p1.y.abs() < 1e-6, "Point should lie on XZ plane, y={}", p1.y);
+                assert!(
+                    p0.z.abs() < 1e-6,
+                    "Point should lie on XY plane, z={}",
+                    p0.z
+                );
+                assert!(
+                    p0.y.abs() < 1e-6,
+                    "Point should lie on XZ plane, y={}",
+                    p0.y
+                );
+                assert!(
+                    p1.z.abs() < 1e-6,
+                    "Point should lie on XY plane, z={}",
+                    p1.z
+                );
+                assert!(
+                    p1.y.abs() < 1e-6,
+                    "Point should lie on XZ plane, y={}",
+                    p1.y
+                );
             }
             other => panic!("Expected Curve, got {:?}", std::mem::discriminant(other)),
         }
@@ -5333,7 +5358,10 @@ mod tests {
         let tol = default_tolerance();
 
         let results = plane1.intersect(&plane2, tol);
-        assert!(results.is_empty(), "Parallel non-coincident planes should not intersect");
+        assert!(
+            results.is_empty(),
+            "Parallel non-coincident planes should not intersect"
+        );
     }
 
     #[test]
@@ -5353,26 +5381,33 @@ mod tests {
     fn test_plane_cylinder_perpendicular() {
         // Cylinder along Z, plane at z=5 perpendicular to Z
         let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 3.0).unwrap();
-        let plane = Plane::from_point_normal(
-            Point3::new(0.0, 0.0, 5.0),
-            Vector3::Z,
-        ).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 5.0), Vector3::Z).unwrap();
         let tol = default_tolerance();
 
         let results = cylinder.intersect(&plane, tol);
-        assert!(!results.is_empty(), "Plane perpendicular to cylinder should produce intersection");
+        assert!(
+            !results.is_empty(),
+            "Plane perpendicular to cylinder should produce intersection"
+        );
 
         match &results[0] {
             SurfaceIntersectionResult::Curve(curve) => {
                 // All points should be at z≈5 and distance≈3 from Z axis
                 for t in [0.0, 0.25, 0.5, 0.75] {
                     let p = curve.point_at(t).unwrap();
-                    assert!((p.z - 5.0).abs() < 0.1, "Point should be at z=5, got z={}", p.z);
+                    assert!(
+                        (p.z - 5.0).abs() < 0.1,
+                        "Point should be at z=5, got z={}",
+                        p.z
+                    );
                     let r = (p.x * p.x + p.y * p.y).sqrt();
                     assert!((r - 3.0).abs() < 0.1, "Point should be at r=3, got r={r}");
                 }
             }
-            other => panic!("Expected Curve (circle), got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "Expected Curve (circle), got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -5385,21 +5420,26 @@ mod tests {
 
         let results = cylinder.intersect(&plane, tol);
         // Plane through cylinder center parallel to axis → 2 lines
-        assert_eq!(results.len(), 2, "Should get 2 intersection lines, got {}", results.len());
+        assert_eq!(
+            results.len(),
+            2,
+            "Should get 2 intersection lines, got {}",
+            results.len()
+        );
     }
 
     #[test]
     fn test_plane_cylinder_no_intersection() {
         // Cylinder along Z at origin with radius 3, plane far away
         let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 3.0).unwrap();
-        let plane = Plane::from_point_normal(
-            Point3::new(10.0, 0.0, 0.0),
-            Vector3::X,
-        ).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(10.0, 0.0, 0.0), Vector3::X).unwrap();
         let tol = default_tolerance();
 
         let results = cylinder.intersect(&plane, tol);
-        assert!(results.is_empty(), "Plane far from cylinder should not intersect");
+        assert!(
+            results.is_empty(),
+            "Plane far from cylinder should not intersect"
+        );
     }
 
     // ===== Plane-Sphere intersection tests =====
@@ -5423,36 +5463,38 @@ mod tests {
                     assert!((r - 5.0).abs() < 0.1, "Points should be at r=5, got r={r}");
                 }
             }
-            other => panic!("Expected Curve (circle), got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "Expected Curve (circle), got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
     #[test]
     fn test_plane_sphere_tangent() {
         let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
-        let plane = Plane::from_point_normal(
-            Point3::new(0.0, 0.0, 5.0),
-            Vector3::Z,
-        ).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 5.0), Vector3::Z).unwrap();
         let tol = default_tolerance();
 
         let results = sphere.intersect(&plane, tol);
         assert_eq!(results.len(), 1);
-        assert!(matches!(results[0], SurfaceIntersectionResult::Point(_)),
-            "Tangent plane should produce a point intersection");
+        assert!(
+            matches!(results[0], SurfaceIntersectionResult::Point(_)),
+            "Tangent plane should produce a point intersection"
+        );
     }
 
     #[test]
     fn test_plane_sphere_no_intersection() {
         let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
-        let plane = Plane::from_point_normal(
-            Point3::new(0.0, 0.0, 10.0),
-            Vector3::Z,
-        ).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 10.0), Vector3::Z).unwrap();
         let tol = default_tolerance();
 
         let results = sphere.intersect(&plane, tol);
-        assert!(results.is_empty(), "Plane outside sphere should not intersect");
+        assert!(
+            results.is_empty(),
+            "Plane outside sphere should not intersect"
+        );
     }
 
     // ===== Sphere-Sphere intersection tests =====
@@ -5497,7 +5539,11 @@ mod tests {
         let tol = default_tolerance();
 
         let results = c1.intersect(&c2, tol);
-        assert_eq!(results.len(), 2, "Parallel overlapping cylinders should give 2 lines");
+        assert_eq!(
+            results.len(),
+            2,
+            "Parallel overlapping cylinders should give 2 lines"
+        );
     }
 
     // =============================================
@@ -5510,10 +5556,7 @@ mod tests {
 
         // Revolve a vertical line segment (x=5, z from 0 to 10) around Z-axis
         // This should produce a cylinder of radius 5
-        let profile = Line::new(
-            Point3::new(5.0, 0.0, 0.0),
-            Point3::new(5.0, 0.0, 10.0),
-        );
+        let profile = Line::new(Point3::new(5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 10.0));
 
         let rev = SurfaceOfRevolution::new(
             Point3::ORIGIN,
@@ -5545,10 +5588,7 @@ mod tests {
         use crate::primitives::curve::Line;
 
         // Revolve line at x=3 around Z → all points should have radius 3
-        let profile = Line::new(
-            Point3::new(3.0, 0.0, 0.0),
-            Point3::new(3.0, 0.0, 8.0),
-        );
+        let profile = Line::new(Point3::new(3.0, 0.0, 0.0), Point3::new(3.0, 0.0, 8.0));
         let rev = SurfaceOfRevolution::new(
             Point3::ORIGIN,
             Vector3::Z,
@@ -5576,23 +5616,31 @@ mod tests {
     fn test_revolution_surface_is_closed() {
         use crate::primitives::curve::Line;
 
-        let profile = Line::new(
-            Point3::new(5.0, 0.0, 0.0),
-            Point3::new(5.0, 0.0, 10.0),
-        );
+        let profile = Line::new(Point3::new(5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 10.0));
 
         // Full revolution should be closed in v
         let full = SurfaceOfRevolution::new(
-            Point3::ORIGIN, Vector3::Z, Box::new(profile.clone()), std::f64::consts::TAU,
-        ).unwrap();
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(profile.clone()),
+            std::f64::consts::TAU,
+        )
+        .unwrap();
         assert!(full.is_closed_v(), "Full revolution should be closed in v");
         assert!(!full.is_closed_u(), "Should not be closed in u");
 
         // Partial revolution should not be closed
         let partial = SurfaceOfRevolution::new(
-            Point3::ORIGIN, Vector3::Z, Box::new(profile), std::f64::consts::PI,
-        ).unwrap();
-        assert!(!partial.is_closed_v(), "Partial revolution should not be closed in v");
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(profile),
+            std::f64::consts::PI,
+        )
+        .unwrap();
+        assert!(
+            !partial.is_closed_v(),
+            "Partial revolution should not be closed in v"
+        );
     }
 
     // =============================================

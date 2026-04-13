@@ -510,13 +510,7 @@ mod tests {
     #[test]
     fn test_torus_euler_characteristic() {
         let mut model = BRepModel::new();
-        let params = TorusParameters::new(
-            Point3::ORIGIN,
-            Vector3::Z,
-            10.0,
-            3.0,
-        )
-        .unwrap();
+        let params = TorusParameters::new(Point3::ORIGIN, Vector3::Z, 10.0, 3.0).unwrap();
 
         let solid_id = TorusPrimitive::create(&params, &mut model).unwrap();
         let solid = model.solids.get(solid_id).unwrap();

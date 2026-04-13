@@ -462,7 +462,9 @@ fn create_revolution_surface(
         profile_clone,
         std::f64::consts::TAU, // Full 360° revolution by default
     )
-    .map_err(|e| OperationError::NumericalError(format!("Failed to create revolution surface: {e}")))?;
+    .map_err(|e| {
+        OperationError::NumericalError(format!("Failed to create revolution surface: {e}"))
+    })?;
 
     Ok(Box::new(revolution))
 }
@@ -512,30 +514,21 @@ fn create_transformed_face(
         let sv = model
             .vertices
             .get(edge.start_vertex)
-            .ok_or_else(|| {
-                OperationError::InvalidGeometry("Start vertex not found".to_string())
-            })?;
+            .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
         let ev = model
             .vertices
             .get(edge.end_vertex)
-            .ok_or_else(|| {
-                OperationError::InvalidGeometry("End vertex not found".to_string())
-            })?;
+            .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
 
-        let new_start_pos = transform.transform_point(&Point3::new(
-            sv.position[0],
-            sv.position[1],
-            sv.position[2],
-        ));
-        let new_end_pos = transform.transform_point(&Point3::new(
-            ev.position[0],
-            ev.position[1],
-            ev.position[2],
-        ));
+        let new_start_pos =
+            transform.transform_point(&Point3::new(sv.position[0], sv.position[1], sv.position[2]));
+        let new_end_pos =
+            transform.transform_point(&Point3::new(ev.position[0], ev.position[1], ev.position[2]));
 
-        let new_start = model
-            .vertices
-            .add_or_find(new_start_pos.x, new_start_pos.y, new_start_pos.z, 1e-6);
+        let new_start =
+            model
+                .vertices
+                .add_or_find(new_start_pos.x, new_start_pos.y, new_start_pos.z, 1e-6);
         let new_end = model
             .vertices
             .add_or_find(new_end_pos.x, new_end_pos.y, new_end_pos.z, 1e-6);
@@ -550,22 +543,13 @@ fn create_transformed_face(
         );
         let new_edge_id = model.edges.add(new_edge);
 
-        let forward = outer_loop
-            .orientations
-            .get(idx)
-            .copied()
-            .unwrap_or(true);
+        let forward = outer_loop.orientations.get(idx).copied().unwrap_or(true);
         new_loop.add_edge(new_edge_id, forward);
     }
 
     let new_loop_id = model.loops.add(new_loop);
 
-    let new_face = Face::new(
-        0,
-        new_surface_id,
-        new_loop_id,
-        face.orientation,
-    );
+    let new_face = Face::new(0, new_surface_id, new_loop_id, face.orientation);
     let new_face_id = model.faces.add(new_face);
 
     Ok(new_face_id)

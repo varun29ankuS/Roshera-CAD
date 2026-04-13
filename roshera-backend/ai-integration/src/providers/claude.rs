@@ -195,9 +195,7 @@ impl LLMProvider for ClaudeProvider {
         context: Option<&super::ConversationContext>,
     ) -> Result<ParsedCommand, ProviderError> {
         match &self.config.api_key {
-            Some(key) if !key.is_empty() => {
-                self.process_via_api(input, context, key).await
-            }
+            Some(key) if !key.is_empty() => self.process_via_api(input, context, key).await,
             _ => self.process_locally(input, context),
         }
     }
@@ -236,7 +234,9 @@ impl LLMProvider for ClaudeProvider {
                     }))
                     .send()
                     .await
-                    .map_err(|e| ProviderError::InferenceError(format!("API request failed: {}", e)))?;
+                    .map_err(|e| {
+                        ProviderError::InferenceError(format!("API request failed: {}", e))
+                    })?;
 
                 let body: Value = response.json().await.map_err(|e| {
                     ProviderError::InferenceError(format!("Failed to parse response: {}", e))
@@ -261,7 +261,11 @@ impl LLMProvider for ClaudeProvider {
     }
 
     fn memory_requirement_mb(&self) -> usize {
-        if self.config.api_key.is_some() { 0 } else { 1 }
+        if self.config.api_key.is_some() {
+            0
+        } else {
+            1
+        }
     }
 }
 
@@ -282,7 +286,10 @@ fn build_system_prompt(context: Option<&super::ConversationContext>) -> String {
                 scene.objects.len()
             ));
             for obj in &scene.objects {
-                prompt.push_str(&format!("\n- {} ({}): {:?}", obj.name, obj.id, obj.object_type));
+                prompt.push_str(&format!(
+                    "\n- {} ({}): {:?}",
+                    obj.name, obj.id, obj.object_type
+                ));
             }
         }
     }
@@ -295,9 +302,12 @@ fn parse_anthropic_response(
     response: &Value,
     original_input: &str,
 ) -> Result<ParsedCommand, ProviderError> {
-    let content = response.get("content").and_then(|c| c.as_array()).ok_or_else(|| {
-        ProviderError::InferenceError("Response missing 'content' array".to_string())
-    })?;
+    let content = response
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| {
+            ProviderError::InferenceError("Response missing 'content' array".to_string())
+        })?;
 
     // Look for tool_use blocks first
     for block in content {
@@ -313,7 +323,10 @@ fn parse_anthropic_response(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                input: block.get("input").cloned().unwrap_or(Value::Object(Default::default())),
+                input: block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default())),
             };
 
             return match tool_dispatch::dispatch_tool_call(&tool_use) {
@@ -491,7 +504,18 @@ fn parse_natural_language_to_tool_use(input: &str) -> Option<ToolUseBlock> {
     }
 
     // Query
-    if contains_any(input, &["dimensions", "info", "properties", "describe", "summary", "what is", "analyze"]) {
+    if contains_any(
+        input,
+        &[
+            "dimensions",
+            "info",
+            "properties",
+            "describe",
+            "summary",
+            "what is",
+            "analyze",
+        ],
+    ) {
         return Some(ToolUseBlock {
             id: "local".to_string(),
             name: "query_geometry".to_string(),
@@ -550,7 +574,9 @@ fn process_scene_command(
         params.insert("objects".to_string(), serde_json::json!(ids));
         return Ok(ParsedCommand {
             original_text: original.to_string(),
-            intent: CommandIntent::Query { target: "select_all".to_string() },
+            intent: CommandIntent::Query {
+                target: "select_all".to_string(),
+            },
             parameters: params,
             confidence: 0.95,
             language: "en".to_string(),
@@ -567,14 +593,18 @@ fn process_scene_command(
         );
         return Ok(ParsedCommand {
             original_text: original.to_string(),
-            intent: CommandIntent::Query { target: "count_objects".to_string() },
+            intent: CommandIntent::Query {
+                target: "count_objects".to_string(),
+            },
             parameters: params,
             confidence: 0.95,
             language: "en".to_string(),
         });
     }
 
-    if input_lower.contains("list") || (input_lower.contains("show") && input_lower.contains("objects")) {
+    if input_lower.contains("list")
+        || (input_lower.contains("show") && input_lower.contains("objects"))
+    {
         let list: Vec<String> = scene
             .objects
             .iter()
@@ -592,16 +622,22 @@ fn process_scene_command(
         );
         return Ok(ParsedCommand {
             original_text: original.to_string(),
-            intent: CommandIntent::Query { target: "list_objects".to_string() },
+            intent: CommandIntent::Query {
+                target: "list_objects".to_string(),
+            },
             parameters: params,
             confidence: 0.95,
             language: "en".to_string(),
         });
     }
 
-    if input_lower.contains("delete") && (input_lower.contains("all") || input_lower.contains("everything")) {
+    if input_lower.contains("delete")
+        && (input_lower.contains("all") || input_lower.contains("everything"))
+    {
         if scene.objects.is_empty() {
-            return Err(ProviderError::InvalidInput("No objects to delete".to_string()));
+            return Err(ProviderError::InvalidInput(
+                "No objects to delete".to_string(),
+            ));
         }
         let ids: Vec<String> = scene.objects.iter().map(|o| o.id.to_string()).collect();
         let mut params = HashMap::new();
@@ -609,7 +645,9 @@ fn process_scene_command(
         params.insert("action".to_string(), serde_json::json!("delete_all"));
         return Ok(ParsedCommand {
             original_text: original.to_string(),
-            intent: CommandIntent::Transform { operation: "delete_all".to_string() },
+            intent: CommandIntent::Transform {
+                operation: "delete_all".to_string(),
+            },
             parameters: params,
             confidence: 0.95,
             language: "en".to_string(),
@@ -647,9 +685,9 @@ fn contains_any(input: &str, keywords: &[&str]) -> bool {
             input.contains(kw)
         } else {
             // Single word: check word boundaries
-            input.split_whitespace().any(|word| {
-                word == *kw || word.starts_with(kw) || word.ends_with(kw)
-            })
+            input
+                .split_whitespace()
+                .any(|word| word == *kw || word.starts_with(kw) || word.ends_with(kw))
         }
     })
 }
@@ -664,7 +702,9 @@ mod tests {
         let result = provider.process_locally("create a box 10 5 3", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box")
+        );
         assert_eq!(cmd.parameters["width"], serde_json::json!(10.0));
         assert_eq!(cmd.parameters["height"], serde_json::json!(5.0));
         assert_eq!(cmd.parameters["depth"], serde_json::json!(3.0));
@@ -676,7 +716,9 @@ mod tests {
         let result = provider.process_locally("make a sphere radius 7.5", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "sphere"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "sphere")
+        );
         assert_eq!(cmd.parameters["radius"], serde_json::json!(7.5));
     }
 
@@ -686,7 +728,9 @@ mod tests {
         let result = provider.process_locally("create cylinder 5 20", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "cylinder"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "cylinder")
+        );
         assert_eq!(cmd.parameters["radius"], serde_json::json!(5.0));
         assert_eq!(cmd.parameters["height"], serde_json::json!(20.0));
     }
@@ -697,7 +741,9 @@ mod tests {
         let result = provider.process_locally("subtract the hole from the block", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::BooleanOperation { ref operation } if operation == "difference"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::BooleanOperation { ref operation } if operation == "difference")
+        );
     }
 
     #[test]
@@ -706,7 +752,9 @@ mod tests {
         let result = provider.process_locally("what are the dimensions of this", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::Query { ref target } if target == "query_geometry"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::Query { ref target } if target == "query_geometry")
+        );
     }
 
     #[test]
@@ -749,7 +797,9 @@ mod tests {
         let result = parse_anthropic_response(&response, "make a box");
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box")
+        );
     }
 
     #[test]
@@ -775,7 +825,9 @@ mod tests {
         let result = provider.process_locally("fillet the edges with radius 3", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::Modify { ref operation, .. } if operation == "fillet"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::Modify { ref operation, .. } if operation == "fillet")
+        );
     }
 
     #[test]
@@ -784,7 +836,9 @@ mod tests {
         let result = provider.process_locally("create a torus 15 4", None);
         assert!(result.is_ok());
         let cmd = result.unwrap();
-        assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "torus"));
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "torus")
+        );
         assert_eq!(cmd.parameters["major_radius"], serde_json::json!(15.0));
         assert_eq!(cmd.parameters["minor_radius"], serde_json::json!(4.0));
     }

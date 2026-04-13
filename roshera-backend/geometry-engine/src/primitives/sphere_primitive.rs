@@ -299,13 +299,14 @@ impl Primitive for SpherePrimitive {
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        let shell = model
-            .shells
-            .get(solid.outer_shell)
-            .ok_or_else(|| PrimitiveError::GeometryError {
-                operation: "get_parameters".to_string(),
-                details: "Outer shell not found".to_string(),
-            })?;
+        let shell =
+            model
+                .shells
+                .get(solid.outer_shell)
+                .ok_or_else(|| PrimitiveError::GeometryError {
+                    operation: "get_parameters".to_string(),
+                    details: "Outer shell not found".to_string(),
+                })?;
 
         // Find the spherical surface to extract center and radius
         for &face_id in &shell.faces {
