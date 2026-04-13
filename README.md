@@ -8,7 +8,7 @@ Primitives, topology, and NURBS math are production-ready. Operations (booleans,
 
 | Dark Mode | Light Mode |
 |-----------|------------|
-| ![Dark Mode](docs/screenshots/dark-mode.png) | ![Light Mode](docs/screenshots/light-mode.png) |
+| ![Dark Mode](roshera-app/docs/screenshots/dark-mode.png) | ![Light Mode](roshera-app/docs/screenshots/light-mode.png) |
 
 ## Architecture
 
