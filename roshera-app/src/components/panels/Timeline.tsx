@@ -83,7 +83,7 @@ function TimelineEntry({
   event: EventSummary
   isLatest: boolean
 }) {
-  const Icon = iconForOperation(event.operation_type)
+  const icon = iconForOperation(event.operation_type)
 
   return (
     <div
@@ -99,7 +99,7 @@ function TimelineEntry({
             isLatest ? 'bg-primary/20 text-primary' : 'bg-muted text-muted-foreground',
           )}
         >
-          <Icon size={10} strokeWidth={1.5} />
+          {icon({ size: 10, strokeWidth: 1.5 })}
         </div>
       </div>
 

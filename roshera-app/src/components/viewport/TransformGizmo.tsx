@@ -1,9 +1,9 @@
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useMemo } from 'react'
 import { TransformControls } from '@react-three/drei'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThree } from '@react-three/fiber'
 import { wsClient } from '@/lib/ws-client'
-import type * as THREE from 'three'
+import { Object3D } from 'three'
 
 export function TransformGizmo() {
   const activeTool = useSceneStore((s) => s.activeTool)
@@ -11,6 +11,7 @@ export function TransformGizmo() {
   const transformSpace = useSceneStore((s) => s.transformSpace)
   const objects = useSceneStore((s) => s.objects)
   const updateObject = useSceneStore((s) => s.updateObject)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const controlsRef = useRef<any>(null)
   const { scene } = useThree()
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -19,23 +20,19 @@ export function TransformGizmo() {
   const selectedObj = selectedId ? objects.get(selectedId) : null
   const showGizmo = selectedObj && activeTool !== 'select'
 
-  const targetMesh = useRef<THREE.Object3D | null>(null)
-
-  useEffect(() => {
-    if (!selectedId) {
-      targetMesh.current = null
-      return
-    }
-
+  const targetMesh = useMemo((): Object3D | null => {
+    if (!selectedId) return null
+    let found: Object3D | null = null
     scene.traverse((child) => {
       if (child.userData?.cadObjectId === selectedId) {
-        targetMesh.current = child
+        found = child
       }
     })
+    return found
   }, [selectedId, scene])
 
   const syncToBackend = useCallback((objectId: string) => {
-    const obj = targetMesh.current
+    const obj = targetMesh
     if (!obj) return
 
     wsClient.send({
@@ -48,15 +45,15 @@ export function TransformGizmo() {
         scale: [obj.scale.x, obj.scale.y, obj.scale.z],
       },
     })
-  }, [])
+  }, [targetMesh])
 
   useEffect(() => {
     const controls = controlsRef.current
     if (!controls) return
 
     const handleChange = () => {
-      if (!targetMesh.current || !selectedId) return
-      const obj = targetMesh.current
+      const obj = targetMesh
+      if (!obj || !selectedId) return
       updateObject(selectedId, {
         position: [obj.position.x, obj.position.y, obj.position.z],
         rotation: [obj.rotation.x, obj.rotation.y, obj.rotation.z],
@@ -66,7 +63,6 @@ export function TransformGizmo() {
 
     const handleMouseUp = () => {
       if (!selectedId) return
-      // Debounce backend sync — send after gizmo interaction ends
       if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
       syncTimerRef.current = setTimeout(() => syncToBackend(selectedId), 100)
     }
@@ -77,7 +73,7 @@ export function TransformGizmo() {
       controls.removeEventListener('objectChange', handleChange)
       controls.removeEventListener('mouseUp', handleMouseUp)
     }
-  }, [selectedId, updateObject, syncToBackend])
+  }, [selectedId, targetMesh, updateObject, syncToBackend])
 
   useEffect(() => {
     return () => {
@@ -85,14 +81,14 @@ export function TransformGizmo() {
     }
   }, [])
 
-  if (!showGizmo || !targetMesh.current) return null
+  if (!showGizmo || !targetMesh) return null
 
   const mode = activeTool as 'translate' | 'rotate' | 'scale'
 
   return (
     <TransformControls
       ref={controlsRef}
-      object={targetMesh.current}
+      object={targetMesh}
       mode={mode}
       space={transformSpace}
       size={0.7}
