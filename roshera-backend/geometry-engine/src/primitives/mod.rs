@@ -22,6 +22,7 @@ pub mod primitive_traits;
 // Geometry intelligence
 pub mod feature_recognition;
 pub mod geometry_summary;
+pub mod tool_schema_generator;
 
 // AI-accessible primitives
 pub mod box_primitive;
