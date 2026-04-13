@@ -1,48 +1,48 @@
 # Roshera
 
-**The world's first AI-readable geometry kernel.**
+**B-Rep geometry kernel built from scratch in Rust.**
 
-Traditional CAD kernels store geometry as pure mathematics: vertices, edges, NURBS control points. To an AI agent, this is opaque data. It can see a cylindrical hole but cannot know it's for an M8 socket head cap screw, that it must have 0.1mm positional tolerance, or that it was designed for CNC machining.
+Roshera is a boundary representation CAD system with production-grade mathematical foundations — NURBS curves and surfaces, exact B-Rep topology, and real-time tessellation. No wrappers around OpenCASCADE or Parasolid.
 
-Roshera is a B-Rep CAD system where every geometric feature carries semantic meaning. AI agents can query design intent, check manufacturing constraints, find similar parts, and reason about engineering relationships directly from the geometry itself.
-
-Built from scratch in Rust. No wrappers around OpenCASCADE or Parasolid.
+Primitives, topology, and NURBS math are production-ready. Operations (booleans, fillet, chamfer) and AI integration are under active development.
 
 ![Roshera CAD UI](Front_ui.jpg)
-
-## How It Works
-
-The kernel has three layers:
-
-**1. B-Rep Engine** — Standard boundary representation: vertices, edges, faces, shells, solids. NURBS curves and surfaces. Boolean operations, extrude, revolve, sweep, loft, fillet, chamfer.
-
-**2. AI-Readable Layer** — Sits on top of B-Rep. A 4-pass classifier detects 20+ feature types (mounting holes, ribs, pockets, walls, bosses) and attaches semantic metadata:
-  - Design intent: why the feature exists, what standard it follows
-  - Manufacturing constraints: CNC machinable? 3D printable? Minimum tool diameter?
-  - Engineering relationships: feature dependencies, mates, alignment
-  - 64-dimensional geometric descriptors for similarity search
-
-**3. Query Interface** — Structured queries for AI agents:
-  - `find_features_by_type("MountingHole")` — all mounting holes in the model
-  - `find_manufacturing_issues("injection_molding")` — features incompatible with that process
-  - `find_thin_walls(2.0)` — walls thinner than 2mm
-  - `describe_entity(face_id)` — "Cylindrical face, 8mm diameter, depth 12mm, likely M8 mounting hole"
 
 ## Architecture
 
 ```
 roshera-backend/
-  geometry-engine/     B-Rep engine + AI-readable semantic layer
+  geometry-engine/     B-Rep kernel: math, primitives, topology, operations, tessellation
   ai-integration/      API-based AI providers (Claude, OpenAI)
   timeline-engine/     Event-sourced design history with branching
   session-manager/     Multi-user collaboration with RBAC
-  export-engine/       STL, OBJ, STEP, ROS export
+  export-engine/       STL, OBJ, ROS export
   rag-engine/          Vamana-indexed retrieval for design knowledge
   api-server/          Axum REST + WebSocket API
   shared-types/        Common type definitions
 
 roshera-front/         Leptos/WASM + Three.js browser client
 ```
+
+## What Works Today
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Math** | Production | Vector3, Matrix4, Quaternion, B-spline, NURBS — tested, SIMD-optimized |
+| **Primitives** | Production | Box, Sphere, Cylinder, Cone, Torus — real B-Rep topology |
+| **Topology** | Production | Euler validation, manifold detection, adjacency queries, parallel building |
+| **Tessellation** | Production | Per-surface-type dispatch, adaptive subdivision, visualization meshes |
+| **Extrude** | Working | Face and profile extrusion with draft angle support |
+| **Boolean** | Partial | Surface-surface intersection computed; face reconstruction in progress |
+| **Fillet** | Partial | Constant-radius working; variable-radius in development |
+| **Revolve / Sweep / Loft** | In development | Pipeline structured, surface generation incomplete |
+| **Chamfer** | In development | Entry point exists, adjacent face lookup incomplete |
+| **Assembly** | Data model | Components, mates, motion limits defined; constraint solver not implemented |
+| **2D Sketch** | Partial | Newton-Raphson solver loop working; constraint coverage expanding |
+| **Export** | STL + OBJ + ROS | STEP writer structured but output not yet valid |
+| **RAG Engine** | Working | Vamana/DiskANN vector index with cosine/euclidean/dot-product |
+| **Timeline** | Working | Event-sourced history with branching |
+| **AI Integration** | Working | Claude + OpenAI API providers, natural language command parsing |
 
 ## Getting Started
 
@@ -70,20 +70,6 @@ docker compose up
 - Rust 1.75+
 - trunk (for frontend): `cargo install trunk`
 - wasm32-unknown-unknown target: `rustup target add wasm32-unknown-unknown`
-
-## Capabilities
-
-| Component | Description |
-|-----------|-------------|
-| **Primitives** | Box, Sphere, Cylinder, Cone, Torus |
-| **Operations** | Boolean, Extrude, Revolve, Sweep, Loft, Fillet, Chamfer, Pattern, Blend |
-| **Topology** | Euler operators, validation, non-manifold detection |
-| **Sketching** | 2D constraint solver (Newton-Raphson), lines, arcs, splines |
-| **Assembly** | Mate constraints, motion simulation |
-| **Export** | STL (ASCII/binary), OBJ, STEP (ISO 10303), ROS (encrypted) |
-| **History** | Event-sourced timeline with branching (not parametric trees) |
-| **AI** | API-based providers (Claude, OpenAI), natural language commands |
-| **Collaboration** | Multi-user sessions, RBAC, real-time sync via WebSocket |
 
 ## API
 

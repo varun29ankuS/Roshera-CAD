@@ -299,8 +299,10 @@ impl Primitive for SpherePrimitive {
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        // TODO: Implement proper parameter storage in the model
-        Ok(SphereParameters::default())
+        Err(PrimitiveError::GeometryError {
+            operation: "get_parameters".to_string(),
+            details: "Parameter recovery from B-Rep topology not yet implemented".to_string(),
+        })
     }
 
     fn validate(solid_id: SolidId, model: &BRepModel) -> Result<ValidationReport, PrimitiveError> {
@@ -605,7 +607,6 @@ fn create_sphere_arc(
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,4 +627,3 @@ mod tests {
         assert_eq!(report.euler_characteristic, 2);
     }
 }
-*/

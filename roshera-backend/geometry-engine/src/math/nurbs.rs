@@ -286,9 +286,9 @@ impl NurbsCurve {
         result.point = Point3::from(result.point.to_vec() / weight_sum);
 
         // First derivative
+        let mut dw1 = 0.0;
         if num_derivatives >= 1 && ders.len() > 1 {
             let mut d1 = Vector3::ZERO;
-            let mut dw1 = 0.0;
 
             for i in 0..=self.degree {
                 let idx = span - self.degree + i;
@@ -314,7 +314,6 @@ impl NurbsCurve {
             }
 
             if let Some(d1) = result.derivative1 {
-                let dw1 = 0.0; // Already computed above
                 result.derivative2 =
                     Some((d2 - result.point.to_vec() * dw2 - d1 * (2.0 * dw1)) / weight_sum);
             }
@@ -1594,10 +1593,10 @@ impl NurbsSurface {
     }
 
     /// Compute intersection with another NURBS surface
-    pub fn intersect(&self, other: &NurbsSurface) -> MathResult<Vec<IntersectionCurve>> {
-        // This is a placeholder implementation
-        // Full implementation would use marching methods or subdivision
-        Ok(Vec::new())
+    pub fn intersect(&self, _other: &NurbsSurface) -> MathResult<Vec<IntersectionCurve>> {
+        Err(super::MathError::NotImplemented(
+            "NURBS surface-surface intersection".to_string(),
+        ))
     }
 
     /// Insert a knot in the U direction

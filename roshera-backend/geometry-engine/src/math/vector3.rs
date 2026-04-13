@@ -793,12 +793,11 @@ impl Index<usize> for Vector3 {
 
     #[inline]
     fn index(&self, index: usize) -> &f64 {
-        debug_assert!(index < 3, "Vector3 index out of bounds: {}", index);
         match index {
             0 => &self.x,
             1 => &self.y,
             2 => &self.z,
-            _ => &self.x, // Safe fallback for release mode
+            _ => panic!("Vector3 index out of bounds: {index}"),
         }
     }
 }
@@ -806,12 +805,11 @@ impl Index<usize> for Vector3 {
 impl IndexMut<usize> for Vector3 {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut f64 {
-        debug_assert!(index < 3, "Vector3 index out of bounds: {}", index);
         match index {
             0 => &mut self.x,
             1 => &mut self.y,
             2 => &mut self.z,
-            _ => &mut self.x, // Safe fallback for release mode
+            _ => panic!("Vector3 index out of bounds: {index}"),
         }
     }
 }

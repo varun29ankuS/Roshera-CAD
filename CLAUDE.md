@@ -10,13 +10,11 @@
 
 ## Architecture
 - Star topology centered on the geometry kernel
-- B-Rep engine with AI-readable semantic layer (the differentiator)
 - Backend-driven: frontend is a thin display layer
-- Every geometric feature carries design intent, manufacturing constraints, and embeddings
 - WebSocket for real-time collaboration, REST for CRUD
 
 ## Codebase
-- `roshera-backend/geometry-engine/` — B-Rep kernel, math, primitives, operations, readable layer
+- `roshera-backend/geometry-engine/` — B-Rep kernel, math, primitives, operations, tessellation
 - `roshera-backend/api-server/` — Axum HTTP/WebSocket server
 - `roshera-backend/ai-integration/` — Claude + OpenAI providers
 - `roshera-backend/timeline-engine/` — Event-sourced design history

@@ -531,8 +531,10 @@ impl Primitive for BoxPrimitive {
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        // Return default parameters (parameter storage not implemented)
-        Ok(BoxParameters::default())
+        Err(PrimitiveError::GeometryError {
+            operation: "get_parameters".to_string(),
+            details: "Parameter recovery from B-Rep topology not yet implemented".to_string(),
+        })
     }
 
     fn validate(solid_id: SolidId, model: &BRepModel) -> Result<ValidationReport, PrimitiveError> {

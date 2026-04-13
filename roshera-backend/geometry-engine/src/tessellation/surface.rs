@@ -554,8 +554,12 @@ fn tessellate_cylindrical_face(
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
-    // Calculate tessellation resolution
-    let radius = 1.0; // TODO: Get actual cylinder radius from surface
+    // Extract actual cylinder radius from surface
+    let radius = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cylinder>()
+        .map(|c| c.radius)
+        .unwrap_or(1.0);
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 

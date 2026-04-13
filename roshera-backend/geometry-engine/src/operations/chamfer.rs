@@ -298,12 +298,12 @@ fn compute_chamfer_offsets(
 
 /// Create ruled surface for chamfer
 fn create_ruled_chamfer_surface(
-    model: &mut BRepModel,
-    data: &ChamferData,
+    _model: &mut BRepModel,
+    _data: &ChamferData,
 ) -> OperationResult<Box<dyn Surface>> {
-    // Would create proper ruled surface between offset curves
-    use crate::primitives::surface::Plane;
-    Ok(Box::new(Plane::xy(0.0)))
+    Err(OperationError::NotImplemented(
+        "Ruled chamfer surface not yet implemented".to_string(),
+    ))
 }
 
 /// Create chamfer face with boundaries
@@ -437,24 +437,26 @@ fn create_straight_edge(
 
 /// Update adjacent faces for chamfer
 fn update_adjacent_faces_for_chamfer(
-    model: &mut BRepModel,
-    solid_id: SolidId,
-    edges: &[EdgeId],
-    chamfer_faces: &[FaceId],
+    _model: &mut BRepModel,
+    _solid_id: SolidId,
+    _edges: &[EdgeId],
+    _chamfer_faces: &[FaceId],
 ) -> OperationResult<()> {
-    // Would update face boundaries to account for chamfer
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "Adjacent face update for chamfer not yet implemented".to_string(),
+    ))
 }
 
 /// Handle vertices where multiple chamfers meet
 fn handle_chamfer_vertices(
-    model: &mut BRepModel,
-    solid_id: SolidId,
-    edges: &[EdgeId],
-    chamfer_faces: &[FaceId],
+    _model: &mut BRepModel,
+    _solid_id: SolidId,
+    _edges: &[EdgeId],
+    _chamfer_faces: &[FaceId],
 ) -> OperationResult<()> {
-    // Would create proper vertex treatments (3-way corners, etc.)
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "Chamfer vertex treatment not yet implemented".to_string(),
+    ))
 }
 
 /// Propagate edge selection
@@ -502,13 +504,14 @@ fn get_adjacent_faces(
 
 /// Compute angle between faces at edge
 fn compute_face_angle(
-    model: &BRepModel,
-    edge_id: EdgeId,
-    face1_id: FaceId,
-    face2_id: FaceId,
+    _model: &BRepModel,
+    _edge_id: EdgeId,
+    _face1_id: FaceId,
+    _face2_id: FaceId,
 ) -> OperationResult<f64> {
-    // Would compute actual angle between faces
-    Ok(std::f64::consts::PI / 2.0) // 90 degrees placeholder
+    Err(OperationError::NotImplemented(
+        "Face angle computation not yet implemented".to_string(),
+    ))
 }
 
 /// Validate chamfer inputs

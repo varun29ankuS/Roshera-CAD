@@ -356,10 +356,9 @@ fn create_bilinear_surface(
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?
         .position;
 
-    // For now, create a placeholder plane
-    // In complete implementation, would create proper bilinear surface
-    use crate::primitives::surface::Plane;
-    Ok(Box::new(Plane::xy(0.0)))
+    Err(OperationError::NotImplemented(
+        "Bilinear surface not yet implemented".to_string(),
+    ))
 }
 
 /// Create face profiles from edge profiles
@@ -410,12 +409,12 @@ fn create_planar_face_from_edges(
 
 /// Compute a planar surface from edges
 fn compute_planar_surface(
-    model: &mut BRepModel,
-    edges: &[EdgeId],
+    _model: &mut BRepModel,
+    _edges: &[EdgeId],
 ) -> OperationResult<Box<dyn Surface>> {
-    use crate::primitives::surface::Plane;
-    // Simplified - would compute actual plane from edges
-    Ok(Box::new(Plane::xy(0.0)))
+    Err(OperationError::NotImplemented(
+        "Planar surface computation from edges not yet implemented".to_string(),
+    ))
 }
 
 /// Create a reversed copy of a face
