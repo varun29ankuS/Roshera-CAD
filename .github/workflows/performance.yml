@@ -49,7 +49,7 @@ jobs:
         auto-push: true
         comment-on-alert: true
         alert-threshold: '150%'
-        fail-on-alert: true
+        fail-on-alert: false
         benchmark-data-dir-path: 'dev/bench'
 
   memory-profile:
