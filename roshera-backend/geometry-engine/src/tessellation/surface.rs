@@ -548,11 +548,7 @@ fn enforce_edge_constraint(
 
 /// Triangulate a simple polygon in 2D using ear clipping.
 /// Appends resulting triangles to `output`.
-fn ear_clip_2d(
-    vertices: &[(f64, f64)],
-    polygon: &[usize],
-    output: &mut Vec<[usize; 3]>,
-) {
+fn ear_clip_2d(vertices: &[(f64, f64)], polygon: &[usize], output: &mut Vec<[usize; 3]>) {
     if polygon.len() < 3 {
         return;
     }
@@ -615,12 +611,7 @@ fn ear_clip_2d(
 }
 
 /// Check if point p is inside triangle (a, b, c) using barycentric coordinates
-fn point_in_triangle_2d(
-    p: &(f64, f64),
-    a: &(f64, f64),
-    b: &(f64, f64),
-    c: &(f64, f64),
-) -> bool {
+fn point_in_triangle_2d(p: &(f64, f64), a: &(f64, f64), b: &(f64, f64), c: &(f64, f64)) -> bool {
     let v0 = (c.0 - a.0, c.1 - a.1);
     let v1 = (b.0 - a.0, b.1 - a.1);
     let v2 = (p.0 - a.0, p.1 - a.1);

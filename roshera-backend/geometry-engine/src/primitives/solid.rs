@@ -532,9 +532,7 @@ impl Solid {
     /// **DEPRECATED**: Use `operations::boolean::boolean_operation()` instead,
     /// which operates on BRepModel and performs real face-face intersection,
     /// classification, and topology reconstruction.
-    #[deprecated(
-        note = "Use operations::boolean::boolean_operation() with BRepModel instead"
-    )]
+    #[deprecated(note = "Use operations::boolean::boolean_operation() with BRepModel instead")]
     pub fn boolean_op(
         &self,
         _other: &Solid,

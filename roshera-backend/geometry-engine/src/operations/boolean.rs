@@ -515,10 +515,10 @@ fn create_line_intersection_curve(
     // large finite values set by the surface implementation.
     let bounds_a = surface_a.parameter_bounds();
     let bounds_b = surface_b.parameter_bounds();
-    let extent_a = ((bounds_a.0 .1 - bounds_a.0 .0).abs())
-        .max((bounds_a.1 .1 - bounds_a.1 .0).abs());
-    let extent_b = ((bounds_b.0 .1 - bounds_b.0 .0).abs())
-        .max((bounds_b.1 .1 - bounds_b.1 .0).abs());
+    let extent_a =
+        ((bounds_a.0 .1 - bounds_a.0 .0).abs()).max((bounds_a.1 .1 - bounds_a.1 .0).abs());
+    let extent_b =
+        ((bounds_b.0 .1 - bounds_b.0 .0).abs()).max((bounds_b.1 .1 - bounds_b.1 .0).abs());
     let line_extent = extent_a.max(extent_b).max(10.0); // floor at 10.0 for degenerate bounds
 
     let start_point = line_point - line_direction * line_extent;
@@ -875,7 +875,11 @@ fn compute_circle_plane_parameters(
     for i in 0..NUM_SAMPLES {
         let angle = 2.0 * std::f64::consts::PI * (i as f64) / (NUM_SAMPLES as f64);
         let point = circle.evaluate(angle)?;
-        params.push(project_to_plane_uv(&point.position, &plane_point, &plane_normal)?);
+        params.push(project_to_plane_uv(
+            &point.position,
+            &plane_point,
+            &plane_normal,
+        )?);
     }
 
     Ok(params)
@@ -939,7 +943,11 @@ fn compute_ellipse_plane_parameters(
     for i in 0..NUM_SAMPLES {
         let t = (i as f64) / (NUM_SAMPLES as f64);
         let point = ellipse.evaluate(t)?;
-        params.push(project_to_plane_uv(&point.position, &plane_point, &plane_normal)?);
+        params.push(project_to_plane_uv(
+            &point.position,
+            &plane_point,
+            &plane_normal,
+        )?);
     }
 
     Ok(params)
@@ -974,7 +982,11 @@ fn compute_line_surface_parameters_bounded(
     for i in 0..=NUM_SAMPLES {
         let t = i as f64 / NUM_SAMPLES as f64;
         let point = line.evaluate(t)?;
-        params.push(project_to_plane_uv(&point.position, &plane_point, plane_normal)?);
+        params.push(project_to_plane_uv(
+            &point.position,
+            &plane_point,
+            plane_normal,
+        )?);
     }
 
     Ok(params)
@@ -2498,12 +2510,12 @@ fn classify_split_faces(
         let mut classified_face = face.clone();
 
         // Determine which solid this face originally came from
-        let (test_solid, origin_solid) =
-            if is_face_from_solid(model, face.original_face, solid_a)? {
-                (solid_b, solid_a)
-            } else {
-                (solid_a, solid_b)
-            };
+        let (test_solid, origin_solid) = if is_face_from_solid(model, face.original_face, solid_a)?
+        {
+            (solid_b, solid_a)
+        } else {
+            (solid_a, solid_b)
+        };
 
         classified_face.from_solid = Some(origin_solid);
 
@@ -3517,7 +3529,11 @@ mod tests {
         ];
 
         let selected = select_faces_for_operation(&faces, BooleanOp::Difference, 0, 1);
-        assert_eq!(selected.len(), 2, "Difference should keep A-outside + B-inside");
+        assert_eq!(
+            selected.len(),
+            2,
+            "Difference should keep A-outside + B-inside"
+        );
         assert!(selected.iter().any(|f| f.original_face == 0));
         assert!(selected.iter().any(|f| f.original_face == 2));
     }
