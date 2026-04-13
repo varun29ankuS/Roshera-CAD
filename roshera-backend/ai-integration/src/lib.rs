@@ -19,6 +19,7 @@ pub mod processor;
 pub mod providers;
 pub mod session_aware_processor;
 pub mod timeline_aware_executor;
+pub mod tool_dispatch;
 pub mod translator;
 
 pub use commands::{Operation, VoiceCommand};
