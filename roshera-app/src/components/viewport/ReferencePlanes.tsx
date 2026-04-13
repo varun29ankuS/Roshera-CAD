@@ -13,9 +13,7 @@ export function ReferencePlanes() {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            count={2}
-            array={new Float32Array([-LEN, Y, 0, LEN, Y, 0])}
-            itemSize={3}
+            args={[new Float32Array([-LEN, Y, 0, LEN, Y, 0]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color="#e74c3c" transparent opacity={0.35} />
@@ -26,9 +24,7 @@ export function ReferencePlanes() {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            count={2}
-            array={new Float32Array([0, 0, 0, 0, LEN, 0])}
-            itemSize={3}
+            args={[new Float32Array([0, 0, 0, 0, LEN, 0]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color="#2ecc71" transparent opacity={0.35} />
@@ -39,9 +35,7 @@ export function ReferencePlanes() {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            count={2}
-            array={new Float32Array([0, Y, -LEN, 0, Y, LEN])}
-            itemSize={3}
+            args={[new Float32Array([0, Y, -LEN, 0, Y, LEN]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color="#3498db" transparent opacity={0.35} />

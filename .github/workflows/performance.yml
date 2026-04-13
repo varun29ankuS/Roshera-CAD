@@ -51,6 +51,7 @@ jobs:
         alert-threshold: '150%'
         fail-on-alert: false
         benchmark-data-dir-path: 'dev/bench'
+        skip-fetch-gh-pages: true
 
   memory-profile:
     name: Memory Usage

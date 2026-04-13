@@ -264,9 +264,11 @@ function TransformEditor({ objectId }: { objectId: string }) {
   ) {
     const num = parseFloat(value)
     if (isNaN(num)) return
-    const current = [...obj[field]] as [number, number, number]
-    current[axis] = num
-    updateObject(objectId, { [field]: current })
+    const current = objects.get(objectId)
+    if (!current) return
+    const vec = [...current[field]] as [number, number, number]
+    vec[axis] = num
+    updateObject(objectId, { [field]: vec })
   }
 
   return (

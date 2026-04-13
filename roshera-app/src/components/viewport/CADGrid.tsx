@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useRef } from 'react'
+import { useMemo } from 'react'
 import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
@@ -78,7 +78,7 @@ export function CADGrid() {
       transparent: true,
       side: THREE.DoubleSide,
       depthWrite: false,
-      extensions: { derivatives: true },
+      extensions: { derivatives: true } as unknown as THREE.ShaderMaterial['extensions'],
     })
   }, [cellSize, sectionSize, fadeDistance, theme])
 

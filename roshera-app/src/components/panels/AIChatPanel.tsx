@@ -2,18 +2,15 @@ import { useRef, useEffect, useState, useCallback } from 'react'
 import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { ChatMessage } from './ChatMessage'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   MessageSquare,
   Send,
-  X,
   Loader2,
   ChevronDown,
   Trash2,
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
 
 export function AIChatPanel() {
   const messages = useChatStore((s) => s.messages)

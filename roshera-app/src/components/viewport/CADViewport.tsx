@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useMemo } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'

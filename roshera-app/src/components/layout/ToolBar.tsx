@@ -1,4 +1,5 @@
-import { useCallback } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   MousePointer2,
   Move3d,
@@ -75,58 +76,78 @@ function sendCommand(cmd: string) {
 
 // ─── Flyout group — pure CSS hover, no timers ────────────────────
 
-function FlyoutGroup({ group }: { group: ToolGroup }) {
+function FlyoutGroup({ group, openId, onToggle }: {
+  group: ToolGroup
+  openId: string | null
+  onToggle: (id: string) => void
+}) {
   const anyActive = group.sections.some((s) => s.items.some((i) => i.active))
+  const isOpen = openId === group.id
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const [pos, setPos] = useState({ top: 0, left: 0 })
+
+  useLayoutEffect(() => {
+    if (isOpen && triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect()
+      setPos({ top: rect.top, left: rect.right + 4 })
+    }
+  }, [isOpen])
 
   return (
-    <div className="relative group/fly">
-      {/* Sidebar icon + label */}
-      <div
+    <div className="relative">
+      <button
+        ref={triggerRef}
+        onClick={() => onToggle(group.id)}
         className={cn(
           'w-14 py-2 flex flex-col items-center justify-center rounded-lg transition-colors cursor-pointer gap-1',
-          anyActive
-            ? 'bg-primary/20 text-primary group-hover/fly:bg-accent group-hover/fly:text-foreground'
-            : 'text-muted-foreground hover:text-foreground group-hover/fly:bg-accent group-hover/fly:text-foreground',
+          anyActive && !isOpen && 'bg-primary/20 text-primary',
+          isOpen && 'bg-accent text-foreground',
+          !anyActive && !isOpen && 'text-muted-foreground hover:text-foreground hover:bg-accent',
         )}
         title={group.tooltip}
       >
         <group.icon size={22} strokeWidth={1.5} />
         <span className="text-[9px] leading-none tracking-wide">{group.tooltip.split(' ')[0]}</span>
-      </div>
+      </button>
 
-      {/* Flyout panel — CSS hover driven, no JS state */}
-      <div className="absolute left-full top-0 z-[9999] hidden group-hover/fly:block">
-        {/* Invisible bridge connecting trigger to panel */}
-        <div className="absolute -left-2 top-0 w-2 h-full" />
-        <div className="min-w-[180px] py-1 rounded-lg border border-border bg-card/95 backdrop-blur-md shadow-2xl">
-        {group.sections.map((section, si) => (
-          <div key={section.label}>
-            {si > 0 && <div className="h-px bg-border/40 mx-2 my-1" />}
-            <div className="px-3 py-1 text-[9px] uppercase tracking-widest text-muted-foreground/50 font-medium">
-              {section.label}
+      {/* Portal to body so Three.js canvas cannot intercept pointer events */}
+      {isOpen && createPortal(
+        <div
+          data-flyout-portal
+          className="fixed z-[9999]"
+          style={{ top: pos.top, left: pos.left }}
+        >
+          <div className="min-w-[180px] py-1 rounded-lg border border-border bg-card/95 backdrop-blur-md shadow-2xl">
+          {group.sections.map((section, si) => (
+            <div key={section.label}>
+              {si > 0 && <div className="h-px bg-border/40 mx-2 my-1" />}
+              <div className="px-3 py-1 text-[9px] uppercase tracking-widest text-muted-foreground/50 font-medium">
+                {section.label}
+              </div>
+              {section.items.map((item) => (
+                <button
+                  key={item.label}
+                  onClick={() => { item.action(); onToggle('') }}
+                  className={cn(
+                    'flex items-center gap-2.5 w-full px-3 py-1.5 text-xs transition-colors',
+                    item.active
+                      ? 'bg-primary/15 text-primary'
+                      : 'text-foreground/80 hover:bg-accent hover:text-foreground',
+                  )}
+                >
+                  <item.icon size={14} strokeWidth={1.5} className="shrink-0" />
+                  <span className="flex-1 text-left">{item.label}</span>
+                  {item.shortcut && (
+                    <span className="text-[10px] text-muted-foreground/50 font-mono">{item.shortcut}</span>
+                  )}
+                </button>
+              ))}
             </div>
-            {section.items.map((item) => (
-              <button
-                key={item.label}
-                onClick={() => item.action()}
-                className={cn(
-                  'flex items-center gap-2.5 w-full px-3 py-1.5 text-xs transition-colors',
-                  item.active
-                    ? 'bg-primary/15 text-primary'
-                    : 'text-foreground/80 hover:bg-accent hover:text-foreground',
-                )}
-              >
-                <item.icon size={14} strokeWidth={1.5} className="shrink-0" />
-                <span className="flex-1 text-left">{item.label}</span>
-                {item.shortcut && (
-                  <span className="text-[10px] text-muted-foreground/50 font-mono">{item.shortcut}</span>
-                )}
-              </button>
-            ))}
+          ))}
           </div>
-        ))}
-        </div>
-      </div>
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }
@@ -138,6 +159,8 @@ export function ToolBar() {
   const setActiveTool = useSceneStore((s) => s.setActiveTool)
   const selectionMode = useSceneStore((s) => s.selectionMode)
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
+  const [openId, setOpenId] = useState<string | null>(null)
+  const toolbarRef = useRef<HTMLDivElement>(null)
 
   const handleToolChange = useCallback((tool: TransformTool) => {
     if (useSceneStore.getState().selectionMode !== 'object') {
@@ -145,6 +168,24 @@ export function ToolBar() {
     }
     setActiveTool(tool)
   }, [setActiveTool, setSelectionMode])
+
+  const handleToggle = useCallback((id: string) => {
+    setOpenId((prev) => (prev === id ? null : id))
+  }, [])
+
+  // Close flyout on click outside toolbar + flyout portal
+  useEffect(() => {
+    if (!openId) return
+    function onPointerDown(e: PointerEvent) {
+      const target = e.target as HTMLElement
+      // Keep open if clicking inside toolbar or inside a portal flyout
+      if (toolbarRef.current?.contains(target)) return
+      if (target.closest('[data-flyout-portal]')) return
+      setOpenId(null)
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [openId])
 
   const groups: ToolGroup[] = [
     // 1. Pointer / Transform / Selection — the core interaction
@@ -309,9 +350,9 @@ export function ToolBar() {
   ]
 
   return (
-    <div className="flex flex-col items-center w-16 bg-card/80 backdrop-blur-sm border-r border-border py-2 gap-1 overflow-visible">
+    <div ref={toolbarRef} className="flex flex-col items-center w-16 bg-card/80 backdrop-blur-sm border-r border-border py-2 gap-1 overflow-visible">
       {groups.map((group) => (
-        <FlyoutGroup key={group.id} group={group} />
+        <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
       ))}
     </div>
   )
