@@ -188,9 +188,8 @@ export function initWebSocket() {
 
   // Join default session once connected
   const unsub = useWSStore.subscribe(
-    (s) => s.status,
-    (status) => {
-      if (status === 'connected') {
+    (state) => {
+      if (state.status === 'connected') {
         wsClient.send({
           type: 'JoinSession',
           payload: { session_id: 'default-session' },

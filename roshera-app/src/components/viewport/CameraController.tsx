@@ -3,7 +3,9 @@ import { useThree, useFrame } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { useSceneStore } from '@/stores/scene-store'
 import * as THREE from 'three'
-import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type OrbitControlsRef = any
 
 const ANIMATION_DURATION = 0.6
 const EASE_OUT_CUBIC = (t: number) => 1 - Math.pow(1 - t, 3)
@@ -18,7 +20,7 @@ interface CameraAnimation {
 }
 
 export function CameraController() {
-  const controlsRef = useRef<OrbitControlsImpl>(null)
+  const controlsRef = useRef<OrbitControlsRef>(null)
   const animRef = useRef<CameraAnimation | null>(null)
   const { camera } = useThree()
 

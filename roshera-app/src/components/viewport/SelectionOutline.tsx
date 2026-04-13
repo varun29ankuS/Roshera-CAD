@@ -28,7 +28,7 @@ export function SelectionOutline() {
 
   return (
     <EffectComposer multisampling={4} autoClear={false}>
-      {selectedMeshes.length > 0 && (
+      {selectedMeshes.length > 0 ? (
         <Outline
           selection={selectedMeshes}
           blendFunction={BlendFunction.ALPHA}
@@ -40,8 +40,10 @@ export function SelectionOutline() {
           blur
           xRay={false}
         />
+      ) : (
+        <></>
       )}
-      {hoveredMeshes.length > 0 && (
+      {hoveredMeshes.length > 0 ? (
         <Outline
           selection={hoveredMeshes}
           blendFunction={BlendFunction.ALPHA}
@@ -53,6 +55,8 @@ export function SelectionOutline() {
           blur
           xRay={false}
         />
+      ) : (
+        <></>
       )}
     </EffectComposer>
   )

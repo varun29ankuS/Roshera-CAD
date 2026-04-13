@@ -31,9 +31,7 @@ export function AxisIndicator() {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            count={2}
-            array={new Float32Array([0, 0, 0, AXIS_LENGTH, 0, 0])}
-            itemSize={3}
+            args={[new Float32Array([0, 0, 0, AXIS_LENGTH, 0, 0]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color={AXIS_COLORS.x} linewidth={2} />
@@ -43,9 +41,7 @@ export function AxisIndicator() {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            count={2}
-            array={new Float32Array([0, 0, 0, 0, AXIS_LENGTH, 0])}
-            itemSize={3}
+            args={[new Float32Array([0, 0, 0, 0, AXIS_LENGTH, 0]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color={AXIS_COLORS.y} linewidth={2} />
@@ -55,9 +51,7 @@ export function AxisIndicator() {
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            count={2}
-            array={new Float32Array([0, 0, 0, 0, 0, AXIS_LENGTH])}
-            itemSize={3}
+            args={[new Float32Array([0, 0, 0, 0, 0, AXIS_LENGTH]), 3]}
           />
         </bufferGeometry>
         <lineBasicMaterial color={AXIS_COLORS.z} linewidth={2} />

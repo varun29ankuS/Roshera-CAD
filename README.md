@@ -6,7 +6,9 @@ Roshera is a boundary representation CAD system with production-grade mathematic
 
 Primitives, topology, and NURBS math are production-ready. Operations (booleans, fillet, chamfer) and AI integration are under active development.
 
-![Roshera CAD UI](Front_ui.jpg)
+| Dark Mode | Light Mode |
+|-----------|------------|
+| ![Dark Mode](docs/screenshots/dark-mode.png) | ![Light Mode](docs/screenshots/light-mode.png) |
 
 ## Architecture
 
@@ -21,7 +23,7 @@ roshera-backend/
   api-server/          Axum REST + WebSocket API
   shared-types/        Common type definitions
 
-roshera-front/         Leptos/WASM + Three.js browser client
+roshera-app/           React + Three.js + TypeScript browser client
 ```
 
 ## What Works Today
@@ -32,7 +34,7 @@ roshera-front/         Leptos/WASM + Three.js browser client
 | **Primitives** | Production | Box, Sphere, Cylinder, Cone, Torus — real B-Rep topology |
 | **Topology** | Production | Euler validation, manifold detection, adjacency queries, parallel building |
 | **Tessellation** | Production | Per-surface-type dispatch, adaptive subdivision, visualization meshes |
-| **Extrude** | Working | Face and profile extrusion with draft angle support |
+| **Extrude** | Working | Face and profile extrusion with draft angle and taper support |
 | **Boolean** | Partial | Surface-surface intersection computed; face reconstruction in progress |
 | **Fillet** | Partial | Constant-radius working; variable-radius in development |
 | **Revolve / Sweep / Loft** | In development | Pipeline structured, surface generation incomplete |
@@ -43,6 +45,7 @@ roshera-front/         Leptos/WASM + Three.js browser client
 | **RAG Engine** | Working | Vamana/DiskANN vector index with cosine/euclidean/dot-product |
 | **Timeline** | Working | Event-sourced history with branching |
 | **AI Integration** | Working | Claude + OpenAI API providers, natural language command parsing |
+| **Frontend** | Working | React + R3F viewport, AI chat, toolbar, model tree, properties panel |
 
 ## Getting Started
 
@@ -53,9 +56,10 @@ cargo run --bin api-server
 # API on http://localhost:3000, WebSocket on ws://localhost:3000/ws
 
 # Frontend (separate terminal)
-cd roshera-front
-trunk serve
-# UI on http://localhost:8080
+cd roshera-app
+npm install
+npm run dev
+# UI on http://localhost:5173
 ```
 
 ### Docker
@@ -68,8 +72,7 @@ docker compose up
 ### Prerequisites
 
 - Rust 1.75+
-- trunk (for frontend): `cargo install trunk`
-- wasm32-unknown-unknown target: `rustup target add wasm32-unknown-unknown`
+- Node.js 20+
 
 ## API
 

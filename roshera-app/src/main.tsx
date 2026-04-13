@@ -6,7 +6,7 @@ import './index.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <TooltipProvider delayDuration={300}>
+    <TooltipProvider delay={300}>
       <App />
     </TooltipProvider>
   </StrictMode>,
