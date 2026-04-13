@@ -527,61 +527,26 @@ impl Solid {
         Ok(self.cached_mass_props.as_ref().unwrap())
     }
 
-    /// Boolean operation with another solid
+    /// Boolean operation with another solid.
+    ///
+    /// **DEPRECATED**: Use `operations::boolean::boolean_operation()` instead,
+    /// which operates on BRepModel and performs real face-face intersection,
+    /// classification, and topology reconstruction.
+    #[deprecated(
+        note = "Use operations::boolean::boolean_operation() with BRepModel instead"
+    )]
     pub fn boolean_op(
         &self,
-        other: &Solid,
-        operation: BooleanOp,
+        _other: &Solid,
+        _operation: BooleanOp,
         _tolerance: Tolerance,
     ) -> MathResult<Solid> {
-        // This is a placeholder for the actual boolean operation
-        // Real implementation would involve:
-        // 1. Face-face intersection
-        // 2. Classification of regions
-        // 3. Selection based on operation type
-        // 4. Topology reconstruction
-
-        match operation {
-            BooleanOp::Union => {
-                // Union: keep exterior of both
-                let mut result = self.clone();
-                result.id = INVALID_SOLID_ID;
-                result.invalidate_cache();
-
-                // Add history
-                result.add_history(HistoryNode {
-                    id: 0,
-                    operation: "Boolean Union".to_string(),
-                    inputs: vec![self.id, other.id],
-                    output: result.id,
-                    parameters: HashMap::new(),
-                    timestamp: std::time::SystemTime::now(),
-                });
-
-                Ok(result)
-            }
-            BooleanOp::Intersection => {
-                // Intersection: keep common interior
-                let mut result = self.clone();
-                result.id = INVALID_SOLID_ID;
-                result.invalidate_cache();
-                Ok(result)
-            }
-            BooleanOp::Difference => {
-                // Difference: A - B
-                let mut result = self.clone();
-                result.id = INVALID_SOLID_ID;
-                result.invalidate_cache();
-                Ok(result)
-            }
-            BooleanOp::SymmetricDifference => {
-                // Symmetric difference: (A - B) ∪ (B - A)
-                let mut result = self.clone();
-                result.id = INVALID_SOLID_ID;
-                result.invalidate_cache();
-                Ok(result)
-            }
-        }
+        Err(MathError::NotImplemented(
+            "Solid::boolean_op is deprecated. Use operations::boolean::boolean_operation() \
+             with BRepModel for real boolean operations with face-face intersection, \
+             classification, and topology reconstruction."
+                .to_string(),
+        ))
     }
 
     /// Transform solid

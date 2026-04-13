@@ -34,7 +34,7 @@
 //! - Patrikalakis & Maekawa (2002). Shape Interrogation for Computer Aided Design.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix3, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Curve, CurveId, CurveIntersection},
     edge::{Edge, EdgeId},
@@ -123,6 +123,8 @@ struct SplitFace {
     surface: SurfaceId,
     boundary_edges: Vec<EdgeId>,
     classification: FaceClassification,
+    /// Which solid this face originally came from (set during classification)
+    from_solid: Option<SolidId>,
 }
 
 /// Classification of face relative to other solid
@@ -151,7 +153,7 @@ pub fn boolean_operation(
     let classified_faces = classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
 
     // Step 4: Select faces based on boolean operation
-    let selected_faces = select_faces_for_operation(&classified_faces, operation);
+    let selected_faces = select_faces_for_operation(&classified_faces, operation, solid_a, solid_b);
 
     // Step 5: Reconstruct topology from selected faces
     let result_solid = reconstruct_topology(model, selected_faces, &options)?;
@@ -427,23 +429,18 @@ fn find_line_plane_intersection_point(
     // [n1; n2] * p = [d1; d2]
     // Using pseudoinverse: p = (A^T A)^(-1) A^T b
 
-    let a_transpose_a = Matrix3::new([
-        [
-            n1.x * n1.x + n2.x * n2.x,
-            n1.x * n1.y + n2.x * n2.y,
-            n1.x * n1.z + n2.x * n2.z,
-        ],
-        [
-            n1.y * n1.x + n2.y * n2.x,
-            n1.y * n1.y + n2.y * n2.y,
-            n1.y * n1.z + n2.y * n2.z,
-        ],
-        [
-            n1.z * n1.x + n2.z * n2.x,
-            n1.z * n1.y + n2.z * n2.y,
-            n1.z * n1.z + n2.z * n2.z,
-        ],
-    ]);
+    // A^T A matrix (row-major input to Matrix3::new)
+    let a_transpose_a = Matrix3::new(
+        n1.x * n1.x + n2.x * n2.x,
+        n1.x * n1.y + n2.x * n2.y,
+        n1.x * n1.z + n2.x * n2.z,
+        n1.y * n1.x + n2.y * n2.x,
+        n1.y * n1.y + n2.y * n2.y,
+        n1.y * n1.z + n2.y * n2.z,
+        n1.z * n1.x + n2.z * n2.x,
+        n1.z * n1.y + n2.z * n2.y,
+        n1.z * n1.z + n2.z * n2.z,
+    );
 
     let a_transpose_b = Vector3::new(
         n1.x * d1 + n2.x * d2,
@@ -451,10 +448,10 @@ fn find_line_plane_intersection_point(
         n1.z * d1 + n2.z * d2,
     );
 
-    // Solve system using Cramer's rule or direct inversion
-    match a_transpose_a.invert() {
-        Some(inv) => Ok(inv * a_transpose_b),
-        None => {
+    // Solve system using direct inversion
+    match a_transpose_a.inverse() {
+        Ok(inv) => Ok(inv.transform_vector(&a_transpose_b)),
+        Err(_) => {
             // Fallback: choose point by setting one coordinate to zero
             // Choose coordinate with smallest normal component
             let abs_n1 = Vector3::new(n1.x.abs(), n1.y.abs(), n1.z.abs());
@@ -512,21 +509,28 @@ fn create_line_intersection_curve(
 ) -> OperationResult<SurfaceIntersectionCurve> {
     use crate::primitives::curve::Line;
 
-    // Create a line curve spanning a reasonable range
-    // For planes, the intersection extends to infinity, but we create a finite segment
-    const LINE_EXTENT: f64 = 1000.0; // Large but finite extent
+    // Derive extent from surfaces' parameter bounds rather than hardcoding.
+    // For bounded surfaces (finite faces), this gives a tight extent.
+    // For unbounded surfaces (infinite planes), parameter bounds are typically
+    // large finite values set by the surface implementation.
+    let bounds_a = surface_a.parameter_bounds();
+    let bounds_b = surface_b.parameter_bounds();
+    let extent_a = ((bounds_a.0 .1 - bounds_a.0 .0).abs())
+        .max((bounds_a.1 .1 - bounds_a.1 .0).abs());
+    let extent_b = ((bounds_b.0 .1 - bounds_b.0 .0).abs())
+        .max((bounds_b.1 .1 - bounds_b.1 .0).abs());
+    let line_extent = extent_a.max(extent_b).max(10.0); // floor at 10.0 for degenerate bounds
 
-    let start_point = line_point - line_direction * LINE_EXTENT;
-    let end_point = line_point + line_direction * LINE_EXTENT;
+    let start_point = line_point - line_direction * line_extent;
+    let end_point = line_point + line_direction * line_extent;
 
     let line_curve = Line::new(start_point, end_point);
 
     // Create parametric representations on both surfaces
-    // For planes, we need to find UV parameters corresponding to 3D points on the line
     let params_a =
-        compute_line_surface_parameters(surface_a, line_point, line_direction, LINE_EXTENT)?;
+        compute_line_surface_parameters(surface_a, line_point, line_direction, line_extent)?;
     let params_b =
-        compute_line_surface_parameters(surface_b, line_point, line_direction, LINE_EXTENT)?;
+        compute_line_surface_parameters(surface_b, line_point, line_direction, line_extent)?;
 
     Ok(SurfaceIntersectionCurve {
         curve: Box::new(line_curve),
@@ -563,72 +567,6 @@ fn compute_line_surface_parameters(
     }
 
     Ok(params)
-}
-
-/// Placeholder for Matrix3 (should be in math module)
-#[derive(Debug, Clone, Copy)]
-struct Matrix3 {
-    data: [[f64; 3]; 3],
-}
-
-impl Matrix3 {
-    fn new(data: [[f64; 3]; 3]) -> Self {
-        Self { data }
-    }
-
-    fn invert(&self) -> Option<Self> {
-        let det = self.determinant();
-        if det.abs() < 1e-12 {
-            return None;
-        }
-
-        let inv_det = 1.0 / det;
-        let mut inv = [[0.0; 3]; 3];
-
-        // Calculate adjugate matrix
-        inv[0][0] =
-            (self.data[1][1] * self.data[2][2] - self.data[1][2] * self.data[2][1]) * inv_det;
-        inv[0][1] =
-            (self.data[0][2] * self.data[2][1] - self.data[0][1] * self.data[2][2]) * inv_det;
-        inv[0][2] =
-            (self.data[0][1] * self.data[1][2] - self.data[0][2] * self.data[1][1]) * inv_det;
-
-        inv[1][0] =
-            (self.data[1][2] * self.data[2][0] - self.data[1][0] * self.data[2][2]) * inv_det;
-        inv[1][1] =
-            (self.data[0][0] * self.data[2][2] - self.data[0][2] * self.data[2][0]) * inv_det;
-        inv[1][2] =
-            (self.data[0][2] * self.data[1][0] - self.data[0][0] * self.data[1][2]) * inv_det;
-
-        inv[2][0] =
-            (self.data[1][0] * self.data[2][1] - self.data[1][1] * self.data[2][0]) * inv_det;
-        inv[2][1] =
-            (self.data[0][1] * self.data[2][0] - self.data[0][0] * self.data[2][1]) * inv_det;
-        inv[2][2] =
-            (self.data[0][0] * self.data[1][1] - self.data[0][1] * self.data[1][0]) * inv_det;
-
-        Some(Self::new(inv))
-    }
-
-    fn determinant(&self) -> f64 {
-        self.data[0][0] * (self.data[1][1] * self.data[2][2] - self.data[1][2] * self.data[2][1])
-            - self.data[0][1]
-                * (self.data[1][0] * self.data[2][2] - self.data[1][2] * self.data[2][0])
-            + self.data[0][2]
-                * (self.data[1][0] * self.data[2][1] - self.data[1][1] * self.data[2][0])
-    }
-}
-
-impl std::ops::Mul<Vector3> for Matrix3 {
-    type Output = Vector3;
-
-    fn mul(self, v: Vector3) -> Vector3 {
-        Vector3::new(
-            self.data[0][0] * v.x + self.data[0][1] * v.y + self.data[0][2] * v.z,
-            self.data[1][0] * v.x + self.data[1][1] * v.y + self.data[1][2] * v.z,
-            self.data[2][0] * v.x + self.data[2][1] * v.y + self.data[2][2] * v.z,
-        )
-    }
 }
 
 /// Stub implementations for other specialized intersections
@@ -888,7 +826,7 @@ fn create_line_intersection_curve_bounded(
     let extent = if let Some(height_limits) = cylinder.height_limits {
         (height_limits[1] - height_limits[0]) * 0.5
     } else {
-        1000.0 // Large extent for infinite cylinder
+        cylinder.radius * 10.0 // Scale extent proportional to cylinder size
     };
 
     let start_point = point - direction * extent;
@@ -909,24 +847,35 @@ fn create_line_intersection_curve_bounded(
 
 /// Helper functions for parametric computations
 
+/// Project a 3D point onto a plane's local UV coordinate system.
+/// Uses the plane normal to build an orthonormal basis (U, V, N) and returns
+/// the dot products of (point - origin) with U and V.
+fn project_to_plane_uv(
+    point: &Point3,
+    plane_point: &Point3,
+    plane_normal: &Vector3,
+) -> OperationResult<(f64, f64)> {
+    let basis = Matrix3::basis_from_z(plane_normal).map_err(|e| {
+        OperationError::NumericalError(format!("Cannot build plane basis: {:?}", e))
+    })?;
+    let u_dir = basis.column(0);
+    let v_dir = basis.column(1);
+    let relative = *point - *plane_point;
+    Ok((relative.dot(&u_dir), relative.dot(&v_dir)))
+}
+
 fn compute_circle_plane_parameters(
     circle: &crate::primitives::curve::Circle,
     plane_point: Point3,
     plane_normal: Vector3,
 ) -> OperationResult<Vec<(f64, f64)>> {
-    // For a circle on a plane, UV parameters are based on local plane coordinates
     let mut params = Vec::new();
     const NUM_SAMPLES: usize = 32;
 
     for i in 0..NUM_SAMPLES {
         let angle = 2.0 * std::f64::consts::PI * (i as f64) / (NUM_SAMPLES as f64);
         let point = circle.evaluate(angle)?;
-
-        // Convert 3D point to plane UV coordinates
-        let relative = point.position - plane_point;
-        let u = relative.x; // Simplified - should use proper plane coordinate system
-        let v = relative.y;
-        params.push((u, v));
+        params.push(project_to_plane_uv(&point.position, &plane_point, &plane_normal)?);
     }
 
     Ok(params)
@@ -984,18 +933,13 @@ fn compute_ellipse_plane_parameters(
     plane_point: Point3,
     plane_normal: Vector3,
 ) -> OperationResult<Vec<(f64, f64)>> {
-    // Similar to circle but for ellipse
     let mut params = Vec::new();
     const NUM_SAMPLES: usize = 32;
 
     for i in 0..NUM_SAMPLES {
         let t = (i as f64) / (NUM_SAMPLES as f64);
         let point = ellipse.evaluate(t)?;
-
-        let relative = point.position - plane_point;
-        let u = relative.x;
-        let v = relative.y;
-        params.push((u, v));
+        params.push(project_to_plane_uv(&point.position, &plane_point, &plane_normal)?);
     }
 
     Ok(params)
@@ -1030,11 +974,7 @@ fn compute_line_surface_parameters_bounded(
     for i in 0..=NUM_SAMPLES {
         let t = i as f64 / NUM_SAMPLES as f64;
         let point = line.evaluate(t)?;
-
-        let relative = point.position - plane_point;
-        let u = relative.x;
-        let v = relative.y;
-        params.push((u, v));
+        params.push(project_to_plane_uv(&point.position, &plane_point, plane_normal)?);
     }
 
     Ok(params)
@@ -1353,7 +1293,16 @@ fn find_cylinder_intersection_seeds(
     const ANGULAR_SAMPLES: usize = 16;
     const HEIGHT_SAMPLES: usize = 10;
 
-    let height_extent = 100.0; // Reasonable sampling extent
+    // Derive height extent from cylinder bounds instead of hardcoding
+    let extent_a = cyl_a
+        .height_limits
+        .map(|h| (h[1] - h[0]).abs())
+        .unwrap_or(cyl_a.radius * 10.0);
+    let extent_b = cyl_b
+        .height_limits
+        .map(|h| (h[1] - h[0]).abs())
+        .unwrap_or(cyl_b.radius * 10.0);
+    let height_extent = extent_a.max(extent_b).max(1.0);
 
     for i in 0..ANGULAR_SAMPLES {
         let angle = 2.0 * std::f64::consts::PI * (i as f64) / (ANGULAR_SAMPLES as f64);
@@ -2531,6 +2480,7 @@ fn create_split_face(
         surface: surface_id,
         boundary_edges: edges,
         classification: FaceClassification::OnBoundary,
+        from_solid: None, // set during classification
     })
 }
 
@@ -2548,11 +2498,14 @@ fn classify_split_faces(
         let mut classified_face = face.clone();
 
         // Determine which solid this face originally came from
-        let (test_solid, from_solid) = if is_face_from_solid(model, face.original_face, solid_a)? {
-            (solid_b, solid_a)
-        } else {
-            (solid_a, solid_b)
-        };
+        let (test_solid, origin_solid) =
+            if is_face_from_solid(model, face.original_face, solid_a)? {
+                (solid_b, solid_a)
+            } else {
+                (solid_a, solid_b)
+            };
+
+        classified_face.from_solid = Some(origin_solid);
 
         // Classify face relative to test solid
         classified_face.classification =
@@ -3061,26 +3014,36 @@ fn is_point_in_face(
 fn select_faces_for_operation(
     classified_faces: &[SplitFace],
     operation: BooleanOp,
+    solid_a: SolidId,
+    solid_b: SolidId,
 ) -> Vec<SplitFace> {
     classified_faces
         .iter()
         .filter(|face| {
-            match (operation, face.classification) {
-                // Union: keep outside faces and boundary
-                (BooleanOp::Union, FaceClassification::Outside) => true,
-                (BooleanOp::Union, FaceClassification::OnBoundary) => true,
+            let from_a = face.from_solid == Some(solid_a);
+            let from_b = face.from_solid == Some(solid_b);
 
-                // Intersection: keep inside faces and boundary
-                (BooleanOp::Intersection, FaceClassification::Inside) => true,
-                (BooleanOp::Intersection, FaceClassification::OnBoundary) => true,
+            match operation {
+                // Union (A ∪ B): keep faces outside the other solid + shared boundary
+                BooleanOp::Union => match face.classification {
+                    FaceClassification::Outside => true,
+                    FaceClassification::OnBoundary => from_a, // avoid duplicates
+                    FaceClassification::Inside => false,
+                },
 
-                // Difference: keep outside faces from A, inside faces from B
-                (BooleanOp::Difference, _) => {
-                    // This needs more context about which solid the face came from
-                    true // Simplified for now
-                }
+                // Intersection (A ∩ B): keep faces inside the other solid + shared boundary
+                BooleanOp::Intersection => match face.classification {
+                    FaceClassification::Inside => true,
+                    FaceClassification::OnBoundary => from_a, // avoid duplicates
+                    FaceClassification::Outside => false,
+                },
 
-                _ => false,
+                // Difference (A - B): keep A faces outside B, B faces inside A (flipped)
+                BooleanOp::Difference => match face.classification {
+                    FaceClassification::Outside => from_a,
+                    FaceClassification::Inside => from_b,
+                    FaceClassification::OnBoundary => false, // boundary faces cancel out
+                },
             }
         })
         .cloned()
@@ -3349,12 +3312,14 @@ mod tests {
                 surface: 0,
                 boundary_edges: vec![1, 2, 3],
                 classification: FaceClassification::Outside,
+                from_solid: None,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![4, 5, 6],
                 classification: FaceClassification::Outside,
+                from_solid: None,
             },
         ];
 
@@ -3371,18 +3336,21 @@ mod tests {
                 surface: 0,
                 boundary_edges: vec![1, 2, 3],
                 classification: FaceClassification::Outside,
+                from_solid: None,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![3, 4, 5],
                 classification: FaceClassification::Outside,
+                from_solid: None,
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![10, 11, 12],
                 classification: FaceClassification::Outside,
+                from_solid: None,
             },
         ];
 
@@ -3451,22 +3419,31 @@ mod tests {
                 surface: 0,
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
+                from_solid: None,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
+                from_solid: None,
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
                 classification: FaceClassification::OnBoundary,
+                from_solid: None,
             },
         ];
 
-        let selected = select_faces_for_operation(&faces, BooleanOp::Union);
+        // Assign origins: face 0 from A, face 1 from B, face 2 boundary from A
+        let mut faces_with_origin = faces;
+        faces_with_origin[0].from_solid = Some(0);
+        faces_with_origin[1].from_solid = Some(1);
+        faces_with_origin[2].from_solid = Some(0);
+
+        let selected = select_faces_for_operation(&faces_with_origin, BooleanOp::Union, 0, 1);
         assert_eq!(selected.len(), 2);
         assert!(selected
             .iter()
@@ -3481,26 +3458,68 @@ mod tests {
                 surface: 0,
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
+                from_solid: Some(0),
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
+                from_solid: Some(1),
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
                 classification: FaceClassification::OnBoundary,
+                from_solid: Some(0),
             },
         ];
 
-        let selected = select_faces_for_operation(&faces, BooleanOp::Intersection);
+        let selected = select_faces_for_operation(&faces, BooleanOp::Intersection, 0, 1);
         assert_eq!(selected.len(), 2);
         assert!(selected
             .iter()
             .all(|f| f.classification != FaceClassification::Outside));
+    }
+
+    #[test]
+    fn test_select_faces_difference() {
+        let faces = vec![
+            SplitFace {
+                original_face: 0,
+                surface: 0,
+                boundary_edges: vec![],
+                classification: FaceClassification::Outside,
+                from_solid: Some(0), // A outside B → keep
+            },
+            SplitFace {
+                original_face: 1,
+                surface: 1,
+                boundary_edges: vec![],
+                classification: FaceClassification::Inside,
+                from_solid: Some(0), // A inside B → discard
+            },
+            SplitFace {
+                original_face: 2,
+                surface: 2,
+                boundary_edges: vec![],
+                classification: FaceClassification::Inside,
+                from_solid: Some(1), // B inside A → keep (cavity wall)
+            },
+            SplitFace {
+                original_face: 3,
+                surface: 3,
+                boundary_edges: vec![],
+                classification: FaceClassification::Outside,
+                from_solid: Some(1), // B outside A → discard
+            },
+        ];
+
+        let selected = select_faces_for_operation(&faces, BooleanOp::Difference, 0, 1);
+        assert_eq!(selected.len(), 2, "Difference should keep A-outside + B-inside");
+        assert!(selected.iter().any(|f| f.original_face == 0));
+        assert!(selected.iter().any(|f| f.original_face == 2));
     }
 
     #[test]

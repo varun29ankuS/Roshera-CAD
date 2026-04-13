@@ -104,7 +104,8 @@ pub fn tessellate_solid(
     mesh
 }
 
-/// Tessellate a shell and append to existing mesh
+/// Tessellate a shell and append to existing mesh.
+/// Populates `mesh.face_map` so each triangle maps back to its B-Rep FaceId.
 pub fn tessellate_shell(
     shell: &Shell,
     model: &BRepModel,
@@ -113,7 +114,13 @@ pub fn tessellate_shell(
 ) {
     for &face_id in &shell.faces {
         if let Some(face) = model.faces.get(face_id) {
+            let tri_start = mesh.triangles.len();
             surface::tessellate_face(face, model, params, mesh);
+            let tri_end = mesh.triangles.len();
+            // Record which B-Rep face each new triangle came from
+            for _ in tri_start..tri_end {
+                mesh.face_map.push(face_id);
+            }
         }
     }
 }

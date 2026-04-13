@@ -17,6 +17,9 @@ pub struct MeshVertex {
 pub struct TriangleMesh {
     pub vertices: Vec<MeshVertex>,
     pub triangles: Vec<[u32; 3]>,
+    /// Maps each triangle index to the B-Rep FaceId it was tessellated from.
+    /// Length equals `triangles.len()`. Used for face picking in the viewport.
+    pub face_map: Vec<u32>,
 }
 
 impl TriangleMesh {
@@ -24,6 +27,7 @@ impl TriangleMesh {
         Self {
             vertices: Vec::new(),
             triangles: Vec::new(),
+            face_map: Vec::new(),
         }
     }
 
@@ -51,6 +55,10 @@ impl TriangleMesh {
             mesh.add_triangle(triangle[0], triangle[1], triangle[2]);
         }
 
+        if !self.face_map.is_empty() {
+            mesh.face_map = Some(self.face_map.clone());
+        }
+
         mesh
     }
 
@@ -62,6 +70,11 @@ impl TriangleMesh {
             indices: Vec::with_capacity(self.triangles.len() * 3),
             uvs: None,
             colors: None,
+            face_map: if self.face_map.is_empty() {
+                None
+            } else {
+                Some(self.face_map.clone())
+            },
         };
 
         // Convert vertices and normals
@@ -114,6 +127,10 @@ pub struct ThreeJsMesh {
     pub colors: Option<Vec<f32>>,
     /// Optional UV coordinates (u,v flattened)
     pub uvs: Option<Vec<f32>>,
+    /// Maps each triangle index to the B-Rep FaceId it was tessellated from.
+    /// `face_map[triangle_index] = face_id`. Used for face picking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub face_map: Option<Vec<u32>>,
 }
 
 impl ThreeJsMesh {
@@ -124,6 +141,7 @@ impl ThreeJsMesh {
             indices: Vec::new(),
             colors: None,
             uvs: None,
+            face_map: None,
         }
     }
 
@@ -188,6 +206,7 @@ impl ThreeJsMesh {
             indices: self.indices.clone(),
             uvs: self.uvs.clone(),
             colors: self.colors.clone(),
+            face_map: self.face_map.clone(),
         }
     }
 
@@ -211,6 +230,10 @@ impl ThreeJsMesh {
 
         if let (Some(self_uvs), Some(other_uvs)) = (&mut self.uvs, &other.uvs) {
             self_uvs.extend(other_uvs);
+        }
+
+        if let (Some(self_fm), Some(other_fm)) = (&mut self.face_map, &other.face_map) {
+            self_fm.extend(other_fm);
         }
     }
 
