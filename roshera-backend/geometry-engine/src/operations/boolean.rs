@@ -2261,8 +2261,7 @@ fn compute_edge_intersections(
             };
 
             // Sample-based closest point search between two curves
-            let (t_a, t_b, dist) =
-                find_curve_curve_closest_point(curve_a, curve_b, tolerance)?;
+            let (t_a, t_b, dist) = find_curve_curve_closest_point(curve_a, curve_b, tolerance)?;
 
             if dist < tolerance.distance() {
                 let point = curve_a.point_at(t_a)?;
@@ -2385,8 +2384,7 @@ fn find_or_create_intersection_vertex(
     }
     // Generate a temporary vertex ID based on point hash
     // This will be reconciled during shell reconstruction
-    let hash = ((point.x * 1000.0) as u32)
-        .wrapping_mul(73856093)
+    let hash = ((point.x * 1000.0) as u32).wrapping_mul(73856093)
         ^ ((point.y * 1000.0) as u32).wrapping_mul(19349663)
         ^ ((point.z * 1000.0) as u32).wrapping_mul(83492791);
     hash
@@ -2649,8 +2647,7 @@ fn ray_cast_classification(
 
         // Check all ray-surface intersections (crucial for curved surfaces
         // like cylinders and spheres where a ray can enter and exit)
-        let t_values =
-            ray_surface_all_intersections(&point, &direction, surface, tolerance)?;
+        let t_values = ray_surface_all_intersections(&point, &direction, surface, tolerance)?;
         for t in t_values {
             if t > tolerance.distance() {
                 let intersection_point = point + direction * t;
@@ -2707,12 +2704,9 @@ fn ray_surface_intersection(
             // Point on ray: P(t) = origin + t * direction
             // Distance from P(t) to axis = R
             use crate::primitives::surface::Cylinder;
-            let cyl = surface
-                .as_any()
-                .downcast_ref::<Cylinder>()
-                .ok_or_else(|| {
-                    OperationError::InternalError("Failed to downcast cylinder".to_string())
-                })?;
+            let cyl = surface.as_any().downcast_ref::<Cylinder>().ok_or_else(|| {
+                OperationError::InternalError("Failed to downcast cylinder".to_string())
+            })?;
 
             let delta = *origin - cyl.origin;
             let d_cross_a = direction.cross(&cyl.axis);
@@ -2784,9 +2778,8 @@ fn ray_surface_intersection(
             let d_dot_a = direction.dot(&cone.axis);
             let delta_dot_a = delta.dot(&cone.axis);
 
-            let a = d_dot_a * d_dot_a * sin_sq
-                - direction.dot(direction) * sin_sq
-                + d_dot_a * d_dot_a;
+            let a =
+                d_dot_a * d_dot_a * sin_sq - direction.dot(direction) * sin_sq + d_dot_a * d_dot_a;
             let b = 2.0
                 * (d_dot_a * delta_dot_a * sin_sq - direction.dot(&delta) * sin_sq
                     + d_dot_a * delta_dot_a);
@@ -2795,10 +2788,9 @@ fn ray_surface_intersection(
 
             // Simplified: use standard cone quadratic
             let a2 = direction.dot(direction) - (1.0 + cos_sq / sin_sq) * d_dot_a * d_dot_a;
-            let b2 = 2.0
-                * (direction.dot(&delta) - (1.0 + cos_sq / sin_sq) * d_dot_a * delta_dot_a);
-            let c2 =
-                delta.dot(&delta) - (1.0 + cos_sq / sin_sq) * delta_dot_a * delta_dot_a;
+            let b2 =
+                2.0 * (direction.dot(&delta) - (1.0 + cos_sq / sin_sq) * d_dot_a * delta_dot_a);
+            let c2 = delta.dot(&delta) - (1.0 + cos_sq / sin_sq) * delta_dot_a * delta_dot_a;
 
             let discriminant = b2 * b2 - 4.0 * a2 * c2;
             if discriminant < 0.0 || a2.abs() < 1e-15 {
@@ -2844,12 +2836,9 @@ fn ray_surface_all_intersections(
         }
         SurfaceType::Cylinder => {
             use crate::primitives::surface::Cylinder;
-            let cyl = surface
-                .as_any()
-                .downcast_ref::<Cylinder>()
-                .ok_or_else(|| {
-                    OperationError::InternalError("Failed to downcast cylinder".to_string())
-                })?;
+            let cyl = surface.as_any().downcast_ref::<Cylinder>().ok_or_else(|| {
+                OperationError::InternalError("Failed to downcast cylinder".to_string())
+            })?;
 
             let delta = *origin - cyl.origin;
             let d_cross_a = direction.cross(&cyl.axis);
@@ -3166,11 +3155,7 @@ fn build_shells_from_faces(
                 if let Some(orig_face) = model.faces.get(split_face.original_face) {
                     if let Some(orig_loop) = model.loops.get(orig_face.outer_loop) {
                         for (i, &eid) in orig_loop.edges.iter().enumerate() {
-                            let fwd = orig_loop
-                                .orientations
-                                .get(i)
-                                .copied()
-                                .unwrap_or(true);
+                            let fwd = orig_loop.orientations.get(i).copied().unwrap_or(true);
                             face_loop.add_edge(eid, fwd);
                         }
                     }
@@ -3308,7 +3293,10 @@ mod tests {
         let origin = Point3::ORIGIN;
         let direction = Vector3::Z;
         let result = ray_surface_intersection(&origin, &direction, &plane, &tol).unwrap();
-        assert!(result.is_none(), "Plane behind ray origin should not be hit");
+        assert!(
+            result.is_none(),
+            "Plane behind ray origin should not be hit"
+        );
     }
 
     #[test]
@@ -3321,10 +3309,7 @@ mod tests {
         let t = ray_surface_intersection(&origin, &direction, &sphere, &tol)
             .unwrap()
             .unwrap();
-        assert!(
-            (t - 7.0).abs() < 1e-10,
-            "Expected t=7.0, got {t}"
-        );
+        assert!((t - 7.0).abs() < 1e-10, "Expected t=7.0, got {t}");
     }
 
     #[test]
@@ -3349,10 +3334,7 @@ mod tests {
         let t = ray_surface_intersection(&origin, &direction, &cylinder, &tol)
             .unwrap()
             .unwrap();
-        assert!(
-            (t - 7.0).abs() < 1e-10,
-            "Expected t=7.0, got {t}"
-        );
+        assert!((t - 7.0).abs() < 1e-10, "Expected t=7.0, got {t}");
     }
 
     // =============================================
@@ -3405,7 +3387,11 @@ mod tests {
         ];
 
         let groups = group_faces_by_adjacency(&faces);
-        assert_eq!(groups.len(), 2, "Should have 2 groups: connected pair + isolated");
+        assert_eq!(
+            groups.len(),
+            2,
+            "Should have 2 groups: connected pair + isolated"
+        );
     }
 
     // =============================================
@@ -3446,7 +3432,9 @@ mod tests {
         match &result {
             Ok(_) => {}
             Err(OperationError::NotImplemented(_)) => {
-                panic!("Boolean operation returned NotImplemented — all stubs should be implemented");
+                panic!(
+                    "Boolean operation returned NotImplemented — all stubs should be implemented"
+                );
             }
             Err(e) => {
                 // Other errors are acceptable (e.g., numerical issues with coincident faces)
@@ -3480,7 +3468,9 @@ mod tests {
 
         let selected = select_faces_for_operation(&faces, BooleanOp::Union);
         assert_eq!(selected.len(), 2);
-        assert!(selected.iter().all(|f| f.classification != FaceClassification::Inside));
+        assert!(selected
+            .iter()
+            .all(|f| f.classification != FaceClassification::Inside));
     }
 
     #[test]
@@ -3508,7 +3498,9 @@ mod tests {
 
         let selected = select_faces_for_operation(&faces, BooleanOp::Intersection);
         assert_eq!(selected.len(), 2);
-        assert!(selected.iter().all(|f| f.classification != FaceClassification::Outside));
+        assert!(selected
+            .iter()
+            .all(|f| f.classification != FaceClassification::Outside));
     }
 
     #[test]
@@ -3521,7 +3513,10 @@ mod tests {
         let tol = Tolerance::default();
         let (t_a, t_b, dist) = find_curve_curve_closest_point(&line_a, &line_b, &tol).unwrap();
 
-        assert!(dist < 1e-6, "Lines cross, distance should be ~0, got {dist}");
+        assert!(
+            dist < 1e-6,
+            "Lines cross, distance should be ~0, got {dist}"
+        );
         assert!((t_a - 0.5).abs() < 0.05, "Expected t_a ≈ 0.5, got {t_a}");
         assert!((t_b - 0.5).abs() < 0.05, "Expected t_b ≈ 0.5, got {t_b}");
     }
@@ -3540,11 +3535,24 @@ mod tests {
         let direction = Vector3::X;
         let hits = ray_surface_all_intersections(&origin, &direction, &cylinder, &tol).unwrap();
 
-        assert_eq!(hits.len(), 2, "Ray through cylinder should hit twice, got {}", hits.len());
+        assert_eq!(
+            hits.len(),
+            2,
+            "Ray through cylinder should hit twice, got {}",
+            hits.len()
+        );
         // First hit at x = -5 → t = 5
-        assert!((hits[0] - 5.0).abs() < 1e-6, "First hit expected at t=5, got {}", hits[0]);
+        assert!(
+            (hits[0] - 5.0).abs() < 1e-6,
+            "First hit expected at t=5, got {}",
+            hits[0]
+        );
         // Second hit at x = +5 → t = 15
-        assert!((hits[1] - 15.0).abs() < 1e-6, "Second hit expected at t=15, got {}", hits[1]);
+        assert!(
+            (hits[1] - 15.0).abs() < 1e-6,
+            "Second hit expected at t=15, got {}",
+            hits[1]
+        );
     }
 
     #[test]
@@ -3556,10 +3564,23 @@ mod tests {
         let direction = Vector3::Z;
         let hits = ray_surface_all_intersections(&origin, &direction, &sphere, &tol).unwrap();
 
-        assert_eq!(hits.len(), 2, "Ray through sphere should hit twice, got {}", hits.len());
+        assert_eq!(
+            hits.len(),
+            2,
+            "Ray through sphere should hit twice, got {}",
+            hits.len()
+        );
         // Enter at z = 7, exit at z = 13
-        assert!((hits[0] - 7.0).abs() < 1e-6, "First hit expected at t=7, got {}", hits[0]);
-        assert!((hits[1] - 13.0).abs() < 1e-6, "Second hit expected at t=13, got {}", hits[1]);
+        assert!(
+            (hits[0] - 7.0).abs() < 1e-6,
+            "First hit expected at t=7, got {}",
+            hits[0]
+        );
+        assert!(
+            (hits[1] - 13.0).abs() < 1e-6,
+            "Second hit expected at t=13, got {}",
+            hits[1]
+        );
     }
 
     #[test]
@@ -3573,7 +3594,11 @@ mod tests {
         let hits = ray_surface_all_intersections(&origin, &direction, &cylinder, &tol).unwrap();
 
         // Tangent ray should yield 1 (degenerate double root) or 0 intersections
-        assert!(hits.len() <= 1, "Tangent ray should hit at most once, got {}", hits.len());
+        assert!(
+            hits.len() <= 1,
+            "Tangent ray should hit at most once, got {}",
+            hits.len()
+        );
     }
 
     #[test]
@@ -3600,7 +3625,9 @@ mod tests {
         };
         let geom_b = {
             let mut builder = TopologyBuilder::new(&mut model);
-            builder.create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 5.0, 30.0).unwrap()
+            builder
+                .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 5.0, 30.0)
+                .unwrap()
         };
 
         let solid_a = match geom_a {
@@ -3624,10 +3651,15 @@ mod tests {
         match &result {
             Ok(solid_id) => {
                 // Verify result is a valid solid
-                assert!(model.solids.get(*solid_id).is_some(), "Result solid should exist");
+                assert!(
+                    model.solids.get(*solid_id).is_some(),
+                    "Result solid should exist"
+                );
             }
             Err(OperationError::NotImplemented(_)) => {
-                panic!("Boolean difference returned NotImplemented — all stubs should be implemented");
+                panic!(
+                    "Boolean difference returned NotImplemented — all stubs should be implemented"
+                );
             }
             Err(e) => {
                 // Numerical errors acceptable for now — the pipeline runs end-to-end
@@ -3686,10 +3718,8 @@ mod tests {
         let surface_id = model.surfaces.add(Box::new(plane));
 
         // Create a simple face with no edges (untrimmed)
-        let loop_data = crate::primitives::r#loop::Loop::new(
-            0,
-            crate::primitives::r#loop::LoopType::Outer,
-        );
+        let loop_data =
+            crate::primitives::r#loop::Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
         let loop_id = model.loops.add(loop_data);
 
         let face = crate::primitives::face::Face::new(

@@ -401,13 +401,14 @@ impl Primitive for CylinderPrimitive {
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        let shell = model
-            .shells
-            .get(solid.outer_shell)
-            .ok_or_else(|| PrimitiveError::GeometryError {
-                operation: "get_parameters".to_string(),
-                details: "Outer shell not found".to_string(),
-            })?;
+        let shell =
+            model
+                .shells
+                .get(solid.outer_shell)
+                .ok_or_else(|| PrimitiveError::GeometryError {
+                    operation: "get_parameters".to_string(),
+                    details: "Outer shell not found".to_string(),
+                })?;
 
         // Find the cylindrical surface among the solid's faces to extract radius and axis
         let mut radius = None;
@@ -447,7 +448,8 @@ impl Primitive for CylinderPrimitive {
                         if let Some(edge) = model.edges.get(edge_id) {
                             for vid in [edge.start_vertex, edge.end_vertex] {
                                 if let Some(v) = model.vertices.get(vid) {
-                                    let p = Point3::new(v.position[0], v.position[1], v.position[2]);
+                                    let p =
+                                        Point3::new(v.position[0], v.position[1], v.position[2]);
                                     let proj = (p - base_center).dot(&axis);
                                     min_proj = min_proj.min(proj);
                                     max_proj = max_proj.max(proj);

@@ -531,13 +531,14 @@ impl Primitive for BoxPrimitive {
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
         // Collect all vertices from the solid's shell faces
-        let shell = model
-            .shells
-            .get(solid.outer_shell)
-            .ok_or_else(|| PrimitiveError::GeometryError {
-                operation: "get_parameters".to_string(),
-                details: "Outer shell not found".to_string(),
-            })?;
+        let shell =
+            model
+                .shells
+                .get(solid.outer_shell)
+                .ok_or_else(|| PrimitiveError::GeometryError {
+                    operation: "get_parameters".to_string(),
+                    details: "Outer shell not found".to_string(),
+                })?;
 
         let mut min_x = f64::MAX;
         let mut min_y = f64::MAX;

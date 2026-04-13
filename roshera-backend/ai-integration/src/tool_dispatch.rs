@@ -48,8 +48,12 @@ pub fn dispatch_tool_call(tool_use: &ToolUseBlock) -> Result<DispatchResult, Pro
         "create_box" => dispatch_create_primitive("box", input, &["width", "height", "depth"]),
         "create_cylinder" => dispatch_create_primitive("cylinder", input, &["radius", "height"]),
         "create_sphere" => dispatch_create_primitive("sphere", input, &["radius"]),
-        "create_cone" => dispatch_create_primitive("cone", input, &["bottom_radius", "top_radius", "height"]),
-        "create_torus" => dispatch_create_primitive("torus", input, &["major_radius", "minor_radius"]),
+        "create_cone" => {
+            dispatch_create_primitive("cone", input, &["bottom_radius", "top_radius", "height"])
+        }
+        "create_torus" => {
+            dispatch_create_primitive("torus", input, &["major_radius", "minor_radius"])
+        }
 
         // --- Boolean operations ---
         "boolean_union" | "boolean_intersection" | "boolean_difference" => {
@@ -81,7 +85,10 @@ pub fn dispatch_tool_call(tool_use: &ToolUseBlock) -> Result<DispatchResult, Pro
 }
 
 /// Validate that all required parameters are present and are numbers.
-fn validate_required_numbers(input: &Value, required: &[&str]) -> Result<HashMap<String, Value>, ProviderError> {
+fn validate_required_numbers(
+    input: &Value,
+    required: &[&str],
+) -> Result<HashMap<String, Value>, ProviderError> {
     let obj = input.as_object().ok_or_else(|| {
         ProviderError::InvalidInput("Tool input must be a JSON object".to_string())
     })?;
@@ -171,9 +178,7 @@ fn dispatch_boolean(operation: &str, input: &Value) -> Result<DispatchResult, Pr
 
     Ok(DispatchResult::Command(ParsedCommand {
         original_text: operation.to_string(),
-        intent: CommandIntent::BooleanOperation {
-            operation: op_type,
-        },
+        intent: CommandIntent::BooleanOperation { operation: op_type },
         parameters: params,
         confidence: 1.0,
         language: "en".to_string(),
@@ -189,14 +194,14 @@ fn dispatch_transform(input: &Value) -> Result<DispatchResult, ProviderError> {
         ProviderError::InvalidInput("Missing required parameter 'object_id'".to_string())
     })?;
 
-    let op = obj.get("operation")
+    let op = obj
+        .get("operation")
         .and_then(|v| v.as_str())
         .unwrap_or("translate")
         .to_string();
 
-    let mut params: HashMap<String, Value> = obj.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut params: HashMap<String, Value> =
+        obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     params.insert("object_id".to_string(), object_id.clone());
 
     Ok(DispatchResult::Command(ParsedCommand {
@@ -213,16 +218,18 @@ fn dispatch_operation(op_name: &str, input: &Value) -> Result<DispatchResult, Pr
         ProviderError::InvalidInput("Tool input must be a JSON object".to_string())
     })?;
 
-    let params: HashMap<String, Value> = obj.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let params: HashMap<String, Value> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     let intent = match op_name {
         "extrude" => CommandIntent::Extrude {
-            target: obj.get("target_id").and_then(|v| v.as_str()).map(String::from),
+            target: obj
+                .get("target_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         },
         _ => CommandIntent::Modify {
-            target: obj.get("target_id")
+            target: obj
+                .get("target_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("last")
                 .to_string(),
@@ -245,9 +252,7 @@ fn dispatch_query(query_type: &str, input: &Value) -> Result<DispatchResult, Pro
         ProviderError::InvalidInput("Tool input must be a JSON object".to_string())
     })?;
 
-    let params: HashMap<String, Value> = obj.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let params: HashMap<String, Value> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     Ok(DispatchResult::Query(ParsedCommand {
         original_text: query_type.to_string(),
@@ -264,9 +269,7 @@ fn dispatch_export(format: &str, input: &Value) -> Result<DispatchResult, Provid
     let empty_map = serde_json::Map::new();
     let obj = input.as_object().unwrap_or(&empty_map);
 
-    let params: HashMap<String, Value> = obj.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let params: HashMap<String, Value> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     Ok(DispatchResult::Command(ParsedCommand {
         original_text: format!("export_{}", format),
@@ -305,7 +308,9 @@ mod tests {
         let result = dispatch_tool_call(&tool_use).unwrap();
         match result {
             DispatchResult::Command(cmd) => {
-                assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box"));
+                assert!(
+                    matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box")
+                );
                 assert_eq!(cmd.parameters["width"], json!(10.0));
                 assert_eq!(cmd.parameters["height"], json!(5.0));
                 assert_eq!(cmd.parameters["depth"], json!(3.0));
@@ -326,7 +331,9 @@ mod tests {
         let result = dispatch_tool_call(&tool_use).unwrap();
         match result {
             DispatchResult::Command(cmd) => {
-                assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "sphere"));
+                assert!(
+                    matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "sphere")
+                );
                 assert_eq!(cmd.parameters["radius"], json!(5.0));
             }
             _ => panic!("Expected Command dispatch"),
@@ -372,7 +379,9 @@ mod tests {
         let result = dispatch_tool_call(&tool_use).unwrap();
         match result {
             DispatchResult::Command(cmd) => {
-                assert!(matches!(cmd.intent, CommandIntent::BooleanOperation { ref operation } if operation == "union"));
+                assert!(
+                    matches!(cmd.intent, CommandIntent::BooleanOperation { ref operation } if operation == "union")
+                );
             }
             _ => panic!("Expected Command dispatch"),
         }
@@ -419,7 +428,9 @@ mod tests {
         let result = dispatch_tool_call(&tool_use).unwrap();
         match result {
             DispatchResult::Command(cmd) => {
-                assert!(matches!(cmd.intent, CommandIntent::Transform { ref operation } if operation == "translate"));
+                assert!(
+                    matches!(cmd.intent, CommandIntent::Transform { ref operation } if operation == "translate")
+                );
                 assert_eq!(cmd.parameters["x"], json!(10.0));
             }
             _ => panic!("Expected Command dispatch"),
@@ -437,7 +448,9 @@ mod tests {
         let result = dispatch_tool_call(&tool_use).unwrap();
         match result {
             DispatchResult::Command(cmd) => {
-                assert!(matches!(cmd.intent, CommandIntent::Export { ref format, .. } if format == "stl"));
+                assert!(
+                    matches!(cmd.intent, CommandIntent::Export { ref format, .. } if format == "stl")
+                );
             }
             _ => panic!("Expected Command dispatch"),
         }
@@ -467,7 +480,9 @@ mod tests {
         let result = dispatch_tool_call(&tool_use).unwrap();
         match result {
             DispatchResult::Command(cmd) => {
-                assert!(matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "cone"));
+                assert!(
+                    matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "cone")
+                );
                 assert_eq!(cmd.parameters["bottom_radius"], json!(5.0));
                 assert_eq!(cmd.parameters["top_radius"], json!(2.0));
             }

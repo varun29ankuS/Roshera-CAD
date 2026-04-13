@@ -278,9 +278,9 @@ fn compute_chamfer_offsets(
         })?;
 
         // Get edge tangent at this parameter
-        let edge_tangent = curve.tangent_at(t).map_err(|e| {
-            OperationError::NumericalError(format!("Edge tangent failed: {:?}", e))
-        })?;
+        let edge_tangent = curve
+            .tangent_at(t)
+            .map_err(|e| OperationError::NumericalError(format!("Edge tangent failed: {:?}", e)))?;
 
         // Get face normals at edge point
         let face_normal1 = face_normal_at_point(model, face1_id, &edge_point)?;
@@ -490,9 +490,10 @@ fn update_adjacent_faces_for_chamfer(
     let shell_id = solid.outer_shell;
 
     // Add chamfer faces to the shell
-    let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
-        OperationError::InvalidGeometry("Shell not found".to_string())
-    })?;
+    let shell = model
+        .shells
+        .get_mut(shell_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
     for &face_id in chamfer_faces {
         shell.add_face(face_id);
     }
@@ -505,9 +506,10 @@ fn update_adjacent_faces_for_chamfer(
     // edges as consumed by removing them from existing loops.
     for &edge_id in edges {
         // Scan all faces in the shell for loops containing this edge
-        let shell = model.shells.get(shell_id).ok_or_else(|| {
-            OperationError::InvalidGeometry("Shell not found".to_string())
-        })?;
+        let shell = model
+            .shells
+            .get(shell_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
         let face_ids: Vec<FaceId> = shell.faces.clone();
 
         for face_id in face_ids {

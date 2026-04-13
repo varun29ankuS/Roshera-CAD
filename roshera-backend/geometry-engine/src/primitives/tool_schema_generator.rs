@@ -13,7 +13,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::primitives::natural_language_schemas::{ParameterDataType, ParameterInfo, PrimitiveSchema};
+use crate::primitives::natural_language_schemas::{
+    ParameterDataType, ParameterInfo, PrimitiveSchema,
+};
 
 /// Tool tier for context-aware schema disclosure.
 ///
@@ -67,10 +69,7 @@ pub fn primitive_to_tool_schema(schema: &PrimitiveSchema) -> ToolSchema {
         "required": required,
     });
 
-    let description = format!(
-        "{}. {}",
-        schema.description, schema.ai_explanation
-    );
+    let description = format!("{}. {}", schema.description, schema.ai_explanation);
 
     ToolSchema {
         name: format!("create_{}", schema.id),
@@ -84,7 +83,10 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
     let base_desc = format!("{} — {}", param.description, param.effect_description);
 
     match &param.data_type {
-        ParameterDataType::Number { precision, format_hint } => {
+        ParameterDataType::Number {
+            precision,
+            format_hint,
+        } => {
             let mut schema = json!({
                 "type": "number",
                 "description": base_desc,
@@ -103,7 +105,10 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
             }
             schema
         }
-        ParameterDataType::Length { default_unit, precision } => {
+        ParameterDataType::Length {
+            default_unit,
+            precision,
+        } => {
             let desc = format!("{} (unit: {})", base_desc, default_unit);
             let mut schema = json!({
                 "type": "number",
@@ -123,7 +128,10 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
             }
             schema
         }
-        ParameterDataType::Angle { default_unit, precision } => {
+        ParameterDataType::Angle {
+            default_unit,
+            precision,
+        } => {
             let desc = format!("{} (unit: {})", base_desc, default_unit);
             let mut schema = json!({
                 "type": "number",
@@ -200,7 +208,10 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
                 "required": ["x", "y", "z"],
             })
         }
-        ParameterDataType::Text { max_length, pattern } => {
+        ParameterDataType::Text {
+            max_length,
+            pattern,
+        } => {
             let mut schema = json!({
                 "type": "string",
                 "description": base_desc,
@@ -544,7 +555,11 @@ mod tests {
     fn test_tier1_tool_count() {
         let tools = tiered_tool_schemas(ToolTier::Tier1);
         // Tier1: box + cylinder + sphere + boolean + transform + query + export_stl
-        assert!(tools.len() >= 5, "Tier1 should have at least 5 tools, got {}", tools.len());
+        assert!(
+            tools.len() >= 5,
+            "Tier1 should have at least 5 tools, got {}",
+            tools.len()
+        );
     }
 
     #[test]
@@ -603,7 +618,10 @@ mod tests {
     #[test]
     fn test_boolean_operation_schema() {
         let schemas = builtin_operation_schemas();
-        let bool_schema = schemas.iter().find(|s| s.name == "boolean_operation").unwrap();
+        let bool_schema = schemas
+            .iter()
+            .find(|s| s.name == "boolean_operation")
+            .unwrap();
 
         let props = &bool_schema.input_schema["properties"];
         let op_enum = props["operation"]["enum"].as_array().unwrap();

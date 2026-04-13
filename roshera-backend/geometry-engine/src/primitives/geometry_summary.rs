@@ -101,10 +101,7 @@ impl fmt::Display for ShapeClassification {
 ///
 /// Walks the B-Rep topology, computes mass properties, classifies surface types,
 /// recognizes features, and produces a structured summary.
-pub fn summarize_solid(
-    solid_id: u32,
-    model: &BRepModel,
-) -> MathResult<GeometrySummary> {
+pub fn summarize_solid(solid_id: u32, model: &BRepModel) -> MathResult<GeometrySummary> {
     let solid = model.solids.get(solid_id).ok_or_else(|| {
         crate::math::MathError::InvalidParameter(format!("Solid {} not found", solid_id))
     })?;
@@ -112,9 +109,10 @@ pub fn summarize_solid(
     let name = solid.name.clone();
 
     // --- Topology counts ---
-    let outer_shell = model.shells.get(solid.outer_shell).ok_or_else(|| {
-        crate::math::MathError::InvalidParameter("Outer shell not found".into())
-    })?;
+    let outer_shell = model
+        .shells
+        .get(solid.outer_shell)
+        .ok_or_else(|| crate::math::MathError::InvalidParameter("Outer shell not found".into()))?;
 
     let mut face_count = 0usize;
     let mut edge_set = std::collections::HashSet::new();
@@ -282,16 +280,13 @@ fn compute_bounding_box(
                     for &face_id in &shell.faces {
                         if let Some(face) = model.faces.get(face_id) {
                             if let Some(surface) = model.surfaces.get(face.surface_id) {
-                                let ((u_min, u_max), (v_min, v_max)) =
-                                    surface.parameter_bounds();
+                                let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
                                 // Sample a grid of points on each surface
                                 let n = 8;
                                 for ui in 0..=n {
                                     for vi in 0..=n {
-                                        let u =
-                                            u_min + (u_max - u_min) * (ui as f64 / n as f64);
-                                        let v =
-                                            v_min + (v_max - v_min) * (vi as f64 / n as f64);
+                                        let u = u_min + (u_max - u_min) * (ui as f64 / n as f64);
+                                        let v = v_min + (v_max - v_min) * (vi as f64 / n as f64);
                                         if let Ok(pt) = surface.point_at(u, v) {
                                             let coords = [pt.x, pt.y, pt.z];
                                             for i in 0..3 {
@@ -475,8 +470,8 @@ impl GeometrySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
     use crate::primitives::primitive_traits::Primitive;
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
 
     fn make_box(model: &mut BRepModel, w: f64, h: f64, d: f64) -> u32 {
         let mut builder = TopologyBuilder::new(model);
@@ -550,9 +545,20 @@ mod tests {
             .map(|s| s.count)
             .sum();
 
-        assert!(plane_count >= 2, "Cylinder should have at least 2 planar caps, got {}", plane_count);
-        assert!(cyl_count >= 1, "Cylinder should have cylindrical faces, got {}", cyl_count);
-        assert!(summary.topology.faces > 2, "Cylinder should have more than 2 faces");
+        assert!(
+            plane_count >= 2,
+            "Cylinder should have at least 2 planar caps, got {}",
+            plane_count
+        );
+        assert!(
+            cyl_count >= 1,
+            "Cylinder should have cylindrical faces, got {}",
+            cyl_count
+        );
+        assert!(
+            summary.topology.faces > 2,
+            "Cylinder should have more than 2 faces"
+        );
     }
 
     #[test]
