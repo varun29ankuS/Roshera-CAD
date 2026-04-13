@@ -525,15 +525,64 @@ impl Primitive for BoxPrimitive {
         solid_id: SolidId,
         model: &BRepModel,
     ) -> Result<Self::Parameters, PrimitiveError> {
-        // Verify solid exists
-        let _solid = model
+        let solid = model
             .solids
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        Err(PrimitiveError::GeometryError {
-            operation: "get_parameters".to_string(),
-            details: "Parameter recovery from B-Rep topology not yet implemented".to_string(),
+        // Collect all vertices from the solid's shell faces
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .ok_or_else(|| PrimitiveError::GeometryError {
+                operation: "get_parameters".to_string(),
+                details: "Outer shell not found".to_string(),
+            })?;
+
+        let mut min_x = f64::MAX;
+        let mut min_y = f64::MAX;
+        let mut min_z = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut max_y = f64::MIN;
+        let mut max_z = f64::MIN;
+        let mut vertex_count = 0;
+
+        for &face_id in &shell.faces {
+            if let Some(face) = model.faces.get(face_id) {
+                if let Some(loop_data) = model.loops.get(face.outer_loop) {
+                    for &edge_id in &loop_data.edges {
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            for vid in [edge.start_vertex, edge.end_vertex] {
+                                if let Some(v) = model.vertices.get(vid) {
+                                    min_x = min_x.min(v.position[0]);
+                                    min_y = min_y.min(v.position[1]);
+                                    min_z = min_z.min(v.position[2]);
+                                    max_x = max_x.max(v.position[0]);
+                                    max_y = max_y.max(v.position[1]);
+                                    max_z = max_z.max(v.position[2]);
+                                    vertex_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if vertex_count == 0 {
+            return Err(PrimitiveError::GeometryError {
+                operation: "get_parameters".to_string(),
+                details: "No vertices found in solid".to_string(),
+            });
+        }
+
+        Ok(BoxParameters {
+            width: max_x - min_x,
+            height: max_y - min_y,
+            depth: max_z - min_z,
+            corner_radius: None,
+            transform: None,
+            tolerance: None,
         })
     }
 

@@ -294,14 +294,43 @@ impl Primitive for SpherePrimitive {
         solid_id: SolidId,
         model: &BRepModel,
     ) -> Result<Self::Parameters, PrimitiveError> {
-        let _solid = model
+        let solid = model
             .solids
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .ok_or_else(|| PrimitiveError::GeometryError {
+                operation: "get_parameters".to_string(),
+                details: "Outer shell not found".to_string(),
+            })?;
+
+        // Find the spherical surface to extract center and radius
+        for &face_id in &shell.faces {
+            if let Some(face) = model.faces.get(face_id) {
+                if let Some(surface) = model.surfaces.get(face.surface_id) {
+                    if surface.surface_type() == crate::primitives::surface::SurfaceType::Sphere {
+                        use crate::primitives::surface::Sphere;
+                        if let Some(sph) = surface.as_any().downcast_ref::<Sphere>() {
+                            return Ok(SphereParameters {
+                                radius: sph.radius,
+                                center: sph.center,
+                                u_segments: 32,
+                                v_segments: 16,
+                                transform: None,
+                                tolerance: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         Err(PrimitiveError::GeometryError {
             operation: "get_parameters".to_string(),
-            details: "Parameter recovery from B-Rep topology not yet implemented".to_string(),
+            details: "No spherical surface found in solid".to_string(),
         })
     }
 
