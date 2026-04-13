@@ -1,0 +1,47 @@
+[package]
+name = "api-server"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP and WebSocket API server for Roshera CAD"
+license = "Apache-2.0"
+
+[[bin]]
+name = "api-server"
+path = "src/main.rs"
+[dependencies]
+shared-types = { path = "../shared-types" }
+geometry-engine = { path = "../geometry-engine" }
+session-manager = { path = "../session-manager" }
+timeline-engine = { path = "../timeline-engine" }
+ai-integration = { path = "../ai-integration" }
+export-engine = { path = "../export-engine" }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+# Additional dependencies
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+dotenvy = "0.15"
+jsonwebtoken = "9.2"
+time = "0.3"
+tower-cookies = "0.11"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+rmp-serde = "1.1"
+regex = "1.10"
+async-stream = "0.3"
+sysinfo = "0.30"
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }
+hyper = "1.0"

@@ -1,0 +1,35 @@
+[package]
+name = "session-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared-types = { path = "../shared-types" }
+timeline-engine = { path = "../timeline-engine" }
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+thiserror = "2.0.12"
+dashmap = "6.1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+hmac = "0.12"
+jwt = "0.16"
+argon2 = "0.5"
+base32 = "0.4"
+rand = "0.8"
+totp-lite = "2.0"
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "sqlite", "json", "chrono", "uuid"] }
+async-trait = "0.1"
+lru = "0.12"
+flate2 = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "delta_updates_demo"
+path = "examples/delta_updates_demo.rs"

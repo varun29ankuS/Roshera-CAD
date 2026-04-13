@@ -1,0 +1,65 @@
+[package]
+name = "geometry-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Geometry generation and operations for Roshera CAD"
+license = "Apache-2.0"
+
+[dependencies]
+num-traits = "0.2"
+arrayvec = "0.7"
+parking_lot = "0.12"
+lru = "0.12"
+rayon = "1.8"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tracing = "0.1"
+tokio = { version = "1.0", features = ["sync", "time", "rt"] }
+
+# SIMD optimizations
+wide = "0.7"              # Portable SIMD operations
+simdeez = "1.0"          # Cross-platform SIMD
+bytemuck = "1.0"         # Safe transmutation for SIMD data
+
+
+## Option 2: Three.js export
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+once_cell = "1.19"
+dashmap = "6.0"
+thiserror = "1.0"
+shared-types = { path = "../shared-types" }
+
+## Option 4: glTF export for universal viewing
+# gltf = "1.3"
+# gltf-json = "1.3"
+
+# For web frontend (Leptos + Three.js)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["WebGlRenderingContext", "WebGl2RenderingContext"] }
+js-sys = "0.3"
+
+# Dependencies for performance testing
+chrono = "0.4"
+num_cpus = "1.16"
+
+# Development dependencies
+[dev-dependencies]
+criterion = "0.5"
+approx = "0.5.1"
+sysinfo = "0.32"
+rand = "0.8"
+
+[features]
+default = []
+export = []
+
+# All tests are now in src/math/test_math/
+
+[[bench]]
+name = "geometry_bench"
+harness = false
+
+[[bin]]
+name = "bench_runner"
+path = "src/bin/bench_runner.rs"

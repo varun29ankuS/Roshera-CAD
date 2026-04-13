@@ -1,0 +1,264 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev pkg-config
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+      working-directory: ./roshera-backend
+    
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features
+      working-directory: ./roshera-backend
+    
+    - name: Run tests
+      run: cargo test --all-features
+      working-directory: ./roshera-backend
+    
+    # Benchmarks not yet implemented
+    # - name: Run benchmarks (dry run)
+    #   run: cargo bench --no-run
+    #   working-directory: ./roshera-backend
+
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    
+    - name: Install trunk
+      run: |
+        cargo install trunk
+        cargo install wasm-bindgen-cli
+    
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-frontend-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Build frontend
+      run: |
+        # Check what files exist
+        ls -la
+        # Check if Trunk.toml exists and create a minimal one if not
+        if [ ! -f "Trunk.toml" ]; then
+          echo "Creating minimal Trunk.toml"
+          echo '[build]' > Trunk.toml
+          echo 'target = "index.html"' >> Trunk.toml
+          echo 'dist = "dist"' >> Trunk.toml
+        fi
+        # Build with trunk
+        trunk build --release
+      working-directory: ./roshera-front
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev pkg-config
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+    
+    - name: Run security audit
+      run: cargo audit
+      working-directory: ./roshera-backend
+
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev pkg-config
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Run benchmarks
+      run: |
+        # Build and run the benchmark runner that outputs JSON
+        cargo build --release --bin bench_runner
+        ./target/release/bench_runner > bench-results.json
+      working-directory: ./roshera-backend
+    
+    - name: Store benchmark result
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        tool: 'customSmallerIsBetter'
+        output-file-path: roshera-backend/bench-results.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: true
+        comment-on-alert: false
+        alert-threshold: '150%'
+        fail-on-alert: false
+        benchmark-data-dir-path: 'dev/bench'
+
+  performance:
+    name: Performance Regression
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev pkg-config
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-perf-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Install critcmp
+      run: cargo install critcmp
+    
+    - name: Run benchmark baseline
+      run: |
+        git checkout ${{ github.event.pull_request.base.sha }}
+        # Check if benchmark exists before running
+        if cargo bench --bench geometry_bench --no-run 2>/dev/null; then
+          cargo bench --bench geometry_bench -- --save-baseline main --output-format bencher | tee bench-results.json
+        else
+          echo "No benchmarks found in base branch"
+          echo '{"results": []}' > bench-results.json
+        fi
+      working-directory: ./roshera-backend
+    
+    - name: Run benchmark comparison
+      run: |
+        git checkout ${{ github.event.pull_request.head.sha }}
+        # Check if benchmark exists before running
+        if cargo bench --bench geometry_bench --no-run 2>/dev/null; then
+          cargo bench --bench geometry_bench -- --save-baseline pr --output-format bencher | tee bench-results.json
+          if [ -d target/criterion/main ]; then
+            critcmp main pr || echo "Benchmark comparison skipped"
+          fi
+        else
+          echo "No benchmarks found in PR branch"
+          echo '{"results": []}' > bench-results.json
+        fi
+      working-directory: ./roshera-backend
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [test, frontend, security]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev pkg-config
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    
+    - name: Install dependencies
+      run: |
+        cargo install trunk
+        cargo install wasm-bindgen-cli
+    
+    - name: Build backend release
+      run: cargo build --release
+      working-directory: ./roshera-backend
+    
+    - name: Build frontend release
+      run: trunk build --release
+      working-directory: ./roshera-front
+    
+    - name: Create deployment artifact
+      run: |
+        mkdir -p deployment
+        cp -r roshera-backend/target/release/* deployment/
+        cp -r roshera-front/dist/* deployment/
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: roshera-deployment
+        path: deployment/
+        retention-days: 30

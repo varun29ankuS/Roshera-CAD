@@ -1,0 +1,13 @@
+{
+  "name": "websocket-test",
+  "version": "1.0.0",
+  "description": "Simple WebSocket test for Roshera backend",
+  "main": "test-websocket.js",
+  "scripts": {
+    "test": "node test-websocket.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "type": "commonjs"
+}

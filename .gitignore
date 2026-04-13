@@ -1,0 +1,124 @@
+# Build artifacts
+target/
+dist/
+pkg/
+*.exe
+*.pdb
+*.rlib
+*.o
+
+# WebAssembly
+*.wasm
+*.js.map
+*.wasm.map
+.trunk/
+
+# Dependencies
+node_modules/
+
+# AI Models
+models/
+*.bin
+*.safetensors
+*.ggml
+*.gguf
+*.model
+*.onnx
+*.pt
+*.pth
+*.h5
+*.tflite
+weights/
+checkpoints/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+
+# Logs & Build Output
+*.log
+*.tmp
+*.txt
+!requirements.txt
+!LICENSE.txt
+
+# Profiling & Coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+target/criterion/
+*.heapprofile
+*.heapsnapshot
+*.trace
+
+# CAD Export Files
+exports/
+output/
+*.stl
+*.step
+*.stp
+*.iges
+*.igs
+*.obj
+*.dae
+*.3ds
+*.fbx
+
+# Rust
+**/*.rs.bk
+.cargo/
+rust-project.json
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Session & State
+*.session
+session-data/
+state/
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+
+# Internal docs (keep local only)
+AI_DEVELOPMENT_GUIDE.md
+COMPILATION_SUCCESS_REPORT.md
+DEPENDENCY_ANALYSIS.md
+DEPENDENCY_GRAPH.md
+DEVELOPMENT_LOG.md
+LOCAL_CLAUDE_NOTES.md
+MATH_MODULE_COMPLETE_REFERENCE.md
+MODULE_COMPLETION_REPORT.md
+PART_MATURITY_WORKFLOW.md
+PRODUCTION_READINESS_ASSESSMENT.md
+PROJECT_SETUP_GUIDE.md
+REMAINING_WORK_TRACKER.md
+SYSTEM_STATUS_CONSOLIDATED.md
+TODO_CURRENT_STATE.md
+VISION_IMPLEMENTATION_GUIDE.md
+WORKFLOW.md
+dependency-graph-visual.md
+workspace-dependencies.dot
+dependency-graph.dot
+business-docs/
+*.bat
+test_websocket.html
+check_frontend.js

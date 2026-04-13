@@ -1,0 +1,80 @@
+name: Linear Issue Sync
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    types: [ opened, closed ]
+
+jobs:
+  sync-linear:
+    name: Update Linear Issues
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Extract Linear Issue IDs
+      id: extract
+      run: |
+        # Extract ROSH-XXX patterns from commit message
+        ISSUE_IDS=$(git log -1 --pretty=%B | grep -oE 'ROSH-[0-9]+' | tr '\n' ' ')
+        echo "issues=$ISSUE_IDS" >> $GITHUB_OUTPUT
+    
+    - name: Update Linear Issue Status
+      if: steps.extract.outputs.issues != ''
+      env:
+        LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      run: |
+        # Parse commit for status keywords
+        COMMIT_MSG=$(git log -1 --pretty=%B)
+        
+        for ISSUE_ID in ${{ steps.extract.outputs.issues }}; do
+          STATUS="In Progress"  # Default
+          
+          # Detect status from commit keywords
+          if echo "$COMMIT_MSG" | grep -iE "(fix|close|complete|done)" > /dev/null; then
+            STATUS="Done"
+          elif echo "$COMMIT_MSG" | grep -iE "(wip|progress|working)" > /dev/null; then
+            STATUS="In Progress"
+          elif echo "$COMMIT_MSG" | grep -iE "(todo|planned)" > /dev/null; then
+            STATUS="Todo"
+          fi
+          
+          # Update Linear via API
+          curl -X POST https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"mutation { issueUpdate(id: \\\"$ISSUE_ID\\\", input: { stateId: \\\"$STATUS\\\" }) { success } }\"
+            }"
+            
+          # Add comment with commit link
+          curl -X POST https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"mutation { commentCreate(issueId: \\\"$ISSUE_ID\\\", body: \\\"Commit: ${{ github.sha }}\\\\nMessage: $COMMIT_MSG\\\\nLink: ${{ github.event.head_commit.url }}\\\") { success } }\"
+            }"
+        done
+    
+    - name: Link PR to Linear
+      if: github.event_name == 'pull_request'
+      env:
+        LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      run: |
+        PR_TITLE="${{ github.event.pull_request.title }}"
+        PR_URL="${{ github.event.pull_request.html_url }}"
+        
+        # Extract issue IDs from PR title/body
+        ISSUE_IDS=$(echo "$PR_TITLE ${{ github.event.pull_request.body }}" | grep -oE 'ROSH-[0-9]+' | tr '\n' ' ')
+        
+        for ISSUE_ID in $ISSUE_IDS; do
+          # Link PR to Linear issue
+          curl -X POST https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"mutation { attachmentCreate(issueId: \\\"$ISSUE_ID\\\", url: \\\"$PR_URL\\\", title: \\\"PR: $PR_TITLE\\\") { success } }\"
+            }"
+        done

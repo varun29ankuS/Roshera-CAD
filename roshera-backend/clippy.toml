@@ -1,0 +1,30 @@
+# Clippy Configuration for Roshera CAD Backend
+
+# Performance thresholds
+too-many-arguments-threshold = 8
+type-complexity-threshold = 500
+single-char-binding-names-threshold = 3
+
+# Code style
+max-fn-params-bools = 3
+max-struct-bools = 3
+doc-valid-idents = ["CAD", "B-Rep", "NURBS", "WebSocket", "LLaMA", "Whisper", "TTS", "ASR", "AI"]
+
+# Allow certain patterns common in CAD systems
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-print-in-tests = true
+
+# Cognitive complexity
+cognitive-complexity-threshold = 30
+
+# MSRV (Minimum Supported Rust Version)
+msrv = "1.70.0"
+
+# Focus on critical errors only during CI/CD
+# Pedantic lints are helpful but not critical for functioning code
+avoid-breaking-exported-api = false
+
+# Disable pedantic warnings that are too noisy
+# These are good practices but cause CI/CD to fail when treated as errors

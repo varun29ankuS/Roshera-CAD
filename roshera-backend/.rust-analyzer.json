@@ -1,0 +1,14 @@
+{
+    "cargo": {
+        "features": ["mock-providers"],
+        "buildScripts": {
+            "enable": true
+        }
+    },
+    "procMacro": {
+        "enable": true
+    },
+    "checkOnSave": {
+        "command": "check"
+    }
+}
