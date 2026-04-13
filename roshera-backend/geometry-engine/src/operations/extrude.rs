@@ -10,7 +10,6 @@
 use super::deep_clone::{deep_clone_faces, CloneContext};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
-use tracing::debug;
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
@@ -22,6 +21,7 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::{Vertex, VertexId},
 };
+use tracing::debug;
 
 /// Find the solid that contains the given face
 fn find_parent_solid(model: &BRepModel, face_id: FaceId) -> Option<SolidId> {
@@ -209,7 +209,12 @@ fn create_unified_extrusion(
     for (i, &face_id) in unified_faces.iter().enumerate() {
         if let Some(face) = model.faces.get(face_id) {
             if model.surfaces.get(face.surface_id).is_some() {
-                debug!(face_idx = i, face_id, surface_id = face.surface_id, "  Face");
+                debug!(
+                    face_idx = i,
+                    face_id,
+                    surface_id = face.surface_id,
+                    "  Face"
+                );
             }
         }
     }
@@ -405,9 +410,7 @@ fn create_complex_extrusion(
                 let to_vertex = pos - face_centroid;
                 // Project onto plane perpendicular to extrusion direction
                 let radial = to_vertex - direction * to_vertex.dot(&direction);
-                let radial_dir = radial
-                    .normalize()
-                    .unwrap_or(Vector3::X);
+                let radial_dir = radial.normalize().unwrap_or(Vector3::X);
                 pos = pos + radial_dir * current_draft_offset;
             }
 
@@ -1103,7 +1106,10 @@ fn create_planar_surface_from_vertices(
     // Get the first three non-collinear vertices
     let mut points = Vec::new();
 
-    debug!(vertex_count = vertices.len(), "create_planar_surface_from_vertices");
+    debug!(
+        vertex_count = vertices.len(),
+        "create_planar_surface_from_vertices"
+    );
 
     for &vertex_id in vertices {
         let vertex = model
@@ -1162,7 +1168,10 @@ fn create_planar_surface_from_vertices(
             let cross_diag = v3.cross(&v4);
 
             debug!(?v3, ?v4, "trying diagonal vectors");
-            debug!(cross_mag = cross_diag.magnitude(), "diagonal cross product magnitude");
+            debug!(
+                cross_mag = cross_diag.magnitude(),
+                "diagonal cross product magnitude"
+            );
 
             if cross_diag.magnitude() > 1e-10 {
                 let normal = cross_diag.normalize().map_err(|e| {
