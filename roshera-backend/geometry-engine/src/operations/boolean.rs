@@ -2087,8 +2087,8 @@ impl IntersectionGraph {
         }
     }
 
-    fn add_edge(&mut self, edge_id: EdgeId, edge_type: EdgeType) {
-        // Implementation would add edge to graph
+    fn add_edge(&mut self, _edge_id: EdgeId, _edge_type: EdgeType) {
+        // Not yet implemented — intersection graph edge storage
     }
 }
 
@@ -2172,22 +2172,23 @@ fn create_edge_from_curve(model: &mut BRepModel, curve_id: CurveId) -> Operation
 
 /// Compute intersections between edges
 fn compute_edge_intersections(
-    graph: &mut IntersectionGraph,
-    model: &BRepModel,
-    tolerance: &Tolerance,
+    _graph: &mut IntersectionGraph,
+    _model: &BRepModel,
+    _tolerance: &Tolerance,
 ) -> OperationResult<()> {
-    // Implementation would compute all edge-edge intersections
-    // and update the graph with intersection vertices
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "Edge-edge intersection computation not yet implemented".to_string(),
+    ))
 }
 
 /// Extract face loops from intersection graph
 fn extract_face_loops(
-    graph: &IntersectionGraph,
-    model: &BRepModel,
+    _graph: &IntersectionGraph,
+    _model: &BRepModel,
 ) -> OperationResult<Vec<Vec<EdgeId>>> {
-    // Implementation would use graph traversal to find closed loops
-    Ok(Vec::new())
+    Err(OperationError::NotImplemented(
+        "Face loop extraction from intersection graph not yet implemented".to_string(),
+    ))
 }
 
 /// Create split face from edges
@@ -2338,14 +2339,14 @@ fn ray_cast_classification(
 
 /// Compute ray-surface intersection
 fn ray_surface_intersection(
-    origin: &Point3,
-    direction: &Vector3,
-    surface: &dyn Surface,
-    tolerance: &Tolerance,
+    _origin: &Point3,
+    _direction: &Vector3,
+    _surface: &dyn Surface,
+    _tolerance: &Tolerance,
 ) -> OperationResult<Option<f64>> {
-    // This would implement ray-surface intersection for each surface type
-    // For now, simplified implementation
-    Ok(None)
+    Err(OperationError::NotImplemented(
+        "Ray-surface intersection not yet implemented".to_string(),
+    ))
 }
 
 /// Check if point is inside face boundaries
@@ -2445,19 +2446,11 @@ fn reconstruct_topology(
 
 /// Build shells from faces
 fn build_shells_from_faces(
-    model: &mut BRepModel,
-    faces: Vec<SplitFace>,
-    options: &BooleanOptions,
+    _model: &mut BRepModel,
+    _faces: Vec<SplitFace>,
+    _options: &BooleanOptions,
 ) -> OperationResult<Vec<ShellId>> {
-    // Group faces into shells by connectivity
-    // This would use edge-face adjacency information
-
-    // For now, create a single shell with all faces
-    let mut shell = Shell::new(0, crate::primitives::shell::ShellType::Closed);
-
-    // Add faces to shell (would need proper face creation)
-    // This is simplified - real implementation would create proper faces
-
-    let shell_id = model.shells.add(shell);
-    Ok(vec![shell_id])
+    Err(OperationError::NotImplemented(
+        "Shell reconstruction from split faces not yet implemented".to_string(),
+    ))
 }

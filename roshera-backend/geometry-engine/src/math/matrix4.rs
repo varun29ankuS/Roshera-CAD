@@ -473,13 +473,41 @@ impl Matrix4 {
         )
     }
 
-    /// Transform a normal (uses inverse transpose of upper-left 3x3)
-    /// Note: This is a simplified version until matrix3.rs is implemented
+    /// Transform a normal using the inverse transpose of the upper-left 3x3.
+    ///
+    /// This is the correct transformation for normals under non-uniform scaling.
+    /// For a matrix M, normals must be transformed by (M^-1)^T to remain
+    /// perpendicular to the transformed surface.
     pub fn transform_normal(&self, n: &Vector3) -> MathResult<Vector3> {
-        // For now, just use the regular transform and normalize
-        // This is correct for orthogonal matrices (rotations)
-        // TODO: Implement proper normal transformation when matrix3.rs is available
-        Ok(self.transform_vector(n).normalize()?)
+        // Compute the inverse transpose of the upper-left 3x3 submatrix.
+        // For the 3x3 submatrix [a b c; d e f; g h i], the inverse transpose
+        // is the cofactor matrix divided by the determinant.
+        let a = self.m[0];
+        let d = self.m[1];
+        let g = self.m[2];
+        let b = self.m[4];
+        let e = self.m[5];
+        let h = self.m[6];
+        let c = self.m[8];
+        let f = self.m[9];
+        let i = self.m[10];
+
+        let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+
+        if det.abs() < consts::EPSILON {
+            return Err(MathError::SingularMatrix);
+        }
+
+        let inv_det = 1.0 / det;
+
+        // Cofactor matrix (which is the transpose of the adjugate)
+        // applied directly to the normal vector
+        let nx = (e * i - f * h) * n.x + (f * g - d * i) * n.y + (d * h - e * g) * n.z;
+        let ny = (c * h - b * i) * n.x + (a * i - c * g) * n.y + (b * g - a * h) * n.z;
+        let nz = (b * f - c * e) * n.x + (c * d - a * f) * n.y + (a * e - b * d) * n.z;
+
+        let transformed = Vector3::new(nx * inv_det, ny * inv_det, nz * inv_det);
+        transformed.normalize()
     }
 
     /// Transform with perspective divide
@@ -1143,6 +1171,16 @@ mod tests {
 
         // Normal should be scaled inversely in X
         assert!(transformed.approx_eq(&Vector3::X, NORMAL_TOLERANCE));
+
+        // Diagonal normal under non-uniform scale: the old (broken) transform_vector
+        // approach would give the wrong answer here. Under scale(2,1,1), a surface
+        // normal at 45 degrees in XY should tilt TOWARD Y (away from the stretched axis).
+        let diagonal_normal = Vector3::new(1.0, 1.0, 0.0).normalize().unwrap();
+        let transformed_diag = m.transform_normal(&diagonal_normal).unwrap();
+        // Inverse-transpose of scale(2,1,1) scales X by 0.5, Y by 1.0
+        // So (1,1,0) -> (0.5, 1.0, 0) -> normalized ~ (0.447, 0.894, 0)
+        assert!(transformed_diag.x < diagonal_normal.x); // X component should shrink
+        assert!(transformed_diag.y > diagonal_normal.y); // Y component should grow
     }
 
     #[test]

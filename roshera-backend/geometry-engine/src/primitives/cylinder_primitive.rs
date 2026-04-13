@@ -401,8 +401,10 @@ impl Primitive for CylinderPrimitive {
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        // TODO: Implement proper parameter storage in the model
-        Ok(CylinderParameters::default())
+        Err(PrimitiveError::GeometryError {
+            operation: "get_parameters".to_string(),
+            details: "Parameter recovery from B-Rep topology not yet implemented".to_string(),
+        })
     }
 
     fn validate(solid_id: SolidId, model: &BRepModel) -> Result<ValidationReport, PrimitiveError> {
@@ -543,23 +545,23 @@ fn create_vertical_line(
     ))
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_cylinder_creation() {
-//         let mut model = BRepModel::new();
-//         let params = CylinderParameters::new(5.0, 10.0).unwrap();
-//
-//         let solid_id = CylinderPrimitive::create(params, &mut model).unwrap();
-//
-//         // Verify solid exists
-//         assert!(model.solids.get(solid_id).is_some());
-//
-//         // Validate the cylinder
-//         let report = CylinderPrimitive::validate(solid_id, &model).unwrap();
-//         assert!(report.is_valid);
-//         assert_eq!(report.euler_characteristic, 2);
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cylinder_creation() {
+        let mut model = BRepModel::new();
+        let params = CylinderParameters::new(5.0, 10.0).unwrap();
+
+        let solid_id = CylinderPrimitive::create(params, &mut model).unwrap();
+
+        // Verify solid exists
+        assert!(model.solids.get(solid_id).is_some());
+
+        // Validate the cylinder
+        let report = CylinderPrimitive::validate(solid_id, &model).unwrap();
+        assert!(report.is_valid);
+        assert_eq!(report.euler_characteristic, 2);
+    }
+}

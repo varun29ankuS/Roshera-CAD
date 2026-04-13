@@ -444,17 +444,14 @@ fn create_rotated_edge(
 
 /// Create a surface of revolution
 fn create_revolution_surface(
-    model: &mut BRepModel,
-    profile_curve_id: u32,
-    axis_origin: Point3,
-    axis_direction: Vector3,
+    _model: &mut BRepModel,
+    _profile_curve_id: u32,
+    _axis_origin: Point3,
+    _axis_direction: Vector3,
 ) -> OperationResult<Box<dyn Surface>> {
-    // use crate::primitives::surface::RevolutionSurface; // TODO: Implement RevolutionSurface
-
-    // In a complete implementation, this would create a proper surface of revolution
-    // For now, return a placeholder
-    use crate::primitives::surface::Plane;
-    Ok(Box::new(Plane::xy(0.0)))
+    Err(OperationError::NotImplemented(
+        "Surface of revolution not yet implemented".to_string(),
+    ))
 }
 
 /// Create a transformed copy of a face
