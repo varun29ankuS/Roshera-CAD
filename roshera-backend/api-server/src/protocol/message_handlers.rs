@@ -1280,6 +1280,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 normals: vec![], // Would compute normals in production
                                                 uvs: None,
                                                 colors: None, // Optional field
+                                                face_map: None,
                                             };
 
                                             // Execute export
@@ -1390,6 +1391,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 normals: vec![],
                                                 uvs: None,
                                                 colors: None,
+                                                face_map: None,
                                             };
 
                                             match export_engine

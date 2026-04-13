@@ -381,6 +381,7 @@ pub async fn create_geometry(
             normals,
             uvs: None,
             colors: None,
+            face_map: None,
         }
     } else {
         // Fallback to empty mesh
@@ -949,6 +950,7 @@ fn tessellate_solid_for_display(
         normals,
         uvs: None,
         colors: None,
+        face_map: None,
     }
 }
 
