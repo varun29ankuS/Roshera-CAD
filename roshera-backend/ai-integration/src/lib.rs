@@ -18,6 +18,8 @@ pub mod parser;
 pub mod processor;
 pub mod providers;
 pub mod session_aware_processor;
+pub mod smart_router;
+pub mod universal_endpoint;
 pub mod timeline_aware_executor;
 pub mod tool_dispatch;
 pub mod translator;
@@ -29,5 +31,9 @@ pub use processor::*;
 pub use providers::{ASRProvider, LLMProvider, ProviderManager, TTSProvider};
 pub use session_aware_processor::{AIAuthContext, SessionAwareAIProcessor, SessionAwareConfig};
 pub use timeline_aware_executor::{AISuggestion, TimelineAwareExecutor, TimelineConfig};
+
+// Vision pipeline types
+pub use smart_router::{SmartRouter, SmartRouterConfig, SmartRouterError};
+pub use universal_endpoint::{UniversalEndpoint, UniversalEndpointConfig};
 
 // Re-export commonly used types from shared-types
