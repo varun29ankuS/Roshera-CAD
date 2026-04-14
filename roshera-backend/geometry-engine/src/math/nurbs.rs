@@ -2358,13 +2358,8 @@ mod tests {
 
     #[test]
     fn test_nurbs_arc_90_degrees_ok() {
-        let result = NurbsCurve::circular_arc(
-            Point3::ORIGIN,
-            1.0,
-            0.0,
-            consts::PI / 2.0,
-            Vector3::Z,
-        );
+        let result =
+            NurbsCurve::circular_arc(Point3::ORIGIN, 1.0, 0.0, consts::PI / 2.0, Vector3::Z);
         assert!(result.is_ok());
     }
 }

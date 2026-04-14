@@ -676,9 +676,21 @@ impl Vector3 {
         let diff = *self - *edge0;
         // Safe per-component division: zero range → 0.0 (fully at edge0)
         let t = Self::new(
-            if range.x.abs() < f64::EPSILON { 0.0 } else { diff.x / range.x },
-            if range.y.abs() < f64::EPSILON { 0.0 } else { diff.y / range.y },
-            if range.z.abs() < f64::EPSILON { 0.0 } else { diff.z / range.z },
+            if range.x.abs() < f64::EPSILON {
+                0.0
+            } else {
+                diff.x / range.x
+            },
+            if range.y.abs() < f64::EPSILON {
+                0.0
+            } else {
+                diff.y / range.y
+            },
+            if range.z.abs() < f64::EPSILON {
+                0.0
+            } else {
+                diff.z / range.z
+            },
         )
         .clamp(&Self::ZERO, &Self::ONE);
         // Smoothstep formula: t² * (3 - 2t) = 3t² - 2t³
@@ -730,7 +742,10 @@ impl Div<f64> for Vector3 {
 
     #[inline(always)]
     fn div(self, scalar: f64) -> Self {
-        debug_assert!(scalar.abs() > f64::EPSILON, "Vector3 divided by zero or near-zero scalar: {scalar}");
+        debug_assert!(
+            scalar.abs() > f64::EPSILON,
+            "Vector3 divided by zero or near-zero scalar: {scalar}"
+        );
         let inv = 1.0 / scalar;
         Self::new(self.x * inv, self.y * inv, self.z * inv)
     }
@@ -741,7 +756,10 @@ impl Div<f64> for &Vector3 {
 
     #[inline(always)]
     fn div(self, scalar: f64) -> Vector3 {
-        debug_assert!(scalar.abs() > f64::EPSILON, "Vector3 divided by zero or near-zero scalar: {scalar}");
+        debug_assert!(
+            scalar.abs() > f64::EPSILON,
+            "Vector3 divided by zero or near-zero scalar: {scalar}"
+        );
         let inv = 1.0 / scalar;
         Vector3::new(self.x * inv, self.y * inv, self.z * inv)
     }
