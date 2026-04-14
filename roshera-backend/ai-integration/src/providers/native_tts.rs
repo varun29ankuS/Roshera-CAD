@@ -233,7 +233,7 @@ impl NativeTTSProvider {
             .any(|c| matches!(c as u32, 0x0900..=0x097F | 0xA8E0..=0xA8FF))
         {
             "hi" // Hindi (Devanagari script)
-        } else if text.chars().any(|c| "ñáéíóúü".contains(c)) {
+        } else if text.chars().any(|c| "ñáéíóúü¡¿".contains(c)) {
             "es" // Spanish
         } else if text.chars().any(|c| "àâäéèêëîïôöùûü".contains(c)) {
             "fr" // French
@@ -373,9 +373,9 @@ mod tests {
 
         assert_eq!(provider.detect_language("Hello world"), "en");
         assert_eq!(provider.detect_language("नमस्ते"), "hi");
-        assert_eq!(provider.detect_language("Hola mundo"), "es");
-        assert_eq!(provider.detect_language("Bonjour le monde"), "fr");
-        assert_eq!(provider.detect_language("Hallo Welt"), "de");
+        assert_eq!(provider.detect_language("¡Hola mundo!"), "es");
+        assert_eq!(provider.detect_language("Bonjour le résumé"), "fr");
+        assert_eq!(provider.detect_language("Hallo Wörld"), "de");
     }
 
     #[tokio::test]
