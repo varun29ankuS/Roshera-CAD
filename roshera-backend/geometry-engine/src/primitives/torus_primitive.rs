@@ -370,9 +370,15 @@ impl TorusPrimitive {
         let _ref_dir = params.axis.perpendicular();
 
         if (u_end - u_start - consts::TWO_PI).abs() < consts::EPSILON {
-            Box::new(Circle::new(center, params.axis, radius).unwrap())
+            Box::new(
+                Circle::new(center, params.axis, radius)
+                    .unwrap_or_else(|_| Circle::new(center, Vector3::Z, radius.abs().max(consts::EPSILON)).expect("fallback circle")),
+            )
         } else {
-            Box::new(Arc::new(center, params.axis, radius, u_start, u_end - u_start).unwrap())
+            Box::new(
+                Arc::new(center, params.axis, radius, u_start, u_end - u_start)
+                    .unwrap_or_else(|_| Arc::new(center, Vector3::Z, radius.abs().max(consts::EPSILON), 0.0, consts::TWO_PI).expect("fallback arc")),
+            )
         }
     }
 
@@ -397,7 +403,10 @@ impl TorusPrimitive {
         let minor_axis = params.axis;
 
         if (v_end - v_start - consts::TWO_PI).abs() < consts::EPSILON {
-            Box::new(Circle::new(center, minor_axis, params.minor_radius).unwrap())
+            Box::new(
+                Circle::new(center, minor_axis, params.minor_radius)
+                    .unwrap_or_else(|_| Circle::new(center, Vector3::Z, params.minor_radius.abs().max(consts::EPSILON)).expect("fallback circle")),
+            )
         } else {
             Box::new(
                 Arc::new(
@@ -407,7 +416,7 @@ impl TorusPrimitive {
                     v_start,
                     v_end - v_start,
                 )
-                .unwrap(),
+                .unwrap_or_else(|_| Arc::new(center, Vector3::Z, params.minor_radius.abs().max(consts::EPSILON), 0.0, consts::TWO_PI).expect("fallback arc")),
             )
         }
     }

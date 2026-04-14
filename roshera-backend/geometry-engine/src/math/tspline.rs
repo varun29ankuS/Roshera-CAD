@@ -397,7 +397,7 @@ impl TSplineMesh {
         }
 
         // Store cache
-        *self.topology_cache.write().unwrap() = cache;
+        *self.topology_cache.write().unwrap_or_else(|e| e.into_inner()) = cache;
     }
 
     /// Compute 1-ring neighborhood
@@ -994,7 +994,7 @@ impl TSplineMesh {
 
     /// Parallel evaluation on GPU (if available)
     pub fn evaluate_gpu(&self, parameters: &[(f64, f64)]) -> Vec<TEvalResult> {
-        if let Some(_gpu) = self.gpu_kernel {
+        if let Some(ref _gpu) = self.gpu_kernel {
             // Would dispatch to GPU
             vec![]
         } else {

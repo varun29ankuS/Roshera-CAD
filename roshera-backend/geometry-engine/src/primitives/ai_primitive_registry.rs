@@ -512,7 +512,7 @@ impl PrimitiveRegistry {
         model: &mut BRepModel,
     ) -> Result<AIResponse, PrimitiveError> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
 
         // Parse the natural language command
         let command = registry.parse_natural_language(description)?;
@@ -892,7 +892,9 @@ impl PrimitiveRegistry {
         primitive_type: &str,
         parameters: &HashMap<String, AIParameterValue>,
     ) -> f64 {
-        let primitive_info = self.primitives.get(primitive_type).unwrap();
+        let Some(primitive_info) = self.primitives.get(primitive_type) else {
+            return 0.0;
+        };
         let required_params = primitive_info.parameter_schema.parameters.len();
         let found_params = parameters.len();
 
@@ -920,7 +922,9 @@ impl PrimitiveRegistry {
 
     /// Generate helpful suggestions for low-confidence parsing
     fn generate_suggestions(&self, _text: &str, primitive_type: &str) -> Vec<String> {
-        let primitive_info = self.primitives.get(primitive_type).unwrap();
+        let Some(primitive_info) = self.primitives.get(primitive_type) else {
+            return vec![];
+        };
         let mut suggestions = vec![];
 
         // Suggest required parameters that weren't found
@@ -1318,7 +1322,7 @@ impl PrimitiveRegistry {
     /// Get the full AI catalog with all available primitives
     pub fn get_full_catalog() -> serde_json::Value {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
 
         // Serialize DashMap entries into a JSON object
         let mut json_obj = serde_json::Map::new();
@@ -1334,7 +1338,7 @@ impl PrimitiveRegistry {
     /// List all primitive names for AI discovery
     pub fn list_all_primitives() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
         registry
             .primitives
             .iter()
@@ -1345,7 +1349,7 @@ impl PrimitiveRegistry {
     /// Get examples for a specific primitive
     pub fn get_examples(primitive_type: &str) -> Vec<serde_json::Value> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
 
         registry
             .primitives
@@ -1579,7 +1583,7 @@ impl PrimitiveRegistry {
     /// Get AI optimization hints based on usage patterns (production implementation)
     pub fn get_optimization_hints() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
         let mut hints = Vec::new();
 
         // Analyze usage patterns using DashMap
@@ -1626,7 +1630,7 @@ impl PrimitiveRegistry {
 
         // Parse command with time tracking
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
         let parsed = registry.parse_natural_language(command)?;
 
         // Check if we're approaching timeout
@@ -1668,7 +1672,7 @@ pub mod gpu {
         // Production implementation would use CUDA/OpenCL for parallel processing
         // For now, fall back to CPU batch processing
         let registry = PrimitiveRegistry::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
         registry.execute_batch(commands.to_vec(), model)
     }
 }
@@ -1691,7 +1695,7 @@ pub mod ml {
             ];
         }
 
-        let last_command = history.last().unwrap().to_lowercase();
+        let last_command = history.last().expect("history non-empty after is_empty check").to_lowercase();
 
         // Simple pattern matching for common workflows
         if last_command.contains("box")

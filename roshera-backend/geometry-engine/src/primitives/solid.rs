@@ -289,7 +289,7 @@ impl Solid {
     pub fn add_feature(&mut self, feature: Feature) -> u32 {
         let id = feature.id;
         {
-            let mut features = self.features.write().unwrap();
+            let mut features = self.features.write().unwrap_or_else(|e| e.into_inner());
             features.insert(id, feature);
         } // Lock is dropped here
         self.invalidate_cache();
@@ -299,7 +299,7 @@ impl Solid {
     /// Suppress/unsuppress feature
     pub fn suppress_feature(&mut self, feature_id: u32, suppress: bool) -> bool {
         let result = {
-            let mut features = self.features.write().unwrap();
+            let mut features = self.features.write().unwrap_or_else(|e| e.into_inner());
             if let Some(feature) = features.get_mut(&feature_id) {
                 feature.suppressed = suppress;
                 true
@@ -316,13 +316,13 @@ impl Solid {
 
     /// Get feature by ID
     pub fn get_feature(&self, feature_id: u32) -> Option<Feature> {
-        let features = self.features.read().unwrap();
+        let features = self.features.read().unwrap_or_else(|e| e.into_inner());
         features.get(&feature_id).cloned()
     }
 
     /// Get features by type
     pub fn get_features_by_type(&self, feature_type: FeatureType) -> Vec<Feature> {
-        let features = self.features.read().unwrap();
+        let features = self.features.read().unwrap_or_else(|e| e.into_inner());
         features
             .values()
             .filter(|f| f.feature_type == feature_type && !f.suppressed)
@@ -332,13 +332,13 @@ impl Solid {
 
     /// Add history node
     pub fn add_history(&mut self, node: HistoryNode) {
-        let mut history = self.history.write().unwrap();
+        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
         history.push(node);
     }
 
     /// Get parametric history
     pub fn get_history(&self) -> Vec<HistoryNode> {
-        let history = self.history.read().unwrap();
+        let history = self.history.read().unwrap_or_else(|e| e.into_inner());
         history.clone()
     }
 
@@ -352,7 +352,7 @@ impl Solid {
         vertex_store: &VertexStore,
     ) -> MathResult<&SolidStats> {
         if self.cached_stats.is_some() {
-            return Ok(self.cached_stats.as_ref().unwrap());
+            return Ok(self.cached_stats.as_ref().expect("cached_stats present after is_some check"));
         }
 
         let mut total_faces = 0;
@@ -405,7 +405,7 @@ impl Solid {
         // For simple solid: χ = 2, so g = 0
         let genus = (2 - euler) / 2;
 
-        let features = self.features.read().unwrap();
+        let features = self.features.read().unwrap_or_else(|e| e.into_inner());
 
         self.cached_stats = Some(SolidStats {
             shell_count: 1 + self.inner_shells.len(),
@@ -419,7 +419,7 @@ impl Solid {
             bbox_max: max_pt,
         });
 
-        Ok(self.cached_stats.as_ref().unwrap())
+        Ok(self.cached_stats.as_ref().expect("cached_stats was just set"))
     }
 
     /// Calculate mass properties (cached)
@@ -434,7 +434,7 @@ impl Solid {
         surface_store: &SurfaceStore,
     ) -> MathResult<&SolidMassProperties> {
         if self.cached_mass_props.is_some() {
-            return Ok(self.cached_mass_props.as_ref().unwrap());
+            return Ok(self.cached_mass_props.as_ref().expect("cached_mass_props present after is_some check"));
         }
 
         // Calculate volume using divergence theorem
@@ -524,7 +524,7 @@ impl Solid {
             radius_of_gyration,
         });
 
-        Ok(self.cached_mass_props.as_ref().unwrap())
+        Ok(self.cached_mass_props.as_ref().expect("cached_mass_props was just set"))
     }
 
     /// Boolean operation with another solid.
@@ -555,7 +555,7 @@ impl Solid {
 
         // Add to history
         let history_id = {
-            let history = self.history.read().unwrap();
+            let history = self.history.read().unwrap_or_else(|e| e.into_inner());
             history.len() as u32
         }; // Lock is dropped here
 
@@ -609,7 +609,7 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().unwrap().len() as u32,
+            id: self.features.read().unwrap_or_else(|e| e.into_inner()).len() as u32,
             feature_type: FeatureType::Fillet,
             faces: new_faces.clone(),
             parent: None,
@@ -639,7 +639,7 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().unwrap().len() as u32,
+            id: self.features.read().unwrap_or_else(|e| e.into_inner()).len() as u32,
             feature_type: FeatureType::Chamfer,
             faces: new_faces.clone(),
             parent: None,
@@ -669,7 +669,7 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().unwrap().len() as u32,
+            id: self.features.read().unwrap_or_else(|e| e.into_inner()).len() as u32,
             feature_type: FeatureType::Shell,
             faces: Vec::new(),
             parent: None,

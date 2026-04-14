@@ -76,10 +76,10 @@ impl Default for BasisCache {
     fn default() -> Self {
         Self {
             n_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1000).unwrap(),
+                const { std::num::NonZeroUsize::new(1000).expect("1000 is non-zero") },
             )),
             dn_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(500).unwrap(),
+                const { std::num::NonZeroUsize::new(500).expect("500 is non-zero") },
             )),
         }
     }
@@ -566,22 +566,22 @@ impl NurbsCurve {
 
         // Compute 2nd derivative if requested
         let derivative2 = if num_derivatives >= 2 {
-            let d2_sum_x = d2_x.as_array_ref().iter().sum::<f64>();
-            let d2_sum_y = d2_y.as_array_ref().iter().sum::<f64>();
-            let d2_sum_z = d2_z.as_array_ref().iter().sum::<f64>();
-            let dw2 = d2_w.as_array_ref().iter().sum::<f64>();
-            let dw1 = d1_w.as_array_ref().iter().sum::<f64>();
+            if let Some(d1) = derivative1 {
+                let d2_sum_x = d2_x.as_array_ref().iter().sum::<f64>();
+                let d2_sum_y = d2_y.as_array_ref().iter().sum::<f64>();
+                let d2_sum_z = d2_z.as_array_ref().iter().sum::<f64>();
+                let dw2 = d2_w.as_array_ref().iter().sum::<f64>();
+                let dw1 = d1_w.as_array_ref().iter().sum::<f64>();
 
-            // Second derivative of rational curve (complex quotient rule)
-            let d1_x = derivative1.unwrap().x;
-            let d1_y = derivative1.unwrap().y;
-            let d1_z = derivative1.unwrap().z;
-
-            Some(Vector3::new(
-                (d2_sum_x - sum_x * dw2 * inv_w - 2.0 * d1_x * dw1 * sum_w) * inv_w * inv_w,
-                (d2_sum_y - sum_y * dw2 * inv_w - 2.0 * d1_y * dw1 * sum_w) * inv_w * inv_w,
-                (d2_sum_z - sum_z * dw2 * inv_w - 2.0 * d1_z * dw1 * sum_w) * inv_w * inv_w,
-            ))
+                // Second derivative of rational curve (complex quotient rule)
+                Some(Vector3::new(
+                    (d2_sum_x - sum_x * dw2 * inv_w - 2.0 * d1.x * dw1 * sum_w) * inv_w * inv_w,
+                    (d2_sum_y - sum_y * dw2 * inv_w - 2.0 * d1.y * dw1 * sum_w) * inv_w * inv_w,
+                    (d2_sum_z - sum_z * dw2 * inv_w - 2.0 * d1.z * dw1 * sum_w) * inv_w * inv_w,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1132,7 +1132,8 @@ impl NurbsCurve {
 
         self.control_points = new_control_points;
         self.weights = new_weights;
-        self.knots = KnotVector::new(new_knots).unwrap();
+        self.knots =
+            KnotVector::new(new_knots).map_err(|_| "Failed to create elevated knot vector")?;
         self.degree = new_degree;
         self.basis_cache = Some(Arc::new(BasisCache::default()));
 
