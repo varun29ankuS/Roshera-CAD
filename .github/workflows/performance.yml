@@ -39,18 +39,22 @@ jobs:
         cargo build --release --bin bench_runner
         ./target/release/bench_runner > bench-results.json
       working-directory: ./roshera-backend
-    
+
+    - name: Fetch gh-pages branch
+      run: git fetch origin gh-pages:gh-pages || echo "gh-pages branch does not exist yet"
+
     - name: Store benchmark results
       uses: benchmark-action/github-action-benchmark@v1
       with:
         tool: 'customSmallerIsBetter'
         output-file-path: roshera-backend/bench-results.json
         github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: true
+        auto-push: ${{ github.ref == 'refs/heads/main' }}
         comment-on-alert: true
         alert-threshold: '150%'
         fail-on-alert: false
         benchmark-data-dir-path: 'dev/bench'
+        skip-fetch-gh-pages: true
 
   memory-profile:
     name: Memory Usage
