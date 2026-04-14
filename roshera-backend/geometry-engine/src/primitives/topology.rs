@@ -77,7 +77,10 @@ impl<'a> TopologyContext<'a> {
     pub fn adjacency(&self) -> MathResult<Arc<AdjacencyInfo>> {
         // Check cache first
         {
-            let cache = self.adjacency_cache.read().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .adjacency_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref adjacency) = *cache {
                 return Ok(Arc::new(adjacency.clone()));
             }
@@ -88,7 +91,10 @@ impl<'a> TopologyContext<'a> {
 
         // Cache it
         {
-            let mut cache = self.adjacency_cache.write().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self
+                .adjacency_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             *cache = Some(adjacency.clone());
         }
 
@@ -750,7 +756,10 @@ fn compute_entity_differences(counts1: &[usize; 7], counts2: &[usize; 7]) -> Has
 }
 
 /// Find all cycles in edge graph
-pub fn find_edge_cycles(_adjacency: &AdjacencyInfo, _max_length: Option<usize>) -> Vec<Vec<EdgeId>> {
+pub fn find_edge_cycles(
+    _adjacency: &AdjacencyInfo,
+    _max_length: Option<usize>,
+) -> Vec<Vec<EdgeId>> {
     // Implementation would use cycle detection algorithm
     Vec::new()
 }

@@ -7,9 +7,7 @@ use crate::permissions::UserPermissions;
 use dashmap::DashMap;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use shared_types::{
-    CADObject, CommandResult, GeometryId, SessionError, SessionState,
-};
+use shared_types::{CADObject, CommandResult, GeometryId, SessionError, SessionState};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::Arc;

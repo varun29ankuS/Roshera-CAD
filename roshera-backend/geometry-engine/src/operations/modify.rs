@@ -6,8 +6,8 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
-    edge::EdgeId, face::FaceId, r#loop::LoopId, solid::SolidId,
-    topology_builder::BRepModel, vertex::VertexId,
+    edge::EdgeId, face::FaceId, r#loop::LoopId, solid::SolidId, topology_builder::BRepModel,
+    vertex::VertexId,
 };
 
 /// Type of modification operation

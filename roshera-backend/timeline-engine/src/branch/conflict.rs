@@ -1,8 +1,6 @@
 //! Conflict resolution for branch merging
 
-use super::merge::{
-    ConflictResolution, ConflictStrategy, ConflictType, MergeConflict,
-};
+use super::merge::{ConflictResolution, ConflictStrategy, ConflictType, MergeConflict};
 use crate::{EntityId, Operation, TimelineError, TimelineResult};
 use std::collections::{HashMap, HashSet};
 

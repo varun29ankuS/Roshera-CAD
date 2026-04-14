@@ -1,9 +1,7 @@
 //! Cache for operation results
 
 use super::{CacheStats, CachedItem};
-use crate::{
-    BranchId, EntityId, EntityType, OperationOutputs,
-};
+use crate::{BranchId, EntityId, EntityType, OperationOutputs};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lru::LruCache;

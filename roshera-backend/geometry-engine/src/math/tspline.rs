@@ -397,7 +397,10 @@ impl TSplineMesh {
         }
 
         // Store cache
-        *self.topology_cache.write().unwrap_or_else(|e| e.into_inner()) = cache;
+        *self
+            .topology_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = cache;
     }
 
     /// Compute 1-ring neighborhood

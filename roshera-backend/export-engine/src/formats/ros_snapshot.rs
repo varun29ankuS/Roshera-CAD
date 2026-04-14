@@ -266,7 +266,11 @@ impl BRepSnapshot {
             snapshot.loops.push((
                 uuid,
                 LoopData {
-                    edges: loop_.edges.iter().map(|&eid| id_to_uuid(eid as u64)).collect(),
+                    edges: loop_
+                        .edges
+                        .iter()
+                        .map(|&eid| id_to_uuid(eid as u64))
+                        .collect(),
                     orientations: loop_.orientations.clone(),
                     is_outer: matches!(loop_.loop_type, LoopType::Outer),
                 },
@@ -307,7 +311,11 @@ impl BRepSnapshot {
             snapshot.shells.push((
                 uuid,
                 ShellData {
-                    faces: shell.faces.iter().map(|&fid| id_to_uuid(fid as u64)).collect(),
+                    faces: shell
+                        .faces
+                        .iter()
+                        .map(|&fid| id_to_uuid(fid as u64))
+                        .collect(),
                     is_closed: matches!(shell.shell_type, GeoShellType::Closed),
                     shell_type: match shell.shell_type {
                         GeoShellType::Closed => ShellType::Closed,
@@ -486,7 +494,9 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
             .map(|row| row.iter().map(|p| [p.x, p.y, p.z]).collect())
             .collect();
         let weights: Vec<Vec<f64>> = nurbs_surf.nurbs.weights.clone();
-        let all_unit = weights.iter().all(|row| row.iter().all(|&w| (w - 1.0).abs() < 1e-12));
+        let all_unit = weights
+            .iter()
+            .all(|row| row.iter().all(|&w| (w - 1.0).abs() < 1e-12));
 
         if all_unit {
             return SurfaceData::BSpline {

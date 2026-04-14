@@ -7,7 +7,7 @@
 //! - Per-chunk and file-level encryption
 //! - Authenticated encryption with additional data (AEAD)
 
- // Add this line to bring the trait into scope
+// Add this line to bring the trait into scope
 use crate::ros_fs::keys::{KeySet, SecureKey};
 use crate::ros_fs::util::constant_time_eq;
 use crate::ros_fs::{EncryptionError, Result};

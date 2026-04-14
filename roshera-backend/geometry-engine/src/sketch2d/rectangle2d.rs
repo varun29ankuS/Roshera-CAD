@@ -232,9 +232,7 @@ impl Rectangle2d {
             let min_dist = edges
                 .iter()
                 .map(|edge| edge.distance_to_point(point))
-                .min_by(|a, b| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or(0.0);
             -min_dist
         } else {

@@ -1990,7 +1990,6 @@ impl Cylinder {
 
             // For skew cylinders, the intersection is generally a space curve
             // We'll use a marching approach to find it
-            
 
             // Start with a grid of test points on first cylinder
             const THETA_SAMPLES: usize = 24;

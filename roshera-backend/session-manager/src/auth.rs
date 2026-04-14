@@ -586,8 +586,6 @@ impl AuthManager {
 
     /// Enable 2FA for user
     pub fn enable_2fa(&self, user_id: &str) -> Result<(String, Vec<String>), SessionError> {
-        
-
         // Generate secret
         let secret = base32::encode(
             base32::Alphabet::RFC4648 { padding: false },

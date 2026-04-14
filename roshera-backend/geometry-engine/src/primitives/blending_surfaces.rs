@@ -651,8 +651,6 @@ impl Surface for G2BlendingSurface {
         _other: &dyn Surface,
         _tolerance: Tolerance,
     ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
-        
-
         // G2 blending surface intersection uses adaptive subdivision
         // Production implementation would:
         // 1. Use bounding box tests for early rejection

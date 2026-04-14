@@ -79,7 +79,6 @@ pub use timeline_types::{
     OperationOutputs, TimelineError, TimelineEvent,
 };
 
-
 /// Unique identifier type for objects
 pub type ObjectId = uuid::Uuid;
 

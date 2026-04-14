@@ -13,10 +13,7 @@
 
 use super::constraints::EntityRef;
 use super::line2d::LineGeometry;
-use super::{
-    Point2d,
-    Sketch2dError, Sketch2dResult, Tolerance2d, Vector2d,
-};
+use super::{Point2d, Sketch2dError, Sketch2dResult, Tolerance2d, Vector2d};
 use dashmap::DashMap;
 use std::sync::Arc;
 

@@ -778,7 +778,6 @@ fn compute_fillet_trim_curves(
     face1_id: FaceId,
     face2_id: FaceId,
 ) -> OperationResult<(Vec<Point3>, Vec<Point3>)> {
-    
     // use crate::math::tolerance::NORMAL_TOLERANCE;
 
     // For trim curve computation, we use the contact curves from the rolling ball data

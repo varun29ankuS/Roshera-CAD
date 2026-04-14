@@ -279,7 +279,10 @@ impl IncrementalCache {
 
     /// Get partial tessellation if available
     pub fn get_partial(&self, key: &CacheKey) -> Option<(ThreeJsMesh, f32)> {
-        let cache = self.partial_results.read().unwrap_or_else(|e| e.into_inner());
+        let cache = self
+            .partial_results
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         cache
             .get(key)
             .map(|partial| (partial.mesh.clone(), partial.progress))
@@ -293,7 +296,10 @@ impl IncrementalCache {
         face_mesh: &ThreeJsMesh,
         total_faces: usize,
     ) {
-        let mut cache = self.partial_results.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .partial_results
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let partial = cache.entry(key).or_insert_with(|| PartialTessellation {
             completed_faces: Vec::new(),
             mesh: ThreeJsMesh::new(),
@@ -307,7 +313,10 @@ impl IncrementalCache {
 
     /// Mark tessellation as complete and remove from partial cache
     pub fn complete(&self, key: &CacheKey) {
-        let mut cache = self.partial_results.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .partial_results
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         cache.remove(key);
     }
 }

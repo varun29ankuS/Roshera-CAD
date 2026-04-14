@@ -211,8 +211,14 @@ impl Shell {
         face_store: &FaceStore,
         loop_store: &LoopStore,
     ) -> MathResult<()> {
-        let mut edge_conn = self.edge_connectivity.write().unwrap_or_else(|e| e.into_inner());
-        let mut face_adj = self.face_adjacency.write().unwrap_or_else(|e| e.into_inner());
+        let mut edge_conn = self
+            .edge_connectivity
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut face_adj = self
+            .face_adjacency
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
 
         edge_conn.clear();
         face_adj.clear();
@@ -303,7 +309,10 @@ impl Shell {
 
     /// Get face adjacency information
     pub fn get_adjacent_faces(&self, face_id: FaceId) -> Vec<FaceId> {
-        let face_adj = self.face_adjacency.read().unwrap_or_else(|e| e.into_inner());
+        let face_adj = self
+            .face_adjacency
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(adj) = face_adj.get(&face_id) {
             let mut adjacent = HashSet::new();
             for faces in adj.adjacent_faces.values() {
@@ -317,7 +326,10 @@ impl Shell {
 
     /// Get boundary edges
     pub fn get_boundary_edges(&self) -> Vec<EdgeId> {
-        let edge_conn = self.edge_connectivity.read().unwrap_or_else(|e| e.into_inner());
+        let edge_conn = self
+            .edge_connectivity
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         edge_conn
             .iter()
             .filter(|(_, conn)| conn.is_boundary)
@@ -327,7 +339,10 @@ impl Shell {
 
     /// Get non-manifold edges
     pub fn get_non_manifold_edges(&self) -> Vec<EdgeId> {
-        let edge_conn = self.edge_connectivity.read().unwrap_or_else(|e| e.into_inner());
+        let edge_conn = self
+            .edge_connectivity
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         edge_conn
             .iter()
             .filter(|(_, conn)| conn.is_non_manifold)
@@ -344,7 +359,10 @@ impl Shell {
         vertex_store: &VertexStore,
     ) -> MathResult<&ShellStats> {
         if self.cached_stats.is_some() {
-            return Ok(self.cached_stats.as_ref().expect("cached_stats present after is_some check"));
+            return Ok(self
+                .cached_stats
+                .as_ref()
+                .expect("cached_stats present after is_some check"));
         }
 
         let mut vertices = HashSet::new();
@@ -390,7 +408,10 @@ impl Shell {
         }
 
         // Count boundary and non-manifold edges
-        let edge_conn = self.edge_connectivity.read().unwrap_or_else(|e| e.into_inner());
+        let edge_conn = self
+            .edge_connectivity
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         for conn in edge_conn.values() {
             if conn.is_boundary {
                 boundary_edges += 1;
@@ -424,7 +445,10 @@ impl Shell {
             bbox_max: max_pt,
         });
 
-        Ok(self.cached_stats.as_ref().expect("cached_stats was just set"))
+        Ok(self
+            .cached_stats
+            .as_ref()
+            .expect("cached_stats was just set"))
     }
 
     /// Calculate mass properties (cached)
@@ -439,7 +463,10 @@ impl Shell {
         density: f64,
     ) -> MathResult<&MassProperties> {
         if self.cached_mass_props.is_some() {
-            return Ok(self.cached_mass_props.as_ref().expect("cached_mass_props present after is_some check"));
+            return Ok(self
+                .cached_mass_props
+                .as_ref()
+                .expect("cached_mass_props present after is_some check"));
         }
 
         let mut total_area = 0.0;
@@ -512,7 +539,10 @@ impl Shell {
             principal_axes,
         });
 
-        Ok(self.cached_mass_props.as_ref().expect("cached_mass_props was just set"))
+        Ok(self
+            .cached_mass_props
+            .as_ref()
+            .expect("cached_mass_props was just set"))
     }
 
     /// Advanced point-in-shell test using winding number
@@ -786,7 +816,10 @@ impl Shell {
         _face_store: &FaceStore,
         _loop_store: &LoopStore,
     ) -> MathResult<HashSet<EdgeId>> {
-        let edge_conn = self.edge_connectivity.read().unwrap_or_else(|e| e.into_inner());
+        let edge_conn = self
+            .edge_connectivity
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         Ok(edge_conn.keys().cloned().collect())
     }
 

@@ -13,8 +13,8 @@
 
 use super::constraints::EntityRef;
 use super::{
-    Constraint, ConstraintId, ConstraintType,
-    DimensionalConstraint, GeometricConstraint, Point2d, Vector2d,
+    Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
+    Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use dashmap::DashMap;

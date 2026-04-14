@@ -9,9 +9,7 @@ use crate::primitives::blending_surfaces::{
     QuarticG2Blend, VariableG2Blend,
 };
 use crate::primitives::curve::Curve;
-use crate::primitives::surface::{
-    G2VerificationReport, Surface, SurfaceContinuity,
-};
+use crate::primitives::surface::{G2VerificationReport, Surface, SurfaceContinuity};
 
 /// G2 blending operation factory with automatic quality optimization
 pub struct G2BlendingOperations;

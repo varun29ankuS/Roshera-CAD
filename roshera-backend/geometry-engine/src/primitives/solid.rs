@@ -352,7 +352,10 @@ impl Solid {
         vertex_store: &VertexStore,
     ) -> MathResult<&SolidStats> {
         if self.cached_stats.is_some() {
-            return Ok(self.cached_stats.as_ref().expect("cached_stats present after is_some check"));
+            return Ok(self
+                .cached_stats
+                .as_ref()
+                .expect("cached_stats present after is_some check"));
         }
 
         let mut total_faces = 0;
@@ -419,7 +422,10 @@ impl Solid {
             bbox_max: max_pt,
         });
 
-        Ok(self.cached_stats.as_ref().expect("cached_stats was just set"))
+        Ok(self
+            .cached_stats
+            .as_ref()
+            .expect("cached_stats was just set"))
     }
 
     /// Calculate mass properties (cached)
@@ -434,7 +440,10 @@ impl Solid {
         surface_store: &SurfaceStore,
     ) -> MathResult<&SolidMassProperties> {
         if self.cached_mass_props.is_some() {
-            return Ok(self.cached_mass_props.as_ref().expect("cached_mass_props present after is_some check"));
+            return Ok(self
+                .cached_mass_props
+                .as_ref()
+                .expect("cached_mass_props present after is_some check"));
         }
 
         // Calculate volume using divergence theorem
@@ -524,7 +533,10 @@ impl Solid {
             radius_of_gyration,
         });
 
-        Ok(self.cached_mass_props.as_ref().expect("cached_mass_props was just set"))
+        Ok(self
+            .cached_mass_props
+            .as_ref()
+            .expect("cached_mass_props was just set"))
     }
 
     /// Boolean operation with another solid.
@@ -609,7 +621,11 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().unwrap_or_else(|e| e.into_inner()).len() as u32,
+            id: self
+                .features
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len() as u32,
             feature_type: FeatureType::Fillet,
             faces: new_faces.clone(),
             parent: None,
@@ -639,7 +655,11 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().unwrap_or_else(|e| e.into_inner()).len() as u32,
+            id: self
+                .features
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len() as u32,
             feature_type: FeatureType::Chamfer,
             faces: new_faces.clone(),
             parent: None,
@@ -669,7 +689,11 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().unwrap_or_else(|e| e.into_inner()).len() as u32,
+            id: self
+                .features
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len() as u32,
             feature_type: FeatureType::Shell,
             faces: Vec::new(),
             parent: None,

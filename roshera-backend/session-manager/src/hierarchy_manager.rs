@@ -1,6 +1,6 @@
 use shared_types::hierarchy::{
-    Assembly, EditContext, HierarchyCommand, HierarchyNode, HierarchyUpdate,
-    PartDefinition, PartInstance, ProjectHierarchy, Transform, WorkflowStage, WorkflowState,
+    Assembly, EditContext, HierarchyCommand, HierarchyNode, HierarchyUpdate, PartDefinition,
+    PartInstance, ProjectHierarchy, Transform, WorkflowStage, WorkflowState,
 };
 use std::collections::HashMap;
 use std::sync::Arc;

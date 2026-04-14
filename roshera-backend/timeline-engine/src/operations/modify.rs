@@ -1,7 +1,8 @@
 //! Modification operations
 
 use crate::{
-    execution::{ExecutionContext, OperationImpl, ResourceEstimate}, Modification, Operation, OperationOutputs, TimelineError, TimelineResult,
+    execution::{ExecutionContext, OperationImpl, ResourceEstimate},
+    Modification, Operation, OperationOutputs, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 
