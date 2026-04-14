@@ -136,3 +136,4 @@ impl SmartRouter {
         &self.config.mode
     }
 }
+
