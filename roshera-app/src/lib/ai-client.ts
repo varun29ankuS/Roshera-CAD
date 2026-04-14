@@ -100,51 +100,80 @@ export async function sendAICommandStreaming(
 }
 
 /**
- * High-level: send a user message, get AI response, update chat store.
+ * High-level: send a user message, get AI response via streaming SSE,
+ * updating the chat message progressively. Falls back to non-streaming
+ * if the stream endpoint is unavailable.
  */
 export async function processUserMessage(text: string, sessionId?: string) {
   const store = useChatStore.getState()
   const wsSession = useWSStore.getState().sessionId
+  const sid = sessionId || wsSession || undefined
 
   store.addMessage({ role: 'user', content: text })
   store.setProcessing(true)
 
+  // Create a placeholder assistant message for progressive updates
+  const msgId = store.addMessage({ role: 'assistant', content: '' })
+  let accumulated = ''
+
   try {
-    const resp = await sendAICommand(text, sessionId || wsSession || undefined)
-
-    if (resp.success && resp.result?.result) {
-      const r = resp.result.result
-      const message = r.message || 'Command executed.'
-      const objectId = r.object_id
-      store.addMessage({
-        role: 'assistant',
-        content: message,
-        objectsAffected: objectId ? [objectId] : undefined,
-      })
-    } else if (resp.error) {
-      store.addMessage({
-        role: 'assistant',
-        content: resp.error,
-        isError: true,
-      })
-    } else {
-      store.addMessage({
-        role: 'assistant',
-        content: 'Command processed.',
-      })
-    }
-
-    // Store session ID if returned
-    if (resp.session_id) {
-      useWSStore.getState().setSessionId(resp.session_id)
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error'
-    store.addMessage({
-      role: 'assistant',
-      content: `Failed to reach backend: ${message}`,
-      isError: true,
+    await sendAICommandStreaming(text, sid, (chunk) => {
+      accumulated += chunk
+      useChatStore.getState().updateMessageContent(msgId, accumulated)
     })
+
+    // If streaming completed but no content arrived, show fallback text
+    if (!accumulated) {
+      useChatStore.getState().updateMessageContent(msgId, 'Command processed.')
+    }
+  } catch {
+    // Stream endpoint unavailable — fall back to blocking request
+    try {
+      const resp = await sendAICommand(text, sid)
+
+      if (resp.success && resp.result?.result) {
+        const r = resp.result.result
+        const message = r.message || 'Command executed.'
+        useChatStore.getState().updateMessageContent(msgId, message)
+
+        if (r.object_id) {
+          // Update the message with affected objects metadata
+          const current = useChatStore.getState().messages.find((m) => m.id === msgId)
+          if (current) {
+            useChatStore.setState((state) => ({
+              messages: state.messages.map((m) =>
+                m.id === msgId
+                  ? { ...m, objectsAffected: [r.object_id!] }
+                  : m,
+              ),
+            }))
+          }
+        }
+      } else if (resp.error) {
+        useChatStore.setState((state) => ({
+          messages: state.messages.map((m) =>
+            m.id === msgId
+              ? { ...m, content: resp.error!, isError: true }
+              : m,
+          ),
+        }))
+      } else {
+        useChatStore.getState().updateMessageContent(msgId, 'Command processed.')
+      }
+
+      if (resp.session_id) {
+        useWSStore.getState().setSessionId(resp.session_id)
+      }
+    } catch (fallbackErr) {
+      const message = fallbackErr instanceof Error ? fallbackErr.message : 'Unknown error'
+      useChatStore.setState((state) => ({
+        messages: state.messages.map((m) =>
+          m.id === msgId
+            ? { ...m, content: `Failed to reach backend: ${message}`, isError: true }
+            : m,
+        ),
+      }))
+    }
   } finally {
     store.setProcessing(false)
   }
