@@ -1618,14 +1618,9 @@ fn march_from_point(
 
             // Take a step
             let next_pos = current.position
-                + tangent
-                    .normalize()
-                    .map_err(|e| {
-                        OperationError::InternalError(format!(
-                            "Failed to normalize tangent: {e}"
-                        ))
-                    })?
-                    * step_size
+                + tangent.normalize().map_err(|e| {
+                    OperationError::InternalError(format!("Failed to normalize tangent: {e}"))
+                })? * step_size
                     * *direction;
 
             // Project onto both surfaces
