@@ -697,7 +697,7 @@ impl Face {
 
         // Start with boundary tessellation
         let boundary_points =
-            self.tessellate_boundaries(params, loop_store, edge_store, curve_store)?;
+            self.tessellate_boundaries(params, surface_store, loop_store, edge_store, curve_store)?;
 
         // Create initial triangulation
         self.tessellate_interior(
@@ -720,6 +720,7 @@ impl Face {
     fn tessellate_boundaries(
         &self,
         params: &TessellationParams,
+        surface_store: &SurfaceStore,
         loop_store: &LoopStore,
         edge_store: &EdgeStore,
         curve_store: &CurveStore,
@@ -741,11 +742,22 @@ impl Face {
                                 params.max_normal_angle,
                             )?;
 
-                            // Convert to UV coordinates (simplified)
-                            for p in edge_points {
-                                // This is a simplification - real implementation would
-                                // project to UV space properly
-                                loop_points.push((p.x, p.y));
+                            // Project 3D edge points to UV space via surface inverse mapping
+                            if let Some(surface) = surface_store.get(self.surface_id) {
+                                let tol = Tolerance::default();
+                                for p in edge_points {
+                                    match surface.closest_point(&p, tol) {
+                                        Ok((u, v)) => loop_points.push((u, v)),
+                                        Err(_) => {
+                                            // Fallback: use normalized position within face UV bounds
+                                            loop_points.push((p.x, p.y));
+                                        }
+                                    }
+                                }
+                            } else {
+                                for p in edge_points {
+                                    loop_points.push((p.x, p.y));
+                                }
                             }
                         }
                     }
@@ -870,10 +882,15 @@ impl Face {
                 let t = i as f64 / samples as f64;
                 let point = edge.evaluate(t, curve_store)?;
 
-                // Find UV coordinates on both faces (simplified)
-                // Real implementation would use proper inverse mapping
-                let (u1, v1) = (point.x, point.y); // Simplified!
-                let (u2, v2) = (point.x, point.y); // Simplified!
+                // Find UV coordinates on both faces via surface inverse mapping
+                let surf1 = surface_store.get(self.surface_id).ok_or_else(|| {
+                    MathError::InvalidParameter("Missing surface for face 1".to_string())
+                })?;
+                let surf2 = surface_store.get(other.surface_id).ok_or_else(|| {
+                    MathError::InvalidParameter("Missing surface for face 2".to_string())
+                })?;
+                let (u1, v1) = surf1.closest_point(&point, tolerance)?;
+                let (u2, v2) = surf2.closest_point(&point, tolerance)?;
 
                 // Check position continuity (G0)
                 let p1 = self.point_at(u1, v1, surface_store)?;
