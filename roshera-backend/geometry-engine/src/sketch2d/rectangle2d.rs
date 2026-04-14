@@ -154,11 +154,17 @@ impl Rectangle2d {
     pub fn edges(&self) -> [LineSegment2d; 4] {
         let corners = self.corners();
 
+        // Rectangle2d invariant: width > 0 and height > 0 guarantee all adjacent corners are
+        // distinct, so LineSegment2d::new cannot fail here.
         [
-            LineSegment2d::new(corners[0], corners[1]).unwrap(), // Bottom
-            LineSegment2d::new(corners[1], corners[2]).unwrap(), // Right
-            LineSegment2d::new(corners[2], corners[3]).unwrap(), // Top
-            LineSegment2d::new(corners[3], corners[0]).unwrap(), // Left
+            LineSegment2d::new(corners[0], corners[1])
+                .unwrap_or_else(|_| unreachable!("Rectangle2d corners[0,1] are always distinct")),
+            LineSegment2d::new(corners[1], corners[2])
+                .unwrap_or_else(|_| unreachable!("Rectangle2d corners[1,2] are always distinct")),
+            LineSegment2d::new(corners[2], corners[3])
+                .unwrap_or_else(|_| unreachable!("Rectangle2d corners[2,3] are always distinct")),
+            LineSegment2d::new(corners[3], corners[0])
+                .unwrap_or_else(|_| unreachable!("Rectangle2d corners[3,0] are always distinct")),
         ]
     }
 
@@ -204,6 +210,7 @@ impl Rectangle2d {
     /// Find the closest point on the rectangle boundary to a given point
     pub fn closest_point_on_boundary(&self, point: &Point2d) -> Point2d {
         let edges = self.edges();
+        let first = edges[0].closest_point(point);
 
         edges
             .iter()
@@ -211,9 +218,9 @@ impl Rectangle2d {
             .min_by(|p1, p2| {
                 let d1 = point.distance_squared_to(p1);
                 let d2 = point.distance_squared_to(p2);
-                d1.partial_cmp(&d2).unwrap()
+                d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .unwrap()
+            .unwrap_or(first)
     }
 
     /// Distance from a point to the rectangle boundary
@@ -222,11 +229,14 @@ impl Rectangle2d {
         if self.contains_point(point) {
             // Point is inside, find distance to nearest edge
             let edges = self.edges();
-            -edges
+            let min_dist = edges
                 .iter()
                 .map(|edge| edge.distance_to_point(point))
-                .min_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap()
+                .min_by(|a, b| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0.0);
+            -min_dist
         } else {
             // Point is outside
             let closest = self.closest_point_on_boundary(point);

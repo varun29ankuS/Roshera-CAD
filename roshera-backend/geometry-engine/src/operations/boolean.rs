@@ -1740,8 +1740,8 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
             let i = index.floor() as usize;
             let frac = index - i as f64;
 
-            if i >= params.len() - 1 {
-                params.last().unwrap().0
+            if i >= params.len().saturating_sub(1) {
+                params.last().map(|p| p.0).unwrap_or(0.0)
             } else {
                 params[i].0 * (1.0 - frac) + params[i + 1].0 * frac
             }
@@ -1751,8 +1751,8 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
             let i = index.floor() as usize;
             let frac = index - i as f64;
 
-            if i >= params_clone.len() - 1 {
-                params_clone.last().unwrap().1
+            if i >= params_clone.len().saturating_sub(1) {
+                params_clone.last().map(|p| p.1).unwrap_or(0.0)
             } else {
                 params_clone[i].1 * (1.0 - frac) + params_clone[i + 1].1 * frac
             }

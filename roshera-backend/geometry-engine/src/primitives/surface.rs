@@ -4581,18 +4581,7 @@ impl Surface for GeneralNurbsSurface {
             self.nurbs.degree_u,
             self.nurbs.degree_v,
         )
-        .unwrap_or_else(|_| {
-            // If creation fails, return a clone
-            crate::math::nurbs::NurbsSurface::new(
-                self.nurbs.control_points.clone(),
-                self.nurbs.weights.clone(),
-                self.nurbs.knots_u.to_vec(),
-                self.nurbs.knots_v.to_vec(),
-                self.nurbs.degree_u,
-                self.nurbs.degree_v,
-            )
-            .unwrap()
-        });
+        .unwrap_or_else(|_| self.nurbs.clone());
 
         Box::new(GeneralNurbsSurface {
             nurbs: transformed_nurbs,

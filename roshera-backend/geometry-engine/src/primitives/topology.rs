@@ -77,7 +77,7 @@ impl<'a> TopologyContext<'a> {
     pub fn adjacency(&self) -> MathResult<Arc<AdjacencyInfo>> {
         // Check cache first
         {
-            let cache = self.adjacency_cache.read().unwrap();
+            let cache = self.adjacency_cache.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ref adjacency) = *cache {
                 return Ok(Arc::new(adjacency.clone()));
             }
@@ -88,7 +88,7 @@ impl<'a> TopologyContext<'a> {
 
         // Cache it
         {
-            let mut cache = self.adjacency_cache.write().unwrap();
+            let mut cache = self.adjacency_cache.write().unwrap_or_else(|e| e.into_inner());
             *cache = Some(adjacency.clone());
         }
 
