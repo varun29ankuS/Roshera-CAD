@@ -802,7 +802,7 @@ mod tests {
         let mut tracker = DeltaTracker::new(session_id);
 
         // Create initial state
-        let mut old_state = SessionState::new(ObjectId::new_v4());
+        let mut old_state = SessionState::new(ObjectId::new_v4(), "test-owner".to_string());
         old_state.id = session_id;
 
         // Create new state with changes
@@ -856,7 +856,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let mut tracker = DeltaTracker::new(session_id);
 
-        let mut state = SessionState::new(ObjectId::new_v4());
+        let mut state = SessionState::new(ObjectId::new_v4(), "test-owner".to_string());
         state.id = session_id;
 
         // Create delta
@@ -873,6 +873,8 @@ mod tests {
                     id: obj_id,
                     name: "Box1".to_string(),
                     mesh: Mesh::new(),
+                    analytical_geometry: None,
+                    cached_meshes: HashMap::new(),
                     transform: Transform3D::identity(),
                     material: shared_types::geometry::MaterialProperties {
                         diffuse_color: [0.5, 0.5, 0.5, 1.0],
@@ -929,6 +931,8 @@ mod tests {
                     id: obj_id1,
                     name: "Box1".to_string(),
                     mesh: Mesh::new(),
+                    analytical_geometry: None,
+                    cached_meshes: HashMap::new(),
                     transform: Transform3D::identity(),
                     material: shared_types::geometry::MaterialProperties {
                         diffuse_color: [0.5, 0.5, 0.5, 1.0],
@@ -965,6 +969,8 @@ mod tests {
                     id: obj_id2,
                     name: "Box2".to_string(),
                     mesh: Mesh::new(),
+                    analytical_geometry: None,
+                    cached_meshes: HashMap::new(),
                     transform: Transform3D::identity(),
                     material: shared_types::geometry::MaterialProperties {
                         diffuse_color: [0.5, 0.5, 0.5, 1.0],

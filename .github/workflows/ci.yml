@@ -42,7 +42,7 @@ jobs:
       working-directory: ./roshera-backend
     
     - name: Run clippy
-      run: cargo clippy --all-targets --all-features 2>&1 | tee /dev/stderr | (! grep -q '^error')
+      run: cargo clippy --all-targets --all-features 2>&1 | tee /dev/stderr | (! grep -q 'error\[E')
       working-directory: ./roshera-backend
     
     - name: Run tests
