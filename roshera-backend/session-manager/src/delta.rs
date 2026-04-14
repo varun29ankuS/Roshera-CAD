@@ -816,6 +816,8 @@ mod tests {
                 id: obj_id,
                 name: "Box1".to_string(),
                 mesh: Mesh::new(),
+                analytical_geometry: None,
+                cached_meshes: HashMap::new(),
                 transform: Transform3D::identity(),
                 material: shared_types::geometry::MaterialProperties {
                     diffuse_color: [0.5, 0.5, 0.5, 1.0],
