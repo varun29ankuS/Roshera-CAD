@@ -119,7 +119,7 @@ impl ParallelTessellator {
             .collect();
 
         // Sort by complexity (descending) for better load balancing
-        face_complexities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        face_complexities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Process faces in parallel with work stealing
         let meshes = Arc::new(Mutex::new(Vec::new()));
