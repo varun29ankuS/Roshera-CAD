@@ -3,17 +3,13 @@
 use super::common::brep_to_entity_state;
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
     PrimitiveType, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
     math::{Matrix4, Point3, Vector3},
-    primitives::{
-        box_primitive::BoxPrimitive, cone_primitive::ConePrimitive,
-        cylinder_primitive::CylinderPrimitive, sphere_primitive::SpherePrimitive,
-        topology_builder::BRepModel, torus_primitive::TorusPrimitive,
-    },
+    primitives::topology_builder::BRepModel,
 };
 
 /// Implementation of create primitive operation

@@ -12,20 +12,18 @@
 //! 4. **Context Aware**: Learns from usage patterns, suggests improvements
 //! 5. **Schema Driven**: Machine-readable parameter descriptions and constraints
 
-use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
     primitive_traits::{
-        ParameterDefinition, ParameterSchema, ParameterType, Primitive, PrimitiveError,
-        ValidationReport, ValueConstraint,
+        ParameterSchema, Primitive, PrimitiveError,
+        ValidationReport,
     },
     solid::SolidId,
-    topology_builder::{BRepModel, PrimitiveOptions},
+    topology_builder::BRepModel,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
@@ -870,7 +868,7 @@ impl PrimitiveRegistry {
     }
 
     /// Get synonym patterns for a parameter (simplified without regex)
-    fn get_synonym_patterns(&self, param_name: &str) -> Vec<String> {
+    fn get_synonym_patterns(&self, _param_name: &str) -> Vec<String> {
         // Return empty for now - synonym handling is done in is_synonym function
         vec![]
     }
@@ -921,7 +919,7 @@ impl PrimitiveRegistry {
     }
 
     /// Generate helpful suggestions for low-confidence parsing
-    fn generate_suggestions(&self, text: &str, primitive_type: &str) -> Vec<String> {
+    fn generate_suggestions(&self, _text: &str, primitive_type: &str) -> Vec<String> {
         let primitive_info = self.primitives.get(primitive_type).unwrap();
         let mut suggestions = vec![];
 
@@ -1133,8 +1131,8 @@ impl PrimitiveRegistry {
     /// Extract technical information for AI learning
     fn extract_technical_info(
         &self,
-        geometry_id: SolidId,
-        model: &BRepModel,
+        _geometry_id: SolidId,
+        _model: &BRepModel,
         validation: &ValidationReport,
     ) -> AITechnicalInfo {
         AITechnicalInfo {
@@ -1526,7 +1524,7 @@ impl PrimitiveRegistry {
     /// AI learning endpoint - submit successful commands for optimization (production DashMap implementation)
     pub fn learn_from_success(command: &str, response: &AIResponse) {
         let registry = Self::global();
-        if let Ok(mut registry) = registry.try_lock() {
+        if let Ok(registry) = registry.try_lock() {
             // Parse the command first
             let parsed_result = registry.parse_natural_language(command);
 

@@ -3,19 +3,14 @@
 //! Splits faces, edges, and solids using various splitting tools
 //! including planes, surfaces, and curves.
 
-use super::intersect::{intersect_curve_surface, intersect_curves, intersect_surfaces};
+use super::intersect::intersect_surfaces;
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Point3, Vector3};
 use crate::primitives::{
-    curve::Curve,
-    edge::{Edge, EdgeId, EdgeOrientation},
-    face::{Face, FaceId, FaceOrientation},
-    r#loop::Loop,
-    shell::Shell,
-    solid::{Solid, SolidId},
-    surface::Surface,
+    edge::{Edge, EdgeId},
+    face::{Face, FaceId},
+    solid::SolidId,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
 };
 
 /// Options for split operations
@@ -100,7 +95,7 @@ pub fn split_face_by_plane(
 pub fn split_face_by_surface(
     model: &mut BRepModel,
     face_id: FaceId,
-    splitting_surface_id: u32,
+    _splitting_surface_id: u32,
     options: SplitOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // Validate inputs
@@ -234,10 +229,10 @@ pub fn split_solid_by_plane(
 
 /// Compute face-plane intersection curve
 fn compute_face_plane_intersection(
-    model: &BRepModel,
-    face: &Face,
-    plane_origin: Point3,
-    plane_normal: Vector3,
+    _model: &BRepModel,
+    _face: &Face,
+    _plane_origin: Point3,
+    _plane_normal: Vector3,
 ) -> OperationResult<Vec<Point3>> {
     // Would compute actual intersection curve
     // For now, return empty (no intersection)
@@ -246,10 +241,10 @@ fn compute_face_plane_intersection(
 
 /// Split face along curve
 fn split_face_along_curve(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     face: &Face,
-    split_curve: &[Point3],
-    options: &SplitOptions,
+    _split_curve: &[Point3],
+    _options: &SplitOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // Would split face into multiple faces along curve
     // For now, return original face
@@ -258,10 +253,10 @@ fn split_face_along_curve(
 
 /// Split face by intersection curves
 fn split_face_by_intersection_curves(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     face_id: FaceId,
-    curves: Vec<super::intersect::IntersectionCurve>,
-    options: &SplitOptions,
+    _curves: Vec<super::intersect::IntersectionCurve>,
+    _options: &SplitOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // Would split face along multiple curves
     Ok(vec![face_id])
@@ -327,9 +322,9 @@ fn filter_faces_by_side(
 
 /// Filter faces by size
 fn filter_faces_by_size(
-    model: &BRepModel,
+    _model: &BRepModel,
     faces: Vec<FaceId>,
-    keep_larger: bool,
+    _keep_larger: bool,
 ) -> OperationResult<Vec<FaceId>> {
     // Would compute face areas and filter
     // For now, return all faces
@@ -337,7 +332,7 @@ fn filter_faces_by_size(
 }
 
 /// Compute face centroid
-fn compute_face_centroid(model: &BRepModel, face: &Face) -> OperationResult<Point3> {
+fn compute_face_centroid(_model: &BRepModel, _face: &Face) -> OperationResult<Point3> {
     // Would compute actual centroid
     // For now, return origin
     Ok(Point3::ZERO)
@@ -345,10 +340,10 @@ fn compute_face_centroid(model: &BRepModel, face: &Face) -> OperationResult<Poin
 
 /// Create cap faces at split plane
 fn create_cap_faces(
-    model: &mut BRepModel,
-    split_face_groups: &[Vec<FaceId>],
-    plane_origin: Point3,
-    plane_normal: Vector3,
+    _model: &mut BRepModel,
+    _split_face_groups: &[Vec<FaceId>],
+    _plane_origin: Point3,
+    _plane_normal: Vector3,
 ) -> OperationResult<Vec<FaceId>> {
     // Would create planar faces to cap the split
     Ok(Vec::new())
@@ -356,11 +351,11 @@ fn create_cap_faces(
 
 /// Assemble split solids from faces
 fn assemble_split_solids(
-    model: &mut BRepModel,
-    split_face_groups: Vec<Vec<FaceId>>,
-    cap_faces: Vec<FaceId>,
-    plane_origin: Point3,
-    plane_normal: Vector3,
+    _model: &mut BRepModel,
+    _split_face_groups: Vec<Vec<FaceId>>,
+    _cap_faces: Vec<FaceId>,
+    _plane_origin: Point3,
+    _plane_normal: Vector3,
 ) -> OperationResult<Vec<SolidId>> {
     // Would assemble faces into separate solids
     Ok(Vec::new())
@@ -370,7 +365,7 @@ fn assemble_split_solids(
 fn validate_split_face_inputs(
     model: &BRepModel,
     face_id: FaceId,
-    options: &SplitOptions,
+    _options: &SplitOptions,
 ) -> OperationResult<()> {
     if model.faces.get(face_id).is_none() {
         return Err(OperationError::InvalidGeometry(
@@ -385,7 +380,7 @@ fn validate_split_face_inputs(
 fn validate_split_solid_inputs(
     model: &BRepModel,
     solid_id: SolidId,
-    options: &SplitOptions,
+    _options: &SplitOptions,
 ) -> OperationResult<()> {
     if model.solids.get(solid_id).is_none() {
         return Err(OperationError::InvalidGeometry(

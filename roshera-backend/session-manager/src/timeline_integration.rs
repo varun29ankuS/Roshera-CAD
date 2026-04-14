@@ -3,13 +3,13 @@
 //! This module provides the bridge between session management and the timeline engine,
 //! ensuring all operations are properly tracked and can be replayed.
 
-use crate::{SessionManager, SessionState};
+use crate::SessionManager;
 use shared_types::geometry_commands::Command as GeometryCommand;
 use timeline_engine::SessionId;
 use timeline_engine::{
     execution::{EntityStateStore, ExecutionConfig, ExecutionEngine},
     operations::register_all_operations,
-    Author, BranchId, EntityId, EventId, Operation, Timeline, TimelineError, TimelineEvent,
+    Author, BranchId, EntityId, EventId, Operation, Timeline, TimelineError,
     TimelineResult,
 };
 
@@ -17,7 +17,7 @@ type UserId = String;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::info;
 
 /// Timeline integration handler for sessions
 pub struct TimelineIntegration {

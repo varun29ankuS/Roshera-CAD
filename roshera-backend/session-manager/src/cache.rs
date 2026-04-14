@@ -8,15 +8,14 @@ use dashmap::DashMap;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use shared_types::{
-    CADObject, CommandResult, GeometryId, OrientationCubeState, SessionError, SessionState,
-    SketchState,
+    CADObject, CommandResult, GeometryId, SessionError, SessionState,
 };
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Cache entry with TTL and metadata
 #[derive(Debug, Clone)]
@@ -334,7 +333,7 @@ impl CacheManager {
                 command_results.clean_expired().await;
 
                 // Clean computed geometry
-                let now = Instant::now();
+                let _now = Instant::now();
                 computed_geometry.retain(|_, entry| !entry.is_expired());
 
                 debug!("Cache cleanup completed");
@@ -362,7 +361,7 @@ impl CacheManager {
         self.sessions.remove(&session_id.to_string()).await;
 
         // Also invalidate related caches
-        let prefix = format!("{}:", session_id);
+        let _prefix = format!("{}:", session_id);
 
         // This is simplified - in production you'd track keys more efficiently
         self.objects.clear().await;

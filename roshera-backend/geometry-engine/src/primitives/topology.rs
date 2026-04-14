@@ -16,19 +16,19 @@
 //! - Component analysis: < 100μs for 10k faces
 //! - Topology comparison: < 1ms for typical models
 
-use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{MathError, MathResult, Tolerance};
 use crate::primitives::{
     curve::CurveStore,
-    edge::{Edge, EdgeId, EdgeStore},
-    face::{Face, FaceId, FaceStore},
+    edge::{EdgeId, EdgeStore},
+    face::{FaceId, FaceStore},
     r#loop::{Loop, LoopId, LoopStore},
     shell::{Shell, ShellId, ShellStore, ShellType},
-    solid::{Solid, SolidId, SolidStore},
+    solid::SolidStore,
     surface::SurfaceStore,
     vertex::{VertexId, VertexStore},
 };
 use rayon::prelude::*;
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -246,15 +246,15 @@ impl<'a> TopologyEditor<'a> {
     /// Split an edge at a parameter value
     pub fn split_edge(
         &mut self,
-        edge_id: EdgeId,
-        parameter: f64,
+        _edge_id: EdgeId,
+        _parameter: f64,
     ) -> MathResult<(VertexId, EdgeId, EdgeId)> {
         // Implementation would split edge and update topology
         Err(MathError::NotImplemented("Edge splitting".to_string()))
     }
 
     /// Collapse an edge to a point
-    pub fn collapse_edge(&mut self, edge_id: EdgeId) -> MathResult<VertexId> {
+    pub fn collapse_edge(&mut self, _edge_id: EdgeId) -> MathResult<VertexId> {
         // Implementation would collapse edge and update faces
         Err(MathError::NotImplemented("Edge collapse".to_string()))
     }
@@ -417,7 +417,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     }
 
     // Build face-face adjacency
-    for (&edge_id, faces) in &info.edge_faces {
+    for (&_edge_id, faces) in &info.edge_faces {
         if faces.len() >= 2 {
             let face_vec: Vec<_> = faces.iter().cloned().collect();
             for i in 0..face_vec.len() {
@@ -605,11 +605,11 @@ pub fn shortest_path_weighted(
 
 /// Find geodesic path on surface
 pub fn geodesic_path(
-    start: VertexId,
-    end: VertexId,
-    surface_faces: &[FaceId],
-    ctx: &TopologyContext,
-    tolerance: Tolerance,
+    _start: VertexId,
+    _end: VertexId,
+    _surface_faces: &[FaceId],
+    _ctx: &TopologyContext,
+    _tolerance: Tolerance,
 ) -> MathResult<PathResult> {
     // This is a placeholder for geodesic path finding
     // Real implementation would use heat method or fast marching
@@ -750,15 +750,15 @@ fn compute_entity_differences(counts1: &[usize; 7], counts2: &[usize; 7]) -> Has
 }
 
 /// Find all cycles in edge graph
-pub fn find_edge_cycles(adjacency: &AdjacencyInfo, max_length: Option<usize>) -> Vec<Vec<EdgeId>> {
+pub fn find_edge_cycles(_adjacency: &AdjacencyInfo, _max_length: Option<usize>) -> Vec<Vec<EdgeId>> {
     // Implementation would use cycle detection algorithm
     Vec::new()
 }
 
 /// Simplify topology by removing unnecessary entities
 pub fn simplify_topology(
-    ctx: &mut TopologyContext,
-    options: SimplificationOptions,
+    _ctx: &mut TopologyContext,
+    _options: SimplificationOptions,
 ) -> MathResult<SimplificationResult> {
     // Implementation would merge coplanar faces, remove zero-length edges, etc.
     Err(MathError::NotImplemented(
@@ -825,8 +825,8 @@ pub struct TopologicalFeatures {
 }
 
 fn find_connected_edge_components(
-    edges: &HashSet<EdgeId>,
-    adjacency: &AdjacencyInfo,
+    _edges: &HashSet<EdgeId>,
+    _adjacency: &AdjacencyInfo,
 ) -> Vec<Vec<EdgeId>> {
     // Implementation would find connected components of edges
     Vec::new()
@@ -865,7 +865,7 @@ struct TopologyLevel {
 }
 
 impl MultiResolutionTopology {
-    pub fn build(ctx: &TopologyContext, num_levels: usize) -> MathResult<Self> {
+    pub fn build(_ctx: &TopologyContext, _num_levels: usize) -> MathResult<Self> {
         // Implementation would build progressive levels of detail
         Err(MathError::NotImplemented(
             "Multi-resolution topology".to_string(),
@@ -1192,7 +1192,7 @@ pub fn is_shell_orientable(shell: &Shell, ctx: &TopologyContext) -> bool {
 }
 
 /// Find holes (inner loops) in all faces
-pub fn find_face_holes(faces: &FaceStore, loops: &LoopStore) -> HashMap<FaceId, Vec<LoopId>> {
+pub fn find_face_holes(faces: &FaceStore, _loops: &LoopStore) -> HashMap<FaceId, Vec<LoopId>> {
     (0..faces.len() as u32)
         .into_par_iter()
         .filter_map(|face_id| {

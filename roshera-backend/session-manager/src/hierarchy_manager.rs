@@ -1,5 +1,5 @@
 use shared_types::hierarchy::{
-    Assembly, EditContext, Feature, FeatureType, HierarchyCommand, HierarchyNode, HierarchyUpdate,
+    Assembly, EditContext, HierarchyCommand, HierarchyNode, HierarchyUpdate,
     PartDefinition, PartInstance, ProjectHierarchy, Transform, WorkflowStage, WorkflowState,
 };
 use std::collections::HashMap;

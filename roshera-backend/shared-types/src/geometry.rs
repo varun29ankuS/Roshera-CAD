@@ -3,7 +3,7 @@
 //! Core geometric representations including meshes, transforms, and CAD objects.
 
 use crate::{
-    Color, ObjectId, Position3D, Timestamp, Vector3D, MAX_TRIANGLES, MAX_VERTICES, TOLERANCE,
+    Color, ObjectId, Position3D, Timestamp, MAX_TRIANGLES, MAX_VERTICES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -1,5 +1,4 @@
 use geometry_engine::math::{
-    bspline::BSplineCurve,
     nurbs::{NurbsCurve, NurbsSurface},
     Point3,
 };

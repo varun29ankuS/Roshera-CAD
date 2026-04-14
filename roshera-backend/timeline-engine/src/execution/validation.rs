@@ -2,8 +2,7 @@
 
 use super::ExecutionContext;
 use crate::{
-    EntityReference, EntityType, Operation, OperationInputs, TimelineError, TimelineResult,
-    ValidationRequirement,
+    EntityType, Operation, OperationInputs, TimelineError, TimelineResult,
 };
 
 /// Validates operations before execution

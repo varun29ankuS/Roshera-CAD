@@ -13,7 +13,7 @@
 //! - Operation execution: Matches or beats Parasolid/ACIS
 //! - Batch operations: Linear scaling with SIMD/GPU
 
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Point3, Vector3};
 use crate::operations::{
     boolean::{BooleanOp, BooleanOptions},
     chamfer::ChamferOptions,
@@ -331,10 +331,10 @@ impl OperationsRegistry {
     /// Parse natural language into operation command
     fn parse_operation_command(&self, text: &str) -> OperationResult<AIOperationCommand> {
         let text = text.to_lowercase();
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
 
         // Check cache first for instant response
-        if let Some(cached_result) = self.check_operation_cache(&text) {
+        if let Some(_cached_result) = self.check_operation_cache(&text) {
             return Ok(AIOperationCommand {
                 operation_type: "cached".to_string(),
                 targets: vec![],
@@ -597,7 +597,7 @@ impl OperationsRegistry {
         let start = std::time::Instant::now();
 
         // Get execution plan
-        let plan = self.create_execution_plan(&command)?;
+        let _plan = self.create_execution_plan(&command)?;
 
         // Execute based on operation type
         let result = match command.operation_type.as_str() {

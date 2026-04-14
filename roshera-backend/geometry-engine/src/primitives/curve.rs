@@ -15,9 +15,7 @@
 use crate::math::{
     consts, BBox, MathError, MathResult, Matrix4, Point3, Point4, Tolerance, Vector3,
 };
-use std::any::Any;
 use std::fmt;
-use std::sync::Arc as SyncArc;
 
 /// Bezier curve segment for clipping algorithms
 #[derive(Debug, Clone)]
@@ -586,7 +584,7 @@ impl Curve for Line {
         true
     }
 
-    fn get_plane(&self, tolerance: Tolerance) -> Option<crate::primitives::surface::Plane> {
+    fn get_plane(&self, _tolerance: Tolerance) -> Option<crate::primitives::surface::Plane> {
         // A line defines a pencil of planes; return one perpendicular to the line
         let dir = self.direction().normalize().ok()?;
         let normal = dir.perpendicular();
@@ -1140,7 +1138,7 @@ impl Curve for Arc {
         let scale_normal = new_normal.magnitude();
 
         // Normalize the vectors
-        let new_x_axis_normalized = new_x_axis.normalize().unwrap_or(self.x_axis);
+        let _new_x_axis_normalized = new_x_axis.normalize().unwrap_or(self.x_axis);
         let new_normal_normalized = new_normal.normalize().unwrap_or(self.normal);
 
         // Check if scales are uniform (within tolerance)
@@ -1179,7 +1177,7 @@ impl Curve for Arc {
         Ok((length / total_length).clamp(0.0, 1.0))
     }
 
-    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, Point3)> {
+    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, Point3)> {
         // Project point onto arc plane
         let to_point = *point - self.center;
         let height = to_point.dot(&self.normal);
@@ -2816,8 +2814,8 @@ impl NurbsCurve {
                 }
 
                 // Apply Bezier clipping to each segment pair
-                for (seg1, (s1_min, s1_max)) in &curve1_segs {
-                    for (seg2, (s2_min, s2_max)) in &curve2_segs {
+                for (seg1, (_s1_min, _s1_max)) in &curve1_segs {
+                    for (seg2, (_s2_min, _s2_max)) in &curve2_segs {
                         if let Some((new_s1_range, new_s2_range)) =
                             self.bezier_clip_segments(seg1, seg2, tolerance)
                         {
@@ -3094,7 +3092,7 @@ impl NurbsCurve {
         const MAX_DEPTH: usize = 20;
         const MIN_INTERVAL_SIZE: f64 = 1e-10;
 
-        for depth in 0..MAX_DEPTH {
+        for _depth in 0..MAX_DEPTH {
             let mut new_intervals = Vec::new();
             let mut found_intersections = false;
 
@@ -3617,7 +3615,7 @@ impl NurbsCurve {
 
             let p1 = self.control_points[i - 1] * w1;
             let p2 = self.control_points[i] * w2;
-            let new_p = ((p1 * (1.0 - alpha) + p2 * alpha) / new_w);
+            let new_p = (p1 * (1.0 - alpha) + p2 * alpha) / new_w;
 
             new_points.push(new_p);
             new_weights.push(new_w);
@@ -3871,11 +3869,11 @@ impl Curve for Circle {
         Some(1.0)
     }
 
-    fn is_linear(&self, tolerance: Tolerance) -> bool {
+    fn is_linear(&self, _tolerance: Tolerance) -> bool {
         false
     }
 
-    fn is_planar(&self, tolerance: Tolerance) -> bool {
+    fn is_planar(&self, _tolerance: Tolerance) -> bool {
         true
     }
 
@@ -3905,7 +3903,7 @@ impl Curve for Circle {
         self.arc.arc_length_between(t1, t2, tolerance)
     }
 
-    fn arc_length(&self, tolerance: Tolerance) -> f64 {
+    fn arc_length(&self, _tolerance: Tolerance) -> f64 {
         consts::TWO_PI * self.arc.radius
     }
 

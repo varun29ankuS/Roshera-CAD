@@ -4,7 +4,7 @@
 //! parametric surfaces (NURBS, B-splines, etc.)
 
 use crate::math::nurbs::NurbsSurface;
-use crate::math::trimmed_nurbs::{IntersectionCurve, IntersectionPoint, Point2};
+use crate::math::trimmed_nurbs::{IntersectionCurve, IntersectionPoint};
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use std::collections::HashSet;
 
@@ -217,7 +217,7 @@ fn march_intersection(
 
         // Predictor step
         let step = tangent.normalize()? * config.marching_step * direction_sign;
-        let predicted_3d = current.position + step;
+        let _predicted_3d = current.position + step;
 
         // Find parameters on both surfaces for predicted point
         let (u1, v1) = predict_parameters(surface1, current.u1, current.v1, &step)?;

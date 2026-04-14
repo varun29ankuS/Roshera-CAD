@@ -2,22 +2,16 @@
 //!
 //! Creates arrays of geometry (linear, circular, or custom patterns)
 
-use super::common::{brep_to_entity_state, entity_state_to_brep};
+use super::common::brep_to_entity_state;
 use crate::{
     brep_serialization::deserialize_brep,
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs, PatternType,
+    CreatedEntity, EntityId, Operation, OperationOutputs, PatternType,
     TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
-use geometry_engine::{
-    math::{Matrix4, Point3, Vector3},
-    primitives::{
-        solid::SolidId,
-        topology_builder::{BRepModel, GeometryId as GeometryEngineId, TopologyBuilder},
-    },
-};
+use geometry_engine::math::{Matrix4, Point3, Vector3};
 
 /// Implementation of pattern operation
 pub struct PatternOp;
@@ -196,7 +190,7 @@ impl OperationImpl for PatternOp {
         {
             // Process each feature to pattern
             let mut all_created_entities = Vec::new();
-            let mapping = get_entity_mapping();
+            let _mapping = get_entity_mapping();
 
             for feature_id in features {
                 // Get the feature entity
@@ -282,7 +276,7 @@ impl OperationImpl for PatternOp {
                             Vector3::new(axis.direction[0], axis.direction[1], axis.direction[2])
                                 .normalize()
                                 .unwrap_or(Vector3::Z);
-                        let center_pt = Point3::new(axis.origin[0], axis.origin[1], axis.origin[2]);
+                        let _center_pt = Point3::new(axis.origin[0], axis.origin[1], axis.origin[2]);
 
                         let angle_per_instance = angle / (*count - 1) as f64;
 

@@ -16,17 +16,16 @@
 //! - Point-in-shell test: < 1μs
 //! - Volume calculation: < 10μs for 1000 faces
 
-use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
     edge::{EdgeId, EdgeStore},
     face::{Face, FaceId, FaceOrientation, FaceStore, INVALID_FACE_ID},
-    r#loop::{LoopId, LoopStore},
+    r#loop::LoopStore,
     surface::SurfaceStore,
-    vertex::{VertexId, VertexStore},
+    vertex::VertexStore,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Shell ID type
@@ -488,7 +487,7 @@ impl Shell {
             let size = self
                 .cached_stats
                 .as_ref()
-                .map(|s| (s.bbox_max - s.bbox_min))
+                .map(|s| s.bbox_max - s.bbox_min)
                 .unwrap_or(Vector3::ONE);
 
             // Box approximation for inertia
@@ -525,8 +524,8 @@ impl Shell {
         loop_store: &LoopStore,
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
-        surface_store: &SurfaceStore,
-        tolerance: Tolerance,
+        _surface_store: &SurfaceStore,
+        _tolerance: Tolerance,
     ) -> MathResult<bool> {
         if self.shell_type != ShellType::Closed {
             return Err(MathError::InvalidParameter(
@@ -732,7 +731,7 @@ impl Shell {
         face_store: &FaceStore,
         surface_store: &mut SurfaceStore,
     ) -> MathResult<Shell> {
-        let mut offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
+        let offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
 
         for &face_id in &self.faces {
             if let Some(face) = face_store.get(face_id) {
@@ -785,8 +784,8 @@ impl Shell {
 
     pub fn edges(
         &self,
-        face_store: &FaceStore,
-        loop_store: &LoopStore,
+        _face_store: &FaceStore,
+        _loop_store: &LoopStore,
     ) -> MathResult<HashSet<EdgeId>> {
         let edge_conn = self.edge_connectivity.read().unwrap();
         Ok(edge_conn.keys().cloned().collect())
@@ -799,7 +798,7 @@ impl Shell {
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
         surface_store: &SurfaceStore,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<f64> {
         let props = self.compute_mass_properties(
             face_store,
@@ -823,7 +822,7 @@ impl Shell {
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
         surface_store: &SurfaceStore,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<f64> {
         let props = self.compute_mass_properties(
             face_store,
@@ -950,7 +949,7 @@ impl ShellStore {
             if let Some(ref s) = shell {
                 // Remove from face indices
                 for &face_id in &s.faces {
-                    if let Some(mut shells) = self.face_to_shells.get_mut(&face_id) {
+                    if let Some(shells) = self.face_to_shells.get_mut(&face_id) {
                         shells.retain(|&sid| sid != id);
                     }
                 }

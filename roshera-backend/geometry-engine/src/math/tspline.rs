@@ -20,9 +20,9 @@
 //! - Bazilevs et al., "Isogeometric analysis using T-splines", 2010
 
 use crate::math::bspline::KnotVector;
-use crate::math::{Matrix4, Point3, Vector3};
+use crate::math::{Point3, Vector3};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// T-spline control point
@@ -391,7 +391,7 @@ impl TSplineMesh {
         }
 
         // Update valence and extraordinary status
-        for (&id, vertex) in &mut self.vertices {
+        for (&_id, vertex) in &mut self.vertices {
             vertex.valence = vertex.neighbors.len();
             vertex.is_extraordinary = vertex.valence != 4;
         }
@@ -647,10 +647,10 @@ impl TSplineMesh {
     /// Local subdivision
     fn local_subdivision(
         &mut self,
-        options: &RefinementOptions,
+        _options: &RefinementOptions,
     ) -> Result<Vec<usize>, &'static str> {
         // Implement Catmull-Clark style subdivision locally
-        let mut new_vertices = Vec::new();
+        let new_vertices = Vec::new();
 
         // This is a placeholder
         self.update_topology_cache();
@@ -660,10 +660,10 @@ impl TSplineMesh {
     /// Make region NURBS-compatible
     fn make_nurbs_compatible(
         &mut self,
-        options: &RefinementOptions,
+        _options: &RefinementOptions,
     ) -> Result<Vec<usize>, &'static str> {
         // Insert vertices to remove T-junctions and extraordinary points
-        let mut new_vertices = Vec::new();
+        let new_vertices = Vec::new();
 
         // This is a complex operation - placeholder
         self.update_topology_cache();
@@ -994,7 +994,7 @@ impl TSplineMesh {
 
     /// Parallel evaluation on GPU (if available)
     pub fn evaluate_gpu(&self, parameters: &[(f64, f64)]) -> Vec<TEvalResult> {
-        if let Some(ref gpu) = self.gpu_kernel {
+        if let Some(_gpu) = self.gpu_kernel {
             // Would dispatch to GPU
             vec![]
         } else {

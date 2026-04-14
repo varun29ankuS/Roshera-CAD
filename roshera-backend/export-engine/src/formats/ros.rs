@@ -6,12 +6,12 @@ use crate::formats::ros_snapshot::BRepSnapshot;
 use crate::ros_fs::keys::{KeyManager, SoftwareKeyManager};
 use crate::ros_fs::util::current_time_ms;
 use crate::ros_fs::{
-    self, Chunk, ChunkIndexEntry, ChunkType, EncryptionAlgorithm, FileHeader,
+    self, Chunk, ChunkType,
     CHUNK_INDEX_ENTRY_SIZE,
 };
 use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
-use std::io::{Cursor, Seek};
+use std::io::Cursor;
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,7 +77,7 @@ pub async fn export_brep_to_ros(
     // Create file
     let mut file = File::create(path)
         .await
-        .map_err(|e| ExportError::FileWriteError {
+        .map_err(|_e| ExportError::FileWriteError {
             path: path.to_string_lossy().to_string(),
         })?;
 
@@ -234,7 +234,7 @@ pub async fn export_brep_to_ros(
     // Write to file
     file.write_all(&buffer)
         .await
-        .map_err(|e| ExportError::FileWriteError {
+        .map_err(|_e| ExportError::FileWriteError {
             path: path.to_string_lossy().to_string(),
         })?;
 

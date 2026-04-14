@@ -18,7 +18,7 @@ use sqlx::{
     Row,
 };
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 /// Database backend type
@@ -483,7 +483,7 @@ impl DatabasePersistence for PostgresDatabase {
             .bind(session_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: session_id.to_string(),
             })?;
 
@@ -635,7 +635,7 @@ impl DatabasePersistence for PostgresDatabase {
             .bind(session_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: object_id.0.to_string(),
             })?;
 
@@ -723,7 +723,7 @@ impl DatabasePersistence for PostgresDatabase {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: user_id.to_string(),
             })?;
 
@@ -745,7 +745,7 @@ impl DatabasePersistence for PostgresDatabase {
             .bind(email)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: email.to_string(),
             })?;
 
@@ -848,7 +848,7 @@ impl DatabasePersistence for PostgresDatabase {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: format!("{}/{}", session_id, user_id),
             })?;
 
@@ -1071,7 +1071,7 @@ impl DatabasePersistence for PostgresDatabase {
             .bind(key_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: key_id.to_string(),
             })?;
 
@@ -1446,7 +1446,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(session_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: session_id.to_string(),
             })?;
 
@@ -1568,7 +1568,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(session_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: object_id.0.to_string(),
             })?;
 
@@ -1664,7 +1664,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: user_id.to_string(),
             })?;
 
@@ -1686,7 +1686,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(email)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: email.to_string(),
             })?;
 
@@ -1791,7 +1791,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: format!("{}/{}", session_id, user_id),
             })?;
 
@@ -1909,7 +1909,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(token_hash)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: "token".to_string(),
             })?;
 
@@ -1980,7 +1980,7 @@ impl DatabasePersistence for SqliteDatabase {
             .bind(key_hash)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SessionError::NotFound {
+            .map_err(|_e| SessionError::NotFound {
                 id: "api_key".to_string(),
             })?;
 
@@ -2016,7 +2016,7 @@ impl DatabasePersistence for SqliteDatabase {
 
     async fn save_timeline_event(
         &self,
-        session_id: &str,
+        _session_id: &str,
         event: &TimelineEventData,
     ) -> Result<(), SessionError> {
         sqlx::query(

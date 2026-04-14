@@ -84,8 +84,8 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
 
     match &param.data_type {
         ParameterDataType::Number {
-            precision,
-            format_hint,
+            precision: _,
+            format_hint: _,
         } => {
             let mut schema = json!({
                 "type": "number",
@@ -107,7 +107,7 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
         }
         ParameterDataType::Length {
             default_unit,
-            precision,
+            precision: _,
         } => {
             let desc = format!("{} (unit: {})", base_desc, default_unit);
             let mut schema = json!({
@@ -130,7 +130,7 @@ fn parameter_to_json_schema(param: &ParameterInfo) -> Value {
         }
         ParameterDataType::Angle {
             default_unit,
-            precision,
+            precision: _,
         } => {
             let desc = format!("{} (unit: {})", base_desc, default_unit);
             let mut schema = json!({

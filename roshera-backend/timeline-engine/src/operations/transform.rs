@@ -4,14 +4,13 @@ use super::common::{
     array_to_matrix4, brep_to_entity_state, entity_state_to_brep, validate_transform_matrix,
 };
 use crate::{
-    execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    EntityId, EntityType, Modification, ModifiedEntity, Operation, OperationInputs,
+    execution::{ExecutionContext, OperationImpl, ResourceEstimate}, EntityType, Modification, ModifiedEntity, Operation,
     OperationOutputs, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
-    math::{Matrix4, Point3, Quaternion, Vector3},
-    primitives::{topology_builder::BRepModel, vertex::Vertex},
+    math::Matrix4,
+    primitives::topology_builder::BRepModel,
 };
 
 /// Implementation of transform operation

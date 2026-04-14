@@ -17,7 +17,7 @@
 //! - DeRose, T., Kass, M., Truong, T. (1993). "Functional composition algorithms via blossoming"
 //! - Vida, J., Martin, R., Varady, T. (1994). "A survey of blending methods that use parametric surfaces"
 
-use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::surface::{
     ContinuityAnalysis, CurvatureInfo, Surface, SurfacePoint, SurfaceType,
 };
@@ -434,7 +434,7 @@ impl G2BlendingSurface {
         let mut grid = vec![vec![Point3::ORIGIN; num_v]; num_u];
 
         // Set boundary control points from sampled conditions
-        for (i, condition) in boundary_conditions.iter().enumerate() {
+        for (_i, condition) in boundary_conditions.iter().enumerate() {
             if condition.boundary_index == 0 {
                 // First boundary (v = 0)
                 let u_index = (condition.parameter * (num_u - 1) as f64).round() as usize;
@@ -464,8 +464,8 @@ impl G2BlendingSurface {
     /// Direct optimization approach for G2 constraint solving
     fn optimize_direct(
         initial_points: &[Vec<Point3>],
-        boundary_conditions: &[BoundaryCondition],
-        tolerance: Tolerance,
+        _boundary_conditions: &[BoundaryCondition],
+        _tolerance: Tolerance,
     ) -> MathResult<Vec<Vec<Point3>>> {
         // Placeholder implementation - would use iterative optimization
         // In production, this would implement Levenberg-Marquardt or similar
@@ -475,8 +475,8 @@ impl G2BlendingSurface {
     /// Variational optimization minimizing energy functional
     fn optimize_variational(
         initial_points: &[Vec<Point3>],
-        boundary_conditions: &[BoundaryCondition],
-        tolerance: Tolerance,
+        _boundary_conditions: &[BoundaryCondition],
+        _tolerance: Tolerance,
     ) -> MathResult<Vec<Vec<Point3>>> {
         // Placeholder - would minimize thin plate spline energy
         Ok(initial_points.to_vec())
@@ -485,8 +485,8 @@ impl G2BlendingSurface {
     /// Constrained least squares optimization
     fn optimize_constrained_ls(
         initial_points: &[Vec<Point3>],
-        boundary_conditions: &[BoundaryCondition],
-        tolerance: Tolerance,
+        _boundary_conditions: &[BoundaryCondition],
+        _tolerance: Tolerance,
     ) -> MathResult<Vec<Vec<Point3>>> {
         // Placeholder - would use QR decomposition for constrained LS
         Ok(initial_points.to_vec())
@@ -495,8 +495,8 @@ impl G2BlendingSurface {
     /// Functional composition optimization via blossoming
     fn optimize_functional_composition(
         initial_points: &[Vec<Point3>],
-        boundary_conditions: &[BoundaryCondition],
-        tolerance: Tolerance,
+        _boundary_conditions: &[BoundaryCondition],
+        _tolerance: Tolerance,
     ) -> MathResult<Vec<Vec<Point3>>> {
         // Placeholder - would implement DeRose et al. algorithm
         Ok(initial_points.to_vec())
@@ -504,15 +504,15 @@ impl G2BlendingSurface {
 
     /// Analyze continuity quality of the blended surface
     fn analyze_continuity(
-        control_points: &[Vec<Point3>],
-        weights: &[Vec<f64>],
-        knots_u: &[f64],
-        knots_v: &[f64],
-        degree_u: usize,
-        degree_v: usize,
-        surface1: &dyn Surface,
-        surface2: &dyn Surface,
-        tolerance: Tolerance,
+        _control_points: &[Vec<Point3>],
+        _weights: &[Vec<f64>],
+        _knots_u: &[f64],
+        _knots_v: &[f64],
+        _degree_u: usize,
+        _degree_v: usize,
+        _surface1: &dyn Surface,
+        _surface2: &dyn Surface,
+        _tolerance: Tolerance,
     ) -> MathResult<ContinuityAnalysis> {
         // Placeholder implementation
         Ok(ContinuityAnalysis {
@@ -555,7 +555,7 @@ impl Surface for G2BlendingSurface {
         Box::new(self.clone())
     }
 
-    fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+    fn evaluate_full(&self, _u: f64, _v: f64) -> MathResult<SurfacePoint> {
         // Placeholder - would evaluate NURBS surface with full differential info
         Ok(SurfacePoint {
             position: Point3::ORIGIN,
@@ -584,7 +584,7 @@ impl Surface for G2BlendingSurface {
         false
     }
 
-    fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+    fn normal_at(&self, _u: f64, _v: f64) -> MathResult<Vector3> {
         // Placeholder - would compute surface normal
         Ok(Vector3::Z)
     }
@@ -601,7 +601,7 @@ impl Surface for G2BlendingSurface {
         Ok((0.5, 0.5))
     }
 
-    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
         // For blending surfaces, offset is complex - approximate with NURBS
         // In production, this would create an offset NURBS surface
         Box::new(self.clone())
@@ -628,13 +628,13 @@ impl Surface for G2BlendingSurface {
 
     fn offset_variable(
         &self,
-        distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         // Variable offset for G2 blending surfaces requires NURBS approximation
         // Sample the distance function and create a weighted NURBS surface
-        let num_samples_u = 20;
-        let num_samples_v = 10;
+        let _num_samples_u = 20;
+        let _num_samples_v = 10;
 
         // For production implementation, we would:
         // 1. Sample distance function at control point locations
@@ -648,10 +648,10 @@ impl Surface for G2BlendingSurface {
 
     fn intersect(
         &self,
-        other: &dyn Surface,
-        tolerance: Tolerance,
+        _other: &dyn Surface,
+        _tolerance: Tolerance,
     ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
-        use crate::primitives::surface::SurfaceIntersectionResult;
+        
 
         // G2 blending surface intersection uses adaptive subdivision
         // Production implementation would:
@@ -768,7 +768,7 @@ impl Surface for CubicG2Blend {
         "CubicG2Blend"
     }
 
-    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
         // Simplified closest point - production would use Newton-Raphson
         let bounds = self.parameter_bounds();
         let mut best_dist = f64::MAX;
@@ -796,7 +796,7 @@ impl Surface for CubicG2Blend {
         Ok((best_u, best_v))
     }
 
-    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
         // Simplified offset - just clone for now
         Box::new(self.clone())
     }
@@ -804,7 +804,7 @@ impl Surface for CubicG2Blend {
     fn offset_exact(
         &self,
         distance: f64,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<crate::primitives::surface::OffsetSurface> {
         Ok(crate::primitives::surface::OffsetSurface {
             surface: Box::new(self.clone()),
@@ -816,16 +816,16 @@ impl Surface for CubicG2Blend {
 
     fn offset_variable(
         &self,
-        distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         Ok(Box::new(self.clone()))
     }
 
     fn intersect(
         &self,
-        other: &dyn Surface,
-        tolerance: Tolerance,
+        _other: &dyn Surface,
+        _tolerance: Tolerance,
     ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
         vec![]
     }
@@ -923,7 +923,7 @@ impl Surface for QuarticG2Blend {
         "QuarticG2Blend"
     }
 
-    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
         // Simplified closest point - production would use Newton-Raphson
         let bounds = self.parameter_bounds();
         let mut best_dist = f64::MAX;
@@ -951,7 +951,7 @@ impl Surface for QuarticG2Blend {
         Ok((best_u, best_v))
     }
 
-    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
         // Simplified offset - just clone for now
         Box::new(self.clone())
     }
@@ -959,7 +959,7 @@ impl Surface for QuarticG2Blend {
     fn offset_exact(
         &self,
         distance: f64,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<crate::primitives::surface::OffsetSurface> {
         Ok(crate::primitives::surface::OffsetSurface {
             surface: Box::new(self.clone()),
@@ -971,16 +971,16 @@ impl Surface for QuarticG2Blend {
 
     fn offset_variable(
         &self,
-        distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         Ok(Box::new(self.clone()))
     }
 
     fn intersect(
         &self,
-        other: &dyn Surface,
-        tolerance: Tolerance,
+        _other: &dyn Surface,
+        _tolerance: Tolerance,
     ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
         vec![]
     }

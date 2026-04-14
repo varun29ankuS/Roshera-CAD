@@ -1005,6 +1005,7 @@ impl SolidStore {
     }
 
     /// Perform boolean operation
+    #[allow(deprecated)]
     pub fn boolean_operation(
         &mut self,
         solid1_id: SolidId,

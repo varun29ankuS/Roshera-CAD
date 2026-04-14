@@ -35,7 +35,7 @@ impl ExportEngine {
         // Ensure output directory exists
         fs::create_dir_all(&self.output_dir)
             .await
-            .map_err(|e| ExportError::FileWriteError {
+            .map_err(|_e| ExportError::FileWriteError {
                 path: self.output_dir.to_string_lossy().to_string(),
             })?;
 
@@ -49,13 +49,13 @@ impl ExportEngine {
         let mut file =
             fs::File::create(&filepath)
                 .await
-                .map_err(|e| ExportError::FileWriteError {
+                .map_err(|_e| ExportError::FileWriteError {
                     path: filepath.to_string_lossy().to_string(),
                 })?;
 
         file.write_all(&content)
             .await
-            .map_err(|e| ExportError::FileWriteError {
+            .map_err(|_e| ExportError::FileWriteError {
                 path: filepath.to_string_lossy().to_string(),
             })?;
 
@@ -67,7 +67,7 @@ impl ExportEngine {
         // Ensure output directory exists
         fs::create_dir_all(&self.output_dir)
             .await
-            .map_err(|e| ExportError::FileWriteError {
+            .map_err(|_e| ExportError::FileWriteError {
                 path: self.output_dir.to_string_lossy().to_string(),
             })?;
 
@@ -80,7 +80,7 @@ impl ExportEngine {
         // Write to file
         fs::write(&filepath, content)
             .await
-            .map_err(|e| ExportError::FileWriteError {
+            .map_err(|_e| ExportError::FileWriteError {
                 path: filepath.to_string_lossy().to_string(),
             })?;
 
@@ -97,7 +97,7 @@ impl ExportEngine {
         // Ensure output directory exists
         fs::create_dir_all(&self.output_dir)
             .await
-            .map_err(|e| ExportError::FileWriteError {
+            .map_err(|_e| ExportError::FileWriteError {
                 path: self.output_dir.to_string_lossy().to_string(),
             })?;
 

@@ -3,7 +3,7 @@
 //! World-class caching system with LRU eviction and content-based hashing
 
 use super::{TessellationParams, ThreeJsMesh};
-use crate::primitives::{face::FaceId, shell::ShellId, solid::SolidId, surface::Surface};
+use crate::primitives::{face::FaceId, shell::ShellId, solid::SolidId};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

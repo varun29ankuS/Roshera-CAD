@@ -239,7 +239,7 @@ impl ThreeJsMesh {
 
     /// Apply a transformation matrix to all vertices
     pub fn transform(&mut self, matrix: &crate::math::Matrix4) {
-        use crate::math::Transform;
+        
 
         // Transform positions
         for i in 0..self.vertex_count() {

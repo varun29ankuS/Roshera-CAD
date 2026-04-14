@@ -4,19 +4,18 @@ use super::brep_helpers::BRepModelExt;
 use super::common::{brep_to_entity_state, entity_state_to_brep};
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
     TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
-    math::{MathPlane as Plane, Matrix4, Point3, Vector3},
+    math::{Point3, Vector3},
     primitives::{
-        edge::{Edge, EdgeId},
+        edge::EdgeId,
         face::FaceId,
-        r#loop::{LoopId, LoopType},
-        shell::{ShellId, ShellType},
+        r#loop::LoopType,
+        shell::ShellType,
         topology_builder::BRepModel,
-        vertex::VertexId,
     },
 };
 use std::collections::{HashMap, HashSet};

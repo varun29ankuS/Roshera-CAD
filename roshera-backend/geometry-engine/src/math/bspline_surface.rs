@@ -14,7 +14,6 @@
 
 use crate::math::nurbs::NurbsCurve;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
-use std::fmt;
 use std::sync::RwLock;
 
 /// 2D parameter for surface evaluation
@@ -1159,7 +1158,7 @@ impl NurbsSurface {
         let w = 1.0 / 2.0_f64.sqrt(); // Weight for 45° points
 
         let bottom_center = center - axis * (height / 2.0);
-        let top_center = center + axis * (height / 2.0);
+        let _top_center = center + axis * (height / 2.0);
 
         let mut control_points = Vec::new();
         let mut weights = Vec::new();
@@ -1206,14 +1205,14 @@ impl NurbsSurface {
         let span_v = self.bspline.find_span_v(param.v);
 
         // Get basis functions with derivatives
-        let ders_u = self.bspline.basis_derivatives(
+        let _ders_u = self.bspline.basis_derivatives(
             &self.bspline.knots_u,
             self.bspline.degree_u,
             span_u,
             param.u,
             2,
         );
-        let ders_v = self.bspline.basis_derivatives(
+        let _ders_v = self.bspline.basis_derivatives(
             &self.bspline.knots_v,
             self.bspline.degree_v,
             span_v,

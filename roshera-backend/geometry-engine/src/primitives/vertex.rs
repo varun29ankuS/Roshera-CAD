@@ -14,7 +14,7 @@
 //! - Batch operations: SIMD-optimized
 //! - Memory usage: 12 bytes/vertex (vs 48-64 bytes in competitors)
 
-use crate::math::{consts, Point3, Vector3};
+use crate::math::{Point3, Vector3};
 // Note: Using DashMap globally for timeline architecture compatibility
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};

@@ -4,15 +4,14 @@
 //! by matching and merging coincident edges and vertices.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Point3, Tolerance, Vector3};
+use crate::math::Point3;
 use crate::primitives::{
-    edge::{Edge, EdgeId},
-    face::{Face, FaceId},
-    r#loop::Loop,
+    edge::EdgeId,
+    face::FaceId,
     shell::{Shell, ShellType},
     solid::{Solid, SolidId},
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -260,7 +259,7 @@ fn edges_match(
 
 /// Merge vertex groups into single vertices
 fn merge_vertex_groups(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     vertex_groups: Vec<Vec<VertexId>>,
 ) -> OperationResult<HashMap<VertexId, VertexId>> {
     let mut vertex_map = HashMap::new();
@@ -284,7 +283,7 @@ fn merge_vertex_groups(
 
 /// Merge paired edges
 fn merge_edge_pairs(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     edge_pairs: Vec<(EdgeId, EdgeId)>,
 ) -> OperationResult<HashMap<EdgeId, EdgeId>> {
     let mut edge_map = HashMap::new();
@@ -359,7 +358,7 @@ fn update_loop_edges(
         let mut new_edges = Vec::new();
 
         for (i, &edge_id) in loop_data.edges.iter().enumerate() {
-            let forward = loop_data.orientations[i];
+            let _forward = loop_data.orientations[i];
             let mapped_edge = edge_map.get(&edge_id).copied().unwrap_or(edge_id);
             new_edges.push(mapped_edge);
         }

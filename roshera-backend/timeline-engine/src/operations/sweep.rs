@@ -6,16 +6,13 @@ use super::common::{brep_to_entity_state, entity_state_to_brep};
 use crate::{
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
     TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
-    math::{Point3, Tolerance, Vector3},
-    primitives::{
-        solid::SolidId,
-        topology_builder::{BRepModel, GeometryId as GeometryEngineId, TopologyBuilder},
-    },
+    math::Tolerance,
+    primitives::topology_builder::{BRepModel, GeometryId as GeometryEngineId},
 };
 
 /// Implementation of sweep operation
@@ -70,10 +67,10 @@ impl OperationImpl for SweepOp {
 
             // Get the profile and path geometries
             let profile_entity = context.get_entity(*profile)?;
-            let profile_brep = entity_state_to_brep(&profile_entity)?;
+            let _profile_brep = entity_state_to_brep(&profile_entity)?;
 
             let path_entity = context.get_entity(*path)?;
-            let path_brep = entity_state_to_brep(&path_entity)?;
+            let _path_brep = entity_state_to_brep(&path_entity)?;
 
             // Use default values since Operation::Sweep doesn't include options
             let twist_angle: f64 = 0.0;
@@ -87,7 +84,7 @@ impl OperationImpl for SweepOp {
             // Get the profile and path faces/curves from the BRep
             let profile_face_id = {
                 // Assuming profile is a face entity
-                let profile_entity = context.get_entity(*profile)?;
+                let _profile_entity = context.get_entity(*profile)?;
                 let mapping = get_entity_mapping();
                 mapping
                     .get_geometry_id(*profile)
@@ -102,7 +99,7 @@ impl OperationImpl for SweepOp {
 
             let path_edge_id = {
                 // Assuming path is an edge entity
-                let path_entity = context.get_entity(*path)?;
+                let _path_entity = context.get_entity(*path)?;
                 let mapping = get_entity_mapping();
                 mapping
                     .get_geometry_id(*path)

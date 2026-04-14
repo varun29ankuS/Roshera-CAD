@@ -649,7 +649,7 @@ impl Surface for SphericalFillet {
         }
 
         // Convert to spherical coordinates
-        let on_sphere = self.center + to_point.normalize()? * self.radius;
+        let _on_sphere = self.center + to_point.normalize()? * self.radius;
         // Map to parameter space - simplified
         Ok((0.5, 0.5))
     }
@@ -742,7 +742,7 @@ impl VariableRadiusFillet {
         let num_u = 20;
         let num_v = 5;
         let mut control_points = vec![vec![Point3::ZERO; num_v]; num_u];
-        let mut weights = vec![vec![1.0; num_v]; num_u];
+        let weights = vec![vec![1.0; num_v]; num_u];
 
         // Sample along spine
         for i in 0..num_u {
@@ -829,7 +829,7 @@ impl Surface for VariableRadiusFillet {
         Ok(Point3::new(u, v, 0.0))
     }
 
-    fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+    fn normal_at(&self, _u: f64, _v: f64) -> MathResult<Vector3> {
         // Would compute normal from NURBS
         Ok(Vector3::Z)
     }
@@ -913,8 +913,8 @@ impl Surface for VariableRadiusFillet {
 /// Compute trim curves on adjacent surfaces for fillet intersection
 pub fn compute_fillet_trim_curves(
     fillet_surface: &dyn Surface,
-    adjacent_surface1: &dyn Surface,
-    adjacent_surface2: &dyn Surface,
+    _adjacent_surface1: &dyn Surface,
+    _adjacent_surface2: &dyn Surface,
     num_samples: usize,
 ) -> MathResult<(Box<dyn Curve>, Box<dyn Curve>)> {
     // This is a critical function that computes surface-surface intersection curves

@@ -16,7 +16,7 @@
 
 use crate::math::{consts, ApproxEq, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Curve, CurveId, CurveStore, ParameterRange},
+    curve::{CurveId, CurveStore, ParameterRange},
     vertex::{VertexId, INVALID_VERTEX_ID},
 };
 use dashmap::DashMap;
@@ -289,7 +289,7 @@ impl Edge {
             return Ok(self.cached_length);
         }
 
-        let curve = curves
+        let _curve = curves
             .get(self.curve_id)
             .ok_or(MathError::InvalidParameter("Invalid curve ID".to_string()))?;
 
@@ -301,7 +301,7 @@ impl Edge {
 
     /// Compute arc length using adaptive integration (non-caching)
     pub fn compute_arc_length(&self, curves: &CurveStore, tolerance: Tolerance) -> MathResult<f64> {
-        let curve = curves
+        let _curve = curves
             .get(self.curve_id)
             .ok_or(MathError::InvalidParameter("Invalid curve ID".to_string()))?;
 
@@ -429,7 +429,7 @@ impl Edge {
         tolerance: Tolerance,
         max_angle: f64,
     ) -> MathResult<Vec<Point3>> {
-        let curve = curves
+        let _curve = curves
             .get(self.curve_id)
             .ok_or(MathError::InvalidParameter("Invalid curve ID".to_string()))?;
 

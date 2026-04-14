@@ -4,17 +4,15 @@
 //! Essential for injection molding, casting, and other manufacturing processes.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
-    shell::Shell,
-    solid::{Solid, SolidId},
+    solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
 };
 
 /// Options for draft operations
@@ -260,10 +258,10 @@ fn group_faces_by_edge(
 
 /// Group faces by neutral face
 fn group_faces_by_face(
-    model: &BRepModel,
-    faces: &[FaceId],
-    neutral_face_id: FaceId,
-    pull_direction: Vector3,
+    _model: &BRepModel,
+    _faces: &[FaceId],
+    _neutral_face_id: FaceId,
+    _pull_direction: Vector3,
 ) -> OperationResult<Vec<FaceGroup>> {
     // Neutral face boundary defines neutral curves
     Err(OperationError::NotImplemented(
@@ -273,7 +271,7 @@ fn group_faces_by_face(
 
 /// Group faces by custom curve
 fn group_faces_by_curve(
-    model: &BRepModel,
+    _model: &BRepModel,
     faces: &[FaceId],
     curve: &Box<dyn Curve>,
     pull_direction: Vector3,
@@ -291,7 +289,7 @@ fn group_faces_by_curve(
 /// Apply draft to a group of faces
 fn apply_draft_to_group(
     model: &mut BRepModel,
-    solid_id: SolidId,
+    _solid_id: SolidId,
     group: FaceGroup,
     options: &DraftOptions,
 ) -> OperationResult<Vec<FaceId>> {
@@ -386,12 +384,12 @@ fn create_drafted_surface(
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
     // Calculate draft transformation
-    let cos_angle = draft_angle.cos();
-    let sin_angle = draft_angle.sin();
+    let _cos_angle = draft_angle.cos();
+    let _sin_angle = draft_angle.sin();
 
     // Create transformation matrix for draft
     // This applies a shear transformation in the draft direction
-    let draft_transform = create_draft_transform_matrix(draft_direction, draft_angle);
+    let _draft_transform = create_draft_transform_matrix(draft_direction, draft_angle);
 
     // Apply draft transformation to the surface
     // For planar surfaces, we can create a new inclined plane
@@ -460,11 +458,11 @@ fn create_drafted_surface(
 }
 
 /// Create draft transformation matrix
-fn create_draft_transform_matrix(draft_direction: Vector3, draft_angle: f64) -> Matrix4 {
+fn create_draft_transform_matrix(_draft_direction: Vector3, draft_angle: f64) -> Matrix4 {
     // Create a shear transformation matrix
     // This is simplified - a full implementation would use more sophisticated transformations
     let cos_angle = draft_angle.cos();
-    let sin_angle = draft_angle.sin();
+    let _sin_angle = draft_angle.sin();
 
     // Create a basic transformation matrix
     // In practice, this would be more complex depending on the draft direction
@@ -519,7 +517,7 @@ fn create_drafted_loop(
 fn create_drafted_edge(
     model: &mut BRepModel,
     edge_id: EdgeId,
-    neutral_curve: &[Point3],
+    _neutral_curve: &[Point3],
     draft_direction: Vector3,
     draft_angle: f64,
     forward: bool,
@@ -712,10 +710,10 @@ fn blend_drafted_faces(model: &mut BRepModel, faces: &[FaceId]) -> OperationResu
 
 /// Update adjacent faces for draft
 fn update_adjacent_faces_for_draft(
-    model: &mut BRepModel,
-    solid_id: SolidId,
-    original_faces: &[FaceId],
-    drafted_faces: &[FaceId],
+    _model: &mut BRepModel,
+    _solid_id: SolidId,
+    _original_faces: &[FaceId],
+    _drafted_faces: &[FaceId],
 ) -> OperationResult<()> {
     // Would update neighboring faces to maintain topology
     Ok(())
@@ -826,7 +824,7 @@ fn compute_average_face_normal(model: &BRepModel, face: &Face) -> OperationResul
 
 /// Compute draft direction from face normal and pull direction
 fn compute_draft_direction(
-    face_normal: Vector3,
+    _face_normal: Vector3,
     pull_direction: Vector3,
     plane_normal: Vector3,
 ) -> Vector3 {
@@ -864,7 +862,7 @@ fn sample_curve_points(curve: &Box<dyn Curve>) -> OperationResult<Vec<Point3>> {
 }
 
 /// Merge face groups that share neutral curves
-fn merge_face_groups(groups: &mut Vec<FaceGroup>) -> OperationResult<()> {
+fn merge_face_groups(_groups: &mut Vec<FaceGroup>) -> OperationResult<()> {
     // Would merge groups with common neutral curves
     Ok(())
 }
@@ -948,9 +946,9 @@ fn compute_surface_intersection(
 
 /// Extend face to intersection curve
 fn extend_face_to_curve(
-    model: &mut BRepModel,
-    face_id: FaceId,
-    intersection_curve: &[Point3],
+    _model: &mut BRepModel,
+    _face_id: FaceId,
+    _intersection_curve: &[Point3],
 ) -> OperationResult<()> {
     // Would extend face boundary to meet intersection curve
     // This is a complex operation involving loop modification
@@ -959,9 +957,9 @@ fn extend_face_to_curve(
 
 /// Trim face at intersection curve
 fn trim_face_at_curve(
-    model: &mut BRepModel,
-    face_id: FaceId,
-    intersection_curve: &[Point3],
+    _model: &mut BRepModel,
+    _face_id: FaceId,
+    _intersection_curve: &[Point3],
 ) -> OperationResult<()> {
     // Would trim face at intersection curve
     // This involves splitting the face and creating new boundaries
@@ -1048,14 +1046,14 @@ fn create_blend_surface_between_faces(
 
 /// Create blend loop between two faces
 fn create_blend_loop(
-    model: &BRepModel,
-    face_id1: FaceId,
-    face_id2: FaceId,
+    _model: &BRepModel,
+    _face_id1: FaceId,
+    _face_id2: FaceId,
 ) -> OperationResult<Loop> {
     // Create a simple rectangular loop for the blend
     use crate::primitives::r#loop::{Loop, LoopType};
 
-    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    let blend_loop = Loop::new(0, LoopType::Outer);
 
     // For simplicity, return empty loop
     // In practice, this would create edges connecting the face boundaries
@@ -1063,7 +1061,7 @@ fn create_blend_loop(
 }
 
 /// Validate drafted solid
-fn validate_drafted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
+fn validate_drafted_solid(_model: &BRepModel, _solid_id: SolidId) -> OperationResult<()> {
     // Would perform full validation
     Ok(())
 }

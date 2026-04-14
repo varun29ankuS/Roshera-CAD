@@ -1,7 +1,7 @@
 //! Cache for tessellated geometry (meshes)
 
 use super::{CacheStats, CachedItem};
-use crate::{BranchId, EntityId, TimelineError, TimelineResult};
+use crate::{BranchId, EntityId};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lru::LruCache;

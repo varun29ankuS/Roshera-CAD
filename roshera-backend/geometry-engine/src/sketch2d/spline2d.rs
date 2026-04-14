@@ -14,14 +14,14 @@
 //! The degree p determines smoothness: C^(p-1) continuity at simple knots.
 
 use super::{
-    Arc2d, LineSegment2d, Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d,
+    Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d,
     Tolerance2d, Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use crate::math::{
-    bspline::{BSplineCurve, BSplineWorkspace, KnotVector},
+    bspline::{BSplineCurve, KnotVector},
     nurbs::NurbsCurve,
-    Point3, Vector3,
+    Point3,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -230,7 +230,7 @@ impl BSpline2d {
     fn get_internal_curve(&self) -> Result<&BSplineCurve, Sketch2dError> {
         // Note: In a real implementation, we'd cache this conversion
         // For now, convert on each call (not optimal but correct)
-        let points_3d: Vec<Point3> = self
+        let _points_3d: Vec<Point3> = self
             .control_points
             .iter()
             .map(|p| Point3::new(p.x, p.y, 0.0))
@@ -323,7 +323,6 @@ impl BSpline2d {
 
         let mut best_u = u_min;
         let mut best_dist = f64::INFINITY;
-        let mut best_point = self.evaluate(u_min)?;
 
         // Initial coarse search
         for i in 0..=samples {
@@ -334,7 +333,6 @@ impl BSpline2d {
             if dist < best_dist {
                 best_dist = dist;
                 best_u = u;
-                best_point = p;
             }
         }
 
@@ -423,7 +421,7 @@ impl BSpline2d {
     }
 
     /// Reduce the degree of the B-spline if possible
-    pub fn reduce_degree(&self, tolerance: f64) -> Sketch2dResult<BSpline2d> {
+    pub fn reduce_degree(&self, _tolerance: f64) -> Sketch2dResult<BSpline2d> {
         // Degree reduction algorithm with error checking
         Err(Sketch2dError::NumericalError {
             description: "Degree reduction algorithm not implemented".to_string(),
@@ -519,7 +517,7 @@ impl NurbsCurve2d {
         }
 
         // Normalize angles
-        let mut start = start_angle;
+        let start = start_angle;
         let mut end = end_angle;
 
         while end < start {
@@ -539,7 +537,7 @@ impl NurbsCurve2d {
         // For single segment arc
         if segments == 1 {
             let cos_half = (segment_angle / 2.0).cos();
-            let sin_half = (segment_angle / 2.0).sin();
+            let _sin_half = (segment_angle / 2.0).sin();
 
             // Three control points for arc
             let p0 = Point2d::new(
