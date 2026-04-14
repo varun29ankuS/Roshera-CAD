@@ -253,8 +253,9 @@ fn create_offset_cylinder(
         )));
     }
 
-    let mut offset_cyl = Cylinder::new(cyl.origin, cyl.axis, new_radius)
-        .map_err(|e| OperationError::NumericalError(format!("Cylinder creation failed: {:?}", e)))?;
+    let mut offset_cyl = Cylinder::new(cyl.origin, cyl.axis, new_radius).map_err(|e| {
+        OperationError::NumericalError(format!("Cylinder creation failed: {:?}", e))
+    })?;
     offset_cyl.height_limits = cyl.height_limits;
     offset_cyl.angle_limits = cyl.angle_limits;
     Ok(Box::new(offset_cyl))
@@ -398,17 +399,10 @@ fn create_offset_freeform(
     let knots_u = uniform_knot_vector(n_u + 1, degree_u);
     let knots_v = uniform_knot_vector(n_v + 1, degree_v);
 
-    let nurbs = NurbsSurface::new(
-        offset_points,
-        weights,
-        knots_u,
-        knots_v,
-        degree_u,
-        degree_v,
-    )
-    .map_err(|e| {
-        OperationError::NumericalError(format!("NURBS surface creation failed: {}", e))
-    })?;
+    let nurbs = NurbsSurface::new(offset_points, weights, knots_u, knots_v, degree_u, degree_v)
+        .map_err(|e| {
+            OperationError::NumericalError(format!("NURBS surface creation failed: {}", e))
+        })?;
 
     Ok(Box::new(GeneralNurbsSurface { nurbs }))
 }
