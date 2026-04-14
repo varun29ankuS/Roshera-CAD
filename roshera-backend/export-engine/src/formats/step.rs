@@ -592,6 +592,7 @@ impl<W: Write> StepWriter<W> {
         face: &crate::formats::ros_snapshot::FaceData,
         surface_map: &HashMap<&uuid::Uuid, StepId>,
         edge_map: &HashMap<&uuid::Uuid, StepId>,
+        loop_map: &HashMap<&uuid::Uuid, &crate::formats::ros_snapshot::LoopData>,
     ) -> std::io::Result<StepId> {
         let surface_id = if let Some(surface_uuid) = &face.surface {
             surface_map.get(surface_uuid).copied().ok_or_else(|| {
@@ -608,26 +609,34 @@ impl<W: Write> StepWriter<W> {
         let mut bound_ids = Vec::new();
 
         // Outer loop
-        if let Some(_outer_loop_uuid) = &face.outer_loop {
-            // For now, we'll just create a placeholder loop
-            // In a real implementation, we'd need to look up the loop edges
-            let outer_edges: Vec<StepId> = Vec::new();
+        if let Some(outer_loop_uuid) = &face.outer_loop {
+            if let Some(loop_data) = loop_map.get(outer_loop_uuid) {
+                let outer_edges: Vec<StepId> = loop_data
+                    .edges
+                    .iter()
+                    .filter_map(|eid| edge_map.get(eid).copied())
+                    .collect();
 
-            if !outer_edges.is_empty() {
-                let loop_id = self.write_face_loop(&outer_edges, true)?;
-                bound_ids.push(loop_id);
+                if !outer_edges.is_empty() {
+                    let loop_id = self.write_face_loop(&outer_edges, true)?;
+                    bound_ids.push(loop_id);
+                }
             }
         }
 
         // Inner loops (holes)
-        for _inner_loop_uuid in &face.inner_loops {
-            // For now, we'll just create placeholder loops
-            // In a real implementation, we'd need to look up the loop edges
-            let inner_edges: Vec<StepId> = Vec::new();
+        for inner_loop_uuid in &face.inner_loops {
+            if let Some(loop_data) = loop_map.get(inner_loop_uuid) {
+                let inner_edges: Vec<StepId> = loop_data
+                    .edges
+                    .iter()
+                    .filter_map(|eid| edge_map.get(eid).copied())
+                    .collect();
 
-            if !inner_edges.is_empty() {
-                let loop_id = self.write_face_loop(&inner_edges, false)?;
-                bound_ids.push(loop_id);
+                if !inner_edges.is_empty() {
+                    let loop_id = self.write_face_loop(&inner_edges, false)?;
+                    bound_ids.push(loop_id);
+                }
             }
         }
 
@@ -906,11 +915,18 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
         edge_map.insert(eid, step_id);
     }
 
+    // Build loop lookup map (UUID → LoopData)
+    let loop_map: HashMap<&uuid::Uuid, &crate::formats::ros_snapshot::LoopData> = snapshot
+        .loops
+        .iter()
+        .map(|(lid, loop_data)| (lid, loop_data))
+        .collect();
+
     // Step 5: Write all faces as ADVANCED_FACE
     let mut face_map = HashMap::new();
     for (fid, face) in &snapshot.faces {
         let step_id = writer
-            .write_face(face, &surface_map, &edge_map)
+            .write_face(face, &surface_map, &edge_map, &loop_map)
             .map_err(|e| ExportError::ExportFailed {
                 reason: format!("Failed to write face: {}", e),
             })?;
