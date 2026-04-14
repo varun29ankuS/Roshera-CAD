@@ -1,24 +1,10 @@
-<p align="center">
-  <img src="assets/logo.png" alt="Roshera" width="200" />
-</p>
+# Roshera
 
-<h1 align="center">Roshera</h1>
+**AI-native CAD engine — B-Rep geometry kernel built from scratch in Rust.**
 
-<p align="center">
-  <strong>AI-native CAD engine — B-Rep geometry kernel built from scratch in Rust.</strong>
-</p>
+Roshera is a boundary representation CAD system with an LLM-driven design workflow, production-grade NURBS mathematics, and a proprietary encrypted file format (.ros) with AI provenance tracking. No wrappers around OpenCASCADE or Parasolid — every line of the geometry kernel is original.
 
-<p align="center">
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/primitives-production-brightgreen" alt="Primitives" /></a>
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/NURBS-production-brightgreen" alt="NURBS" /></a>
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/booleans-working-yellow" alt="Booleans" /></a>
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/AI--native-working-yellow" alt="AI" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-dual-blue" alt="License" /></a>
-</p>
-
----
-
-Roshera is a boundary representation CAD system with an LLM-driven design workflow, production-grade NURBS mathematics, and a vision-aware AI pipeline that sees your viewport. No wrappers around OpenCASCADE or Parasolid — every line of the geometry kernel is original.
+The geometry kernel has been through three rounds of topological audit with all critical and high-severity issues resolved. Math primitives, topology, and operations are hardened against division-by-zero, NaN propagation, and degenerate geometry.
 
 | Dark Mode | Light Mode |
 |-----------|------------|
@@ -28,11 +14,11 @@ Roshera is a boundary representation CAD system with an LLM-driven design workfl
 
 ```
 roshera-backend/
-  geometry-engine/     B-Rep kernel: NURBS math, primitives, topology, operations, tessellation
-  ai-integration/      LLM providers (Claude, OpenAI) + vision pipeline + smart routing
+  geometry-engine/     B-Rep kernel: math, primitives, topology, operations, tessellation
+  ai-integration/      API-based AI providers (Claude, OpenAI)
   timeline-engine/     Event-sourced design history with branching
   session-manager/     Multi-user collaboration with RBAC
-  export-engine/       STL, OBJ, encrypted .ros (AES-256-GCM), STEP (in progress)
+  export-engine/       STL, OBJ, encrypted .ros (AES-256-GCM, AI provenance)
   rag-engine/          Vamana-indexed retrieval for design knowledge
   api-server/          Axum REST + WebSocket API
   shared-types/        Common type definitions
@@ -40,33 +26,28 @@ roshera-backend/
 roshera-app/           React + Three.js + TypeScript browser client
 ```
 
-## Status
+## What Works Today
 
-| Layer | Component | Status |
-|-------|-----------|--------|
-| **Math** | Vector3, Matrix4, Quaternion | Tested, SIMD-optimized |
-| | B-spline, NURBS evaluation | Tested, hardened against singularities |
-| **Primitives** | Box, Sphere, Cylinder, Cone, Torus | B-Rep topology with Euler validation |
-| **Topology** | Manifold detection, adjacency | Tested |
-| **Tessellation** | Per-surface dispatch, adaptive subdivision | Tested for analytic surfaces |
-| **Operations** | Extrude (draft, taper, twist) | Tested |
-| | Boolean (union, intersect, difference) | Implemented, edge cases in progress |
-| | Fillet (constant-radius) | Implemented |
-| | Chamfer, Offset, Sewing | Implemented |
-| | Revolve (full/partial) | Implemented |
-| | Sweep (single path) | Implemented, multi-guide not started |
-| | Loft (ruled surfaces) | Implemented, smooth NURBS loft not started |
-| **Sketch 2D** | Newton-Raphson constraint solver | Implemented |
-| **Assembly** | Data model + mates | Defined; constraint solver not started |
-| **Export** | STL, OBJ, encrypted .ros | Working |
-| | STEP | Bridge implemented, output validation needed |
-| **AI** | Claude + OpenAI providers | Working |
-| | Vision pipeline + smart routing | Implemented |
-| | Natural language command parsing | Working |
-| **Infrastructure** | Timeline (event-sourced history) | Working |
-| | RAG (Vamana vector index) | Working |
-| | Session manager (multi-user, RBAC) | Working |
-| **Frontend** | React + R3F viewport, toolbar, chat | Working |
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Math** | Production | Vector3, Matrix4, Quaternion, B-spline, NURBS — hardened against singularities |
+| **Primitives** | Production | Box, Sphere, Cylinder, Cone, Torus — real B-Rep topology with dihedral angles |
+| **Topology** | Production | Euler validation (V-E+F=2), manifold detection, parallel adjacency, real dihedral angles |
+| **Tessellation** | Production | Per-surface-type dispatch, adaptive subdivision, proper UV mapping |
+| **Extrude** | Production | Face and profile extrusion with draft angle, taper, twist, and scaling |
+| **Boolean** | Working | SSI via marching, 3-ray face classification, topology reconstruction |
+| **Fillet** | Working | Constant-radius (cylindrical/toroidal/spherical) + variable-radius (NURBS) |
+| **Chamfer** | Working | Distance and angle-based chamfers with robust edge lookup |
+| **Offset** | Working | Plane, cylinder, sphere, cone, torus, NURBS surface offsets |
+| **Sewing** | Working | Topology repair: edge/vertex matching, shell stitching, manifold validation |
+| **Revolve / Sweep / Loft** | In development | Pipeline structured, surface generation incomplete |
+| **Assembly** | Data model | Components, mates, motion limits defined; constraint solver not started |
+| **2D Sketch** | Partial | Newton-Raphson solver loop working; constraint coverage expanding |
+| **Export** | STL + OBJ + ROS | Encrypted .ros with AI provenance; STEP writer not yet valid |
+| **RAG Engine** | Working | Vamana/DiskANN vector index with cosine/euclidean/dot-product |
+| **Timeline** | Working | Event-sourced history with branching |
+| **AI Integration** | Working | Claude + OpenAI API providers, natural language command parsing |
+| **Frontend** | Working | React + R3F viewport, AI chat, toolbar, model tree, properties panel |
 
 ## Getting Started
 
@@ -112,14 +93,6 @@ ws.send(JSON.stringify({
   data: { command: "CreatePrimitive", parameters: { type: "sphere", radius: 5.0 } }
 }));
 ```
-
-## Logo
-
-<p align="center">
-  <img src="assets/logo-dimensions.png" alt="Roshera Logo Dimensions" width="400" />
-</p>
-
-The Roshera mark is constructed from a Boolean union of a rectangle (2x × 3.236x) and a circle (radius x), expressing the core operation of the geometry kernel itself.
 
 ## License
 
