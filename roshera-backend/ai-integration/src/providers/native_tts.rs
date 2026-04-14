@@ -56,13 +56,7 @@ impl NativeTTSProvider {
         let capabilities = ProviderCapabilities {
             name: "Native-TTS".to_string(),
             version: "1.0.0".to_string(),
-            supported_languages: vec![
-                "en".to_string(),
-                "hi".to_string(),
-                "es".to_string(),
-                "fr".to_string(),
-                "de".to_string(),
-            ],
+            supported_languages: vec!["en".to_string(), "hi".to_string()],
             max_context_length: 1000, // Characters
             supports_streaming: false,
             supports_batching: false,
@@ -116,21 +110,14 @@ impl NativeTTSProvider {
             .arg("-a")
             .arg(self.config.volume.to_string()); // Volume
 
-        // Set voice/language
+        // Set voice/language — English and Hindi only
         if let Some(voice_id) = voice {
             if voice_id.contains("hi") {
-                cmd.arg("-v").arg("hi"); // Hindi voice
-            } else if voice_id.contains("es") {
-                cmd.arg("-v").arg("es"); // Spanish voice
-            } else if voice_id.contains("fr") {
-                cmd.arg("-v").arg("fr"); // French voice
-            } else if voice_id.contains("de") {
-                cmd.arg("-v").arg("de"); // German voice
+                cmd.arg("-v").arg("hi");
             } else {
-                cmd.arg("-v").arg("en"); // Default to English
+                cmd.arg("-v").arg("en");
             }
         } else {
-            // Auto-detect language
             let lang = self.detect_language(text);
             cmd.arg("-v").arg(lang);
         }
@@ -225,20 +212,13 @@ impl NativeTTSProvider {
         Ok(cursor.into_inner())
     }
 
-    /// Simple language detection
+    /// Simple language detection — English and Hindi only for now
     fn detect_language(&self, text: &str) -> &'static str {
-        // Simple heuristic-based language detection
         if text
             .chars()
             .any(|c| matches!(c as u32, 0x0900..=0x097F | 0xA8E0..=0xA8FF))
         {
             "hi" // Hindi (Devanagari script)
-        } else if text.chars().any(|c| "ñáéíóúü¡¿".contains(c)) {
-            "es" // Spanish
-        } else if text.chars().any(|c| "àâäéèêëîïôöùûü".contains(c)) {
-            "fr" // French
-        } else if text.chars().any(|c| "äöüß".contains(c)) {
-            "de" // German
         } else {
             "en" // Default to English
         }
@@ -322,27 +302,6 @@ impl TTSProvider for NativeTTSProvider {
                 gender: Some("female".to_string()),
                 sample_rate: self.config.sample_rate,
             },
-            VoiceInfo {
-                id: "es-ES-male".to_string(),
-                name: "Spanish Male".to_string(),
-                language: "es".to_string(),
-                gender: Some("male".to_string()),
-                sample_rate: self.config.sample_rate,
-            },
-            VoiceInfo {
-                id: "fr-FR-female".to_string(),
-                name: "French Female".to_string(),
-                language: "fr".to_string(),
-                gender: Some("female".to_string()),
-                sample_rate: self.config.sample_rate,
-            },
-            VoiceInfo {
-                id: "de-DE-male".to_string(),
-                name: "German Male".to_string(),
-                language: "de".to_string(),
-                gender: Some("male".to_string()),
-                sample_rate: self.config.sample_rate,
-            },
         ]
     }
 
@@ -373,9 +332,8 @@ mod tests {
 
         assert_eq!(provider.detect_language("Hello world"), "en");
         assert_eq!(provider.detect_language("नमस्ते"), "hi");
-        assert_eq!(provider.detect_language("¡Hola mundo!"), "es");
-        assert_eq!(provider.detect_language("Bonjour le château"), "fr");
-        assert_eq!(provider.detect_language("Straße nach Hause"), "de");
+        assert_eq!(provider.detect_language("Create a box"), "en");
+        assert_eq!(provider.detect_language("यह एक बॉक्स बनाओ"), "hi");
     }
 
     #[tokio::test]
