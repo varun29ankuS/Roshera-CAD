@@ -1,20 +1,18 @@
 //! Revolve operation implementation
 
 use super::brep_helpers::BRepModelExt;
-use super::common::{brep_to_entity_state, entity_state_to_brep, extract_sketch_plane};
+use super::common::{brep_to_entity_state, entity_state_to_brep};
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
     TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
     math::{Matrix4, Point3, Vector3},
     primitives::{
-        edge::EdgeId,
-        face::FaceId,
         r#loop::{LoopId, LoopType},
-        shell::{ShellId, ShellType},
+        shell::ShellType,
         topology_builder::BRepModel,
         vertex::VertexId,
     },

@@ -2,10 +2,9 @@
 
 use super::{CacheStats, CachedItem};
 use crate::{
-    BranchId, EntityId, EntityType, EventId, Operation, OperationOutputs, TimelineError,
-    TimelineResult,
+    BranchId, EntityId, EntityType, OperationOutputs,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::RwLock;

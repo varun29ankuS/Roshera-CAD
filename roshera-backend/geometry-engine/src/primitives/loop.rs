@@ -20,8 +20,7 @@ use crate::primitives::{
     edge::{EdgeId, EdgeStore},
     vertex::{VertexId, VertexStore},
 };
-use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::collections::HashMap;
 
 /// Loop ID type
 pub type LoopId = u32;
@@ -599,7 +598,7 @@ impl Loop {
         // Calculate offset for each vertex
         for i in 0..vertices.len() {
             let prev_idx = if i == 0 { vertices.len() - 1 } else { i - 1 };
-            let next_idx = (i + 1) % vertices.len();
+            let _next_idx = (i + 1) % vertices.len();
 
             // Get edges
             let edge1 = edge_store
@@ -806,7 +805,7 @@ impl LoopStore {
             if let Some(ref l) = loop_ {
                 // Remove from edge indices
                 for &edge_id in &l.edges {
-                    if let Some(mut loops) = self.edge_to_loops.get_mut(&edge_id) {
+                    if let Some(loops) = self.edge_to_loops.get_mut(&edge_id) {
                         loops.retain(|&lid| lid != id);
                     }
                 }

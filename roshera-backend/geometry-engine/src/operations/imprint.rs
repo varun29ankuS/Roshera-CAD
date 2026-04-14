@@ -8,7 +8,6 @@ use crate::math::{Point3, Vector3};
 use crate::primitives::{
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
-    r#loop::Loop,
     surface::Surface,
     topology_builder::BRepModel,
     vertex::VertexId,

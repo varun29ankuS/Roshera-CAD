@@ -3,17 +3,16 @@
 //! Creates beveled transitions between faces by cutting edges at specified angles or distances.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
-    shell::Shell,
-    solid::{Solid, SolidId},
+    solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 
 /// Options for chamfer operations
@@ -220,11 +219,11 @@ fn create_angle_chamfer(
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
-    angle: f64,
+    _angle: f64,
 ) -> OperationResult<FaceId> {
     // For symmetric angle chamfer, compute equal distances
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
-    let half_angle = face_angle / 2.0;
+    let _half_angle = face_angle / 2.0;
 
     // Choose a reasonable default distance
     let distance = 1.0; // Would be computed from edge length
@@ -357,7 +356,7 @@ fn create_chamfer_face(
     data: &ChamferData,
 ) -> OperationResult<FaceId> {
     // Create edges for chamfer boundary
-    let edge = model
+    let _edge = model
         .edges
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
@@ -568,9 +567,9 @@ fn update_adjacent_faces_for_chamfer(
 /// this creates a triangular face connecting the three offset endpoints.
 fn handle_chamfer_vertices(
     model: &mut BRepModel,
-    solid_id: SolidId,
+    _solid_id: SolidId,
     edges: &[EdgeId],
-    chamfer_faces: &[FaceId],
+    _chamfer_faces: &[FaceId],
 ) -> OperationResult<()> {
     use std::collections::HashMap;
 
@@ -606,7 +605,7 @@ fn handle_chamfer_vertices(
     // infrastructure that's not yet robust enough.
 
     // For now, verify that vertex connectivity is maintained
-    for (vertex_id, incident_edges) in &vertex_edges {
+    for (_vertex_id, incident_edges) in &vertex_edges {
         if incident_edges.len() >= 3 {
             // Three or more chamfered edges meeting at a vertex — complex case
             // Log but don't fail; the chamfer faces are still valid individually
@@ -632,7 +631,7 @@ fn propagate_edge_selection(
 
 /// Propagate along tangent edges
 fn propagate_tangent_edges(
-    model: &BRepModel,
+    _model: &BRepModel,
     initial_edges: Vec<EdgeId>,
 ) -> OperationResult<Vec<EdgeId>> {
     // Would find all tangent-connected edges
@@ -641,7 +640,7 @@ fn propagate_tangent_edges(
 
 /// Propagate along smooth edges
 fn propagate_smooth_edges(
-    model: &BRepModel,
+    _model: &BRepModel,
     initial_edges: Vec<EdgeId>,
 ) -> OperationResult<Vec<EdgeId>> {
     // Would find all smoothly-connected edges
@@ -842,7 +841,7 @@ fn validate_chamfer_inputs(
 }
 
 /// Validate chamfered solid
-fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
+fn validate_chamfered_solid(_model: &BRepModel, _solid_id: SolidId) -> OperationResult<()> {
     // Would perform full validation
     Ok(())
 }

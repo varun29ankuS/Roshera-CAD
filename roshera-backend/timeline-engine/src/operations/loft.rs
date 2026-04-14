@@ -6,17 +6,13 @@ use super::common::{brep_to_entity_state, entity_state_to_brep};
 use crate::{
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
     TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
-    math::{Point3, Tolerance, Vector3},
-    operations::loft::LoftOptions,
-    primitives::{
-        solid::SolidId,
-        topology_builder::{BRepModel, GeometryId as GeometryEngineId, TopologyBuilder},
-    },
+    math::Tolerance,
+    primitives::topology_builder::{BRepModel, GeometryId as GeometryEngineId},
 };
 
 /// Implementation of loft operation
@@ -35,7 +31,7 @@ impl OperationImpl for LoftOp {
     ) -> TimelineResult<()> {
         if let Operation::Loft {
             profiles,
-            guide_curves,
+            guide_curves: _,
         } = operation
         {
             // Check we have at least 2 profiles
@@ -72,7 +68,7 @@ impl OperationImpl for LoftOp {
     ) -> TimelineResult<OperationOutputs> {
         if let Operation::Loft {
             profiles,
-            guide_curves,
+            guide_curves: _,
         } = operation
         {
             // Create a new BRep model for the result
@@ -100,7 +96,7 @@ impl OperationImpl for LoftOp {
             let mapping = get_entity_mapping();
 
             for profile_id in profiles {
-                let profile_entity = context.get_entity(*profile_id)?;
+                let _profile_entity = context.get_entity(*profile_id)?;
                 let face_id = mapping
                     .get_geometry_id(*profile_id)
                     .and_then(|id| match id {
@@ -132,7 +128,7 @@ impl OperationImpl for LoftOp {
             }
 
             // Import loft types
-            use geometry_engine::operations::loft::LoftType;
+            
 
             // Create loft options with production-grade settings
             let loft_options = GeomLoftOptions {

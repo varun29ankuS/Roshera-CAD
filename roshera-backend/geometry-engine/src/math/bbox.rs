@@ -7,7 +7,7 @@
 //! - Support for spatial indexing and culling
 //! - Cache-friendly 48-byte representation
 
-use super::{consts, ApproxEq, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use super::{consts, ApproxEq, Matrix4, Point3, Tolerance, Vector3};
 use std::fmt;
 
 /// Axis-aligned bounding box

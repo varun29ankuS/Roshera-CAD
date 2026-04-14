@@ -227,7 +227,7 @@ impl<W: Write> StepWriter<W> {
     /// Write a line
     pub fn write_line(&mut self, start: &[f64; 3], end: &[f64; 3]) -> std::io::Result<StepId> {
         let start_id = self.write_cartesian_point(start)?;
-        let end_id = self.write_cartesian_point(end)?;
+        let _end_id = self.write_cartesian_point(end)?;
 
         // Calculate direction and magnitude
         let dir = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
@@ -304,7 +304,7 @@ impl<W: Write> StepWriter<W> {
     pub fn write_curve(
         &mut self,
         curve: &crate::formats::ros_snapshot::CurveData,
-        vertex_map: &HashMap<&uuid::Uuid, StepId>,
+        _vertex_map: &HashMap<&uuid::Uuid, StepId>,
     ) -> std::io::Result<StepId> {
         use crate::formats::ros_snapshot::CurveData;
 
@@ -335,8 +335,8 @@ impl<W: Write> StepWriter<W> {
                 normal,
             } => {
                 // Write CIRCLE entity
-                let center_pt = self.write_cartesian_point(&[center[0], center[1], center[2]])?;
-                let axis = self.write_axis2_placement_3d(
+                let _center_pt = self.write_cartesian_point(&[center[0], center[1], center[2]])?;
+                let _axis = self.write_axis2_placement_3d(
                     &[center[0], center[1], center[2]],
                     Some(&[normal[0], normal[1], normal[2]]),
                     Some(&[1.0, 0.0, 0.0]),
@@ -420,9 +420,9 @@ impl<W: Write> StepWriter<W> {
                 )
             }
             CurveData::Arc {
-                center,
-                normal,
-                radius,
+                center: _,
+                normal: _,
+                radius: _,
                 start_angle,
                 end_angle,
             } => {
@@ -976,7 +976,7 @@ pub async fn export_assembly_to_step(
     assembly: &geometry_engine::assembly::Assembly,
     path: &Path,
 ) -> Result<(), ExportError> {
-    use geometry_engine::assembly::*;
+    
 
     // Create file
     let file = std::fs::File::create(path).map_err(|_| ExportError::FileWriteError {

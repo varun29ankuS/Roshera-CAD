@@ -23,8 +23,7 @@
 
 use crate::math::bspline::KnotVector;
 use crate::math::trimmed_nurbs::IntersectionCurve;
-use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Vector3};
-use rayon::prelude::*;
+use crate::math::{consts, MathResult, Matrix4, Point3, Vector3};
 use std::sync::Arc;
 
 // SIMD optimizations
@@ -767,7 +766,7 @@ impl NurbsCurve {
         ];
 
         // Find spans for all 4 parameters
-        let spans = [
+        let _spans = [
             self.find_span(clamped[0]),
             self.find_span(clamped[1]),
             self.find_span(clamped[2]),
@@ -988,7 +987,7 @@ impl NurbsCurve {
             return Err("Parameter u outside curve bounds");
         }
 
-        let n = self.control_points.len();
+        let _n = self.control_points.len();
         let p = self.degree;
 
         // Check multiplicity
@@ -1246,7 +1245,7 @@ impl NurbsSurface {
         }
 
         // Validate rectangular grid structure
-        for (i, row) in control_points.iter().enumerate() {
+        for (_i, row) in control_points.iter().enumerate() {
             if row.len() != n_v {
                 return Err("Inconsistent control point grid - must be rectangular");
             }
@@ -1257,12 +1256,12 @@ impl NurbsSurface {
             return Err("Weight grid U dimension mismatch");
         }
 
-        for (i, row) in weights.iter().enumerate() {
+        for (_i, row) in weights.iter().enumerate() {
             if row.len() != n_v {
                 return Err("Weight grid V dimension mismatch");
             }
             // Validate all weights are positive (NURBS requirement)
-            for (j, &w) in row.iter().enumerate() {
+            for (_j, &w) in row.iter().enumerate() {
                 if w < 0.0 {
                     return Err("Negative weight detected - NURBS requires positive weights");
                 }

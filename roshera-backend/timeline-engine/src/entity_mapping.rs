@@ -4,14 +4,13 @@
 //! and Geometry Engine IDs, ensuring proper tracking of geometry throughout
 //! the timeline system.
 
-use crate::{EntityId, TimelineError, TimelineResult};
+use crate::EntityId;
 use dashmap::DashMap;
 use geometry_engine::primitives::{
     edge::EdgeId, face::FaceId, solid::SolidId, topology_builder::GeometryId as GeometryEngineId,
     vertex::VertexId,
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Mapping system for entity IDs
 pub struct EntityMapping {

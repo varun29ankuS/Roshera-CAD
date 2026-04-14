@@ -3,23 +3,19 @@
 //! Since BRepModel uses DashMap for concurrent access, we need a
 //! serializable representation for export/import
 
-use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::{
-    curve::{self, Curve},
-    edge::{Edge, EdgeOrientation},
-    face::{Face, FaceOrientation},
-    r#loop::{Loop, LoopType},
-    shell::{Shell, ShellType as GeoShellType},
-    solid::Solid,
+    curve::Curve,
+    edge::EdgeOrientation,
+    face::FaceOrientation,
+    r#loop::LoopType,
+    shell::ShellType as GeoShellType,
     surface::{
-        self, Cone as GeoCone, Cylinder as GeoCylinder, GeneralNurbsSurface, Plane as GeoPlane,
-        Sphere as GeoSphere, Surface, SurfaceType, Torus as GeoTorus,
+        Cone as GeoCone, Cylinder as GeoCylinder, GeneralNurbsSurface, Plane as GeoPlane,
+        Sphere as GeoSphere, Surface, Torus as GeoTorus,
     },
     topology_builder::BRepModel,
-    vertex::Vertex,
 };
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 use std::collections::HashMap;
 use uuid::Uuid;
 

@@ -8,17 +8,16 @@
 //! - Pham, B. (1992). Offset curves and surfaces: a brief survey. CAD.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Point3, Vector3};
 use crate::primitives::{
     curve::Curve,
-    edge::{Edge, EdgeId, EdgeOrientation},
-    face::{Face, FaceId, FaceOrientation},
+    edge::{Edge, EdgeId},
+    face::{Face, FaceId},
     r#loop::Loop,
     shell::{Shell, ShellType},
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
 };
 
 /// Options for offset operations
@@ -475,8 +474,8 @@ fn create_offset_edge(
     edge_id: EdgeId,
     surface_id: u32,
     distance: f64,
-    forward: bool,
-    options: &OffsetOptions,
+    _forward: bool,
+    _options: &OffsetOptions,
 ) -> OperationResult<EdgeId> {
     let edge = model
         .edges
@@ -535,8 +534,8 @@ fn create_offset_edge(
 /// Create offset curve
 fn create_offset_curve(
     curve: &dyn Curve,
-    surface_id: u32,
-    distance: f64,
+    _surface_id: u32,
+    _distance: f64,
 ) -> OperationResult<Box<dyn Curve>> {
     // Would create proper offset curve
     // For now, return copy of original
@@ -546,7 +545,7 @@ fn create_offset_curve(
 /// Compute surface normal at a point
 fn compute_surface_normal_at_point(
     surface: &dyn Surface,
-    point: Point3,
+    _point: Point3,
 ) -> OperationResult<Vector3> {
     // Would compute actual normal at closest point on surface
     // For now, use parametric center
@@ -555,8 +554,8 @@ fn compute_surface_normal_at_point(
 
 /// Extend corners in offset loop
 fn extend_offset_corners(
-    model: &mut BRepModel,
-    offset_edges: &mut Vec<(EdgeId, bool)>,
+    _model: &mut BRepModel,
+    _offset_edges: &mut Vec<(EdgeId, bool)>,
 ) -> OperationResult<()> {
     // Would extend surfaces at corners to meet
     Ok(())
@@ -564,9 +563,9 @@ fn extend_offset_corners(
 
 /// Round corners in offset loop
 fn round_offset_corners(
-    model: &mut BRepModel,
-    offset_edges: &mut Vec<(EdgeId, bool)>,
-    radius: f64,
+    _model: &mut BRepModel,
+    _offset_edges: &mut Vec<(EdgeId, bool)>,
+    _radius: f64,
 ) -> OperationResult<()> {
     // Would add arc edges at corners
     Ok(())
@@ -613,7 +612,7 @@ fn create_interior_offset_faces(
 /// Create wall faces for shell openings
 fn create_shell_walls(
     model: &mut BRepModel,
-    solid: &Solid,
+    _solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
 ) -> OperationResult<Vec<FaceId>> {
@@ -646,10 +645,10 @@ fn create_shell_walls(
 
 /// Create a wall face between outer and inner edges
 fn create_wall_face(
-    model: &mut BRepModel,
-    outer_edge_id: EdgeId,
-    thickness: f64,
-    forward: bool,
+    _model: &mut BRepModel,
+    _outer_edge_id: EdgeId,
+    _thickness: f64,
+    _forward: bool,
 ) -> OperationResult<FaceId> {
     // Would create rectangular face connecting outer edge to inner offset edge
     Err(OperationError::NotImplemented(

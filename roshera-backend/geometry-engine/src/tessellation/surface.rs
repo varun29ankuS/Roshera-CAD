@@ -1,10 +1,9 @@
 //! Surface tessellation algorithms
 
-use super::adaptive::{compute_plane_axes, delaunay_triangulate};
+use super::adaptive::compute_plane_axes;
 use super::{AdaptiveTessellator, MeshVertex, TessellationParams, ThreeJsMesh, TriangleMesh};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
-use crate::primitives::r#loop::Loop;
 use crate::primitives::surface::Surface;
 use crate::primitives::topology_builder::BRepModel;
 use std::collections::{HashMap, HashSet};
@@ -441,7 +440,7 @@ fn enforce_edge_constraint(
     }
 
     // Collect boundary edges of the cavity (edges not shared between removed triangles)
-    let removed_set: HashSet<usize> = intersecting.iter().cloned().collect();
+    let _removed_set: HashSet<usize> = intersecting.iter().cloned().collect();
     let mut edge_count: HashMap<(usize, usize), usize> = HashMap::new();
     let mut cavity_vertices: HashSet<usize> = HashSet::new();
 
@@ -461,7 +460,7 @@ fn enforce_edge_constraint(
     cavity_vertices.insert(v2);
 
     // Boundary edges are those appearing exactly once among removed triangles
-    let boundary_edges: Vec<(usize, usize)> = edge_count
+    let _boundary_edges: Vec<(usize, usize)> = edge_count
         .iter()
         .filter(|(_, &count)| count == 1)
         .map(|(&edge, _)| edge)
@@ -814,7 +813,7 @@ fn tessellate_spherical_face(
     let v_span = v_max - v_min;
 
     // Calculate resolution based on angular deviation
-    let radius = estimate_sphere_radius(surface);
+    let _radius = estimate_sphere_radius(surface);
     let u_steps = ((u_span / params.max_angle_deviation) as usize).max(3);
     let v_steps = ((v_span / params.max_angle_deviation) as usize).max(3);
 
@@ -974,8 +973,8 @@ fn tessellate_spherical_regular(
     u_max: f64,
     v_min: f64,
     v_max: f64,
-    u_steps: usize,
-    v_steps: usize,
+    _u_steps: usize,
+    _v_steps: usize,
     mesh: &mut TriangleMesh,
 ) {
     // Use adaptive tessellation for better quality
@@ -983,7 +982,7 @@ fn tessellate_spherical_regular(
     let temp_mesh = tessellator.tessellate_patch(surface, (u_min, u_max), (v_min, v_max));
 
     // Convert to ThreeJS mesh with face normal
-    let normal = face
+    let _normal = face
         .normal_at(
             (u_min + u_max) / 2.0,
             (v_min + v_max) / 2.0,
@@ -1061,7 +1060,7 @@ fn tessellate_conical_face(
 
     // Calculate tessellation resolution
     let u_span = u_max - u_min;
-    let v_span = v_max - v_min;
+    let _v_span = v_max - v_min;
 
     // Angular resolution for u (around axis)
     let u_steps = ((u_span / params.max_angle_deviation) as usize).max(8);
@@ -1234,8 +1233,8 @@ fn tessellate_toroidal_face(
     let u_steps_chord = ((major_radius * u_span) / params.max_edge_length) as usize;
     let v_steps_chord = ((minor_radius * v_span) / params.max_edge_length) as usize;
 
-    let u_steps = u_steps.max(u_steps_chord).min(params.max_segments);
-    let v_steps = v_steps.max(v_steps_chord).min(params.max_segments / 2);
+    let _u_steps = u_steps.max(u_steps_chord).min(params.max_segments);
+    let _v_steps = v_steps.max(v_steps_chord).min(params.max_segments / 2);
 
     // Use adaptive tessellation for high quality
     let tessellator = AdaptiveTessellator::new(params.clone());
@@ -1403,7 +1402,7 @@ fn tessellate_generic_face(
     };
 
     // Get parameter bounds
-    let (u_range, v_range) = surface.parameter_bounds();
+    let (_u_range, _v_range) = surface.parameter_bounds();
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
     // Simple uniform grid tessellation
@@ -1668,7 +1667,7 @@ pub fn tessellate_surface(
     surface: &dyn Surface,
     u_range: (f64, f64),
     v_range: (f64, f64),
-    params: &TessellationParams,
+    _params: &TessellationParams,
 ) -> TriangleMesh {
     let mut mesh = TriangleMesh::new();
 
@@ -1838,7 +1837,7 @@ fn subdivide_nurbs_quad(
     let node_idx = quad_tree.nodes.len() - 1;
 
     // Subdivide into 4 children
-    let children = quad_tree.subdivide(node_idx);
+    let _children = quad_tree.subdivide(node_idx);
 
     // Recursively subdivide children
     let u_mid = (u_min + u_max) / 2.0;
@@ -1984,7 +1983,7 @@ fn quad_tree_to_mesh(
     let mut vertex_map = HashMap::new();
 
     // Process all leaf nodes
-    for (idx, node) in quad_tree.nodes.iter().enumerate() {
+    for (_idx, node) in quad_tree.nodes.iter().enumerate() {
         if node.children.is_none() {
             // This is a leaf node - tessellate it
             let vertices = [

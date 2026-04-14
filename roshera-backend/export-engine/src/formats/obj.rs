@@ -1,7 +1,6 @@
 //! OBJ file format support
 
 use shared_types::{
-    geometry::MaterialProperties, // Use the geometry MaterialProperties specifically
     ExportError,
     Mesh,
 };

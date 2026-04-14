@@ -335,7 +335,7 @@ fn compute_damping_factor(error: f64, prev_error: f64, stagnation_count: &mut u3
 
 /// Try Aitken's acceleration for faster convergence
 #[inline]
-fn try_aitken_acceleration<F>(f: &F, x: f64, dx: f64) -> Option<f64>
+fn try_aitken_acceleration<F>(_f: &F, x: f64, dx: f64) -> Option<f64>
 where
     F: Fn(f64) -> f64,
 {
@@ -351,6 +351,7 @@ where
 }
 
 /// Bisection method with Illinois algorithm for faster convergence
+#[allow(unused_assignments)]
 pub fn bisection<F>(
     f: F,
     mut a: f64,
@@ -960,7 +961,7 @@ impl RemezApproximation {
         f: F,
         range: Range<f64>,
         degree: usize,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<Self>
     where
         F: Fn(f64) -> f64 + Copy,
@@ -1044,7 +1045,7 @@ pub mod ulp {
             u64::MAX
         } else {
             // Same sign
-            (a_bits.max(b_bits) - a_bits.min(b_bits))
+            a_bits.max(b_bits) - a_bits.min(b_bits)
         }
     }
 

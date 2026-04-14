@@ -4,9 +4,8 @@
 //! Supports guide curves, vertex correspondence, and tangency constraints.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Point3, Vector3};
 use crate::primitives::{
-    curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
@@ -14,7 +13,7 @@ use crate::primitives::{
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 
 /// Options for loft operations
@@ -173,10 +172,10 @@ fn create_linear_loft(
 
 /// Create a smooth cubic loft
 fn create_cubic_loft(
-    model: &mut BRepModel,
-    profiles: Vec<FaceId>,
-    correspondence: Vec<Vec<VertexId>>,
-    options: &LoftOptions,
+    _model: &mut BRepModel,
+    _profiles: Vec<FaceId>,
+    _correspondence: Vec<Vec<VertexId>>,
+    _options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     // This would implement smooth cubic interpolation between profiles
     // using NURBS surfaces
@@ -187,10 +186,10 @@ fn create_cubic_loft(
 
 /// Create a minimal twist loft
 fn create_minimal_twist_loft(
-    model: &mut BRepModel,
-    profiles: Vec<FaceId>,
-    correspondence: Vec<Vec<VertexId>>,
-    options: &LoftOptions,
+    _model: &mut BRepModel,
+    _profiles: Vec<FaceId>,
+    _correspondence: Vec<Vec<VertexId>>,
+    _options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     // This would optimize the correspondence to minimize twist
     Err(OperationError::NotImplemented(
@@ -200,9 +199,9 @@ fn create_minimal_twist_loft(
 
 /// Create a guided loft following guide curves
 fn create_guided_loft(
-    model: &mut BRepModel,
-    profiles: Vec<FaceId>,
-    correspondence: Vec<Vec<VertexId>>,
+    _model: &mut BRepModel,
+    _profiles: Vec<FaceId>,
+    _correspondence: Vec<Vec<VertexId>>,
     options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     if options.guide_curves.is_empty() {
@@ -220,8 +219,8 @@ fn create_guided_loft(
 /// Create ruled surfaces between two profiles
 fn create_ruled_surfaces_between_profiles(
     model: &mut BRepModel,
-    profile1: FaceId,
-    profile2: FaceId,
+    _profile1: FaceId,
+    _profile2: FaceId,
     vertices1: &[VertexId],
     vertices2: &[VertexId],
 ) -> OperationResult<Vec<FaceId>> {
@@ -335,22 +334,22 @@ fn create_bilinear_surface(
     // use crate::primitives::surface::BilinearSurface; // TODO: Implement BilinearSurface
 
     // Get vertex positions
-    let p00 = model
+    let _p00 = model
         .vertices
         .get(v00)
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?
         .position;
-    let p10 = model
+    let _p10 = model
         .vertices
         .get(v10)
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?
         .position;
-    let p01 = model
+    let _p01 = model
         .vertices
         .get(v01)
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?
         .position;
-    let p11 = model
+    let _p11 = model
         .vertices
         .get(v11)
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?

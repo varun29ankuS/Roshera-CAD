@@ -184,7 +184,7 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
 
     // Parallel vertex deduplication
     let vertex_count = mesh.vertex_count();
-    let mut unique_vertices: Vec<(f32, f32, f32, f32, f32, f32)> = Vec::new();
+    let _unique_vertices: Vec<(f32, f32, f32, f32, f32, f32)> = Vec::new();
     let vertex_remap = Arc::new(Mutex::new(vec![0u32; vertex_count]));
     let next_index = Arc::new(AtomicU32::new(0));
 
@@ -199,12 +199,12 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
     chunks.par_iter().for_each(|chunk| {
         for &i in chunk {
             let idx = i * 3;
-            let pos = (
+            let _pos = (
                 mesh.positions[idx],
                 mesh.positions[idx + 1],
                 mesh.positions[idx + 2],
             );
-            let normal = (
+            let _normal = (
                 mesh.normals[idx],
                 mesh.normals[idx + 1],
                 mesh.normals[idx + 2],

@@ -7,9 +7,9 @@
 //! - All new files use v3 by default
 
 use crate::ros_fs::aipr::{AICommandTracker, PrivacySettings, TrackingLevel};
-use crate::ros_fs::chunk::{Chunk, ChunkIndexEntry, ChunkType};
+use crate::ros_fs::chunk::{Chunk, ChunkType};
 use crate::ros_fs::encryption::{ChunkEncryptor, EncryptionAlgorithm};
-use crate::ros_fs::keys::{KeyManager, KeySet, SoftwareKeyManager};
+use crate::ros_fs::keys::{KeyManager, SoftwareKeyManager};
 use crate::ros_fs::{Result, RosFileError};
 use byteorder::ReadBytesExt;
 use std::fs::File;
@@ -145,7 +145,7 @@ pub fn migrate_v2_to_v3<P: AsRef<Path>>(
     let v2_chunks = load_v2_chunks(&mut v2_file)?;
 
     // Initialize AI tracking if requested
-    let mut ai_tracker = if options.enable_ai_tracking {
+    let ai_tracker = if options.enable_ai_tracking {
         Some(AICommandTracker::new(
             options.tracking_level,
             PrivacySettings::default(),
@@ -256,7 +256,7 @@ fn write_v3_file<P: AsRef<Path>>(
     key_set: Option<crate::ros_fs::keys::KeySet>,
     file_iv: Option<[u8; 8]>,
 ) -> Result<()> {
-    use crate::ros_fs::header::{FileHeader, FileHeaderBuilder};
+    use crate::ros_fs::header::FileHeader;
     use std::fs::OpenOptions;
     use std::io::Write;
 

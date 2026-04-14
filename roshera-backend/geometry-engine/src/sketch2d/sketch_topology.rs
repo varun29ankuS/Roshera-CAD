@@ -14,12 +14,10 @@
 use super::constraints::EntityRef;
 use super::line2d::LineGeometry;
 use super::{
-    Arc2dId, Circle2dId, Ellipse2dId, Line2dId, Point2d, Polyline2dId, Rectangle2dId,
-    Sketch2dError, Sketch2dResult, Spline2dId, Tolerance2d, Vector2d,
+    Point2d,
+    Sketch2dError, Sketch2dResult, Tolerance2d, Vector2d,
 };
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Type of sketch entity edge

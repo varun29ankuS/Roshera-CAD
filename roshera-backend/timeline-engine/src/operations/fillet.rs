@@ -5,19 +5,13 @@
 use super::common::{brep_to_entity_state, entity_state_to_brep, validate_edges_same_solid};
 use crate::{
     entity_mapping::get_entity_mapping,
-    execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    EntityId, EntityType, ModifiedEntity, Operation, OperationInputs, OperationOutputs,
+    execution::{ExecutionContext, OperationImpl, ResourceEstimate}, EntityType, Operation, OperationOutputs,
     TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
     math::Tolerance,
-    operations::fillet::FilletOptions,
-    primitives::{
-        edge::EdgeId,
-        solid::SolidId,
-        topology_builder::{BRepModel, GeometryId as GeometryEngineId},
-    },
+    primitives::topology_builder::GeometryId as GeometryEngineId,
 };
 
 /// Implementation of fillet operation

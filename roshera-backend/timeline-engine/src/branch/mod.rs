@@ -5,8 +5,7 @@
 
 use crate::error::{TimelineError, TimelineResult};
 use crate::types::{
-    AIContext, Author, Branch, BranchId, BranchMetadata, BranchPurpose, BranchState, CheckpointId,
-    EntityId, EventId, EventIndex, ForkPoint, Operation, OptimizationObjective, TimelineEvent,
+    AIContext, Author, Branch, BranchId, BranchMetadata, BranchPurpose, BranchState, EventIndex, ForkPoint, OptimizationObjective,
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;

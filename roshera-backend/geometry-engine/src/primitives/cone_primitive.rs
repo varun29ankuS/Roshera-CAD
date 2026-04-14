@@ -4,19 +4,18 @@
 //! Handles apex singularity, partial cones (frustums), and sector cones.
 
 use crate::{
-    math::{consts, MathResult, Point3, Vector3},
+    math::{consts, Point3, Vector3},
     primitives::{
-        curve::{Arc, Circle, CurveId, Line, ParameterRange},
-        edge::{Edge, EdgeId, EdgeOrientation},
-        face::{Face, FaceId, FaceOrientation},
+        curve::{Arc, Circle, ParameterRange},
+        edge::{Edge, EdgeOrientation},
+        face::{Face, FaceOrientation},
         primitive_traits::PrimitiveError,
-        r#loop::{Loop, LoopId, LoopType},
-        shell::{Shell, ShellId, ShellType},
+        r#loop::{Loop, LoopType},
+        shell::{Shell, ShellType},
         solid::{Solid, SolidId},
-        surface::{Cone, Cylinder, Plane, SurfaceId},
+        surface::{Cone, Plane},
         topology_builder::BRepModel,
         topology_builder::TopologyBuilder,
-        vertex::VertexId,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -117,7 +116,7 @@ pub struct ConePrimitive;
 impl ConePrimitive {
     /// Create a cone with B-Rep topology
     pub fn create(params: &ConeParameters, model: &mut BRepModel) -> PrimitiveResult<SolidId> {
-        let mut builder = TopologyBuilder::new(model);
+        let _builder = TopologyBuilder::new(model);
 
         // Calculate key dimensions
         let top_radius = params.height * params.half_angle.tan();
@@ -150,7 +149,7 @@ impl ConePrimitive {
         let cone_surface_id = model.surfaces.add(Box::new(cone_surface));
 
         // Create vertices
-        let apex_vertex = if has_apex {
+        let _apex_vertex = if has_apex {
             Some(
                 model
                     .vertices
@@ -231,7 +230,7 @@ impl ConePrimitive {
                 loop_.add_edge(top_edge_id, true);
                 let loop_id = model.loops.add(loop_);
 
-                let mut face = Face::new(0, cone_surface_id, loop_id, FaceOrientation::Forward);
+                let face = Face::new(0, cone_surface_id, loop_id, FaceOrientation::Forward);
                 model.faces.add(face)
             } else {
                 // Frustum - two circular edges
@@ -371,9 +370,9 @@ impl ConePrimitive {
 
     /// Update cone parameters
     pub fn update_parameters(
-        solid_id: SolidId,
-        params: &ConeParameters,
-        model: &mut BRepModel,
+        _solid_id: SolidId,
+        _params: &ConeParameters,
+        _model: &mut BRepModel,
     ) -> PrimitiveResult<()> {
         // TODO: Implement parametric update
         Err(PrimitiveError::GeometryError {

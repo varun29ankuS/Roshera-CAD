@@ -751,7 +751,7 @@ impl Plane {
     fn create_variable_offset_nurbs(
         &self,
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         // Variable offset for plane requires NURBS approximation
         let samples_u = 32; // U direction samples
@@ -810,7 +810,7 @@ impl Plane {
         knots_v.extend(vec![1.0; degree_v + 1]);
 
         // Create NURBS surface from offset points
-        let nurbs_surface = NurbsSurface::new(
+        let _nurbs_surface = NurbsSurface::new(
             control_points,
             weights,
             knots_u,
@@ -1080,7 +1080,7 @@ impl Plane {
         // - Kriezis et al. (1992). "Rational polynomial surface intersections"
 
         // Start with a grid search to find initial intersection points
-        let mut initial_points = self.find_initial_intersection_points(other, tolerance);
+        let initial_points = self.find_initial_intersection_points(other, tolerance);
 
         if initial_points.is_empty() {
             return vec![];
@@ -1146,7 +1146,7 @@ impl Plane {
         const GRID_SIZE: usize = 20;
 
         let (u_range, v_range) = self.parameter_bounds();
-        let (s_range, t_range) = other.parameter_bounds();
+        let (_s_range, _t_range) = other.parameter_bounds();
 
         for i in 0..GRID_SIZE {
             for j in 0..GRID_SIZE {
@@ -1721,7 +1721,7 @@ impl Surface for Cylinder {
         knots_v.extend(vec![1.0; degree_v + 1]);
 
         // Create NURBS surface from offset points
-        let nurbs_surface = NurbsSurface::new(
+        let _nurbs_surface = NurbsSurface::new(
             control_points_grid,
             weights_grid,
             knots_u,
@@ -1990,7 +1990,7 @@ impl Cylinder {
 
             // For skew cylinders, the intersection is generally a space curve
             // We'll use a marching approach to find it
-            use crate::math::Vector3;
+            
 
             // Start with a grid of test points on first cylinder
             const THETA_SAMPLES: usize = 24;
@@ -2093,7 +2093,7 @@ impl Cylinder {
 
         // Control points for one quadrant
         let p0 = center + major_axis * semi_major;
-        let p1 = center + major_axis * semi_major + minor_axis * semi_minor;
+        let _p1 = center + major_axis * semi_major + minor_axis * semi_minor;
         let p2 = center + minor_axis * semi_minor;
 
         // Build full ellipse from 4 quadrants
@@ -2134,7 +2134,7 @@ impl Cylinder {
 
         // For a full cylinder, we need 9 control points for a NURBS circle
         // and 2 rows for the height
-        let n_u = 9; // Standard for NURBS circle
+        let _n_u = 9; // Standard for NURBS circle
         let n_v = 2; // Top and bottom
 
         // Create control points
@@ -2151,7 +2151,7 @@ impl Cylinder {
 
             // Create NURBS circle control points
             // Using standard 9-point NURBS circle
-            let w = std::f64::consts::FRAC_1_SQRT_2; // weight for 45° points
+            let _w = std::f64::consts::FRAC_1_SQRT_2; // weight for 45° points
 
             // Get perpendicular directions
             let x_dir = self.ref_dir;
@@ -2187,7 +2187,7 @@ impl Cylinder {
         // Weights for rational B-spline (NURBS)
         // For a perfect circle, intermediate control points need weight 1/√2 ≈ 0.707
         let w = std::f64::consts::FRAC_1_SQRT_2;
-        let weights = vec![
+        let _weights = vec![
             vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0], // bottom row
             vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0], // top row
         ];
@@ -2513,7 +2513,7 @@ impl Surface for Sphere {
         knots_v.extend(vec![1.0; degree_v + 1]);
 
         // Create NURBS surface from offset points
-        let nurbs_surface = NurbsSurface::new(
+        let _nurbs_surface = NurbsSurface::new(
             control_points_grid,
             weights_grid,
             knots_u,
@@ -2597,7 +2597,7 @@ impl Sphere {
                 Err(_) => return vec![], // Should not happen
             }
         };
-        let v_dir = plane.normal.cross(&u_dir);
+        let _v_dir = plane.normal.cross(&u_dir);
 
         // Create circle curve
         let circle =
@@ -2676,7 +2676,7 @@ impl Sphere {
         let circle_normal = direction;
 
         // Find perpendicular direction for circle
-        let u_dir = if circle_normal.dot(&Vector3::Z).abs() < 0.9 {
+        let _u_dir = if circle_normal.dot(&Vector3::Z).abs() < 0.9 {
             match circle_normal.cross(&Vector3::Z).normalize() {
                 Ok(dir) => dir,
                 Err(_) => return vec![], // Should not happen
@@ -3028,7 +3028,7 @@ impl Surface for Cone {
     fn offset_variable(
         &self,
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         // Variable offset for cone requires NURBS approximation
         // Sample the distance function across the cone's parameter space
@@ -3168,7 +3168,7 @@ impl Cone {
         }
 
         // Classify conic section type
-        let sin_axis_angle = axis_angle.sin();
+        let _sin_axis_angle = axis_angle.sin();
         let cos_axis_angle = axis_angle.cos();
 
         // Angle between plane and cone surface
@@ -3181,7 +3181,7 @@ impl Cone {
             // - Hartmann, E. (2003). "Geometry and Algorithms for Computer Aided Design"
 
             // Find the vertex of the parabola
-            let generator_dir = self.axis * self.half_angle.cos()
+            let _generator_dir = self.axis * self.half_angle.cos()
                 + match self.axis.perpendicular().normalize() {
                     Ok(perp) => perp * self.half_angle.sin(),
                     Err(_) => return vec![],
@@ -3442,7 +3442,7 @@ impl Torus {
         // Find two orthogonal directions in the plane
         // perpendicular() already returns a normalized vector
         let dir1 = plane.normal.perpendicular();
-        let dir2 = plane.normal.cross(&dir1);
+        let _dir2 = plane.normal.cross(&dir1);
 
         // Create a circle in the plane
         // Note: In the general case, this would be an ellipse, but for true Villarceau
@@ -3692,7 +3692,7 @@ impl Surface for Torus {
     fn offset_variable(
         &self,
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         // Variable offset for torus requires NURBS approximation
         let samples_u = 32; // Major circumference samples
@@ -3797,7 +3797,7 @@ impl Torus {
         // 3. One circle (tangent plane)
         // 4. No intersection
 
-        let mut intersections = Vec::new();
+        let intersections = Vec::new();
 
         // Distance from torus center to plane
         let center_to_plane = plane.normal.dot(&(self.center - plane.origin));
@@ -4050,32 +4050,32 @@ impl SurfaceStore {
         match surface_type {
             SurfaceType::Plane => {
                 if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
-                    let idx = self.planes.len();
+                    let _idx = self.planes.len();
                     self.planes.push(*plane);
                     // Defer type_map insertion - only when needed for lookup
                 }
             }
             SurfaceType::Cylinder => {
                 if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
-                    let idx = self.cylinders.len();
+                    let _idx = self.cylinders.len();
                     self.cylinders.push(*cyl);
                 }
             }
             SurfaceType::Sphere => {
                 if let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() {
-                    let idx = self.spheres.len();
+                    let _idx = self.spheres.len();
                     self.spheres.push(*sphere);
                 }
             }
             SurfaceType::Cone => {
                 if let Some(cone) = surface.as_any().downcast_ref::<Cone>() {
-                    let idx = self.cones.len();
+                    let _idx = self.cones.len();
                     self.cones.push(*cone);
                 }
             }
             SurfaceType::Torus => {
                 if let Some(torus) = surface.as_any().downcast_ref::<Torus>() {
-                    let idx = self.toruses.len();
+                    let _idx = self.toruses.len();
                     self.toruses.push(*torus);
                 }
             }
@@ -4673,7 +4673,7 @@ impl Surface for GeneralNurbsSurface {
         Ok((u, v))
     }
 
-    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
         // For NURBS surfaces, we can only approximate offset
         // Return the offset surface directly (not wrapped in OffsetSurface struct)
         // The OffsetSurface struct is for tracking quality metadata, not for direct use
@@ -4695,7 +4695,7 @@ impl Surface for GeneralNurbsSurface {
     fn offset_variable(
         &self,
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         // Variable offset for NURBS requires creating a new NURBS surface
         // Sample the offset function and create offset control points
@@ -4755,7 +4755,7 @@ impl Surface for GeneralNurbsSurface {
 
     fn intersect(
         &self,
-        other: &dyn Surface,
+        _other: &dyn Surface,
         _tolerance: Tolerance,
     ) -> Vec<SurfaceIntersectionResult> {
         // NURBS surface intersection is complex - for now return empty
@@ -4893,8 +4893,8 @@ impl Surface for SurfaceOfRevolution {
         let p_minus = self.profile_curve.point_at(u_minus)?;
         let du_scale = 1.0 / (u_plus - u_minus);
 
-        let (h_plus, r_plus, rd_plus) = self.decompose_profile_point(p_plus);
-        let (h_minus, r_minus, rd_minus) = self.decompose_profile_point(p_minus);
+        let (h_plus, r_plus, _rd_plus) = self.decompose_profile_point(p_plus);
+        let (h_minus, r_minus, _rd_minus) = self.decompose_profile_point(p_minus);
 
         let dh_du = (h_plus - h_minus) * du_scale;
         let dr_du = (r_plus - r_minus) * du_scale;
@@ -4916,8 +4916,8 @@ impl Surface for SurfaceOfRevolution {
         };
 
         // Second derivatives (finite differences)
-        let v_plus = v + h;
-        let v_minus = v - h;
+        let _v_plus = v + h;
+        let _v_minus = v - h;
 
         let pos_uu = {
             let p1 = self.profile_curve.point_at(u_plus)?;
@@ -5042,7 +5042,7 @@ impl Surface for SurfaceOfRevolution {
         Ok((best_u, v.clamp(0.0, self.angle)))
     }
 
-    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
         // Offset a surface of revolution by offsetting the profile curve
         // For now, use a numerical approximation via NURBS fitting
         // A more exact approach would offset the profile curve by distance
@@ -5249,7 +5249,7 @@ impl Surface for RuledSurface {
         Ok((best_u, best_v))
     }
 
-    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
         Box::new(self.clone()) // Simplified
     }
 

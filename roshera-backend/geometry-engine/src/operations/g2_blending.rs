@@ -3,16 +3,15 @@
 //! High-level operations for creating G2 continuous blending surfaces
 //! between existing CAD surfaces with automatic quality optimization.
 
-use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{MathResult, Point3, Tolerance};
 use crate::primitives::blending_surfaces::{
     BlendingAlgorithm, BlendingQuality, CubicG2Blend, G2BlendingSurface, InterpolationMethod,
     QuarticG2Blend, VariableG2Blend,
 };
 use crate::primitives::curve::Curve;
 use crate::primitives::surface::{
-    G2ContinuityReport, G2VerificationReport, Surface, SurfaceContinuity,
+    G2VerificationReport, Surface, SurfaceContinuity,
 };
-use std::sync::Arc;
 
 /// G2 blending operation factory with automatic quality optimization
 pub struct G2BlendingOperations;
@@ -332,11 +331,11 @@ impl G2BlendingOperations {
     // Helper methods (placeholder implementations)
 
     fn analyze_blending_complexity(
-        surface1: &dyn Surface,
-        surface2: &dyn Surface,
-        boundary1: &dyn Curve,
-        boundary2: &dyn Curve,
-        tolerance: Tolerance,
+        _surface1: &dyn Surface,
+        _surface2: &dyn Surface,
+        _boundary1: &dyn Curve,
+        _boundary2: &dyn Curve,
+        _tolerance: Tolerance,
     ) -> MathResult<BlendingComplexity> {
         // Analyze curvature variation, surface types, etc.
         // For now, return moderate complexity
@@ -344,8 +343,8 @@ impl G2BlendingOperations {
     }
 
     fn analyze_internal_surface_quality(
-        surface: &dyn Surface,
-        tolerance: Tolerance,
+        _surface: &dyn Surface,
+        _tolerance: Tolerance,
     ) -> MathResult<InternalQualityMetrics> {
         Ok(InternalQualityMetrics {
             fairness_score: 0.9,
@@ -355,46 +354,46 @@ impl G2BlendingOperations {
     }
 
     fn apply_optimization_step(
-        blend: &mut G2BlendingSurface,
-        quality_report: &G2QualityReport,
-        tolerance: Tolerance,
+        _blend: &mut G2BlendingSurface,
+        _quality_report: &G2QualityReport,
+        _tolerance: Tolerance,
     ) -> MathResult<()> {
         // Apply gradient-based optimization to control points
         Ok(())
     }
 
     fn optimize_cubic_control_points(
-        control_points: &mut [[Point3; 4]; 4],
-        surface1: &dyn Surface,
-        surface2: &dyn Surface,
-        tolerance: Tolerance,
+        _control_points: &mut [[Point3; 4]; 4],
+        _surface1: &dyn Surface,
+        _surface2: &dyn Surface,
+        _tolerance: Tolerance,
     ) -> MathResult<()> {
         // Optimize control points for G2 continuity
         Ok(())
     }
 
     fn optimize_quartic_control_points(
-        control_points: &mut [[Point3; 5]; 5],
-        twist_factors: &mut [[f64; 5]; 5],
-        constraints: &[crate::primitives::blending_surfaces::CurvatureConstraint],
-        tolerance: Tolerance,
+        _control_points: &mut [[Point3; 5]; 5],
+        _twist_factors: &mut [[f64; 5]; 5],
+        _constraints: &[crate::primitives::blending_surfaces::CurvatureConstraint],
+        _tolerance: Tolerance,
     ) -> MathResult<()> {
         Ok(())
     }
 
     fn setup_quartic_constraints(
-        surface1: &dyn Surface,
-        surface2: &dyn Surface,
-        boundary1: &dyn Curve,
-        boundary2: &dyn Curve,
-        tolerance: Tolerance,
+        _surface1: &dyn Surface,
+        _surface2: &dyn Surface,
+        _boundary1: &dyn Curve,
+        _boundary2: &dyn Curve,
+        _tolerance: Tolerance,
     ) -> MathResult<Vec<crate::primitives::blending_surfaces::CurvatureConstraint>> {
         Ok(vec![])
     }
 
     fn compute_cubic_quality(
-        control_points: &[[Point3; 4]; 4],
-        tolerance: Tolerance,
+        _control_points: &[[Point3; 4]; 4],
+        _tolerance: Tolerance,
     ) -> MathResult<BlendingQuality> {
         Ok(BlendingQuality {
             g0_error: 0.0,
@@ -407,8 +406,8 @@ impl G2BlendingOperations {
     }
 
     fn compute_quartic_quality(
-        control_points: &[[Point3; 5]; 5],
-        tolerance: Tolerance,
+        _control_points: &[[Point3; 5]; 5],
+        _tolerance: Tolerance,
     ) -> MathResult<BlendingQuality> {
         Ok(BlendingQuality {
             g0_error: 0.0,

@@ -4,9 +4,9 @@
 //! Supports partial revolutions, multiple profiles, and helical paths.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
-    curve::{Curve, ParameterRange},
+    curve::ParameterRange,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
@@ -14,7 +14,7 @@ use crate::primitives::{
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 
 /// Options for revolution operations
@@ -177,10 +177,10 @@ fn create_revolution(
 
 /// Create a helical sweep
 fn create_helical_sweep(
-    model: &mut BRepModel,
-    base_face: &Face,
-    base_face_id: FaceId,
-    options: &RevolveOptions,
+    _model: &mut BRepModel,
+    _base_face: &Face,
+    _base_face_id: FaceId,
+    _options: &RevolveOptions,
 ) -> OperationResult<SolidId> {
     // This would implement helical sweep with pitch
     // For now, return NotImplemented
@@ -254,8 +254,8 @@ fn create_revolution_segment_face(
     let rotation_start = Matrix4::from_axis_angle(&axis_direction, start_angle)?;
     let rotation_end = Matrix4::from_axis_angle(&axis_direction, end_angle)?;
 
-    let v0 = edge.start_vertex;
-    let v1 = edge.end_vertex;
+    let _v0 = edge.start_vertex;
+    let _v1 = edge.end_vertex;
     let v2 = create_rotated_vertex(model, &end_vertex, axis_origin, rotation_start)?;
     let v3 = create_rotated_vertex(model, &end_vertex, axis_origin, rotation_end)?;
     let v4 = create_rotated_vertex(model, &start_vertex, axis_origin, rotation_end)?;

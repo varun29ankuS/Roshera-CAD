@@ -71,10 +71,7 @@ pub use transform::{
     TransformOptions, TransformResult,
 };
 
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
-use crate::primitives::{
-    edge::EdgeId, face::FaceId, solid::SolidId, topology_builder::BRepModel, vertex::VertexId,
-};
+use crate::math::Tolerance;
 
 /// Common result type for all operations
 pub type OperationResult<T> = Result<T, OperationError>;

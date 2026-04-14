@@ -5,7 +5,7 @@
 //! and two orthogonal axes (X and Y), with the Z axis computed as their cross product.
 
 use super::{Point2d, Sketch2dError, Sketch2dResult, Vector2d};
-use crate::math::{MathError, MathResult, Matrix4, Point3, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

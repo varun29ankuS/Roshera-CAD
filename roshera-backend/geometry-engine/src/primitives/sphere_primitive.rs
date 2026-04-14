@@ -3,7 +3,7 @@
 //! This module implements a world-class parametric sphere primitive that meets
 //! all requirements for exact geometry, complete topology, and parametric updates.
 
-use crate::math::{consts, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{consts, Matrix4, Point3, Tolerance};
 use crate::primitives::{
     curve::{Arc, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
@@ -17,7 +17,6 @@ use crate::primitives::{
     shell::{Shell, ShellType},
     solid::Solid,
     solid::SolidId,
-    surface::Sphere as SphereSurface,
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -131,8 +130,8 @@ impl Primitive for SpherePrimitive {
             })?;
         let surface_id = model.surfaces.add(Box::new(sphere_surface));
 
-        let mut vertices: Vec<VertexId> = Vec::new();
-        let mut edges: Vec<EdgeId> = Vec::new();
+        let _vertices: Vec<VertexId> = Vec::new();
+        let _edges: Vec<EdgeId> = Vec::new();
         let mut faces: Vec<FaceId> = Vec::new();
 
         // Create vertex grid
@@ -459,7 +458,7 @@ fn create_triangle_edges(
     v1: VertexId,
     v2: VertexId,
     v3: VertexId,
-    tolerance: Tolerance,
+    _tolerance: Tolerance,
 ) -> Result<Vec<EdgeId>, PrimitiveError> {
     let mut edges = Vec::new();
 
@@ -553,7 +552,7 @@ fn create_quad_edges(
     v4: VertexId,
     _j: u32,
     _i: u32,
-    tolerance: Tolerance,
+    _tolerance: Tolerance,
 ) -> Result<Vec<EdgeId>, PrimitiveError> {
     let mut edges = Vec::new();
 

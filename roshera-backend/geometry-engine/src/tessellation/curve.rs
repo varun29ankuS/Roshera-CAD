@@ -1,7 +1,7 @@
 //! Curve tessellation algorithms
 
 use super::TessellationParams;
-use crate::math::{tolerance, Point3, Vector3};
+use crate::math::{tolerance, Point3};
 use crate::primitives::{builder::BRepModel, curve::Curve, edge::Edge};
 
 /// Tessellate an edge into line segments

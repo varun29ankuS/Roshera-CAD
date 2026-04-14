@@ -20,7 +20,7 @@
 //! - de Boor: "A Practical Guide to Splines" (1978)
 //! - Prautzsch et al.: "Bézier and B-Spline Techniques" (2002)
 
-use crate::math::{consts, ApproxEq, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use std::fmt;
 use std::ops::Index;
 
@@ -653,10 +653,10 @@ impl BSplineCurve {
                 use std::arch::x86_64::*;
 
                 // Load basis functions
-                let b0 = _mm256_set1_pd(basis[0]);
-                let b1 = _mm256_set1_pd(basis[1]);
-                let b2 = _mm256_set1_pd(basis[2]);
-                let b3 = _mm256_set1_pd(basis[3]);
+                let _b0 = _mm256_set1_pd(basis[0]);
+                let _b1 = _mm256_set1_pd(basis[1]);
+                let _b2 = _mm256_set1_pd(basis[2]);
+                let _b3 = _mm256_set1_pd(basis[3]);
 
                 // Load control points (4 at a time for AVX)
                 let idx = span - self.degree;

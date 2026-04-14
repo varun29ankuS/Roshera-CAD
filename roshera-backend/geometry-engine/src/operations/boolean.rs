@@ -36,7 +36,7 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Curve, CurveId, CurveIntersection},
+    curve::{Curve, CurveId},
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     shell::{Shell, ShellId},
@@ -1131,7 +1131,7 @@ fn handle_parallel_cylinders(
 fn create_cylinder_tangent_line(
     cyl_a: &crate::primitives::surface::Cylinder,
     cyl_b: &crate::primitives::surface::Cylinder,
-    axis_distance: f64,
+    _axis_distance: f64,
     external: bool,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     // Find the point of tangency
@@ -1238,7 +1238,7 @@ fn solve_general_cylinder_intersection(
     // In production, this would implement the full analytical solution
 
     // Set up coordinate system with cylinder A at origin
-    let transform = create_cylinder_intersection_transform(cyl_a, cyl_b)?;
+    let _transform = create_cylinder_intersection_transform(cyl_a, cyl_b)?;
 
     // Solve intersection using parametric marching along key curves
     let curves = march_cylinder_intersection_curves(cyl_a, cyl_b, tolerance)?;
@@ -1249,7 +1249,7 @@ fn solve_general_cylinder_intersection(
 /// Create coordinate transform for cylinder intersection
 fn create_cylinder_intersection_transform(
     cyl_a: &crate::primitives::surface::Cylinder,
-    cyl_b: &crate::primitives::surface::Cylinder,
+    _cyl_b: &crate::primitives::surface::Cylinder,
 ) -> OperationResult<Matrix4> {
     // Create transform that places cylinder A at origin with Z-axis alignment
     let translation = Matrix4::from_translation(&(-cyl_a.origin));
@@ -1366,12 +1366,11 @@ fn march_from_point_cylinders(
     let mut params_a = vec![start.params_a];
     let mut params_b = vec![start.params_b];
 
-    let mut current = start.clone();
     let step_size = tolerance.distance() * 10.0; // Adaptive step size
 
     // March in both directions
     for &direction in &[1.0, -1.0] {
-        current = start.clone();
+        let mut current = start.clone();
 
         for _step in 0..1000 {
             // Maximum steps to prevent infinite loops
@@ -1537,8 +1536,8 @@ fn find_initial_intersection_points(
     let (v_min_a, v_max_a) = v_bounds_a;
 
     let (u_bounds_b, v_bounds_b) = surface_b.parameter_bounds();
-    let (u_min_b, u_max_b) = u_bounds_b;
-    let (v_min_b, v_max_b) = v_bounds_b;
+    let (_u_min_b, _u_max_b) = u_bounds_b;
+    let (_v_min_b, _v_max_b) = v_bounds_b;
 
     // Sample surface A
     for i in 0..=GRID_SIZE {
@@ -1764,7 +1763,7 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
 
 /// Merge curves that connect
 fn merge_connected_curves(
-    mut curves: Vec<SurfaceIntersectionCurve>,
+    curves: Vec<SurfaceIntersectionCurve>,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     if curves.len() <= 1 {
@@ -1834,56 +1833,7 @@ fn merge_connected_curves(
         }
 
         // Create merged curve from chain
-        if chain.len() == 1 {
-            // Single curve - reconstruct without cloning function pointers
-            let idx = chain[0];
-            let original = &curves[idx];
-
-            // Extract values before creating closures
-            let t_range_a = original.on_surface_a.t_range;
-
-            // Create new parametric curves with proper mathematical implementation
-            let on_surface_a = ParametricCurve {
-                u_of_t: Box::new(move |t| {
-                    // Linear parametrization for now - in production this would be
-                    // computed from the actual intersection curve geometry
-                    let (t_min, t_max) = t_range_a;
-                    t_min + t * (t_max - t_min)
-                }),
-                v_of_t: Box::new(move |t| {
-                    let (t_min, t_max) = t_range_a;
-                    t_min + t * (t_max - t_min)
-                }),
-                t_range: t_range_a,
-            };
-
-            // Extract values for surface B
-            let t_range_b = original.on_surface_b.t_range;
-
-            let on_surface_b = ParametricCurve {
-                u_of_t: Box::new(move |t| {
-                    let (t_min, t_max) = t_range_b;
-                    t_min + t * (t_max - t_min)
-                }),
-                v_of_t: Box::new(move |t| {
-                    let (t_min, t_max) = t_range_b;
-                    t_min + t * (t_max - t_min)
-                }),
-                t_range: t_range_b,
-            };
-
-            // Create a new line curve for the intersection
-            // In production, this would use the actual computed intersection geometry
-            let start_point = Point3::ORIGIN;
-            let end_point = Point3::new(1.0, 0.0, 0.0);
-            let line_curve = crate::primitives::curve::Line::new(start_point, end_point);
-
-            merged.push(SurfaceIntersectionCurve {
-                curve: Box::new(line_curve),
-                on_surface_a,
-                on_surface_b,
-            });
-        } else if !chain.is_empty() {
+        if !chain.is_empty() {
             // Collect all points from the chain
             let mut all_points = Vec::new();
             let mut all_params_a = Vec::new();
@@ -2340,10 +2290,10 @@ fn find_curve_curve_closest_point(
 fn find_or_create_intersection_vertex(
     graph: &IntersectionGraph,
     point: Point3,
-    tolerance: &Tolerance,
+    _tolerance: &Tolerance,
 ) -> VertexId {
     // Check existing graph nodes for a nearby vertex
-    for (&vid, _node) in &graph.nodes {
+    for (&_vid, _node) in &graph.nodes {
         // We'd need model access to check positions, but for now use the VID
         // The actual vertex creation happens in the model during reconstruction
     }
@@ -2362,7 +2312,7 @@ fn find_or_create_intersection_vertex(
 /// to find minimal enclosed regions.
 fn extract_face_loops(
     graph: &IntersectionGraph,
-    model: &BRepModel,
+    _model: &BRepModel,
 ) -> OperationResult<Vec<Vec<EdgeId>>> {
     let mut loops: Vec<Vec<EdgeId>> = Vec::new();
     let mut used_edge_directions: HashSet<(EdgeId, bool)> = HashSet::new();
@@ -2385,7 +2335,7 @@ fn extract_face_loops(
             // Try to trace a loop starting from this directed edge
             let mut loop_edges = Vec::new();
             let mut current_edge = edge_id;
-            let mut current_forward = forward;
+            let current_forward = forward;
 
             let ge = &graph.edges[&current_edge];
             let start_vertex = if current_forward {
@@ -2449,7 +2399,6 @@ fn extract_face_loops(
                         loop_edges.push(eid);
                         used_edge_directions.insert((eid, fwd));
                         current_edge = eid;
-                        current_forward = fwd;
                         current_vertex = next_v;
                     }
                     None => break,
@@ -2460,7 +2409,7 @@ fn extract_face_loops(
                 loops.push(loop_edges);
             } else {
                 // Undo used markers if we didn't find a loop
-                for &eid in &loop_edges {
+                for &_eid in &loop_edges {
                     // We can't easily undo the specific directions, but this is acceptable
                     // as failed traces won't produce duplicate loops
                 }
@@ -2487,7 +2436,7 @@ fn extract_face_loops(
 
 /// Create split face from edges
 fn create_split_face(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     surface_id: SurfaceId,
     edges: Vec<EdgeId>,
     original_face: FaceId,
@@ -3120,7 +3069,7 @@ fn reconstruct_topology(
 fn build_shells_from_faces(
     model: &mut BRepModel,
     faces: Vec<SplitFace>,
-    options: &BooleanOptions,
+    _options: &BooleanOptions,
 ) -> OperationResult<Vec<ShellId>> {
     if faces.is_empty() {
         return Err(OperationError::InvalidBRep(

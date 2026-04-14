@@ -551,10 +551,10 @@ impl Matrix4 {
         let scale = self.scale_vector();
         let r00 = self.m[0] / scale.x;
         let r10 = self.m[1] / scale.x;
-        let r20 = self.m[2] / scale.x;
+        let _r20 = self.m[2] / scale.x;
         let r01 = self.m[4] / scale.y;
         let r11 = self.m[5] / scale.y;
-        let r21 = self.m[6] / scale.y;
+        let _r21 = self.m[6] / scale.y;
         let r02 = self.m[8] / scale.z;
         let r12 = self.m[9] / scale.z;
         let r22 = self.m[10] / scale.z;

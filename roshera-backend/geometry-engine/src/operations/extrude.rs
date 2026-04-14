@@ -7,11 +7,10 @@
 //! - Stroud, I. (2006). Boundary Representation Modelling Techniques. Springer.
 //! - Mäntylä, M. (1988). An Introduction to Solid Modeling. Computer Science Press.
 
-use super::deep_clone::{deep_clone_faces, CloneContext};
+use super::deep_clone::deep_clone_faces;
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
-    curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
@@ -19,7 +18,7 @@ use crate::primitives::{
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 use tracing::debug;
 
@@ -163,7 +162,7 @@ fn create_unified_extrusion(
     let mut unified_faces = Vec::new();
 
     // 1. Deep clone all faces from parent EXCEPT the base face being extruded
-    let faces_to_clone: Vec<FaceId> = parent_shell
+    let _faces_to_clone: Vec<FaceId> = parent_shell
         .faces
         .iter()
         .filter(|&&face_id| face_id != base_face_id)

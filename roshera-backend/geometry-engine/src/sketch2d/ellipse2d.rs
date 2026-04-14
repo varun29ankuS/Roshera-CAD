@@ -109,7 +109,7 @@ impl Ellipse2d {
 
     /// Create an ellipse from three points
     /// The points should not be collinear
-    pub fn from_three_points(p1: &Point2d, p2: &Point2d, p3: &Point2d) -> Sketch2dResult<Self> {
+    pub fn from_three_points(_p1: &Point2d, _p2: &Point2d, _p3: &Point2d) -> Sketch2dResult<Self> {
         // This is a complex algorithm involving conic fitting
         // For now, return an error
         Err(Sketch2dError::NumericalError {
@@ -400,7 +400,7 @@ impl Ellipse2d {
     }
 
     /// Split the ellipse into arcs at given parameters
-    pub fn split_at_parameters(&self, parameters: &[f64]) -> Vec<Arc2d> {
+    pub fn split_at_parameters(&self, _parameters: &[f64]) -> Vec<Arc2d> {
         // This would create Arc2d segments
         // For now, return empty as Arc2d doesn't support elliptical arcs
         Vec::new()

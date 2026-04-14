@@ -14,11 +14,10 @@ use crate::primitives::{
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     fillet_surfaces::{CylindricalFillet, SphericalFillet, ToroidalFillet, VariableRadiusFillet},
-    r#loop::Loop,
     solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 use std::collections::HashSet;
 
@@ -369,7 +368,7 @@ fn compute_variable_rolling_ball_positions(
 
         // Get point and tangent on edge
         let edge_point = edge.evaluate(t, &model.curves)?;
-        let edge_tangent = edge.tangent_at(t, &model.curves)?;
+        let _edge_tangent = edge.tangent_at(t, &model.curves)?;
 
         // Get surface normals
         let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
@@ -403,11 +402,11 @@ fn compute_variable_rolling_ball_positions(
 
 /// Create a function-based radius fillet
 fn create_function_radius_fillet(
-    model: &mut BRepModel,
-    edge_id: EdgeId,
-    face1_id: FaceId,
-    face2_id: FaceId,
-    radius_fn: &Box<dyn Fn(f64) -> f64>,
+    _model: &mut BRepModel,
+    _edge_id: EdgeId,
+    _face1_id: FaceId,
+    _face2_id: FaceId,
+    _radius_fn: &Box<dyn Fn(f64) -> f64>,
 ) -> OperationResult<FaceId> {
     // This would sample the radius function and create NURBS surface
     Err(OperationError::NotImplemented(
@@ -572,7 +571,7 @@ fn compute_rolling_ball_positions(
 
         // Get point and tangent on edge
         let edge_point = edge.evaluate(t, &model.curves)?;
-        let edge_tangent = edge.tangent_at(t, &model.curves)?;
+        let _edge_tangent = edge.tangent_at(t, &model.curves)?;
 
         // Get surface normals at edge point (projected)
         let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
@@ -690,7 +689,7 @@ fn is_radius_constant(data: &RollingBallData) -> bool {
 
 /// Create cylindrical fillet surface
 fn create_cylindrical_fillet_surface(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     data: &RollingBallData,
 ) -> OperationResult<Box<dyn Surface>> {
     // Create spine curve from edge centers
@@ -709,7 +708,7 @@ fn create_cylindrical_fillet_surface(
 
 /// Create toroidal fillet surface
 fn create_toroidal_fillet_surface(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     data: &RollingBallData,
 ) -> OperationResult<Box<dyn Surface>> {
     // Create center curve
@@ -729,7 +728,7 @@ fn create_toroidal_fillet_surface(
 
 /// Create NURBS fillet surface for variable radius
 fn create_nurbs_fillet_surface(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     data: &RollingBallData,
 ) -> OperationResult<Box<dyn Surface>> {
     // Create spine curve
@@ -779,7 +778,7 @@ fn compute_fillet_trim_curves(
     face1_id: FaceId,
     face2_id: FaceId,
 ) -> OperationResult<(Vec<Point3>, Vec<Point3>)> {
-    use crate::operations::surface_intersection::intersection_curve_to_nurbs;
+    
     // use crate::math::tolerance::NORMAL_TOLERANCE;
 
     // For trim curve computation, we use the contact curves from the rolling ball data
@@ -795,11 +794,11 @@ fn compute_fillet_trim_curves(
         .get(face2_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
 
-    let surface1 = model
+    let _surface1 = model
         .surfaces
         .get(face1.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
-    let surface2 = model
+    let _surface2 = model
         .surfaces
         .get(face2.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;
@@ -940,9 +939,9 @@ fn create_trimmed_fillet_face(
 
 /// Create transition surfaces between fillets
 fn create_fillet_transitions(
-    model: &mut BRepModel,
-    edges: &[EdgeId],
-    fillet_faces: &[FaceId],
+    _model: &mut BRepModel,
+    _edges: &[EdgeId],
+    _fillet_faces: &[FaceId],
 ) -> OperationResult<Vec<FaceId>> {
     // Would create transition surfaces at vertices where fillets meet
     Ok(Vec::new())
@@ -950,10 +949,10 @@ fn create_fillet_transitions(
 
 /// Update adjacent faces to account for fillet trimming
 fn update_adjacent_faces(
-    model: &mut BRepModel,
-    solid_id: SolidId,
-    edges: &[EdgeId],
-    fillet_faces: &[FaceId],
+    _model: &mut BRepModel,
+    _solid_id: SolidId,
+    _edges: &[EdgeId],
+    _fillet_faces: &[FaceId],
 ) -> OperationResult<()> {
     // Would update face boundaries to trim against fillet surfaces
     Ok(())
@@ -1256,7 +1255,7 @@ fn propagate_all_edges(
 
 /// Group edges into continuous chains
 fn group_edges_into_chains(
-    model: &BRepModel,
+    _model: &BRepModel,
     edges: &[EdgeId],
 ) -> OperationResult<Vec<Vec<EdgeId>>> {
     // Would group connected edges into chains
@@ -1349,9 +1348,9 @@ fn face_contains_edge(
 
 /// Get edges connected to a vertex in a solid
 fn get_edges_at_vertex(
-    model: &BRepModel,
-    solid_id: SolidId,
-    vertex_id: VertexId,
+    _model: &BRepModel,
+    _solid_id: SolidId,
+    _vertex_id: VertexId,
 ) -> OperationResult<Vec<EdgeId>> {
     // Would find all edges connected to vertex
     Ok(Vec::new())
@@ -1407,7 +1406,7 @@ fn validate_fillet_inputs(
     model: &BRepModel,
     solid_id: SolidId,
     edges: &[EdgeId],
-    options: &FilletOptions,
+    _options: &FilletOptions,
 ) -> OperationResult<()> {
     // Check solid exists
     if model.solids.get(solid_id).is_none() {
@@ -1460,13 +1459,13 @@ fn validate_vertex_fillet_inputs(
 }
 
 /// Validate filleted solid
-fn validate_filleted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
+fn validate_filleted_solid(_model: &BRepModel, _solid_id: SolidId) -> OperationResult<()> {
     // Would perform full B-Rep validation
     Ok(())
 }
 
 /// Adaptive sampling for rolling ball
-fn adaptive_rolling_ball_sampling(curve: &dyn Curve, tolerance: &Tolerance) -> Vec<f64> {
+fn adaptive_rolling_ball_sampling(_curve: &dyn Curve, _tolerance: &Tolerance) -> Vec<f64> {
     // Simple uniform sampling for now
     // TODO: Implement curvature-based adaptive sampling
     let num_samples = 20;
@@ -1482,7 +1481,7 @@ fn validate_fillet_parameters(
     model: &BRepModel,
     edge_id: EdgeId,
     radius: f64,
-    tolerance: &Tolerance,
+    _tolerance: &Tolerance,
 ) -> OperationResult<()> {
     if radius <= 0.0 {
         return Err(OperationError::InvalidRadius(radius));

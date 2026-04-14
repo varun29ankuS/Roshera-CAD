@@ -3,15 +3,14 @@
 //! Computes intersections between various geometric entities including
 //! curve-curve, curve-surface, and surface-surface intersections.
 
-use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{MathResult, Matrix4, Point3, Tolerance, Vector3};
+use super::{OperationError, OperationResult};
+use crate::math::{MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::VertexId,
 };
 
 /// Default tolerance for parametric comparisons
@@ -303,7 +302,7 @@ fn intersect_line_line(
     if denom.abs() < tolerance.distance() {
         // Lines are in parallel planes, check 3D
         let denom_xz = a.x * b.z - a.z * b.x;
-        let denom_yz = a.y * b.z - a.z * b.y;
+        let _denom_yz = a.y * b.z - a.z * b.y;
 
         if denom_xz.abs() > tolerance.distance() {
             let s = (c.x * b.z - c.z * b.x) / denom_xz;
@@ -393,11 +392,11 @@ fn intersect_line_line(
 
 /// Intersect line and arc
 fn intersect_line_arc(
-    curve1: &Box<dyn Curve>,
-    curve2: &Box<dyn Curve>,
-    edge1: &Edge,
-    edge2: &Edge,
-    tolerance: Tolerance,
+    _curve1: &Box<dyn Curve>,
+    _curve2: &Box<dyn Curve>,
+    _edge1: &Edge,
+    _edge2: &Edge,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement line-arc intersection
     Ok(IntersectionResult::None)
@@ -405,11 +404,11 @@ fn intersect_line_arc(
 
 /// Intersect two arcs
 fn intersect_arc_arc(
-    arc1: &Box<dyn Curve>,
-    arc2: &Box<dyn Curve>,
-    edge1: &Edge,
-    edge2: &Edge,
-    tolerance: Tolerance,
+    _arc1: &Box<dyn Curve>,
+    _arc2: &Box<dyn Curve>,
+    _edge1: &Edge,
+    _edge2: &Edge,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement arc-arc intersection
     Ok(IntersectionResult::None)
@@ -767,10 +766,10 @@ fn intersect_curve_plane(
 
 /// Intersect curve with cylinder
 fn intersect_curve_cylinder(
-    curve: &Box<dyn Curve>,
-    cylinder: &Box<dyn Surface>,
-    edge: &Edge,
-    tolerance: Tolerance,
+    _curve: &Box<dyn Curve>,
+    _cylinder: &Box<dyn Surface>,
+    _edge: &Edge,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement curve-cylinder intersection
     Ok(IntersectionResult::None)
@@ -778,10 +777,10 @@ fn intersect_curve_cylinder(
 
 /// Intersect curve with sphere
 fn intersect_curve_sphere(
-    curve: &Box<dyn Curve>,
-    sphere: &Box<dyn Surface>,
-    edge: &Edge,
-    tolerance: Tolerance,
+    _curve: &Box<dyn Curve>,
+    _sphere: &Box<dyn Surface>,
+    _edge: &Edge,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement curve-sphere intersection
     Ok(IntersectionResult::None)
@@ -789,10 +788,10 @@ fn intersect_curve_sphere(
 
 /// General curve-surface intersection
 fn intersect_curve_general_surface(
-    curve: &dyn Curve,
-    surface: &dyn Surface,
-    edge: &Edge,
-    tolerance: Tolerance,
+    _curve: &dyn Curve,
+    _surface: &dyn Surface,
+    _edge: &Edge,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement general marching method
     Ok(IntersectionResult::None)
@@ -831,7 +830,7 @@ fn intersect_plane_plane(
 
         if dist < tolerance.distance() {
             // Planes are coincident - return surface intersection
-            let mut boundary_curves = Vec::new();
+            let boundary_curves = Vec::new();
 
             // For now, return the bounds as a rectangular boundary
             // In a full implementation, we'd compute the actual intersection of the bounded regions
@@ -894,9 +893,9 @@ fn intersect_plane_plane(
 
 /// Intersect plane and cylinder
 fn intersect_plane_cylinder(
-    surface1: &Box<dyn Surface>,
-    surface2: &Box<dyn Surface>,
-    tolerance: Tolerance,
+    _surface1: &Box<dyn Surface>,
+    _surface2: &Box<dyn Surface>,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Plane-cylinder gives ellipse, line, or nothing
     Ok(IntersectionResult::None)
@@ -904,9 +903,9 @@ fn intersect_plane_cylinder(
 
 /// Intersect plane and sphere
 fn intersect_plane_sphere(
-    surface1: &Box<dyn Surface>,
-    surface2: &Box<dyn Surface>,
-    tolerance: Tolerance,
+    _surface1: &Box<dyn Surface>,
+    _surface2: &Box<dyn Surface>,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Plane-sphere gives circle, point, or nothing
     Ok(IntersectionResult::None)
@@ -914,11 +913,11 @@ fn intersect_plane_sphere(
 
 /// General surface-surface intersection
 fn intersect_general_surfaces(
-    surface1: &dyn Surface,
-    surface2: &dyn Surface,
-    face1: &Face,
-    face2: &Face,
-    tolerance: Tolerance,
+    _surface1: &dyn Surface,
+    _surface2: &dyn Surface,
+    _face1: &Face,
+    _face2: &Face,
+    _tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement marching method for general surfaces
     Ok(IntersectionResult::None)

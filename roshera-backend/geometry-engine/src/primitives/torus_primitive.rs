@@ -6,17 +6,16 @@
 use crate::{
     math::{consts, Point3, Vector3},
     primitives::{
-        curve::{Arc, Circle, CurveId, ParameterRange},
-        edge::{Edge, EdgeId, EdgeOrientation},
-        face::{Face, FaceId, FaceOrientation},
+        curve::{Arc, Circle, ParameterRange},
+        edge::{Edge, EdgeOrientation},
+        face::{Face, FaceOrientation},
         primitive_traits::PrimitiveError,
-        r#loop::{Loop, LoopId, LoopType},
-        shell::{Shell, ShellId, ShellType},
+        r#loop::{Loop, LoopType},
+        shell::{Shell, ShellType},
         solid::{Solid, SolidId},
-        surface::{Plane, SurfaceId, Torus},
+        surface::Torus,
         topology_builder::BRepModel,
         topology_builder::TopologyBuilder,
-        vertex::VertexId,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -130,11 +129,11 @@ pub struct TorusPrimitive;
 impl TorusPrimitive {
     /// Create a torus with B-Rep topology
     pub fn create(params: &TorusParameters, model: &mut BRepModel) -> PrimitiveResult<SolidId> {
-        let mut builder = TopologyBuilder::new(model);
+        let _builder = TopologyBuilder::new(model);
 
         // Create reference directions
         let ref_dir = params.axis.perpendicular();
-        let y_dir = params.axis.cross(&ref_dir);
+        let _y_dir = params.axis.cross(&ref_dir);
 
         // Angle ranges
         let major_angle_range = params.major_angle_range.unwrap_or([0.0, consts::TWO_PI]);
@@ -368,7 +367,7 @@ impl TorusPrimitive {
         let height = params.minor_radius * sin_v;
 
         let center = params.center + params.axis * height;
-        let ref_dir = params.axis.perpendicular();
+        let _ref_dir = params.axis.perpendicular();
 
         if (u_end - u_start - consts::TWO_PI).abs() < consts::EPSILON {
             Box::new(Circle::new(center, params.axis, radius).unwrap())
@@ -394,7 +393,7 @@ impl TorusPrimitive {
             + y_dir * (params.major_radius * sin_u);
 
         let radial_dir = ref_dir * cos_u + y_dir * sin_u;
-        let minor_ref = radial_dir;
+        let _minor_ref = radial_dir;
         let minor_axis = params.axis;
 
         if (v_end - v_start - consts::TWO_PI).abs() < consts::EPSILON {
@@ -415,9 +414,9 @@ impl TorusPrimitive {
 
     /// Update torus parameters
     pub fn update_parameters(
-        solid_id: SolidId,
-        params: &TorusParameters,
-        model: &mut BRepModel,
+        _solid_id: SolidId,
+        _params: &TorusParameters,
+        _model: &mut BRepModel,
     ) -> PrimitiveResult<()> {
         // TODO: Implement parametric update
         Err(PrimitiveError::GeometryError {

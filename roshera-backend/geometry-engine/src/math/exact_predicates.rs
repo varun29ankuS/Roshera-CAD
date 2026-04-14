@@ -22,7 +22,7 @@
 //! Most inputs (>99%) only require the fast test, maintaining performance
 //! while guaranteeing correctness for all inputs.
 
-use crate::math::{consts, vector2::Vector2, Point3, Vector3};
+use crate::math::{vector2::Vector2, Point3};
 
 /// Result of an orientation test
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

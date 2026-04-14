@@ -257,7 +257,7 @@ fn transform_vertices(
 fn transform_curves(
     model: &mut BRepModel,
     edge_ids: &[EdgeId],
-    transform: &Matrix4,
+    _transform: &Matrix4,
 ) -> OperationResult<()> {
     let mut transformed_curves = HashSet::new();
 

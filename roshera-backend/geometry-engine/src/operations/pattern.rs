@@ -4,17 +4,12 @@
 //! rectangular, and custom patterns.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
-    curve::Curve,
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     r#loop::Loop,
-    shell::Shell,
-    solid::{Solid, SolidId},
-    surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
 };
 
 /// Type of pattern
@@ -346,7 +341,7 @@ fn generate_rectangular_transforms(pattern: &RectangularPattern) -> OperationRes
 }
 
 /// Generate transforms for curve pattern
-fn generate_curve_transforms(pattern: &CurvePattern) -> OperationResult<Vec<Matrix4>> {
+fn generate_curve_transforms(_pattern: &CurvePattern) -> OperationResult<Vec<Matrix4>> {
     // Would generate transforms along curve
     // For now, return placeholder
     Err(OperationError::NotImplemented(
@@ -359,8 +354,8 @@ fn create_pattern_instance(
     model: &mut BRepModel,
     source_features: &[FaceId],
     transform: &Matrix4,
-    instance_index: usize,
-    options: &PatternOptions,
+    _instance_index: usize,
+    _options: &PatternOptions,
 ) -> OperationResult<Vec<FaceId>> {
     let mut instance_faces = Vec::new();
 
@@ -503,7 +498,7 @@ fn transform_edge(
 }
 
 /// Check for interference between instances
-fn check_interference(model: &BRepModel, instance: &[FaceId]) -> OperationResult<bool> {
+fn check_interference(_model: &BRepModel, _instance: &[FaceId]) -> OperationResult<bool> {
     // Would check for geometric interference
     // For now, always return false (no interference)
     Ok(false)
@@ -511,8 +506,8 @@ fn check_interference(model: &BRepModel, instance: &[FaceId]) -> OperationResult
 
 /// Merge coincident geometry in pattern
 fn merge_pattern_geometry(
-    model: &mut BRepModel,
-    instances: &mut Vec<Vec<FaceId>>,
+    _model: &mut BRepModel,
+    _instances: &mut Vec<Vec<FaceId>>,
 ) -> OperationResult<()> {
     // Would merge vertices, edges, and faces that are coincident
     Ok(())
@@ -523,7 +518,7 @@ fn validate_pattern_inputs(
     model: &BRepModel,
     source_features: &[FaceId],
     pattern_type: &PatternType,
-    options: &PatternOptions,
+    _options: &PatternOptions,
 ) -> OperationResult<()> {
     // Check source features exist
     for &face_id in source_features {
@@ -593,7 +588,7 @@ fn validate_pattern_inputs(
 }
 
 /// Validate pattern result
-fn validate_pattern_result(model: &BRepModel, instances: &[Vec<FaceId>]) -> OperationResult<()> {
+fn validate_pattern_result(_model: &BRepModel, _instances: &[Vec<FaceId>]) -> OperationResult<()> {
     // Would validate that pattern created valid geometry
     Ok(())
 }

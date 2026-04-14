@@ -1,4 +1,4 @@
-use geometry_engine::math::{Matrix3, Matrix4, Point3, Vector3};
+use geometry_engine::math::{Matrix4, Point3, Vector3};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {

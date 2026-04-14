@@ -6,7 +6,7 @@
 //! Uses safe serialization instead of packed structs to avoid undefined behavior.
 
 use crate::ros_fs::util::{crc32, current_time_ms, generate_uuid_v4};
-use crate::ros_fs::{FormatError, Result, RosFileError, VersionError};
+use crate::ros_fs::{FormatError, Result, VersionError};
 use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Seek, SeekFrom, Write};
 
