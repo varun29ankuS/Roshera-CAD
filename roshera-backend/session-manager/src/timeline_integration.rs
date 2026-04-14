@@ -9,8 +9,7 @@ use timeline_engine::SessionId;
 use timeline_engine::{
     execution::{EntityStateStore, ExecutionConfig, ExecutionEngine},
     operations::register_all_operations,
-    Author, BranchId, EntityId, EventId, Operation, Timeline, TimelineError,
-    TimelineResult,
+    Author, BranchId, EntityId, EventId, Operation, Timeline, TimelineError, TimelineResult,
 };
 
 type UserId = String;

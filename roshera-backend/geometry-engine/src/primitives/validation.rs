@@ -979,7 +979,11 @@ pub struct ToolConstraints {
 }
 
 // Manufacturing validation helpers
-fn check_wall_thickness(_model: &BRepModel, _min_thickness: f64, validation: &mut ValidationResult) {
+fn check_wall_thickness(
+    _model: &BRepModel,
+    _min_thickness: f64,
+    validation: &mut ValidationResult,
+) {
     // Implementation would check minimum distances between faces
     // For now, add a placeholder warning
     validation

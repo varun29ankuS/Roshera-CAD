@@ -49,7 +49,6 @@ impl Timeline {
         session_id: uuid::Uuid,
     ) -> TimelineResult<EventId> {
         use crate::types::Author;
-        
 
         // Convert shared_types::Operation to timeline Operation
         let timeline_op = self.convert_to_timeline_operation(operation)?;
@@ -256,7 +255,10 @@ impl Timeline {
                     .map(|id| crate::types::EntityId::from_geometry_id(&id))
                     .collect(),
             },
-            shared_types::Operation::Custom { name, parameters: _ } => {
+            shared_types::Operation::Custom {
+                name,
+                parameters: _,
+            } => {
                 // Timeline doesn't support custom operations yet
                 // Convert to a generic operation
                 return Err(TimelineError::InvalidOperation(format!(

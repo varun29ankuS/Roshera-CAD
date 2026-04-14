@@ -6,8 +6,8 @@ use super::common::{brep_to_entity_state, entity_state_to_brep};
 use crate::{
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
-    TimelineError, TimelineResult,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs, TimelineError,
+    TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
@@ -128,7 +128,6 @@ impl OperationImpl for LoftOp {
             }
 
             // Import loft types
-            
 
             // Create loft options with production-grade settings
             let loft_options = GeomLoftOptions {

@@ -4,7 +4,8 @@ use super::brep_helpers::BRepModelExt;
 use crate::{
     brep_serialization::{deserialize_brep, serialize_brep},
     entity_mapping::get_entity_mapping,
-    execution::{EntityState, ExecutionContext}, EntityId, EntityType, TimelineError, TimelineResult,
+    execution::{EntityState, ExecutionContext},
+    EntityId, EntityType, TimelineError, TimelineResult,
 };
 use geometry_engine::{
     math::{Matrix4, Point3, Vector3},

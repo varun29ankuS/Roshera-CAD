@@ -4,8 +4,8 @@ use super::brep_helpers::BRepModelExt;
 use super::common::brep_to_entity_state;
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs,
-    SketchElement, SketchPlane, TimelineError, TimelineResult,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs, SketchElement, SketchPlane,
+    TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{

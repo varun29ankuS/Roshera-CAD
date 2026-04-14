@@ -407,7 +407,6 @@ pub mod angle_utils {
 
 /// Numerical constants for robust computation
 pub mod numerical {
-    
 
     /// Smallest positive normalized f64
     pub const MIN_POSITIVE: f64 = f64::MIN_POSITIVE;
@@ -469,7 +468,6 @@ pub mod physical {
 
 /// Common mathematical sequences
 pub mod sequences {
-    
 
     /// Fibonacci numbers (first 20)
     pub const FIBONACCI: [u64; 20] = [

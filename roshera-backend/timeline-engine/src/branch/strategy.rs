@@ -1,8 +1,7 @@
 //! Branching strategies for AI-driven design exploration
 
 use crate::types::{
-    Author, BranchId, BranchPurpose, DesignConstraint, EventIndex,
-    OptimizationObjective,
+    Author, BranchId, BranchPurpose, DesignConstraint, EventIndex, OptimizationObjective,
 };
 use std::collections::HashMap;
 

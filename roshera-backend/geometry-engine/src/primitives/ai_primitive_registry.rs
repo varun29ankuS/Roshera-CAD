@@ -14,10 +14,7 @@
 
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
-    primitive_traits::{
-        ParameterSchema, Primitive, PrimitiveError,
-        ValidationReport,
-    },
+    primitive_traits::{ParameterSchema, Primitive, PrimitiveError, ValidationReport},
     solid::SolidId,
     topology_builder::BRepModel,
 };
@@ -1695,7 +1692,10 @@ pub mod ml {
             ];
         }
 
-        let last_command = history.last().expect("history non-empty after is_empty check").to_lowercase();
+        let last_command = history
+            .last()
+            .expect("history non-empty after is_empty check")
+            .to_lowercase();
 
         // Simple pattern matching for common workflows
         if last_command.contains("box")

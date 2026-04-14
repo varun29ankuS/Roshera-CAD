@@ -6,8 +6,8 @@
 use dashmap::DashMap;
 use shared_types::commands::ExportFormat;
 use shared_types::{
-    AICommand, AnalysisType, BooleanOp, CommandResult, ObjectId, Position3D,
-    PrimitiveType, SessionAction, SessionError, ShapeParameters, TransformType,
+    AICommand, AnalysisType, BooleanOp, CommandResult, ObjectId, Position3D, PrimitiveType,
+    SessionAction, SessionError, ShapeParameters, TransformType,
 };
 use std::sync::Arc;
 use timeline_engine::{Operation, Timeline};

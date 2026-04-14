@@ -5,10 +5,7 @@
 use crate::formats::ros_snapshot::BRepSnapshot;
 use crate::ros_fs::keys::{KeyManager, SoftwareKeyManager};
 use crate::ros_fs::util::current_time_ms;
-use crate::ros_fs::{
-    self, Chunk, ChunkType,
-    CHUNK_INDEX_ENTRY_SIZE,
-};
+use crate::ros_fs::{self, Chunk, ChunkType, CHUNK_INDEX_ENTRY_SIZE};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
 use std::io::Cursor;

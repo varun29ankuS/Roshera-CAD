@@ -443,7 +443,6 @@ macro_rules! debug_assert_finite {
     ($value:expr) => {};
 }
 
-
 /// Precomputed lookup tables for performance
 pub mod tables {
     use super::consts;

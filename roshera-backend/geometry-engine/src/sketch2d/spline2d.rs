@@ -14,8 +14,7 @@
 //! The degree p determines smoothness: C^(p-1) continuity at simple knots.
 
 use super::{
-    Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d,
-    Tolerance2d, Vector2d,
+    Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d, Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use crate::math::{

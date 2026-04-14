@@ -976,8 +976,6 @@ pub async fn export_assembly_to_step(
     assembly: &geometry_engine::assembly::Assembly,
     path: &Path,
 ) -> Result<(), ExportError> {
-    
-
     // Create file
     let file = std::fs::File::create(path).map_err(|_| ExportError::FileWriteError {
         path: path.to_string_lossy().to_string(),

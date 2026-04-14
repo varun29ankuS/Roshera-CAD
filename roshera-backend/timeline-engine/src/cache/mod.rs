@@ -1,8 +1,6 @@
 //! Caching layer for timeline operations and computed results
 
-use crate::{
-    BranchId, EntityId, Operation, TimelineResult,
-};
+use crate::{BranchId, EntityId, Operation, TimelineResult};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::sync::Arc;

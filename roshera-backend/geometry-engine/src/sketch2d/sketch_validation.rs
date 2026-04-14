@@ -14,9 +14,7 @@
 use super::constraints::{ConstraintId, ConstraintStatus, EntityRef};
 use super::line2d::LineGeometry;
 use super::sketch_topology::{ProfileType, SketchLoop, SketchTopology, TopologyIssue};
-use super::{
-    Point2d, Sketch, SketchEntity2d, Tolerance2d, Vector2d,
-};
+use super::{Point2d, Sketch, SketchEntity2d, Tolerance2d, Vector2d};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
