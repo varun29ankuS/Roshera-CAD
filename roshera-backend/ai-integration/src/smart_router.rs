@@ -79,12 +79,35 @@ pub struct SmartRouter {
 
 /// Keywords that indicate a command needs visual context
 const VISION_KEYWORDS: &[&str] = &[
-    "this", "that", "these", "those", "here", "there",
-    "select", "selected", "pointing", "cursor", "click",
-    "red", "blue", "green", "yellow", "white", "black",
-    "left", "right", "top", "bottom", "front", "back",
-    "the", "move the", "rotate the", "scale the",
-    "make that", "make this",
+    "this",
+    "that",
+    "these",
+    "those",
+    "here",
+    "there",
+    "select",
+    "selected",
+    "pointing",
+    "cursor",
+    "click",
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "white",
+    "black",
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "front",
+    "back",
+    "the",
+    "move the",
+    "rotate the",
+    "scale the",
+    "make that",
+    "make this",
 ];
 
 impl SmartRouter {
@@ -136,4 +159,3 @@ impl SmartRouter {
         &self.config.mode
     }
 }
-
