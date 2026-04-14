@@ -390,23 +390,38 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     Ok(info)
 }
 
-/// Calculate dihedral angles at edges
+/// Calculate dihedral angles at edges using surface normals at edge midpoints
 fn calculate_dihedral_angles(info: &mut AdjacencyInfo, ctx: &TopologyContext) -> MathResult<()> {
+    let tol = crate::math::tolerance::NORMAL_TOLERANCE;
+
     for (&edge_id, faces) in &info.edge_faces {
         if faces.len() == 2 {
             let face_vec: Vec<_> = faces.iter().cloned().collect();
 
-            // Get face normals at edge midpoint
             if let Some(edge) = ctx.edges.get(edge_id) {
                 if let Ok(midpoint) = edge.evaluate(0.5, ctx.curves) {
-                    // Get normals (simplified - would project to get actual surface parameters)
                     if let (Some(face1), Some(face2)) =
                         (ctx.faces.get(face_vec[0]), ctx.faces.get(face_vec[1]))
                     {
-                        // Calculate approximate dihedral angle
-                        // Real implementation would be more sophisticated
-                        let angle = consts::PI; // Placeholder
-                        info.edge_angles.insert(edge_id, angle);
+                        // Project edge midpoint onto each face's surface to get UV params
+                        let s1 = ctx.surfaces.get(face1.surface_id);
+                        let s2 = ctx.surfaces.get(face2.surface_id);
+
+                        if let (Some(surf1), Some(surf2)) = (s1, s2) {
+                            if let (Ok((u1, v1)), Ok((u2, v2))) = (
+                                surf1.closest_point(&midpoint, tol),
+                                surf2.closest_point(&midpoint, tol),
+                            ) {
+                                if let (Ok(n1), Ok(n2)) = (
+                                    face1.normal_at(u1, v1, ctx.surfaces),
+                                    face2.normal_at(u2, v2, ctx.surfaces),
+                                ) {
+                                    let cos_angle = n1.dot(&n2).clamp(-1.0, 1.0);
+                                    let angle = cos_angle.acos();
+                                    info.edge_angles.insert(edge_id, angle);
+                                }
+                            }
+                        }
                     }
                 }
             }

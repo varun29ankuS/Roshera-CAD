@@ -1617,7 +1617,16 @@ fn march_from_point(
             }
 
             // Take a step
-            let next_pos = current.position + tangent.normalize().unwrap() * step_size * *direction;
+            let next_pos = current.position
+                + tangent
+                    .normalize()
+                    .map_err(|e| {
+                        OperationError::InternalError(format!(
+                            "Failed to normalize tangent: {e}"
+                        ))
+                    })?
+                    * step_size
+                    * *direction;
 
             // Project onto both surfaces
             let (u_a, v_a) = surface_a.closest_point(&next_pos, *tolerance)?;
@@ -2549,12 +2558,34 @@ fn classify_face_relative_to_solid(
     // Get a point on the face interior
     let test_point = get_face_interior_point(model, face)?;
 
-    // Cast ray from test point
-    let ray_direction = Vector3::new(0.577, 0.577, 0.577); // Arbitrary direction
-    let classification =
-        ray_cast_classification(model, solid, test_point, ray_direction, tolerance)?;
+    // Cast rays from test point using multiple non-aligned directions (majority vote)
+    const RAY_DIRECTIONS: [Vector3; 3] = [
+        Vector3::new(0.5773502691896258, 0.5773502691896258, 0.5773502691896258),
+        Vector3::new(0.8017837257372732, 0.2672612419124244, 0.5345224838248488),
+        Vector3::new(0.3333333333333333, 0.6666666666666666, 0.6666666666666666),
+    ];
 
-    Ok(classification)
+    let mut inside_count = 0u32;
+    let mut outside_count = 0u32;
+
+    for ray_direction in &RAY_DIRECTIONS {
+        let classification =
+            ray_cast_classification(model, solid, test_point, *ray_direction, tolerance)?;
+        match classification {
+            FaceClassification::Inside => inside_count += 1,
+            FaceClassification::Outside => outside_count += 1,
+            FaceClassification::OnBoundary => {}
+        }
+    }
+
+    if inside_count >= 2 {
+        Ok(FaceClassification::Inside)
+    } else if outside_count >= 2 {
+        Ok(FaceClassification::Outside)
+    } else {
+        // No clear majority — fall back to first ray result
+        ray_cast_classification(model, solid, test_point, RAY_DIRECTIONS[0], tolerance)
+    }
 }
 
 /// Get a point in the interior of a face
@@ -2743,15 +2774,6 @@ fn ray_surface_intersection(
             let d_dot_a = direction.dot(&cone.axis);
             let delta_dot_a = delta.dot(&cone.axis);
 
-            let a =
-                d_dot_a * d_dot_a * sin_sq - direction.dot(direction) * sin_sq + d_dot_a * d_dot_a;
-            let b = 2.0
-                * (d_dot_a * delta_dot_a * sin_sq - direction.dot(&delta) * sin_sq
-                    + d_dot_a * delta_dot_a);
-            let c = delta_dot_a * delta_dot_a * sin_sq - delta.dot(&delta) * sin_sq
-                + delta_dot_a * delta_dot_a;
-
-            // Simplified: use standard cone quadratic
             let a2 = direction.dot(direction) - (1.0 + cos_sq / sin_sq) * d_dot_a * d_dot_a;
             let b2 =
                 2.0 * (direction.dot(&delta) - (1.0 + cos_sq / sin_sq) * d_dot_a * delta_dot_a);
@@ -2995,8 +3017,8 @@ fn is_point_in_face(
     }
 
     if uv_polygon.len() < 3 {
-        // Not enough boundary points, fall back to parameter bounds
-        return Ok(true);
+        // Not enough boundary points to form a polygon; conservatively classify as outside
+        return Ok(false);
     }
 
     // 2D ray-casting point-in-polygon test
