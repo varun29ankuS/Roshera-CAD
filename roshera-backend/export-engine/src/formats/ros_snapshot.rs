@@ -5,10 +5,21 @@
 
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::{
-    edge::Edge, face::Face, r#loop::Loop, shell::Shell, solid::Solid, surface::Surface,
-    topology_builder::BRepModel, vertex::Vertex,
+    curve::{self, Curve},
+    edge::{Edge, EdgeOrientation},
+    face::{Face, FaceOrientation},
+    r#loop::{Loop, LoopType},
+    shell::{Shell, ShellType as GeoShellType},
+    solid::Solid,
+    surface::{
+        self, Cone as GeoCone, Cylinder as GeoCylinder, GeneralNurbsSurface, Plane as GeoPlane,
+        Sphere as GeoSphere, Surface, SurfaceType, Torus as GeoTorus,
+    },
+    topology_builder::BRepModel,
+    vertex::Vertex,
 };
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -216,31 +227,312 @@ impl BRepSnapshot {
         }
     }
 
-    /// Convert from BRepModel to snapshot
+    /// Convert from BRepModel to snapshot — extracts all topology and geometry
     pub fn from_model(model: &BRepModel) -> Self {
         let mut snapshot = Self::new();
 
-        // TODO: Iterate through DashMap stores and extract data
-        // This would require methods on BRepModel to iterate its contents
-        // For now, return empty snapshot
+        // ── Vertices ──
+        for (vid, vertex) in model.vertices.iter() {
+            let uuid = id_to_uuid(vid as u64);
+            snapshot.vertices.push((
+                uuid,
+                VertexData {
+                    position: vertex.position,
+                    tolerance: vertex.tolerance,
+                },
+            ));
+        }
+
+        // ── Curves ──
+        for (cid, curve) in model.curves.iter() {
+            let uuid = id_to_uuid(cid as u64);
+            let curve_data = extract_curve_data(curve);
+            snapshot.curves.push((uuid, curve_data));
+        }
+
+        // ── Edges ──
+        for (eid, edge) in model.edges.iter() {
+            let uuid = id_to_uuid(eid as u64);
+            snapshot.edges.push((
+                uuid,
+                EdgeData {
+                    start_vertex: id_to_uuid(edge.start_vertex as u64),
+                    end_vertex: id_to_uuid(edge.end_vertex as u64),
+                    curve: Some(id_to_uuid(edge.curve_id as u64)),
+                    orientation: matches!(edge.orientation, EdgeOrientation::Forward),
+                },
+            ));
+        }
+
+        // ── Loops ──
+        for (lid, loop_) in model.loops.iter() {
+            let uuid = id_to_uuid(lid as u64);
+            snapshot.loops.push((
+                uuid,
+                LoopData {
+                    edges: loop_.edges.iter().map(|&eid| id_to_uuid(eid as u64)).collect(),
+                    orientations: loop_.orientations.clone(),
+                    is_outer: matches!(loop_.loop_type, LoopType::Outer),
+                },
+            ));
+        }
+
+        // ── Surfaces ──
+        // SurfaceStore.get(id) is the reliable accessor (iter() depends on type_map)
+        for sid in 0..model.surfaces.len() as u32 {
+            if let Some(surface) = model.surfaces.get(sid) {
+                let uuid = id_to_uuid(sid as u64);
+                let surface_data = extract_surface_data(surface);
+                snapshot.surfaces.push((uuid, surface_data));
+            }
+        }
+
+        // ── Faces ──
+        for (fid, face) in model.faces.iter() {
+            let uuid = id_to_uuid(fid as u64);
+            snapshot.faces.push((
+                uuid,
+                FaceData {
+                    surface: Some(id_to_uuid(face.surface_id as u64)),
+                    outer_loop: Some(id_to_uuid(face.outer_loop as u64)),
+                    inner_loops: face
+                        .inner_loops
+                        .iter()
+                        .map(|&lid| id_to_uuid(lid as u64))
+                        .collect(),
+                    orientation: matches!(face.orientation, FaceOrientation::Forward),
+                },
+            ));
+        }
+
+        // ── Shells ──
+        for (shid, shell) in model.shells.iter() {
+            let uuid = id_to_uuid(shid as u64);
+            snapshot.shells.push((
+                uuid,
+                ShellData {
+                    faces: shell.faces.iter().map(|&fid| id_to_uuid(fid as u64)).collect(),
+                    is_closed: matches!(shell.shell_type, GeoShellType::Closed),
+                    shell_type: match shell.shell_type {
+                        GeoShellType::Closed => ShellType::Closed,
+                        GeoShellType::Open => ShellType::Open,
+                        _ => ShellType::Open,
+                    },
+                },
+            ));
+        }
+
+        // ── Solids ──
+        for (sid, solid) in model.solids.iter() {
+            let uuid = id_to_uuid(sid as u64);
+            let mut shells = vec![id_to_uuid(solid.outer_shell as u64)];
+            for &inner in &solid.inner_shells {
+                shells.push(id_to_uuid(inner as u64));
+            }
+            snapshot.solids.push((
+                uuid,
+                SolidData {
+                    shells,
+                    feature_type: solid.name.clone(),
+                },
+            ));
+        }
 
         snapshot
     }
 
-    /// Convert from snapshot to BRepModel
+    /// Convert from snapshot to BRepModel (import path)
     pub fn to_model(&self) -> BRepModel {
-        let model = BRepModel::new();
-
-        // TODO: Reconstruct BRepModel from snapshot data
-        // This would require methods on BRepModel to add entities with specific IDs
-        // For now, return empty model
-
-        model
+        // Import is not yet implemented — requires adding entities with specific IDs
+        BRepModel::new()
     }
 }
 
 impl Default for BRepSnapshot {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Helper functions for model extraction ──
+
+/// Convert a u32/u64 topology ID to a deterministic UUID (namespace-based)
+fn id_to_uuid(id: u64) -> Uuid {
+    // Use a fixed namespace to make IDs deterministic and reversible
+    let bytes = id.to_le_bytes();
+    let mut uuid_bytes = [0u8; 16];
+    // Namespace prefix "ROSHERA\0" + 8 bytes of ID
+    uuid_bytes[0..8].copy_from_slice(b"ROSHERA\0");
+    uuid_bytes[8..16].copy_from_slice(&bytes);
+    Uuid::from_bytes(uuid_bytes)
+}
+
+/// Extract curve parameters into serializable CurveData
+fn extract_curve_data(curve: &dyn Curve) -> CurveData {
+    use geometry_engine::primitives::curve::{Arc, Circle, Line, NurbsCurve};
+
+    let any = curve.as_any();
+
+    if let Some(line) = any.downcast_ref::<Line>() {
+        return CurveData::Line {
+            start: [line.start.x, line.start.y, line.start.z],
+            end: [line.end.x, line.end.y, line.end.z],
+        };
+    }
+
+    if let Some(circle) = any.downcast_ref::<Circle>() {
+        let center = circle.center();
+        let normal = circle.normal();
+        let radius = circle.radius();
+        return CurveData::Circle {
+            center: [center.x, center.y, center.z],
+            normal: [normal.x, normal.y, normal.z],
+            radius,
+        };
+    }
+
+    if let Some(arc) = any.downcast_ref::<Arc>() {
+        return CurveData::Arc {
+            center: [arc.center.x, arc.center.y, arc.center.z],
+            normal: [arc.normal.x, arc.normal.y, arc.normal.z],
+            radius: arc.radius,
+            start_angle: arc.start_angle,
+            end_angle: arc.start_angle + arc.sweep_angle,
+        };
+    }
+
+    if let Some(nurbs) = any.downcast_ref::<NurbsCurve>() {
+        let cps: Vec<[f64; 3]> = nurbs
+            .control_points
+            .iter()
+            .map(|p| [p.x, p.y, p.z])
+            .collect();
+        if nurbs.weights.iter().all(|&w| (w - 1.0).abs() < 1e-12) {
+            // Non-rational — store as BSpline
+            return CurveData::BSpline {
+                control_points: cps,
+                knots: nurbs.knots.clone(),
+                degree: nurbs.degree as u32,
+            };
+        }
+        return CurveData::Nurbs {
+            control_points: cps,
+            weights: nurbs.weights.clone(),
+            knots: nurbs.knots.clone(),
+            degree: nurbs.degree as u32,
+        };
+    }
+
+    // Fallback: sample the curve as a polyline and store as BSpline degree 1
+    let n_samples = 20;
+    let mut cps = Vec::with_capacity(n_samples + 1);
+    for i in 0..=n_samples {
+        let t = i as f64 / n_samples as f64;
+        if let Ok(pt) = curve.point_at(t) {
+            cps.push([pt.x, pt.y, pt.z]);
+        }
+    }
+    CurveData::BSpline {
+        control_points: cps,
+        knots: Vec::new(), // Empty knots = sampled polyline
+        degree: 1,
+    }
+}
+
+/// Extract surface parameters into serializable SurfaceData
+fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
+    let any = surface.as_any();
+
+    if let Some(plane) = any.downcast_ref::<GeoPlane>() {
+        return SurfaceData::Plane {
+            origin: [plane.origin.x, plane.origin.y, plane.origin.z],
+            normal: [plane.normal.x, plane.normal.y, plane.normal.z],
+        };
+    }
+
+    if let Some(cyl) = any.downcast_ref::<GeoCylinder>() {
+        return SurfaceData::Cylinder {
+            origin: [cyl.origin.x, cyl.origin.y, cyl.origin.z],
+            axis: [cyl.axis.x, cyl.axis.y, cyl.axis.z],
+            radius: cyl.radius,
+        };
+    }
+
+    if let Some(sph) = any.downcast_ref::<GeoSphere>() {
+        return SurfaceData::Sphere {
+            center: [sph.center.x, sph.center.y, sph.center.z],
+            radius: sph.radius,
+        };
+    }
+
+    if let Some(cone) = any.downcast_ref::<GeoCone>() {
+        return SurfaceData::Cone {
+            apex: [cone.apex.x, cone.apex.y, cone.apex.z],
+            axis: [cone.axis.x, cone.axis.y, cone.axis.z],
+            half_angle: cone.half_angle,
+        };
+    }
+
+    if let Some(torus) = any.downcast_ref::<GeoTorus>() {
+        return SurfaceData::Torus {
+            center: [torus.center.x, torus.center.y, torus.center.z],
+            axis: [torus.axis.x, torus.axis.y, torus.axis.z],
+            major_radius: torus.major_radius,
+            minor_radius: torus.minor_radius,
+        };
+    }
+
+    if let Some(nurbs_surf) = any.downcast_ref::<GeneralNurbsSurface>() {
+        let cps: Vec<Vec<[f64; 3]>> = nurbs_surf
+            .nurbs
+            .control_points
+            .iter()
+            .map(|row| row.iter().map(|p| [p.x, p.y, p.z]).collect())
+            .collect();
+        let weights: Vec<Vec<f64>> = nurbs_surf.nurbs.weights.clone();
+        let all_unit = weights.iter().all(|row| row.iter().all(|&w| (w - 1.0).abs() < 1e-12));
+
+        if all_unit {
+            return SurfaceData::BSpline {
+                control_points: cps,
+                knots_u: nurbs_surf.nurbs.knots_u.values().to_vec(),
+                knots_v: nurbs_surf.nurbs.knots_v.values().to_vec(),
+                degree_u: nurbs_surf.nurbs.degree_u as u32,
+                degree_v: nurbs_surf.nurbs.degree_v as u32,
+            };
+        }
+        return SurfaceData::Nurbs {
+            control_points: cps,
+            weights,
+            knots_u: nurbs_surf.nurbs.knots_u.values().to_vec(),
+            knots_v: nurbs_surf.nurbs.knots_v.values().to_vec(),
+            degree_u: nurbs_surf.nurbs.degree_u as u32,
+            degree_v: nurbs_surf.nurbs.degree_v as u32,
+        };
+    }
+
+    // Fallback: sample the surface and store as BSpline approximation
+    let n = 10;
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let mut cps: Vec<Vec<[f64; 3]>> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let u = u_min + (u_max - u_min) * i as f64 / n as f64;
+        let mut row = Vec::with_capacity(n + 1);
+        for j in 0..=n {
+            let v = v_min + (v_max - v_min) * j as f64 / n as f64;
+            if let Ok(pt) = surface.point_at(u, v) {
+                row.push([pt.x, pt.y, pt.z]);
+            } else {
+                row.push([0.0, 0.0, 0.0]);
+            }
+        }
+        cps.push(row);
+    }
+    SurfaceData::BSpline {
+        control_points: cps,
+        knots_u: Vec::new(),
+        knots_v: Vec::new(),
+        degree_u: 1,
+        degree_v: 1,
     }
 }
