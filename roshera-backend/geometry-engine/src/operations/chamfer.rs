@@ -333,15 +333,17 @@ fn create_ruled_chamfer_surface(
     // a proper B-spline fit could improve accuracy for highly curved edges.
     let curve1: Box<dyn Curve> = Box::new(Line::new(
         data.offset_points1[0],
-        *data.offset_points1.last().ok_or_else(|| {
-            OperationError::InternalError("Empty offset points".into())
-        })?,
+        *data
+            .offset_points1
+            .last()
+            .ok_or_else(|| OperationError::InternalError("Empty offset points".into()))?,
     ));
     let curve2: Box<dyn Curve> = Box::new(Line::new(
         data.offset_points2[0],
-        *data.offset_points2.last().ok_or_else(|| {
-            OperationError::InternalError("Empty offset points".into())
-        })?,
+        *data
+            .offset_points2
+            .last()
+            .ok_or_else(|| OperationError::InternalError("Empty offset points".into()))?,
     ));
 
     Ok(Box::new(RuledSurface::new(curve1, curve2)))
@@ -370,18 +372,20 @@ fn create_chamfer_face(
         data.offset_points1[0].y,
         data.offset_points1[0].z,
     );
-    let p1_end = data.offset_points1.last().ok_or_else(|| {
-        OperationError::InternalError("Empty offset points".into())
-    })?;
+    let p1_end = data
+        .offset_points1
+        .last()
+        .ok_or_else(|| OperationError::InternalError("Empty offset points".into()))?;
     let v1_end = model.vertices.add(p1_end.x, p1_end.y, p1_end.z);
     let v2_start = model.vertices.add(
         data.offset_points2[0].x,
         data.offset_points2[0].y,
         data.offset_points2[0].z,
     );
-    let p2_end = data.offset_points2.last().ok_or_else(|| {
-        OperationError::InternalError("Empty offset points".into())
-    })?;
+    let p2_end = data
+        .offset_points2
+        .last()
+        .ok_or_else(|| OperationError::InternalError("Empty offset points".into()))?;
     let v2_end = model.vertices.add(p2_end.x, p2_end.y, p2_end.z);
 
     // Create edges
@@ -437,9 +441,9 @@ fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationRes
     use crate::primitives::curve::Line;
     let line = Line::new(
         points[0],
-        *points.last().ok_or_else(|| {
-            OperationError::InternalError("Empty offset points".into())
-        })?,
+        *points
+            .last()
+            .ok_or_else(|| OperationError::InternalError("Empty offset points".into()))?,
     );
     Ok(model.curves.add(Box::new(line)))
 }
