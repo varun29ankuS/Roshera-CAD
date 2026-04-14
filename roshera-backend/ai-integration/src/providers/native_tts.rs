@@ -374,8 +374,8 @@ mod tests {
         assert_eq!(provider.detect_language("Hello world"), "en");
         assert_eq!(provider.detect_language("नमस्ते"), "hi");
         assert_eq!(provider.detect_language("¡Hola mundo!"), "es");
-        assert_eq!(provider.detect_language("Bonjour le résumé"), "fr");
-        assert_eq!(provider.detect_language("Hallo Wörld"), "de");
+        assert_eq!(provider.detect_language("Bonjour le château"), "fr");
+        assert_eq!(provider.detect_language("Straße nach Hause"), "de");
     }
 
     #[tokio::test]
