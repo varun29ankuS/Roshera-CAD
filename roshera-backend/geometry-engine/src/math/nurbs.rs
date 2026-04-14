@@ -140,6 +140,15 @@ impl NurbsCurve {
             return Err("Control points and weights must have same length");
         }
 
+        for &w in &weights {
+            if w <= 0.0 {
+                return Err("All NURBS weights must be positive");
+            }
+            if !w.is_finite() {
+                return Err("NURBS weights must be finite");
+            }
+        }
+
         let n = control_points.len();
 
         // Create and validate knot vector
@@ -172,6 +181,11 @@ impl NurbsCurve {
         // Determine number of segments (max 90 degrees per segment)
         let segments = ((sweep_angle.abs() / (consts::PI / 2.0)).ceil() as usize).max(1);
         let segment_angle = sweep_angle / segments as f64;
+
+        // A single NURBS segment cannot represent a semicircle (cos(π/2) = 0 → infinite radius)
+        if segment_angle >= consts::PI - 1e-10 {
+            return Err("Segment angle too large for rational arc representation");
+        }
 
         // Build local coordinate system
         let normal = normal
@@ -283,6 +297,13 @@ impl NurbsCurve {
             result.point += self.control_points[idx].to_vec() * (ders[0][i] * w);
             weight_sum += ders[0][i] * w;
         }
+
+        // Guard against degenerate weight sum (malformed knot vector or boundary evaluation)
+        if weight_sum.abs() < f64::EPSILON {
+            result.point = self.control_points[span];
+            return result;
+        }
+
         result.point = Point3::from(result.point.to_vec() / weight_sum);
 
         // First derivative
@@ -2307,5 +2328,43 @@ mod tests {
         let iso_v = surface.iso_curve_v(0.5).unwrap();
 
         assert_eq!(iso_v.degree, surface.degree_u);
+    }
+
+    #[test]
+    fn test_nurbs_negative_weight_rejected() {
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, -1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let result = NurbsCurve::new(cp, weights, knots, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nurbs_zero_weight_rejected() {
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, 0.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let result = NurbsCurve::new(cp, weights, knots, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nurbs_arc_90_degrees_ok() {
+        let result = NurbsCurve::circular_arc(
+            Point3::ORIGIN,
+            1.0,
+            0.0,
+            consts::PI / 2.0,
+            Vector3::Z,
+        );
+        assert!(result.is_ok());
     }
 }
