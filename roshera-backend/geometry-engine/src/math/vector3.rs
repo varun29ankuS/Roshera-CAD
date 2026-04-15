@@ -414,9 +414,14 @@ impl Vector3 {
     }
 
     /// Component-wise reciprocal (1/x, 1/y, 1/z)
+    ///
+    /// Returns `Err(MathError::DivisionByZero)` if any component is zero.
     #[inline]
-    pub fn recip(&self) -> Self {
-        Self::new(1.0 / self.x, 1.0 / self.y, 1.0 / self.z)
+    pub fn recip(&self) -> MathResult<Self> {
+        if self.x == 0.0 || self.y == 0.0 || self.z == 0.0 {
+            return Err(MathError::DivisionByZero);
+        }
+        Ok(Self::new(1.0 / self.x, 1.0 / self.y, 1.0 / self.z))
     }
 
     /// Component-wise minimum
@@ -600,9 +605,14 @@ impl Vector3 {
     }
 
     /// Component-wise divide
+    ///
+    /// Returns `Err(MathError::DivisionByZero)` if any component of `other` is zero.
     #[inline(always)]
-    pub fn component_div(&self, other: &Self) -> Self {
-        Self::new(self.x / other.x, self.y / other.y, self.z / other.z)
+    pub fn component_div(&self, other: &Self) -> MathResult<Self> {
+        if other.x == 0.0 || other.y == 0.0 || other.z == 0.0 {
+            return Err(MathError::DivisionByZero);
+        }
+        Ok(Self::new(self.x / other.x, self.y / other.y, self.z / other.z))
     }
 
     /// Apply function to each component
@@ -952,7 +962,7 @@ impl Vector3 {
 
         let denom = dot00 * dot11 - dot01 * dot01;
         // Degenerate triangle (collinear or coincident points) — return centroid
-        if denom.abs() < f64::EPSILON * f64::EPSILON {
+        if denom.abs() < 1e-12 {
             return Self::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
         }
         let inv_denom = 1.0 / denom;
@@ -1116,7 +1126,7 @@ mod tests {
         let b = Vector3::new(2.0, 2.0, 3.0);
 
         assert_eq!(a.component_mul(&b), Vector3::new(2.0, 8.0, 27.0));
-        assert_eq!(a.component_div(&b), Vector3::new(0.5, 2.0, 3.0));
+        assert_eq!(a.component_div(&b).unwrap(), Vector3::new(0.5, 2.0, 3.0));
 
         assert_eq!(a.min(&b), Vector3::new(1.0, 2.0, 3.0));
         assert_eq!(a.max(&b), Vector3::new(2.0, 4.0, 9.0));
@@ -1219,5 +1229,64 @@ mod tests {
         assert!(result.z.is_finite());
         // When edge0 == edge1, all components should be 0.0 (at edge0)
         assert_eq!(result, Vector3::ZERO);
+    }
+
+    // === Kernel hardening tests ===
+
+    #[test]
+    fn test_component_div_zero_returns_error() {
+        let a = Vector3::new(1.0, 2.0, 3.0);
+        let zero_x = Vector3::new(0.0, 1.0, 1.0);
+        let zero_y = Vector3::new(1.0, 0.0, 1.0);
+        let zero_z = Vector3::new(1.0, 1.0, 0.0);
+        assert!(a.component_div(&zero_x).is_err());
+        assert!(a.component_div(&zero_y).is_err());
+        assert!(a.component_div(&zero_z).is_err());
+    }
+
+    #[test]
+    fn test_component_div_valid() {
+        let a = Vector3::new(10.0, 20.0, 30.0);
+        let b = Vector3::new(2.0, 5.0, 10.0);
+        let result = a.component_div(&b).unwrap();
+        assert_eq!(result, Vector3::new(5.0, 4.0, 3.0));
+    }
+
+    #[test]
+    fn test_recip_zero_returns_error() {
+        assert!(Vector3::new(0.0, 1.0, 1.0).recip().is_err());
+        assert!(Vector3::new(1.0, 0.0, 1.0).recip().is_err());
+        assert!(Vector3::new(1.0, 1.0, 0.0).recip().is_err());
+    }
+
+    #[test]
+    fn test_recip_valid() {
+        let r = Vector3::new(2.0, 4.0, 5.0).recip().unwrap();
+        assert_eq!(r, Vector3::new(0.5, 0.25, 0.2));
+    }
+
+    #[test]
+    fn test_barycentric_degenerate_triangle() {
+        // Collinear points — should return centroid, not NaN/Inf
+        let a = Point3::new(0.0, 0.0, 0.0);
+        let b = Point3::new(1.0, 0.0, 0.0);
+        let c = Point3::new(2.0, 0.0, 0.0);
+        let p = Point3::new(0.5, 0.0, 0.0);
+        let bary = Vector3::barycentric(&p, &a, &b, &c);
+        assert!(bary.x.is_finite());
+        assert!(bary.y.is_finite());
+        assert!(bary.z.is_finite());
+        // Should be centroid (1/3, 1/3, 1/3)
+        assert!((bary.x - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_barycentric_coincident_points() {
+        // All points the same — maximally degenerate
+        let p = Point3::new(1.0, 1.0, 1.0);
+        let bary = Vector3::barycentric(&p, &p, &p, &p);
+        assert!(bary.x.is_finite());
+        assert!(bary.y.is_finite());
+        assert!(bary.z.is_finite());
     }
 }

@@ -62,7 +62,7 @@ impl PerformanceHints {
             std::hint::black_box(v1.cross(&v2));
 
             // Warmup normalize
-            std::hint::black_box(v1.normalize());
+            let _ = std::hint::black_box(v1.normalize());
 
             // Warmup basic arithmetic
             std::hint::black_box(v1 + v2);
