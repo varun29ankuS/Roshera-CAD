@@ -338,6 +338,11 @@ impl Matrix4 {
                 "Invalid field of view".to_string(),
             ));
         }
+        if aspect.abs() < consts::EPSILON {
+            return Err(MathError::InvalidParameter(
+                "Aspect ratio must be non-zero".to_string(),
+            ));
+        }
 
         let f = 1.0 / (fov_y * 0.5).tan();
         let range_inv = 1.0 / (near - far);
@@ -1192,5 +1197,45 @@ mod tests {
         let reflected = m.transform_vector(&v);
 
         assert_eq!(reflected, Vector3::new(1.0, -1.0, 0.0));
+    }
+
+    // === Kernel hardening tests ===
+
+    #[test]
+    fn test_perspective_zero_aspect_returns_error() {
+        let result = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 0.0, 0.1, 100.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_perspective_near_equals_far_returns_error() {
+        let result = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 1.0, 10.0, 10.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_perspective_invalid_fov_returns_error() {
+        assert!(Matrix4::perspective(0.0, 1.0, 0.1, 100.0).is_err());
+        assert!(Matrix4::perspective(std::f64::consts::PI, 1.0, 0.1, 100.0).is_err());
+        assert!(Matrix4::perspective(-1.0, 1.0, 0.1, 100.0).is_err());
+    }
+
+    #[test]
+    fn test_perspective_valid_produces_finite() {
+        let m = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 1000.0)
+            .unwrap();
+        for i in 0..16 {
+            assert!(m.m[i].is_finite(), "m[{i}] is not finite: {}", m.m[i]);
+        }
+    }
+
+    #[test]
+    fn test_orthographic_degenerate_returns_error() {
+        // left == right
+        assert!(Matrix4::orthographic(5.0, 5.0, -1.0, 1.0, 0.1, 100.0).is_err());
+        // bottom == top
+        assert!(Matrix4::orthographic(-1.0, 1.0, 5.0, 5.0, 0.1, 100.0).is_err());
+        // near == far
+        assert!(Matrix4::orthographic(-1.0, 1.0, -1.0, 1.0, 10.0, 10.0).is_err());
     }
 }

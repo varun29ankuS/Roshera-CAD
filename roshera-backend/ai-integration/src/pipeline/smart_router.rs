@@ -262,9 +262,20 @@ impl SmartRouter {
             "front", "back", "left", "right",
             "above", "below", "near", "far",
         ];
-        
+
         let lower = text.to_lowercase();
-        vision_keywords.iter().any(|keyword| lower.contains(keyword))
+        vision_keywords.iter().any(|keyword| {
+            // Word-boundary match to avoid substring false positives (e.g. "sphere" matching "here")
+            for (i, _) in lower.match_indices(keyword) {
+                let before_ok = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphabetic();
+                let after = i + keyword.len();
+                let after_ok = after >= lower.len() || !lower.as_bytes()[after].is_ascii_alphabetic();
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+            false
+        })
     }
     
     /// Convert VisionConfig to UniversalEndpointConfig

@@ -279,10 +279,15 @@ impl AdaptiveTessellator {
         // Check angle between all pairs of normals
         for i in 0..normals.len() {
             for j in i + 1..normals.len() {
-                if let Ok(angle) = normals[i].angle(&normals[j]) {
-                    if angle > self.params.max_angle_deviation {
+                match normals[i].angle(&normals[j]) {
+                    Ok(angle) if angle > self.params.max_angle_deviation => {
                         return false; // Too much normal variation
                     }
+                    Err(_) => {
+                        // Degenerate normal (zero-length) — force subdivision
+                        return false;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -292,15 +297,30 @@ impl AdaptiveTessellator {
 
     /// Calculate flatness of a quad (maximum distance from plane)
     fn calculate_flatness(&self, mesh: &TriangleMesh, vertices: &[u32; 4]) -> f64 {
-        let v0 = &mesh.vertices[vertices[0] as usize].position;
-        let v1 = &mesh.vertices[vertices[1] as usize].position;
-        let v2 = &mesh.vertices[vertices[2] as usize].position;
-        let v3 = &mesh.vertices[vertices[3] as usize].position;
+        let vcount = mesh.vertices.len();
+        let i0 = vertices[0] as usize;
+        let i1 = vertices[1] as usize;
+        let i2 = vertices[2] as usize;
+        let i3 = vertices[3] as usize;
+        if i0 >= vcount || i1 >= vcount || i2 >= vcount || i3 >= vcount {
+            return f64::MAX; // Out-of-bounds → treat as maximally non-flat
+        }
+        let v0 = &mesh.vertices[i0].position;
+        let v1 = &mesh.vertices[i1].position;
+        let v2 = &mesh.vertices[i2].position;
+        let v3 = &mesh.vertices[i3].position;
 
         // Calculate plane through first three vertices
         let edge1 = *v1 - *v0;
         let edge2 = *v2 - *v0;
-        let normal = edge1.cross(&edge2).normalize().unwrap_or(Vector3::Z);
+        let normal = match edge1.cross(&edge2).normalize() {
+            Ok(n) => n,
+            Err(_) => {
+                // Degenerate triangle (collinear vertices) — report max flatness
+                // so the caller treats this patch as maximally non-flat
+                return f64::MAX;
+            }
+        };
 
         // Check distance of fourth vertex from plane
         let to_v3 = *v3 - *v0;
@@ -337,14 +357,20 @@ pub fn delaunay_triangulate(points: &[Point3], normal: &Vector3) -> Vec<[u32; 3]
 }
 
 /// Compute orthonormal axes for a plane given its normal
+///
+/// Uses a robust two-candidate strategy: picks the cardinal axis least aligned
+/// with `normal` to guarantee a non-degenerate cross product.
 pub fn compute_plane_axes(normal: &Vector3) -> (Vector3, Vector3) {
-    // Choose initial vector not parallel to normal
-    let initial = if normal.x.abs() < 0.9 {
+    // Pick the cardinal axis least aligned with normal for maximum cross-product magnitude
+    let initial = if normal.x.abs() <= normal.y.abs() && normal.x.abs() <= normal.z.abs() {
         Vector3::X
-    } else {
+    } else if normal.y.abs() <= normal.z.abs() {
         Vector3::Y
+    } else {
+        Vector3::Z
     };
 
+    // These normalizations cannot fail: `initial` is chosen to be non-parallel to `normal`
     let u_axis = normal.cross(&initial).normalize().unwrap_or(Vector3::X);
     let v_axis = normal.cross(&u_axis).normalize().unwrap_or(Vector3::Y);
 
@@ -795,5 +821,39 @@ mod tests {
         assert_eq!(quality.triangle_count, 1);
         assert_eq!(quality.vertex_count, 3);
         assert!((quality.total_area - 0.5).abs() < 1e-10);
+    }
+
+    // === Kernel hardening tests ===
+
+    #[test]
+    fn test_compute_plane_axes_x_aligned() {
+        let (u, v) = compute_plane_axes(&Vector3::X);
+        assert!(u.magnitude() > 0.99);
+        assert!(v.magnitude() > 0.99);
+        assert!(u.dot(&v).abs() < 1e-10, "Axes must be orthogonal");
+        assert!(u.dot(&Vector3::X).abs() < 1e-10, "u must be perpendicular to normal");
+    }
+
+    #[test]
+    fn test_compute_plane_axes_y_aligned() {
+        let (u, v) = compute_plane_axes(&Vector3::Y);
+        assert!(u.dot(&v).abs() < 1e-10, "Axes must be orthogonal");
+        assert!(u.dot(&Vector3::Y).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_plane_axes_z_aligned() {
+        let (u, v) = compute_plane_axes(&Vector3::Z);
+        assert!(u.dot(&v).abs() < 1e-10, "Axes must be orthogonal");
+        assert!(u.dot(&Vector3::Z).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_plane_axes_diagonal() {
+        let normal = Vector3::new(1.0, 1.0, 1.0).normalize().unwrap();
+        let (u, v) = compute_plane_axes(&normal);
+        assert!(u.dot(&v).abs() < 1e-10, "Axes must be orthogonal");
+        assert!(u.dot(&normal).abs() < 1e-10, "u must be perpendicular to normal");
+        assert!(v.dot(&normal).abs() < 1e-10, "v must be perpendicular to normal");
     }
 }

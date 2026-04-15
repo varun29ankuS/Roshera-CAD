@@ -94,12 +94,14 @@ impl Plane {
 
     /// Create a plane from coefficients ax + by + cz + d = 0
     pub fn from_coefficients(a: f64, b: f64, c: f64, d: f64) -> MathResult<Self> {
-        let normal = Vector3::new(a, b, c).normalize()?;
-        let scale = 1.0 / Vector3::new(a, b, c).magnitude();
-        Ok(Self {
-            normal,
-            distance: -d * scale,
-        })
+        let raw = Vector3::new(a, b, c);
+        let mag = raw.magnitude();
+        if mag < consts::EPSILON {
+            return Err(MathError::DivisionByZero);
+        }
+        let normal = raw / mag;
+        let distance = -d / mag;
+        Ok(Self { normal, distance })
     }
 
     /// Get the plane coefficients (a, b, c, d) for ax + by + cz + d = 0
@@ -248,19 +250,16 @@ impl Plane {
         let direction = self.normal.cross(&other.normal);
         let dir_mag_sq = direction.magnitude_squared();
 
-        // Check if planes are parallel
+        // Check if planes are parallel (or nearly so)
         if dir_mag_sq < consts::EPSILON * consts::EPSILON {
             return None;
         }
 
-        // Find a point on the line of intersection
-        // We'll find the point closest to the origin
-        let n1_cross_n2 = self.normal.cross(&other.normal);
-        let det = n1_cross_n2.magnitude_squared();
-
+        // Find a point on the line of intersection closest to the origin.
+        // `direction` == n1 × n2, so dir_mag_sq is already the determinant.
         let point = ((other.normal * self.distance - self.normal * other.distance)
-            .cross(&n1_cross_n2))
-            / det;
+            .cross(&direction))
+            / dir_mag_sq;
 
         direction
             .normalize()
@@ -815,5 +814,40 @@ mod tests {
             &Point3::new(2.0, 0.0, 0.0),
         );
         assert!(result.is_err());
+    }
+
+    // === Kernel hardening tests ===
+
+    #[test]
+    fn test_from_coefficients_zero_normal_returns_error() {
+        assert!(Plane::from_coefficients(0.0, 0.0, 0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_from_coefficients_valid() {
+        let p = Plane::from_coefficients(0.0, 0.0, 1.0, -5.0).unwrap();
+        assert!((p.normal.z - 1.0).abs() < 1e-10);
+        assert!((p.distance - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_intersect_parallel_planes_returns_none() {
+        let p1 = Plane::from_coefficients(0.0, 0.0, 1.0, 0.0).unwrap();
+        let p2 = Plane::from_coefficients(0.0, 0.0, 1.0, -5.0).unwrap();
+        assert!(p1.intersect_plane(&p2).is_none());
+    }
+
+    #[test]
+    fn test_intersect_perpendicular_planes_valid() {
+        let p1 = Plane::from_coefficients(1.0, 0.0, 0.0, 0.0).unwrap(); // x=0
+        let p2 = Plane::from_coefficients(0.0, 1.0, 0.0, 0.0).unwrap(); // y=0
+        let result = p1.intersect_plane(&p2);
+        assert!(result.is_some());
+        let (point, dir) = result.unwrap();
+        assert!(point.x.is_finite());
+        assert!(point.y.is_finite());
+        assert!(point.z.is_finite());
+        // Intersection of x=0 and y=0 is the z-axis
+        assert!((dir.z.abs() - 1.0).abs() < 1e-10);
     }
 }
