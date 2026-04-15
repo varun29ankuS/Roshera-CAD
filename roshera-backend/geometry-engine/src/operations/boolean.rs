@@ -2324,8 +2324,7 @@ fn compute_edge_intersections(
 
         for (param, split_vid) in &splits {
             // Adjust parameter relative to remaining edge's range
-            let range_len =
-                remaining_edge.param_range.end - remaining_edge.param_range.start;
+            let range_len = remaining_edge.param_range.end - remaining_edge.param_range.start;
             if range_len.abs() < 1e-15 {
                 continue;
             }
@@ -2344,7 +2343,11 @@ fn compute_edge_intersections(
             let first_ge = GraphEdge {
                 edge_id: first_id,
                 edge_type,
-                start_vertex: model.edges.get(first_id).map(|e| e.start_vertex).unwrap_or(0),
+                start_vertex: model
+                    .edges
+                    .get(first_id)
+                    .map(|e| e.start_vertex)
+                    .unwrap_or(0),
                 end_vertex: *split_vid,
                 intersections: Vec::new(),
             };
@@ -2705,9 +2708,9 @@ fn classify_face_relative_to_solid(
 
     // Three non-aligned ray directions (no two are coplanar with common edges)
     let rays = [
-        Vector3::new(0.577, 0.577, 0.577),   // (1,1,1) normalized
-        Vector3::new(-0.707, 0.707, 0.0),     // (-1,1,0) normalized
-        Vector3::new(0.0, -0.408, 0.913),     // (0,-1,√5) normalized
+        Vector3::new(0.577, 0.577, 0.577), // (1,1,1) normalized
+        Vector3::new(-0.707, 0.707, 0.0),  // (-1,1,0) normalized
+        Vector3::new(0.0, -0.408, 0.913),  // (0,-1,√5) normalized
     ];
 
     let mut inside_votes = 0u32;
@@ -2762,19 +2765,22 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
         ))
     } else {
         // Fallback to surface parameter center if no edges available
-        let surface = model
-            .surfaces
-            .get(face.surface)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "surface_id".to_string(),
-                expected: "valid surface ID".to_string(),
-                received: format!("{:?}", face.surface),
-            })?;
+        let surface =
+            model
+                .surfaces
+                .get(face.surface)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{:?}", face.surface),
+                })?;
 
         let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
         let u_mid = (u_min + u_max) * 0.5;
         let v_mid = (v_min + v_max) * 0.5;
-        surface.point_at(u_mid, v_mid).map_err(|e| OperationError::InternalError(e.to_string()))
+        surface
+            .point_at(u_mid, v_mid)
+            .map_err(|e| OperationError::InternalError(e.to_string()))
     }
 }
 

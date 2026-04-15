@@ -612,7 +612,11 @@ impl Vector3 {
         if other.x == 0.0 || other.y == 0.0 || other.z == 0.0 {
             return Err(MathError::DivisionByZero);
         }
-        Ok(Self::new(self.x / other.x, self.y / other.y, self.z / other.z))
+        Ok(Self::new(
+            self.x / other.x,
+            self.y / other.y,
+            self.z / other.z,
+        ))
     }
 
     /// Apply function to each component
