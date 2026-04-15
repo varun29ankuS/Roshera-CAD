@@ -1222,8 +1222,7 @@ mod tests {
 
     #[test]
     fn test_perspective_valid_produces_finite() {
-        let m = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 1000.0)
-            .unwrap();
+        let m = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 1000.0).unwrap();
         for i in 0..16 {
             assert!(m.m[i].is_finite(), "m[{i}] is not finite: {}", m.m[i]);
         }

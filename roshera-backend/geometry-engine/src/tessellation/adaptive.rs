@@ -831,7 +831,10 @@ mod tests {
         assert!(u.magnitude() > 0.99);
         assert!(v.magnitude() > 0.99);
         assert!(u.dot(&v).abs() < 1e-10, "Axes must be orthogonal");
-        assert!(u.dot(&Vector3::X).abs() < 1e-10, "u must be perpendicular to normal");
+        assert!(
+            u.dot(&Vector3::X).abs() < 1e-10,
+            "u must be perpendicular to normal"
+        );
     }
 
     #[test]
@@ -853,7 +856,13 @@ mod tests {
         let normal = Vector3::new(1.0, 1.0, 1.0).normalize().unwrap();
         let (u, v) = compute_plane_axes(&normal);
         assert!(u.dot(&v).abs() < 1e-10, "Axes must be orthogonal");
-        assert!(u.dot(&normal).abs() < 1e-10, "u must be perpendicular to normal");
-        assert!(v.dot(&normal).abs() < 1e-10, "v must be perpendicular to normal");
+        assert!(
+            u.dot(&normal).abs() < 1e-10,
+            "u must be perpendicular to normal"
+        );
+        assert!(
+            v.dot(&normal).abs() < 1e-10,
+            "v must be perpendicular to normal"
+        );
     }
 }

@@ -7,7 +7,7 @@ use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Arc, ParameterRange},
     edge::{Edge, EdgeOrientation},
-    face::{FaceOrientation},
+    face::FaceOrientation,
     primitive_traits::{
         EntityRef, IssueSeverity, ManifoldStatus, ParameterDefinition, ParameterSchema,
         ParameterType, Primitive, PrimitiveError, ValidationIssue, ValidationMetrics,
@@ -167,8 +167,8 @@ impl Primitive for SpherePrimitive {
             params.center,
             Vector3::new(0.0, -1.0, 0.0), // normal: -Y
             params.radius,
-            0.0,                            // start angle (south pole)
-            std::f64::consts::PI,           // sweep angle (semicircle to north pole)
+            0.0,                  // start angle (south pole)
+            std::f64::consts::PI, // sweep angle (semicircle to north pole)
         )
         .map_err(|e| PrimitiveError::GeometryError {
             operation: "create_seam_arc".to_string(),
@@ -190,16 +190,12 @@ impl Primitive for SpherePrimitive {
         // Face: single spherical face.
         // Outer loop traverses seam forward (S→N) then reversed (N→S on opposite side).
         let mut outer_loop = Loop::new(0, LoopType::Outer);
-        outer_loop.add_edge(seam_edge_id, true);  // forward: S→N
+        outer_loop.add_edge(seam_edge_id, true); // forward: S→N
         outer_loop.add_edge(seam_edge_id, false); // reversed: N→S
         let loop_id = model.loops.add(outer_loop);
 
-        let face = crate::primitives::face::Face::new(
-            0,
-            surface_id,
-            loop_id,
-            FaceOrientation::Forward,
-        );
+        let face =
+            crate::primitives::face::Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
         let face_id = model.faces.add(face);
 
         // Shell and solid

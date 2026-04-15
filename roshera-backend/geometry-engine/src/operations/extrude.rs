@@ -272,8 +272,7 @@ fn create_complex_unified_extrusion(
         .clone();
 
     // Clone all faces from parent EXCEPT the base face being extruded
-    let mut unified_faces =
-        deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
+    let mut unified_faces = deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
 
     // Get base loop vertices
     let base_loop = model
@@ -347,9 +346,7 @@ fn create_complex_unified_extrusion(
             let vertex = model
                 .vertices
                 .get(vertex_id)
-                .ok_or_else(|| {
-                    OperationError::InvalidGeometry("Vertex not found".to_string())
-                })?;
+                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
             let mut pos = Point3::from(vertex.position);
 
             // Draft: offset radially from centroid in plane perpendicular to direction
@@ -361,11 +358,10 @@ fn create_complex_unified_extrusion(
             }
 
             let transformed_pos = transform.transform_point(&pos);
-            let new_vertex = model.vertices.add(
-                transformed_pos.x,
-                transformed_pos.y,
-                transformed_pos.z,
-            );
+            let new_vertex =
+                model
+                    .vertices
+                    .add(transformed_pos.x, transformed_pos.y, transformed_pos.z);
             current_vertices.push(new_vertex);
         }
 
