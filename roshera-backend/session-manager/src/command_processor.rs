@@ -225,15 +225,15 @@ impl CommandProcessor {
                 use shared_types::TransformType;
                 let matrix: [[f64; 4]; 4] = match transform_type {
                     TransformType::Translate { offset } => [
-                        [1.0, 0.0, 0.0, offset.x as f64],
-                        [0.0, 1.0, 0.0, offset.y as f64],
-                        [0.0, 0.0, 1.0, offset.z as f64],
+                        [1.0, 0.0, 0.0, offset[0] as f64],
+                        [0.0, 1.0, 0.0, offset[1] as f64],
+                        [0.0, 0.0, 1.0, offset[2] as f64],
                         [0.0, 0.0, 0.0, 1.0],
                     ],
                     TransformType::Scale { factor } => [
-                        [factor.x as f64, 0.0, 0.0, 0.0],
-                        [0.0, factor.y as f64, 0.0, 0.0],
-                        [0.0, 0.0, factor.z as f64, 0.0],
+                        [factor[0] as f64, 0.0, 0.0, 0.0],
+                        [0.0, factor[1] as f64, 0.0, 0.0],
+                        [0.0, 0.0, factor[2] as f64, 0.0],
                         [0.0, 0.0, 0.0, 1.0],
                     ],
                     TransformType::Rotate {
@@ -241,19 +241,19 @@ impl CommandProcessor {
                         angle_degrees,
                     } => {
                         // Rodrigues' rotation formula to build a rotation matrix.
-                        let theta = (angle_degrees as f64).to_radians();
+                        let theta = (*angle_degrees as f64).to_radians();
                         let (sin_t, cos_t) = (theta.sin(), theta.cos());
                         let one_minus_cos = 1.0 - cos_t;
                         // Normalise the axis vector.
-                        let len = ((axis.x as f64).powi(2)
-                            + (axis.y as f64).powi(2)
-                            + (axis.z as f64).powi(2))
+                        let len = ((axis[0] as f64).powi(2)
+                            + (axis[1] as f64).powi(2)
+                            + (axis[2] as f64).powi(2))
                         .sqrt()
                         .max(1e-15);
                         let (ux, uy, uz) = (
-                            axis.x as f64 / len,
-                            axis.y as f64 / len,
-                            axis.z as f64 / len,
+                            axis[0] as f64 / len,
+                            axis[1] as f64 / len,
+                            axis[2] as f64 / len,
                         );
                         [
                             [
@@ -279,15 +279,15 @@ impl CommandProcessor {
                     }
                     TransformType::Mirror { plane_normal } => {
                         // Householder reflection through the plane whose normal is `n`.
-                        let len = ((plane_normal.x as f64).powi(2)
-                            + (plane_normal.y as f64).powi(2)
-                            + (plane_normal.z as f64).powi(2))
+                        let len = ((plane_normal[0] as f64).powi(2)
+                            + (plane_normal[1] as f64).powi(2)
+                            + (plane_normal[2] as f64).powi(2))
                         .sqrt()
                         .max(1e-15);
                         let (nx, ny, nz) = (
-                            plane_normal.x as f64 / len,
-                            plane_normal.y as f64 / len,
-                            plane_normal.z as f64 / len,
+                            plane_normal[0] as f64 / len,
+                            plane_normal[1] as f64 / len,
+                            plane_normal[2] as f64 / len,
                         );
                         [
                             [1.0 - 2.0 * nx * nx, -2.0 * nx * ny, -2.0 * nx * nz, 0.0],
