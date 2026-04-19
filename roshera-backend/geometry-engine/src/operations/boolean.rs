@@ -381,8 +381,15 @@ fn plane_plane_intersection(
         // Planes are parallel - check if coincident
         let distance = (point_b - point_a).dot(&normal_a);
         if distance.abs() < tolerance.distance() {
-            // Coincident planes - not implemented as curve intersection
-            return Ok(vec![]);
+            // Coincident planes: the "intersection" is a 2D region, not a curve.
+            // Returning an empty curve list here silently hides a boolean-op
+            // failure mode. Surface this to the caller as an explicit error so
+            // downstream code can route to an imprint/merge path.
+            return Err(OperationError::CoplanarFaces(
+                "plane-plane intersection: surfaces are coincident \
+                 (boolean requires imprint-then-merge, not curve intersection)"
+                    .to_string(),
+            ));
         } else {
             // Parallel but distinct - no intersection
             return Ok(vec![]);
@@ -3982,5 +3989,46 @@ mod tests {
         // Point on the plane should be inside (untrimmed face → always true)
         let result = is_point_in_face(&model, face_id, &Point3::new(0.5, 0.5, 0.0), &tol);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_plane_plane_intersection_coincident_returns_coplanar_error() {
+        // Two coincident planes (same point, same normal) should surface a
+        // CoplanarFaces error, not silently return an empty curve list.
+        let plane_a =
+            Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X).expect("plane_a construction");
+        let plane_b = Plane::new(Point3::new(0.0, 0.0, 1e-14), Vector3::Z, Vector3::X)
+            .expect("plane_b construction");
+        let tol = Tolerance::default();
+
+        let result = plane_plane_intersection(&plane_a, &plane_b, &tol);
+        match result {
+            Err(OperationError::CoplanarFaces(_)) => {}
+            Err(e) => panic!("expected CoplanarFaces, got {e:?}"),
+            Ok(curves) => panic!(
+                "expected error on coincident planes, got Ok with {} curves",
+                curves.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_plane_plane_intersection_parallel_distinct_returns_empty() {
+        // Two parallel but distinct planes should return no intersection curves
+        // (this is the correct answer, not an error).
+        let plane_a =
+            Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X).expect("plane_a construction");
+        let plane_b = Plane::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, Vector3::X)
+            .expect("plane_b construction");
+        let tol = Tolerance::default();
+
+        let result = plane_plane_intersection(&plane_a, &plane_b, &tol);
+        match result {
+            Ok(curves) => assert!(
+                curves.is_empty(),
+                "parallel distinct planes must produce no curves"
+            ),
+            Err(e) => panic!("parallel distinct planes should not error, got {e:?}"),
+        }
     }
 }
