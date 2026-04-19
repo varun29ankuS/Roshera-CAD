@@ -183,14 +183,15 @@ pub async fn export_brep_to_ros(
 
     // AIPR chunk - AI provenance (if tracking is enabled)
     if options.track_ai {
-        let tracking_level = ros_fs::TrackingLevel::from_u8(options.ai_tracking_level).map_err(
-            |_| ExportError::ExportFailed {
-                reason: format!(
-                    "Invalid AI tracking level {} (expected 0..=2)",
-                    options.ai_tracking_level
-                ),
-            },
-        )?;
+        let tracking_level =
+            ros_fs::TrackingLevel::from_u8(options.ai_tracking_level).map_err(|_| {
+                ExportError::ExportFailed {
+                    reason: format!(
+                        "Invalid AI tracking level {} (expected 0..=2)",
+                        options.ai_tracking_level
+                    ),
+                }
+            })?;
         let ai_tracker =
             ros_fs::AICommandTracker::new(tracking_level, ros_fs::PrivacySettings::default(), None);
 
