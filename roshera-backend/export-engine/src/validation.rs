@@ -152,8 +152,14 @@ impl MeshOptimizer {
         }
 
         // Flatten back
-        optimized.vertices = unique_vertices.iter().flat_map(|v| v.iter().copied()).collect();
-        optimized.normals = unique_normals.iter().flat_map(|n| n.iter().copied()).collect();
+        optimized.vertices = unique_vertices
+            .iter()
+            .flat_map(|v| v.iter().copied())
+            .collect();
+        optimized.normals = unique_normals
+            .iter()
+            .flat_map(|n| n.iter().copied())
+            .collect();
 
         // Remove degenerate triangles (where two or more indices are the same)
         let mut clean_indices = Vec::with_capacity(optimized.indices.len());

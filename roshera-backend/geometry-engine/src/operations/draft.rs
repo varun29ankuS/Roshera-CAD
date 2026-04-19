@@ -345,20 +345,33 @@ fn draft_single_face(
             let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
             Ok(model.faces.add(drafted_face))
         }
-        DraftType::Variable(angle_fn) => {
-            draft_single_face_variable(
-                model, face_id, &face, neutral_curve, draft_direction, angle_fn.as_ref(), options,
-            )
-        }
-        DraftType::Tangent => {
-            draft_single_face_tangent(
-                model, face_id, &face, neutral_curve, draft_direction, options,
-            )
-        }
+        DraftType::Variable(angle_fn) => draft_single_face_variable(
+            model,
+            face_id,
+            &face,
+            neutral_curve,
+            draft_direction,
+            angle_fn.as_ref(),
+            options,
+        ),
+        DraftType::Tangent => draft_single_face_tangent(
+            model,
+            face_id,
+            &face,
+            neutral_curve,
+            draft_direction,
+            options,
+        ),
         DraftType::Stepped(steps) => {
             let steps_clone = steps.clone();
             draft_single_face_stepped(
-                model, face_id, &face, neutral_curve, draft_direction, &steps_clone, options,
+                model,
+                face_id,
+                &face,
+                neutral_curve,
+                draft_direction,
+                &steps_clone,
+                options,
             )
         }
     }
@@ -742,8 +755,12 @@ fn draft_single_face_variable(
             let v = v_min + (v_max - v_min) * j as f64 / sample_n as f64;
             let p = surface.point_at(u, v)?;
             let h = p.dot(&draft_direction);
-            if h < h_min { h_min = h; }
-            if h > h_max { h_max = h; }
+            if h < h_min {
+                h_min = h;
+            }
+            if h > h_max {
+                h_max = h;
+            }
         }
     }
 
@@ -768,19 +785,15 @@ fn draft_single_face_variable(
     for k in 0..=num_slices {
         let h = h_min + (h_max - h_min) * k as f64 / num_slices as f64;
         let plane_origin = draft_direction * h;
-        let curves = intersect_surface_plane(
-            surface,
-            plane_origin,
-            draft_direction,
-            &int_config,
-        )?;
+        let curves = intersect_surface_plane(surface, plane_origin, draft_direction, &int_config)?;
 
         let relative_h = h - neutral_h;
         let draft_angle = angle_fn(relative_h);
 
         for curve in &curves {
             for pt in &curve.points {
-                let offset = compute_draft_offset(pt.position, draft_direction, draft_angle, relative_h);
+                let offset =
+                    compute_draft_offset(pt.position, draft_direction, draft_angle, relative_h);
                 all_drafted_points.push(pt.position + offset);
             }
         }
@@ -799,8 +812,7 @@ fn draft_single_face_variable(
     )?;
     let surface_id = model.surfaces.add(drafted_surface);
 
-    let drafted_loop =
-        create_drafted_loop(model, face, neutral_curve, draft_direction, mid_angle)?;
+    let drafted_loop = create_drafted_loop(model, face, neutral_curve, draft_direction, mid_angle)?;
     let loop_id = model.loops.add(drafted_loop);
 
     let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
@@ -839,12 +851,7 @@ fn draft_single_face_tangent(
         max_curves: 10,
     };
 
-    let curves = intersect_surface_plane(
-        surface,
-        neutral_center,
-        draft_direction,
-        &int_config,
-    )?;
+    let curves = intersect_surface_plane(surface, neutral_center, draft_direction, &int_config)?;
 
     // Compute the average tangent of the intersection curve at the parting line
     // to derive the G1-continuous draft angle.
@@ -867,7 +874,11 @@ fn draft_single_face_tangent(
             // Clamp to valid range for acos.
             let angle = (1.0 - cos_angle.clamp(0.0, 1.0)).acos().abs();
             // Use a small default when surface is nearly aligned with pull.
-            if angle < 1e-6 { 3.0_f64.to_radians() } else { angle }
+            if angle < 1e-6 {
+                3.0_f64.to_radians()
+            } else {
+                angle
+            }
         } else {
             3.0_f64.to_radians()
         }
@@ -927,12 +938,8 @@ fn draft_single_face_stepped(
     // This confirms each slab boundary is geometrically reachable.
     for &(height, _angle) in steps {
         let plane_origin = draft_direction * height;
-        let _boundary_curves = intersect_surface_plane(
-            surface,
-            plane_origin,
-            draft_direction,
-            &int_config,
-        )?;
+        let _boundary_curves =
+            intersect_surface_plane(surface, plane_origin, draft_direction, &int_config)?;
     }
 
     // Use the angle from the slab whose height range contains the neutral
@@ -974,9 +981,15 @@ fn compute_draft_offset(
     let lateral_magnitude = height * draft_angle.tan();
     // Pick an arbitrary perpendicular direction.
     let perp = if draft_direction.cross(&Vector3::X).magnitude() > 1e-10 {
-        draft_direction.cross(&Vector3::X).normalize().unwrap_or(Vector3::Y)
+        draft_direction
+            .cross(&Vector3::X)
+            .normalize()
+            .unwrap_or(Vector3::Y)
     } else {
-        draft_direction.cross(&Vector3::Y).normalize().unwrap_or(Vector3::X)
+        draft_direction
+            .cross(&Vector3::Y)
+            .normalize()
+            .unwrap_or(Vector3::X)
     };
     perp * lateral_magnitude
 }
@@ -992,7 +1005,10 @@ fn find_step_angle(steps: &[(f64, f64)], h: f64) -> f64 {
             return angle;
         }
     }
-    steps.last().map(|&(_, a)| a).unwrap_or(5.0_f64.to_radians())
+    steps
+        .last()
+        .map(|&(_, a)| a)
+        .unwrap_or(5.0_f64.to_radians())
 }
 
 /// Compute face-plane intersection curve using surface-plane intersection.

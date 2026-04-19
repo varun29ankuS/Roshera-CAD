@@ -6,8 +6,8 @@ use axum::{
     http::StatusCode,
     response::{Json, Result},
 };
-use serde::{Deserialize, Serialize};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use session_manager::{AuthManager, Permission};
 use tracing::{error, info, warn};
 
@@ -193,7 +193,10 @@ pub async fn register(
 
     // Reject if this username is already registered.
     if state.database.load_user(&user_id).await.is_ok() {
-        warn!("Registration rejected — username already taken: {}", payload.username);
+        warn!(
+            "Registration rejected — username already taken: {}",
+            payload.username
+        );
         return Ok(Json(RegisterResponse {
             success: false,
             user_id: None,
@@ -297,11 +300,7 @@ pub async fn refresh_token(
     let user_id = claims.sub;
 
     let new_token = auth_manager
-        .create_token(
-            &user_id,
-            claims.email,
-            claims.roles,
-        )
+        .create_token(&user_id, claims.email, claims.roles)
         .map_err(|e| {
             error!("Failed to create new token during refresh: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")

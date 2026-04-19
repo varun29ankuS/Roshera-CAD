@@ -441,19 +441,22 @@ impl<W: Write> StepWriter<W> {
                     trim1_id, start_angle
                 )?;
                 let trim2_id = self.next_id();
-                writeln!(
-                    self.writer,
-                    "{}=PARAMETER_VALUE({});",
-                    trim2_id, end_angle
-                )?;
+                writeln!(self.writer, "{}=PARAMETER_VALUE({});", trim2_id, end_angle)?;
 
                 // Write TRIMMED_CURVE referencing the basis circle
                 let id = self.next_id();
                 writeln!(
                     self.writer,
                     "{}=TRIMMED_CURVE('',{},({}),({}),{},.PARAMETER.);",
-                    id, basis_circle_id, trim1_id, trim2_id,
-                    if end_angle > start_angle { ".T." } else { ".F." }
+                    id,
+                    basis_circle_id,
+                    trim1_id,
+                    trim2_id,
+                    if end_angle > start_angle {
+                        ".T."
+                    } else {
+                        ".F."
+                    }
                 )?;
                 Ok(id)
             }
@@ -580,7 +583,11 @@ impl<W: Write> StepWriter<W> {
         writeln!(self.writer, "{}=VECTOR('',{},1.0);", vec_id, dir_id)?;
 
         let id = self.next_id();
-        writeln!(self.writer, "{}=LINE('',{},{});", id, start_vertex_id, vec_id)?;
+        writeln!(
+            self.writer,
+            "{}=LINE('',{},{});",
+            id, start_vertex_id, vec_id
+        )?;
         Ok(id)
     }
 
@@ -791,15 +798,27 @@ impl<W: Write> StepWriter<W> {
     fn write_geometric_context(&mut self) -> std::io::Result<StepId> {
         // Length unit: millimeters
         let mm_id = self.next_id();
-        writeln!(self.writer, "{}=( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );", mm_id)?;
+        writeln!(
+            self.writer,
+            "{}=( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );",
+            mm_id
+        )?;
 
         // Angle unit: radians
         let rad_id = self.next_id();
-        writeln!(self.writer, "{}=( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );", rad_id)?;
+        writeln!(
+            self.writer,
+            "{}=( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );",
+            rad_id
+        )?;
 
         // Solid angle unit: steradians
         let sr_id = self.next_id();
-        writeln!(self.writer, "{}=( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );", sr_id)?;
+        writeln!(
+            self.writer,
+            "{}=( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );",
+            sr_id
+        )?;
 
         // Uncertainty measure
         let uncertainty_id = self.next_id();
@@ -997,11 +1016,8 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
     }
 
     // Build loop lookup map: Uuid -> &LoopData
-    let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> = snapshot
-        .loops
-        .iter()
-        .map(|(id, data)| (id, data))
-        .collect();
+    let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> =
+        snapshot.loops.iter().map(|(id, data)| (id, data)).collect();
 
     // Step 5: Write all faces as ADVANCED_FACE
     let mut face_map = HashMap::new();
@@ -1091,11 +1107,11 @@ pub async fn export_assembly_to_step(
             // Write all geometry entities for this component
             let mut vertex_map = HashMap::new();
             for (vid, vertex) in &snapshot.vertices {
-                let step_id = writer.write_cartesian_point(&vertex.position).map_err(|e| {
-                    ExportError::ExportFailed {
+                let step_id = writer
+                    .write_cartesian_point(&vertex.position)
+                    .map_err(|e| ExportError::ExportFailed {
                         reason: format!("Failed to write vertex: {}", e),
-                    }
-                })?;
+                    })?;
                 vertex_map.insert(vid, step_id);
             }
 
@@ -1111,37 +1127,35 @@ pub async fn export_assembly_to_step(
 
             let mut surface_map = HashMap::new();
             for (sid, surface) in &snapshot.surfaces {
-                let step_id = writer.write_surface(surface).map_err(|e| {
-                    ExportError::ExportFailed {
-                        reason: format!("Failed to write surface: {}", e),
-                    }
-                })?;
+                let step_id =
+                    writer
+                        .write_surface(surface)
+                        .map_err(|e| ExportError::ExportFailed {
+                            reason: format!("Failed to write surface: {}", e),
+                        })?;
                 surface_map.insert(sid, step_id);
             }
 
             let mut edge_map = HashMap::new();
             for (eid, edge) in &snapshot.edges {
-                let step_id = writer.write_edge(edge, &vertex_map, &curve_map).map_err(|e| {
-                    ExportError::ExportFailed {
+                let step_id = writer
+                    .write_edge(edge, &vertex_map, &curve_map)
+                    .map_err(|e| ExportError::ExportFailed {
                         reason: format!("Failed to write edge: {}", e),
-                    }
-                })?;
+                    })?;
                 edge_map.insert(eid, step_id);
             }
 
-            let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> = snapshot
-                .loops
-                .iter()
-                .map(|(id, data)| (id, data))
-                .collect();
+            let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> =
+                snapshot.loops.iter().map(|(id, data)| (id, data)).collect();
 
             let mut face_map = HashMap::new();
             for (fid, face) in &snapshot.faces {
-                let step_id = writer.write_face(face, &surface_map, &edge_map, &loop_map).map_err(|e| {
-                    ExportError::ExportFailed {
+                let step_id = writer
+                    .write_face(face, &surface_map, &edge_map, &loop_map)
+                    .map_err(|e| ExportError::ExportFailed {
                         reason: format!("Failed to write face: {}", e),
-                    }
-                })?;
+                    })?;
                 face_map.insert(fid, step_id);
             }
 
@@ -1158,11 +1172,11 @@ pub async fn export_assembly_to_step(
             // Write solids and capture the last shape ID for this component
             let mut last_shape_id = writer.next_id(); // fallback
             for (solid_id, solid) in &snapshot.solids {
-                last_shape_id = writer.write_solid(solid, solid_id, &shell_map).map_err(|e| {
-                    ExportError::ExportFailed {
+                last_shape_id = writer
+                    .write_solid(solid, solid_id, &shell_map)
+                    .map_err(|e| ExportError::ExportFailed {
                         reason: format!("Failed to write solid: {}", e),
-                    }
-                })?;
+                    })?;
             }
 
             component_step_ids.push((last_shape_id, component.transform.clone()));
@@ -1350,7 +1364,14 @@ fn parse_step_entities(data: &str) -> Result<HashMap<u32, StepEntity>, ExportErr
             }
         }
         let args = rhs[args_start..args_end].to_string();
-        entities.insert(id, StepEntity { id, type_name, args });
+        entities.insert(
+            id,
+            StepEntity {
+                id,
+                type_name,
+                args,
+            },
+        );
     }
     Ok(entities)
 }
@@ -1564,8 +1585,7 @@ fn reconstruct_brep_from_step(
                                                             p1,
                                                             Vector3::new(dir[0], dir[1], dir[2]),
                                                         );
-                                                    let cid =
-                                                        model.curves.add(Box::new(line));
+                                                    let cid = model.curves.add(Box::new(line));
                                                     curve_id_map.insert(step_id, cid);
                                                     continue;
                                                 }
@@ -1635,8 +1655,7 @@ fn reconstruct_brep_from_step(
                 let args = split_step_args(&entity.args);
                 if args.len() >= 3 {
                     if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((origin, axis, _)) =
-                            extract_axis2_placement(entities, axis_ref)
+                        if let Some((origin, axis, _)) = extract_axis2_placement(entities, axis_ref)
                         {
                             if let Ok(radius) = args[2].trim().parse::<f64>() {
                                 let cyl = geometry_engine::primitives::surface::Cylinder::new(
@@ -1657,9 +1676,7 @@ fn reconstruct_brep_from_step(
                 let args = split_step_args(&entity.args);
                 if args.len() >= 3 {
                     if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((center, _, _)) =
-                            extract_axis2_placement(entities, axis_ref)
-                        {
+                        if let Some((center, _, _)) = extract_axis2_placement(entities, axis_ref) {
                             if let Ok(radius) = args[2].trim().parse::<f64>() {
                                 let sphere = geometry_engine::primitives::surface::Sphere::new(
                                     Point3::new(center[0], center[1], center[2]),
@@ -1678,13 +1695,10 @@ fn reconstruct_brep_from_step(
                 let args = split_step_args(&entity.args);
                 if args.len() >= 4 {
                     if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((apex, axis, _)) =
-                            extract_axis2_placement(entities, axis_ref)
-                        {
-                            if let (Ok(_radius), Ok(half_angle_deg)) = (
-                                args[2].trim().parse::<f64>(),
-                                args[3].trim().parse::<f64>(),
-                            ) {
+                        if let Some((apex, axis, _)) = extract_axis2_placement(entities, axis_ref) {
+                            if let (Ok(_radius), Ok(half_angle_deg)) =
+                                (args[2].trim().parse::<f64>(), args[3].trim().parse::<f64>())
+                            {
                                 let cone = geometry_engine::primitives::surface::Cone::new(
                                     Point3::new(apex[0], apex[1], apex[2]),
                                     Vector3::new(axis[0], axis[1], axis[2]),
@@ -1703,13 +1717,11 @@ fn reconstruct_brep_from_step(
                 let args = split_step_args(&entity.args);
                 if args.len() >= 4 {
                     if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((center, axis, _)) =
-                            extract_axis2_placement(entities, axis_ref)
+                        if let Some((center, axis, _)) = extract_axis2_placement(entities, axis_ref)
                         {
-                            if let (Ok(major_r), Ok(minor_r)) = (
-                                args[2].trim().parse::<f64>(),
-                                args[3].trim().parse::<f64>(),
-                            ) {
+                            if let (Ok(major_r), Ok(minor_r)) =
+                                (args[2].trim().parse::<f64>(), args[3].trim().parse::<f64>())
+                            {
                                 let torus = geometry_engine::primitives::surface::Torus::new(
                                     Point3::new(center[0], center[1], center[2]),
                                     Vector3::new(axis[0], axis[1], axis[2]),

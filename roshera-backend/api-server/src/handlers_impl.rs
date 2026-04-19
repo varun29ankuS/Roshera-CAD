@@ -46,11 +46,10 @@ pub async fn create_basic_geometry(
                 transform: None,
                 tolerance: None,
             };
-            BoxPrimitive::create(box_params, &mut model)
-                .map_err(|e| {
-                    tracing::error!("Failed to create box: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
+            BoxPrimitive::create(box_params, &mut model).map_err(|e| {
+                tracing::error!("Failed to create box: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
         }
         "create_sphere" => {
             let params = payload.parameters.unwrap_or(serde_json::json!({}));
@@ -64,11 +63,10 @@ pub async fn create_basic_geometry(
                 transform: None,
                 tolerance: None,
             };
-            SpherePrimitive::create(sphere_params, &mut model)
-                .map_err(|e| {
-                    tracing::error!("Failed to create sphere: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
+            SpherePrimitive::create(sphere_params, &mut model).map_err(|e| {
+                tracing::error!("Failed to create sphere: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
         }
         "create_cylinder" => {
             let params = payload.parameters.unwrap_or(serde_json::json!({}));
@@ -84,11 +82,10 @@ pub async fn create_basic_geometry(
                 transform: None,
                 tolerance: None,
             };
-            CylinderPrimitive::create(cylinder_params, &mut model)
-                .map_err(|e| {
-                    tracing::error!("Failed to create cylinder: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
+            CylinderPrimitive::create(cylinder_params, &mut model).map_err(|e| {
+                tracing::error!("Failed to create cylinder: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
         }
         _ => {
             return Err(StatusCode::BAD_REQUEST);
@@ -188,9 +185,10 @@ pub async fn process_ai_command_stream(
         // auth context. This is idempotent — re-registering the same token is safe.
         if let Err(e) = session_aware_ai.authenticate(&jwt_id).await {
             let _ = tx
-                .send(Ok(Event::default()
-                    .event("error")
-                    .data(serde_json::json!({"error": format!("Authentication setup failed: {}", e)}).to_string())))
+                .send(Ok(Event::default().event("error").data(
+                    serde_json::json!({"error": format!("Authentication setup failed: {}", e)})
+                        .to_string(),
+                )))
                 .await;
             return;
         }
@@ -210,9 +208,9 @@ pub async fn process_ai_command_stream(
             Ok(p) => p,
             Err(e) => {
                 let _ = tx
-                    .send(Ok(Event::default()
-                        .event("error")
-                        .data(serde_json::json!({"error": e.to_string()}).to_string())))
+                    .send(Ok(Event::default().event("error").data(
+                        serde_json::json!({"error": e.to_string()}).to_string(),
+                    )))
                     .await;
                 return;
             }
@@ -222,9 +220,7 @@ pub async fn process_ai_command_stream(
         let result_json =
             serde_json::to_string(&processed.result).unwrap_or_else(|_| "{}".to_string());
         let _ = tx
-            .send(Ok(Event::default()
-                .event("complete")
-                .data(result_json)))
+            .send(Ok(Event::default().event("complete").data(result_json)))
             .await;
     });
 
@@ -274,7 +270,11 @@ pub async fn list_sessions(
     for session_id in session_ids {
         if let Ok(session_ref) = state.session_manager.get_session(&session_id).await {
             let session = session_ref.read().await;
-            if session.active_users.iter().any(|u| u.id == auth_info.user_id) {
+            if session
+                .active_users
+                .iter()
+                .any(|u| u.id == auth_info.user_id)
+            {
                 user_sessions.push(serde_json::json!({
                     "id": session.id,
                     "name": session.name,
@@ -328,7 +328,10 @@ pub async fn get_session(
             let session = session_ref.read().await;
             // Verify the requesting user has access: they must be an active participant
             // or hold ViewAllSessions permission.
-            let is_participant = session.active_users.iter().any(|u| u.id == auth_info.user_id);
+            let is_participant = session
+                .active_users
+                .iter()
+                .any(|u| u.id == auth_info.user_id);
             let has_broad_access = auth_info.permissions.contains(&Permission::ViewAllSessions);
             if !is_participant && !has_broad_access {
                 return Err(StatusCode::FORBIDDEN);
@@ -357,11 +360,17 @@ pub async fn delete_session(
 ) -> Result<StatusCode, StatusCode> {
     // Only users with DeleteAllSessions permission may delete arbitrary sessions.
     // Otherwise, verify the requesting user is an active participant before allowing deletion.
-    if !auth_info.permissions.contains(&Permission::DeleteAllSessions) {
+    if !auth_info
+        .permissions
+        .contains(&Permission::DeleteAllSessions)
+    {
         match state.session_manager.get_session(&id).await {
             Ok(session_ref) => {
                 let session = session_ref.read().await;
-                let is_participant = session.active_users.iter().any(|u| u.id == auth_info.user_id);
+                let is_participant = session
+                    .active_users
+                    .iter()
+                    .any(|u| u.id == auth_info.user_id);
                 if !is_participant {
                     return Err(StatusCode::FORBIDDEN);
                 }

@@ -323,19 +323,14 @@ impl CommandExecutor {
         let model_clone = Arc::clone(&self.model);
         tokio::task::spawn_blocking(move || {
             let matrix = match xform {
-                shared_types::geometry_commands::Transform::Translate { offset } => {
-                    Ok(Matrix4::translation(
-                        offset[0] as f64,
-                        offset[1] as f64,
-                        offset[2] as f64,
-                    ))
-                }
+                shared_types::geometry_commands::Transform::Translate { offset } => Ok(
+                    Matrix4::translation(offset[0] as f64, offset[1] as f64, offset[2] as f64),
+                ),
                 shared_types::geometry_commands::Transform::Rotate {
                     axis,
                     angle_radians,
                 } => {
-                    let axis_vec =
-                        Vector3::new(axis[0] as f64, axis[1] as f64, axis[2] as f64);
+                    let axis_vec = Vector3::new(axis[0] as f64, axis[1] as f64, axis[2] as f64);
                     Matrix4::from_axis_angle(&axis_vec, angle_radians)
                         .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
                 }

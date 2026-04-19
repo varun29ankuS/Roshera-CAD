@@ -61,7 +61,11 @@ pub struct FrameAtStation {
 ///
 /// When `hint` is `None`, falls back to `Vector3::perpendicular()` which picks an
 /// arbitrary direction orthogonal to `tangent`.
-fn initial_normal(tangent: &Vector3, hint: Option<&Vector3>, tol: Tolerance) -> MathResult<Vector3> {
+fn initial_normal(
+    tangent: &Vector3,
+    hint: Option<&Vector3>,
+    tol: Tolerance,
+) -> MathResult<Vector3> {
     if let Some(hint_dir) = hint {
         // Project hint onto the plane perpendicular to tangent
         let projected = *hint_dir - *tangent * tangent.dot(hint_dir);
@@ -82,12 +86,15 @@ fn initial_normal(tangent: &Vector3, hint: Option<&Vector3>, tol: Tolerance) -> 
 /// - Column 1 (Y): binormal
 /// - Column 2 (Z): tangent (forward)
 /// - Column 3: translation (position)
-fn build_frame_matrix(position: &Point3, normal: &Vector3, binormal: &Vector3, tangent: &Vector3) -> Matrix4 {
+fn build_frame_matrix(
+    position: &Point3,
+    normal: &Vector3,
+    binormal: &Vector3,
+    tangent: &Vector3,
+) -> Matrix4 {
     Matrix4::new(
-        normal.x,   binormal.x, tangent.x, position.x,
-        normal.y,   binormal.y, tangent.y, position.y,
-        normal.z,   binormal.z, tangent.z, position.z,
-        0.0,        0.0,        0.0,       1.0,
+        normal.x, binormal.x, tangent.x, position.x, normal.y, binormal.y, tangent.y, position.y,
+        normal.z, binormal.z, tangent.z, position.z, 0.0, 0.0, 0.0, 1.0,
     )
 }
 
@@ -439,10 +446,7 @@ pub fn multi_guide_frames(
             Vector3::new(cx * inv, cy * inv, 0.0)
         };
 
-        let target_local: Vec<Vector3> = target_2d
-            .iter()
-            .map(|p| *p - target_centroid)
-            .collect();
+        let target_local: Vec<Vector3> = target_2d.iter().map(|p| *p - target_centroid).collect();
 
         // Target mean distance (for scale)
         let target_mean_dist = {
@@ -626,8 +630,8 @@ pub fn birail_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::ApproxEq;
     use crate::math::tolerance::NORMAL_TOLERANCE;
+    use crate::math::ApproxEq;
     use crate::primitives::curve::Line;
 
     /// Helper: straight line from (0,0,0) to (10,0,0)
@@ -774,10 +778,7 @@ mod tests {
         let guide2 = Line::new(Point3::new(0.0, 0.0, 5.0), Point3::new(10.0, 0.0, 5.0));
 
         let guides: Vec<&dyn Curve> = vec![&guide1 as &dyn Curve, &guide2 as &dyn Curve];
-        let profile_pts = vec![
-            Point3::new(5.0, 0.0, 0.0),
-            Point3::new(0.0, 5.0, 0.0),
-        ];
+        let profile_pts = vec![Point3::new(5.0, 0.0, 0.0), Point3::new(0.0, 5.0, 0.0)];
 
         let frames = multi_guide_frames(&path, &guides, &profile_pts, 3, NORMAL_TOLERANCE).unwrap();
 
@@ -786,11 +787,7 @@ mod tests {
         // Verify that scale is approximately 1.0 (guides maintain constant distance)
         for f in &frames {
             if let Some(s) = f.scale {
-                assert!(
-                    (s - 1.0).abs() < 0.5,
-                    "scale = {} (should be near 1.0)",
-                    s
-                );
+                assert!((s - 1.0).abs() < 0.5, "scale = {} (should be near 1.0)", s);
             }
         }
     }

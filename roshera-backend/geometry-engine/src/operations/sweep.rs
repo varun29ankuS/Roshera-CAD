@@ -175,12 +175,8 @@ pub fn sweep_profile(
         SweepType::MultiGuide => {
             create_frame_driven_sweep(model, profile_face, &path_edge, &options)?
         }
-        SweepType::Rail => {
-            create_frame_driven_sweep(model, profile_face, &path_edge, &options)?
-        }
-        SweepType::BiRail => {
-            create_frame_driven_sweep(model, profile_face, &path_edge, &options)?
-        }
+        SweepType::Rail => create_frame_driven_sweep(model, profile_face, &path_edge, &options)?,
+        SweepType::BiRail => create_frame_driven_sweep(model, profile_face, &path_edge, &options)?,
     };
 
     // Validate result if requested
@@ -297,15 +293,12 @@ fn create_frame_driven_sweep(
     let mut sections: Vec<SweepSection> = Vec::with_capacity(frame_stations.len());
 
     for frame in &frame_stations {
-        let scale_val = compute_scale_at_parameter(frame.parameter, &options.scale)
-            .unwrap_or(1.0)
+        let scale_val = compute_scale_at_parameter(frame.parameter, &options.scale).unwrap_or(1.0)
             * frame.scale.unwrap_or(1.0);
 
-        let twist_val = compute_twist_at_parameter(frame.parameter, &options.twist)
-            .unwrap_or(0.0);
+        let twist_val = compute_twist_at_parameter(frame.parameter, &options.twist).unwrap_or(0.0);
 
-        let transform =
-            build_sweep_transform(frame.position, frame.matrix, scale_val, twist_val);
+        let transform = build_sweep_transform(frame.position, frame.matrix, scale_val, twist_val);
 
         let section = create_sweep_section(model, profile_face, frame.parameter, transform)?;
         sections.push(section);
