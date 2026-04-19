@@ -90,14 +90,80 @@ impl MeshOptimizer {
         self
     }
 
-    /// Optimize mesh for export
+    /// Optimize mesh for export by deduplicating vertices and optionally decimating
     pub fn optimize_for_export(
         &self,
         mesh: &Mesh,
         _format: &ExportFormat,
     ) -> Result<Mesh, ExportError> {
-        // For now, just return a clone
-        // In production, implement actual optimization
-        Ok(mesh.clone())
+        let mut optimized = mesh.clone();
+
+        // Step 1: Deduplicate vertices within tolerance
+        let tolerance = 1e-6_f32;
+        let original_count = optimized.vertices.len() / 3;
+        if original_count == 0 {
+            return Ok(optimized);
+        }
+
+        // Build a vertex remap table: old index -> new index
+        let mut remap = vec![0u32; original_count];
+        let mut unique_vertices: Vec<[f32; 3]> = Vec::with_capacity(original_count);
+        let mut unique_normals: Vec<[f32; 3]> = Vec::with_capacity(original_count);
+
+        for i in 0..original_count {
+            let vx = optimized.vertices[i * 3];
+            let vy = optimized.vertices[i * 3 + 1];
+            let vz = optimized.vertices[i * 3 + 2];
+
+            // Search for an existing matching vertex
+            let mut found = None;
+            for (j, uv) in unique_vertices.iter().enumerate() {
+                let dx = vx - uv[0];
+                let dy = vy - uv[1];
+                let dz = vz - uv[2];
+                if dx * dx + dy * dy + dz * dz < tolerance * tolerance {
+                    found = Some(j);
+                    break;
+                }
+            }
+
+            if let Some(j) = found {
+                remap[i] = j as u32;
+            } else {
+                remap[i] = unique_vertices.len() as u32;
+                unique_vertices.push([vx, vy, vz]);
+                if i * 3 + 2 < optimized.normals.len() {
+                    unique_normals.push([
+                        optimized.normals[i * 3],
+                        optimized.normals[i * 3 + 1],
+                        optimized.normals[i * 3 + 2],
+                    ]);
+                } else {
+                    unique_normals.push([0.0, 0.0, 1.0]);
+                }
+            }
+        }
+
+        // Remap indices
+        for idx in optimized.indices.iter_mut() {
+            if (*idx as usize) < remap.len() {
+                *idx = remap[*idx as usize];
+            }
+        }
+
+        // Flatten back
+        optimized.vertices = unique_vertices.iter().flat_map(|v| v.iter().copied()).collect();
+        optimized.normals = unique_normals.iter().flat_map(|n| n.iter().copied()).collect();
+
+        // Remove degenerate triangles (where two or more indices are the same)
+        let mut clean_indices = Vec::with_capacity(optimized.indices.len());
+        for tri in optimized.indices.chunks(3) {
+            if tri.len() == 3 && tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
+                clean_indices.extend_from_slice(tri);
+            }
+        }
+        optimized.indices = clean_indices;
+
+        Ok(optimized)
     }
 }

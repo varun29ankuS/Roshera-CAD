@@ -7,6 +7,7 @@ use axum::{
     response::{Json, Result},
 };
 use serde::{Deserialize, Serialize};
+use chrono::Utc;
 use session_manager::{AuthManager, Permission};
 use tracing::{error, info, warn};
 
@@ -58,6 +59,10 @@ pub struct RefreshResponse {
 }
 
 /// Handle user login
+///
+/// Validates credentials against the user store held by the database persistence layer.
+/// The supplied password is verified via Argon2 against the hash stored in `UserData`.
+/// A JWT access token and a JWT refresh token are returned on success.
 pub async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
@@ -66,54 +71,48 @@ pub async fn login(
 
     let auth_manager = &state.auth_manager;
 
-    // For MVP, we'll use a simple in-memory user system
-    // In production, this would query a database
+    // Derive the canonical user_id from the username (consistent with registration).
+    let user_id = format!("user_{}", payload.username);
 
-    // Demo users with hardcoded passwords (NEVER do this in production)
-    let demo_password_hash = auth_manager.hash_password("demo123").unwrap_or_default();
-
-    // Verify the password matches our demo user
-    let is_valid = if payload.username == "demo" || payload.username == "admin" {
-        payload.password == "demo123" // Simple check for MVP
-    } else {
-        false
+    // Load user data from the database — this is the single source of truth.
+    let user_data = match state.database.load_user(&user_id).await {
+        Ok(u) => u,
+        Err(_) => {
+            // Use a constant-time-equivalent response to prevent username enumeration.
+            warn!("Login failed — user not found: {}", payload.username);
+            return Ok(Json(LoginResponse {
+                success: false,
+                token: None,
+                refresh_token: None,
+                expires_in: None,
+                user_id: None,
+                permissions: None,
+                error: Some("Invalid credentials".to_string()),
+            }));
+        }
     };
 
-    if is_valid {
-        let user_id = format!("user_{}", payload.username);
-        info!("Login successful for user: {}", user_id);
+    if !user_data.is_active {
+        warn!("Login rejected — account inactive for user: {}", user_id);
+        return Ok(Json(LoginResponse {
+            success: false,
+            token: None,
+            refresh_token: None,
+            expires_in: None,
+            user_id: None,
+            permissions: None,
+            error: Some("Account is inactive".to_string()),
+        }));
+    }
 
-        // Create a session token
-        let token = auth_manager
-            .create_token(
-                &user_id,
-                Some(format!("{}@example.com", payload.username)),
-                vec!["user".to_string()],
-            )
-            .map_err(|e| {
-                error!("Failed to create token: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
-            })?;
+    // Verify the supplied password against the stored Argon2 hash.
+    let password_valid = auth_manager
+        .verify_password(&payload.password, &user_data.password_hash)
+        .unwrap_or(false);
 
-        // For refresh token, we'll use the JWT ID as a simple refresh token
-        let refresh_token = token.id.clone();
-
-        // Get default permissions
-        let permissions = get_user_permission_strings();
-
-        Ok(Json(LoginResponse {
-            success: true,
-            token: Some(token.token),
-            refresh_token: Some(refresh_token),
-            expires_in: Some(token.expires_at.timestamp() as u64),
-            user_id: Some(user_id),
-            permissions: Some(permissions),
-            error: None,
-        }))
-    } else {
-        warn!("Login failed for user {}", payload.username);
-
-        Ok(Json(LoginResponse {
+    if !password_valid {
+        warn!("Login failed — wrong password for user: {}", user_id);
+        return Ok(Json(LoginResponse {
             success: false,
             token: None,
             refresh_token: None,
@@ -121,11 +120,43 @@ pub async fn login(
             user_id: None,
             permissions: None,
             error: Some("Invalid credentials".to_string()),
-        }))
+        }));
     }
+
+    info!("Login successful for user: {}", user_id);
+
+    let token = auth_manager
+        .create_token(
+            &user_id,
+            Some(user_data.email.clone()),
+            vec!["user".to_string()],
+        )
+        .map_err(|e| {
+            error!("Failed to create token: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
+        })?;
+
+    // The refresh token is embedded inside the SessionToken returned by create_token.
+    let refresh_token = token.refresh_token.clone().unwrap_or_default();
+    let permissions = get_user_permission_strings();
+
+    Ok(Json(LoginResponse {
+        success: true,
+        token: Some(token.token),
+        refresh_token: Some(refresh_token),
+        expires_in: Some(token.expires_at.timestamp() as u64),
+        user_id: Some(user_id),
+        permissions: Some(permissions),
+        error: None,
+    }))
 }
 
 /// Handle user registration
+///
+/// Validates the supplied username, email, and password, hashes the password with
+/// Argon2, and persists a new `UserData` record through the database persistence layer.
+/// The canonical `user_id` is derived as `"user_{username}"` for consistent lookups
+/// in the login handler.
 pub async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterRequest>,
@@ -134,7 +165,6 @@ pub async fn register(
 
     let auth_manager = &state.auth_manager;
 
-    // Validate input
     if payload.username.len() < 3 {
         return Ok(Json(RegisterResponse {
             success: false,
@@ -144,21 +174,36 @@ pub async fn register(
         }));
     }
 
-    if payload.password.len() < 8 {
+    if !payload
+        .username
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
         return Ok(Json(RegisterResponse {
             success: false,
             user_id: None,
-            message: "Password must be at least 8 characters".to_string(),
-            error: Some("WEAK_PASSWORD".to_string()),
+            message: "Username may only contain letters, digits, hyphens, and underscores"
+                .to_string(),
+            error: Some("INVALID_USERNAME_CHARS".to_string()),
         }));
     }
 
-    // For MVP, we'll create a simple user registration
-    // In production, this would use a proper database
+    // Derive the canonical user_id to ensure consistent lookup in login.
+    let user_id = format!("user_{}", payload.username);
 
-    let user_id = uuid::Uuid::new_v4().to_string();
+    // Reject if this username is already registered.
+    if state.database.load_user(&user_id).await.is_ok() {
+        warn!("Registration rejected — username already taken: {}", payload.username);
+        return Ok(Json(RegisterResponse {
+            success: false,
+            user_id: None,
+            message: "Username is already taken".to_string(),
+            error: Some("USERNAME_TAKEN".to_string()),
+        }));
+    }
 
-    // Validate and hash the password
+    // Validate and hash the password using Argon2 via AuthManager.
+    // hash_password also enforces the configured password complexity requirements.
     let password_hash = match auth_manager.hash_password(&payload.password) {
         Ok(hash) => hash,
         Err(e) => {
@@ -175,19 +220,38 @@ pub async fn register(
         }
     };
 
-    // In a production system, we would:
-    // 1. Check if username/email already exists
-    // 2. Store user in database with password_hash
-    // 3. Send verification email
-    // 4. Create audit log entry
+    let now = Utc::now();
+    let user_data = session_manager::UserData {
+        id: user_id.clone(),
+        email: payload.email.clone(),
+        name: payload
+            .full_name
+            .clone()
+            .unwrap_or_else(|| payload.username.clone()),
+        password_hash,
+        created_at: now,
+        last_login: None,
+        is_active: true,
+        is_verified: false, // Email verification is a separate flow.
+        profile: serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    if let Err(e) = state.database.save_user(&user_data).await {
+        error!(
+            "Failed to persist user {} during registration: {:?}",
+            user_id, e
+        );
+        return Ok(Json(RegisterResponse {
+            success: false,
+            user_id: None,
+            message: "Registration failed due to a server error".to_string(),
+            error: Some("STORAGE_ERROR".to_string()),
+        }));
+    }
 
     info!(
-        "Registration successful for user: {} (id: {})",
+        "Registration successful: user '{}' (id: {})",
         payload.username, user_id
-    );
-    info!(
-        "User email: {:?}, full name: {:?}",
-        payload.email, payload.full_name
     );
 
     Ok(Json(RegisterResponse {
@@ -202,61 +266,63 @@ pub async fn register(
 }
 
 /// Handle token refresh
+///
+/// The supplied refresh token must be a valid, unexpired JWT signed by this server.
+/// The `sub` claim in the refresh token is used to identify the user for whom
+/// a new access token is issued. The refresh token itself is validated via
+/// `AuthManager::verify_token` so revoked or expired refresh tokens are rejected.
 pub async fn refresh_token(
     State(state): State<AppState>,
     Json(payload): Json<RefreshRequest>,
 ) -> Result<Json<RefreshResponse>> {
     info!("Token refresh attempt");
 
-    // For MVP, we'll implement a simple token refresh
-    // In production, this would:
-    // 1. Validate the refresh token
-    // 2. Check if it's not revoked
-    // 3. Generate new access token
-    // 4. Optionally rotate refresh token
-
     let auth_manager = &state.auth_manager;
 
-    // For now, just create a new token if the refresh token looks valid (is a UUID)
-    if let Ok(_uuid) = uuid::Uuid::parse_str(&payload.refresh_token) {
-        // Create a new token
-        let user_id = "refreshed_user"; // In production, extract from refresh token
+    // Validate the refresh token as a JWT. verify_token checks signature, expiry,
+    // and revocation list, so a bare UUID or tampered token is rejected here.
+    let claims = match auth_manager.verify_token(&payload.refresh_token) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Token refresh rejected — invalid token: {:?}", e);
+            return Ok(Json(RefreshResponse {
+                success: false,
+                token: None,
+                expires_in: None,
+                error: Some("Invalid or expired refresh token".to_string()),
+            }));
+        }
+    };
 
-        let new_token = auth_manager
-            .create_token(
-                user_id,
-                Some("user@example.com".to_string()),
-                vec!["user".to_string()],
-            )
-            .map_err(|e| {
-                error!("Failed to create new token: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
-            })?;
+    let user_id = claims.sub;
 
-        info!("Token refresh successful for user: {}", user_id);
+    let new_token = auth_manager
+        .create_token(
+            &user_id,
+            claims.email,
+            claims.roles,
+        )
+        .map_err(|e| {
+            error!("Failed to create new token during refresh: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
+        })?;
 
-        Ok(Json(RefreshResponse {
-            success: true,
-            token: Some(new_token.token),
-            expires_in: Some(new_token.expires_at.timestamp() as u64),
-            error: None,
-        }))
-    } else {
-        warn!("Invalid refresh token format");
+    info!("Token refresh successful for user: {}", user_id);
 
-        Ok(Json(RefreshResponse {
-            success: false,
-            token: None,
-            expires_in: None,
-            error: Some("Invalid refresh token".to_string()),
-        }))
-    }
+    Ok(Json(RefreshResponse {
+        success: true,
+        token: Some(new_token.token),
+        expires_in: Some(new_token.expires_at.timestamp() as u64),
+        error: None,
+    }))
 }
 
-/// Get default permission strings for a user
+/// Default permission strings returned on successful login.
+///
+/// These reflect the baseline "user" role. Fine-grained per-session permissions
+/// are enforced by the `PermissionManager` when the user joins a session and are
+/// stored in `UserPermissions` records, not in the JWT itself.
 fn get_user_permission_strings() -> Vec<String> {
-    // Return default permissions as strings
-    // In production, this would be based on user's role from database
     vec![
         "ViewGeometry".to_string(),
         "CreateGeometry".to_string(),

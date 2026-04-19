@@ -46,18 +46,12 @@ impl NativeProviderFactory {
         .await
     }
 
-    /// Create a LLaMA 8-bit quantized provider
-    pub async fn create_llama_provider(
-        config: &NativeProviderConfig,
-    ) -> Result<LlamaCandleProvider, ProviderError> {
-        tracing::info!("Creating LLaMA 8-bit quantized provider");
-        let model_path = config.model_dir.join("llama/3b-q8.gguf");
-        let tokenizer_path = config.model_dir.join("llama/tokenizer.json");
-        LlamaCandleProvider::new(
-            model_path.to_string_lossy().to_string(),
-            tokenizer_path.to_string_lossy().to_string(),
-        )
-        .await
+    /// Create a Claude API LLM provider
+    pub async fn create_claude_provider(
+        _config: &NativeProviderConfig,
+    ) -> Result<ClaudeProvider, ProviderError> {
+        tracing::info!("Creating Claude API LLM provider");
+        Ok(ClaudeProvider::new())
     }
 
     /// Create a native TTS provider
@@ -92,14 +86,14 @@ impl NativeProviderFactory {
             }
         }
 
-        // LLM Provider
-        match Self::create_llama_provider(config).await {
+        // LLM Provider (API-based)
+        match Self::create_claude_provider(config).await {
             Ok(provider) => {
-                manager.register_llm("llama-native".to_string(), Box::new(provider));
-                tracing::info!("✓ Native LLaMA LLM provider registered");
+                manager.register_llm("claude".to_string(), Box::new(provider));
+                tracing::info!("✓ Claude API LLM provider registered");
             }
             Err(e) => {
-                tracing::warn!("Failed to create native LLaMA provider: {}. Using mock.", e);
+                tracing::warn!("Failed to create Claude provider: {}. Using mock.", e);
                 manager.register_llm("mock".to_string(), Box::new(MockLLMProvider::new()));
             }
         }
@@ -123,8 +117,8 @@ impl NativeProviderFactory {
             "mock"
         };
 
-        let llm_provider = if manager.llm_providers.contains_key("llama-native") {
-            "llama-native"
+        let llm_provider = if manager.llm_providers.contains_key("claude") {
+            "claude"
         } else {
             "mock"
         };
@@ -150,74 +144,42 @@ impl NativeProviderFactory {
         Ok(manager)
     }
 
-    /// Check if all required model files are present
-    pub fn check_model_availability(config: &NativeProviderConfig) -> ModelAvailability {
-        // For stub implementations, models are not required
-        // This will be updated when real model loading is implemented
-        ModelAvailability {
-            whisper_model: true, // Stub doesn't need real models
-            whisper_tokenizer: true,
-            llama_model: true,
+    /// Check API provider availability (Claude API key configured, etc.)
+    pub fn check_provider_availability(config: &NativeProviderConfig) -> ProviderAvailability {
+        let claude_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+        ProviderAvailability {
+            whisper_model: config.model_dir.join("whisper/base.bin").exists(),
+            claude_api_key,
             model_dir_exists: config.model_dir.exists(),
         }
     }
-
-    /// Download missing models (placeholder for future implementation)
-    pub async fn download_missing_models(
-        config: &NativeProviderConfig,
-        availability: &ModelAvailability,
-    ) -> Result<(), ProviderError> {
-        if !availability.model_dir_exists {
-            std::fs::create_dir_all(&config.model_dir).map_err(|e| {
-                ProviderError::ConfigError(format!("Failed to create model directory: {}", e))
-            })?;
-        }
-
-        tracing::info!("Model download not implemented. Please run the download scripts manually:");
-
-        if !availability.whisper_model || !availability.whisper_tokenizer {
-            tracing::info!("  - For Whisper: python download_whisper_models.py");
-        }
-
-        if !availability.llama_model {
-            tracing::info!("  - For LLaMA: python download_llama_models.py");
-        }
-
-        Ok(())
-    }
 }
 
-/// Model availability status
+/// Provider availability status
 #[derive(Debug, Clone)]
-pub struct ModelAvailability {
+pub struct ProviderAvailability {
     pub whisper_model: bool,
-    pub whisper_tokenizer: bool,
-    pub llama_model: bool,
+    pub claude_api_key: bool,
     pub model_dir_exists: bool,
 }
 
-impl ModelAvailability {
+impl ProviderAvailability {
     pub fn all_available(&self) -> bool {
-        self.whisper_model && self.whisper_tokenizer && self.llama_model
+        self.whisper_model && self.claude_api_key
     }
 
     pub fn any_available(&self) -> bool {
-        self.whisper_model || self.llama_model
+        self.whisper_model || self.claude_api_key
     }
 
-    pub fn missing_models(&self) -> Vec<&'static str> {
+    pub fn missing_providers(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-
         if !self.whisper_model {
             missing.push("whisper-model");
         }
-        if !self.whisper_tokenizer {
-            missing.push("whisper-tokenizer");
+        if !self.claude_api_key {
+            missing.push("ANTHROPIC_API_KEY");
         }
-        if !self.llama_model {
-            missing.push("llama-model");
-        }
-
         missing
     }
 }
@@ -227,14 +189,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_model_availability_check() {
+    fn test_provider_availability_check() {
         let config = NativeProviderConfig::default();
-        let availability = NativeProviderFactory::check_model_availability(&config);
+        let availability = NativeProviderFactory::check_provider_availability(&config);
 
         // Should not panic
         let _all = availability.all_available();
         let _any = availability.any_available();
-        let _missing = availability.missing_models();
+        let _missing = availability.missing_providers();
     }
 
     #[tokio::test]

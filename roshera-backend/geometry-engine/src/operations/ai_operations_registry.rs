@@ -735,10 +735,10 @@ impl OperationsRegistry {
             match target {
                 EntityReference::Edge(id) => edge_ids.push(*id),
                 EntityReference::All => {
-                    // Add all edges - simplified for now
-                    return Err(OperationError::NotImplemented(
-                        "All edges selection".to_string(),
-                    ));
+                    // Collect all edge IDs from the model
+                    for (eid, _) in model.edges.iter() {
+                        edge_ids.push(eid);
+                    }
                 }
                 _ => {}
             }

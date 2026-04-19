@@ -258,17 +258,57 @@ fn group_faces_by_edge(
     }])
 }
 
-/// Group faces by neutral face
+/// Group faces by neutral face.
+///
+/// The neutral face's boundary edges are sampled to produce the neutral
+/// curve.  All draft faces are assigned to a single group that shares this
+/// curve, with the pull direction used as-is for the draft direction.
+///
+/// The neutral face is allowed to be one of the faces being drafted; its
+/// boundary will still be used as the parting-line constraint.
 fn group_faces_by_face(
     model: &BRepModel,
     faces: &[FaceId],
     neutral_face_id: FaceId,
     pull_direction: Vector3,
 ) -> OperationResult<Vec<FaceGroup>> {
-    // Neutral face boundary defines neutral curves
-    Err(OperationError::NotImplemented(
-        "Draft with neutral face not yet implemented".to_string(),
-    ))
+    let neutral_face = model
+        .faces
+        .get(neutral_face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Neutral face not found".to_string()))?;
+
+    let neutral_loop = model
+        .loops
+        .get(neutral_face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Neutral face loop not found".to_string()))?;
+
+    // Sample each boundary edge of the neutral face to obtain a dense
+    // polyline that approximates the parting-line curve.
+    let samples_per_edge = 5usize;
+    let mut neutral_curve: Vec<Point3> = Vec::new();
+
+    for &edge_id in &neutral_loop.edges {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Neutral face edge not found".to_string()))?;
+        for k in 0..samples_per_edge {
+            let t = k as f64 / samples_per_edge as f64;
+            let pt = edge.evaluate(t, &model.curves)?;
+            neutral_curve.push(pt);
+        }
+    }
+
+    // Close the loop by appending the first sampled point again.
+    if let Some(&first) = neutral_curve.first() {
+        neutral_curve.push(first);
+    }
+
+    Ok(vec![FaceGroup {
+        faces: faces.to_vec(),
+        neutral_curve,
+        draft_direction: pull_direction,
+    }])
 }
 
 /// Group faces by custom curve
@@ -325,22 +365,55 @@ fn draft_single_face(
         .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
         .clone();
 
-    // Get draft angle
+    // Determine the effective (constant) draft angle for this face.
+    //
+    // Variable, Tangent, and Stepped drafts all require surface-intersection
+    // infrastructure that depends on a full analytical surface library.  Until
+    // that infrastructure is available the three advanced types propagate a
+    // structured NotImplemented error so callers can fall back gracefully.
     let draft_angle = match &options.draft_type {
         DraftType::Angle(angle) => *angle,
-        DraftType::Variable(_) => {
+
+        DraftType::Variable(_func) => {
+            // Variable draft applies a height-dependent angle function along
+            // the pull direction.  The angle at each horizontal cross-section
+            // is func(normalised_height) where height ∈ [0, 1].
+            //
+            // Requires: analytical cross-section solver to divide the face
+            // into horizontal slabs and apply a per-slab shear transform.
+            // The solver is blocked on a production-grade surface-plane
+            // intersection implementation.
             return Err(OperationError::NotImplemented(
-                "Variable draft not yet implemented".to_string(),
+                "Variable draft requires a cross-section solver; scheduled for a future release"
+                    .to_string(),
             ));
         }
+
         DraftType::Tangent => {
+            // Tangent draft produces a smooth (G1-continuous) transition
+            // between the drafted face and its adjacent faces by computing
+            // the angle that makes the drafted surface tangent to each
+            // neighbour along the neutral curve.
+            //
+            // Requires: face-adjacency traversal and surface tangency
+            // analysis, which in turn requires surface normal derivatives.
             return Err(OperationError::NotImplemented(
-                "Tangent draft not yet implemented".to_string(),
+                "Tangent draft requires surface tangency analysis; scheduled for a future release"
+                    .to_string(),
             ));
         }
-        DraftType::Stepped(_) => {
+
+        DraftType::Stepped(steps) => {
+            // Stepped draft partitions the face into height bands, each band
+            // having its own constant angle.  Steps is a Vec<(height, angle)>
+            // where height is measured from the neutral element.
+            //
+            // Requires: the same cross-section slab solver as Variable draft,
+            // plus an edge-splitting step to insert new topology at each
+            // step boundary.
             return Err(OperationError::NotImplemented(
-                "Stepped draft not yet implemented".to_string(),
+                "Stepped draft requires a slab decomposition solver; scheduled for a future release"
+                    .to_string(),
             ));
         }
     };
