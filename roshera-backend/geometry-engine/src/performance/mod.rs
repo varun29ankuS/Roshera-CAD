@@ -11,10 +11,11 @@
 //! - mul_add provides better CPU pipelining than separate multiply+add
 
 use crate::math::{Matrix4, Point3, Vector3};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 static WARMUP_ONCE: Once = Once::new();
-static mut WARMUP_COMPLETE: bool = false;
+static WARMUP_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 /// Number of warmup iterations for critical paths
 pub const WARMUP_ITERATIONS: usize = 10_000;
@@ -38,16 +39,14 @@ impl PerformanceHints {
             // Warmup Matrix4 operations
             Self::warmup_matrix4_ops();
 
-            unsafe {
-                WARMUP_COMPLETE = true;
-            }
+            WARMUP_COMPLETE.store(true, Ordering::Release);
         });
     }
 
     /// Check if warmup has been completed
     #[inline(always)]
     pub fn is_warmed_up() -> bool {
-        unsafe { WARMUP_COMPLETE }
+        WARMUP_COMPLETE.load(Ordering::Acquire)
     }
 
     fn warmup_vector3_ops() {
