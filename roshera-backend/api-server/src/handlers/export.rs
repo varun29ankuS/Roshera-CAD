@@ -212,13 +212,11 @@ pub async fn download_file(
         "application/octet-stream"
     };
 
+    let disposition = format!("attachment; filename=\"{}\"", filename);
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, content_type),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                &format!("attachment; filename=\"{}\"", filename),
-            ),
+            (axum::http::header::CONTENT_TYPE, content_type.to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
         ],
         data,
     ))
