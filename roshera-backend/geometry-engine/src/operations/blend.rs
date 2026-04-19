@@ -108,6 +108,13 @@ pub fn blend_faces(
         None => compute_blend_curves(model, &face1, &face2)?,
     };
 
+    // Validate blend curves have endpoints (required by downstream helpers)
+    if curve1.is_empty() || curve2.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "Blend curves must contain at least one point".to_string(),
+        ));
+    }
+
     // Create blend surface based on type
     let blend_faces = match options.blend_type {
         BlendType::G1 => create_g1_blend(model, &face1, &face2, &curve1, &curve2, &options)?,
@@ -232,8 +239,14 @@ fn create_hermite_blend_surface(
         .ok_or_else(|| OperationError::InvalidGeometry("Surface 2 not found".into()))?;
 
     // Use RuledSurface through the two boundary curves for the blend
-    let c1_line = crate::primitives::curve::Line::new(curve1[0], *curve1.last().unwrap());
-    let c2_line = crate::primitives::curve::Line::new(curve2[0], *curve2.last().unwrap());
+    let c1_line = crate::primitives::curve::Line::new(
+        curve1[0],
+        *curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+    );
+    let c2_line = crate::primitives::curve::Line::new(
+        curve2[0],
+        *curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+    );
 
     let ruled = RuledSurface::new(Box::new(c1_line), Box::new(c2_line));
     Ok(Box::new(ruled))
@@ -266,8 +279,14 @@ fn create_conic_blend_surface(
     // Use RuledSurface between curve1 and curve2 with conic weighting
     // The rho parameter influences the intermediate control, but for a two-curve
     // ruled surface we apply the conic blend as a weighted midpoint offset
-    let c1 = crate::primitives::curve::Line::new(curve1[0], *curve1.last().unwrap());
-    let c2 = crate::primitives::curve::Line::new(curve2[0], *curve2.last().unwrap());
+    let c1 = crate::primitives::curve::Line::new(
+        curve1[0],
+        *curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+    );
+    let c2 = crate::primitives::curve::Line::new(
+        curve2[0],
+        *curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+    );
 
     let ruled = RuledSurface::new(Box::new(c1), Box::new(c2));
     Ok(Box::new(ruled))
@@ -320,8 +339,14 @@ fn create_ruled_blend_surface(
 ) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::RuledSurface;
 
-    let c1 = crate::primitives::curve::Line::new(curve1[0], *curve1.last().unwrap());
-    let c2 = crate::primitives::curve::Line::new(curve2[0], *curve2.last().unwrap());
+    let c1 = crate::primitives::curve::Line::new(
+        curve1[0],
+        *curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+    );
+    let c2 = crate::primitives::curve::Line::new(
+        curve2[0],
+        *curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+    );
 
     let ruled = RuledSurface::new(Box::new(c1), Box::new(c2));
     Ok(Box::new(ruled))
@@ -336,7 +361,11 @@ fn create_blend_face(
 ) -> OperationResult<FaceId> {
     // Create boundary curves
     let edge1 = create_curve_edge(model, curve1)?;
-    let edge2 = create_lateral_edge(model, curve1.last().unwrap(), curve2.last().unwrap())?;
+    let edge2 = create_lateral_edge(
+        model,
+        curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+        curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+    )?;
     let edge3 = create_curve_edge(model, curve2)?;
     let edge4 = create_lateral_edge(model, &curve2[0], &curve1[0])?;
 
@@ -370,16 +399,15 @@ fn create_curve_edge(model: &mut BRepModel, points: &[Point3]) -> OperationResul
     // Would create B-spline curve through points
     // For now, create line between endpoints
     use crate::primitives::curve::Line;
-    let line = Line::new(points[0], *points.last().unwrap());
+    let last_point = *points
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge curve points must be non-empty".to_string()))?;
+    let line = Line::new(points[0], last_point);
     let curve_id = model.curves.add(Box::new(line));
 
     // Create vertices
     let v_start = model.vertices.add(points[0].x, points[0].y, points[0].z);
-    let v_end = model.vertices.add(
-        points.last().unwrap().x,
-        points.last().unwrap().y,
-        points.last().unwrap().z,
-    );
+    let v_end = model.vertices.add(last_point.x, last_point.y, last_point.z);
 
     // Create edge
     let edge = Edge::new_auto_range(

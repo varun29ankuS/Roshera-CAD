@@ -175,9 +175,10 @@ impl FullIntegrationExecutor {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         // Auto-tessellate if enabled
-        if self.config.auto_tessellate && result.object_id.is_some() {
-            let object_id = result.object_id.unwrap();
-            self.tessellate_object(session_id, object_id).await?;
+        if self.config.auto_tessellate {
+            if let Some(object_id) = result.object_id {
+                self.tessellate_object(session_id, object_id).await?;
+            }
         }
 
         Ok(result)

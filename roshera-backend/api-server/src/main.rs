@@ -331,302 +331,6 @@ async fn list_roles_wrapper(
     list_roles(State(state), auth_info).await
 }
 
-// Removed duplicate main function - using the complete one below
-/*
-async fn main_old() -> Result<(), Box<dyn StdError>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
-    // Initialize enhanced AI components
-    let mut provider_manager = ProviderManager::new();
-
-    // Setup AI providers with fallbacks
-    use ai_integration::providers::{ClaudeProvider, OllamaProvider, MockASRProvider, MockTTSProvider};
-
-    let ollama_available = check_ollama_availability().await;
-
-    if ollama_available {
-        tracing::info!("Ollama detected, using for AI commands");
-        provider_manager.register_llm("ollama".to_string(), Box::new(OllamaProvider::new("mistral:7b-instruct".to_string())));
-        provider_manager.set_active("mock".to_string(), "ollama".to_string(), Some("mock".to_string()));
-    } else {
-        tracing::info!("Ollama not available, using mock provider for testing");
-        // Register a mock provider for testing when Ollama is not available
-        use ai_integration::providers::mock::MockLLMProvider;
-        provider_manager.register_llm("mock".to_string(), Box::new(MockLLMProvider::new()));
-        provider_manager.set_active("mock".to_string(), "mock".to_string(), Some("mock".to_string()));
-    }
-
-    provider_manager.register_asr("mock".to_string(), Box::new(MockASRProvider::new()));
-    provider_manager.register_tts("mock".to_string(), Box::new(MockTTSProvider::new()));
-
-    let provider_manager = Arc::new(Mutex::new(provider_manager));
-
-    // Initialize database connection
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost/roshera".to_string());
-
-    // Create database config for 20 concurrent users
-    let db_config = session_manager::DatabaseConfig {
-        db_type: session_manager::DatabaseType::PostgreSQL,
-        url: database_url.clone(),
-        max_connections: 5,  // 20 users don't need 10 connections
-        connect_timeout: 5,  // seconds
-        run_migrations: true,
-    };
-
-    // Try to connect to PostgreSQL, create a proper error handler
-    let database: Arc<dyn DatabasePersistence + Send + Sync> = match PostgresDatabase::new(&db_config).await {
-        Ok(db) => {
-            tracing::info!("Connected to PostgreSQL database");
-            Arc::new(db)
-        }
-        Err(e) => {
-            tracing::error!("Failed to connect to PostgreSQL: {}. Please ensure PostgreSQL is running and the database exists.", e);
-            tracing::error!("You can create the database with: createdb roshera");
-            tracing::error!("Or set DATABASE_URL environment variable to your PostgreSQL connection string");
-            return Err(Box::new(e) as Box<dyn StdError>);
-        }
-    };
-
-    // Initialize enhanced session management components
-    let auth_config = session_manager::AuthConfig {
-        issuer: "roshera-cad".to_string(),
-        audience: vec!["roshera-api".to_string()],
-        token_expiry_seconds: 3600,
-        refresh_expiry_seconds: 86400,
-        max_failed_attempts: 5,
-        lockout_duration_seconds: 300,
-        require_2fa_for_sensitive: false,
-        api_key_prefix: "roshera_".to_string(),
-        password_requirements: session_manager::PasswordRequirements {
-            min_length: 8,
-            require_uppercase: true,
-            require_lowercase: true,
-            require_numbers: true,
-            require_special: true,
-        },
-    };
-    let auth_manager = Arc::new(AuthManager::new(
-        auth_config,
-        &std::env::var("JWT_SECRET").unwrap_or_else(|_| "roshera-secret-key-change-in-production".to_string()),
-    ));
-
-    let permission_manager = Arc::new(PermissionManager::new());
-    // Realistic cache settings for 20 concurrent users
-    let cache_config = session_manager::CacheConfig {
-        session_capacity: 50,      // 20 users + some headroom
-        object_capacity: 500,       // ~25 objects per user
-        permission_capacity: 50,    // Permissions for 20 users
-        command_capacity: 200,      // Recent commands
-        max_size_mb: 100,          // 100MB is plenty
-        session_ttl: std::time::Duration::from_secs(1800),  // 30 minutes
-        object_ttl: std::time::Duration::from_secs(3600),   // 1 hour
-        permission_ttl: std::time::Duration::from_secs(900), // 15 minutes
-        command_ttl: std::time::Duration::from_secs(600),   // 10 minutes
-        enable_warming: false,
-        cleanup_interval: std::time::Duration::from_secs(600), // Every 10 minutes
-    };
-    let cache_manager = Arc::new(CacheManager::new(cache_config));
-    let broadcast_manager = BroadcastManager::new();
-
-    // Initialize session manager
-    let session_manager = Arc::new(SessionManager::new(
-        broadcast_manager,
-    ));
-
-    // Initialize geometry and AI components
-    let command_executor = Arc::new(Mutex::new(CommandExecutor::new()));
-    let ai_processor = Arc::new(Mutex::new(AIProcessor::new(
-        provider_manager.clone(),
-        command_executor.clone(),
-    )));
-
-    // Initialize session-aware AI processor
-    let session_aware_config = SessionAwareConfig::default();
-    let session_aware_ai = Arc::new(SessionAwareAIProcessor::new(
-        provider_manager.clone(),
-        command_executor.clone(),
-        session_manager.clone(),
-        session_aware_config,
-    ));
-
-    // Initialize timeline
-    let timeline = Arc::new(RwLock::new(
-        Timeline::new(timeline_engine::TimelineConfig::default())
-    ));
-
-    // Initialize managers
-    let branch_manager = Arc::new(BranchManager::new());
-    let hierarchy_manager = Arc::new(HierarchyManager::new());
-
-    // Initialize engines
-    let geometry_model = Arc::new(RwLock::new(geometry_engine::primitives::topology_builder::BRepModel::new()));
-    let export_engine = Arc::new(export_engine::ExportEngine::new());
-    let request_metrics = Arc::new(dashmap::DashMap::new());
-
-    let full_integration_executor = Arc::new(FullIntegrationExecutor::new(
-        geometry_model.clone(),
-        export_engine.clone(),
-        session_manager.clone(),
-        timeline.clone(),
-        ai_integration::full_integration_executor::FullIntegrationConfig::default(),
-    ));
-
-    // Create enhanced state
-    let state = AppState {
-        model: Arc::new(tokio::sync::RwLock::new(geometry_engine::primitives::topology_builder::BRepModel::new())),
-        solids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        uuid_to_local: Arc::new(DashMap::new()),
-        local_to_uuid: Arc::new(DashMap::new()),
-        ai_processor,
-        session_aware_ai,
-        full_integration_executor,
-        command_executor,
-        provider_manager,
-        session_manager,
-        auth_manager,
-        permission_manager,
-        cache_manager,
-        timeline,
-        branch_manager,
-        hierarchy_manager,
-        database,
-        geometry_model,
-        export_engine,
-        request_metrics,
-        // smart_router: not yet implemented
-        command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
-        performance_metrics: Arc::new(Mutex::new(metrics::PerformanceTracker::default())),
-    };
-
-    // Configure CORS with authentication headers
-    let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:8080".parse().unwrap(),
-            "http://127.0.0.1:8080".parse().unwrap(),
-            "http://[::1]:8080".parse().unwrap(),
-        ])
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PUT,
-            axum::http::Method::DELETE,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::header::ACCEPT,
-            axum::http::header::ORIGIN,
-        ])
-        .expose_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderName::from_static("x-session-id"),
-            axum::http::HeaderName::from_static("x-user-id"),
-        ])
-        .allow_credentials(true);
-
-    // Build public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/", get(root))
-        .route("/health", get(enhanced_health))
-        .route("/api/auth/login", post(handlers::auth::login))
-        .route("/api/auth/refresh", post(handlers::auth::refresh_token))
-        .route("/api/auth/register", post(handlers::auth::register))
-        .route("/api/ai/status", get(get_ai_status))
-        .route("/ws", get(protocol::message_handlers::websocket_handler));
-
-    // Build protected routes (require authentication)
-    // These handlers need to be wrapped to work with axum's Handler trait
-    let protected_routes = Router::new()
-        // Geometry endpoints
-        .route("/api/geometry", post(enhanced_create_geometry_wrapper))
-        .route("/api/geometry/{id}", get(get_geometry_wrapper))
-        .route("/api/geometry/{id}", put(update_geometry_wrapper))
-        .route("/api/geometry/{id}", delete(delete_geometry_wrapper))
-
-        // Enhanced AI endpoints with session awareness
-        .route("/api/ai/command", post(process_enhanced_ai_command_wrapper))
-        .route("/api/ai/command/stream", post(process_ai_command_stream))
-        .route("/api/ai/voice", post(process_voice_command_wrapper))
-
-        // Session management endpoints
-        .route("/api/sessions", get(list_sessions_wrapper))
-        .route("/api/sessions", post(create_session_wrapper))
-        .route("/api/sessions/{id}", get(get_session_wrapper))
-        .route("/api/sessions/{id}", delete(delete_session_wrapper))
-        .route("/api/sessions/{id}/join", post(join_session_wrapper))
-        .route("/api/sessions/{id}/leave", post(leave_session_wrapper))
-
-        // Delta update endpoints
-        .route("/api/sessions/{id}/deltas", get(delta_handlers::get_session_deltas_wrapper))
-        .route("/api/sessions/{id}/deltas/subscribe", get(delta_handlers::subscribe_to_deltas_wrapper))
-        .route("/api/sessions/{id}/deltas", post(delta_handlers::apply_session_delta_wrapper))
-        .route("/api/sessions/{id}/deltas/batch", post(delta_handlers::apply_batch_deltas_wrapper))
-        .route("/api/sessions/{id}/snapshot", get(delta_handlers::get_session_snapshot))
-        .route("/api/sessions/{id}/deltas/stats", get(delta_handlers::get_delta_stats))
-        .route("/api/sessions/{id}/deltas/compact", post(delta_handlers::compact_session_deltas_wrapper))
-
-        // Cache management endpoints
-        .route("/api/cache/stats", get(handlers::cache::get_cache_stats))
-        .route("/api/cache/clear", post(handlers::cache::clear_cache_wrapper))
-        .route("/api/cache/objects/{id}", get(handlers::cache::get_cached_object))
-
-        // Permission management endpoints
-        .route("/api/permissions", get(get_user_permissions_wrapper))
-        .route("/api/permissions/{user_id}", put(update_user_permissions))
-        .route("/api/roles", get(list_roles_wrapper))
-
-        // Timeline endpoints (enhanced)
-        .route("/api/timeline/init", post(handlers::timeline::initialize_timeline))
-        .route("/api/timeline/record", post(handlers::timeline::record_operation))
-        .route("/api/timeline/branch/create", post(handlers::timeline::create_branch))
-        .route("/api/timeline/branch/switch/{branch_id}", post(handlers::timeline::switch_branch))
-        .route("/api/timeline/history/{branch_id}", get(handlers::timeline::get_history))
-        .route("/api/timeline/merge", post(handlers::timeline::merge_branches))
-        .route("/api/timeline/checkpoint", post(handlers::timeline::create_checkpoint))
-
-        // Hierarchy endpoints
-        .route("/api/hierarchy/{session_id}", get(handlers::hierarchy::get_hierarchy))
-        .route("/api/hierarchy/{session_id}/command", post(handlers::hierarchy::execute_hierarchy_command))
-
-        // Apply auth middleware properly
-        .layer(middleware::from_fn_with_state(
-            state.auth_manager.clone(),
-            auth_middleware::auth_middleware,
-        ));
-
-    // Combine all routes
-    let app = public_routes
-        .merge(protected_routes)
-        .layer(middleware::from_fn_with_state(
-            state.auth_manager.clone(),
-            auth_middleware::rate_limit_middleware,
-        ))
-        .layer(cors)
-        .with_state(state);
-
-    // Start server
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn StdError>)?;
-
-    println!("Enhanced API Server listening on {}", listener.local_addr().map_err(|e| Box::new(e) as Box<dyn StdError>)?);
-    println!("Features:");
-    println!("  ✓ JWT Authentication & API Keys");
-    println!("  ✓ Role-based Access Control");
-    println!("  ✓ Multi-layer Caching");
-    println!("  ✓ Delta Updates & Real-time Sync");
-    println!("  ✓ Session-aware AI Processing");
-    println!("  ✓ Full Integration Executor");
-    println!("  ✓ Database Persistence");
-
-    axum::serve(listener, app).await.map_err(|e| Box::new(e) as Box<dyn StdError>)?;
-
-    Ok(())
-}
-*/
 
 async fn create_geometry(
     State(state): State<AppState>,
@@ -1316,14 +1020,6 @@ fn extract_arc_parameters(
     ))
 }
 
-async fn check_ollama_availability() -> bool {
-    let client = reqwest::Client::new();
-    match client.get("http://localhost:11434/api/tags").send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
-    }
-}
-
 // Placeholder implementations for missing handlers
 async fn get_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
@@ -1983,16 +1679,28 @@ async fn stream_logs() -> Sse<impl Stream<Item = Result<SseEvent, std::convert::
     let mut rx = LOG_BROADCASTER.subscribe();
 
     let stream = async_stream::stream! {
-        // Send initial connection message
-        yield Ok(SseEvent::default().json_data(LogMessage {
+        // Send initial connection message. Falls back to a plain-text event
+        // if JSON serialization of the static connect message ever fails.
+        let connect_msg = LogMessage {
             timestamp: chrono::Utc::now().to_rfc3339(),
             level: "INFO".to_string(),
             message: "Connected to log stream".to_string(),
-        }).unwrap());
+        };
+        let connect_event = SseEvent::default()
+            .json_data(&connect_msg)
+            .unwrap_or_else(|_| SseEvent::default().data("Connected to log stream"));
+        yield Ok(connect_event);
 
-        // Stream logs as they come
+        // Stream logs as they come. Skip any log entry whose JSON encoding
+        // fails rather than terminating the stream.
         while let Ok(log) = rx.recv().await {
-            yield Ok(SseEvent::default().json_data(&log).unwrap());
+            match SseEvent::default().json_data(&log) {
+                Ok(event) => yield Ok(event),
+                Err(err) => {
+                    tracing::warn!("Dropped log SSE event due to serialization error: {err}");
+                    continue;
+                }
+            }
         }
     };
 
@@ -2293,22 +2001,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_manager = Arc::new(CacheManager::new(cache_config));
     let hierarchy_manager = Arc::new(HierarchyManager::new());
 
-    // Initialize AI components
+    // Initialize AI components.
+    // Policy: API-only providers (Claude/OpenAI). Local-model runtimes are
+    // not permitted. If no API key is configured, fall back to the mock
+    // provider so the server can still boot for non-AI workflows and tests.
     let mut provider_manager = ProviderManager::new();
 
-    // Check for Ollama availability
-    let ollama_available = check_ollama_availability().await;
-
-    if ollama_available {
-        tracing::info!("Ollama detected, using for AI commands");
-        use ai_integration::providers::OllamaProvider;
+    if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
+        tracing::info!("Anthropic API key detected, registering Claude provider");
+        let claude_config = ai_integration::providers::claude::ClaudeConfig {
+            api_key: Some(anthropic_key),
+            ..Default::default()
+        };
         provider_manager.register_llm(
-            "ollama".to_string(),
-            Box::new(OllamaProvider::new("mistral:7b-instruct".to_string())),
+            "claude".to_string(),
+            Box::new(ai_integration::providers::ClaudeProvider::with_config(
+                claude_config,
+            )),
         );
-        provider_manager.set_active("mock".to_string(), "ollama".to_string(), None);
+        provider_manager.set_active("mock".to_string(), "claude".to_string(), None);
     } else {
-        tracing::info!("Ollama not available, using mock provider for testing");
+        tracing::info!("No LLM API key configured, falling back to mock provider");
         provider_manager.register_llm(
             "mock".to_string(),
             Box::new(ai_integration::providers::MockLLMProvider::new()),

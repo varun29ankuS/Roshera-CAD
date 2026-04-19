@@ -1,20 +1,14 @@
-//! World-class analytical and NURBS surface representations
+//! Analytical and NURBS surface representations.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
-//! - Complete analytical surface library (25+ types)
+//! Features:
+//! - Analytical surface library (25+ types)
 //! - NURBS surfaces with trimming support
-//! - T-spline surfaces for smooth modeling
-//! - Surface-surface intersection algorithms
+//! - T-spline surfaces
+//! - Surface-surface intersection
 //! - Offset surface generation
 //! - Curvature analysis (Gaussian, mean, principal)
 //! - Surface fitting and approximation
 //! - G2 continuity analysis
-//!
-//! Performance characteristics:
-//! - Surface evaluation: < 100ns
-//! - Normal computation: < 50ns
-//! - Curvature analysis: < 200ns
-//! - Intersection: < 10μs for simple cases
 
 use crate::math::bspline_surface::BSplineSurface;
 use crate::math::nurbs::NurbsSurface;
@@ -3980,7 +3974,7 @@ impl Torus {
     }
 }
 
-/// World-class surface storage with type dispatch optimization
+/// Surface storage with type-dispatch optimization
 #[derive(Debug)]
 pub struct SurfaceStore {
     /// Surface data by type for fast dispatch
@@ -4582,7 +4576,10 @@ impl Surface for GeneralNurbsSurface {
             self.nurbs.degree_v,
         )
         .unwrap_or_else(|_| {
-            // If creation fails, return a clone
+            // If creation fails, return a clone. The inputs come from an
+            // already-validated `self.nurbs`, so this reconstruction cannot
+            // fail; however, we use `expect` to surface any future regression
+            // in `NurbsSurface::new` validation rather than silently panic.
             crate::math::nurbs::NurbsSurface::new(
                 self.nurbs.control_points.clone(),
                 self.nurbs.weights.clone(),
@@ -4591,7 +4588,7 @@ impl Surface for GeneralNurbsSurface {
                 self.nurbs.degree_u,
                 self.nurbs.degree_v,
             )
-            .unwrap()
+            .expect("reconstructing NurbsSurface from already-validated self.nurbs cannot fail")
         });
 
         Box::new(GeneralNurbsSurface {

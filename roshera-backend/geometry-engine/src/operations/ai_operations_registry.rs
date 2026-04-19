@@ -1,17 +1,10 @@
-//! AI-First Operations Registry - World's Fastest CAD Operations Interface
+//! AI-First operations registry.
 //!
-//! This module provides an AI-accessible interface to all CAD operations with:
-//! - Natural language understanding for complex operations
-//! - Performance-optimized execution paths
-//! - Intelligent parameter inference
-//! - Operation chaining and optimization
-//! - Real-time learning from usage patterns
-//!
-//! # Performance Guarantees
-//! - Operation parsing: < 1ms
-//! - Parameter inference: < 5ms
-//! - Operation execution: Matches or beats Parasolid/ACIS
-//! - Batch operations: Linear scaling with SIMD/GPU
+//! Provides an AI-callable interface to all CAD operations:
+//! - Natural-language parsing of operation intents
+//! - Parameter inference from partial input
+//! - Operation chaining and batch execution
+//! - Usage-based catalog hints
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::operations::{
@@ -267,7 +260,9 @@ impl OperationsRegistry {
         model: &mut BRepModel,
     ) -> OperationResult<AIOperationResult> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry
+            .lock()
+            .expect("AIOperationsRegistry global Mutex poisoned");
 
         let command = registry.parse_operation_command(text)?;
         registry.execute_operation(command, model)
@@ -1559,7 +1554,9 @@ impl OperationsRegistry {
     /// Get operation catalog for AI discovery
     pub fn get_operations_catalog() -> serde_json::Value {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry
+            .lock()
+            .expect("AIOperationsRegistry global Mutex poisoned");
 
         // Build operations JSON manually without requiring Serialize trait
         let mut operations_json = serde_json::Map::new();
@@ -1636,7 +1633,9 @@ impl OperationsRegistry {
         model: &mut BRepModel,
     ) -> Vec<OperationResult<AIOperationResult>> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry
+            .lock()
+            .expect("AIOperationsRegistry global Mutex poisoned");
 
         commands
             .into_iter()
@@ -1650,7 +1649,9 @@ impl OperationsRegistry {
     /// Get performance hints based on usage
     pub fn get_performance_hints() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap();
+        let registry = registry
+            .lock()
+            .expect("AIOperationsRegistry global Mutex poisoned");
 
         let mut hints = vec![];
 
@@ -1742,7 +1743,13 @@ mod uuid {
         pub fn new_v4() -> Self {
             // Simple UUID v4 generation
             use std::time::{SystemTime, UNIX_EPOCH};
-            let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            // `duration_since(UNIX_EPOCH)` can only fail if the system clock
+            // is set before 1970. For a UUID source we prefer to degrade
+            // gracefully rather than panic, so fall back to a zero duration
+            // in that pathological case.
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
             let random = time.as_nanos() ^ ((time.as_secs() as u128) << 64);
             Self(random)
         }

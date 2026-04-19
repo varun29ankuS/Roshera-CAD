@@ -1,21 +1,14 @@
-//! World-class NURBS (Non-Uniform Rational B-Spline) implementation
+//! NURBS (Non-Uniform Rational B-Spline) implementation.
 //!
-//! Industry-leading features matching Parasolid/ACIS:
-//! - Full NURBS curve and surface evaluation
+//! Features:
+//! - NURBS curve and surface evaluation
 //! - Knot insertion and removal (Oslo algorithm)
 //! - Degree elevation and reduction
 //! - NURBS derivatives up to arbitrary order
 //! - Exact conic sections (circles, ellipses, parabolas, hyperbolas)
 //! - NURBS interpolation and approximation
 //! - Reparameterization and knot refinement
-//! - NURBS-NURBS intersection algorithms
-//! - GPU-ready evaluation kernels
-//!
-//! Performance characteristics:
-//! - Single point evaluation: < 100ns
-//! - Derivative evaluation: < 200ns
-//! - Knot insertion: < 1μs
-//! - Surface tessellation: < 10ms for 10k points
+//! - NURBS-NURBS intersection
 //!
 //! References:
 //! - Piegl & Tiller, "The NURBS Book", 2nd Edition
@@ -77,10 +70,12 @@ impl Default for BasisCache {
     fn default() -> Self {
         Self {
             n_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1000).unwrap(),
+                std::num::NonZeroUsize::new(1000)
+                    .expect("literal 1000 is non-zero"),
             )),
             dn_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(500).unwrap(),
+                std::num::NonZeroUsize::new(500)
+                    .expect("literal 500 is non-zero"),
             )),
         }
     }
@@ -573,10 +568,15 @@ impl NurbsCurve {
             let dw2 = d2_w.as_array_ref().iter().sum::<f64>();
             let dw1 = d1_w.as_array_ref().iter().sum::<f64>();
 
-            // Second derivative of rational curve (complex quotient rule)
-            let d1_x = derivative1.unwrap().x;
-            let d1_y = derivative1.unwrap().y;
-            let d1_z = derivative1.unwrap().z;
+            // Second derivative of rational curve (complex quotient rule).
+            // `derivative1` is guaranteed `Some` here because the enclosing
+            // `if num_derivatives >= 2` implies num_derivatives >= 1, which
+            // set `derivative1 = Some(..)` above.
+            let d1 = derivative1
+                .expect("num_derivatives >= 2 implies derivative1 was computed above");
+            let d1_x = d1.x;
+            let d1_y = d1.y;
+            let d1_z = d1.z;
 
             Some(Vector3::new(
                 (d2_sum_x - sum_x * dw2 * inv_w - 2.0 * d1_x * dw1 * sum_w) * inv_w * inv_w,
@@ -1133,7 +1133,8 @@ impl NurbsCurve {
 
         self.control_points = new_control_points;
         self.weights = new_weights;
-        self.knots = KnotVector::new(new_knots).unwrap();
+        self.knots = KnotVector::new(new_knots)
+            .map_err(|_| "degree elevation produced an invalid knot vector")?;
         self.degree = new_degree;
         self.basis_cache = Some(Arc::new(BasisCache::default()));
 

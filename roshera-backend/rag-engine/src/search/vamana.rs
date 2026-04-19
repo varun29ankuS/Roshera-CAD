@@ -152,7 +152,9 @@ impl VamanaIndex {
             for entry in self.vectors.iter() {
                 let vec_id = *entry.key();
                 let vec_data = entry.value().clone();
-                if let Some(ref sq) = *self.sq.read().unwrap() {
+                if let Some(ref sq) = *self.sq
+                .read()
+                .expect("vamana scalar-quantizer RwLock poisoned") {
                     let code = sq.encode(&vec_data);
                     self.sq_codes.insert(vec_id, code);
                 }
@@ -161,7 +163,9 @@ impl VamanaIndex {
         
         // Store SQ code if enabled and trained
         if self.use_sq && self.sq_trained.load(Ordering::Relaxed) {
-            if let Some(ref sq) = *self.sq.read().unwrap() {
+            if let Some(ref sq) = *self.sq
+                .read()
+                .expect("vamana scalar-quantizer RwLock poisoned") {
                 let code = sq.encode(&final_vector);
                 self.sq_codes.insert(id, code);
             }
@@ -172,12 +176,20 @@ impl VamanaIndex {
         
         // If this is the first node, make it the medoid
         if id == 0 {
-            *self.medoid.write().unwrap() = Some(id);
+            *self.medoid
+            .write()
+            .expect("vamana medoid RwLock poisoned") = Some(id);
             return id;
         }
         
         // Find neighbors using greedy search from medoid
-        let medoid_id = self.medoid.read().unwrap().unwrap();
+        // Medoid was initialized at id==0 (early return above) before any
+        // subsequent insert can reach this branch, so `Some` is an invariant.
+        let medoid_id = self
+            .medoid
+            .read()
+            .expect("vamana medoid RwLock poisoned")
+            .expect("vamana medoid must be Some once id > 0 (first insert sets it)");
         let candidates = self.greedy_search(&final_vector, medoid_id, self.L);
         
         // Robust pruning to select exactly R neighbors
@@ -186,22 +198,36 @@ impl VamanaIndex {
         // Add bidirectional edges
         for &neighbor_id in &neighbors {
             // Add neighbor to new node
-            self.graph.get_mut(&id).unwrap().push(neighbor_id);
+            self.graph
+                .get_mut(&id)
+                .expect("vamana: new node's graph entry was just inserted above").push(neighbor_id);
             
             // Add new node to neighbor
-            self.graph.get_mut(&neighbor_id).unwrap().push(id);
+            self.graph
+                .get_mut(&neighbor_id)
+                .expect("vamana: neighbor_id originates from the graph itself").push(id);
             
             // Prune neighbor if it exceeds R connections
-            let neighbor_connections = self.graph.get(&neighbor_id).unwrap().clone();
+            let neighbor_connections = self
+                .graph
+                .get(&neighbor_id)
+                .expect("vamana: neighbor_id originates from the graph itself")
+                .clone();
             if neighbor_connections.len() > self.R {
-                let neighbor_vector = self.vectors.get(&neighbor_id).unwrap().clone();
+                let neighbor_vector = self
+                .vectors
+                .get(&neighbor_id)
+                .expect("vamana: neighbor_id originates from graph; vectors entry must exist")
+                .clone();
                 
                 // Convert neighbor connections to SearchResults with distances
                 let neighbor_candidates: Vec<SearchResult> = neighbor_connections.iter().map(|&nid| {
                     let dist = if nid == neighbor_id {
                         0.0
                     } else {
-                        let other_vector = self.vectors.get(&nid).unwrap();
+                        let other_vector = self.vectors.get(&nid).expect(
+                            "vamana: nid originates from graph; vectors entry must exist",
+                        );
                         self.calculate_distance(&neighbor_vector, &other_vector)
                     };
                     SearchResult { id: nid, distance: dist }
@@ -210,7 +236,9 @@ impl VamanaIndex {
                 let pruned = self.robust_prune(&neighbor_vector, neighbor_candidates, self.R, self.alpha);
                 
                 // Update neighbor's connections
-                *self.graph.get_mut(&neighbor_id).unwrap() = pruned;
+                *self.graph
+                .get_mut(&neighbor_id)
+                .expect("vamana: neighbor_id originates from the graph itself") = pruned;
             }
         }
         
@@ -234,7 +262,11 @@ impl VamanaIndex {
         };
         
         // Start search from medoid
-        let medoid_id = match self.medoid.read().unwrap().as_ref() {
+        let medoid_guard = self
+            .medoid
+            .read()
+            .expect("vamana medoid RwLock poisoned");
+        let medoid_id = match medoid_guard.as_ref() {
             Some(&id) => id,
             None => return Vec::new(),
         };
@@ -249,10 +281,15 @@ impl VamanaIndex {
         // Rerank with exact distances if using SQ
         if self.use_sq {
             for result in &mut candidates {
-                let exact_vector = self.vectors.get(&result.id).unwrap();
+                let exact_vector = self
+                    .vectors
+                    .get(&result.id)
+                    .expect("vamana rerank: result.id originates from graph search; vectors entry must exist");
                 result.distance = self.calculate_distance(&query_vector, &exact_vector);
             }
-            candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+            candidates.sort_by(|a, b| a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal));
         }
         
         // Return top k
@@ -267,7 +304,11 @@ impl VamanaIndex {
         let mut w = BinaryHeap::new(); // Max heap for result set
         
         // Start with the starting point
-        let start_dist = self.calculate_distance(query, &self.vectors.get(&start).unwrap());
+        let start_vec = self
+            .vectors
+            .get(&start)
+            .expect("vamana greedy_search: start id must have a vectors entry");
+        let start_dist = self.calculate_distance(query, &start_vec);
         candidates.push(SearchResult { id: start, distance: -start_dist }); // Negative for min-heap behavior
         w.push(SearchResult { id: start, distance: start_dist });
         visited.insert(start);
@@ -289,7 +330,10 @@ impl VamanaIndex {
                     if !visited.contains(&neighbor_id) {
                         visited.insert(neighbor_id);
                         
-                        let neighbor_dist = self.calculate_distance(query, &self.vectors.get(&neighbor_id).unwrap());
+                        let neighbor_vec = self.vectors.get(&neighbor_id).expect(
+                            "vamana: neighbor_id originates from graph; vectors entry must exist",
+                        );
+                        let neighbor_dist = self.calculate_distance(query, &neighbor_vec);
                         
                         // Add to candidates for further exploration
                         candidates.push(SearchResult { id: neighbor_id, distance: -neighbor_dist });
@@ -371,7 +415,9 @@ impl VamanaIndex {
         let mut candidates = candidates;
         
         // Sort candidates by distance to query
-        candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        candidates.sort_by(|a, b| a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal));
         
         for candidate in &candidates {
             if result.len() >= R {
@@ -421,21 +467,35 @@ impl VamanaIndex {
             return 0.0;
         }
         
-        let vec1 = self.vectors.get(&id1).unwrap().clone();
-        let vec2 = self.vectors.get(&id2).unwrap().clone();
+        // Caller provides ids from the graph / vectors maps.
+        let vec1 = self
+            .vectors
+            .get(&id1)
+            .expect("vamana calculate_distance_between: id1 must exist in vectors")
+            .clone();
+        let vec2 = self
+            .vectors
+            .get(&id2)
+            .expect("vamana calculate_distance_between: id2 must exist in vectors")
+            .clone();
         self.calculate_distance(&vec1, &vec2)
     }
     
     /// Calculate distance using SQ codes (faster)
     fn calculate_distance_sq(&self, query: &[f32], node_id: u32) -> f32 {
         if let Some(code) = self.sq_codes.get(&node_id) {
-            if let Some(ref sq) = *self.sq.read().unwrap() {
+            if let Some(ref sq) = *self.sq
+                .read()
+                .expect("vamana scalar-quantizer RwLock poisoned") {
                 return sq.distance(query, &*code);
             }
         }
         
         // Fallback to exact distance
-        let node_vector = self.vectors.get(&node_id).unwrap();
+        let node_vector = self
+            .vectors
+            .get(&node_id)
+            .expect("vamana calculate_distance_sq: node_id must exist in vectors");
         self.calculate_distance(query, &node_vector)
     }
     
@@ -483,7 +543,10 @@ impl VamanaIndex {
         }
         
         // Train the quantizer
-        let mut sq_guard = self.sq.write().unwrap();
+        let mut sq_guard = self
+            .sq
+            .write()
+            .expect("vamana scalar-quantizer RwLock poisoned");
         if let Some(ref mut sq) = *sq_guard {
             sq.train(&training_vectors);
         }
@@ -500,7 +563,10 @@ impl VamanaIndex {
         
         // Sample random subset for efficiency (1000 nodes max)
         let sample_size = std::cmp::min(1000, node_ids.len());
-        let mut rng = self.rng.lock().unwrap();
+        let mut rng = self
+            .rng
+            .lock()
+            .expect("vamana RNG Mutex poisoned");
         let mut sampled_nodes = node_ids.clone();
         
         // Shuffle and take first sample_size nodes
@@ -513,13 +579,18 @@ impl VamanaIndex {
         let mut best_avg_dist = f32::MAX;
         
         for &candidate_id in &sampled_nodes {
-            let candidate_vector = self.vectors.get(&candidate_id).unwrap();
+            let candidate_vector = self
+                .vectors
+                .get(&candidate_id)
+                .expect("vamana update_medoid: candidate_id sampled from vectors itself");
             let total_dist: f32 = sampled_nodes.iter()
                 .map(|&other_id| {
                     if other_id == candidate_id {
                         0.0
                     } else {
-                        let other_vector = self.vectors.get(&other_id).unwrap();
+                        let other_vector = self.vectors.get(&other_id).expect(
+                            "vamana update_medoid: other_id sampled from vectors itself",
+                        );
                         self.calculate_distance(&candidate_vector, &other_vector)
                     }
                 })
@@ -532,7 +603,9 @@ impl VamanaIndex {
             }
         }
         
-        *self.medoid.write().unwrap() = Some(best_medoid);
+        *self.medoid
+            .write()
+            .expect("vamana medoid RwLock poisoned") = Some(best_medoid);
     }
     
     /// Get statistics about the index
@@ -546,7 +619,10 @@ impl VamanaIndex {
             total_edges,
             avg_degree,
             target_degree: self.R,
-            medoid: *self.medoid.read().unwrap(),
+            medoid: *self
+                .medoid
+                .read()
+                .expect("vamana medoid RwLock poisoned"),
             using_sq: self.use_sq,
         }
     }

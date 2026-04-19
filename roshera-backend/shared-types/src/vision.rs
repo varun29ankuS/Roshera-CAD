@@ -395,20 +395,20 @@ pub struct VisionConfig {
     pub model_name: String,
 }
 
-/// Supported vision provider types
+/// Supported vision provider types.
+///
+/// Policy: API-only. Local-model runtimes are not supported.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VisionProviderType {
-    /// Ollama local models
-    Ollama,
-    /// OpenAI GPT-4V
+    /// OpenAI GPT-4V / GPT-4o
     OpenAI,
     /// Anthropic Claude
     Anthropic,
     /// Google Gemini
     Google,
-    /// HuggingFace models
+    /// HuggingFace Inference API
     HuggingFace,
-    /// Custom API endpoint
+    /// Custom API endpoint (hosted)
     CustomAPI,
 }
 

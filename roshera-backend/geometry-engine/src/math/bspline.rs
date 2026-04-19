@@ -1,19 +1,16 @@
-//! B-Spline curves and surfaces implementation
+//! B-Spline curves and surfaces.
 //!
-//! Provides comprehensive B-spline functionality matching Parasolid capabilities:
+//! Features:
 //! - Non-uniform B-spline curves and surfaces
-//! - Efficient evaluation using Cox-de Boor algorithm
+//! - Evaluation via Cox-de Boor
 //! - Knot insertion/removal (Oslo algorithm)
 //! - Degree elevation/reduction
 //! - Curve/surface fitting
-//! - Derivatives up to arbitrary order
+//! - Arbitrary-order derivatives
 //!
-//! High-performance optimizations:
-//! - Zero heap allocations - stack arrays only
-//! - SIMD vectorization using AVX2
-//! - Monomorphized code paths for common degrees
-//! - Unrolled loops with prefetching
-//! - Branchless algorithms where possible
+//! Implementation notes:
+//! - Stack-allocated scratch buffers on hot paths
+//! - SIMD-ready layouts; monomorphized paths for common degrees
 //!
 //! References:
 //! - Piegl & Tiller: "The NURBS Book" (1997)
@@ -767,8 +764,14 @@ impl BSplineCurve {
     /// Quadratic B-spline (degree 2)
     #[inline(always)]
     fn evaluate_quadratic(&self, u: f64) -> Point3 {
-        // Similar optimized implementation
-        self.evaluate_generic(u).unwrap()
+        // `evaluate_quadratic` is only dispatched when `self.degree == 2`,
+        // which is well below `MAX_DEGREE`. All remaining failure modes in
+        // `evaluate_generic` derive from invariants the curve itself guarantees
+        // on construction (valid knot vector, matching control-point count).
+        // If those invariants are ever violated we cannot return a meaningful
+        // point, so we surface the bug loudly via `expect`.
+        self.evaluate_generic(u)
+            .expect("BSpline evaluate_quadratic: degree=2 invariants violated")
     }
 
     /// Generic evaluation for arbitrary degree

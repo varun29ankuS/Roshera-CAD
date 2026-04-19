@@ -283,7 +283,9 @@ impl<W: Write> StepWriter<W> {
                 format_id_list(&cp_ids),
                 format_real_list(knots),
                 format_int_list(multiplicities),
-                format_real_list(weights.unwrap())
+                format_real_list(
+                    weights.expect("weights.is_some() verified by enclosing `if` guard")
+                )
             )?;
         } else {
             // Write as non-rational B-spline

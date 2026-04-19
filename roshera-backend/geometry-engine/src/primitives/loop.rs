@@ -1,18 +1,12 @@
-//! World-class loop representation for B-Rep topology
+//! Loop representation for B-Rep topology.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
-//! - Winding number computation for robust point-in-loop tests
+//! Features:
+//! - Winding-number computation for robust point-in-loop tests
 //! - Loop simplification and cleanup
 //! - Self-intersection detection
 //! - Convexity analysis
 //! - Loop offsetting for tool paths
 //! - Hierarchical loop trees for complex faces
-//!
-//! Performance characteristics:
-//! - Loop creation: < 20ns
-//! - Point-in-loop test: < 100ns
-//! - Area calculation: < 200ns
-//! - Self-intersection: < 1μs
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -74,7 +68,7 @@ pub struct LoopStats {
     pub max_curvature: f64,
 }
 
-/// World-class loop representation
+/// Loop representation
 #[derive(Debug, Clone)]
 pub struct Loop {
     /// Unique identifier
@@ -190,7 +184,10 @@ impl Loop {
         normal: &Vector3,
     ) -> MathResult<&LoopStats> {
         if self.cached_stats.is_some() {
-            return Ok(self.cached_stats.as_ref().unwrap());
+            return Ok(self
+                .cached_stats
+                .as_ref()
+                .expect("cached_stats presence verified by is_some() guard above"));
         }
 
         let vertices = self.vertices_cached(edge_store)?;
@@ -237,7 +234,10 @@ impl Loop {
             max_curvature,
         });
 
-        Ok(self.cached_stats.as_ref().unwrap())
+        Ok(self
+            .cached_stats
+            .as_ref()
+            .expect("cached_stats just assigned via `Some(...)` above"))
     }
 
     /// Compute area and centroid efficiently
@@ -705,7 +705,7 @@ impl Loop {
     }
 }
 
-/// World-class loop store with spatial indexing
+/// Loop store with spatial indexing
 #[derive(Debug)]
 pub struct LoopStore {
     /// Loop data

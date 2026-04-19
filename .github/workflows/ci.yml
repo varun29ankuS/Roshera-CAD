@@ -37,6 +37,26 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     
+    - name: Enforce API-only AI provider policy (no local models)
+      # CLAUDE.md mandates hosted-API providers only. This guard fails the
+      # build if Ollama / LLaMA / Whisper / Candle identifiers are
+      # reintroduced into the Rust backend or config files.
+      run: |
+        set -e
+        PATTERN='\b(ollama|llama|whisper|candle)\b'
+        # Scope: Rust sources, Cargo manifests, and config files under roshera-backend/.
+        # Exclude generated indexes, docs, and legacy markdown.
+        MATCHES=$(grep -RInE "$PATTERN" \
+          --include='*.rs' --include='*.toml' --include='*.yaml' --include='*.yml' \
+          roshera-backend/ \
+          | grep -viE '^[^:]+:[^:]+:\s*(//|#).*' \
+          || true)
+        if [ -n "$MATCHES" ]; then
+          echo "::error::Forbidden local-model identifiers found (API-only policy):"
+          echo "$MATCHES"
+          exit 1
+        fi
+
     - name: Check formatting
       run: cargo fmt --all -- --check
       working-directory: ./roshera-backend

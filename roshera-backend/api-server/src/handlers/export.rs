@@ -66,19 +66,26 @@ pub async fn export_mesh(
     }
 
     // Handle multiple meshes
-    let final_mesh = if meshes_to_export.len() == 1 {
-        meshes_to_export.into_iter().next().unwrap()
-    } else {
-        // Merge multiple meshes into one
-        tracing::info!("Merging {} meshes for export", meshes_to_export.len());
+    let final_mesh = match meshes_to_export.len() {
+        0 => {
+            // Already guarded by the `meshes_to_export.is_empty()` check above,
+            // but handle defensively rather than panicking.
+            tracing::error!("No meshes available to export after collection");
+            return Err(StatusCode::NOT_FOUND);
+        }
+        1 => meshes_to_export.swap_remove(0),
+        _ => {
+            // Merge multiple meshes into one
+            tracing::info!("Merging {} meshes for export", meshes_to_export.len());
 
-        // Collect references and transforms for merging
-        let mesh_refs: Vec<&Mesh> = meshes_to_export.iter().collect();
-        let transforms: Vec<&Transform3D> =
-            objects_to_export.iter().map(|obj| &obj.transform).collect();
+            // Collect references and transforms for merging
+            let mesh_refs: Vec<&Mesh> = meshes_to_export.iter().collect();
+            let transforms: Vec<&Transform3D> =
+                objects_to_export.iter().map(|obj| &obj.transform).collect();
 
-        // Use the new mesh merging functionality
-        Mesh::merge_multiple(mesh_refs, Some(transforms))
+            // Use the new mesh merging functionality
+            Mesh::merge_multiple(mesh_refs, Some(transforms))
+        }
     };
 
     // Generate filename

@@ -169,7 +169,12 @@ pub fn migrate_v2_to_v3<P: AsRef<Path>>(
             let salt = crate::ros_fs::util::random_16();
             let key_manager = SoftwareKeyManager::default();
             let keys = key_manager.generate_key_set(password, &salt)?;
-            let iv: [u8; 8] = crate::ros_fs::util::random_bytes(8).try_into().unwrap();
+            let iv: [u8; 8] = crate::ros_fs::util::random_bytes(8).try_into().map_err(|_| {
+                RosFileError::Other {
+                    message: "random_bytes(8) did not return 8 bytes".to_string(),
+                    source: None,
+                }
+            })?;
 
             (Some(keys), Some(iv))
         } else {

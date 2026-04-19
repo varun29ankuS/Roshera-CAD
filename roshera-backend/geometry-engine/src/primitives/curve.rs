@@ -1,11 +1,11 @@
-//! Analytical curve representations for B-Rep edges
+//! Analytical curve representations for B-Rep edges.
 //!
-//! Industry-standard curve library matching Parasolid/ACIS capabilities:
+//! Supported curve kinds:
 //! - Lines, arcs, ellipses, parabolas, hyperbolas
-//! - NURBS curves with full rational support
+//! - NURBS curves (rational)
 //! - Composite curves and curve-on-surface
-//! - Efficient evaluation and derivative calculations
-//! - Robust intersection and projection algorithms
+//!
+//! Capabilities: evaluation, derivatives, intersection, projection.
 //!
 //! References:
 //! - ISO 10303-42:2022 Geometric and topological representation
@@ -363,7 +363,7 @@ impl CurvePoint {
     }
 }
 
-/// Common trait for all curve types - Parasolid/ACIS compatible
+/// Common trait for all curve types.
 pub trait Curve: fmt::Debug + Send + Sync {
     /// Get self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;

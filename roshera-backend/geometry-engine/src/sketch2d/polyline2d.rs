@@ -73,8 +73,13 @@ impl Polyline2d {
         if is_closed
             && vertices
                 .first()
-                .unwrap()
-                .coincident_with(vertices.last().unwrap(), &tolerance)
+                .expect("vertices.len() >= 2: verified by early return above")
+                .coincident_with(
+                    vertices
+                        .last()
+                        .expect("vertices.len() >= 2: verified by early return above"),
+                    &tolerance,
+                )
         {
             return Err(Sketch2dError::DegenerateGeometry {
                 entity: "Polyline2d".to_string(),
@@ -204,9 +209,13 @@ impl Polyline2d {
 
         // Add closing segment for closed polylines
         if self.is_closed && self.vertices.len() >= 2 {
-            if let Ok(segment) =
-                LineSegment2d::new(*self.vertices.last().unwrap(), self.vertices[0])
-            {
+            if let Ok(segment) = LineSegment2d::new(
+                *self
+                    .vertices
+                    .last()
+                    .expect("vertices.len() >= 2: verified by enclosing if-guard"),
+                self.vertices[0],
+            ) {
                 segments.push(segment);
             }
         }
@@ -223,7 +232,15 @@ impl Polyline2d {
         if index < self.vertices.len() - 1 {
             LineSegment2d::new(self.vertices[index], self.vertices[index + 1]).ok()
         } else if self.is_closed && index == self.vertices.len() - 1 {
-            LineSegment2d::new(*self.vertices.last().unwrap(), self.vertices[0]).ok()
+            // index < segment_count (verified at entry) and is_closed => len >= 1
+            LineSegment2d::new(
+                *self
+                    .vertices
+                    .last()
+                    .expect("closed polyline with segment_count > 0: vertices are non-empty"),
+                self.vertices[0],
+            )
+            .ok()
         } else {
             None
         }
@@ -429,13 +446,18 @@ impl Polyline2d {
             return points.to_vec();
         }
 
+        // `points.len() > 2` is verified above, so `last()` always returns Some.
+        const LEN_INVARIANT: &str =
+            "points.len() > 2: verified by early return above (len <= 2 case)";
+
         // Find the point with maximum distance
         let mut max_dist = 0.0;
         let mut max_index = 0;
 
-        let line = match LineSegment2d::new(points[0], *points.last().unwrap()) {
+        let last_point = *points.last().expect(LEN_INVARIANT);
+        let line = match LineSegment2d::new(points[0], last_point) {
             Ok(l) => l,
-            Err(_) => return vec![points[0], *points.last().unwrap()],
+            Err(_) => return vec![points[0], last_point],
         };
 
         for i in 1..points.len() - 1 {
@@ -453,7 +475,7 @@ impl Polyline2d {
             result.extend(self.douglas_peucker(&points[max_index..], tolerance));
             result
         } else {
-            vec![points[0], *points.last().unwrap()]
+            vec![points[0], last_point]
         }
     }
 

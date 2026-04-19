@@ -33,7 +33,7 @@ dotenvy = "0.15"
 tracing = { workspace = true }
 metrics = "0.21"
 
-# HTTP client for Ollama
+# HTTP client for hosted LLM APIs (Claude, OpenAI, etc.)
 reqwest = { version = "0.12", features = ["json"] }
 
 # For TTS - Native implementations
@@ -66,3 +66,6 @@ env_logger = "0.11"
 name = "ai_benchmarks"
 harness = false
 
+
+[lints]
+workspace = true

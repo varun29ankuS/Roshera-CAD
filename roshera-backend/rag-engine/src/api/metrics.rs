@@ -314,7 +314,7 @@ impl MetricsCollector {
             return 0.0;
         }
         
-        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let index = ((latencies.len() as f64 - 1.0) * percentile) as usize;
         latencies[index]
     }

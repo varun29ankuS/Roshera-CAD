@@ -1,8 +1,7 @@
 //! LLM Tool Schema Generation from CAD Registries.
 //!
 //! Converts PrimitiveSchema and operation metadata into JSON Schema format
-//! compatible with Anthropic's tool_use API, OpenAI's function calling, and
-//! Ollama's tool support.
+//! compatible with Anthropic's tool_use API and OpenAI's function calling.
 //!
 //! # Design
 //!

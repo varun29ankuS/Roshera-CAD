@@ -96,10 +96,7 @@ impl SessionManager {
     /// Creates a new session
     pub async fn create_session(&self, user_name: String) -> String {
         let session_id = Uuid::new_v4();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
+        let now = shared_types::unix_millis_now();
 
         let session = SessionState::new(session_id, user_name.clone());
 
@@ -565,10 +562,7 @@ impl SessionManager {
 
 /// Get current timestamp in milliseconds
 fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_millis() as u64
+    shared_types::unix_millis_now()
 }
 
 impl Default for SessionManager {

@@ -1,14 +1,9 @@
-//! World-class numerical utilities for aerospace CAD operations
+//! Numerical utilities for CAD operations.
 //!
-//! This module provides robust, high-performance numerical algorithms
-//! that rival industry leaders like Parasolid. Every algorithm is
-//! designed for maximum accuracy and speed.
-//!
-//! # Performance Characteristics
-//! - Zero heap allocations in hot paths
-//! - SIMD-ready data layouts where applicable  
-//! - Adaptive algorithms that choose optimal methods
-//! - Extensive use of const functions and inline hints
+//! Design goals:
+//! - Avoid heap allocations on hot paths
+//! - SIMD-ready data layouts where applicable
+//! - Adaptive algorithms that switch method by input size/conditioning
 
 use super::{consts, MathError, MathResult, Tolerance};
 use std::ops::Range;
@@ -124,7 +119,10 @@ pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64, tolerance: Tolerance) -> Vec<
     };
 
     // Sort and remove near-duplicates
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    roots.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     dedup_roots(&mut roots, tol);
     roots
 }
@@ -231,7 +229,10 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
         roots.push(r + shift);
     }
 
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    roots.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     dedup_roots(&mut roots, tol);
     roots
 }
@@ -924,7 +925,10 @@ where
         f_prev = fx;
     }
 
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    roots.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     roots
 }
 

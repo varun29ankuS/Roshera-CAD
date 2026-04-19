@@ -140,7 +140,9 @@ impl CommandExecutor {
             };
 
             // Create sphere using the primitive system in the shared model
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = SpherePrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -181,7 +183,9 @@ impl CommandExecutor {
             };
 
             // Create cylinder using the primitive system in the shared model
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = CylinderPrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -217,7 +221,9 @@ impl CommandExecutor {
             };
 
             // Create cone using the primitive system in the shared model
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = ConePrimitive::create(&params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -252,7 +258,9 @@ impl CommandExecutor {
         let op_name = format!("{:?}", op);
         let model_clone = Arc::clone(&self.model);
         let result_solid_id = tokio::task::spawn_blocking(move || {
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default())
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
         })
@@ -360,7 +368,9 @@ impl CommandExecutor {
                 }
             }?;
 
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             transform_solid(&mut model, solid_id, matrix, TransformOptions::default())
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
 
@@ -399,7 +409,10 @@ impl CommandExecutor {
     pub async fn clear(&mut self) {
         self.id_map.clear();
         self.solid_to_geometry.clear();
-        let mut model = self.model.write().unwrap();
+        let mut model = self
+            .model
+            .write()
+            .expect("BRep model RwLock poisoned; prior holder panicked");
         *model = BRepModel::new();
     }
 }
