@@ -308,11 +308,7 @@ pub fn intersect_surface_plane(
                 continue;
             }
             // `curves.last()` is the curve we just pushed above.
-            for cp in &curves
-                .last()
-                .expect("curve just pushed above")
-                .points
-            {
+            for cp in &curves.last().expect("curve just pushed above").points {
                 if (cp.position - s.position).magnitude() < config.tolerance.distance() * 5.0 {
                     used[k] = true;
                     break;

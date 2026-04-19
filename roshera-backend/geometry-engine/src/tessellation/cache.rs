@@ -46,33 +46,55 @@ impl TessellationCache {
 
     /// Get a cached mesh if available
     pub fn get(&self, key: &CacheKey) -> Option<Arc<ThreeJsMesh>> {
-        let mut cache = self.cache.write().expect("tessellation cache RwLock poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .expect("tessellation cache RwLock poisoned");
         if let Some(mesh) = cache.get(key) {
-            *self.hits.write().expect("tessellation hits RwLock poisoned") += 1;
+            *self
+                .hits
+                .write()
+                .expect("tessellation hits RwLock poisoned") += 1;
             Some(Arc::clone(mesh))
         } else {
-            *self.misses.write().expect("tessellation misses RwLock poisoned") += 1;
+            *self
+                .misses
+                .write()
+                .expect("tessellation misses RwLock poisoned") += 1;
             None
         }
     }
 
     /// Insert a mesh into the cache
     pub fn insert(&self, key: CacheKey, mesh: ThreeJsMesh) {
-        let mut cache = self.cache.write().expect("tessellation cache RwLock poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .expect("tessellation cache RwLock poisoned");
         cache.put(key, Arc::new(mesh));
     }
 
     /// Clear the entire cache
     pub fn clear(&self) {
-        let mut cache = self.cache.write().expect("tessellation cache RwLock poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .expect("tessellation cache RwLock poisoned");
         cache.clear();
     }
 
     /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
         let hits = *self.hits.read().expect("tessellation hits RwLock poisoned");
-        let misses = *self.misses.read().expect("tessellation misses RwLock poisoned");
-        let size = self.cache.read().expect("tessellation cache RwLock poisoned").len();
+        let misses = *self
+            .misses
+            .read()
+            .expect("tessellation misses RwLock poisoned");
+        let size = self
+            .cache
+            .read()
+            .expect("tessellation cache RwLock poisoned")
+            .len();
 
         CacheStats {
             hits,
@@ -280,7 +302,10 @@ impl IncrementalCache {
 
     /// Get partial tessellation if available
     pub fn get_partial(&self, key: &CacheKey) -> Option<(ThreeJsMesh, f32)> {
-        let cache = self.partial_results.read().expect("incremental tessellation cache RwLock poisoned");
+        let cache = self
+            .partial_results
+            .read()
+            .expect("incremental tessellation cache RwLock poisoned");
         cache
             .get(key)
             .map(|partial| (partial.mesh.clone(), partial.progress))
@@ -294,7 +319,10 @@ impl IncrementalCache {
         face_mesh: &ThreeJsMesh,
         total_faces: usize,
     ) {
-        let mut cache = self.partial_results.write().expect("incremental tessellation cache RwLock poisoned");
+        let mut cache = self
+            .partial_results
+            .write()
+            .expect("incremental tessellation cache RwLock poisoned");
         let partial = cache.entry(key).or_insert_with(|| PartialTessellation {
             completed_faces: Vec::new(),
             mesh: ThreeJsMesh::new(),
@@ -308,7 +336,10 @@ impl IncrementalCache {
 
     /// Mark tessellation as complete and remove from partial cache
     pub fn complete(&self, key: &CacheKey) {
-        let mut cache = self.partial_results.write().expect("incremental tessellation cache RwLock poisoned");
+        let mut cache = self
+            .partial_results
+            .write()
+            .expect("incremental tessellation cache RwLock poisoned");
         cache.remove(key);
     }
 }

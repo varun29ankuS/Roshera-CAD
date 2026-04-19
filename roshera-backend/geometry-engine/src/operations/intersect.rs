@@ -608,7 +608,9 @@ fn intersect_general_curves(
         // `.last()`, which is guaranteed `Some` there.
         let is_distinct = match unique_intersections.last() {
             None => true,
-            Some(last) => (intersection.position - last.position).magnitude() > tolerance.distance(),
+            Some(last) => {
+                (intersection.position - last.position).magnitude() > tolerance.distance()
+            }
         };
         if is_distinct {
             unique_intersections.push(intersection);

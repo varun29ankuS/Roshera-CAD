@@ -557,9 +557,8 @@ impl AICommandTracker {
         let mut result = email_re.replace_all(text, "[EMAIL]").to_string();
 
         // Phone pattern
-        let phone_re =
-            Regex::new(r"\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}")
-                .expect("static phone PII regex must compile");
+        let phone_re = Regex::new(r"\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}")
+            .expect("static phone PII regex must compile");
         result = phone_re.replace_all(&result, "[PHONE]").to_string();
 
         // Credit card pattern

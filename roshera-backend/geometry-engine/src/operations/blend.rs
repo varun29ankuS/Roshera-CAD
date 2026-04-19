@@ -241,11 +241,15 @@ fn create_hermite_blend_surface(
     // Use RuledSurface through the two boundary curves for the blend
     let c1_line = crate::primitives::curve::Line::new(
         curve1[0],
-        *curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+        *curve1
+            .last()
+            .expect("curve1 non-empty: validated in blend_faces entry"),
     );
     let c2_line = crate::primitives::curve::Line::new(
         curve2[0],
-        *curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+        *curve2
+            .last()
+            .expect("curve2 non-empty: validated in blend_faces entry"),
     );
 
     let ruled = RuledSurface::new(Box::new(c1_line), Box::new(c2_line));
@@ -281,11 +285,15 @@ fn create_conic_blend_surface(
     // ruled surface we apply the conic blend as a weighted midpoint offset
     let c1 = crate::primitives::curve::Line::new(
         curve1[0],
-        *curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+        *curve1
+            .last()
+            .expect("curve1 non-empty: validated in blend_faces entry"),
     );
     let c2 = crate::primitives::curve::Line::new(
         curve2[0],
-        *curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+        *curve2
+            .last()
+            .expect("curve2 non-empty: validated in blend_faces entry"),
     );
 
     let ruled = RuledSurface::new(Box::new(c1), Box::new(c2));
@@ -341,11 +349,15 @@ fn create_ruled_blend_surface(
 
     let c1 = crate::primitives::curve::Line::new(
         curve1[0],
-        *curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
+        *curve1
+            .last()
+            .expect("curve1 non-empty: validated in blend_faces entry"),
     );
     let c2 = crate::primitives::curve::Line::new(
         curve2[0],
-        *curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+        *curve2
+            .last()
+            .expect("curve2 non-empty: validated in blend_faces entry"),
     );
 
     let ruled = RuledSurface::new(Box::new(c1), Box::new(c2));
@@ -363,8 +375,12 @@ fn create_blend_face(
     let edge1 = create_curve_edge(model, curve1)?;
     let edge2 = create_lateral_edge(
         model,
-        curve1.last().expect("curve1 non-empty: validated in blend_faces entry"),
-        curve2.last().expect("curve2 non-empty: validated in blend_faces entry"),
+        curve1
+            .last()
+            .expect("curve1 non-empty: validated in blend_faces entry"),
+        curve2
+            .last()
+            .expect("curve2 non-empty: validated in blend_faces entry"),
     )?;
     let edge3 = create_curve_edge(model, curve2)?;
     let edge4 = create_lateral_edge(model, &curve2[0], &curve1[0])?;
@@ -399,9 +415,9 @@ fn create_curve_edge(model: &mut BRepModel, points: &[Point3]) -> OperationResul
     // Would create B-spline curve through points
     // For now, create line between endpoints
     use crate::primitives::curve::Line;
-    let last_point = *points
-        .last()
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge curve points must be non-empty".to_string()))?;
+    let last_point = *points.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Edge curve points must be non-empty".to_string())
+    })?;
     let line = Line::new(points[0], last_point);
     let curve_id = model.curves.add(Box::new(line));
 

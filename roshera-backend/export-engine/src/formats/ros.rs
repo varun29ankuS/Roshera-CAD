@@ -183,18 +183,17 @@ pub async fn export_brep_to_ros(
 
     // AIPR chunk - AI provenance (if tracking is enabled)
     if options.track_ai {
-        let tracking_level = ros_fs::TrackingLevel::from_u8(options.ai_tracking_level)
-            .ok_or_else(|| ExportError::ExportFailed {
-                reason: format!(
-                    "Invalid AI tracking level {} (expected 0..=2)",
-                    options.ai_tracking_level
-                ),
+        let tracking_level =
+            ros_fs::TrackingLevel::from_u8(options.ai_tracking_level).ok_or_else(|| {
+                ExportError::ExportFailed {
+                    reason: format!(
+                        "Invalid AI tracking level {} (expected 0..=2)",
+                        options.ai_tracking_level
+                    ),
+                }
             })?;
-        let ai_tracker = ros_fs::AICommandTracker::new(
-            tracking_level,
-            ros_fs::PrivacySettings::default(),
-            None,
-        );
+        let ai_tracker =
+            ros_fs::AICommandTracker::new(tracking_level, ros_fs::PrivacySettings::default(), None);
 
         let aipr_chunk = ros_fs::Chunk::new(ros_fs::ChunkType::AIPR, ai_tracker.serialize());
         chunks.push(aipr_chunk);
@@ -343,12 +342,14 @@ pub async fn import_ros_to_brep(
             reason: "Geometry is encrypted but no key available".to_string(),
         })?;
 
-        let enc_algo = ros_fs::EncryptionAlgorithm::from_id(geom_entry.enc_algo)
-            .ok_or_else(|| ExportError::ExportFailed {
-                reason: format!(
-                    "Unknown encryption algorithm id {} in chunk index",
-                    geom_entry.enc_algo
-                ),
+        let enc_algo =
+            ros_fs::EncryptionAlgorithm::from_id(geom_entry.enc_algo).ok_or_else(|| {
+                ExportError::ExportFailed {
+                    reason: format!(
+                        "Unknown encryption algorithm id {} in chunk index",
+                        geom_entry.enc_algo
+                    ),
+                }
             })?;
         let decryptor = ros_fs::ChunkEncryptor::new(enc_algo, key_set.clone(), header.file_iv);
 

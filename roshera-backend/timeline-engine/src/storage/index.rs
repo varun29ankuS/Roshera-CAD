@@ -410,11 +410,11 @@ impl StorageIndex {
             // Verify the event exists at the specified location. Fall back
             // to the current directory if `index_path` has no parent (e.g.
             // a bare filename); this is exceedingly rare in practice.
-            let parent = self.index_path.parent().unwrap_or_else(|| {
-                std::path::Path::new(".")
-            });
-            let segment_path =
-                parent.join(format!("segment_{:06}.log", location.segment));
+            let parent = self
+                .index_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let segment_path = parent.join(format!("segment_{:06}.log", location.segment));
             if !segment_path.exists() {
                 tracing::warn!("Missing segment file for event {:?}", event_id);
                 is_valid = false;

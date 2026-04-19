@@ -331,7 +331,6 @@ async fn list_roles_wrapper(
     list_roles(State(state), auth_info).await
 }
 
-
 async fn create_geometry(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,

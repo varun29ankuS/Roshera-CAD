@@ -681,31 +681,30 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                         let user_name = format!("User_{}", &user_id[..8]); // Default user name
 
                                         // Create or join session
-                                        let actual_session_id = if session_id == "default"
-                                            || session_id.is_empty()
-                                        {
-                                            // Create new session if "default" or empty
-                                            state
-                                                .session_manager
-                                                .create_session(user_name.clone())
-                                                .await
-                                        } else {
-                                            // Try to join existing session
-                                            match state
-                                                .session_manager
-                                                .get_session(&session_id)
-                                                .await
-                                            {
-                                                Ok(_) => session_id.clone(),
-                                                Err(_) => {
-                                                    // Session doesn't exist, create new one
-                                                    state
-                                                        .session_manager
-                                                        .create_session(user_name.clone())
-                                                        .await
+                                        let actual_session_id =
+                                            if session_id == "default" || session_id.is_empty() {
+                                                // Create new session if "default" or empty
+                                                state
+                                                    .session_manager
+                                                    .create_session(user_name.clone())
+                                                    .await
+                                            } else {
+                                                // Try to join existing session
+                                                match state
+                                                    .session_manager
+                                                    .get_session(&session_id)
+                                                    .await
+                                                {
+                                                    Ok(_) => session_id.clone(),
+                                                    Err(_) => {
+                                                        // Session doesn't exist, create new one
+                                                        state
+                                                            .session_manager
+                                                            .create_session(user_name.clone())
+                                                            .await
+                                                    }
                                                 }
-                                            }
-                                        };
+                                            };
 
                                         // Add the current user to the session
                                         if let Ok(session) = state
@@ -1999,4 +1998,3 @@ async fn send_collaborators_update(
 
     Ok(())
 }
-

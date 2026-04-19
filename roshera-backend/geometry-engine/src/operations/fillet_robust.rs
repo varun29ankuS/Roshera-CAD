@@ -306,9 +306,10 @@ pub fn blend_vertex_fillets(
     // This is simplified - proper implementation would solve for
     // the center that maintains tangency with all fillet surfaces
     let vertex_id = vertex_edges[0].start_vertex;
-    let vertex = model.vertices.get(vertex_id).ok_or_else(|| {
-        MathError::InvalidParameter("Blend vertex not found in model".into())
-    })?;
+    let vertex = model
+        .vertices
+        .get(vertex_id)
+        .ok_or_else(|| MathError::InvalidParameter("Blend vertex not found in model".into()))?;
     let blend_center = Point3::from(vertex.position);
 
     // Compute angular spans for each edge
