@@ -570,14 +570,16 @@ fn create_wall_face(
         .clone();
 
     // Get the outer edge endpoints
-    let p1 = model
+    let p1_arr = model
         .vertices
         .get_position(outer_edge.start_vertex)
         .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".into()))?;
-    let p2 = model
+    let p2_arr = model
         .vertices
         .get_position(outer_edge.end_vertex)
         .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".into()))?;
+    let p1 = Vector3::new(p1_arr[0], p1_arr[1], p1_arr[2]);
+    let p2 = Vector3::new(p2_arr[0], p2_arr[1], p2_arr[2]);
 
     // Compute offset direction from the surface normal at midpoint
     let edge_curve = model
