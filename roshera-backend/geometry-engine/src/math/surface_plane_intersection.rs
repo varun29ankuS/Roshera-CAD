@@ -125,9 +125,9 @@ pub fn intersect_surface_plane(
     config: &SurfacePlaneIntersectionConfig,
 ) -> MathResult<Vec<ParametricIntersectionCurve>> {
     // Normalise the plane normal.
-    let normal = plane_normal.normalize().map_err(|_| {
-        MathError::InvalidParameter("plane_normal must be non-zero".into())
-    })?;
+    let normal = plane_normal
+        .normalize()
+        .map_err(|_| MathError::InvalidParameter("plane_normal must be non-zero".into()))?;
 
     let ((raw_u_min, raw_u_max), (raw_v_min, raw_v_max)) = surface.parameter_bounds();
 
@@ -173,10 +173,58 @@ pub fn intersect_surface_plane(
             let v1 = v0 + dv;
 
             // Check each of the four edges of this grid cell.
-            maybe_add_seed(surface, &normal, plane_origin, d00, d10, u0, v0, u1, v0, &mut seeds, config);
-            maybe_add_seed(surface, &normal, plane_origin, d10, d11, u1, v0, u1, v1, &mut seeds, config);
-            maybe_add_seed(surface, &normal, plane_origin, d00, d01, u0, v0, u0, v1, &mut seeds, config);
-            maybe_add_seed(surface, &normal, plane_origin, d01, d11, u0, v1, u1, v1, &mut seeds, config);
+            maybe_add_seed(
+                surface,
+                &normal,
+                plane_origin,
+                d00,
+                d10,
+                u0,
+                v0,
+                u1,
+                v0,
+                &mut seeds,
+                config,
+            );
+            maybe_add_seed(
+                surface,
+                &normal,
+                plane_origin,
+                d10,
+                d11,
+                u1,
+                v0,
+                u1,
+                v1,
+                &mut seeds,
+                config,
+            );
+            maybe_add_seed(
+                surface,
+                &normal,
+                plane_origin,
+                d00,
+                d01,
+                u0,
+                v0,
+                u0,
+                v1,
+                &mut seeds,
+                config,
+            );
+            maybe_add_seed(
+                surface,
+                &normal,
+                plane_origin,
+                d01,
+                d11,
+                u0,
+                v1,
+                u1,
+                v1,
+                &mut seeds,
+                config,
+            );
         }
     }
 
@@ -200,12 +248,28 @@ pub fn intersect_surface_plane(
 
         // Trace in both directions.
         let forward = trace_direction(
-            surface, &normal, plane_origin, seed, true, config,
-            u_min, u_max, v_min, v_max,
+            surface,
+            &normal,
+            plane_origin,
+            seed,
+            true,
+            config,
+            u_min,
+            u_max,
+            v_min,
+            v_max,
         );
         let backward = trace_direction(
-            surface, &normal, plane_origin, seed, false, config,
-            u_min, u_max, v_min, v_max,
+            surface,
+            &normal,
+            plane_origin,
+            seed,
+            false,
+            config,
+            u_min,
+            u_max,
+            v_min,
+            v_max,
         );
 
         // Assemble curve: reversed-backward + seed + forward.
@@ -225,7 +289,10 @@ pub fn intersect_surface_plane(
         let last = pts.last().unwrap().position;
         let is_closed = (last - first).magnitude() < config.tolerance.distance() * 10.0;
 
-        curves.push(ParametricIntersectionCurve { points: pts, is_closed });
+        curves.push(ParametricIntersectionCurve {
+            points: pts,
+            is_closed,
+        });
 
         // Mark consumed seeds.
         for (k, s) in seeds.iter().enumerate() {
@@ -278,7 +345,11 @@ fn maybe_add_seed(
     } else {
         // Fallback: accept the linear interpolation.
         if let Ok(pos) = surface.point_at(u_seed, v_seed) {
-            seeds.push(ParametricIntersectionPoint { position: pos, u: u_seed, v: v_seed });
+            seeds.push(ParametricIntersectionPoint {
+                position: pos,
+                u: u_seed,
+                v: v_seed,
+            });
         }
     }
 }
@@ -308,7 +379,11 @@ fn newton_correct(
         let eval = surface.evaluate_full(u, v).ok()?;
         let d = (eval.position - plane_origin).dot(normal);
         if d.abs() < tol {
-            return Some(ParametricIntersectionPoint { position: eval.position, u, v });
+            return Some(ParametricIntersectionPoint {
+                position: eval.position,
+                u,
+                v,
+            });
         }
 
         // Gradient of d in parameter space:  grad_d = (dS/du . n, dS/dv . n)
@@ -334,7 +409,11 @@ fn newton_correct(
     let pos = surface.point_at(u, v).ok()?;
     let d = (pos - plane_origin).dot(normal);
     if d.abs() < tol * 100.0 {
-        Some(ParametricIntersectionPoint { position: pos, u, v })
+        Some(ParametricIntersectionPoint {
+            position: pos,
+            u,
+            v,
+        })
     } else {
         None
     }
@@ -413,18 +492,18 @@ fn trace_direction(
             // Clip to boundary and add the boundary point.
             let clamped_u = next_u.clamp(u_min, u_max);
             let clamped_v = next_v.clamp(v_min, v_max);
-            if let Some(corrected) = newton_correct(
-                surface, normal, plane_origin, clamped_u, clamped_v, config,
-            ) {
+            if let Some(corrected) =
+                newton_correct(surface, normal, plane_origin, clamped_u, clamped_v, config)
+            {
                 pts.push(corrected);
             }
             break;
         }
 
         // Corrector: snap back to d = 0.
-        if let Some(corrected) = newton_correct(
-            surface, normal, plane_origin, next_u, next_v, config,
-        ) {
+        if let Some(corrected) =
+            newton_correct(surface, normal, plane_origin, next_u, next_v, config)
+        {
             // Check we actually advanced.
             let dist = (corrected.position - cur.position).magnitude();
             if dist < tol * 0.01 {
@@ -484,8 +563,8 @@ mod tests {
         let s2 = std::f64::consts::FRAC_1_SQRT_2;
         let surface = SurfacePlane::new_bounded(
             Point3::ZERO,
-            Vector3::new(s2, 0.0, s2),   // tilted normal
-            Vector3::new(s2, 0.0, -s2),  // u direction in the plane
+            Vector3::new(s2, 0.0, s2),  // tilted normal
+            Vector3::new(s2, 0.0, -s2), // u direction in the plane
             (-5.0, 5.0),
             (-5.0, 5.0),
         )
@@ -503,7 +582,10 @@ mod tests {
             .expect("intersection should succeed");
 
         // The two planes intersect, so we expect at least one curve.
-        assert!(!curves.is_empty(), "expected at least one intersection curve");
+        assert!(
+            !curves.is_empty(),
+            "expected at least one intersection curve"
+        );
 
         // All intersection points must lie on z = 0 within tolerance.
         for curve in &curves {

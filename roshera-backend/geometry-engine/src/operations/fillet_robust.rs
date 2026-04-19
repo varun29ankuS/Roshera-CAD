@@ -398,12 +398,8 @@ pub fn compute_fillet_transition(
     }
 
     match blend_params.blend_type {
-        TransitionType::Linear => {
-            build_linear_transition(&pts1, &pts2)
-        }
-        TransitionType::Cubic => {
-            build_cubic_transition(&pts1, &pts2, &tans1, &tans2)
-        }
+        TransitionType::Linear => build_linear_transition(&pts1, &pts2),
+        TransitionType::Cubic => build_cubic_transition(&pts1, &pts2, &tans1, &tans2),
         TransitionType::Quintic => {
             // Collect second derivatives (curvature vectors) for G2 matching
             let mut curvs1 = Vec::with_capacity(n + 1);
@@ -425,10 +421,7 @@ pub fn compute_fillet_transition(
 /// Constructs a cubic NURBS curve through each set of boundary points (using
 /// uniform parameterization), then creates a `RuledSurface` that linearly
 /// interpolates between them.
-fn build_linear_transition(
-    pts1: &[Point3],
-    pts2: &[Point3],
-) -> MathResult<Box<dyn Surface>> {
+fn build_linear_transition(pts1: &[Point3], pts2: &[Point3]) -> MathResult<Box<dyn Surface>> {
     let curve1 = interpolating_cubic_curve(pts1)?;
     let curve2 = interpolating_cubic_curve(pts2)?;
     Ok(Box::new(RuledSurface::new(
@@ -559,9 +552,12 @@ fn build_nurbs_surface_from_grid(
         knots_v,
         degree_u,
         degree_v,
-    ).map_err(|msg| MathError::InvalidParameter(msg.to_string()))?;
+    )
+    .map_err(|msg| MathError::InvalidParameter(msg.to_string()))?;
 
-    Ok(Box::new(crate::primitives::surface::GeneralNurbsSurface { nurbs }))
+    Ok(Box::new(crate::primitives::surface::GeneralNurbsSurface {
+        nurbs,
+    }))
 }
 
 /// Generate a clamped uniform knot vector for `n` control points and the

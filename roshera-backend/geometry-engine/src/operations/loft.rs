@@ -322,10 +322,26 @@ fn create_cubic_loft(
             let v01 = r1[vi];
             let v11 = r1[(vi + 1) % n];
 
-            let pos00 = model.vertices.get(v00).map(|v| v.position).unwrap_or([0.0; 3]);
-            let pos10 = model.vertices.get(v10).map(|v| v.position).unwrap_or([0.0; 3]);
-            let pos01 = model.vertices.get(v01).map(|v| v.position).unwrap_or([0.0; 3]);
-            let pos11 = model.vertices.get(v11).map(|v| v.position).unwrap_or([0.0; 3]);
+            let pos00 = model
+                .vertices
+                .get(v00)
+                .map(|v| v.position)
+                .unwrap_or([0.0; 3]);
+            let pos10 = model
+                .vertices
+                .get(v10)
+                .map(|v| v.position)
+                .unwrap_or([0.0; 3]);
+            let pos01 = model
+                .vertices
+                .get(v01)
+                .map(|v| v.position)
+                .unwrap_or([0.0; 3]);
+            let pos11 = model
+                .vertices
+                .get(v11)
+                .map(|v| v.position)
+                .unwrap_or([0.0; 3]);
 
             let c1 = Box::new(Line::new(
                 Point3::new(pos00[0], pos00[1], pos00[2]),
@@ -343,10 +359,8 @@ fn create_cubic_loft(
             let e2 = create_or_find_edge(model, v11, v01)?;
             let e3 = create_or_find_edge(model, v01, v00)?;
 
-            let mut face_loop = crate::primitives::r#loop::Loop::new(
-                0,
-                crate::primitives::r#loop::LoopType::Outer,
-            );
+            let mut face_loop =
+                crate::primitives::r#loop::Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
             face_loop.add_edge(e0, true);
             face_loop.add_edge(e1, true);
             face_loop.add_edge(e2, true);
@@ -416,7 +430,9 @@ fn create_minimal_twist_loft(
             .vertices
             .get(vid)
             .ok_or_else(|| {
-                OperationError::InvalidGeometry("Vertex not found in twist optimisation".to_string())
+                OperationError::InvalidGeometry(
+                    "Vertex not found in twist optimisation".to_string(),
+                )
             })?
             .position;
         Ok(Point3::new(pos[0], pos[1], pos[2]))
@@ -468,9 +484,7 @@ fn create_minimal_twist_loft(
         }
 
         // Apply the optimal rotation to re-index the current profile's vertex list
-        let rotated: Vec<VertexId> = (0..n)
-            .map(|i| curr[(i + best_rotation) % n])
-            .collect();
+        let rotated: Vec<VertexId> = (0..n).map(|i| curr[(i + best_rotation) % n]).collect();
         optimised.push(rotated);
     }
 
@@ -562,12 +576,9 @@ fn create_guided_loft(
     let mut snapped_correspondence = correspondence.clone();
 
     for &guide_edge_id in &options.guide_curves {
-        let guide_edge = model
-            .edges
-            .get(guide_edge_id)
-            .ok_or_else(|| {
-                OperationError::InvalidGeometry("Guide curve edge not found".to_string())
-            })?;
+        let guide_edge = model.edges.get(guide_edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Guide curve edge not found".to_string())
+        })?;
 
         let start_vid = guide_edge.start_vertex;
         let end_vid = guide_edge.end_vertex;
@@ -921,14 +932,14 @@ fn compute_planar_surface(
     let mut pts: Vec<Point3> = Vec::with_capacity(edges.len());
     for &eid in edges {
         let edge = model.edges.get(eid).ok_or_else(|| {
-            OperationError::InvalidGeometry("Edge not found in planar surface computation".to_string())
+            OperationError::InvalidGeometry(
+                "Edge not found in planar surface computation".to_string(),
+            )
         })?;
         let pos = model
             .vertices
             .get(edge.start_vertex)
-            .ok_or_else(|| {
-                OperationError::InvalidGeometry("Start vertex not found".to_string())
-            })?
+            .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
             .position;
         pts.push(Point3::new(pos[0], pos[1], pos[2]));
     }
@@ -1013,16 +1024,10 @@ fn compute_planar_surface(
     v_min -= margin;
     v_max += margin;
 
-    let plane = Plane::new_bounded(
-        centroid,
-        normal,
-        u_dir,
-        (u_min, u_max),
-        (v_min, v_max),
-    )
-    .map_err(|e| {
-        OperationError::NumericalError(format!("Failed to construct bounded plane: {:?}", e))
-    })?;
+    let plane = Plane::new_bounded(centroid, normal, u_dir, (u_min, u_max), (v_min, v_max))
+        .map_err(|e| {
+            OperationError::NumericalError(format!("Failed to construct bounded plane: {:?}", e))
+        })?;
 
     Ok(Box::new(plane))
 }

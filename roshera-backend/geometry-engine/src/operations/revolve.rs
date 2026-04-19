@@ -250,10 +250,34 @@ fn create_helical_sweep(
             let l3 = model.curves.add(Box::new(Line::new(p3, p4)));
             let l4 = model.curves.add(Box::new(Line::new(p4, p1)));
 
-            let e1 = model.edges.add(Edge::new_auto_range(0, v1, v2, l1, EdgeOrientation::Forward));
-            let e2 = model.edges.add(Edge::new_auto_range(0, v2, v3, l2, EdgeOrientation::Forward));
-            let e3 = model.edges.add(Edge::new_auto_range(0, v3, v4, l3, EdgeOrientation::Forward));
-            let e4 = model.edges.add(Edge::new_auto_range(0, v4, v1, l4, EdgeOrientation::Forward));
+            let e1 = model.edges.add(Edge::new_auto_range(
+                0,
+                v1,
+                v2,
+                l1,
+                EdgeOrientation::Forward,
+            ));
+            let e2 = model.edges.add(Edge::new_auto_range(
+                0,
+                v2,
+                v3,
+                l2,
+                EdgeOrientation::Forward,
+            ));
+            let e3 = model.edges.add(Edge::new_auto_range(
+                0,
+                v3,
+                v4,
+                l3,
+                EdgeOrientation::Forward,
+            ));
+            let e4 = model.edges.add(Edge::new_auto_range(
+                0,
+                v4,
+                v1,
+                l4,
+                EdgeOrientation::Forward,
+            ));
 
             let mut face_loop = Loop::new(0, LoopType::Outer);
             face_loop.add_edge(e1, true);

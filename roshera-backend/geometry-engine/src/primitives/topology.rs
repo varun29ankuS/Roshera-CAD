@@ -946,9 +946,10 @@ pub fn simplify_topology(
                     .face_edges
                     .get(&face_id)
                     .and_then(|e1| {
-                        adjacency.face_edges.get(&neighbor_id).map(|e2| {
-                            e1.intersection(e2).copied().collect::<Vec<_>>()
-                        })
+                        adjacency
+                            .face_edges
+                            .get(&neighbor_id)
+                            .map(|e2| e1.intersection(e2).copied().collect::<Vec<_>>())
                     })
                     .unwrap_or_default();
 
@@ -984,7 +985,10 @@ pub fn simplify_topology(
     }
     statistics.insert("degree2_vertices".to_string(), redundant_vertex_count);
 
-    statistics.insert("total_removable_vertices".to_string(), removed_vertices.len());
+    statistics.insert(
+        "total_removable_vertices".to_string(),
+        removed_vertices.len(),
+    );
     statistics.insert("total_removable_edges".to_string(), removed_edges.len());
     statistics.insert("total_mergeable_face_pairs".to_string(), merged_faces.len());
 
@@ -1168,9 +1172,7 @@ impl MultiResolutionTopology {
         }
 
         // Sort by importance ascending (least important first = simplify first)
-        edge_importance.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
-        });
+        edge_importance.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         // Determine the maximum importance across all edges for threshold scaling
         let max_importance = edge_importance
@@ -1225,7 +1227,9 @@ impl MultiResolutionTopology {
                                         adjacency
                                             .face_edges
                                             .get(nf)
-                                            .map(|fe| !fe.iter().all(|e| collapsed_edges.contains(e)))
+                                            .map(|fe| {
+                                                !fe.iter().all(|e| collapsed_edges.contains(e))
+                                            })
                                             .unwrap_or(true)
                                     })
                                     .collect()

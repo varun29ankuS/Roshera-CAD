@@ -746,7 +746,11 @@ impl Surface for SphericalFillet {
         // Convert direction to spherical coordinates
         let theta = dir.z.acos(); // polar angle
         let phi = dir.y.atan2(dir.x); // azimuthal angle
-        let phi = if phi < 0.0 { phi + std::f64::consts::TAU } else { phi };
+        let phi = if phi < 0.0 {
+            phi + std::f64::consts::TAU
+        } else {
+            phi
+        };
 
         // Map to [0, 1] parameter space
         let u = ((theta - self.u_bounds.0) / theta_range).clamp(0.0, 1.0);
@@ -920,7 +924,11 @@ impl Surface for VariableRadiusFillet {
             .or_else(|| {
                 let n = du.cross(&dv);
                 let mag = n.magnitude();
-                if mag > 1e-15 { Some(n / mag) } else { None }
+                if mag > 1e-15 {
+                    Some(n / mag)
+                } else {
+                    None
+                }
             })
             .unwrap_or(Vector3::Z);
 

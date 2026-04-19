@@ -250,8 +250,11 @@ impl CommandProcessor {
                             + (axis.z as f64).powi(2))
                         .sqrt()
                         .max(1e-15);
-                        let (ux, uy, uz) =
-                            (axis.x as f64 / len, axis.y as f64 / len, axis.z as f64 / len);
+                        let (ux, uy, uz) = (
+                            axis.x as f64 / len,
+                            axis.y as f64 / len,
+                            axis.z as f64 / len,
+                        );
                         [
                             [
                                 cos_t + ux * ux * one_minus_cos,
@@ -305,9 +308,7 @@ impl CommandProcessor {
                 material,
             } => Operation::Modify {
                 entity: timeline_engine::EntityId(*object_id),
-                modifications: vec![timeline_engine::Modification::SetMaterial(
-                    material.clone(),
-                )],
+                modifications: vec![timeline_engine::Modification::SetMaterial(material.clone())],
             },
             AICommand::Export { format, .. } => Operation::Generic {
                 command_type: "Export".to_string(),

@@ -621,7 +621,11 @@ fn create_wall_face(
     let line_bottom = Line::new(p3, p4);
     let c_bottom = model.curves.add(Box::new(line_bottom));
     let e_bottom = model.edges.add(Edge::new_auto_range(
-        0, v3, v4, c_bottom, EdgeOrientation::Forward,
+        0,
+        v3,
+        v4,
+        c_bottom,
+        EdgeOrientation::Forward,
     ));
 
     let line_left = Line::new(p4, p1);
