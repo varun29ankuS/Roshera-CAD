@@ -1,51 +1,34 @@
-/// Native provider factory for pure Rust AI integration
+/// Provider factory for API-based AI integration
 ///
 /// # Design Rationale
-/// - **Why factory pattern**: Clean initialization of complex providers
-/// - **Why native-first**: No Python/system dependencies by default
-/// - **Performance**: Faster startup, no subprocess overhead
-/// - **Business Value**: Simpler deployment, better reliability
+/// - **Why factory pattern**: Clean initialization of provider manager
+/// - **Why API-only**: No local models — uses Claude API for LLM, mock for ASR/TTS
+/// - **Performance**: Fast startup, no model loading overhead
+/// - **Business Value**: Simpler deployment, no GPU requirements
 use super::*;
-use std::path::Path;
 
-/// Configuration for native AI providers
+/// Configuration for AI providers
 #[derive(Debug, Clone)]
 pub struct NativeProviderConfig {
-    /// Model directory containing all AI models
-    pub model_dir: std::path::PathBuf,
-    /// Enable CUDA if available
-    pub use_cuda: bool,
-    /// TTS configuration
-    pub tts_config: NativeTTSConfig,
+    /// Claude API model to use (e.g. "claude-sonnet-4-20250514")
+    pub claude_model: String,
+    /// Maximum tokens for LLM responses
+    pub max_tokens: usize,
 }
 
 impl Default for NativeProviderConfig {
     fn default() -> Self {
         Self {
-            model_dir: std::path::PathBuf::from("models"),
-            use_cuda: true,
-            tts_config: NativeTTSConfig::default(),
+            claude_model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 4096,
         }
     }
 }
 
-/// Factory for creating native AI providers
+/// Factory for creating AI providers
 pub struct NativeProviderFactory;
 
 impl NativeProviderFactory {
-    /// Create a native Whisper ASR provider
-    pub async fn create_whisper_provider(
-        config: &NativeProviderConfig,
-    ) -> Result<WhisperProvider, ProviderError> {
-        tracing::info!("Creating Whisper Base provider");
-        let model_path = config.model_dir.join("whisper/base.bin");
-        WhisperProvider::new(
-            model_path.to_string_lossy().to_string(),
-            super::whisper::ModelSize::Base,
-        )
-        .await
-    }
-
     /// Create a Claude API LLM provider
     pub async fn create_claude_provider(
         _config: &NativeProviderConfig,
@@ -54,43 +37,27 @@ impl NativeProviderFactory {
         Ok(ClaudeProvider::new())
     }
 
-    /// Create a native TTS provider
-    pub async fn create_tts_provider(
-        config: &NativeProviderConfig,
-    ) -> Result<NativeTTSProvider, ProviderError> {
-        tracing::info!("Creating native TTS provider");
-        NativeTTSProvider::new(config.tts_config.clone()).await
-    }
-
-    /// Create a complete native provider manager
+    /// Create a complete provider manager with API-based providers
+    ///
+    /// Uses Claude for LLM and mock providers for ASR/TTS.
+    /// ASR and TTS will be replaced with API providers (e.g. OpenAI Whisper API)
+    /// when those integrations are built.
     pub async fn create_provider_manager(
         config: &NativeProviderConfig,
     ) -> Result<ProviderManager, ProviderError> {
         let mut manager = ProviderManager::new();
 
-        // Try to create native providers, fall back to mocks if models are missing
-        tracing::info!("Initializing native AI provider manager...");
+        tracing::info!("Initializing AI provider manager (API-only mode)...");
 
-        // ASR Provider
-        match Self::create_whisper_provider(config).await {
-            Ok(provider) => {
-                manager.register_asr("whisper-native".to_string(), Box::new(provider));
-                tracing::info!("✓ Native Whisper ASR provider registered");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create native Whisper provider: {}. Using mock.",
-                    e
-                );
-                manager.register_asr("mock".to_string(), Box::new(MockASRProvider::new()));
-            }
-        }
+        // ASR Provider — mock until API-based ASR is integrated
+        manager.register_asr("mock".to_string(), Box::new(MockASRProvider::new()));
+        tracing::info!("Registered mock ASR provider (API ASR not yet integrated)");
 
-        // LLM Provider (API-based)
+        // LLM Provider — Claude API
         match Self::create_claude_provider(config).await {
             Ok(provider) => {
                 manager.register_llm("claude".to_string(), Box::new(provider));
-                tracing::info!("✓ Claude API LLM provider registered");
+                tracing::info!("Registered Claude API LLM provider");
             }
             Err(e) => {
                 tracing::warn!("Failed to create Claude provider: {}. Using mock.", e);
@@ -98,41 +65,21 @@ impl NativeProviderFactory {
             }
         }
 
-        // TTS Provider
-        match Self::create_tts_provider(config).await {
-            Ok(provider) => {
-                manager.register_tts("native".to_string(), Box::new(provider));
-                tracing::info!("✓ Native TTS provider registered");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create native TTS provider: {}. Using mock.", e);
-                manager.register_tts("mock".to_string(), Box::new(MockTTSProvider::new()));
-            }
-        }
+        // TTS Provider — mock until API-based TTS is integrated
+        manager.register_tts("mock".to_string(), Box::new(MockTTSProvider::new()));
+        tracing::info!("Registered mock TTS provider (API TTS not yet integrated)");
 
         // Set active providers
-        let asr_provider = if manager.asr_providers.contains_key("whisper-native") {
-            "whisper-native"
-        } else {
-            "mock"
-        };
-
         let llm_provider = if manager.llm_providers.contains_key("claude") {
             "claude"
         } else {
             "mock"
         };
 
-        let tts_provider = if manager.tts_providers.contains_key("native") {
-            Some("native".to_string())
-        } else {
-            Some("mock".to_string())
-        };
-
         manager.set_active(
-            asr_provider.to_string(),
+            "mock".to_string(),
             llm_provider.to_string(),
-            tts_provider,
+            Some("mock".to_string()),
         );
 
         let memory_mb = manager.total_memory_requirement_mb();
@@ -144,13 +91,10 @@ impl NativeProviderFactory {
         Ok(manager)
     }
 
-    /// Check API provider availability (Claude API key configured, etc.)
-    pub fn check_provider_availability(config: &NativeProviderConfig) -> ProviderAvailability {
-        let claude_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+    /// Check API provider availability
+    pub fn check_provider_availability() -> ProviderAvailability {
         ProviderAvailability {
-            whisper_model: config.model_dir.join("whisper/base.bin").exists(),
-            claude_api_key,
-            model_dir_exists: config.model_dir.exists(),
+            claude_api_key: std::env::var("ANTHROPIC_API_KEY").is_ok(),
         }
     }
 }
@@ -158,25 +102,19 @@ impl NativeProviderFactory {
 /// Provider availability status
 #[derive(Debug, Clone)]
 pub struct ProviderAvailability {
-    pub whisper_model: bool,
+    /// Whether ANTHROPIC_API_KEY environment variable is set
     pub claude_api_key: bool,
-    pub model_dir_exists: bool,
 }
 
 impl ProviderAvailability {
+    /// Check if all required providers are available
     pub fn all_available(&self) -> bool {
-        self.whisper_model && self.claude_api_key
+        self.claude_api_key
     }
 
-    pub fn any_available(&self) -> bool {
-        self.whisper_model || self.claude_api_key
-    }
-
+    /// List missing provider configurations
     pub fn missing_providers(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-        if !self.whisper_model {
-            missing.push("whisper-model");
-        }
         if !self.claude_api_key {
             missing.push("ANTHROPIC_API_KEY");
         }
@@ -190,20 +128,14 @@ mod tests {
 
     #[test]
     fn test_provider_availability_check() {
-        let config = NativeProviderConfig::default();
-        let availability = NativeProviderFactory::check_provider_availability(&config);
-
-        // Should not panic
+        let availability = NativeProviderFactory::check_provider_availability();
         let _all = availability.all_available();
-        let _any = availability.any_available();
         let _missing = availability.missing_providers();
     }
 
     #[tokio::test]
     async fn test_provider_manager_creation() {
         let config = NativeProviderConfig::default();
-
-        // Should succeed even without models (will use mocks)
         let manager = NativeProviderFactory::create_provider_manager(&config).await;
         assert!(manager.is_ok());
     }

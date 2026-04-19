@@ -8,7 +8,6 @@
 
 pub mod audio_processor;
 pub mod audio_processor_advanced;
-pub mod audio_processor_rnnoise;
 pub mod audio_processor_simple;
 pub mod commands;
 pub mod context_builder;

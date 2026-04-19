@@ -18,17 +18,13 @@ use thiserror::Error;
 pub mod claude; // Claude API integration
 pub mod mock; // Mock providers for testing
 pub mod native_factory; // Factory for creating providers
-pub mod native_tts; // Native Rust TTS
 pub mod ollama; // Ollama local LLM integration (optional)
-pub mod whisper; // Whisper with C++ bindings (requires libclang)
 
 // Re-exports for convenience
 pub use claude::ClaudeProvider;
 pub use mock::{MockASRProvider, MockLLMProvider, MockTTSProvider};
 pub use native_factory::{NativeProviderConfig, NativeProviderFactory};
-pub use native_tts::{NativeTTSConfig, NativeTTSProvider};
 pub use ollama::OllamaProvider;
-pub use whisper::{ModelSize as WhisperModelSize, WhisperProvider};
 
 /// Error types for AI providers
 #[derive(Error, Debug)]
