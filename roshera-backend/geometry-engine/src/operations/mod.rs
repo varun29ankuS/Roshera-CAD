@@ -61,7 +61,7 @@ pub use draft::{apply_draft, DraftOptions};
 pub use extrude::{extrude_face, extrude_profile, ExtrudeOptions};
 pub use fillet::{fillet_edges, fillet_vertices, FilletOptions};
 pub use g2_blending::{BlendingComplexity, G2BlendingOperations, G2QualityReport};
-pub use loft::{loft_profiles, LoftOptions};
+pub use loft::{compute_planar_surface_from_edges, loft_profiles, LoftOptions};
 pub use offset::{offset_face, offset_solid, OffsetOptions};
 pub use pattern::{create_pattern, PatternOptions, PatternType};
 pub use revolve::{revolve_face, revolve_profile, RevolveOptions};

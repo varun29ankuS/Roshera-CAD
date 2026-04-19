@@ -11,7 +11,37 @@ use crate::primitives::surface::{
     OffsetQuality, OffsetSurface, Surface, SurfaceIntersectionResult, SurfacePoint, SurfaceType,
 };
 use std::any::Any;
-// use std::fmt;
+
+/// Newton-Raphson closest point search on any surface with evaluate_full
+fn newton_closest_point(
+    surface: &dyn Surface,
+    point: &Point3,
+    tolerance: Tolerance,
+) -> MathResult<(f64, f64)> {
+    let mut u = 0.5;
+    let mut v = 0.5;
+    let eps = tolerance.distance();
+    let du = 1e-6;
+    let dv = 1e-6;
+
+    for _ in 0..20 {
+        let sp = surface.point_at(u, v)?;
+        let diff = *point - sp;
+        let dist = diff.magnitude();
+        if dist < eps {
+            break;
+        }
+        let sp_du = surface.point_at((u + du).min(1.0), v)?;
+        let sp_dv = surface.point_at(u, (v + dv).min(1.0))?;
+        let dpos_du = (sp_du - sp) / du;
+        let dpos_dv = (sp_dv - sp) / dv;
+        let du_step = diff.dot(&dpos_du) / dpos_du.dot(&dpos_du).max(1e-30);
+        let dv_step = diff.dot(&dpos_dv) / dpos_dv.dot(&dpos_dv).max(1e-30);
+        u = (u + du_step * 0.5).clamp(0.0, 1.0);
+        v = (v + dv_step * 0.5).clamp(0.0, 1.0);
+    }
+    Ok((u, v))
+}
 
 /// Matrix 2x2 for shape operator
 #[derive(Debug, Clone, Copy)]
@@ -209,25 +239,72 @@ impl Surface for CylindricalFillet {
         false // Not fully circular
     }
 
-    fn transform(&self, _transform: &Matrix4) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would transform spine and contact curves
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn transform(&self, transform: &Matrix4) -> Box<dyn Surface> {
+        // Transform spine and contact curves, recompute axis field
+        let transformed_spine = self.spine.transform(transform);
+        let transformed_c1 = self.contact1.transform(transform);
+        let transformed_c2 = self.contact2.transform(transform);
+        // Transform axis vectors (rotation only — use upper 3x3)
+        let axis_field: Vec<Vector3> = self
+            .axis_field
+            .iter()
+            .map(|a| transform.transform_vector(a))
+            .collect();
+        Box::new(CylindricalFillet {
+            spine: transformed_spine,
+            radius: self.radius,
+            contact1: transformed_c1,
+            contact2: transformed_c2,
+            axis_field,
+            angle_span: self.angle_span.clone(),
+        })
     }
 
     fn type_name(&self) -> &'static str {
         "CylindricalFillet"
     }
 
-    fn closest_point(&self, _point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Simplified - would implement Newton-Raphson
-        Ok((0.5, 0.5))
+    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        // Newton-Raphson iteration to find closest (u, v) parameter
+        let mut u = 0.5;
+        let mut v = 0.5;
+        let max_iter = 20;
+        let eps = tolerance.distance();
+
+        for _ in 0..max_iter {
+            let sp = self.evaluate_full(u, v)?;
+            let diff = *point - sp.position;
+            let dist = diff.magnitude();
+            if dist < eps {
+                break;
+            }
+            // Approximate gradient using finite differences
+            let du = 1e-6;
+            let dv = 1e-6;
+            let sp_du = self.evaluate_full((u + du).min(1.0), v)?;
+            let sp_dv = self.evaluate_full(u, (v + dv).min(1.0))?;
+            let dpos_du = (sp_du.position - sp.position) / du;
+            let dpos_dv = (sp_dv.position - sp.position) / dv;
+            // Project diff onto tangent plane
+            let du_step = diff.dot(&dpos_du) / dpos_du.dot(&dpos_du).max(1e-30);
+            let dv_step = diff.dot(&dpos_dv) / dpos_dv.dot(&dpos_dv).max(1e-30);
+            u = (u + du_step * 0.5).clamp(0.0, 1.0);
+            v = (v + dv_step * 0.5).clamp(0.0, 1.0);
+        }
+        Ok((u, v))
     }
 
-    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would create a new CylindricalFillet with offset radius
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+        // Create a new cylindrical fillet with adjusted radius
+        let new_radius = (self.radius + distance).abs();
+        Box::new(CylindricalFillet {
+            spine: self.spine.clone_box(),
+            radius: new_radius,
+            contact1: self.contact1.clone_box(),
+            contact2: self.contact2.clone_box(),
+            axis_field: self.axis_field.clone(),
+            angle_span: self.angle_span.clone(),
+        })
     }
 
     fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
@@ -419,25 +496,34 @@ impl Surface for ToroidalFillet {
         (self.angle_bounds.1 - self.angle_bounds.0) >= std::f64::consts::TAU - 1e-10
     }
 
-    fn transform(&self, _transform: &Matrix4) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would transform center curve and contacts
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn transform(&self, transform: &Matrix4) -> Box<dyn Surface> {
+        Box::new(ToroidalFillet {
+            major_radius: self.major_radius,
+            minor_radius: self.minor_radius,
+            center_curve: self.center_curve.transform(transform),
+            angle_bounds: self.angle_bounds,
+            contact1: self.contact1.transform(transform),
+            contact2: self.contact2.transform(transform),
+        })
     }
 
     fn type_name(&self) -> &'static str {
         "ToroidalFillet"
     }
 
-    fn closest_point(&self, _point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Simplified - would implement Newton-Raphson
-        Ok((0.5, 0.5))
+    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        newton_closest_point(self, point, tolerance)
     }
 
-    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would create a new ToroidalFillet with offset radius
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+        Box::new(ToroidalFillet {
+            major_radius: self.major_radius,
+            minor_radius: (self.minor_radius + distance).abs(),
+            center_curve: self.center_curve.clone_box(),
+            angle_bounds: self.angle_bounds,
+            contact1: self.contact1.clone_box(),
+            contact2: self.contact2.clone_box(),
+        })
     }
 
     fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
@@ -630,10 +716,15 @@ impl Surface for SphericalFillet {
         (self.v_bounds.1 - self.v_bounds.0) >= std::f64::consts::TAU - 1e-10
     }
 
-    fn transform(&self, _transform: &Matrix4) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would transform center and edges
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn transform(&self, transform: &Matrix4) -> Box<dyn Surface> {
+        let new_center = transform.transform_point(&self.center);
+        Box::new(SphericalFillet {
+            center: new_center,
+            radius: self.radius,
+            u_bounds: self.u_bounds,
+            v_bounds: self.v_bounds,
+            edges: self.edges.iter().map(|e| e.transform(transform)).collect(),
+        })
     }
 
     fn type_name(&self) -> &'static str {
@@ -641,23 +732,36 @@ impl Surface for SphericalFillet {
     }
 
     fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Project point to sphere
+        // Project point onto sphere surface and map to parameter space
         let to_point = *point - self.center;
         let dist = to_point.magnitude();
         if dist < 1e-10 {
             return Ok((0.5, 0.5));
         }
 
-        // Convert to spherical coordinates
-        let on_sphere = self.center + to_point.normalize()? * self.radius;
-        // Map to parameter space - simplified
-        Ok((0.5, 0.5))
+        let dir = to_point / dist;
+        let theta_range = self.u_bounds.1 - self.u_bounds.0;
+        let phi_range = self.v_bounds.1 - self.v_bounds.0;
+
+        // Convert direction to spherical coordinates
+        let theta = dir.z.acos(); // polar angle
+        let phi = dir.y.atan2(dir.x); // azimuthal angle
+        let phi = if phi < 0.0 { phi + std::f64::consts::TAU } else { phi };
+
+        // Map to [0, 1] parameter space
+        let u = ((theta - self.u_bounds.0) / theta_range).clamp(0.0, 1.0);
+        let v = ((phi - self.v_bounds.0) / phi_range).clamp(0.0, 1.0);
+        Ok((u, v))
     }
 
-    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would create a new SphericalFillet with offset radius
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+        Box::new(SphericalFillet {
+            center: self.center,
+            radius: (self.radius + distance).abs(),
+            u_bounds: self.u_bounds,
+            v_bounds: self.v_bounds,
+            edges: self.edges.iter().map(|e| e.clone_box()).collect(),
+        })
     }
 
     fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
@@ -806,66 +910,106 @@ impl Surface for VariableRadiusFillet {
     }
 
     fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
-        // Would delegate to NURBS implementation
-        // For now, return a dummy surface point
+        // Evaluate NURBS with second-order derivatives
+        let eval = self.nurbs.evaluate_derivatives(u, v, 2, 2);
+        let position = eval.point;
+        let du = eval.du.unwrap_or(Vector3::ZERO);
+        let dv = eval.dv.unwrap_or(Vector3::ZERO);
+        let normal = eval
+            .normal
+            .or_else(|| {
+                let n = du.cross(&dv);
+                let mag = n.magnitude();
+                if mag > 1e-15 { Some(n / mag) } else { None }
+            })
+            .unwrap_or(Vector3::Z);
+
+        let duu = eval.duu.unwrap_or(Vector3::ZERO);
+        let dvv = eval.dvv.unwrap_or(Vector3::ZERO);
+        let duv = eval.duv.unwrap_or(Vector3::ZERO);
+
+        // Compute principal curvatures from second fundamental form
+        let e = duu.dot(&normal);
+        let f = duv.dot(&normal);
+        let g = dvv.dot(&normal);
+        let big_e = du.dot(&du);
+        let big_f = du.dot(&dv);
+        let big_g = dv.dot(&dv);
+        let denom = big_e * big_g - big_f * big_f;
+        let (k1, k2) = if denom.abs() > 1e-20 {
+            let mean = (e * big_g - 2.0 * f * big_f + g * big_e) / (2.0 * denom);
+            let gauss = (e * g - f * f) / denom;
+            let disc = (mean * mean - gauss).max(0.0).sqrt();
+            (mean + disc, mean - disc)
+        } else {
+            (0.0, 0.0)
+        };
+
         Ok(SurfacePoint {
-            position: Point3::new(u, v, 0.0),
-            du: Vector3::X,
-            dv: Vector3::Y,
-            duu: Vector3::ZERO,
-            duv: Vector3::ZERO,
-            dvv: Vector3::ZERO,
-            normal: Vector3::Z,
-            k1: 0.0,
-            k2: 0.0,
-            dir1: Vector3::X,
-            dir2: Vector3::Y,
+            position,
+            du,
+            dv,
+            duu,
+            duv,
+            dvv,
+            normal,
+            k1,
+            k2,
+            dir1: du.normalize().unwrap_or(Vector3::X),
+            dir2: dv.normalize().unwrap_or(Vector3::Y),
         })
     }
 
-    fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
-        // Would evaluate NURBS at (u,v)
-        // For now, return a dummy point
-        Ok(Point3::new(u, v, 0.0))
-    }
-
-    fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
-        // Would compute normal from NURBS
-        Ok(Vector3::Z)
-    }
-
     fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
-        // Would get from NURBS
-        ((0.0, 1.0), (0.0, 1.0))
+        self.nurbs.parameter_bounds()
     }
 
     fn is_closed_u(&self) -> bool {
-        false // Simplified
+        false
     }
 
     fn is_closed_v(&self) -> bool {
-        false // Simplified
+        false
     }
 
-    fn transform(&self, _transform: &Matrix4) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would transform NURBS control points
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn transform(&self, transform: &Matrix4) -> Box<dyn Surface> {
+        let mut transformed_nurbs = self.nurbs.clone();
+        let _ = transformed_nurbs.transform(transform);
+        Box::new(VariableRadiusFillet {
+            nurbs: transformed_nurbs,
+            spine: self.spine.transform(transform),
+            radius_samples: self.radius_samples.clone(),
+            contact1: self.contact1.transform(transform),
+            contact2: self.contact2.transform(transform),
+        })
     }
 
     fn type_name(&self) -> &'static str {
         "VariableRadiusFillet"
     }
 
-    fn closest_point(&self, _point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Simplified - would delegate to NURBS closest point
-        Ok((0.5, 0.5))
+    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        newton_closest_point(self, point, tolerance)
     }
 
-    fn offset(&self, _distance: f64) -> Box<dyn Surface> {
-        // For now, just return a plane as placeholder
-        // In production, would offset the NURBS surface
-        Box::new(crate::primitives::surface::Plane::xy(0.0))
+    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+        // Offset the variable radius fillet by adjusting radius samples and rebuilding NURBS
+        let offset_radii: Vec<f64> = self
+            .radius_samples
+            .iter()
+            .map(|r| (r + distance).abs())
+            .collect();
+        // Rebuild the fillet with new radii
+        match VariableRadiusFillet::new(
+            self.spine.clone_box(),
+            *offset_radii.first().unwrap_or(&1.0),
+            *offset_radii.last().unwrap_or(&1.0),
+            self.contact1.clone_box(),
+            self.contact2.clone_box(),
+        ) {
+            Ok(fillet) => Box::new(fillet),
+            Err(_) => Box::new(self.clone()),
+        }
     }
 
     fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {

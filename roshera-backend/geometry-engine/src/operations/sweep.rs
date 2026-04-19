@@ -148,6 +148,95 @@ pub enum SweepQuality {
     High,
 }
 
+/// Options for multi-guide sweep
+#[derive(Debug)]
+pub struct MultiGuideSweepOptions {
+    /// Common sweep options
+    pub sweep: SweepOptions,
+    /// Additional guide curves beyond the primary path
+    pub guide_edges: Vec<crate::primitives::edge::EdgeId>,
+}
+
+/// Options for rail sweep
+#[derive(Debug)]
+pub struct RailSweepOptions {
+    /// Common sweep options
+    pub sweep: SweepOptions,
+    /// Rail edge that controls orientation and scale
+    pub rail_edge: crate::primitives::edge::EdgeId,
+}
+
+/// Options for bi-rail sweep
+#[derive(Debug)]
+pub struct BiRailSweepOptions {
+    /// Common sweep options
+    pub sweep: SweepOptions,
+    /// First rail edge
+    pub rail1_edge: crate::primitives::edge::EdgeId,
+    /// Second rail edge
+    pub rail2_edge: crate::primitives::edge::EdgeId,
+}
+
+/// Sweep a profile along multiple guide curves.
+///
+/// The profile is transformed at each station so that its key points track
+/// the corresponding guide curves simultaneously, producing a surface that
+/// honours every guide rail.
+///
+/// # Errors
+/// Returns `OperationError::NotImplemented` — multi-guide geometry solver is
+/// scheduled for a future release.
+pub fn create_multi_guide_sweep(
+    _model: &mut BRepModel,
+    _profile: Vec<EdgeId>,
+    _path: EdgeId,
+    _options: MultiGuideSweepOptions,
+) -> OperationResult<SolidId> {
+    Err(OperationError::NotImplemented(
+        "Multi-guide sweep requires a multi-constraint frame solver; scheduled for a future release".to_string(),
+    ))
+}
+
+/// Sweep a profile along a path with a single orientation rail.
+///
+/// The rail curve constrains the rotational degree of freedom of the sweep
+/// frame at each station, preventing unwanted twist along the path.
+///
+/// # Errors
+/// Returns `OperationError::NotImplemented` — rail-constrained sweep is
+/// scheduled for a future release.
+pub fn create_rail_sweep(
+    _model: &mut BRepModel,
+    _profile: Vec<EdgeId>,
+    _path: EdgeId,
+    _options: RailSweepOptions,
+) -> OperationResult<SolidId> {
+    Err(OperationError::NotImplemented(
+        "Rail sweep requires a rail-constrained frame solver; scheduled for a future release".to_string(),
+    ))
+}
+
+/// Sweep a profile along a path constrained by two rail curves.
+///
+/// Both rails govern the sweep frame simultaneously: the first rail fixes
+/// one side of the profile and the second rail fixes the other, so the
+/// profile cross-section scales and rotates to remain in contact with both
+/// rails at every station.
+///
+/// # Errors
+/// Returns `OperationError::NotImplemented` — bi-rail sweep is scheduled for
+/// a future release.
+pub fn create_birail_sweep(
+    _model: &mut BRepModel,
+    _profile: Vec<EdgeId>,
+    _path: EdgeId,
+    _options: BiRailSweepOptions,
+) -> OperationResult<SolidId> {
+    Err(OperationError::NotImplemented(
+        "Bi-rail sweep requires a dual-rail constraint solver; scheduled for a future release".to_string(),
+    ))
+}
+
 /// Sweep a profile along a path
 pub fn sweep_profile(
     model: &mut BRepModel,
@@ -173,17 +262,17 @@ pub fn sweep_profile(
         SweepType::Path => create_path_sweep(model, profile_face, &path_edge, &options)?,
         SweepType::MultiGuide => {
             return Err(OperationError::NotImplemented(
-                "Multi-guide sweep not yet implemented".to_string(),
+                "Multi-guide sweep requires a multi-constraint frame solver; scheduled for a future release".to_string(),
             ));
         }
         SweepType::Rail => {
             return Err(OperationError::NotImplemented(
-                "Rail sweep not yet implemented".to_string(),
+                "Rail sweep requires a rail-constrained frame solver; scheduled for a future release".to_string(),
             ));
         }
         SweepType::BiRail => {
             return Err(OperationError::NotImplemented(
-                "Bi-rail sweep not yet implemented".to_string(),
+                "Bi-rail sweep requires a dual-rail constraint solver; scheduled for a future release".to_string(),
             ));
         }
     };
@@ -412,7 +501,8 @@ fn compute_scale_at_parameter(t: f64, scale_control: &ScaleControl) -> Operation
         ScaleControl::Linear(start, end) => Ok(start + (end - start) * t),
         ScaleControl::Function(func) => Ok(func(t)),
         ScaleControl::Rails => Err(OperationError::NotImplemented(
-            "Rail-based scaling not yet implemented".to_string(),
+            "Rail-based scaling requires a bi-rail frame solver; scheduled for a future release"
+                .to_string(),
         )),
     }
 }
@@ -607,17 +697,56 @@ fn create_or_find_edge(
     Ok(model.edges.add(edge))
 }
 
-/// Create bilinear surface
+/// Create bilinear surface spanning four corner vertices.
+///
+/// The surface is a ruled surface whose two boundary generators are the line
+/// from `v1→v2` (at v=0) and the line from `v4→v3` (at v=1).  Evaluating
+/// at parameter (u, v) performs bilinear interpolation across the quad:
+///
+/// ```text
+///   P(u, v) = (1-v)*[(1-u)*P1 + u*P2] + v*[(1-u)*P4 + u*P3]
+/// ```
+///
+/// This matches the `RuledSurface` definition exactly when both generators
+/// are straight lines.
 fn create_bilinear_surface(
-    _model: &BRepModel,
-    _v1: VertexId,
-    _v2: VertexId,
-    _v3: VertexId,
-    _v4: VertexId,
+    model: &BRepModel,
+    v1: VertexId,
+    v2: VertexId,
+    v3: VertexId,
+    v4: VertexId,
 ) -> OperationResult<Box<dyn Surface>> {
-    Err(OperationError::NotImplemented(
-        "Bilinear surface not yet implemented".to_string(),
-    ))
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::RuledSurface;
+
+    // Resolve corner positions.
+    let p1 = model
+        .vertices
+        .get(v1)
+        .ok_or_else(|| OperationError::InvalidGeometry("Vertex v1 not found".to_string()))?
+        .point();
+    let p2 = model
+        .vertices
+        .get(v2)
+        .ok_or_else(|| OperationError::InvalidGeometry("Vertex v2 not found".to_string()))?
+        .point();
+    let p3 = model
+        .vertices
+        .get(v3)
+        .ok_or_else(|| OperationError::InvalidGeometry("Vertex v3 not found".to_string()))?
+        .point();
+    let p4 = model
+        .vertices
+        .get(v4)
+        .ok_or_else(|| OperationError::InvalidGeometry("Vertex v4 not found".to_string()))?
+        .point();
+
+    // Generator at v=0: v1 → v2
+    let gen0: Box<dyn crate::primitives::curve::Curve> = Box::new(Line::new(p1, p2));
+    // Generator at v=1: v4 → v3
+    let gen1: Box<dyn crate::primitives::curve::Curve> = Box::new(Line::new(p4, p3));
+
+    Ok(Box::new(RuledSurface::new(gen0, gen1)))
 }
 
 /// Create profile face from edges

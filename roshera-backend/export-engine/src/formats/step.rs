@@ -426,12 +426,34 @@ impl<W: Write> StepWriter<W> {
                 start_angle,
                 end_angle,
             } => {
-                // Write ARC entity - similar to circle but with angle limits
+                // Write basis CIRCLE entity first
+                let basis_circle_id = self.write_circle(
+                    &[center[0], center[1], center[2]],
+                    &[normal[0], normal[1], normal[2]],
+                    *radius,
+                )?;
+
+                // Write trim parameter points
+                let trim1_id = self.next_id();
+                writeln!(
+                    self.writer,
+                    "{}=PARAMETER_VALUE({});",
+                    trim1_id, start_angle
+                )?;
+                let trim2_id = self.next_id();
+                writeln!(
+                    self.writer,
+                    "{}=PARAMETER_VALUE({});",
+                    trim2_id, end_angle
+                )?;
+
+                // Write TRIMMED_CURVE referencing the basis circle
                 let id = self.next_id();
                 writeln!(
                     self.writer,
-                    "{}=TRIMMED_CURVE('',#999,({},{}),#999,.T.,.PARAMETER.);",
-                    id, start_angle, end_angle
+                    "{}=TRIMMED_CURVE('',{},({}),({}),{},.PARAMETER.);",
+                    id, basis_circle_id, trim1_id, trim2_id,
+                    if end_angle > start_angle { ".T." } else { ".F." }
                 )?;
                 Ok(id)
             }
@@ -546,6 +568,22 @@ impl<W: Write> StepWriter<W> {
         }
     }
 
+    /// Write a LINE entity using already-written vertex STEP IDs as endpoints
+    fn write_line_from_vertices(
+        &mut self,
+        start_vertex_id: StepId,
+        end_vertex_id: StepId,
+    ) -> std::io::Result<StepId> {
+        // Create a direction placeholder (unit X — the actual geometry is defined by vertices)
+        let dir_id = self.write_direction(&[1.0, 0.0, 0.0])?;
+        let vec_id = self.next_id();
+        writeln!(self.writer, "{}=VECTOR('',{},1.0);", vec_id, dir_id)?;
+
+        let id = self.next_id();
+        writeln!(self.writer, "{}=LINE('',{},{});", id, start_vertex_id, vec_id)?;
+        Ok(id)
+    }
+
     /// Write an edge entity
     pub fn write_edge(
         &mut self,
@@ -567,14 +605,17 @@ impl<W: Write> StepWriter<W> {
         let v2_id = self.next_id();
         writeln!(self.writer, "{}=VERTEX('',{});", v2_id, end_vertex)?;
 
-        // Write EDGE_CURVE
+        // Write EDGE_CURVE — if no curve exists, synthesize a straight line
         let curve_id = if let Some(curve_uuid) = &edge.curve {
-            curve_map
-                .get(curve_uuid)
-                .map(|id| *id)
-                .unwrap_or_else(|| StepId(9999)) // Placeholder for missing curve
+            if let Some(&id) = curve_map.get(curve_uuid) {
+                id
+            } else {
+                // Curve UUID exists but wasn't written — create a line from start to end vertex
+                self.write_line_from_vertices(*start_vertex, *end_vertex)?
+            }
         } else {
-            StepId(9999) // No curve defined
+            // No curve defined — create a straight line from start to end vertex
+            self.write_line_from_vertices(*start_vertex, *end_vertex)?
         };
 
         let id = self.next_id();
@@ -592,6 +633,7 @@ impl<W: Write> StepWriter<W> {
         face: &crate::formats::ros_snapshot::FaceData,
         surface_map: &HashMap<&uuid::Uuid, StepId>,
         edge_map: &HashMap<&uuid::Uuid, StepId>,
+        loop_map: &HashMap<&uuid::Uuid, &crate::formats::ros_snapshot::LoopData>,
     ) -> std::io::Result<StepId> {
         let surface_id = if let Some(surface_uuid) = &face.surface {
             surface_map.get(surface_uuid).copied().ok_or_else(|| {
@@ -607,27 +649,35 @@ impl<W: Write> StepWriter<W> {
         // Write face bounds (loops)
         let mut bound_ids = Vec::new();
 
-        // Outer loop
-        if let Some(_outer_loop_uuid) = &face.outer_loop {
-            // For now, we'll just create a placeholder loop
-            // In a real implementation, we'd need to look up the loop edges
-            let outer_edges: Vec<StepId> = Vec::new();
+        // Outer loop — look up edges from loop data
+        if let Some(outer_loop_uuid) = &face.outer_loop {
+            if let Some(loop_data) = loop_map.get(outer_loop_uuid) {
+                let outer_edges: Vec<StepId> = loop_data
+                    .edges
+                    .iter()
+                    .filter_map(|edge_uuid| edge_map.get(edge_uuid).copied())
+                    .collect();
 
-            if !outer_edges.is_empty() {
-                let loop_id = self.write_face_loop(&outer_edges, true)?;
-                bound_ids.push(loop_id);
+                if !outer_edges.is_empty() {
+                    let loop_id = self.write_face_loop(&outer_edges, true)?;
+                    bound_ids.push(loop_id);
+                }
             }
         }
 
-        // Inner loops (holes)
-        for _inner_loop_uuid in &face.inner_loops {
-            // For now, we'll just create placeholder loops
-            // In a real implementation, we'd need to look up the loop edges
-            let inner_edges: Vec<StepId> = Vec::new();
+        // Inner loops (holes) — look up edges from loop data
+        for inner_loop_uuid in &face.inner_loops {
+            if let Some(loop_data) = loop_map.get(inner_loop_uuid) {
+                let inner_edges: Vec<StepId> = loop_data
+                    .edges
+                    .iter()
+                    .filter_map(|edge_uuid| edge_map.get(edge_uuid).copied())
+                    .collect();
 
-            if !inner_edges.is_empty() {
-                let loop_id = self.write_face_loop(&inner_edges, false)?;
-                bound_ids.push(loop_id);
+                if !inner_edges.is_empty() {
+                    let loop_id = self.write_face_loop(&inner_edges, false)?;
+                    bound_ids.push(loop_id);
+                }
             }
         }
 
@@ -723,15 +773,55 @@ impl<W: Write> StepWriter<W> {
         let id = self.next_id();
         writeln!(self.writer, "{}=MANIFOLD_SOLID_BREP('',{});", id, shell_id)?;
 
+        // Write geometric context for the shape representation
+        let context_id = self.write_geometric_context()?;
+
         // Write ADVANCED_BREP_SHAPE_REPRESENTATION
         let shape_id = self.next_id();
         writeln!(
             self.writer,
-            "{}=ADVANCED_BREP_SHAPE_REPRESENTATION('',({}),#999);",
-            shape_id, id
+            "{}=ADVANCED_BREP_SHAPE_REPRESENTATION('',({},{}),{});",
+            shape_id, id, context_id, context_id
         )?;
 
         Ok(shape_id)
+    }
+
+    /// Write a geometric representation context (required by ADVANCED_BREP_SHAPE_REPRESENTATION)
+    fn write_geometric_context(&mut self) -> std::io::Result<StepId> {
+        // Length unit: millimeters
+        let mm_id = self.next_id();
+        writeln!(self.writer, "{}=( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );", mm_id)?;
+
+        // Angle unit: radians
+        let rad_id = self.next_id();
+        writeln!(self.writer, "{}=( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );", rad_id)?;
+
+        // Solid angle unit: steradians
+        let sr_id = self.next_id();
+        writeln!(self.writer, "{}=( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );", sr_id)?;
+
+        // Uncertainty measure
+        let uncertainty_id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),{},'distance_accuracy_value','Maximum model space distance');",
+            uncertainty_id, mm_id
+        )?;
+
+        // Geometric representation context
+        let ctx_id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT(({uncertainty})) GLOBAL_UNIT_ASSIGNED_CONTEXT(({mm},{rad},{sr})) REPRESENTATION_CONTEXT('Context3D','3D Context with 1e-7 uncertainty') );",
+            ctx_id,
+            uncertainty = uncertainty_id,
+            mm = mm_id,
+            rad = rad_id,
+            sr = sr_id
+        )?;
+
+        Ok(ctx_id)
     }
 
     /// Flush the writer
@@ -906,11 +996,18 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
         edge_map.insert(eid, step_id);
     }
 
+    // Build loop lookup map: Uuid -> &LoopData
+    let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> = snapshot
+        .loops
+        .iter()
+        .map(|(id, data)| (id, data))
+        .collect();
+
     // Step 5: Write all faces as ADVANCED_FACE
     let mut face_map = HashMap::new();
     for (fid, face) in &snapshot.faces {
         let step_id = writer
-            .write_face(face, &surface_map, &edge_map)
+            .write_face(face, &surface_map, &edge_map, &loop_map)
             .map_err(|e| ExportError::ExportFailed {
                 reason: format!("Failed to write face: {}", e),
             })?;
@@ -992,11 +1089,9 @@ pub async fn export_assembly_to_step(
             let snapshot = BRepSnapshot::from_model(&component.part);
 
             // Write all geometry entities for this component
-            // (Following the same pattern as export_brep_to_step)
             let mut vertex_map = HashMap::new();
             for (vid, vertex) in &snapshot.vertices {
-                let point = vertex.position;
-                let step_id = writer.write_cartesian_point(&point).map_err(|e| {
+                let step_id = writer.write_cartesian_point(&vertex.position).map_err(|e| {
                     ExportError::ExportFailed {
                         reason: format!("Failed to write vertex: {}", e),
                     }
@@ -1004,12 +1099,73 @@ pub async fn export_assembly_to_step(
                 vertex_map.insert(vid, step_id);
             }
 
-            // ... (curves, surfaces, edges, faces, shells, solids)
-            // This follows the same pattern as in export_brep_to_step
+            let mut curve_map = HashMap::new();
+            for (cid, curve) in &snapshot.curves {
+                let step_id = writer.write_curve(curve, &vertex_map).map_err(|e| {
+                    ExportError::ExportFailed {
+                        reason: format!("Failed to write curve: {}", e),
+                    }
+                })?;
+                curve_map.insert(cid, step_id);
+            }
 
-            // Store component ID and transform
-            let shape_id = writer.next_id();
-            component_step_ids.push((shape_id, component.transform.clone()));
+            let mut surface_map = HashMap::new();
+            for (sid, surface) in &snapshot.surfaces {
+                let step_id = writer.write_surface(surface).map_err(|e| {
+                    ExportError::ExportFailed {
+                        reason: format!("Failed to write surface: {}", e),
+                    }
+                })?;
+                surface_map.insert(sid, step_id);
+            }
+
+            let mut edge_map = HashMap::new();
+            for (eid, edge) in &snapshot.edges {
+                let step_id = writer.write_edge(edge, &vertex_map, &curve_map).map_err(|e| {
+                    ExportError::ExportFailed {
+                        reason: format!("Failed to write edge: {}", e),
+                    }
+                })?;
+                edge_map.insert(eid, step_id);
+            }
+
+            let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> = snapshot
+                .loops
+                .iter()
+                .map(|(id, data)| (id, data))
+                .collect();
+
+            let mut face_map = HashMap::new();
+            for (fid, face) in &snapshot.faces {
+                let step_id = writer.write_face(face, &surface_map, &edge_map, &loop_map).map_err(|e| {
+                    ExportError::ExportFailed {
+                        reason: format!("Failed to write face: {}", e),
+                    }
+                })?;
+                face_map.insert(fid, step_id);
+            }
+
+            let mut shell_map = HashMap::new();
+            for (sid, shell) in &snapshot.shells {
+                let step_id = writer.write_shell(shell, &face_map).map_err(|e| {
+                    ExportError::ExportFailed {
+                        reason: format!("Failed to write shell: {}", e),
+                    }
+                })?;
+                shell_map.insert(sid, step_id);
+            }
+
+            // Write solids and capture the last shape ID for this component
+            let mut last_shape_id = writer.next_id(); // fallback
+            for (solid_id, solid) in &snapshot.solids {
+                last_shape_id = writer.write_solid(solid, solid_id, &shell_map).map_err(|e| {
+                    ExportError::ExportFailed {
+                        reason: format!("Failed to write solid: {}", e),
+                    }
+                })?;
+            }
+
+            component_step_ids.push((last_shape_id, component.transform.clone()));
         }
     }
 
@@ -1075,16 +1231,34 @@ pub async fn import_step_to_brep(path: &Path) -> Result<BRepModel, ExportError> 
         });
     }
 
-    // TODO: Implement full STEP parser
-    // This requires:
-    // 1. Parsing HEADER section
-    // 2. Parsing DATA section with entity definitions
-    // 3. Building entity reference map
-    // 4. Converting STEP entities to B-Rep entities
-    // 5. Reconstructing topology relationships
+    // Parse all lines into a single buffer, stripping comments
+    let mut data_section = String::new();
+    let mut in_data = false;
+    for line_result in lines {
+        let line = line_result.map_err(|e| ExportError::ExportFailed {
+            reason: format!("Failed to read STEP file: {}", e),
+        })?;
+        let trimmed = line.trim();
+        if trimmed == "DATA;" {
+            in_data = true;
+            continue;
+        }
+        if trimmed == "ENDSEC;" && in_data {
+            break;
+        }
+        if in_data {
+            data_section.push_str(trimmed);
+            data_section.push(' ');
+        }
+    }
 
-    // For now, return empty model
-    Ok(BRepModel::new())
+    // Parse entities: #N=TYPE(...);
+    let entities = parse_step_entities(&data_section)?;
+
+    // Build B-Rep model from parsed entities
+    let model = reconstruct_brep_from_step(&entities)?;
+
+    Ok(model)
 }
 
 /// STEP export options
@@ -1117,5 +1291,665 @@ impl Default for StepExportOptions {
             include_layers: true,
             tolerance: 1e-6,
         }
+    }
+}
+
+// ── STEP Import Parser ──────────────────────────────────────────────────────
+
+/// A parsed STEP entity with its type name and raw argument string
+#[derive(Debug, Clone)]
+struct StepEntity {
+    id: u32,
+    type_name: String,
+    args: String,
+}
+
+/// Parse all `#N=TYPE(...)` entities from the DATA section text
+fn parse_step_entities(data: &str) -> Result<HashMap<u32, StepEntity>, ExportError> {
+    let mut entities = HashMap::new();
+    // Regex-free parser: split on `;` then parse each statement
+    for statement in data.split(';') {
+        let stmt = statement.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        // Find #N=TYPE(...)
+        let Some(hash_pos) = stmt.find('#') else {
+            continue;
+        };
+        let after_hash = &stmt[hash_pos + 1..];
+        let Some(eq_pos) = after_hash.find('=') else {
+            continue;
+        };
+        let id_str = after_hash[..eq_pos].trim();
+        let Ok(id) = id_str.parse::<u32>() else {
+            continue;
+        };
+        let rhs = after_hash[eq_pos + 1..].trim();
+        // Find type name (everything before first '(')
+        let Some(paren_pos) = rhs.find('(') else {
+            continue;
+        };
+        let type_name = rhs[..paren_pos].trim().to_uppercase();
+        // Extract args between outermost parens
+        let args_start = paren_pos + 1;
+        // Find matching closing paren (handle nesting)
+        let mut depth = 1;
+        let mut args_end = args_start;
+        for (i, ch) in rhs[args_start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        args_end = args_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = rhs[args_start..args_end].to_string();
+        entities.insert(id, StepEntity { id, type_name, args });
+    }
+    Ok(entities)
+}
+
+/// Parse a comma-separated list of f64 values from a STEP argument like "1.0,2.0,3.0"
+fn parse_real_list(s: &str) -> Vec<f64> {
+    s.split(',')
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .collect()
+}
+
+/// Parse a STEP entity reference like "#123" into a u32 ID
+fn parse_ref(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.starts_with('#') {
+        s[1..].parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
+/// Parse a comma-separated list of STEP references like "#1,#2,#3"
+fn parse_ref_list(s: &str) -> Vec<u32> {
+    s.split(',').filter_map(|v| parse_ref(v)).collect()
+}
+
+/// Split top-level comma-separated args (respecting nested parens)
+fn split_step_args(args: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    for ch in args.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                result.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let last = current.trim().to_string();
+    if !last.is_empty() {
+        result.push(last);
+    }
+    result
+}
+
+/// Extract coordinates from a CARTESIAN_POINT entity
+fn extract_point(entities: &HashMap<u32, StepEntity>, id: u32) -> Option<[f64; 3]> {
+    let entity = entities.get(&id)?;
+    if entity.type_name != "CARTESIAN_POINT" {
+        return None;
+    }
+    let args = split_step_args(&entity.args);
+    // args[0] = name string, args[1] = (x,y,z)
+    if args.len() < 2 {
+        return None;
+    }
+    let coords_str = args[1].trim();
+    let coords_inner = coords_str
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(coords_str);
+    let vals = parse_real_list(coords_inner);
+    if vals.len() >= 3 {
+        Some([vals[0], vals[1], vals[2]])
+    } else if vals.len() == 2 {
+        Some([vals[0], vals[1], 0.0])
+    } else {
+        None
+    }
+}
+
+/// Extract direction from a DIRECTION entity
+fn extract_direction(entities: &HashMap<u32, StepEntity>, id: u32) -> Option<[f64; 3]> {
+    let entity = entities.get(&id)?;
+    if entity.type_name != "DIRECTION" {
+        return None;
+    }
+    let args = split_step_args(&entity.args);
+    if args.len() < 2 {
+        return None;
+    }
+    let coords_str = args[1].trim();
+    let coords_inner = coords_str
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(coords_str);
+    let vals = parse_real_list(coords_inner);
+    if vals.len() >= 3 {
+        Some([vals[0], vals[1], vals[2]])
+    } else {
+        None
+    }
+}
+
+/// Extract location and axis from AXIS2_PLACEMENT_3D
+fn extract_axis2_placement(
+    entities: &HashMap<u32, StepEntity>,
+    id: u32,
+) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
+    let entity = entities.get(&id)?;
+    if entity.type_name != "AXIS2_PLACEMENT_3D" {
+        return None;
+    }
+    let args = split_step_args(&entity.args);
+    // args: name, location_ref, axis_ref, ref_direction_ref
+    if args.len() < 2 {
+        return None;
+    }
+    let location = parse_ref(&args[1]).and_then(|r| extract_point(entities, r))?;
+    let axis = if args.len() > 2 {
+        parse_ref(&args[2])
+            .and_then(|r| extract_direction(entities, r))
+            .unwrap_or([0.0, 0.0, 1.0])
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let ref_dir = if args.len() > 3 {
+        parse_ref(&args[3])
+            .and_then(|r| extract_direction(entities, r))
+            .unwrap_or([1.0, 0.0, 0.0])
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    Some((location, axis, ref_dir))
+}
+
+/// Reconstruct a BRepModel from parsed STEP entities
+fn reconstruct_brep_from_step(
+    entities: &HashMap<u32, StepEntity>,
+) -> Result<BRepModel, ExportError> {
+    use geometry_engine::math::{Point3, Tolerance, Vector3};
+    use geometry_engine::primitives::{
+        curve::ParameterRange,
+        edge::{Edge, EdgeOrientation},
+        face::FaceOrientation,
+        r#loop::{Loop, LoopType},
+        shell::{Shell, ShellType},
+        solid::Solid,
+    };
+
+    let mut model = BRepModel::new();
+    let tolerance = Tolerance::default();
+
+    // Type aliases for readability
+    type VertexId = geometry_engine::primitives::vertex::VertexId;
+    type CurveId = geometry_engine::primitives::curve::CurveId;
+    type SurfaceId = geometry_engine::primitives::surface::SurfaceId;
+    type EdgeId = geometry_engine::primitives::edge::EdgeId;
+    type LoopId = geometry_engine::primitives::r#loop::LoopId;
+    type FaceId = geometry_engine::primitives::face::FaceId;
+    type ShellId = geometry_engine::primitives::shell::ShellId;
+
+    // Map from STEP entity ID -> internal store ID for each entity type
+    let mut vertex_id_map: HashMap<u32, VertexId> = HashMap::new();
+    let mut curve_id_map: HashMap<u32, CurveId> = HashMap::new();
+    let mut surface_id_map: HashMap<u32, SurfaceId> = HashMap::new();
+    let mut edge_id_map: HashMap<u32, EdgeId> = HashMap::new();
+
+    // Pass 1: Import CARTESIAN_POINTs as vertices
+    for (&step_id, entity) in entities {
+        if entity.type_name == "CARTESIAN_POINT" {
+            if let Some(coords) = extract_point(entities, step_id) {
+                let vid = model.vertices.add_or_find(
+                    coords[0],
+                    coords[1],
+                    coords[2],
+                    tolerance.distance(),
+                );
+                vertex_id_map.insert(step_id, vid);
+            }
+        }
+    }
+
+    // Pass 2: Import curves (LINE, CIRCLE, B_SPLINE_CURVE_WITH_KNOTS)
+    for (&step_id, entity) in entities {
+        match entity.type_name.as_str() {
+            "LINE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 3 {
+                    if let Some(start_ref) = parse_ref(&args[1]) {
+                        if let Some(start_pt) = extract_point(entities, start_ref) {
+                            // Create a line curve
+                            let p1 = Point3::new(start_pt[0], start_pt[1], start_pt[2]);
+                            let line = geometry_engine::primitives::curve::Line::new(
+                                p1,
+                                // Direction from VECTOR entity
+                                Vector3::new(1.0, 0.0, 0.0), // default, refined below
+                            );
+                            // Try to extract actual direction from the vector ref
+                            if let Some(vec_ref) = parse_ref(&args[2]) {
+                                if let Some(vec_entity) = entities.get(&vec_ref) {
+                                    if vec_entity.type_name == "VECTOR" {
+                                        let vec_args = split_step_args(&vec_entity.args);
+                                        if vec_args.len() >= 2 {
+                                            if let Some(dir_ref) = parse_ref(&vec_args[1]) {
+                                                if let Some(dir) =
+                                                    extract_direction(entities, dir_ref)
+                                                {
+                                                    let line =
+                                                        geometry_engine::primitives::curve::Line::new(
+                                                            p1,
+                                                            Vector3::new(dir[0], dir[1], dir[2]),
+                                                        );
+                                                    let cid =
+                                                        model.curves.add(Box::new(line));
+                                                    curve_id_map.insert(step_id, cid);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let cid = model.curves.add(Box::new(line));
+                            curve_id_map.insert(step_id, cid);
+                        }
+                    }
+                }
+            }
+            "CIRCLE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 3 {
+                    if let Some(axis_ref) = parse_ref(&args[1]) {
+                        if let Some((center, normal, _ref_dir)) =
+                            extract_axis2_placement(entities, axis_ref)
+                        {
+                            if let Ok(radius) = args[2].trim().parse::<f64>() {
+                                let arc = geometry_engine::primitives::curve::Arc::new(
+                                    Point3::new(center[0], center[1], center[2]),
+                                    Vector3::new(normal[0], normal[1], normal[2]),
+                                    radius,
+                                    0.0,
+                                    std::f64::consts::TAU,
+                                );
+                                if let Ok(arc) = arc {
+                                    let cid = model.curves.add(Box::new(arc));
+                                    curve_id_map.insert(step_id, cid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 3: Import surfaces (PLANE, CYLINDRICAL_SURFACE, SPHERICAL_SURFACE, etc.)
+    for (&step_id, entity) in entities {
+        match entity.type_name.as_str() {
+            "PLANE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 2 {
+                    if let Some(axis_ref) = parse_ref(&args[1]) {
+                        if let Some((origin, normal, ref_dir)) =
+                            extract_axis2_placement(entities, axis_ref)
+                        {
+                            let plane = geometry_engine::primitives::surface::Plane::new(
+                                Point3::new(origin[0], origin[1], origin[2]),
+                                Vector3::new(normal[0], normal[1], normal[2]),
+                                Vector3::new(ref_dir[0], ref_dir[1], ref_dir[2]),
+                            );
+                            if let Ok(plane) = plane {
+                                let sid = model.surfaces.add(Box::new(plane));
+                                surface_id_map.insert(step_id, sid);
+                            }
+                        }
+                    }
+                }
+            }
+            "CYLINDRICAL_SURFACE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 3 {
+                    if let Some(axis_ref) = parse_ref(&args[1]) {
+                        if let Some((origin, axis, _)) =
+                            extract_axis2_placement(entities, axis_ref)
+                        {
+                            if let Ok(radius) = args[2].trim().parse::<f64>() {
+                                let cyl = geometry_engine::primitives::surface::Cylinder::new(
+                                    Point3::new(origin[0], origin[1], origin[2]),
+                                    Vector3::new(axis[0], axis[1], axis[2]),
+                                    radius,
+                                );
+                                if let Ok(cyl) = cyl {
+                                    let sid = model.surfaces.add(Box::new(cyl));
+                                    surface_id_map.insert(step_id, sid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "SPHERICAL_SURFACE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 3 {
+                    if let Some(axis_ref) = parse_ref(&args[1]) {
+                        if let Some((center, _, _)) =
+                            extract_axis2_placement(entities, axis_ref)
+                        {
+                            if let Ok(radius) = args[2].trim().parse::<f64>() {
+                                let sphere = geometry_engine::primitives::surface::Sphere::new(
+                                    Point3::new(center[0], center[1], center[2]),
+                                    radius,
+                                );
+                                if let Ok(sphere) = sphere {
+                                    let sid = model.surfaces.add(Box::new(sphere));
+                                    surface_id_map.insert(step_id, sid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "CONICAL_SURFACE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 4 {
+                    if let Some(axis_ref) = parse_ref(&args[1]) {
+                        if let Some((apex, axis, _)) =
+                            extract_axis2_placement(entities, axis_ref)
+                        {
+                            if let (Ok(_radius), Ok(half_angle_deg)) = (
+                                args[2].trim().parse::<f64>(),
+                                args[3].trim().parse::<f64>(),
+                            ) {
+                                let cone = geometry_engine::primitives::surface::Cone::new(
+                                    Point3::new(apex[0], apex[1], apex[2]),
+                                    Vector3::new(axis[0], axis[1], axis[2]),
+                                    half_angle_deg.to_radians(),
+                                );
+                                if let Ok(cone) = cone {
+                                    let sid = model.surfaces.add(Box::new(cone));
+                                    surface_id_map.insert(step_id, sid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "TOROIDAL_SURFACE" => {
+                let args = split_step_args(&entity.args);
+                if args.len() >= 4 {
+                    if let Some(axis_ref) = parse_ref(&args[1]) {
+                        if let Some((center, axis, _)) =
+                            extract_axis2_placement(entities, axis_ref)
+                        {
+                            if let (Ok(major_r), Ok(minor_r)) = (
+                                args[2].trim().parse::<f64>(),
+                                args[3].trim().parse::<f64>(),
+                            ) {
+                                let torus = geometry_engine::primitives::surface::Torus::new(
+                                    Point3::new(center[0], center[1], center[2]),
+                                    Vector3::new(axis[0], axis[1], axis[2]),
+                                    major_r,
+                                    minor_r,
+                                );
+                                if let Ok(torus) = torus {
+                                    let sid = model.surfaces.add(Box::new(torus));
+                                    surface_id_map.insert(step_id, sid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 4: Import EDGE_CURVE entities
+    for (&step_id, entity) in entities {
+        if entity.type_name == "EDGE_CURVE" {
+            let args = split_step_args(&entity.args);
+            // args: name, start_vertex_ref, end_vertex_ref, curve_ref, same_sense
+            if args.len() >= 4 {
+                // Resolve vertex references (VERTEX_POINT -> CARTESIAN_POINT)
+                let start_vid = parse_ref(&args[1])
+                    .and_then(|vr| resolve_vertex_point(entities, vr))
+                    .and_then(|pt_id| vertex_id_map.get(&pt_id).copied());
+                let end_vid = parse_ref(&args[2])
+                    .and_then(|vr| resolve_vertex_point(entities, vr))
+                    .and_then(|pt_id| vertex_id_map.get(&pt_id).copied());
+                let curve_cid = parse_ref(&args[3]).and_then(|cr| curve_id_map.get(&cr).copied());
+
+                if let (Some(sv), Some(ev)) = (start_vid, end_vid) {
+                    // Use a default curve if not found
+                    let cid = curve_cid.unwrap_or_else(|| {
+                        // Create a placeholder line curve
+                        let line = geometry_engine::primitives::curve::Line::new(
+                            Point3::new(0.0, 0.0, 0.0),
+                            Vector3::new(1.0, 0.0, 0.0),
+                        );
+                        model.curves.add(Box::new(line))
+                    });
+
+                    let edge = Edge::new(
+                        0,
+                        sv,
+                        ev,
+                        cid,
+                        EdgeOrientation::Forward,
+                        ParameterRange::new(0.0, 1.0),
+                    );
+                    let eid = model.edges.add(edge);
+                    edge_id_map.insert(step_id, eid);
+                }
+            }
+        }
+    }
+
+    // Pass 5: Import EDGE_LOOP -> Loop, FACE_OUTER_BOUND/FACE_BOUND -> Face, CLOSED_SHELL/OPEN_SHELL -> Shell
+    let mut loop_id_map: HashMap<u32, LoopId> = HashMap::new();
+    let mut face_bound_loop_map: HashMap<u32, (LoopId, bool)> = HashMap::new();
+    let mut face_id_map: HashMap<u32, FaceId> = HashMap::new();
+    let mut shell_id_map: HashMap<u32, ShellId> = HashMap::new();
+
+    // 5a: EDGE_LOOPs
+    for (&step_id, entity) in entities {
+        if entity.type_name == "EDGE_LOOP" {
+            let args = split_step_args(&entity.args);
+            if args.len() >= 2 {
+                let refs_str = args[1].trim();
+                let refs_inner = refs_str
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .unwrap_or(refs_str);
+                let edge_refs = parse_ref_list(refs_inner);
+
+                let mut lp = Loop::new(0, LoopType::Outer);
+                for er in &edge_refs {
+                    // Edge refs might be ORIENTED_EDGE entities
+                    if let Some(eid) = resolve_oriented_edge(entities, *er, &edge_id_map) {
+                        lp.add_edge(eid, true);
+                    }
+                }
+                let lid = model.loops.add(lp);
+                loop_id_map.insert(step_id, lid);
+            }
+        }
+    }
+
+    // 5b: FACE_OUTER_BOUND and FACE_BOUND
+    for (&step_id, entity) in entities {
+        if entity.type_name == "FACE_OUTER_BOUND" || entity.type_name == "FACE_BOUND" {
+            let args = split_step_args(&entity.args);
+            if args.len() >= 2 {
+                let is_outer = entity.type_name == "FACE_OUTER_BOUND";
+                if let Some(loop_ref) = parse_ref(&args[1]) {
+                    if let Some(&lid) = loop_id_map.get(&loop_ref) {
+                        face_bound_loop_map.insert(step_id, (lid, is_outer));
+                    }
+                }
+            }
+        }
+    }
+
+    // 5c: ADVANCED_FACE
+    for (&step_id, entity) in entities {
+        if entity.type_name == "ADVANCED_FACE" {
+            let args = split_step_args(&entity.args);
+            // args: name, (bound_refs), surface_ref, same_sense
+            if args.len() >= 3 {
+                let bounds_str = args[1].trim();
+                let bounds_inner = bounds_str
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .unwrap_or(bounds_str);
+                let bound_refs = parse_ref_list(bounds_inner);
+
+                let surface_ref = parse_ref(&args[2]);
+                let sid = surface_ref.and_then(|sr| surface_id_map.get(&sr).copied());
+
+                // Find outer loop from bounds
+                let mut outer_loop_id = None;
+                for &br in &bound_refs {
+                    if let Some(&(lid, is_outer)) = face_bound_loop_map.get(&br) {
+                        if is_outer {
+                            outer_loop_id = Some(lid);
+                            break;
+                        }
+                    }
+                }
+                // If no explicit outer, take the first bound
+                if outer_loop_id.is_none() {
+                    for &br in &bound_refs {
+                        if let Some(&(lid, _)) = face_bound_loop_map.get(&br) {
+                            outer_loop_id = Some(lid);
+                            break;
+                        }
+                    }
+                }
+
+                if let (Some(surface_id), Some(loop_id)) = (sid, outer_loop_id) {
+                    let face = geometry_engine::primitives::face::Face::new(
+                        0,
+                        surface_id,
+                        loop_id,
+                        FaceOrientation::Forward,
+                    );
+                    let fid = model.faces.add(face);
+                    face_id_map.insert(step_id, fid);
+                }
+            }
+        }
+    }
+
+    // 5d: CLOSED_SHELL and OPEN_SHELL
+    for (&step_id, entity) in entities {
+        if entity.type_name == "CLOSED_SHELL" || entity.type_name == "OPEN_SHELL" {
+            let args = split_step_args(&entity.args);
+            if args.len() >= 2 {
+                let faces_str = args[1].trim();
+                let faces_inner = faces_str
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .unwrap_or(faces_str);
+                let face_refs = parse_ref_list(faces_inner);
+
+                let shell_type = if entity.type_name == "CLOSED_SHELL" {
+                    ShellType::Closed
+                } else {
+                    ShellType::Open
+                };
+                let mut shell = Shell::new(0, shell_type);
+                for &fr in &face_refs {
+                    if let Some(&fid) = face_id_map.get(&fr) {
+                        shell.add_face(fid);
+                    }
+                }
+                let shell_id = model.shells.add(shell);
+                shell_id_map.insert(step_id, shell_id);
+            }
+        }
+    }
+
+    // Pass 6: Import MANIFOLD_SOLID_BREP
+    for (_step_id, entity) in entities {
+        if entity.type_name == "MANIFOLD_SOLID_BREP" {
+            let args = split_step_args(&entity.args);
+            if args.len() >= 2 {
+                if let Some(shell_ref) = parse_ref(&args[1]) {
+                    if let Some(&shell_id) = shell_id_map.get(&shell_ref) {
+                        let solid = Solid::new(0, shell_id);
+                        model.solids.add(solid);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(model)
+}
+
+/// Resolve a VERTEX or VERTEX_POINT entity to its CARTESIAN_POINT ID
+fn resolve_vertex_point(entities: &HashMap<u32, StepEntity>, vertex_ref: u32) -> Option<u32> {
+    let entity = entities.get(&vertex_ref)?;
+    match entity.type_name.as_str() {
+        "VERTEX_POINT" | "VERTEX" => {
+            let args = split_step_args(&entity.args);
+            // args: name, point_ref
+            if args.len() >= 2 {
+                parse_ref(&args[1])
+            } else {
+                None
+            }
+        }
+        "CARTESIAN_POINT" => Some(vertex_ref),
+        _ => None,
+    }
+}
+
+/// Resolve an ORIENTED_EDGE to get the underlying edge ID
+fn resolve_oriented_edge(
+    entities: &HashMap<u32, StepEntity>,
+    oriented_edge_ref: u32,
+    edge_id_map: &HashMap<u32, geometry_engine::primitives::edge::EdgeId>,
+) -> Option<geometry_engine::primitives::edge::EdgeId> {
+    let entity = entities.get(&oriented_edge_ref)?;
+    match entity.type_name.as_str() {
+        "ORIENTED_EDGE" => {
+            let args = split_step_args(&entity.args);
+            // args: name, *, *, edge_ref, orientation
+            if args.len() >= 4 {
+                let edge_ref = parse_ref(&args[3])?;
+                edge_id_map.get(&edge_ref).copied()
+            } else {
+                None
+            }
+        }
+        "EDGE_CURVE" => edge_id_map.get(&oriented_edge_ref).copied(),
+        _ => None,
     }
 }

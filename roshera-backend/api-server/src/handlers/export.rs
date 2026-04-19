@@ -180,6 +180,46 @@ pub async fn export_mesh(
     Ok(Json(response))
 }
 
-pub async fn download_file() -> impl axum::response::IntoResponse {
-    axum::response::Html("Download not implemented yet")
+pub async fn download_file(
+    State(state): State<AppState>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    // Construct the export directory path
+    let export_dir = std::path::PathBuf::from("exports");
+    let file_path = export_dir.join(&filename);
+
+    // Security: prevent directory traversal
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Read the file
+    let data = tokio::fs::read(&file_path).await.map_err(|e| {
+        tracing::warn!("File not found for download: {} ({})", filename, e);
+        StatusCode::NOT_FOUND
+    })?;
+
+    // Determine content type from extension
+    let content_type = if filename.ends_with(".stl") {
+        "application/sla"
+    } else if filename.ends_with(".obj") {
+        "text/plain"
+    } else if filename.ends_with(".step") || filename.ends_with(".stp") {
+        "application/step"
+    } else if filename.ends_with(".ros") {
+        "application/octet-stream"
+    } else {
+        "application/octet-stream"
+    };
+
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                &format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        data,
+    ))
 }
