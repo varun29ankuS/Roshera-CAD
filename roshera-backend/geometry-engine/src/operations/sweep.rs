@@ -275,17 +275,13 @@ fn create_frame_driven_sweep(
             // here we fall back to parallel transport when no rail data is
             // available, matching the previous behaviour but with the proper
             // frame solver.
-            parallel_transport_frames(curve.as_ref(), num_sections, None, tolerance)?
+            parallel_transport_frames(curve, num_sections, None, tolerance)?
         }
-        SweepType::BiRail => {
-            parallel_transport_frames(curve.as_ref(), num_sections, None, tolerance)?
-        }
-        SweepType::MultiGuide => {
-            parallel_transport_frames(curve.as_ref(), num_sections, None, tolerance)?
-        }
+        SweepType::BiRail => parallel_transport_frames(curve, num_sections, None, tolerance)?,
+        SweepType::MultiGuide => parallel_transport_frames(curve, num_sections, None, tolerance)?,
         SweepType::Path => {
             // Path sweep should go through create_path_sweep; this is a defensive fallback.
-            parallel_transport_frames(curve.as_ref(), num_sections, None, tolerance)?
+            parallel_transport_frames(curve, num_sections, None, tolerance)?
         }
     };
 
@@ -459,7 +455,7 @@ fn compute_minimal_rotation_frame(
 
     let tolerance = Tolerance::from_distance(1e-8);
     let num_stations = 50;
-    let frames = parallel_transport_frames(curve.as_ref(), num_stations, None, tolerance)?;
+    let frames = parallel_transport_frames(curve, num_stations, None, tolerance)?;
 
     // Map edge parameter to curve parameter and find closest station
     let curve_t = edge.edge_to_curve_parameter(t);

@@ -219,14 +219,16 @@ fn create_helical_sweep(
                 .clone();
 
             // Get edge endpoints and transform them
-            let p_start = model
+            let ps_arr = model
                 .vertices
                 .get_position(edge.start_vertex)
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".into()))?;
-            let p_end = model
+            let pe_arr = model
                 .vertices
                 .get_position(edge.end_vertex)
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".into()))?;
+            let p_start = Vector3::new(ps_arr[0], ps_arr[1], ps_arr[2]);
+            let p_end = Vector3::new(pe_arr[0], pe_arr[1], pe_arr[2]);
 
             let p1 = xform.transform_point(&p_start);
             let p2 = xform.transform_point(&p_end);
