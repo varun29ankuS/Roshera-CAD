@@ -119,10 +119,7 @@ pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64, tolerance: Tolerance) -> Vec<
     };
 
     // Sort and remove near-duplicates
-    roots.sort_by(|a, b| {
-        a.partial_cmp(b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     dedup_roots(&mut roots, tol);
     roots
 }
@@ -229,10 +226,7 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
         roots.push(r + shift);
     }
 
-    roots.sort_by(|a, b| {
-        a.partial_cmp(b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     dedup_roots(&mut roots, tol);
     roots
 }
@@ -925,10 +919,7 @@ where
         f_prev = fx;
     }
 
-    roots.sort_by(|a, b| {
-        a.partial_cmp(b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     roots
 }
 

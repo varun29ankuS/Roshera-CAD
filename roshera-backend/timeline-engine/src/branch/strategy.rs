@@ -250,9 +250,9 @@ impl BranchingStrategy for ExplorationStrategy {
 
         // Find branch with highest score. Treat NaN as the smallest value so
         // it cannot win over a finite score.
-        let best = candidates.iter().max_by(|(_, s1), (_, s2)| {
-            s1.partial_cmp(s2).unwrap_or(std::cmp::Ordering::Equal)
-        })?;
+        let best = candidates
+            .iter()
+            .max_by(|(_, s1), (_, s2)| s1.partial_cmp(s2).unwrap_or(std::cmp::Ordering::Equal))?;
 
         // Only select if improvement is significant
         if best.1 > self.min_improvement {

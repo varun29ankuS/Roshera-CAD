@@ -477,10 +477,7 @@ impl Point2dStore {
                     .get(&id)
                     .map(|p| (id, p.position.distance_squared_to(pos)))
             })
-            .min_by(|(_, d1), (_, d2)| {
-                d1.partial_cmp(d2)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .min_by(|(_, d1), (_, d2)| d1.partial_cmp(d2).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(id, _)| id)
     }
 

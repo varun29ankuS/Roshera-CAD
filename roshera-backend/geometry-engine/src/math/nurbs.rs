@@ -70,12 +70,10 @@ impl Default for BasisCache {
     fn default() -> Self {
         Self {
             n_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1000)
-                    .expect("literal 1000 is non-zero"),
+                std::num::NonZeroUsize::new(1000).expect("literal 1000 is non-zero"),
             )),
             dn_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(500)
-                    .expect("literal 500 is non-zero"),
+                std::num::NonZeroUsize::new(500).expect("literal 500 is non-zero"),
             )),
         }
     }
@@ -572,8 +570,8 @@ impl NurbsCurve {
             // `derivative1` is guaranteed `Some` here because the enclosing
             // `if num_derivatives >= 2` implies num_derivatives >= 1, which
             // set `derivative1 = Some(..)` above.
-            let d1 = derivative1
-                .expect("num_derivatives >= 2 implies derivative1 was computed above");
+            let d1 =
+                derivative1.expect("num_derivatives >= 2 implies derivative1 was computed above");
             let d1_x = d1.x;
             let d1_y = d1.y;
             let d1_z = d1.z;

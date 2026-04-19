@@ -452,14 +452,10 @@ fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationRes
     // For now, create line between endpoints
     use crate::primitives::curve::Line;
     let first = points.first().ok_or_else(|| {
-        OperationError::InvalidGeometry(
-            "Offset curve requires at least one point".to_string(),
-        )
+        OperationError::InvalidGeometry("Offset curve requires at least one point".to_string())
     })?;
     let last = points.last().ok_or_else(|| {
-        OperationError::InvalidGeometry(
-            "Offset curve requires at least one point".to_string(),
-        )
+        OperationError::InvalidGeometry("Offset curve requires at least one point".to_string())
     })?;
     let line = Line::new(*first, *last);
     Ok(model.curves.add(Box::new(line)))

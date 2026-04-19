@@ -346,10 +346,7 @@ impl ParallelValidator {
             // Thread-pool construction can fail on invalid `n` (e.g. 0) or
             // Rayon-internal errors. Fall back to the default (global) pool
             // rather than panicking the validator at construction time.
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build()
-                .ok()
+            rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
         });
 
         Self {

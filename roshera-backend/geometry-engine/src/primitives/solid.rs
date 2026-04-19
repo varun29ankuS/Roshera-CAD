@@ -283,7 +283,10 @@ impl Solid {
     pub fn add_feature(&mut self, feature: Feature) -> u32 {
         let id = feature.id;
         {
-            let mut features = self.features.write().expect("solid features RwLock poisoned");
+            let mut features = self
+                .features
+                .write()
+                .expect("solid features RwLock poisoned");
             features.insert(id, feature);
         } // Lock is dropped here
         self.invalidate_cache();
@@ -293,7 +296,10 @@ impl Solid {
     /// Suppress/unsuppress feature
     pub fn suppress_feature(&mut self, feature_id: u32, suppress: bool) -> bool {
         let result = {
-            let mut features = self.features.write().expect("solid features RwLock poisoned");
+            let mut features = self
+                .features
+                .write()
+                .expect("solid features RwLock poisoned");
             if let Some(feature) = features.get_mut(&feature_id) {
                 feature.suppressed = suppress;
                 true
@@ -310,13 +316,19 @@ impl Solid {
 
     /// Get feature by ID
     pub fn get_feature(&self, feature_id: u32) -> Option<Feature> {
-        let features = self.features.read().expect("solid features RwLock poisoned");
+        let features = self
+            .features
+            .read()
+            .expect("solid features RwLock poisoned");
         features.get(&feature_id).cloned()
     }
 
     /// Get features by type
     pub fn get_features_by_type(&self, feature_type: FeatureType) -> Vec<Feature> {
-        let features = self.features.read().expect("solid features RwLock poisoned");
+        let features = self
+            .features
+            .read()
+            .expect("solid features RwLock poisoned");
         features
             .values()
             .filter(|f| f.feature_type == feature_type && !f.suppressed)
@@ -402,7 +414,10 @@ impl Solid {
         // For simple solid: χ = 2, so g = 0
         let genus = (2 - euler) / 2;
 
-        let features = self.features.read().expect("solid features RwLock poisoned");
+        let features = self
+            .features
+            .read()
+            .expect("solid features RwLock poisoned");
 
         self.cached_stats = Some(SolidStats {
             shell_count: 1 + self.inner_shells.len(),
@@ -615,7 +630,11 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().expect("solid features RwLock poisoned").len() as u32,
+            id: self
+                .features
+                .read()
+                .expect("solid features RwLock poisoned")
+                .len() as u32,
             feature_type: FeatureType::Fillet,
             faces: new_faces.clone(),
             parent: None,
@@ -645,7 +664,11 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().expect("solid features RwLock poisoned").len() as u32,
+            id: self
+                .features
+                .read()
+                .expect("solid features RwLock poisoned")
+                .len() as u32,
             feature_type: FeatureType::Chamfer,
             faces: new_faces.clone(),
             parent: None,
@@ -675,7 +698,11 @@ impl Solid {
 
         // Create feature
         let feature = Feature {
-            id: self.features.read().expect("solid features RwLock poisoned").len() as u32,
+            id: self
+                .features
+                .read()
+                .expect("solid features RwLock poisoned")
+                .len() as u32,
             feature_type: FeatureType::Shell,
             faces: Vec::new(),
             parent: None,
