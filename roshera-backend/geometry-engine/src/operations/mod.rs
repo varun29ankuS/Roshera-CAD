@@ -118,6 +118,11 @@ pub enum OperationError {
         expected: String,
         received: String,
     },
+
+    /// Operation hit a coplanar-face case it cannot yet resolve as a clean
+    /// curve-intersection. Callers should route to an imprint-then-merge path
+    /// or report the limitation to the user.
+    CoplanarFaces(String),
 }
 
 impl From<crate::math::MathError> for OperationError {
@@ -155,6 +160,7 @@ impl std::fmt::Display for OperationError {
                 "Invalid input for '{}': expected {}, received {}",
                 parameter, expected, received
             ),
+            OperationError::CoplanarFaces(msg) => write!(f, "Coplanar faces: {}", msg),
         }
     }
 }
