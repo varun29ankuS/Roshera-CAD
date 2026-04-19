@@ -218,9 +218,10 @@ pub async fn export_brep_to_ros(
         buffer.extend_from_slice(&chunk.data);
     }
 
-    // Write chunk index
+    // Write chunk index (append to end of buffer, after header + chunk data)
     {
-        let mut cursor = Cursor::new(&mut buffer);
+        let mut index_buf = Vec::new();
+        let mut cursor = Cursor::new(&mut index_buf);
         for chunk in &chunks {
             chunk
                 .index
@@ -229,6 +230,7 @@ pub async fn export_brep_to_ros(
                     reason: format!("Failed to write chunk index: {}", e),
                 })?;
         }
+        buffer.extend_from_slice(&index_buf);
     }
 
     // Write to file
