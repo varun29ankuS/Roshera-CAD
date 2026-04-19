@@ -43,6 +43,12 @@ pub mod surface_surface_intersection;
 pub mod test_oslo;
 pub mod trimmed_nurbs;
 pub mod tspline;
+
+// Frame computation for sweep operations
+pub mod frame;
+
+// Surface-plane intersection for draft operations
+pub mod surface_plane_intersection;
 use crate::math::constants::DEG_TO_RAD;
 use crate::math::constants::PHI;
 use crate::math::constants::RAD_TO_DEG;
