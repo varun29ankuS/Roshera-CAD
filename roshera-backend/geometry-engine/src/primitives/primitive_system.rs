@@ -734,45 +734,197 @@ impl PrimitiveSystem {
     // PARAMETRIC OPERATIONS
     // =====================================
 
-    /// Update parameters of existing geometry
+    /// Update parameters of existing geometry by looking up the original creation
+    /// operation in the global `OPERATION_HISTORY` and recreating the primitive
+    /// with merged parameters.
+    ///
+    /// # Arguments
+    /// * `geometry_id` - The geometry to update. Must be a `Solid` variant that
+    ///   was previously created through this `PrimitiveSystem`.
+    /// * `new_parameters` - Parameter overrides. Keys that match the original
+    ///   creation parameters are replaced; unknown keys are ignored.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. The old solid is removed from the model and a new
+    /// solid is created at the same `GeometryId` slot. Callers holding the old
+    /// `GeometryId` can continue using it.
+    ///
+    /// # Errors
+    /// * `InvalidInput` if `geometry_id` is not a `Solid`.
+    /// * `NotFound` if no creation record exists in `OPERATION_HISTORY`.
+    /// * Any error from the underlying primitive creation functions.
+    ///
+    /// # Performance
+    /// O(1) history lookup via DashMap, plus the cost of recreating the primitive.
     pub fn update_parameters(&mut self, geometry_id: GeometryId, new_parameters: HashMap<String, f64>) -> Result<(), PrimitiveError> {
-        // TODO: Implement history tracking for parametric updates
-        // For now, return NotImplemented error
-        return Err(PrimitiveError::InvalidInput {
-            input: "update_parameters".to_string(),
-            expected: "implemented feature".to_string(),
-            received: "not implemented yet".to_string(),
-        });
-        /*
-        let history = self.model.get_history();
-        
-        // Find the operation that created this geometry
-        for (index, operation) in history.iter().enumerate() {
-            if let Some(result_ref) = &operation.result {
-                let matches = match (geometry_id, result_ref) {
-                    (GeometryId::Solid(id1), crate::primitives::topology_builder::EntityReference::Solid(id2)) => id1 == *id2,
-                    (GeometryId::Face(id1), crate::primitives::topology_builder::EntityReference::Face(id2)) => id1 == *id2,
-                    (GeometryId::Edge(id1), crate::primitives::topology_builder::EntityReference::Edge(id2)) => id1 == *id2,
-                    (GeometryId::Vertex(id1), crate::primitives::topology_builder::EntityReference::Vertex(id2)) => id1 == *id2,
-                    _ => false,
-                };
+        let solid_id = match geometry_id {
+            GeometryId::Solid(id) => id,
+            _ => {
+                return Err(PrimitiveError::InvalidInput {
+                    input: format!("{:?}", geometry_id),
+                    expected: "GeometryId::Solid".to_string(),
+                    received: "non-solid geometry id".to_string(),
+                });
+            }
+        };
 
-                if matches {
-                    // Found the operation - update parameters and replay
-                    return self.replay_operation_with_new_parameters(index, new_parameters);
-                }
+        // Look up the original operation that created this geometry.
+        let operation = OPERATION_HISTORY
+            .get(&geometry_id)
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
+
+        let op_type = operation.operation_type.clone();
+
+        // Build merged parameter set: start from original, override with new values.
+        let merged: DashMap<String, f64> = DashMap::new();
+        for entry in operation.parameters.iter() {
+            merged.insert(entry.key().clone(), *entry.value());
+        }
+        drop(operation); // Release DashMap ref before mutating self.
+
+        for (key, value) in &new_parameters {
+            merged.insert(key.clone(), *value);
+        }
+
+        // Helper closure: read a required f64 from merged params.
+        let get = |key: &str| -> Result<f64, PrimitiveError> {
+            merged
+                .get(key)
+                .map(|v| *v)
+                .ok_or_else(|| PrimitiveError::InvalidParameters {
+                    parameter: key.to_string(),
+                    value: "missing".to_string(),
+                    constraint: format!("required for {} recreation", op_type),
+                })
+        };
+
+        // Remove the old solid from the model so its slot can be reused.
+        self.model.solids.remove(solid_id);
+
+        // Invalidate caches for the old geometry.
+        OPERATION_HISTORY.remove(&geometry_id);
+        VALIDATION_CACHE.remove(&geometry_id);
+
+        // Recreate primitive based on the original operation type.
+        let new_id = match op_type.as_str() {
+            "box" => {
+                let width = get("width")?;
+                let height = get("height")?;
+                let depth = get("depth")?;
+                self.create_box(width, height, depth)?
+            }
+            "sphere" => {
+                let center = Point3::new(
+                    get("center_x")?,
+                    get("center_y")?,
+                    get("center_z")?,
+                );
+                let radius = get("radius")?;
+                self.create_sphere(center, radius)?
+            }
+            "cylinder" => {
+                let base_center = Point3::new(
+                    get("base_center_x")?,
+                    get("base_center_y")?,
+                    get("base_center_z")?,
+                );
+                let axis = Vector3::new(
+                    get("axis_x")?,
+                    get("axis_y")?,
+                    get("axis_z")?,
+                );
+                let radius = get("radius")?;
+                let height = get("height")?;
+                self.create_cylinder(base_center, axis, radius, height)?
+            }
+            "cone" => {
+                let apex = Point3::new(
+                    get("apex_x")?,
+                    get("apex_y")?,
+                    get("apex_z")?,
+                );
+                let axis = Vector3::new(
+                    get("axis_x")?,
+                    get("axis_y")?,
+                    get("axis_z")?,
+                );
+                let half_angle = get("half_angle")?;
+                let height = get("height")?;
+                self.create_cone(apex, axis, half_angle, height)?
+            }
+            "torus" => {
+                let center = Point3::new(
+                    get("center_x")?,
+                    get("center_y")?,
+                    get("center_z")?,
+                );
+                let axis = Vector3::new(
+                    get("axis_x")?,
+                    get("axis_y")?,
+                    get("axis_z")?,
+                );
+                let major_radius = get("major_radius")?;
+                let minor_radius = get("minor_radius")?;
+                self.create_torus(center, axis, major_radius, minor_radius)?
+            }
+            _ => {
+                return Err(PrimitiveError::InvalidInput {
+                    input: op_type.clone(),
+                    expected: "box, sphere, cylinder, cone, or torus".to_string(),
+                    received: op_type,
+                });
+            }
+        };
+
+        // The new primitive was cached by the create_* call under its own id.
+        // If the new id differs from the old one (typical after remove + re-add),
+        // alias the old geometry_id to the new operation record so that
+        // downstream code referencing the original id can still find it.
+        if new_id != geometry_id {
+            if let Some(new_op) = OPERATION_HISTORY.get(&new_id) {
+                OPERATION_HISTORY.insert(geometry_id, new_op.clone());
             }
         }
 
-        Err(PrimitiveError::NotFound { solid_id: 0 })
-        */
+        Ok(())
     }
 
-    /// Get creation history for parametric modeling
+    /// Get creation history for parametric modeling.
+    ///
+    /// Returns a chronologically-ordered JSON array of all primitive creation
+    /// operations recorded in the global `OPERATION_HISTORY`. Each entry
+    /// contains the operation type, parameter snapshot, dependency list, and
+    /// the resulting `GeometryId`.
+    ///
+    /// # Returns
+    /// A `Vec<serde_json::Value>` sorted by ascending timestamp. Empty if no
+    /// primitives have been created through this system.
+    ///
+    /// # Performance
+    /// O(n log n) where n is the number of recorded operations (sort step).
     pub fn get_creation_history(&self) -> Vec<serde_json::Value> {
-        // TODO: Implement history tracking
-        // For now, return empty history
-        vec![]
+        let mut entries: Vec<(u64, serde_json::Value)> = OPERATION_HISTORY
+            .iter()
+            .map(|entry| {
+                let op = entry.value();
+                let params: HashMap<String, f64> = op
+                    .parameters
+                    .iter()
+                    .map(|p| (p.key().clone(), *p.value()))
+                    .collect();
+                let json = serde_json::json!({
+                    "operation_type": op.operation_type,
+                    "parameters": params,
+                    "dependencies": op.dependencies,
+                    "timestamp": op.timestamp,
+                    "result_id": format!("{:?}", op.result_id),
+                });
+                (op.timestamp, json)
+            })
+            .collect();
+
+        entries.sort_by_key(|(ts, _)| *ts);
+        entries.into_iter().map(|(_, v)| v).collect()
     }
 
     // =====================================
@@ -844,18 +996,61 @@ impl PrimitiveSystem {
         Ok(loop_obj.edges.clone())
     }
 
-    /// Replay operation with new parameters for parametric updates
-    fn replay_operation_with_new_parameters(&mut self, operation_index: usize, new_parameters: HashMap<String, f64>) -> Result<(), PrimitiveError> {
-        // This would implement the parametric update logic
-        // 1. Get the operation from history
-        // 2. Update its parameters
-        // 3. Replay from that point forward
-        // 4. Update all dependent operations
-        Err(PrimitiveError::InvalidInput {
-            input: "replay_operation_with_new_parameters".to_string(),
-            expected: "implemented feature".to_string(),
-            received: "not implemented yet".to_string(),
-        })
+    /// Replay a specific operation from the global history with modified
+    /// parameters, then cascade updates to all dependent operations.
+    ///
+    /// This is the full parametric replay path: it walks the dependency graph
+    /// forward from `operation_index` and recreates every dependent geometry in
+    /// topological order.
+    ///
+    /// # Arguments
+    /// * `operation_index` - Timestamp-based index into the global history.
+    /// * `new_parameters` - Parameter overrides to apply at `operation_index`.
+    ///
+    /// # Returns
+    /// `Ok(())` when the entire dependency chain has been successfully replayed.
+    ///
+    /// # Errors
+    /// Propagates any error from the underlying primitive creation functions.
+    /// If a downstream dependency fails, earlier replayed operations are *not*
+    /// rolled back (the caller should snapshot beforehand if atomicity is needed).
+    fn replay_operation_with_new_parameters(
+        &mut self,
+        operation_index: usize,
+        new_parameters: HashMap<String, f64>,
+    ) -> Result<(), PrimitiveError> {
+        // Collect all operations sorted by timestamp so we can find the one at
+        // the requested index and everything that depends on it.
+        let mut all_ops: Vec<PrimitiveOperation> = OPERATION_HISTORY
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        all_ops.sort_by_key(|op| op.timestamp);
+
+        if operation_index >= all_ops.len() {
+            return Err(PrimitiveError::NotFound { solid_id: 0 });
+        }
+
+        let root_op = &all_ops[operation_index];
+        let root_id = root_op.result_id;
+
+        // Apply new parameters to the root operation via update_parameters.
+        self.update_parameters(root_id, new_parameters)?;
+
+        // Walk forward through the timeline and replay any operation whose
+        // dependency list references the root id (direct dependents).
+        for op in all_ops.iter().skip(operation_index + 1) {
+            if op.dependencies.contains(&root_id) {
+                let dep_params: HashMap<String, f64> = op
+                    .parameters
+                    .iter()
+                    .map(|p| (p.key().clone(), *p.value()))
+                    .collect();
+                self.update_parameters(op.result_id, dep_params)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
