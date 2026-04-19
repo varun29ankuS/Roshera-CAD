@@ -285,8 +285,16 @@ pub fn intersect_surface_plane(
         }
 
         // Check closure.
-        let first = pts.first().unwrap().position;
-        let last = pts.last().unwrap().position;
+        // Guarded by the `pts.len() < 2` continue above — `pts` is guaranteed
+        // to have at least two elements here.
+        let first = pts
+            .first()
+            .expect("pts.len() >= 2 verified by guard above")
+            .position;
+        let last = pts
+            .last()
+            .expect("pts.len() >= 2 verified by guard above")
+            .position;
         let is_closed = (last - first).magnitude() < config.tolerance.distance() * 10.0;
 
         curves.push(ParametricIntersectionCurve {
@@ -299,7 +307,12 @@ pub fn intersect_surface_plane(
             if used[k] {
                 continue;
             }
-            for cp in &curves.last().unwrap().points {
+            // `curves.last()` is the curve we just pushed above.
+            for cp in &curves
+                .last()
+                .expect("curve just pushed above")
+                .points
+            {
                 if (cp.position - s.position).magnitude() < config.tolerance.distance() * 5.0 {
                     used[k] = true;
                     break;

@@ -220,7 +220,10 @@ fn create_path_sweep(
 
     // Add end cap if creating solid
     if options.create_solid {
-        let end_face = create_reversed_face(model, sections.last().unwrap().face_id)?;
+        let last_section = sections
+            .last()
+            .expect("sweep: ≥1 section must exist before creating end cap");
+        let end_face = create_reversed_face(model, last_section.face_id)?;
         shell_faces.push(end_face);
     }
 
@@ -313,7 +316,10 @@ fn create_frame_driven_sweep(
     }
 
     if options.create_solid {
-        let end_face = create_reversed_face(model, sections.last().unwrap().face_id)?;
+        let last_section = sections
+            .last()
+            .expect("sweep: ≥1 section must exist before creating end cap");
+        let end_face = create_reversed_face(model, last_section.face_id)?;
         shell_faces.push(end_face);
     }
 

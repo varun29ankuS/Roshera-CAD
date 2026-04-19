@@ -552,24 +552,29 @@ impl AICommandTracker {
         use regex::Regex;
 
         // Email pattern
-        let email_re = Regex::new(r"[\w.-]+@[\w.-]+\.\w+").unwrap();
+        let email_re =
+            Regex::new(r"[\w.-]+@[\w.-]+\.\w+").expect("static email PII regex must compile");
         let mut result = email_re.replace_all(text, "[EMAIL]").to_string();
 
         // Phone pattern
         let phone_re =
-            Regex::new(r"\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}").unwrap();
+            Regex::new(r"\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}")
+                .expect("static phone PII regex must compile");
         result = phone_re.replace_all(&result, "[PHONE]").to_string();
 
         // Credit card pattern
-        let cc_re = Regex::new(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b").unwrap();
+        let cc_re = Regex::new(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b")
+            .expect("static credit-card PII regex must compile");
         result = cc_re.replace_all(&result, "[CREDIT_CARD]").to_string();
 
         // SSN pattern
-        let ssn_re = Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap();
+        let ssn_re =
+            Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("static SSN PII regex must compile");
         result = ssn_re.replace_all(&result, "[SSN]").to_string();
 
         // IP address pattern
-        let ip_re = Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap();
+        let ip_re = Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+            .expect("static IP-address PII regex must compile");
         result = ip_re.replace_all(&result, "[IP_ADDRESS]").to_string();
 
         result

@@ -1,14 +1,7 @@
-//! World-class tolerance management for aerospace-grade precision
+//! Tolerance management for the B-Rep engine.
 //!
-//! This module implements a sophisticated tolerance system that rivals
-//! industry leaders like Parasolid, providing adaptive, context-aware
-//! tolerances for all geometric operations.
-//!
-//! # Design Philosophy
-//!
-//! We maintain backward compatibility with a simple Tolerance struct
-//! while providing extended capabilities through ToleranceEx for
-//! advanced operations.
+//! Provides a simple `Tolerance` struct for most callers and an extended
+//! `ToleranceEx` for adaptive, context-aware geometric operations.
 
 use super::consts;
 use serde::{Deserialize, Serialize};
@@ -130,10 +123,10 @@ impl fmt::Display for Tolerance {
     }
 }
 
-/// Extended tolerance for advanced operations
+/// Extended tolerance for advanced operations.
 ///
-/// This provides Parasolid-level capabilities while keeping
-/// the simple API for basic operations
+/// Provides adaptive/context-aware tolerance data while keeping the
+/// simpler `Tolerance` API available for basic callers.
 #[derive(Debug, Clone, Copy)]
 pub struct ToleranceEx {
     /// Base tolerance (for compatibility)

@@ -1,7 +1,9 @@
-//! Universal endpoint for multi-provider vision API access
+//! Universal endpoint for multi-provider vision API access.
 //!
 //! Provides a unified interface for sending vision requests to different
-//! AI providers (Ollama, OpenAI, Anthropic, Google, HuggingFace, custom).
+//! hosted AI providers (OpenAI, Anthropic, Google, HuggingFace, CustomAPI).
+//!
+//! Policy: API-only. Local-model runtimes are not supported.
 
 use shared_types::vision::VisionProviderType;
 
@@ -29,10 +31,10 @@ pub struct UniversalEndpointConfig {
 impl Default for UniversalEndpointConfig {
     fn default() -> Self {
         Self {
-            provider: VisionProviderType::Ollama,
-            url: "http://localhost:11434/api/generate".to_string(),
+            provider: VisionProviderType::Anthropic,
+            url: "https://api.anthropic.com/v1/messages".to_string(),
             api_key: None,
-            model_name: "llava:latest".to_string(),
+            model_name: "claude-3-5-sonnet-20241022".to_string(),
             timeout_secs: 30,
             max_tokens: 1000,
             temperature: 0.7,
@@ -69,7 +71,6 @@ impl UniversalEndpoint {
     pub fn capabilities(&self) -> EndpointCapabilities {
         let name = format!("Universal-{:?}", self.config.provider);
         let (supports_vision, supports_streaming, max_context) = match self.config.provider {
-            VisionProviderType::Ollama => (true, true, 4096),
             VisionProviderType::OpenAI => (true, true, 128_000),
             VisionProviderType::Anthropic => (true, true, 200_000),
             VisionProviderType::Google => (true, true, 32_000),

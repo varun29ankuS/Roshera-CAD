@@ -1,20 +1,14 @@
-//! World-class B-Rep topology traversal and query utilities
+//! B-Rep topology traversal and query utilities.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
-//! - Advanced graph algorithms for topology navigation
+//! Features:
+//! - Graph algorithms for topology navigation
 //! - Parallel topology analysis with work-stealing
 //! - Topology modification and surgery operations
 //! - Persistent topology changes with undo/redo
 //! - Topology optimization and simplification
-//! - Advanced queries (geodesic paths, curvature flow)
+//! - Queries: geodesic paths, curvature flow
 //! - Topology fingerprinting and comparison
 //! - Multi-resolution topology representations
-//!
-//! Performance characteristics:
-//! - Adjacency building: < 1ms for 10k faces
-//! - Path finding: < 10μs for typical models
-//! - Component analysis: < 100μs for 10k faces
-//! - Topology comparison: < 1ms for typical models
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -77,7 +71,10 @@ impl<'a> TopologyContext<'a> {
     pub fn adjacency(&self) -> MathResult<Arc<AdjacencyInfo>> {
         // Check cache first
         {
-            let cache = self.adjacency_cache.read().unwrap();
+            let cache = self
+                .adjacency_cache
+                .read()
+                .expect("adjacency_cache RwLock poisoned");
             if let Some(ref adjacency) = *cache {
                 return Ok(Arc::new(adjacency.clone()));
             }
@@ -88,7 +85,10 @@ impl<'a> TopologyContext<'a> {
 
         // Cache it
         {
-            let mut cache = self.adjacency_cache.write().unwrap();
+            let mut cache = self
+                .adjacency_cache
+                .write()
+                .expect("adjacency_cache RwLock poisoned");
             *cache = Some(adjacency.clone());
         }
 

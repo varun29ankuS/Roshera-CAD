@@ -1616,8 +1616,12 @@ fn march_from_point(
                 break; // Degenerate tangent
             }
 
-            // Take a step
-            let next_pos = current.position + tangent.normalize().unwrap() * step_size * *direction;
+            // Take a step. `normalize()` is guaranteed Some because the
+            // magnitude check above ensures tangent is well above zero.
+            let normalized_tangent = tangent
+                .normalize()
+                .expect("tangent magnitude verified > tolerance above");
+            let next_pos = current.position + normalized_tangent * step_size * *direction;
 
             // Project onto both surfaces
             let (u_a, v_a) = surface_a.closest_point(&next_pos, *tolerance)?;
@@ -1737,8 +1741,11 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
             let i = index.floor() as usize;
             let frac = index - i as f64;
 
-            if i >= params.len() - 1 {
-                params.last().unwrap().0
+            if i >= params.len().saturating_sub(1) {
+                // Fall back to (0.0, 0.0) when params is empty; otherwise
+                // return the final sample. This keeps the parametric curve
+                // total on all inputs without panicking.
+                params.last().map(|p| p.0).unwrap_or(0.0)
             } else {
                 params[i].0 * (1.0 - frac) + params[i + 1].0 * frac
             }
@@ -1748,8 +1755,8 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
             let i = index.floor() as usize;
             let frac = index - i as f64;
 
-            if i >= params_clone.len() - 1 {
-                params_clone.last().unwrap().1
+            if i >= params_clone.len().saturating_sub(1) {
+                params_clone.last().map(|p| p.1).unwrap_or(0.0)
             } else {
                 params_clone[i].1 * (1.0 - frac) + params_clone[i + 1].1 * frac
             }

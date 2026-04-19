@@ -29,6 +29,18 @@ use uuid::Uuid;
 // Import our protocol
 use super::protocol::{ClientMessage, ServerMessage};
 
+/// Returns the current wall-clock time as milliseconds since the Unix epoch.
+///
+/// Falls back to `0` if the system clock is set before `UNIX_EPOCH`. Protocol
+/// handlers use this for `last_activity`/`joined_at` metadata; returning `0`
+/// is preferable to panicking a live connection.
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {
@@ -673,12 +685,10 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             || session_id.is_empty()
                                         {
                                             // Create new session if "default" or empty
-                                            let new_session_id = state
+                                            state
                                                 .session_manager
                                                 .create_session(user_name.clone())
-                                                .await;
-                                            add_mock_collaborators(&new_session_id, &state).await;
-                                            new_session_id
+                                                .await
                                         } else {
                                             // Try to join existing session
                                             match state
@@ -689,13 +699,10 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 Ok(_) => session_id.clone(),
                                                 Err(_) => {
                                                     // Session doesn't exist, create new one
-                                                    let new_session_id = state
+                                                    state
                                                         .session_manager
                                                         .create_session(user_name.clone())
-                                                        .await;
-                                                    add_mock_collaborators(&new_session_id, &state)
-                                                        .await;
-                                                    new_session_id
+                                                        .await
                                                 }
                                             }
                                         };
@@ -707,11 +714,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             .await
                                         {
                                             let mut session_state = session.write().await;
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis()
-                                                as u64;
+                                            let now = unix_millis_now();
 
                                             // Check if user already exists (to avoid duplicates)
                                             if !session_state
@@ -859,11 +862,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 info!("Session description: {}", desc);
                                             }
 
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis()
-                                                as u64;
+                                            let now = unix_millis_now();
 
                                             let user_info = shared_types::session::UserInfo {
                                                 id: user_id.to_string(),
@@ -978,12 +977,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                     user.cursor_position = cursor_position;
                                                     user.selected_objects =
                                                         selected_objects.clone();
-                                                    user.last_activity =
-                                                        std::time::SystemTime::now()
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .unwrap()
-                                                            .as_millis()
-                                                            as u64;
+                                                    user.last_activity = unix_millis_now();
 
                                                     info!("Updated presence: cursor={:?}, selected={:?}",
                                                           cursor_position, selected_objects);
@@ -2006,75 +2000,3 @@ async fn send_collaborators_update(
     Ok(())
 }
 
-async fn add_mock_collaborators(session_id: &str, state: &AppState) {
-    use shared_types::session::UserInfo;
-
-    info!("Adding mock collaborators to session: {}", session_id);
-
-    // Define 3 mock collaborators with different activity states
-    let mock_users = vec![
-        UserInfo {
-            id: "ankita_123".to_string(),
-            name: "Ankita".to_string(),
-            color: [0.2, 0.7, 0.9, 1.0], // Blue
-            last_activity: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            role: shared_types::session::UserRole::Editor,
-            cursor_position: None,
-            selected_objects: Vec::new(),
-        },
-        UserInfo {
-            id: "anushree_456".to_string(),
-            name: "Anushree".to_string(),
-            color: [0.9, 0.3, 0.2, 1.0], // Red
-            last_activity: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                .saturating_sub(60000) as u64, // 1 minute ago (inactive)
-            role: shared_types::session::UserRole::Editor,
-            cursor_position: None,
-            selected_objects: Vec::new(),
-        },
-        UserInfo {
-            id: "rajiv_789".to_string(),
-            name: "Rajiv".to_string(),
-            color: [0.3, 0.8, 0.3, 1.0], // Green
-            last_activity: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            role: shared_types::session::UserRole::Editor,
-            cursor_position: None,
-            selected_objects: Vec::new(),
-        },
-    ];
-
-    // Add mock users to the session
-    match state.session_manager.get_session(session_id).await {
-        Ok(session) => {
-            let mut session_state = session.write().await;
-            let before_count = session_state.active_users.len();
-            for user in &mock_users {
-                info!("  Adding mock user: {} ({})", user.name, user.id);
-                session_state.active_users.push(user.clone());
-            }
-            let after_count = session_state.active_users.len();
-            info!(
-                "Added {} mock collaborators to session {} (total users: {} -> {})",
-                mock_users.len(),
-                session_id,
-                before_count,
-                after_count
-            );
-        }
-        Err(e) => {
-            error!(
-                "Failed to get session {} for adding mock collaborators: {}",
-                session_id, e
-            );
-        }
-    }
-}

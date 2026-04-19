@@ -661,7 +661,10 @@ fn in_circle_test_3d(p1: &Point3, p2: &Point3, p3: &Point3, p4: &Point3) -> bool
         return false; // Degenerate triangle
     }
 
-    let normal = normal.normalize().unwrap();
+    // Magnitude is guaranteed > sqrt(1e-10) by the guard above.
+    let normal = normal
+        .normalize()
+        .expect("non-degenerate normal verified by magnitude_squared guard above");
     let (u_axis, v_axis) = compute_plane_axes(&normal);
 
     // Project points to 2D

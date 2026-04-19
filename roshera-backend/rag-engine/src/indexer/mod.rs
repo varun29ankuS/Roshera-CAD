@@ -680,7 +680,7 @@ impl FileIndexer {
         
         // Simple regex-based extraction (can be improved)
         let re = regex::Regex::new(r"\b(fn|struct|impl|class|def|function|const|let|var)\s+(\w+)")
-            .unwrap();
+            .expect("static symbol-extraction regex must compile");
         
         for cap in re.captures_iter(content) {
             if let Some(symbol) = cap.get(2) {
@@ -725,7 +725,12 @@ impl FileIndexer {
         
         // Spawn watcher thread
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            // Failures below terminate only this file-watcher thread (not the
+            // main process). They indicate a deeper system condition (runtime
+            // start, inotify/FSEvents allocation, missing watch path) that the
+            // indexer cannot recover from on its own.
+            let rt = tokio::runtime::Runtime::new()
+                .expect("file-watcher: failed to create tokio runtime");
             rt.block_on(async {
                 let mut debouncer = new_debouncer(
                     std::time::Duration::from_secs(2),
@@ -735,12 +740,14 @@ impl FileIndexer {
                                 let _ = tx.blocking_send(event);
                             }
                         }
-                    }
-                ).unwrap();
-                
-                debouncer.watcher()
+                    },
+                )
+                .expect("file-watcher: failed to allocate debouncer");
+
+                debouncer
+                    .watcher()
                     .watch(&watch_path, RecursiveMode::Recursive)
-                    .unwrap();
+                    .expect("file-watcher: failed to start watching path");
                 
                 // Keep watcher alive
                 loop {

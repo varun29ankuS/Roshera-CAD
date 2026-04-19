@@ -1,7 +1,7 @@
 # Roshera CAD - Project Instructions
 
 ## Rules
-- MUST NOT run `cargo build`, `cargo run`, `trunk serve`, or `trunk build` — user manages builds
+- MUST NOT run `cargo build`, `cargo run`, `npm run dev`, or `npm run build` — user manages builds
 - MUST NOT add "Co-Authored-By" or "Generated with Claude Code" to commits
 - Production-grade code only. No TODOs, no placeholders, no mocks, no stubs
 - Understand context, intent, and impact before changing anything
@@ -22,4 +22,4 @@
 - `roshera-backend/export-engine/` — STL, OBJ, STEP, ROS formats
 - `roshera-backend/shared-types/` — Common types (ObjectId, Position3D, etc.)
 - `roshera-backend/rag-engine/` — Vamana-indexed RAG
-- `roshera-front/` — Leptos/WASM + Three.js frontend
+- `roshera-app/` — React/Vite/TypeScript frontend (Three.js viewport)

@@ -151,8 +151,15 @@ impl PrimitiveSystem {
         };
         
         OPERATION_HISTORY.insert(result, operation);
-        
-        let hash_key = self.hash_parameters(operation_type, &OPERATION_HISTORY.get(&result).unwrap().parameters);
+
+        // The entry we just inserted under `result` is the value we need;
+        // `.get` can only miss if another thread removes it between the
+        // two calls. Fall back to recomputing the hash from the just-built
+        // `operation` if that happens, rather than panicking.
+        let hash_key = match OPERATION_HISTORY.get(&result) {
+            Some(entry) => self.hash_parameters(operation_type, &entry.parameters),
+            None => self.hash_parameters(operation_type, &Default::default()),
+        };
         PRIMITIVE_CACHE.insert(hash_key, result);
     }
 

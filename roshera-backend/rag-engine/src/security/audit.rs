@@ -500,10 +500,18 @@ impl AuditLogger {
         let mut hasher = Sha256::new();
         hasher.update(entry.id.as_bytes());
         hasher.update(entry.timestamp.to_rfc3339().as_bytes());
-        hasher.update(serde_json::to_string(&entry.event_type).unwrap().as_bytes());
+        hasher.update(
+            serde_json::to_string(&entry.event_type)
+                .expect("AuditEntry::event_type Serialize impl is infallible")
+                .as_bytes(),
+        );
         hasher.update(entry.action.as_bytes());
         hasher.update(entry.previous_hash.as_bytes());
-        hasher.update(serde_json::to_string(&entry.details).unwrap().as_bytes());
+        hasher.update(
+            serde_json::to_string(&entry.details)
+                .expect("AuditEntry::details Serialize impl is infallible")
+                .as_bytes(),
+        );
         
         format!("{:x}", hasher.finalize())
     }

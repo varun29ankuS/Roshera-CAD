@@ -1,23 +1,14 @@
-//! B-Rep Operations Module
+//! B-Rep Operations Module.
 //!
-//! World-class implementations of all standard CAD operations on B-Rep models.
-//! All operations maintain exact analytical geometry (no tessellation).
+//! Standard CAD operations on B-Rep models. All operations work on exact
+//! analytical geometry (no tessellation).
 //!
 //! # Design Principles
 //!
-//! 1. **Analytical Precision**: All operations work on exact NURBS/analytical surfaces
-//! 2. **Topological Integrity**: Maintain watertight B-Rep at all times
-//! 3. **Performance**: Match or exceed Parasolid/ACIS performance targets
-//! 4. **Thread Safety**: All operations are thread-safe and parallelizable
-//! 5. **History Tracking**: Full parametric history for all operations
-//!
-//! # Performance Targets
-//!
-//! - Boolean operations: < 100ms for 10k faces
-//! - Fillet/chamfer: < 50ms per edge
-//! - Extrude/revolve: < 20ms
-//! - Loft: < 200ms for 10 profiles
-//! - Pattern: < 10ms per instance
+//! 1. Analytical precision: operations act on exact NURBS/analytical surfaces
+//! 2. Topological integrity: maintain watertight B-Rep invariants
+//! 3. Thread-safety: operations are safe to parallelize
+//! 4. History tracking: each operation records a timeline event
 
 // Core operation modules
 pub mod blend;

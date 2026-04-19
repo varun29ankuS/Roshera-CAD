@@ -148,7 +148,13 @@ fn create_linear_loft(
 
     // Add top cap if creating solid
     if options.create_solid && !options.closed {
-        let top_face = create_reversed_face(model, profiles.last().unwrap())?;
+        // `profiles.last()` is guaranteed Some: loft construction
+        // requires ≥2 profiles (validated at entry), and the enclosing
+        // loop has already iterated over them.
+        let last_profile = profiles
+            .last()
+            .expect("loft: profiles validated non-empty at entry (≥2 required)");
+        let top_face = create_reversed_face(model, last_profile)?;
         shell_faces.push(top_face);
     }
 
@@ -373,7 +379,10 @@ fn create_cubic_loft(
     }
 
     if options.create_solid && !options.closed {
-        let top_face = create_reversed_face(model, profiles.last().unwrap())?;
+        let last_profile = profiles
+            .last()
+            .expect("loft: profiles validated non-empty at entry (≥2 required)");
+        let top_face = create_reversed_face(model, last_profile)?;
         shell_faces.push(top_face);
     }
 
@@ -656,7 +665,10 @@ fn create_guided_loft(
     }
 
     if options.create_solid && !options.closed {
-        let top_face = create_reversed_face(model, profiles.last().unwrap())?;
+        let last_profile = profiles
+            .last()
+            .expect("loft: profiles validated non-empty at entry (≥2 required)");
+        let top_face = create_reversed_face(model, last_profile)?;
         shell_faces.push(top_face);
     }
 

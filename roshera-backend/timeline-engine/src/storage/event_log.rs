@@ -79,15 +79,16 @@ impl EventLog {
             self.rotate_segment().await?;
         }
 
-        // Get current file
+        // Get current file, opening the segment lazily if not yet present.
         let mut file_guard = self.current_file.lock().await;
-        if file_guard.is_none() {
-            let segment = self.current_segment.load(Ordering::Relaxed);
-            let file = self.open_segment(segment).await?;
-            *file_guard = Some(file);
-        }
-
-        let file = file_guard.as_mut().unwrap();
+        let file = match file_guard.as_mut() {
+            Some(f) => f,
+            None => {
+                let segment = self.current_segment.load(Ordering::Relaxed);
+                let opened = self.open_segment(segment).await?;
+                file_guard.insert(opened)
+            }
+        };
 
         // Get current position
         let offset = file

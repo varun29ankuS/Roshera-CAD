@@ -1,19 +1,12 @@
-//! World-class T-spline implementation
+//! T-spline implementation.
 //!
-//! Industry-leading features matching Autodesk T-splines technology:
+//! Features:
 //! - Local refinement without propagating control points
 //! - Extraordinary points (valence != 4)
-//! - T-junctions in control mesh
-//! - Seamless NURBS conversion
-//! - GPU-accelerated evaluation
+//! - T-junctions in the control mesh
+//! - NURBS conversion
 //! - Watertight surface generation
-//! - Advanced modeling operations (extrude, merge, crease)
-//!
-//! Performance characteristics:
-//! - Single point evaluation: < 200ns
-//! - Local refinement: < 1ms
-//! - NURBS conversion: < 10ms for typical models
-//! - GPU evaluation: 1M points/second
+//! - Modeling operations (extrude, merge, crease)
 //!
 //! References:
 //! - Sederberg et al., "T-splines and T-NURCCs", SIGGRAPH 2003
@@ -397,7 +390,10 @@ impl TSplineMesh {
         }
 
         // Store cache
-        *self.topology_cache.write().unwrap() = cache;
+        *self
+            .topology_cache
+            .write()
+            .expect("TSpline topology_cache RwLock poisoned") = cache;
     }
 
     /// Compute 1-ring neighborhood

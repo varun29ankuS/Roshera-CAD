@@ -1,12 +1,11 @@
-//! Test suite for primitives module
+//! Test suite for the primitives module.
 //!
-//! Comprehensive test coverage for the Roshera CAD primitives module including:
-//! - 200+ tests across 10 focused test files
-//! - Performance benchmarks vs industry standards (Parasolid/ACIS)
-//! - Mathematical accuracy and topology validation
-//! - AI integration and natural language processing
-//! - Edge cases and stress testing
-//! - Production-grade quality assurance
+//! Covers:
+//! - Topology correctness (Vertex, Edge, Loop, Face, Shell, Solid)
+//! - Mathematical accuracy
+//! - AI integration and natural-language parsing
+//! - Edge cases and stress tests
+//! - Internal performance benchmarks (no third-party kernel comparisons)
 
 // 1. Performance benchmarks - Industry comparison tests (to be implemented)
 pub mod performance_benchmarks;

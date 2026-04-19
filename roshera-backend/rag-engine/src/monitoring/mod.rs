@@ -347,8 +347,11 @@ impl MonitoringSystem {
         let encoder = TextEncoder::new();
         let metric_families = prometheus::gather();
         let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        String::from_utf8(buffer).unwrap()
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .expect("prometheus TextEncoder cannot fail when writing to a Vec<u8>");
+        String::from_utf8(buffer)
+            .expect("prometheus text exposition format is guaranteed ASCII/UTF-8")
     }
 
     /// Get dashboard data

@@ -591,7 +591,11 @@ fn intersect_general_curves(
     // Remove duplicate intersections
     intersections.sort_by(|a, b| match &a.param1 {
         IntersectionParameter::Single(t1) => match &b.param1 {
-            IntersectionParameter::Single(t2) => t1.partial_cmp(t2).unwrap(),
+            // NaN-safe: treat unorderable values as equal so the sort
+            // remains total even if an intersection param is NaN.
+            IntersectionParameter::Single(t2) => {
+                t1.partial_cmp(t2).unwrap_or(std::cmp::Ordering::Equal)
+            }
             _ => std::cmp::Ordering::Equal,
         },
         _ => std::cmp::Ordering::Equal,
@@ -599,10 +603,14 @@ fn intersect_general_curves(
 
     let mut unique_intersections: Vec<IntersectionPoint> = Vec::new();
     for intersection in intersections {
-        if unique_intersections.is_empty()
-            || (intersection.position - unique_intersections.last().unwrap().position).magnitude()
-                > tolerance.distance()
-        {
+        // Short-circuit: if `unique_intersections` is empty we push
+        // unconditionally; only the `else` branch of the `||` accesses
+        // `.last()`, which is guaranteed `Some` there.
+        let is_distinct = match unique_intersections.last() {
+            None => true,
+            Some(last) => (intersection.position - last.position).magnitude() > tolerance.distance(),
+        };
+        if is_distinct {
             unique_intersections.push(intersection);
         }
     }

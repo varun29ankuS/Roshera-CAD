@@ -71,10 +71,10 @@ impl Default for SmartRouterConfig {
         Self {
             mode: ProcessingMode::Unified,
             vision_config: VisionConfig {
-                provider: VisionProviderType::Ollama,
-                url: "http://localhost:11434/api/generate".to_string(),
+                provider: VisionProviderType::Anthropic,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
                 api_key: None,
-                model_name: "bakllava:latest".to_string(),
+                model_name: "claude-3-5-sonnet-20241022".to_string(),
             },
             reasoning_config: None,
             enable_cache: true,
@@ -444,7 +444,7 @@ mod tests {
     fn test_config_default() {
         let config = SmartRouterConfig::default();
         assert_eq!(config.mode, ProcessingMode::Unified);
-        assert_eq!(config.vision_config.provider, VisionProviderType::Ollama);
+        assert_eq!(config.vision_config.provider, VisionProviderType::Anthropic);
     }
     
     #[test]

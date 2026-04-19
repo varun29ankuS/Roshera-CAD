@@ -178,7 +178,8 @@ impl TrimmedNurbsSurface {
             let curve = NurbsCurve2D {
                 control_points: vec![start, end],
                 weights: vec![1.0, 1.0],
-                knots: KnotVector::new(vec![0.0, 0.0, 1.0, 1.0]).unwrap(),
+                knots: KnotVector::new(vec![0.0, 0.0, 1.0, 1.0])
+                    .expect("literal degree-1 Bezier knot vector is always valid"),
                 degree: 1,
             };
 
@@ -189,7 +190,8 @@ impl TrimmedNurbsSurface {
             });
         }
 
-        TrimLoop::new(curves, true).unwrap()
+        TrimLoop::new(curves, true)
+            .expect("unit-square trim loop constructed from validated corner curves")
     }
 
     /// Add a trim loop (hole or inner boundary)

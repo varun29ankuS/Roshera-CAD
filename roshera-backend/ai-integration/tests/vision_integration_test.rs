@@ -220,10 +220,10 @@ async fn test_separated_mode_requires_reasoning_config() {
 #[test]
 fn test_universal_endpoint_config() {
     let config = UniversalEndpointConfig {
-        provider: VisionProviderType::Ollama,
-        url: "http://localhost:11434/api/generate".to_string(),
+        provider: VisionProviderType::Anthropic,
+        url: "https://api.anthropic.com/v1/messages".to_string(),
         api_key: None,
-        model_name: "bakllava:latest".to_string(),
+        model_name: "claude-3-5-sonnet-20241022".to_string(),
         timeout_secs: 30,
         max_tokens: 1000,
         temperature: 0.7,
@@ -233,8 +233,8 @@ fn test_universal_endpoint_config() {
     let endpoint = UniversalEndpoint::new(config.clone());
     let capabilities = endpoint.capabilities();
 
-    assert_eq!(capabilities.name, "Universal-Ollama");
-    assert_eq!(config.model_name, "bakllava:latest");
+    assert_eq!(capabilities.name, "Universal-Anthropic");
+    assert_eq!(config.model_name, "claude-3-5-sonnet-20241022");
 }
 
 /// Test that viewport context is properly formatted
@@ -373,7 +373,6 @@ fn test_viewport_capture_serialization_size() {
 #[test]
 fn test_provider_request_formats() {
     let providers = vec![
-        VisionProviderType::Ollama,
         VisionProviderType::OpenAI,
         VisionProviderType::Anthropic,
         VisionProviderType::Google,

@@ -88,7 +88,12 @@ pub async fn export_brep_to_ros(
         })?;
 
         let salt = ros_fs::random_16();
-        let file_iv = ros_fs::random_bytes(8).try_into().unwrap();
+        let file_iv: [u8; 8] =
+            ros_fs::random_bytes(8)
+                .try_into()
+                .map_err(|_| ExportError::ExportFailed {
+                    reason: "random_bytes(8) did not return 8 bytes".to_string(),
+                })?;
         let key_manager = SoftwareKeyManager::default();
         let key_set = key_manager
             .generate_key_set(&password, &salt)
@@ -178,8 +183,15 @@ pub async fn export_brep_to_ros(
 
     // AIPR chunk - AI provenance (if tracking is enabled)
     if options.track_ai {
+        let tracking_level = ros_fs::TrackingLevel::from_u8(options.ai_tracking_level)
+            .ok_or_else(|| ExportError::ExportFailed {
+                reason: format!(
+                    "Invalid AI tracking level {} (expected 0..=2)",
+                    options.ai_tracking_level
+                ),
+            })?;
         let ai_tracker = ros_fs::AICommandTracker::new(
-            ros_fs::TrackingLevel::from_u8(options.ai_tracking_level).unwrap(),
+            tracking_level,
             ros_fs::PrivacySettings::default(),
             None,
         );
@@ -331,11 +343,14 @@ pub async fn import_ros_to_brep(
             reason: "Geometry is encrypted but no key available".to_string(),
         })?;
 
-        let decryptor = ros_fs::ChunkEncryptor::new(
-            ros_fs::EncryptionAlgorithm::from_id(geom_entry.enc_algo).unwrap(),
-            key_set.clone(),
-            header.file_iv,
-        );
+        let enc_algo = ros_fs::EncryptionAlgorithm::from_id(geom_entry.enc_algo)
+            .ok_or_else(|| ExportError::ExportFailed {
+                reason: format!(
+                    "Unknown encryption algorithm id {} in chunk index",
+                    geom_entry.enc_algo
+                ),
+            })?;
+        let decryptor = ros_fs::ChunkEncryptor::new(enc_algo, key_set.clone(), header.file_iv);
 
         geom_data = decryptor
             .decrypt_chunk(

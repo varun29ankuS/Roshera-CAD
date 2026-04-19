@@ -333,11 +333,17 @@ fn create_ruled_chamfer_surface(
     // a proper B-spline fit could improve accuracy for highly curved edges.
     let curve1: Box<dyn Curve> = Box::new(Line::new(
         data.offset_points1[0],
-        *data.offset_points1.last().unwrap(),
+        *data
+            .offset_points1
+            .last()
+            .expect("offset_points1 non-empty: is_empty check above rejects empty"),
     ));
     let curve2: Box<dyn Curve> = Box::new(Line::new(
         data.offset_points2[0],
-        *data.offset_points2.last().unwrap(),
+        *data
+            .offset_points2
+            .last()
+            .expect("offset_points2 non-empty: is_empty check above rejects empty"),
     ));
 
     Ok(Box::new(RuledSurface::new(curve1, curve2)))
@@ -356,9 +362,29 @@ fn create_chamfer_face(
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
+    // Validate chamfer data has non-empty offset point sequences.
+    // Upstream `compute_chamfer_offsets` always populates these via a
+    // `for i in 0..=num_samples` loop, but we guard here defensively
+    // since `create_chamfer_face` is callable independently.
+    if data.offset_points1.is_empty() || data.offset_points2.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "Chamfer offset point sequences must be non-empty".to_string(),
+        ));
+    }
+
     // Create offset edge curves
     let offset_curve1 = create_offset_curve(model, &data.offset_points1)?;
     let offset_curve2 = create_offset_curve(model, &data.offset_points2)?;
+
+    // Capture last-point references once; validated non-empty above.
+    let last1 = data
+        .offset_points1
+        .last()
+        .expect("offset_points1 non-empty: validated above");
+    let last2 = data
+        .offset_points2
+        .last()
+        .expect("offset_points2 non-empty: validated above");
 
     // Create vertices at ends
     let v1_start = model.vertices.add(
@@ -366,21 +392,13 @@ fn create_chamfer_face(
         data.offset_points1[0].y,
         data.offset_points1[0].z,
     );
-    let v1_end = model.vertices.add(
-        data.offset_points1.last().unwrap().x,
-        data.offset_points1.last().unwrap().y,
-        data.offset_points1.last().unwrap().z,
-    );
+    let v1_end = model.vertices.add(last1.x, last1.y, last1.z);
     let v2_start = model.vertices.add(
         data.offset_points2[0].x,
         data.offset_points2[0].y,
         data.offset_points2[0].z,
     );
-    let v2_end = model.vertices.add(
-        data.offset_points2.last().unwrap().x,
-        data.offset_points2.last().unwrap().y,
-        data.offset_points2.last().unwrap().z,
-    );
+    let v2_end = model.vertices.add(last2.x, last2.y, last2.z);
 
     // Create edges
     let edge1 = Edge::new_auto_range(
@@ -433,7 +451,17 @@ fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationRes
     // Would create proper B-spline curve through points
     // For now, create line between endpoints
     use crate::primitives::curve::Line;
-    let line = Line::new(points[0], *points.last().unwrap());
+    let first = points.first().ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "Offset curve requires at least one point".to_string(),
+        )
+    })?;
+    let last = points.last().ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "Offset curve requires at least one point".to_string(),
+        )
+    })?;
+    let line = Line::new(*first, *last);
     Ok(model.curves.add(Box::new(line)))
 }
 
