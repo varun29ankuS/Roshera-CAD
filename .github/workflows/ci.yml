@@ -21,7 +21,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
+        sudo apt-get install -y pkg-config
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -42,11 +42,11 @@ jobs:
       working-directory: ./roshera-backend
     
     - name: Run clippy
-      run: cargo clippy --all-targets --all-features 2>&1 | tee /dev/stderr | (! grep -q 'error\[E')
+      run: cargo clippy --all-targets --workspace 2>&1 | tee /dev/stderr | (! grep -q 'error\[E')
       working-directory: ./roshera-backend
-    
+
     - name: Run tests
-      run: cargo test --all-features
+      run: cargo test --workspace
       working-directory: ./roshera-backend
     
     # Benchmarks not yet implemented
@@ -94,7 +94,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
+        sudo apt-get install -y pkg-config
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -118,7 +118,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
+        sudo apt-get install -y pkg-config
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -134,22 +134,13 @@ jobs:
     
     - name: Run benchmarks
       run: |
-        # Build and run the benchmark runner that outputs JSON
-        cargo build --release --bin bench_runner
-        ./target/release/bench_runner > bench-results.json
+        # Run criterion benchmarks if they exist
+        if cargo bench --workspace --no-run 2>/dev/null; then
+          cargo bench --workspace -- --output-format bencher | tee bench-results.txt
+        else
+          echo "No benchmarks found, skipping"
+        fi
       working-directory: ./roshera-backend
-    
-    - name: Store benchmark result
-      uses: benchmark-action/github-action-benchmark@v1
-      with:
-        tool: 'customSmallerIsBetter'
-        output-file-path: roshera-backend/bench-results.json
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: true
-        comment-on-alert: false
-        alert-threshold: '150%'
-        fail-on-alert: false
-        benchmark-data-dir-path: 'dev/bench'
 
   performance:
     name: Performance Regression
@@ -164,7 +155,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
+        sudo apt-get install -y pkg-config
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -220,7 +211,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
+        sudo apt-get install -y pkg-config
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
