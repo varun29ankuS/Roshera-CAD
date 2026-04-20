@@ -68,6 +68,10 @@ roshera-app/           React + Three.js + TypeScript browser client
 | | Session manager (multi-user, RBAC) | Working |
 | **Frontend** | React + R3F viewport, toolbar, chat | Working |
 
+## Performance
+
+Measured numbers from the geometry kernel. See individual sections below for detail and methodology.
+
 ## Getting Started
 
 ```bash
