@@ -389,6 +389,7 @@ impl FullIntegrationExecutor {
                                 normals,
                                 uvs: None,
                                 colors: None,
+                                face_map: None,
                             };
                             let filename = self
                                 .export_engine
@@ -428,6 +429,7 @@ impl FullIntegrationExecutor {
                                 normals,
                                 uvs: None,
                                 colors: None,
+                                face_map: None,
                             };
                             let filename = self
                                 .export_engine

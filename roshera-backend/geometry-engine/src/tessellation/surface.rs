@@ -409,21 +409,26 @@ fn triangle_has_edge(triangle: &[usize; 3], v1: usize, v2: usize) -> bool {
     false
 }
 
-/// Enforce an edge constraint in the triangulation
+/// Enforce an edge constraint in the triangulation.
+///
+/// Removes all triangles whose edges cross the constraint edge (v1, v2),
+/// then retriangulates the two resulting cavities (one on each side of the
+/// constraint edge) using ear-clipping. This produces a valid constrained
+/// Delaunay triangulation.
 fn enforce_edge_constraint(
     triangles: &mut Vec<[usize; 3]>,
     vertices: &[(f64, f64)],
     v1: usize,
     v2: usize,
 ) {
-    // Check if edge already exists
+    // Check if edge already exists in the triangulation
     for triangle in triangles.iter() {
         if triangle_has_edge(triangle, v1, v2) {
             return;
         }
     }
 
-    // Find triangles intersecting the edge and retriangulate
+    // Find triangles whose edges intersect the constraint edge
     let mut intersecting = Vec::new();
     for (idx, triangle) in triangles.iter().enumerate() {
         if edge_intersects_triangle(vertices, v1, v2, *triangle) {
@@ -435,15 +440,194 @@ fn enforce_edge_constraint(
         return;
     }
 
-    // Remove intersecting triangles
+    // Collect boundary edges of the cavity (edges not shared between removed triangles)
+    let removed_set: HashSet<usize> = intersecting.iter().cloned().collect();
+    let mut edge_count: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut cavity_vertices: HashSet<usize> = HashSet::new();
+
+    for &idx in &intersecting {
+        let tri = triangles[idx];
+        for k in 0..3 {
+            let a = tri[k];
+            let b = tri[(k + 1) % 3];
+            cavity_vertices.insert(a);
+            cavity_vertices.insert(b);
+            let edge = if a < b { (a, b) } else { (b, a) };
+            *edge_count.entry(edge).or_insert(0) += 1;
+        }
+    }
+    // Ensure constraint endpoints are included
+    cavity_vertices.insert(v1);
+    cavity_vertices.insert(v2);
+
+    // Boundary edges are those appearing exactly once among removed triangles
+    let boundary_edges: Vec<(usize, usize)> = edge_count
+        .iter()
+        .filter(|(_, &count)| count == 1)
+        .map(|(&edge, _)| edge)
+        .collect();
+
+    // Remove intersecting triangles (reverse order to keep indices valid with swap_remove)
     intersecting.sort_unstable_by(|a, b| b.cmp(a));
-    for idx in intersecting {
-        triangles.swap_remove(idx);
+    for idx in &intersecting {
+        triangles.swap_remove(*idx);
     }
 
-    // Retriangulate the cavity
-    // This is a simplified approach - a full implementation would use ear clipping
-    // For now, just create triangles from v1 and v2 to other vertices
+    // Separate cavity vertices into two polygons: above and below the constraint edge
+    let edge_dir = (
+        vertices[v2].0 - vertices[v1].0,
+        vertices[v2].1 - vertices[v1].1,
+    );
+
+    let mut above: Vec<usize> = Vec::new();
+    let mut below: Vec<usize> = Vec::new();
+
+    for &vi in &cavity_vertices {
+        if vi == v1 || vi == v2 {
+            continue;
+        }
+        let rel = (
+            vertices[vi].0 - vertices[v1].0,
+            vertices[vi].1 - vertices[v1].1,
+        );
+        let cross = edge_dir.0 * rel.1 - edge_dir.1 * rel.0;
+        if cross > 0.0 {
+            above.push(vi);
+        } else {
+            below.push(vi);
+        }
+    }
+
+    // Triangulate each side: fan from constraint edge to cavity boundary vertices.
+    // Sort vertices by angle from v1→v2 to produce a correct polygon ordering.
+    let retriangulate_side = |side: &mut Vec<usize>, tris: &mut Vec<[usize; 3]>| {
+        if side.is_empty() {
+            return;
+        }
+
+        // Sort by angle relative to v1, measured from v1→v2 direction
+        let base_angle = edge_dir.1.atan2(edge_dir.0);
+        side.sort_by(|&a, &b| {
+            let da = (
+                vertices[a].0 - vertices[v1].0,
+                vertices[a].1 - vertices[v1].1,
+            );
+            let db = (
+                vertices[b].0 - vertices[v1].0,
+                vertices[b].1 - vertices[v1].1,
+            );
+            let angle_a = da.1.atan2(da.0) - base_angle;
+            let angle_b = db.1.atan2(db.0) - base_angle;
+            // Normalize to [0, 2π)
+            let na = if angle_a < 0.0 {
+                angle_a + 2.0 * std::f64::consts::PI
+            } else {
+                angle_a
+            };
+            let nb = if angle_b < 0.0 {
+                angle_b + 2.0 * std::f64::consts::PI
+            } else {
+                angle_b
+            };
+            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Build polygon: v1, sorted vertices..., v2
+        let mut polygon = Vec::with_capacity(side.len() + 2);
+        polygon.push(v1);
+        polygon.extend_from_slice(side);
+        polygon.push(v2);
+
+        // Ear-clipping triangulation of the polygon
+        ear_clip_2d(vertices, &polygon, tris);
+    };
+
+    retriangulate_side(&mut above, triangles);
+    retriangulate_side(&mut below, triangles);
+}
+
+/// Triangulate a simple polygon in 2D using ear clipping.
+/// Appends resulting triangles to `output`.
+fn ear_clip_2d(vertices: &[(f64, f64)], polygon: &[usize], output: &mut Vec<[usize; 3]>) {
+    if polygon.len() < 3 {
+        return;
+    }
+    if polygon.len() == 3 {
+        output.push([polygon[0], polygon[1], polygon[2]]);
+        return;
+    }
+
+    let mut remaining: Vec<usize> = polygon.to_vec();
+
+    let mut max_iterations = remaining.len() * remaining.len();
+    let mut i = 0;
+
+    while remaining.len() > 3 && max_iterations > 0 {
+        max_iterations -= 1;
+        let n = remaining.len();
+        let prev = remaining[(i + n - 1) % n];
+        let curr = remaining[i % n];
+        let next = remaining[(i + 1) % n];
+
+        let p0 = vertices[prev];
+        let p1 = vertices[curr];
+        let p2 = vertices[next];
+
+        // Check if this is a convex (ear) vertex
+        let cross = (p1.0 - p0.0) * (p2.1 - p0.1) - (p1.1 - p0.1) * (p2.0 - p0.0);
+        if cross <= 1e-14 {
+            // Not convex, skip
+            i = (i + 1) % remaining.len();
+            continue;
+        }
+
+        // Check that no other vertex lies inside this ear triangle
+        let mut is_ear = true;
+        for &vi in &remaining {
+            if vi == prev || vi == curr || vi == next {
+                continue;
+            }
+            if point_in_triangle_2d(&vertices[vi], &p0, &p1, &p2) {
+                is_ear = false;
+                break;
+            }
+        }
+
+        if is_ear {
+            output.push([prev, curr, next]);
+            remaining.remove(i % remaining.len());
+            if i >= remaining.len() && !remaining.is_empty() {
+                i = 0;
+            }
+        } else {
+            i = (i + 1) % remaining.len();
+        }
+    }
+
+    // Emit final triangle
+    if remaining.len() == 3 {
+        output.push([remaining[0], remaining[1], remaining[2]]);
+    }
+}
+
+/// Check if point p is inside triangle (a, b, c) using barycentric coordinates
+fn point_in_triangle_2d(p: &(f64, f64), a: &(f64, f64), b: &(f64, f64), c: &(f64, f64)) -> bool {
+    let v0 = (c.0 - a.0, c.1 - a.1);
+    let v1 = (b.0 - a.0, b.1 - a.1);
+    let v2 = (p.0 - a.0, p.1 - a.1);
+
+    let dot00 = v0.0 * v0.0 + v0.1 * v0.1;
+    let dot01 = v0.0 * v1.0 + v0.1 * v1.1;
+    let dot02 = v0.0 * v2.0 + v0.1 * v2.1;
+    let dot11 = v1.0 * v1.0 + v1.1 * v1.1;
+    let dot12 = v1.0 * v2.0 + v1.1 * v2.1;
+
+    let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
+    let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
+    let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
+
+    // Point is inside if u >= 0, v >= 0, u + v <= 1 (with tolerance)
+    u > 1e-10 && v > 1e-10 && (u + v) < 1.0 - 1e-10
 }
 
 /// Check if an edge intersects a triangle
@@ -554,8 +738,12 @@ fn tessellate_cylindrical_face(
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
-    // Calculate tessellation resolution
-    let radius = 1.0; // TODO: Get actual cylinder radius from surface
+    // Extract actual cylinder radius from surface
+    let radius = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cylinder>()
+        .map(|c| c.radius)
+        .unwrap_or(1.0);
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 

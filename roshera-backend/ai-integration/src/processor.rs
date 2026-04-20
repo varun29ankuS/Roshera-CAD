@@ -739,9 +739,9 @@ mod tests {
     async fn test_processor_text() {
         // Create mock providers
         let mut manager = ProviderManager::new();
-        manager.register_asr("mock", Box::new(MockASRProvider::new()));
-        manager.register_llm("mock", Box::new(MockLLMProvider::new()));
-        manager.set_active("mock", "mock", None);
+        manager.register_asr("mock".to_string(), Box::new(MockASRProvider::new()));
+        manager.register_llm("mock".to_string(), Box::new(MockLLMProvider::new()));
+        manager.set_active("mock".to_string(), "mock".to_string(), None);
 
         let provider_manager = Arc::new(Mutex::new(manager));
         let executor = Arc::new(Mutex::new(CommandExecutor::new()));

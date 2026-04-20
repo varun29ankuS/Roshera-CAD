@@ -672,9 +672,27 @@ impl Vector3 {
     /// Smooth step interpolation
     #[inline]
     pub fn smoothstep(&self, edge0: &Self, edge1: &Self) -> Self {
-        let t = (*self - *edge0)
-            .component_div(&(*edge1 - *edge0))
-            .clamp(&Self::ZERO, &Self::ONE);
+        let range = *edge1 - *edge0;
+        let diff = *self - *edge0;
+        // Safe per-component division: zero range → 0.0 (fully at edge0)
+        let t = Self::new(
+            if range.x.abs() < f64::EPSILON {
+                0.0
+            } else {
+                diff.x / range.x
+            },
+            if range.y.abs() < f64::EPSILON {
+                0.0
+            } else {
+                diff.y / range.y
+            },
+            if range.z.abs() < f64::EPSILON {
+                0.0
+            } else {
+                diff.z / range.z
+            },
+        )
+        .clamp(&Self::ZERO, &Self::ONE);
         // Smoothstep formula: t² * (3 - 2t) = 3t² - 2t³
         let t2 = t.component_mul(&t);
         let t3 = t2.component_mul(&t);
@@ -724,7 +742,10 @@ impl Div<f64> for Vector3 {
 
     #[inline(always)]
     fn div(self, scalar: f64) -> Self {
-        // Multiply by reciprocal for better performance
+        debug_assert!(
+            scalar.abs() > f64::EPSILON,
+            "Vector3 divided by zero or near-zero scalar: {scalar}"
+        );
         let inv = 1.0 / scalar;
         Self::new(self.x * inv, self.y * inv, self.z * inv)
     }
@@ -735,6 +756,10 @@ impl Div<f64> for &Vector3 {
 
     #[inline(always)]
     fn div(self, scalar: f64) -> Vector3 {
+        debug_assert!(
+            scalar.abs() > f64::EPSILON,
+            "Vector3 divided by zero or near-zero scalar: {scalar}"
+        );
         let inv = 1.0 / scalar;
         Vector3::new(self.x * inv, self.y * inv, self.z * inv)
     }
@@ -793,12 +818,11 @@ impl Index<usize> for Vector3 {
 
     #[inline]
     fn index(&self, index: usize) -> &f64 {
-        debug_assert!(index < 3, "Vector3 index out of bounds: {}", index);
         match index {
             0 => &self.x,
             1 => &self.y,
             2 => &self.z,
-            _ => &self.x, // Safe fallback for release mode
+            _ => panic!("Vector3 index out of bounds: {index}"),
         }
     }
 }
@@ -806,12 +830,11 @@ impl Index<usize> for Vector3 {
 impl IndexMut<usize> for Vector3 {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut f64 {
-        debug_assert!(index < 3, "Vector3 index out of bounds: {}", index);
         match index {
             0 => &mut self.x,
             1 => &mut self.y,
             2 => &mut self.z,
-            _ => &mut self.x, // Safe fallback for release mode
+            _ => panic!("Vector3 index out of bounds: {index}"),
         }
     }
 }
@@ -927,7 +950,12 @@ impl Vector3 {
         let dot11 = v1.dot(&v1);
         let dot12 = v1.dot(&v2);
 
-        let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
+        let denom = dot00 * dot11 - dot01 * dot01;
+        // Degenerate triangle (collinear or coincident points) — return centroid
+        if denom.abs() < f64::EPSILON * f64::EPSILON {
+            return Self::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
+        }
+        let inv_denom = 1.0 / denom;
         let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
         let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
 
@@ -1159,5 +1187,37 @@ mod tests {
 
         // Ensure proper alignment for SIMD
         assert_eq!(std::mem::align_of::<Vector3>(), 8);
+    }
+
+    #[test]
+    fn test_barycentric_collinear_returns_centroid() {
+        // Collinear points: degenerate triangle
+        let a = Point3::new(0.0, 0.0, 0.0);
+        let b = Point3::new(1.0, 0.0, 0.0);
+        let c = Point3::new(2.0, 0.0, 0.0);
+        let p = Point3::new(1.0, 0.0, 0.0);
+        let bary = Vector3::barycentric(&p, &a, &b, &c);
+        // Should return centroid (1/3, 1/3, 1/3) for degenerate triangle
+        assert!((bary.x - 1.0 / 3.0).abs() < 1e-10);
+        assert!((bary.y - 1.0 / 3.0).abs() < 1e-10);
+        assert!((bary.z - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_barycentric_coincident_returns_centroid() {
+        let p = Point3::new(1.0, 1.0, 1.0);
+        let bary = Vector3::barycentric(&p, &p, &p, &p);
+        assert!((bary.x - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_smoothstep_equal_edges_no_nan() {
+        let edge = Vector3::new(1.0, 2.0, 3.0);
+        let result = Vector3::new(1.5, 2.5, 3.5).smoothstep(&edge, &edge);
+        assert!(result.x.is_finite());
+        assert!(result.y.is_finite());
+        assert!(result.z.is_finite());
+        // When edge0 == edge1, all components should be 0.0 (at edge0)
+        assert_eq!(result, Vector3::ZERO);
     }
 }

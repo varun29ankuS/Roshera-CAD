@@ -178,53 +178,47 @@ impl TorusPrimitive {
 
         let torus_surface_id = model.surfaces.add(Box::new(torus_surface));
 
-        // For a full torus, we need to create proper topology with seam edges
-        // This ensures the Euler characteristic is correct (V - E + F = 2)
+        // For a full torus, create proper minimal cell complex topology.
+        // A torus is a genus-1 surface with Euler characteristic χ = V - E + F = 0.
+        // Minimal cell complex: 1 vertex, 2 edges (seam loops), 1 face.
+        // Both edges are loops from the single vertex back to itself:
+        //   - Edge 1 (u-seam): follows constant v=0 around the major circle
+        //   - Edge 2 (v-seam): follows constant u=0 around the minor circle
         let torus_face = if is_closed_u && is_closed_v {
-            // Full torus - create with seam edges for proper Euler characteristic
-            // We'll create a grid topology that wraps around
+            // Single vertex at (u=0, v=0)
+            let p = Self::evaluate_point(params, 0.0, 0.0);
+            let v_id = model.vertices.add(p.x, p.y, p.z);
 
-            // Create a simple representation: one vertex, two edges (seams), one face
-            // This gives us V=1, E=2, F=1, so V-E+F = 0, which is wrong...
-            // Actually, for a solid torus, we need a different approach
-
-            // Let's create a minimal valid topology:
-            // We'll use 2 vertices connected by 2 edges forming the seams
-            let p1 = Self::evaluate_point(params, 0.0, 0.0);
-            let p2 = Self::evaluate_point(params, consts::PI, 0.0);
-
-            let v1 = model.vertices.add(p1.x, p1.y, p1.z);
-            let v2 = model.vertices.add(p2.x, p2.y, p2.z);
-
-            // Create two edges connecting the vertices
-            // First edge: half of the major circle
-            let edge1_curve = Self::create_major_circle_arc(params, 0.0, 0.0, consts::PI);
+            // Edge 1: u-seam (major circle at v=0), loops from v_id back to v_id
+            let edge1_curve = Self::create_major_circle_arc(params, 0.0, 0.0, consts::TWO_PI);
             let edge1_curve_id = model.curves.add(edge1_curve);
             let edge1 = Edge::new(
                 0,
-                v1,
-                v2,
+                v_id,
+                v_id, // loop edge: same start and end vertex
                 edge1_curve_id,
                 EdgeOrientation::Forward,
                 ParameterRange::new(0.0, 1.0),
             );
-            let edge1_id = model.edges.add_or_find(edge1);
+            // Use .add() directly — both seam edges share the same vertex pair (v_id, v_id)
+            // so add_or_find() would incorrectly deduplicate them.
+            let edge1_id = model.edges.add(edge1);
 
-            // Second edge: other half of the major circle
-            let edge2_curve =
-                Self::create_major_circle_arc(params, 0.0, consts::PI, consts::TWO_PI);
+            // Edge 2: v-seam (minor circle at u=0), loops from v_id back to v_id
+            let edge2_curve = Self::create_minor_circle_arc(params, 0.0, 0.0, consts::TWO_PI);
             let edge2_curve_id = model.curves.add(edge2_curve);
             let edge2 = Edge::new(
                 0,
-                v2,
-                v1,
+                v_id,
+                v_id, // loop edge: same start and end vertex
                 edge2_curve_id,
                 EdgeOrientation::Forward,
                 ParameterRange::new(0.0, 1.0),
             );
-            let edge2_id = model.edges.add_or_find(edge2);
+            let edge2_id = model.edges.add(edge2);
 
-            // Create loop with both edges
+            // Create loop with both seam edges
+            // V=1, E=2, F=1 → χ = 1 - 2 + 1 = 0 ✓ (genus-1 torus)
             let mut outer_loop = Loop::new(0, LoopType::Outer);
             outer_loop.add_edge(edge1_id, true);
             outer_loop.add_edge(edge2_id, true);
@@ -511,5 +505,43 @@ mod tests {
             10.0, // minor radius > major - invalid!
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_torus_euler_characteristic() {
+        let mut model = BRepModel::new();
+        let params = TorusParameters::new(Point3::ORIGIN, Vector3::Z, 10.0, 3.0).unwrap();
+
+        let solid_id = TorusPrimitive::create(&params, &mut model).unwrap();
+        let solid = model.solids.get(solid_id).unwrap();
+        let shell = model.shells.get(solid.outer_shell).unwrap();
+
+        // Count V, E, F
+        let f = shell.faces.len();
+        let mut all_edges = std::collections::HashSet::new();
+        let mut all_vertices = std::collections::HashSet::new();
+
+        for &face_id in &shell.faces {
+            if let Some(face) = model.faces.get(face_id) {
+                if let Some(loop_data) = model.loops.get(face.outer_loop) {
+                    for &edge_id in &loop_data.edges {
+                        all_edges.insert(edge_id);
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            all_vertices.insert(edge.start_vertex);
+                            all_vertices.insert(edge.end_vertex);
+                        }
+                    }
+                }
+            }
+        }
+
+        let v = all_vertices.len();
+        let e = all_edges.len();
+        let euler = v as i32 - e as i32 + f as i32;
+
+        assert_eq!(
+            euler, 0,
+            "Torus Euler characteristic should be 0 (genus-1), got V={v} - E={e} + F={f} = {euler}"
+        );
     }
 }

@@ -246,20 +246,73 @@ pub struct ViewportInfo {
     
     /// Mouse position in world space
     pub mouse_world: Option<[f32; 3]>,
+
+    /// Mouse movement context for AI awareness
+    #[serde(default)]
+    pub mouse_context: Option<MouseContext>,
 }
 
 /// Mouse position in normalized screen coordinates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MousePosition {
+    /// X coordinate (-1.0 to 1.0)
     pub x: f32,
+    /// Y coordinate (-1.0 to 1.0)
     pub y: f32,
 }
 
 /// Mouse position in pixels
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PixelPosition {
+    /// X coordinate in pixels
     pub x: f32,
+    /// Y coordinate in pixels
     pub y: f32,
+}
+
+/// Mouse movement context for AI spatial awareness
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MouseContext {
+    /// Mouse velocity in pixels/second
+    pub velocity: [f32; 2],
+    /// How long the mouse has been stationary (milliseconds, 0 = moving)
+    pub dwell_ms: u64,
+    /// Object ID the mouse is hovering over (if any)
+    pub hover_object_id: Option<String>,
+    /// Face/edge/vertex index being hovered
+    pub hover_sub_element: Option<SubElementRef>,
+    /// Recent mouse trail (last N positions in screen coords for gesture detection)
+    pub trail: Vec<[f32; 2]>,
+    /// Whether a mouse button is currently pressed
+    pub button_pressed: bool,
+    /// Which button (0=left, 1=middle, 2=right)
+    pub button_index: u8,
+}
+
+/// Reference to a sub-element (face, edge, or vertex)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubElementRef {
+    /// Parent object ID
+    pub object_id: String,
+    /// Sub-element type
+    pub element_type: SubElementType,
+    /// Index within the parent object
+    pub index: u32,
+    /// 3D position of the sub-element (center/midpoint)
+    pub position: Option<[f32; 3]>,
+    /// Surface normal at hover point (for faces)
+    pub normal: Option<[f32; 3]>,
+}
+
+/// Type of sub-element being referenced
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SubElementType {
+    /// A face of a solid
+    Face,
+    /// An edge of a solid
+    Edge,
+    /// A vertex of a solid
+    Vertex,
 }
 
 /// Light information

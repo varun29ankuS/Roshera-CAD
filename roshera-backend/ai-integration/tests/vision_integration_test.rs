@@ -92,6 +92,7 @@ fn create_test_viewport() -> ViewportCapture {
             mouse_screen: MousePosition { x: 0.0, y: 0.0 },
             mouse_pixels: PixelPosition { x: 960.0, y: 540.0 },
             mouse_world: Some([5.0, 5.0, 5.0]),
+            mouse_context: None,
         },
         lighting: vec![],
         clipping_planes: vec![],

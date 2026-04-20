@@ -1081,8 +1081,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 normals: vec![], // Would compute normals in production
                                                 uvs: None,
                                                 colors: None, // Optional field
+                                                face_map: None,
                                             };
-                                            
+
                                             // Execute export
                                             match export_engine.export_stl(&mesh, &filename).await {
                                                 Ok(result_path) => {
@@ -1172,8 +1173,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 normals: vec![],
                                                 uvs: None,
                                                 colors: None,
+                                                face_map: None,
                                             };
-                                            
+
                                             match export_engine.export_obj(&mesh, &obj_filename).await {
                                                 Ok(result_path) => {
                                                     info!("Successfully exported to OBJ: {}", result_path);

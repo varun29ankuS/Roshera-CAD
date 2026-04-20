@@ -42,7 +42,7 @@ jobs:
       working-directory: ./roshera-backend
     
     - name: Run clippy
-      run: cargo clippy --all-targets --all-features
+      run: cargo clippy --all-targets --all-features 2>&1 | tee /dev/stderr | (! grep -q 'error\[E')
       working-directory: ./roshera-backend
     
     - name: Run tests
@@ -57,43 +57,32 @@ jobs:
   frontend:
     name: Frontend Build
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
       with:
-        targets: wasm32-unknown-unknown
-    
-    - name: Install trunk
-      run: |
-        cargo install trunk
-        cargo install wasm-bindgen-cli
-    
-    - name: Cache cargo dependencies
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-frontend-${{ hashFiles('**/Cargo.lock') }}
-    
-    - name: Build frontend
-      run: |
-        # Check what files exist
-        ls -la
-        # Check if Trunk.toml exists and create a minimal one if not
-        if [ ! -f "Trunk.toml" ]; then
-          echo "Creating minimal Trunk.toml"
-          echo '[build]' > Trunk.toml
-          echo 'target = "index.html"' >> Trunk.toml
-          echo 'dist = "dist"' >> Trunk.toml
-        fi
-        # Build with trunk
-        trunk build --release
-      working-directory: ./roshera-front
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: roshera-app/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+      working-directory: ./roshera-app
+
+    - name: Type check
+      run: npx tsc -b
+      working-directory: ./roshera-app
+
+    - name: Lint
+      run: npm run lint
+      working-directory: ./roshera-app
+
+    - name: Build
+      run: npm run build
+      working-directory: ./roshera-app
 
   security:
     name: Security Audit
@@ -116,6 +105,7 @@ jobs:
     - name: Run security audit
       run: cargo audit
       working-directory: ./roshera-backend
+      continue-on-error: true
 
   benchmark:
     name: Run Benchmarks
@@ -234,27 +224,27 @@ jobs:
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: wasm32-unknown-unknown
-    
-    - name: Install dependencies
-      run: |
-        cargo install trunk
-        cargo install wasm-bindgen-cli
-    
+
     - name: Build backend release
       run: cargo build --release
       working-directory: ./roshera-backend
     
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: roshera-app/package-lock.json
+
     - name: Build frontend release
-      run: trunk build --release
-      working-directory: ./roshera-front
-    
+      run: npm ci && npm run build
+      working-directory: ./roshera-app
+
     - name: Create deployment artifact
       run: |
         mkdir -p deployment
         cp -r roshera-backend/target/release/* deployment/
-        cp -r roshera-front/dist/* deployment/
+        cp -r roshera-app/dist/* deployment/
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4

@@ -577,6 +577,11 @@ async fn handle_boolean_operation(
                     .collect(),
                 colors: None,
                 uvs: None,
+                face_map: if triangle_mesh.face_map.is_empty() {
+                    None
+                } else {
+                    Some(triangle_mesh.face_map.clone())
+                },
             };
 
             // Store result in session
@@ -1474,6 +1479,11 @@ fn tessellate_solid_for_display(
             .collect(),
         colors: None,
         uvs: None,
+        face_map: if triangle_mesh.face_map.is_empty() {
+            None
+        } else {
+            Some(triangle_mesh.face_map.clone())
+        },
     };
 
     Ok(mesh)

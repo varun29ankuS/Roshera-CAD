@@ -635,7 +635,10 @@ fn in_circle_test_3d(p1: &Point3, p2: &Point3, p3: &Point3, p4: &Point3) -> bool
         return false; // Degenerate triangle
     }
 
-    let normal = normal.normalize().unwrap();
+    let normal = match normal.normalize() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
     let (u_axis, v_axis) = compute_plane_axes(&normal);
 
     // Project points to 2D

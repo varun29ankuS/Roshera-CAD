@@ -693,6 +693,7 @@ mod tests {
         let session = SessionState {
             id: uuid::Uuid::new_v4(),
             name: "Test Session".to_string(),
+            owner_id: "test-owner".to_string(),
             objects: std::collections::HashMap::new(),
             history: std::collections::VecDeque::new(),
             history_index: 0,
@@ -704,7 +705,7 @@ mod tests {
             sketch_planes: std::collections::HashMap::new(),
             active_sketch_plane: None,
             orientation_cube: OrientationCubeState::default(),
-            sketch_state: SketchState::default(), // Add missing field with default value
+            sketch_state: SketchState::default(),
         };
 
         manager.cache_session(&session).await;

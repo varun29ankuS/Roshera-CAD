@@ -19,6 +19,11 @@ pub mod natural_language_schemas;
 pub mod primitive_examples;
 pub mod primitive_traits;
 
+// Geometry intelligence
+pub mod feature_recognition;
+pub mod geometry_summary;
+pub mod tool_schema_generator;
+
 // AI-accessible primitives
 pub mod box_primitive;
 pub mod cone_primitive;

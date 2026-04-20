@@ -516,6 +516,8 @@ mod tests {
             id: ObjectId::new_v4(),
             name: "Test".to_string(),
             mesh: crate::Mesh::new(),
+            analytical_geometry: None,
+            cached_meshes: HashMap::new(),
             transform: crate::Transform3D::identity(),
             material: crate::geometry::MaterialProperties::default(),
             visible: true,

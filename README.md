@@ -1,10 +1,10 @@
 # Roshera
 
-**B-Rep geometry kernel built from scratch in Rust.**
+**AI-native CAD engine — B-Rep geometry kernel built from scratch in Rust.**
 
-Roshera is a boundary representation CAD system with production-grade mathematical foundations — NURBS curves and surfaces, exact B-Rep topology, and real-time tessellation. No wrappers around OpenCASCADE or Parasolid.
+Roshera is a boundary representation CAD system with an LLM-driven design workflow, production-grade NURBS mathematics, and a proprietary encrypted file format (.ros) with AI provenance tracking. No wrappers around OpenCASCADE or Parasolid — every line of the geometry kernel is original.
 
-Primitives, topology, and NURBS math are production-ready. Operations (booleans, fillet, chamfer) and AI integration are under active development.
+The geometry kernel has been through three rounds of topological audit with all critical and high-severity issues resolved. Math primitives, topology, and operations are hardened against division-by-zero, NaN propagation, and degenerate geometry.
 
 | Dark Mode | Light Mode |
 |-----------|------------|
@@ -18,7 +18,7 @@ roshera-backend/
   ai-integration/      API-based AI providers (Claude, OpenAI)
   timeline-engine/     Event-sourced design history with branching
   session-manager/     Multi-user collaboration with RBAC
-  export-engine/       STL, OBJ, ROS export
+  export-engine/       STL, OBJ, encrypted .ros (AES-256-GCM, AI provenance)
   rag-engine/          Vamana-indexed retrieval for design knowledge
   api-server/          Axum REST + WebSocket API
   shared-types/        Common type definitions
@@ -30,18 +30,20 @@ roshera-app/           React + Three.js + TypeScript browser client
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **Math** | Production | Vector3, Matrix4, Quaternion, B-spline, NURBS — tested, SIMD-optimized |
-| **Primitives** | Production | Box, Sphere, Cylinder, Cone, Torus — real B-Rep topology |
-| **Topology** | Production | Euler validation, manifold detection, adjacency queries, parallel building |
-| **Tessellation** | Production | Per-surface-type dispatch, adaptive subdivision, visualization meshes |
-| **Extrude** | Working | Face and profile extrusion with draft angle and taper support |
-| **Boolean** | Partial | Surface-surface intersection computed; face reconstruction in progress |
-| **Fillet** | Partial | Constant-radius working; variable-radius in development |
+| **Math** | Production | Vector3, Matrix4, Quaternion, B-spline, NURBS — hardened against singularities |
+| **Primitives** | Production | Box, Sphere, Cylinder, Cone, Torus — real B-Rep topology with dihedral angles |
+| **Topology** | Production | Euler validation (V-E+F=2), manifold detection, parallel adjacency, real dihedral angles |
+| **Tessellation** | Production | Per-surface-type dispatch, adaptive subdivision, proper UV mapping |
+| **Extrude** | Production | Face and profile extrusion with draft angle, taper, twist, and scaling |
+| **Boolean** | Working | SSI via marching, 3-ray face classification, topology reconstruction |
+| **Fillet** | Working | Constant-radius (cylindrical/toroidal/spherical) + variable-radius (NURBS) |
+| **Chamfer** | Working | Distance and angle-based chamfers with robust edge lookup |
+| **Offset** | Working | Plane, cylinder, sphere, cone, torus, NURBS surface offsets |
+| **Sewing** | Working | Topology repair: edge/vertex matching, shell stitching, manifold validation |
 | **Revolve / Sweep / Loft** | In development | Pipeline structured, surface generation incomplete |
-| **Chamfer** | In development | Entry point exists, adjacent face lookup incomplete |
-| **Assembly** | Data model | Components, mates, motion limits defined; constraint solver not implemented |
+| **Assembly** | Data model | Components, mates, motion limits defined; constraint solver not started |
 | **2D Sketch** | Partial | Newton-Raphson solver loop working; constraint coverage expanding |
-| **Export** | STL + OBJ + ROS | STEP writer structured but output not yet valid |
+| **Export** | STL + OBJ + ROS | Encrypted .ros with AI provenance; STEP writer not yet valid |
 | **RAG Engine** | Working | Vamana/DiskANN vector index with cosine/euclidean/dot-product |
 | **Timeline** | Working | Event-sourced history with branching |
 | **AI Integration** | Working | Claude + OpenAI API providers, natural language command parsing |
