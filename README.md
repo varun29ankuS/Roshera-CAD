@@ -88,6 +88,16 @@ Criterion, release build, median of 100 samples.
 | Point3 distance | 505 ps |
 | Point3 translate | 868 ps |
 
+### Primitive creation
+
+Full B-Rep topology construction with a fresh `BRepModel` per iteration. Criterion, release build.
+
+| Primitive | Time |
+|-----------|------|
+| Box | 65 µs |
+| Sphere | 49 µs |
+| Cylinder | 50 µs |
+
 ## Getting Started
 
 ```bash
