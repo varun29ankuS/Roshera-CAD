@@ -1699,6 +1699,7 @@ impl OperationError {
             OperationError::IncompatibleProfiles => "incompatible_profiles",
             OperationError::InvalidPattern(_) => "invalid_pattern",
             OperationError::InvalidInput { .. } => "invalid_input",
+            OperationError::CoplanarFaces(_) => "coplanar_faces",
         }
     }
 

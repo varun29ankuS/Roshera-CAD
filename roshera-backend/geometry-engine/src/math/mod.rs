@@ -29,13 +29,19 @@ pub mod bspline;
 pub mod bspline_surface;
 pub mod continuity_analysis;
 pub mod nurbs;
-pub mod surface_surface_intersection;
+pub mod surface_intersection;
 pub mod test_oslo;
 pub mod trimmed_nurbs;
 pub mod tspline;
 
 // Frame computation for sweep operations
 pub mod frame;
+
+// Dense linear system solver shared across sketch constraints and G2 blending
+pub mod linear_solver;
+
+// Tensor-product Bézier patch evaluation for G2 blending surfaces
+pub mod bezier_patch;
 
 // Surface-plane intersection for draft operations
 pub mod surface_plane_intersection;

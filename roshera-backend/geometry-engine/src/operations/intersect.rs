@@ -902,36 +902,61 @@ fn intersect_plane_plane(
     }]))
 }
 
-/// Intersect plane and cylinder
-fn intersect_plane_cylinder(
-    surface1: &Box<dyn Surface>,
-    surface2: &Box<dyn Surface>,
-    tolerance: Tolerance,
-) -> OperationResult<IntersectionResult> {
-    // Plane-cylinder gives ellipse, line, or nothing
-    Ok(IntersectionResult::None)
-}
-
-/// Intersect plane and sphere
-fn intersect_plane_sphere(
-    surface1: &Box<dyn Surface>,
-    surface2: &Box<dyn Surface>,
-    tolerance: Tolerance,
-) -> OperationResult<IntersectionResult> {
-    // Plane-sphere gives circle, point, or nothing
-    Ok(IntersectionResult::None)
-}
-
-/// General surface-surface intersection
+/// General surface-surface intersection — delegates to the canonical math
+/// layer ([`crate::math::surface_intersection::intersect_surfaces`]) and
+/// wraps each traced polyline as a `Box<dyn Curve>` for the `IntersectionResult`.
 fn intersect_general_surfaces(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
-    face1: &Face,
-    face2: &Face,
+    _face1: &Face,
+    _face2: &Face,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Would implement marching method for general surfaces
-    Ok(IntersectionResult::None)
+    use crate::math::surface_intersection::{
+        intersect_surfaces as math_intersect, intersection_curve_to_nurbs,
+    };
+    use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
+
+    let raw = math_intersect(surface1, surface2, &tolerance).map_err(|e| {
+        OperationError::NumericalError(format!("surface-surface intersection failed: {:?}", e))
+    })?;
+
+    if raw.is_empty() {
+        return Ok(IntersectionResult::None);
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for curve in &raw {
+        // Need at least degree + 1 samples; use cubic degree.
+        if curve.points.len() < 4 {
+            continue;
+        }
+        let math_nurbs = intersection_curve_to_nurbs(curve, 3).map_err(|e| {
+            OperationError::NumericalError(format!("intersection curve fit failed: {:?}", e))
+        })?;
+        let prim = PrimNurbsCurve::new(
+            math_nurbs.degree,
+            math_nurbs.control_points,
+            math_nurbs.weights,
+            math_nurbs.knots.values().to_vec(),
+        )
+        .map_err(|e| {
+            OperationError::NumericalError(format!("primitive NURBS conversion failed: {:?}", e))
+        })?;
+
+        out.push(IntersectionCurve {
+            curve_3d: Box::new(prim),
+            param_curve1: None,
+            param_curve2: None,
+            t_range: (0.0, 1.0),
+        });
+    }
+
+    if out.is_empty() {
+        Ok(IntersectionResult::None)
+    } else {
+        Ok(IntersectionResult::Curves(out))
+    }
 }
 
 // #[cfg(test)]

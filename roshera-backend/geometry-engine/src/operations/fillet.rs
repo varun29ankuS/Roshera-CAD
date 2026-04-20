@@ -806,7 +806,7 @@ fn compute_fillet_trim_curves(
     face1_id: FaceId,
     face2_id: FaceId,
 ) -> OperationResult<(Vec<Point3>, Vec<Point3>)> {
-    use crate::operations::surface_intersection::intersection_curve_to_nurbs;
+    use crate::math::surface_intersection::intersection_curve_to_nurbs;
     // use crate::math::tolerance::NORMAL_TOLERANCE;
 
     // For trim curve computation, we use the contact curves from the rolling ball data
@@ -847,7 +847,7 @@ fn create_trimmed_fillet_face(
     trim_curve1: Vec<Point3>,
     trim_curve2: Vec<Point3>,
 ) -> OperationResult<FaceId> {
-    use crate::operations::surface_intersection::intersection_curve_to_nurbs;
+    use crate::math::surface_intersection::intersection_curve_to_nurbs;
     use crate::primitives::r#loop::Loop;
 
     // Get the original edge for start/end vertices
@@ -862,11 +862,12 @@ fn create_trimmed_fillet_face(
 
     // Create curves for trim boundaries
     let trim_curve1_math = intersection_curve_to_nurbs(
-        &crate::operations::surface_intersection::IntersectionCurve {
+        &crate::math::surface_intersection::IntersectionCurve {
             points: trim_curve1.clone(),
             params1: vec![(0.0, 0.0); trim_curve1.len()],
             params2: vec![(0.0, 0.0); trim_curve1.len()],
             tangents: vec![Vector3::X; trim_curve1.len()],
+            is_closed: false,
         },
         3,
     )
@@ -875,11 +876,12 @@ fn create_trimmed_fillet_face(
     })?;
 
     let trim_curve2_math = intersection_curve_to_nurbs(
-        &crate::operations::surface_intersection::IntersectionCurve {
+        &crate::math::surface_intersection::IntersectionCurve {
             points: trim_curve2.clone(),
             params1: vec![(0.0, 0.0); trim_curve2.len()],
             params2: vec![(0.0, 0.0); trim_curve2.len()],
             tangents: vec![Vector3::X; trim_curve2.len()],
+            is_closed: false,
         },
         3,
     )
