@@ -1114,7 +1114,9 @@ impl BSplineCurve {
                 }
 
                 let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                let j2 = if (r - 1) <= pk as usize {
+                // Piegl-Tiller A2.3 uses signed comparison (r-1 vs pk, both int).
+                // In Rust, `r: usize` underflows when r == 0; compute as i32.
+                let j2 = if (r as i32) - 1 <= pk {
                     k - 1
                 } else {
                     self.degree - r
@@ -1172,6 +1174,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-only: asserts 200ns/op which only holds with -O; run with --release --ignored"]
     fn test_performance_benchmark() {
         use std::time::Instant;
 

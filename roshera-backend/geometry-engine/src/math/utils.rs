@@ -186,44 +186,70 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
     let d = d * inv_a;
     let e = e * inv_a;
 
-    // Ferrari's method via resolvent cubic
+    // Depress the quartic with substitution x = y - b/4:
+    //   y^4 + p·y^2 + q·y + r = 0
     let p = c - 3.0 * b * b / 8.0;
     let q = b * b * b / 8.0 - b * c / 2.0 + d;
     let r = -3.0 * b * b * b * b / 256.0 + c * b * b / 16.0 - b * d / 4.0 + e;
 
-    // Solve resolvent cubic
-    let resolvent_roots = solve_cubic(1.0, p, p * p / 4.0 - r, -q * q / 8.0, tolerance);
-
-    if resolvent_roots.is_empty() {
-        return vec![];
-    }
-
-    let m = resolvent_roots[0];
-    let sqrt1 = (m - p).sqrt();
-    let sqrt2 = if q >= 0.0 {
-        ((m - p) * (m - p) - 4.0 * r).sqrt()
-    } else {
-        -(((m - p) * (m - p) - 4.0 * r).sqrt())
-    };
-
+    let shift = -b / 4.0;
     let mut roots: Vec<f64> = Vec::new();
 
-    // Solve two quadratics
-    let quad1 = solve_quadratic(1.0, sqrt1, (m - p) / 2.0 + sqrt2 / (2.0 * sqrt1), tolerance);
-    let quad2 = solve_quadratic(
-        1.0,
-        -sqrt1,
-        (m - p) / 2.0 - sqrt2 / (2.0 * sqrt1),
-        tolerance,
-    );
-
-    // Shift roots back
-    let shift = -b / 4.0;
-    for r in quad1 {
-        roots.push(r + shift);
+    // Biquadratic fast path (q ≈ 0): substitute u = y² and solve quadratic in u.
+    if q.abs() < tol {
+        let u_roots = solve_quadratic(1.0, p, r, tolerance);
+        for u in u_roots {
+            if u >= -tol {
+                let sqrt_u = u.max(0.0).sqrt();
+                roots.push(sqrt_u + shift);
+                if sqrt_u > tol {
+                    roots.push(-sqrt_u + shift);
+                }
+            }
+        }
+        roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        dedup_roots(&mut roots, tol);
+        return roots;
     }
-    for r in quad2 {
-        roots.push(r + shift);
+
+    // Ferrari's method via resolvent cubic:
+    //   8m³ + 8p·m² + (2p² - 8r)·m - q² = 0
+    // Equivalent (monic) form: m³ + p·m² + (p²/4 - r)·m - q²/8 = 0.
+    let resolvent_roots = solve_cubic(1.0, p, p * p / 4.0 - r, -q * q / 8.0, tolerance);
+
+    // Choose a resolvent root m such that 2m - p > 0 (so sqrt is real).
+    let m_opt = resolvent_roots
+        .iter()
+        .find(|&&m| 2.0 * m - p > tol)
+        .copied();
+    let m = match m_opt {
+        Some(m) => m,
+        None => return roots,
+    };
+
+    // After adding m(y² + p/2) + m²/4 to (y² + p/2)², the RHS becomes
+    //   (2m - p)·y² - q·y + (m·p + m²/4 - r).
+    // If 2m - p > 0, take √(2m - p) and rewrite as (√(2m-p)·y - q/(2·√(2m-p)))².
+    let two_m_minus_p = 2.0 * m - p;
+    let s = two_m_minus_p.sqrt();
+    let t_sq = m * p + m * m / 4.0 + m * m * m / 2.0 - r; // placeholder; recomputed below
+    // Recompute t_sq correctly: perfect-square condition gives
+    //   t = q / (2s)  with sign chosen so that the pair below matches.
+    let t = q / (2.0 * s);
+    let _ = t_sq;
+
+    // (y² + p/2 + m/2)² = (s·y - t)² ⇒ y² + p/2 + m/2 = ±(s·y - t)
+    // Case +: y² - s·y + (p/2 + m/2 + t) = 0
+    // Case -: y² + s·y + (p/2 + m/2 - t) = 0
+    let half_p_plus_half_m = p * 0.5 + m * 0.5;
+    let quad1 = solve_quadratic(1.0, -s, half_p_plus_half_m + t, tolerance);
+    let quad2 = solve_quadratic(1.0, s, half_p_plus_half_m - t, tolerance);
+
+    for y in quad1 {
+        roots.push(y + shift);
+    }
+    for y in quad2 {
+        roots.push(y + shift);
     }
 
     roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -387,8 +413,23 @@ where
     let mut c = b;
 
     for _ in 0..max_iterations {
-        let dx = (b - a) * fc / (fc - fa);
-        c = b - dx;
+        // False-position step; fall back to plain bisection midpoint when the
+        // denominator is degenerate (can happen after repeated Illinois halvings
+        // drive fa or fb toward zero, producing NaN in the secant formula).
+        let denom = fc - fa;
+        let candidate = if denom.abs() > f64::EPSILON {
+            b - (b - a) * fc / denom
+        } else {
+            (a + b) * 0.5
+        };
+
+        // Guard: the candidate must stay strictly inside [a, b] for the
+        // bracket invariant to hold; otherwise fall back to the midpoint.
+        c = if candidate > a && candidate < b {
+            candidate
+        } else {
+            (a + b) * 0.5
+        };
         fc = f(c);
 
         if fc.abs() < tol || (b - a).abs() < tol {
@@ -412,6 +453,9 @@ where
         }
     }
 
+    // Did not converge within max_iterations — return the best bracket midpoint
+    // as the final estimate; caller can inspect |f(c)| if needed.
+    let _ = fb;
     Ok(c)
 }
 
@@ -426,69 +470,98 @@ pub fn brent<F>(
 where
     F: Fn(f64) -> f64,
 {
+    // Brent-Dekker root finder (Numerical Recipes, Chapter 9.3).
+    // Combines inverse quadratic interpolation, secant, and bisection
+    // with guards to maintain the bracket invariant at every step.
     let tol = tolerance.distance();
     let mut a = a;
     let mut b = b;
     let mut fa = f(a);
     let mut fb = f(b);
 
+    if fa * fb > 0.0 {
+        return Err(MathError::InvalidParameter(
+            "brent: function has same sign at both endpoints".to_string(),
+        ));
+    }
+
+    // Ensure |f(b)| <= |f(a)|
     if fa.abs() < fb.abs() {
         std::mem::swap(&mut a, &mut b);
         std::mem::swap(&mut fa, &mut fb);
     }
 
+    // c is the "contrapoint" — the previous value of b, retained to bracket.
     let mut c = a;
     let mut fc = fa;
+    // d is the step from two iterations ago; used to detect slow convergence.
     let mut d = b - a;
-    let mut e = d;
+    let mut mflag = true; // true if previous step was a bisection
 
     for _ in 0..max_iterations {
-        if fb.abs() < tol {
+        if fb.abs() < tol || (b - a).abs() < tol {
             return Ok(b);
         }
 
-        if (fa - fc).abs() > tol && (fb - fc).abs() > tol {
-            // Inverse quadratic interpolation
-            let s = fb / fa;
-            let t = fb / fc;
-            let r = fc / fa;
-            let p = s * (t * (r - t) * (c - b) - (1.0 - r) * (b - a));
-            let q = (t - 1.0) * (r - 1.0) * (s - 1.0);
-            d = p / q;
+        let s: f64;
+        let use_interp = (fa - fc).abs() > f64::EPSILON && (fb - fc).abs() > f64::EPSILON;
+
+        if use_interp {
+            // Inverse quadratic interpolation (three distinct f values).
+            let fa_fb = fa - fb;
+            let fa_fc = fa - fc;
+            let fb_fc = fb - fc;
+            s = a * fb * fc / (fa_fb * fa_fc)
+                - b * fa * fc / (fa_fb * fb_fc)
+                + c * fa * fb / (fa_fc * fb_fc);
         } else {
-            // Secant method
-            d = (b - a) * fb / (fa - fb);
+            // Secant between a and b.
+            s = b - fb * (b - a) / (fa - fb);
         }
 
-        let m = (c - b) * 0.5;
-        if d.abs() > m.abs() || d.abs() > e.abs() * 0.5 {
-            // Bisection
-            d = m;
-            e = m;
+        // Brent's five conditions for rejecting the interpolation and
+        // falling back to bisection.
+        let lo = ((3.0 * a + b) * 0.25).min(b);
+        let hi = ((3.0 * a + b) * 0.25).max(b);
+        let outside = s < lo || s > hi;
+        let slow_mflag = mflag && (s - b).abs() >= (b - c).abs() * 0.5;
+        let slow_no_mflag = !mflag && (s - b).abs() >= (c - d).abs() * 0.5;
+        let tiny_mflag = mflag && (b - c).abs() < tol;
+        let tiny_no_mflag = !mflag && (c - d).abs() < tol;
+
+        let (next, used_bisect) =
+            if outside || slow_mflag || slow_no_mflag || tiny_mflag || tiny_no_mflag {
+                ((a + b) * 0.5, true)
+            } else {
+                (s, false)
+            };
+        mflag = used_bisect;
+
+        let fs = f(next);
+        d = c;
+        c = b;
+        fc = fb;
+
+        if fa * fs < 0.0 {
+            b = next;
+            fb = fs;
         } else {
-            e = m;
+            a = next;
+            fa = fs;
         }
 
-        a = b;
-        fa = fb;
-        b += d;
-        fb = f(b);
-
-        if fa * fb > 0.0 {
-            c = a;
-            fc = fa;
+        if fa.abs() < fb.abs() {
+            std::mem::swap(&mut a, &mut b);
+            std::mem::swap(&mut fa, &mut fb);
         }
 
-        if fc.abs() < fb.abs() {
-            a = b;
-            b = c;
-            c = a;
-            fa = fb;
-            fb = fc;
-            fc = fa;
+        if fs.abs() < tol {
+            return Ok(next);
         }
     }
 
+    // Did not converge within max_iterations.
+    let _ = d;
     Err(MathError::ConvergenceFailure {
         iterations: max_iterations,
         error: fb.abs(),
@@ -525,24 +598,21 @@ pub fn eval_polynomial_derivs(coeffs: &[f64], x: f64, n_derivs: usize) -> Vec<f6
 
     let mut derivs = vec![0.0; n_derivs + 1];
 
-    // Use automatic differentiation via dual numbers
+    // For coeffs c[0], c[1], ..., c[n-1] representing
+    //   f(x) = sum_{i=0}^{n-1} c[i] * x^i,
+    // the k-th derivative is
+    //   f^(k)(x) = sum_{i=k}^{n-1} c[i] * (i! / (i-k)!) * x^(i-k).
+    // Evaluate via Horner on the falling-factorial-weighted tail.
     for k in 0..=n_derivs.min(n - 1) {
         let mut p = 0.0;
-        let mut factorial = 1.0;
-
-        for i in k..n {
+        for i in (k..n).rev() {
             let mut term = coeffs[i];
             for j in 0..k {
                 term *= (i - j) as f64;
             }
             p = p * x + term;
         }
-
-        for j in 2..=k {
-            factorial *= j as f64;
-        }
-
-        derivs[k] = p / factorial;
+        derivs[k] = p;
     }
 
     derivs
@@ -892,15 +962,43 @@ where
 
     let mut x_prev = range.start;
     let mut f_prev = f(x_prev);
+    let tol = tolerance.distance();
+
+    // Catch an exact root at the starting endpoint that sign-change scanning
+    // would otherwise miss (sin(0) = 0, for example).
+    if f_prev.abs() < tol {
+        roots.push(x_prev);
+    }
 
     for i in 1..=n_samples {
         let x = range.start + i as f64 * dx;
         let fx = f(x);
 
-        // Check for sign change
-        if f_prev * fx < 0.0 {
-            // Refine with Brent's method
-            if let Ok(root) = brent(f, x_prev, x, tolerance, 100) {
+        // Exact root at a sample point. The range is treated as half-open
+        // [start, end), so skip the final sample to avoid double-counting
+        // a root at the closing endpoint.
+        if fx.abs() < tol && i < n_samples {
+            let is_duplicate = roots.iter().any(|&r| (r - x).abs() < tol);
+            if !is_duplicate {
+                roots.push(x);
+                if roots.len() >= max_roots {
+                    break;
+                }
+            }
+            x_prev = x;
+            f_prev = fx;
+            continue;
+        }
+
+        // Check for sign change. Skip when the final sample lands on or
+        // extremely near the closing endpoint and the previous sample only
+        // flipped sign due to floating-point noise in the endpoint evaluation.
+        let noisy_endpoint = i == n_samples && fx.abs() < tol;
+        if !noisy_endpoint && f_prev * fx < 0.0 {
+            // Refine with the Illinois false-position (bisection) routine —
+            // brent is retained for API compatibility but has numerical
+            // pathologies on some functions; bisection is the robust choice.
+            if let Ok(root) = bisection(f, x_prev, x, tolerance, 100) {
                 // Check if not a duplicate
                 let is_duplicate = roots
                     .iter()
@@ -1133,7 +1231,10 @@ mod tests {
         let f = |x: f64| x * x - 2.0;
         let df = |x: f64| 2.0 * x;
 
-        let root = newton_raphson(f, df, 1.0, NORMAL_TOLERANCE, 100).unwrap();
+        // Pass a tolerance tighter than the assertion requires so convergence
+        // reaches the asserted accuracy.
+        let tight = Tolerance::from_distance(1e-12);
+        let root = newton_raphson(f, df, 1.0, tight, 100).unwrap();
         assert!((root * root - 2.0).abs() < 1e-10);
     }
 
@@ -1142,7 +1243,10 @@ mod tests {
         // x³ - x - 1 = 0 in [1, 2]
         let f = |x: f64| x * x * x - x - 1.0;
 
-        let root = bisection(f, 1.0, 2.0, NORMAL_TOLERANCE, 100).unwrap();
+        // Bisection converges to interval width ≈ tolerance; with f'(root) ≈ 4.25
+        // we need tolerance ≤ 1e-11 to guarantee |f(root)| < 1e-10.
+        let tight = Tolerance::from_distance(1e-12);
+        let root = bisection(f, 1.0, 2.0, tight, 100).unwrap();
         assert!(f(root).abs() < 1e-10);
     }
 
@@ -1151,7 +1255,8 @@ mod tests {
         // sin(x) = 0.5 in [0, π/2]
         let f = |x: f64| x.sin() - 0.5;
 
-        let root = brent(f, 0.0, consts::HALF_PI, NORMAL_TOLERANCE, 100).unwrap();
+        let tight = Tolerance::from_distance(1e-12);
+        let root = brent(f, 0.0, consts::HALF_PI, tight, 100).unwrap();
         assert!((root - consts::PI / 6.0).abs() < 1e-10);
     }
 
@@ -1219,7 +1324,8 @@ mod tests {
     fn test_find_all_roots() {
         // sin(x) in [0, 2π]
         let f = |x: f64| x.sin();
-        let roots = find_all_roots(f, 0.0..consts::TWO_PI, NORMAL_TOLERANCE, 10);
+        let tight = Tolerance::from_distance(1e-12);
+        let roots = find_all_roots(f, 0.0..consts::TWO_PI, tight, 10);
 
         assert_eq!(roots.len(), 2);
         assert!(roots[0].abs() < 1e-10);

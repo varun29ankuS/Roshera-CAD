@@ -209,13 +209,14 @@ mod tests {
         let solid = model.solids.get(solid_id).unwrap();
         let shell = model.shells.get(solid.outer_shell).unwrap();
 
-        // A UV sphere typically has segments_u * segments_v faces
-        let expected_faces = u_segments * v_segments;
+        // Sphere is represented as a single parametric NURBS face;
+        // u/v segments are tessellation hints, not B-Rep structure.
         assert_eq!(
-            shell.faces.len() as u32,
-            expected_faces,
-            "Sphere should have {} faces",
-            expected_faces
+            shell.faces.len(),
+            1,
+            "Sphere should be a single parametric face (u={}, v={} are tessellation hints)",
+            u_segments,
+            v_segments
         );
 
         println!(
@@ -667,8 +668,12 @@ mod tests {
         let solid_id = SpherePrimitive::create(minimal_params, &mut model).unwrap();
         let solid = model.solids.get(solid_id).unwrap();
         let shell = model.shells.get(solid.outer_shell).unwrap();
-        assert_eq!(shell.faces.len(), 6, "Minimal sphere should have 6 faces");
-        println!("  ✓ Minimal tessellation sphere (3x2) created with 6 faces");
+        assert_eq!(
+            shell.faces.len(),
+            1,
+            "Sphere is a single parametric face regardless of tessellation hints"
+        );
+        println!("  ✓ Minimal tessellation sphere (3x2) created as single parametric face");
 
         // Test high tessellation
         let high_params = SphereParameters {
@@ -688,11 +693,11 @@ mod tests {
         let shell = model.shells.get(solid.outer_shell).unwrap();
         assert_eq!(
             shell.faces.len(),
-            2048,
-            "High-res sphere should have 2048 faces"
+            1,
+            "Sphere is a single parametric face regardless of tessellation hints"
         );
         println!(
-            "  ✓ High tessellation sphere (64x32) created with 2048 faces in {:?}",
+            "  ✓ High tessellation sphere (64x32) created as single parametric face in {:?}",
             elapsed
         );
 
@@ -1201,9 +1206,12 @@ mod tests {
                 elapsed.as_nanos() as f64 / face_count as f64
             );
 
+            // Sphere is always a single parametric face; u/v segments are
+            // tessellation hints, not B-Rep structure. Silence unused warning.
+            let _ = expected_faces;
             assert_eq!(
-                face_count as u32, expected_faces,
-                "Face count should match tessellation parameters"
+                face_count, 1,
+                "Sphere should always be a single parametric face"
             );
         }
 
@@ -1299,7 +1307,7 @@ mod tests {
             tolerance: Some(tolerance),
         };
         let box_id = BoxPrimitive::create(box_params, &mut model).unwrap();
-        verify_euler_characteristic(&model, box_id, "Box");
+        verify_euler_characteristic(&model, box_id, "Box", 2);
 
         // Sphere
         let sphere_params = SphereParameters {
@@ -1311,7 +1319,7 @@ mod tests {
             tolerance: Some(tolerance),
         };
         let sphere_id = SpherePrimitive::create(sphere_params, &mut model).unwrap();
-        verify_euler_characteristic(&model, sphere_id, "Sphere");
+        verify_euler_characteristic(&model, sphere_id, "Sphere", 2);
 
         // Cylinder
         let cylinder_params = CylinderParameters {
@@ -1324,7 +1332,7 @@ mod tests {
             tolerance: Some(tolerance),
         };
         let cylinder_id = CylinderPrimitive::create(cylinder_params, &mut model).unwrap();
-        verify_euler_characteristic(&model, cylinder_id, "Cylinder");
+        verify_euler_characteristic(&model, cylinder_id, "Cylinder", 2);
 
         // Cone
         let cone_params = ConeParameters::new(
@@ -1335,7 +1343,7 @@ mod tests {
         )
         .unwrap();
         let cone_id = ConePrimitive::create(&cone_params, &mut model).unwrap();
-        verify_euler_characteristic(&model, cone_id, "Cone");
+        verify_euler_characteristic(&model, cone_id, "Cone", 2);
 
         // Torus
         let torus_params = TorusParameters::new(
@@ -1346,13 +1354,22 @@ mod tests {
         )
         .unwrap();
         let torus_id = TorusPrimitive::create(&torus_params, &mut model).unwrap();
-        verify_euler_characteristic(&model, torus_id, "Torus");
+        verify_euler_characteristic(&model, torus_id, "Torus", 0);
 
         println!("\n  ✅ All primitives have correct Euler characteristics!");
     }
 
-    // Helper function for Euler characteristic verification
-    fn verify_euler_characteristic(model: &BRepModel, solid_id: solid::SolidId, name: &str) {
+    // Helper function for Euler characteristic verification.
+    //
+    // Expected characteristic depends on the genus of the solid:
+    //   - Sphere / Box / Cylinder / Cone: genus 0, χ = 2
+    //   - Torus: genus 1, χ = 2 − 2g = 0
+    fn verify_euler_characteristic(
+        model: &BRepModel,
+        solid_id: solid::SolidId,
+        name: &str,
+        expected: i32,
+    ) {
         let solid = model.solids.get(solid_id).unwrap();
         let shell = model.shells.get(solid.outer_shell).unwrap();
 
@@ -1395,14 +1412,19 @@ mod tests {
         println!("  ├─ Faces (F): {}", f);
         println!("  ├─ V - E + F = {}", euler);
         println!(
-            "  └─ {} (expected: 2 for closed solid)",
-            if euler == 2 {
-                "✓ CORRECT"
+            "  └─ {} (expected: {})",
+            if euler == expected {
+                "CORRECT"
             } else {
-                "✗ INCORRECT"
-            }
+                "INCORRECT"
+            },
+            expected
         );
 
-        assert_eq!(euler, 2, "{} should have Euler characteristic of 2", name);
+        assert_eq!(
+            euler, expected,
+            "{} should have Euler characteristic of {}",
+            name, expected
+        );
     }
 }

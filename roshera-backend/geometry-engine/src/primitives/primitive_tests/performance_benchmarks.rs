@@ -846,7 +846,7 @@ impl PerformanceBenchmarks {
             // Evaluate at 1M parameter values
             for i in 0..EVALUATIONS {
                 let t = i as f64 / (EVALUATIONS - 1) as f64;
-                let _point = nurbs.evaluate(t).derivative1.unwrap();
+                let _point = nurbs.evaluate(t).point;
             }
 
             total_time += start.elapsed();
@@ -954,8 +954,8 @@ mod tests {
         let report = PerformanceBenchmarks::generate_report(&results);
 
         assert!(report.contains("# Roshera CAD Performance Benchmark Report"));
-        assert!(report.contains("## 🏆 Performance Summary"));
-        assert!(report.contains("## 📊 Detailed Performance Results"));
+        assert!(report.contains("Performance Summary"));
+        assert!(report.contains("Detailed Performance Results"));
 
         println!("Report generated successfully ({} chars)", report.len());
     }
