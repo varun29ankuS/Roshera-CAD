@@ -3902,21 +3902,19 @@ mod tests {
             BooleanOptions::default(),
         );
 
+        assert!(
+            !matches!(&result, Err(OperationError::NotImplemented(_))),
+            "Boolean difference returned NotImplemented — all stubs should be implemented"
+        );
         match &result {
             Ok(solid_id) => {
-                // Verify result is a valid solid
                 assert!(
                     model.solids.get(*solid_id).is_some(),
                     "Result solid should exist"
                 );
             }
-            Err(OperationError::NotImplemented(_)) => {
-                panic!(
-                    "Boolean difference returned NotImplemented — all stubs should be implemented"
-                );
-            }
             Err(e) => {
-                // Numerical errors acceptable for now — the pipeline runs end-to-end
+                // Numerical errors acceptable for now — the pipeline runs end-to-end.
                 eprintln!("Boolean difference returned error (acceptable): {e}");
             }
         }
@@ -3952,14 +3950,13 @@ mod tests {
             BooleanOptions::default(),
         );
 
-        match &result {
-            Ok(_) => {}
-            Err(OperationError::NotImplemented(_)) => {
-                panic!("Boolean union returned NotImplemented");
-            }
-            Err(e) => {
-                eprintln!("Boolean union box+sphere returned error (acceptable): {e}");
-            }
+        assert!(
+            !matches!(&result, Err(OperationError::NotImplemented(_))),
+            "Boolean union returned NotImplemented — all stubs should be implemented"
+        );
+        if let Err(e) = &result {
+            // Numerical errors acceptable for now — the pipeline runs end-to-end.
+            eprintln!("Boolean union box+sphere returned error (acceptable): {e}");
         }
     }
 
