@@ -592,41 +592,6 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
     }
 }
 
-/// Surface intersection result
-#[derive(Debug, Clone)]
-pub struct SurfaceIntersection {
-    /// Type of intersection
-    pub intersection_type: SurfaceIntersectionType,
-    /// Intersection curve(s)
-    pub curves: Vec<IntersectionCurve>,
-    /// Isolated intersection points
-    pub points: Vec<(Point3, (f64, f64), (f64, f64))>, // point, (u1,v1), (u2,v2)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SurfaceIntersectionType {
-    /// Surfaces don't intersect
-    None,
-    /// Intersection is a set of curves
-    Curves,
-    /// Surfaces are coincident in a region
-    Coincident,
-    /// Surfaces touch at isolated points
-    Points,
-}
-
-#[derive(Debug, Clone)]
-pub struct IntersectionCurve {
-    /// 3D points on curve
-    pub points: Vec<Point3>,
-    /// Parameters on first surface
-    pub params1: Vec<(f64, f64)>,
-    /// Parameters on second surface
-    pub params2: Vec<(f64, f64)>,
-    /// Is curve closed
-    pub is_closed: bool,
-}
-
 /// Enhanced planar surface
 #[derive(Debug, Clone, Copy)]
 pub struct Plane {

@@ -35,7 +35,6 @@ pub mod intersect;
 pub mod project;
 pub mod sew;
 pub mod split;
-pub mod surface_intersection;
 
 // AI integration
 pub mod ai_operations_registry;

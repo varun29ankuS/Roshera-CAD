@@ -15,7 +15,6 @@
 //! - Rogers, "An Introduction to NURBS"
 
 use crate::math::bspline::KnotVector;
-use crate::math::trimmed_nurbs::IntersectionCurve;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Vector3};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -1068,8 +1067,10 @@ impl NurbsCurve {
             }
         }
 
-        // Copy unaffected control points (after the insertion region)
-        for i in span + 1..n {
+        // Copy unaffected control points (after the insertion region).
+        // Boehm's algorithm: after computing Q[k-p+1..=k], the original
+        // control points P[k..=n-1] are retained with shifted indices.
+        for i in span..n {
             new_control_points.push(self.control_points[i]);
             new_weights.push(self.weights[i]);
         }
@@ -1200,6 +1201,402 @@ impl NurbsCurve {
         } else {
             points.push(p2);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1 numerical methods (ported from primitives::curve::NurbsCurve
+    // to make the primitives layer a thin adapter over this math layer).
+    //
+    // These methods are expressed entirely in terms of Point3/Vector3 and
+    // the existing evaluator; they carry no dependency on the primitives
+    // layer's Curve trait, so they live here cleanly.
+    // ------------------------------------------------------------------
+
+    /// Axis-aligned bounding box of the control polygon.
+    ///
+    /// This is a conservative bound: the curve itself is contained in the
+    /// convex hull of the control points, which is contained in this box.
+    /// Useful as a coarse rejection test before intersection work.
+    pub fn bounding_box(&self) -> (Point3, Point3) {
+        let mut min = self.control_points[0];
+        let mut max = self.control_points[0];
+        for p in self.control_points.iter().skip(1) {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            min.z = min.z.min(p.z);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+            max.z = max.z.max(p.z);
+        }
+        (min, max)
+    }
+
+    /// Test whether all control points are collinear within `tolerance_distance`.
+    ///
+    /// A curve with collinear control points is itself a straight line (by
+    /// the convex-hull property of NURBS). The converse is not true in
+    /// general, so this test is conservative.
+    pub fn is_linear(&self, tolerance_distance: f64) -> bool {
+        if self.control_points.len() < 3 {
+            return true;
+        }
+        let p0 = self.control_points[0];
+        let p1 = self.control_points[self.control_points.len() - 1];
+        let dir = match (p1 - p0).normalize() {
+            Ok(d) => d,
+            Err(_) => return true, // coincident endpoints → degenerate, treat as linear
+        };
+        for i in 1..self.control_points.len() - 1 {
+            let to_p = self.control_points[i] - p0;
+            let proj = dir * to_p.dot(&dir);
+            let dist = (to_p - proj).magnitude();
+            if dist > tolerance_distance {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Best-fit plane through the control polygon, as `(origin, unit_normal)`.
+    ///
+    /// Returns `None` if all control points are collinear (no plane is
+    /// uniquely defined). The origin is the first control point; the
+    /// normal is the first non-degenerate cross product found.
+    pub fn best_fit_plane(&self) -> Option<(Point3, Vector3)> {
+        if self.control_points.len() < 3 {
+            return None;
+        }
+        let p0 = self.control_points[0];
+        for i in 1..self.control_points.len() - 1 {
+            let v1 = self.control_points[i] - p0;
+            for j in (i + 1)..self.control_points.len() {
+                let v2 = self.control_points[j] - p0;
+                if let Ok(n) = v1.cross(&v2).normalize() {
+                    return Some((p0, n));
+                }
+            }
+        }
+        None
+    }
+
+    /// Test whether all control points lie within `tolerance_distance` of
+    /// a common plane.
+    pub fn is_planar(&self, tolerance_distance: f64) -> bool {
+        if self.control_points.len() < 4 {
+            return true;
+        }
+        let (origin, normal) = match self.best_fit_plane() {
+            Some(p) => p,
+            None => return true, // all collinear → trivially planar
+        };
+        for p in &self.control_points {
+            let signed = normal.dot(&(*p - origin));
+            if signed.abs() > tolerance_distance {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Return a NURBS curve with reversed parameterization.
+    ///
+    /// The reversed curve has the same geometric shape but traverses
+    /// parameter from the opposite end. Knots are remapped via
+    /// `k' = (u_min + u_max) - k`.
+    pub fn reversed(&self) -> Result<NurbsCurve, &'static str> {
+        let mut rev_points = self.control_points.clone();
+        rev_points.reverse();
+        let mut rev_weights = self.weights.clone();
+        rev_weights.reverse();
+
+        let knots = self.knots.values();
+        let (a, b) = match (knots.first(), knots.last()) {
+            (Some(f), Some(l)) => (*f, *l),
+            _ => return Err("Empty knot vector"),
+        };
+        let rev_knots: Vec<f64> = knots.iter().rev().map(|k| a + b - *k).collect();
+
+        NurbsCurve::new(rev_points, rev_weights, rev_knots, self.degree)
+    }
+
+    /// Split the curve at parameter `u`, returning `(left, right)`.
+    ///
+    /// Uses knot insertion to bring the multiplicity at `u` up to `degree`
+    /// (creating an interpolating control point), then partitions the
+    /// control polygon and knot vector. Each output curve has its knot
+    /// vector re-normalized to span `[0, 1]`.
+    ///
+    /// References:
+    /// - Piegl & Tiller, "The NURBS Book" (2nd ed.), Section 5.4 (Curve Splitting)
+    pub fn split(&self, u: f64) -> MathResult<(NurbsCurve, NurbsCurve)> {
+        let (u_min, u_max) = self.parameter_bounds();
+        if u <= u_min || u >= u_max {
+            return Err(MathError::InvalidParameter(format!(
+                "Split parameter {} outside open interval ({}, {})",
+                u, u_min, u_max
+            )));
+        }
+
+        let p = self.degree;
+
+        // Bring multiplicity at u up to exactly `p` so we have an
+        // interpolating control point there.
+        let mut curve = self.clone();
+        let existing_mult = curve.knots.multiplicity(u);
+        let inserts_needed = p.saturating_sub(existing_mult);
+        if inserts_needed > 0 {
+            curve.insert_knot(u, inserts_needed).map_err(|e| {
+                MathError::InvalidParameter(format!("Knot insertion failed during split: {}", e))
+            })?;
+        }
+
+        // Find the first index j where knots[j] == u (within tolerance).
+        let knots_after = curve.knots.values();
+        let j = match knots_after.iter().position(|k| (*k - u).abs() < 1e-9) {
+            Some(idx) => idx,
+            None => {
+                return Err(MathError::InvalidParameter(
+                    "Split parameter missing from knot vector after insertion".to_string(),
+                ));
+            }
+        };
+        if j < 1 || j + p > knots_after.len() {
+            return Err(MathError::InvalidParameter(format!(
+                "Split index {} out of range for knot vector of length {}",
+                j,
+                knots_after.len()
+            )));
+        }
+
+        // Left curve:
+        //   control_points[0..=j-1]  (j points)
+        //   knots = knots_after[0..j] ++ [u; p+1]
+        let left_points = curve.control_points[..j].to_vec();
+        let left_weights = curve.weights[..j].to_vec();
+        let mut left_knots: Vec<f64> = knots_after[..j].to_vec();
+        for _ in 0..=p {
+            left_knots.push(u);
+        }
+
+        // Right curve:
+        //   control_points[j-1..]
+        //   knots = [u; p+1] ++ knots_after[j+p..]
+        let right_points = curve.control_points[j - 1..].to_vec();
+        let right_weights = curve.weights[j - 1..].to_vec();
+        let mut right_knots: Vec<f64> = vec![u; p + 1];
+        right_knots.extend_from_slice(&knots_after[j + p..]);
+
+        // Normalize each knot vector to span [0, 1].
+        let normalize = |knots: Vec<f64>| -> Vec<f64> {
+            let start = match knots.first() {
+                Some(s) => *s,
+                None => return knots,
+            };
+            let end = match knots.last() {
+                Some(e) => *e,
+                None => return knots,
+            };
+            let span = end - start;
+            if span.abs() < 1e-12 {
+                knots
+            } else {
+                knots.iter().map(|k| (*k - start) / span).collect()
+            }
+        };
+        let left_knots = normalize(left_knots);
+        let right_knots = normalize(right_knots);
+
+        let left = NurbsCurve::new(left_points, left_weights, left_knots, p)
+            .map_err(|e| MathError::InvalidParameter(format!("Left subcurve invalid: {}", e)))?;
+        let right = NurbsCurve::new(right_points, right_weights, right_knots, p)
+            .map_err(|e| MathError::InvalidParameter(format!("Right subcurve invalid: {}", e)))?;
+
+        Ok((left, right))
+    }
+
+    /// Return the subcurve between parameters `u1` and `u2`.
+    ///
+    /// If `u1 > u2`, the arguments are swapped. Requires `u_min <= u1, u2 <= u_max`.
+    /// The returned curve has knot vector normalized to span `[0, 1]`.
+    pub fn subcurve(&self, u1: f64, u2: f64) -> MathResult<NurbsCurve> {
+        let (lo, hi) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+        let (u_min, u_max) = self.parameter_bounds();
+        if lo < u_min - 1e-12 || hi > u_max + 1e-12 {
+            return Err(MathError::InvalidParameter(format!(
+                "Subcurve range [{}, {}] outside bounds [{}, {}]",
+                lo, hi, u_min, u_max
+            )));
+        }
+        let lo = lo.max(u_min);
+        let hi = hi.min(u_max);
+        if (hi - lo).abs() < 1e-12 {
+            return Err(MathError::InvalidParameter(
+                "Subcurve range is degenerate (zero-length)".to_string(),
+            ));
+        }
+
+        // Full-range fast path.
+        if (lo - u_min).abs() < 1e-12 && (hi - u_max).abs() < 1e-12 {
+            return Ok(self.clone());
+        }
+
+        // Stage 1: trim the right end by splitting at hi (unless hi == u_max).
+        let stage1 = if (hi - u_max).abs() < 1e-12 {
+            self.clone()
+        } else {
+            self.split(hi)?.0
+        };
+
+        if (lo - u_min).abs() < 1e-12 {
+            return Ok(stage1);
+        }
+
+        // stage1 has bounds [0, 1] covering the original [u_min, hi] range.
+        // Map lo into stage1's parameter: (lo - u_min) / (hi - u_min).
+        let denom = hi - u_min;
+        if denom.abs() < 1e-12 {
+            return Err(MathError::InvalidParameter(
+                "Degenerate subcurve: zero-length original range".to_string(),
+            ));
+        }
+        let lo_stage1 = (lo - u_min) / denom;
+        Ok(stage1.split(lo_stage1)?.1)
+    }
+
+    /// Speed of the parameterization at `u`, i.e. `|C'(u)|`.
+    #[inline]
+    fn speed(&self, u: f64) -> f64 {
+        self.evaluate_derivatives(u, 1)
+            .derivative1
+            .unwrap_or(Vector3::ZERO)
+            .magnitude()
+    }
+
+    /// Arc length between parameters `u1` and `u2` using adaptive Simpson's rule.
+    ///
+    /// The integration is `∫|C'(u)| du` over the given interval, where
+    /// `C'(u)` is the first derivative of the curve. Adaptive subdivision
+    /// refines until the Simpson error estimate drops below
+    /// `tolerance_distance` per segment.
+    pub fn arc_length_between(&self, u1: f64, u2: f64, tolerance_distance: f64) -> f64 {
+        let (u_min, u_max) = self.parameter_bounds();
+        let u1 = u1.clamp(u_min, u_max);
+        let u2 = u2.clamp(u_min, u_max);
+        if (u2 - u1).abs() < consts::EPSILON {
+            return 0.0;
+        }
+        let (a, b) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+        let fa = self.speed(a);
+        let fm = self.speed((a + b) * 0.5);
+        let fb = self.speed(b);
+        let whole = (b - a) * (fa + 4.0 * fm + fb) / 6.0;
+        self.adaptive_simpson(a, b, tolerance_distance.max(1e-12), whole, 12)
+    }
+
+    /// Total arc length of the curve over its parameter domain.
+    pub fn arc_length(&self, tolerance_distance: f64) -> f64 {
+        let (u_min, u_max) = self.parameter_bounds();
+        self.arc_length_between(u_min, u_max, tolerance_distance)
+    }
+
+    fn adaptive_simpson(
+        &self,
+        a: f64,
+        b: f64,
+        tolerance: f64,
+        whole: f64,
+        depth: u32,
+    ) -> f64 {
+        let m = (a + b) * 0.5;
+        let fa = self.speed(a);
+        let fm = self.speed(m);
+        let fb = self.speed(b);
+        let fml = self.speed((a + m) * 0.5);
+        let fmr = self.speed((m + b) * 0.5);
+        let left = (m - a) * (fa + 4.0 * fml + fm) / 6.0;
+        let right = (b - m) * (fm + 4.0 * fmr + fb) / 6.0;
+        let combined = left + right;
+        if depth == 0 || (combined - whole).abs() <= 15.0 * tolerance {
+            // Richardson extrapolation improves the estimate.
+            return combined + (combined - whole) / 15.0;
+        }
+        self.adaptive_simpson(a, m, tolerance * 0.5, left, depth - 1)
+            + self.adaptive_simpson(m, b, tolerance * 0.5, right, depth - 1)
+    }
+
+    /// Parameter at which the cumulative arc length from `u_min` equals
+    /// `target_length`. Clamps to the parameter domain at both ends.
+    ///
+    /// Uses bounded Newton iteration on `f(u) = L(u) - target_length`
+    /// where `f'(u) = |C'(u)|`.
+    pub fn parameter_at_length(&self, target_length: f64, tolerance_distance: f64) -> f64 {
+        let (u_min, u_max) = self.parameter_bounds();
+        let total = self.arc_length(tolerance_distance);
+        if target_length <= 0.0 {
+            return u_min;
+        }
+        if target_length >= total {
+            return u_max;
+        }
+        let mut u = u_min + (u_max - u_min) * (target_length / total);
+        for _ in 0..20 {
+            let current = self.arc_length_between(u_min, u, tolerance_distance);
+            let err = current - target_length;
+            if err.abs() < tolerance_distance {
+                break;
+            }
+            let speed = self.speed(u);
+            if speed < consts::EPSILON {
+                break;
+            }
+            u -= err / speed;
+            u = u.clamp(u_min, u_max);
+        }
+        u
+    }
+
+    /// Closest point on the curve to a given point.
+    ///
+    /// Returns `(parameter, point_on_curve)`. Combines a coarse 20-sample
+    /// search for an initial guess with bounded Newton-Raphson refinement
+    /// of `f(u) = (C(u) - P) · C'(u) = 0`.
+    pub fn closest_point(&self, point: &Point3, tolerance_distance: f64) -> (f64, Point3) {
+        let (u_min, u_max) = self.parameter_bounds();
+        const N_SAMPLES: usize = 20;
+        let mut best_u = u_min;
+        let mut best_dist_sq = f64::INFINITY;
+
+        for i in 0..=N_SAMPLES {
+            let u = u_min + (u_max - u_min) * (i as f64 / N_SAMPLES as f64);
+            let p = self.evaluate(u).point;
+            let d2 = p.distance_squared(point);
+            if d2 < best_dist_sq {
+                best_dist_sq = d2;
+                best_u = u;
+            }
+        }
+
+        let mut u = best_u;
+        for _ in 0..20 {
+            let ders = self.evaluate_derivatives(u, 2);
+            let c = ders.point;
+            let c1 = ders.derivative1.unwrap_or(Vector3::ZERO);
+            let c2 = ders.derivative2.unwrap_or(Vector3::ZERO);
+            let to_p = c - *point;
+            let f = to_p.dot(&c1);
+            if f.abs() < tolerance_distance {
+                break;
+            }
+            // f'(u) = |C'(u)|² + (C(u) - P) · C''(u)
+            let df = c1.magnitude_squared() + to_p.dot(&c2);
+            if df.abs() < consts::EPSILON {
+                break;
+            }
+            let du = f / df;
+            u = (u - du).clamp(u_min, u_max);
+        }
+        let closest = self.evaluate(u).point;
+        (u, closest)
     }
 }
 
@@ -1612,13 +2009,6 @@ impl NurbsSurface {
         )
     }
 
-    /// Compute intersection with another NURBS surface
-    pub fn intersect(&self, _other: &NurbsSurface) -> MathResult<Vec<IntersectionCurve>> {
-        Err(super::MathError::NotImplemented(
-            "NURBS surface-surface intersection".to_string(),
-        ))
-    }
-
     /// Insert a knot in the U direction
     ///
     /// References:
@@ -1923,6 +2313,17 @@ impl NurbsSurface {
     pub fn mixed_derivative(&self, u: f64, v: f64) -> Vector3 {
         let point = self.evaluate_derivatives(u, v, 1, 1);
         point.duv.unwrap_or(Vector3::ZERO)
+    }
+
+    /// Compute unit surface normal at parameters `(u, v)`.
+    ///
+    /// The normal is the normalized cross product of the first partial
+    /// derivatives. Returns an error at degenerate points where the two
+    /// tangents are parallel (e.g. surface poles).
+    pub fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+        let du = self.derivative_u(u, v);
+        let dv = self.derivative_v(u, v);
+        du.cross(&dv).normalize()
     }
 
     /// Check if surface is closed in U direction
@@ -2360,5 +2761,223 @@ mod tests {
         let result =
             NurbsCurve::circular_arc(Point3::ORIGIN, 1.0, 0.0, consts::PI / 2.0, Vector3::Z);
         assert!(result.is_ok());
+    }
+
+    // ================================================================
+    // Phase 1 (audit task #13) — tests for numerical methods ported
+    // from primitives::curve::NurbsCurve.
+    // ================================================================
+
+    fn sample_quadratic() -> NurbsCurve {
+        // Non-rational quadratic curve: (0,0) → (1,1) → (2,0)
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        NurbsCurve::new(cp, weights, knots, 2).unwrap()
+    }
+
+    #[test]
+    fn test_bounding_box_spans_control_polygon() {
+        let curve = sample_quadratic();
+        let (min, max) = curve.bounding_box();
+        assert!((min.x - 0.0).abs() < 1e-12);
+        assert!((min.y - 0.0).abs() < 1e-12);
+        assert!((max.x - 2.0).abs() < 1e-12);
+        assert!((max.y - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_is_linear_detects_collinear_points() {
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let line = NurbsCurve::new(cp, weights, knots, 2).unwrap();
+        assert!(line.is_linear(1e-10));
+
+        let curved = sample_quadratic();
+        assert!(!curved.is_linear(1e-10));
+    }
+
+    #[test]
+    fn test_is_planar_detects_coplanar_points() {
+        // All points in XY plane.
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(3.0, 1.0, 0.0),
+        ];
+        let weights = vec![1.0; 4];
+        let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let planar = NurbsCurve::new(cp, weights, knots, 3).unwrap();
+        assert!(planar.is_planar(1e-10));
+
+        // One point lifted out of plane.
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 1.0), // z = 1
+            Point3::new(3.0, 1.0, 0.0),
+        ];
+        let weights = vec![1.0; 4];
+        let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let non_planar = NurbsCurve::new(cp, weights, knots, 3).unwrap();
+        assert!(!non_planar.is_planar(1e-10));
+    }
+
+    #[test]
+    fn test_reversed_swaps_endpoints() {
+        let curve = sample_quadratic();
+        let rev = curve.reversed().unwrap();
+        let p_start = curve.evaluate(0.0).point;
+        let p_end = curve.evaluate(1.0).point;
+        let r_start = rev.evaluate(0.0).point;
+        let r_end = rev.evaluate(1.0).point;
+        assert!((p_start - r_end).magnitude() < 1e-10);
+        assert!((p_end - r_start).magnitude() < 1e-10);
+    }
+
+    #[test]
+    fn test_split_produces_matching_endpoints() {
+        let curve = sample_quadratic();
+        let u_split = 0.5;
+        let split_point = curve.evaluate(u_split).point;
+        let (left, right) = curve.split(u_split).unwrap();
+
+        // Left curve ends at split point, right curve starts at split point.
+        let left_end = left.evaluate(1.0).point;
+        let right_start = right.evaluate(0.0).point;
+        assert!(
+            (left_end - split_point).magnitude() < 1e-9,
+            "left end {:?} != split {:?}",
+            left_end,
+            split_point
+        );
+        assert!(
+            (right_start - split_point).magnitude() < 1e-9,
+            "right start {:?} != split {:?}",
+            right_start,
+            split_point
+        );
+        // Left start matches original start.
+        assert!((left.evaluate(0.0).point - curve.evaluate(0.0).point).magnitude() < 1e-9);
+        // Right end matches original end.
+        assert!((right.evaluate(1.0).point - curve.evaluate(1.0).point).magnitude() < 1e-9);
+    }
+
+    #[test]
+    fn test_split_rejects_out_of_range() {
+        let curve = sample_quadratic();
+        assert!(curve.split(0.0).is_err());
+        assert!(curve.split(1.0).is_err());
+        assert!(curve.split(-0.5).is_err());
+        assert!(curve.split(1.5).is_err());
+    }
+
+    #[test]
+    fn test_subcurve_preserves_shape() {
+        let curve = sample_quadratic();
+        let sub = curve.subcurve(0.25, 0.75).unwrap();
+        // Sub starts at curve(0.25), ends at curve(0.75).
+        let p_a = curve.evaluate(0.25).point;
+        let p_b = curve.evaluate(0.75).point;
+        assert!((sub.evaluate(0.0).point - p_a).magnitude() < 1e-9);
+        assert!((sub.evaluate(1.0).point - p_b).magnitude() < 1e-9);
+    }
+
+    #[test]
+    fn test_arc_length_of_straight_line_matches_distance() {
+        // A curve whose control points are collinear traces a straight line.
+        // Arc length from u=0 to u=1 equals the distance from first to last control point.
+        let cp = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let line = NurbsCurve::new(cp, weights, knots, 2).unwrap();
+        let length = line.arc_length(1e-8);
+        assert!((length - 2.0).abs() < 1e-6, "expected 2.0, got {}", length);
+    }
+
+    #[test]
+    fn test_arc_length_of_quarter_circle_matches_pi_over_2() {
+        // A 90-degree unit-radius arc has length π/2.
+        let arc = NurbsCurve::circular_arc(
+            Point3::ORIGIN,
+            1.0,
+            0.0,
+            consts::PI / 2.0,
+            Vector3::Z,
+        )
+        .unwrap();
+        let length = arc.arc_length(1e-8);
+        let expected = consts::PI / 2.0;
+        assert!(
+            (length - expected).abs() < 1e-4,
+            "arc length {} differs from π/2 {} by more than 1e-4",
+            length,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_parameter_at_length_round_trips() {
+        let arc = NurbsCurve::circular_arc(
+            Point3::ORIGIN,
+            1.0,
+            0.0,
+            consts::PI / 2.0,
+            Vector3::Z,
+        )
+        .unwrap();
+        let total = arc.arc_length(1e-8);
+        let u_half = arc.parameter_at_length(total * 0.5, 1e-6);
+        let measured = arc.arc_length_between(0.0, u_half, 1e-8);
+        assert!(
+            (measured - total * 0.5).abs() < 1e-3,
+            "round-trip error: half-length {} vs target {}",
+            measured,
+            total * 0.5
+        );
+    }
+
+    #[test]
+    fn test_closest_point_finds_endpoint_for_external_target() {
+        let curve = sample_quadratic();
+        // A point far to the right of the curve end → closest should be near end.
+        let target = Point3::new(10.0, 0.0, 0.0);
+        let (u, p) = curve.closest_point(&target, 1e-8);
+        assert!(
+            u > 0.99,
+            "expected parameter near 1.0 for far-right target, got {}",
+            u
+        );
+        let curve_end = curve.evaluate(1.0).point;
+        assert!((p - curve_end).magnitude() < 1e-6);
+    }
+
+    #[test]
+    fn test_closest_point_recovers_point_on_curve() {
+        let curve = sample_quadratic();
+        let u_target = 0.37;
+        let on_curve = curve.evaluate(u_target).point;
+        let (u_found, p_found) = curve.closest_point(&on_curve, 1e-10);
+        assert!(
+            (u_found - u_target).abs() < 1e-4,
+            "parameter recovery: got {}, expected {}",
+            u_found,
+            u_target
+        );
+        assert!((p_found - on_curve).magnitude() < 1e-6);
     }
 }
