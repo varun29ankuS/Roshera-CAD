@@ -14,12 +14,15 @@
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
+    edge::EdgeId,
+    face::FaceId,
     primitive_traits::{
         ParameterDefinition, ParameterSchema, ParameterType, Primitive, PrimitiveError,
         ValidationReport, ValueConstraint,
     },
     solid::SolidId,
     topology_builder::{BRepModel, PrimitiveOptions},
+    vertex::VertexId,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -148,6 +151,24 @@ pub struct AIPerformanceMetrics {
     pub creation_time_ms: f64,
     pub memory_used_bytes: usize,
     pub complexity_score: f64,
+}
+
+/// Bounding extents derived directly from vertex positions.
+#[derive(Debug, Clone)]
+struct TopologyExtents {
+    min: [f64; 3],
+    max: [f64; 3],
+    centroid: [f64; 3],
+}
+
+/// Honest structural counts walked from a `Solid`'s topology.
+#[derive(Debug, Clone)]
+struct SolidTopologyCounts {
+    vertex_count: usize,
+    edge_count: usize,
+    face_count: usize,
+    /// `None` if the solid has zero reachable vertices.
+    extents: Option<TopologyExtents>,
 }
 
 /// Comprehensive information about a primitive type for AI discovery
@@ -442,8 +463,6 @@ struct BatchProcessor {
 #[derive(Debug)]
 struct PendingCommand {
     command: AICommand,
-    // Placeholder for future async support
-    _placeholder: usize,
     queued_at: std::time::Instant,
 }
 
@@ -998,7 +1017,8 @@ impl PrimitiveRegistry {
             success: validation.is_valid,
             geometry_id: Some(geometry_id),
             description: self.generate_description(&command, &validation),
-            technical_info: self.extract_technical_info(geometry_id, model, &validation),
+            technical_info: self
+                .extract_technical_info(geometry_id, model, &command, &validation),
             next_suggestions: self.generate_next_suggestions(&command),
             warnings: self.generate_warnings(&validation),
             metrics: AIPerformanceMetrics {
@@ -1114,7 +1134,11 @@ impl PrimitiveRegistry {
         self.primitives.insert("box".to_string(), box_info);
     }
 
-    /// Generate human-readable description of created geometry
+    /// Generate human-readable description of created geometry.
+    ///
+    /// Honest topology counts live on `AIResponse.technical_info.topology`; the
+    /// human summary intentionally omits them to avoid duplicating (and risking
+    /// disagreeing with) the structured data.
     fn generate_description(&self, command: &AICommand, validation: &ValidationReport) -> String {
         match command.primitive_type.as_str() {
             "box" => {
@@ -1129,10 +1153,7 @@ impl PrimitiveRegistry {
                     .unwrap_or(10.0);
 
                 if validation.is_valid {
-                    format!(
-                        "Created a {}×{}×{} box with {} vertices, {} edges, and {} faces",
-                        width, height, depth, 8, 12, 6
-                    )
+                    format!("Created a {}×{}×{} box", width, height, depth)
                 } else {
                     format!(
                         "Attempted to create {}×{}×{} box but topology validation failed",
@@ -1144,51 +1165,201 @@ impl PrimitiveRegistry {
         }
     }
 
-    /// Extract technical information for AI learning
+    /// Walk the topology of a solid and gather honest structural counts and
+    /// vertex-position-derived geometric extents.
+    ///
+    /// Returns `None` if the solid or its outer shell is missing from the model
+    /// (caller falls back to validation-only information).
+    fn walk_solid_topology(
+        &self,
+        geometry_id: SolidId,
+        model: &BRepModel,
+    ) -> Option<SolidTopologyCounts> {
+        use std::collections::HashSet;
+
+        let solid = model.solids.get(geometry_id)?;
+
+        let mut face_ids: HashSet<FaceId> = HashSet::new();
+        let mut edge_ids: HashSet<EdgeId> = HashSet::new();
+        let mut vertex_ids: HashSet<VertexId> = HashSet::new();
+
+        let shell_ids = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+
+        for shell_id in shell_ids {
+            let Some(shell) = model.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                if !face_ids.insert(face_id) {
+                    continue;
+                }
+                let Some(face) = model.faces.get(face_id) else {
+                    continue;
+                };
+                let loop_ids =
+                    std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied());
+                for loop_id in loop_ids {
+                    let Some(loop_ref) = model.loops.get(loop_id) else {
+                        continue;
+                    };
+                    for &edge_id in &loop_ref.edges {
+                        if !edge_ids.insert(edge_id) {
+                            continue;
+                        }
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            vertex_ids.insert(edge.start_vertex);
+                            vertex_ids.insert(edge.end_vertex);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        let mut sum = [0.0_f64; 3];
+        let mut counted: usize = 0;
+
+        for vid in &vertex_ids {
+            if let Some(vertex) = model.vertices.get(*vid) {
+                for axis in 0..3 {
+                    let v = vertex.position[axis];
+                    if v < min[axis] {
+                        min[axis] = v;
+                    }
+                    if v > max[axis] {
+                        max[axis] = v;
+                    }
+                    sum[axis] += v;
+                }
+                counted += 1;
+            }
+        }
+
+        let extents = if counted > 0 {
+            let inv = 1.0 / counted as f64;
+            Some(TopologyExtents {
+                min,
+                max,
+                centroid: [sum[0] * inv, sum[1] * inv, sum[2] * inv],
+            })
+        } else {
+            None
+        };
+
+        Some(SolidTopologyCounts {
+            vertex_count: vertex_ids.len(),
+            edge_count: edge_ids.len(),
+            face_count: face_ids.len(),
+            extents,
+        })
+    }
+
+    /// Collect numeric parameters from the command into the `final_parameters`
+    /// map. Non-numeric AIParameterValue variants (Text, Boolean, Point, Vector)
+    /// are intentionally excluded because `AITechnicalInfo::final_parameters`
+    /// is typed `HashMap<String, f64>`.
+    fn collect_numeric_parameters(
+        parameters: &HashMap<String, AIParameterValue>,
+    ) -> HashMap<String, f64> {
+        parameters
+            .iter()
+            .filter_map(|(k, v)| match v {
+                AIParameterValue::Number { value, .. } => Some((k.clone(), *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extract technical information for AI learning.
+    ///
+    /// Counts are derived from the actual B-Rep topology via
+    /// [`walk_solid_topology`]. Mass properties (`volume`, `surface_area`) are
+    /// reported as `None` because the underlying `Solid::volume` /
+    /// `Solid::surface_area` APIs require `&mut` access that is unavailable
+    /// here. Downstream consumers that need them should recompute via the
+    /// solid's mass-property cache.
     fn extract_technical_info(
         &self,
         geometry_id: SolidId,
         model: &BRepModel,
+        command: &AICommand,
         validation: &ValidationReport,
     ) -> AITechnicalInfo {
-        AITechnicalInfo {
-            final_parameters: HashMap::new(), // TODO: Extract from geometry
-            topology: AITopologyInfo {
-                vertex_count: 8, // TODO: Extract from actual geometry
-                edge_count: 12,
-                face_count: 6,
-                euler_characteristic: validation.euler_characteristic,
-                is_manifold: matches!(
-                    validation.manifold_check,
-                    crate::primitives::primitive_traits::ManifoldStatus::Manifold
-                ),
-                is_closed: true, // TODO: Determine from geometry
-            },
-            properties: AIGeometricProperties {
-                volume: Some(0.0),       // TODO: Calculate
-                surface_area: Some(0.0), // TODO: Calculate
-                bounding_box: AIBoundingBox {
+        let counts = self.walk_solid_topology(geometry_id, model);
+
+        let (vertex_count, edge_count, face_count, extents) = match &counts {
+            Some(c) => (c.vertex_count, c.edge_count, c.face_count, c.extents.clone()),
+            None => (0, 0, 0, None),
+        };
+
+        let is_manifold = matches!(
+            validation.manifold_check,
+            crate::primitives::primitive_traits::ManifoldStatus::Manifold
+        );
+        // A B-Rep is "closed" iff every edge is shared by exactly two faces.
+        // The manifold check enforces exactly that property for a valid
+        // watertight solid, so we reuse it here.
+        let is_closed = is_manifold;
+
+        let (bbox, centroid) = match extents {
+            Some(e) => {
+                let bbox = AIBoundingBox {
                     min: AIPoint3D {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
+                        x: e.min[0],
+                        y: e.min[1],
+                        z: e.min[2],
                     },
                     max: AIPoint3D {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
+                        x: e.max[0],
+                        y: e.max[1],
+                        z: e.max[2],
                     },
                     dimensions: AIPoint3D {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
+                        x: e.max[0] - e.min[0],
+                        y: e.max[1] - e.min[1],
+                        z: e.max[2] - e.min[2],
                     },
-                },
-                center_of_mass: AIPoint3D {
+                };
+                let centroid = AIPoint3D {
+                    x: e.centroid[0],
+                    y: e.centroid[1],
+                    z: e.centroid[2],
+                };
+                (bbox, centroid)
+            }
+            None => {
+                let zero = AIPoint3D {
                     x: 0.0,
                     y: 0.0,
                     z: 0.0,
-                },
+                };
+                (
+                    AIBoundingBox {
+                        min: zero.clone(),
+                        max: zero.clone(),
+                        dimensions: zero.clone(),
+                    },
+                    zero,
+                )
+            }
+        };
+
+        AITechnicalInfo {
+            final_parameters: Self::collect_numeric_parameters(&command.parameters),
+            topology: AITopologyInfo {
+                vertex_count,
+                edge_count,
+                face_count,
+                euler_characteristic: validation.euler_characteristic,
+                is_manifold,
+                is_closed,
+            },
+            properties: AIGeometricProperties {
+                volume: None,
+                surface_area: None,
+                bounding_box: bbox,
+                center_of_mass: centroid,
             },
         }
     }
