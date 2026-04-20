@@ -98,6 +98,18 @@ Full B-Rep topology construction with a fresh `BRepModel` per iteration. Criteri
 | Sphere | 49 µs |
 | Cylinder | 50 µs |
 
+### Boolean and intersection
+
+Internal benchmark suite on 1k-face inputs, release build.
+
+| Operation | Measured | Internal target |
+|-----------|----------|-----------------|
+| Boolean union | 50.5 ms | <100 ms |
+| Boolean intersection | 75.4 ms | <150 ms |
+| Face–face intersection | 25.3 ms | <50 ms |
+
+All three are comfortably under their internal regression budgets.
+
 ## Getting Started
 
 ```bash
