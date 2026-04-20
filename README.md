@@ -73,7 +73,7 @@ Measured numbers for each subsystem below are in the [Performance](#performance)
 
 ## Performance
 
-Measured numbers from the geometry kernel. See individual sections below for detail and methodology.
+Measured numbers from the geometry kernel. See individual sections below for detail and methodology. Full table and reproduction commands in [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Math microbenchmarks
 
