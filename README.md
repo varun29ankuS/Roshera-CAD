@@ -43,6 +43,8 @@ roshera-app/           React + Three.js + TypeScript browser client
 
 ## Status
 
+Measured numbers for each subsystem below are in the [Performance](#performance) section.
+
 | Layer | Component | Status |
 |-------|-----------|--------|
 | **Math** | Vector3, Matrix4, Quaternion | Tested, SIMD-optimized |
