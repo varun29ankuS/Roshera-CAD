@@ -4091,6 +4091,16 @@ impl SurfaceStore {
         self.surfaces.get(id as usize).map(|s| s.as_ref())
     }
 
+    /// Replace the surface at `id` in-place on the fast-path storage.
+    ///
+    /// Returns the previous surface, or `None` if `id` is out of range.
+    /// Only replaces entries added via [`SurfaceStore::add`]; surfaces
+    /// added via [`SurfaceStore::add_with_type_dispatch`] are not affected.
+    pub fn replace(&mut self, id: SurfaceId, new: Box<dyn Surface>) -> Option<Box<dyn Surface>> {
+        let slot = self.surfaces.get_mut(id as usize)?;
+        Some(std::mem::replace(slot, new))
+    }
+
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.surfaces.len()
