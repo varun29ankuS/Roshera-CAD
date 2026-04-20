@@ -48,10 +48,10 @@ Measured numbers for each subsystem below are in the [Performance](#performance)
 | Layer | Component | Status |
 |-------|-----------|--------|
 | **Math** | Vector3, Matrix4, Quaternion | Tested, SIMD-optimized |
-| | B-spline, NURBS evaluation | Tested, hardened against singularities |
+| | B-spline, NURBS evaluation | Tested, hardened against singularities; perf above budget (see Performance) |
 | **Primitives** | Box, Sphere, Cylinder, Cone, Torus | B-Rep topology with Euler validation |
 | **Topology** | Manifold detection, adjacency | Tested |
-| **Tessellation** | Per-surface dispatch, adaptive subdivision | Tested for analytic surfaces |
+| **Tessellation** | Per-surface dispatch, adaptive subdivision | Tested for analytic surfaces; perf above budget (see Performance) |
 | **Operations** | Extrude (draft, taper, twist) | Tested |
 | | Boolean (union, intersect, difference) | Implemented, edge cases in progress |
 | | Fillet (constant-radius) | Implemented |
