@@ -121,6 +121,15 @@ All three are comfortably under their internal regression budgets.
 
 Both are above their internal regression budgets — NURBS eval by ~6× and B-spline eval by ~3.7×. Flagged for profiling and optimization.
 
+### Tessellation and memory
+
+| Metric | Measured | Internal target |
+|--------|----------|-----------------|
+| Tessellation (1M triangles, estimated) | 5,350 ms | <250 ms |
+| Memory per 1M vertices (SoA layout) | 34.3 MB | <192 MB |
+
+Memory is well under budget thanks to the structure-of-arrays vertex layout. Tessellation is the single biggest performance gap (~21× over target) and is the top candidate for the next optimization pass.
+
 ## Getting Started
 
 ```bash
