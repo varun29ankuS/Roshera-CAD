@@ -138,6 +138,25 @@ Memory is well under budget thanks to the structure-of-arrays vertex layout. Tes
 
 These are tracked as blind spots to add to `benches/geometry_bench.rs`.
 
+### Methodology
+
+- Host: Windows 11, x86_64, release build.
+- Profile overrides: `CARGO_PROFILE_BENCH_LTO=off`, `CARGO_PROFILE_BENCH_CODEGEN_UNITS=16`. Full-LTO would shave an additional 15–30% off these numbers but currently hits a rustc-LLVM OOM on this host — fix tracked separately.
+- Criterion numbers reported as the median of 100 samples after a 3-second warmup.
+- Internal-suite numbers (Boolean / NURBS / tessellation) are single-sample wall-clock with per-operation iteration counts in the 10–100 range. Treat Criterion numbers as the statistical baseline.
+- "Internal target" = internal regression budget. Not a comparison against any third-party kernel.
+
+Reproduce:
+
+```bash
+cd roshera-backend
+CARGO_PROFILE_BENCH_LTO=off CARGO_PROFILE_BENCH_CODEGEN_UNITS=16 \
+  cargo bench -p geometry-engine --bench geometry_bench
+
+CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo test --release -p geometry-engine --lib test_performance_benchmark_suite -- --nocapture
+```
+
 ## Getting Started
 
 ```bash
