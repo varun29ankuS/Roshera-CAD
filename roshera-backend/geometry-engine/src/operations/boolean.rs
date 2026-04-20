@@ -2405,8 +2405,9 @@ fn extract_face_loops(
             let mut found_loop = false;
 
             // Walk edges until we return to start or get stuck
-            for _ in 0..100 {
-                // safety limit
+            // Safety limit scales with graph size — a valid loop visits each edge at most once
+            let max_loop_steps = valid_edges.len() * 2;
+            for _ in 0..max_loop_steps {
                 if current_vertex == start_vertex && !loop_edges.is_empty() {
                     found_loop = true;
                     break;
@@ -2961,7 +2962,10 @@ fn is_point_in_face(
     let (u, v) = surface.closest_point(point, *tolerance)?;
     let surf_point = surface.point_at(u, v)?;
     let dist = (*point - surf_point).magnitude();
-    if dist > tolerance.distance() * 10.0 {
+    // Allow 10x geometric tolerance for surface proximity — accounts for
+    // projection inaccuracy on high-curvature regions
+    const SURFACE_PROXIMITY_FACTOR: f64 = 10.0;
+    if dist > tolerance.distance() * SURFACE_PROXIMITY_FACTOR {
         return Ok(false);
     }
 
