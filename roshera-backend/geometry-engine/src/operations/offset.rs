@@ -233,64 +233,198 @@ fn create_offset_plane(surface: &dyn Surface, distance: f64) -> OperationResult<
     Ok(Box::new(offset_plane))
 }
 
-/// Create offset cylinder
+/// Create offset cylinder — radius changes by `distance` along normal direction
 fn create_offset_cylinder(
     surface: &dyn Surface,
     distance: f64,
 ) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::Cylinder;
 
-    // For cylinder, increase/decrease radius
-    // This is simplified - would need proper cylinder data
-    Err(OperationError::NotImplemented(
-        "Cylinder offset not yet implemented".to_string(),
-    ))
+    let cyl = surface
+        .as_any()
+        .downcast_ref::<Cylinder>()
+        .ok_or_else(|| OperationError::InternalError("Expected Cylinder surface".to_string()))?;
+
+    let new_radius = cyl.radius + distance;
+    if new_radius <= 0.0 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Offset distance {} would produce non-positive cylinder radius {}",
+            distance, new_radius
+        )));
+    }
+
+    let mut offset_cyl = Cylinder::new(cyl.origin, cyl.axis, new_radius).map_err(|e| {
+        OperationError::NumericalError(format!("Cylinder creation failed: {:?}", e))
+    })?;
+    offset_cyl.height_limits = cyl.height_limits;
+    offset_cyl.angle_limits = cyl.angle_limits;
+    Ok(Box::new(offset_cyl))
 }
 
-/// Create offset sphere
+/// Create offset sphere — radius changes by `distance`
 fn create_offset_sphere(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::Sphere;
 
-    // For sphere, increase/decrease radius
-    // This is simplified - would need proper sphere data
-    Err(OperationError::NotImplemented(
-        "Sphere offset not yet implemented".to_string(),
-    ))
+    let sph = surface
+        .as_any()
+        .downcast_ref::<Sphere>()
+        .ok_or_else(|| OperationError::InternalError("Expected Sphere surface".to_string()))?;
+
+    let new_radius = sph.radius + distance;
+    if new_radius <= 0.0 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Offset distance {} would produce non-positive sphere radius {}",
+            distance, new_radius
+        )));
+    }
+
+    let mut offset_sph = Sphere::new(sph.center, new_radius)
+        .map_err(|e| OperationError::NumericalError(format!("Sphere creation failed: {:?}", e)))?;
+    offset_sph.param_limits = sph.param_limits;
+    Ok(Box::new(offset_sph))
 }
 
-/// Create offset cone
+/// Create offset cone — the offset of a cone is not a cone (it's an involute surface)
+/// so we approximate by moving the apex along the axis and preserving the half-angle.
+/// This is exact for the lateral surface normal offset.
 fn create_offset_cone(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
-    // Cone offset is more complex due to apex
-    Err(OperationError::NotImplemented(
-        "Cone offset not yet implemented".to_string(),
-    ))
+    use crate::primitives::surface::Cone;
+
+    let cone = surface
+        .as_any()
+        .downcast_ref::<Cone>()
+        .ok_or_else(|| OperationError::InternalError("Expected Cone surface".to_string()))?;
+
+    // The normal on a cone surface makes angle (π/2 - half_angle) with the axis.
+    // Offsetting moves the apex by distance / sin(half_angle) along the axis.
+    let sin_half = cone.half_angle.sin();
+    if sin_half.abs() < 1e-10 {
+        return Err(OperationError::InvalidGeometry(
+            "Cone half-angle too small for offset".to_string(),
+        ));
+    }
+
+    let apex_shift = distance / sin_half;
+    let new_apex = cone.apex + cone.axis * apex_shift;
+
+    let mut offset_cone = Cone::new(new_apex, cone.axis, cone.half_angle)
+        .map_err(|e| OperationError::NumericalError(format!("Cone creation failed: {:?}", e)))?;
+    offset_cone.height_limits = cone.height_limits;
+    offset_cone.angle_limits = cone.angle_limits;
+    Ok(Box::new(offset_cone))
 }
 
-/// Create offset torus
+/// Create offset torus — minor radius changes by `distance`
 fn create_offset_torus(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
-    // Torus offset affects minor radius
-    Err(OperationError::NotImplemented(
-        "Torus offset not yet implemented".to_string(),
-    ))
+    use crate::primitives::surface::Torus;
+
+    let torus = surface
+        .as_any()
+        .downcast_ref::<Torus>()
+        .ok_or_else(|| OperationError::InternalError("Expected Torus surface".to_string()))?;
+
+    let new_minor = torus.minor_radius + distance;
+    if new_minor <= 0.0 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Offset distance {} would produce non-positive torus minor radius {}",
+            distance, new_minor
+        )));
+    }
+    if new_minor >= torus.major_radius {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Offset torus minor radius {} would exceed major radius {}",
+            new_minor, torus.major_radius
+        )));
+    }
+
+    let mut offset_torus = Torus::new(torus.center, torus.axis, torus.major_radius, new_minor)
+        .map_err(|e| OperationError::NumericalError(format!("Torus creation failed: {:?}", e)))?;
+    offset_torus.param_limits = torus.param_limits;
+    Ok(Box::new(offset_torus))
 }
 
-/// Create offset B-spline surface
+/// Create offset B-spline surface by sampling normals and fitting a new surface
 fn create_offset_bspline(
     surface: &dyn Surface,
     distance: f64,
 ) -> OperationResult<Box<dyn Surface>> {
-    // General offset for B-spline surfaces
-    Err(OperationError::NotImplemented(
-        "B-spline surface offset not yet implemented".to_string(),
-    ))
+    // Offset of a freeform surface: sample, offset along normals, fit new surface
+    create_offset_freeform(surface, distance)
 }
 
-/// Create offset NURBS surface
+/// Create offset NURBS surface by sampling normals and fitting a new surface
 fn create_offset_nurbs(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
-    // General offset for NURBS surfaces
-    Err(OperationError::NotImplemented(
-        "NURBS surface offset not yet implemented".to_string(),
-    ))
+    create_offset_freeform(surface, distance)
+}
+
+/// Generic freeform surface offset: sample the surface on a grid,
+/// displace each point along its normal by `distance`, then construct
+/// a new NURBS surface through the offset points.
+fn create_offset_freeform(
+    surface: &dyn Surface,
+    distance: f64,
+) -> OperationResult<Box<dyn Surface>> {
+    use crate::math::nurbs::NurbsSurface;
+    use crate::primitives::surface::GeneralNurbsSurface;
+
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let n_u = 20usize;
+    let n_v = 20usize;
+
+    let mut offset_points: Vec<Vec<Point3>> = Vec::with_capacity(n_u + 1);
+
+    for i in 0..=n_u {
+        let u = u_min + (u_max - u_min) * i as f64 / n_u as f64;
+        let mut row = Vec::with_capacity(n_v + 1);
+        for j in 0..=n_v {
+            let v = v_min + (v_max - v_min) * j as f64 / n_v as f64;
+            let pt = surface.point_at(u, v).map_err(|e| {
+                OperationError::NumericalError(format!("Surface eval failed: {:?}", e))
+            })?;
+            let n = surface.normal_at(u, v).map_err(|e| {
+                OperationError::NumericalError(format!("Normal eval failed: {:?}", e))
+            })?;
+            row.push(pt + n * distance);
+        }
+        offset_points.push(row);
+    }
+
+    let degree_u = 3.min(n_u);
+    let degree_v = 3.min(n_v);
+
+    // Uniform weights (non-rational)
+    let weights: Vec<Vec<f64>> = vec![vec![1.0; n_v + 1]; n_u + 1];
+
+    // Clamped uniform knot vectors
+    let knots_u = uniform_knot_vector(n_u + 1, degree_u);
+    let knots_v = uniform_knot_vector(n_v + 1, degree_v);
+
+    let nurbs = NurbsSurface::new(offset_points, weights, knots_u, knots_v, degree_u, degree_v)
+        .map_err(|e| {
+            OperationError::NumericalError(format!("NURBS surface creation failed: {}", e))
+        })?;
+
+    Ok(Box::new(GeneralNurbsSurface { nurbs }))
+}
+
+/// Create a uniform knot vector for a B-spline of given control point count and degree
+fn uniform_knot_vector(n_control: usize, degree: usize) -> Vec<f64> {
+    let n_knots = n_control + degree + 1;
+    let mut knots = Vec::with_capacity(n_knots);
+
+    // Clamped uniform knot vector
+    for _ in 0..=degree {
+        knots.push(0.0);
+    }
+    let n_internal = n_knots - 2 * (degree + 1);
+    for i in 1..=n_internal {
+        knots.push(i as f64 / (n_internal + 1) as f64);
+    }
+    for _ in 0..=degree {
+        knots.push(1.0);
+    }
+
+    knots
 }
 
 /// Create offset loop (boundary curves)
