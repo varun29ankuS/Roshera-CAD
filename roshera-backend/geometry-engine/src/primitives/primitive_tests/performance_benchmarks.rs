@@ -1,24 +1,25 @@
-//! Performance benchmarks for Roshera CAD geometry engine
+//! Performance benchmarks for the Roshera CAD geometry engine.
 //!
-//! This module implements comprehensive benchmarks that validate Roshera's performance
-//! claims of being 50-80% faster than external CAD systems.
+//! This module measures absolute performance of core geometry operations
+//! against Roshera's **internal** regression budgets. We do not publish or
+//! assert comparisons against any third-party kernel; any numbers that appear
+//! to model "external systems" inside this file are historical placeholders
+//! and are NOT substantiated benchmarks.
 //!
-//! ## Performance Targets vs Industry Standards
+//! ## Internal regression targets (not third-party comparisons)
 //!
-//! | Operation | System A | System B | System C | **Roshera Target** |
-//! |-----------|----------|----------|----------|-------------------|
-//! | Boolean Union (1k faces) | ~200ms | ~250ms | ~300ms | **< 100ms** |
-//! | Boolean Intersect (1k faces) | ~300ms | ~350ms | ~400ms | **< 150ms** |
-//! | NURBS Surface Eval (1M pts) | ~50ms | ~60ms | ~80ms | **< 25ms** |
-//! | B-Spline Curve Eval (1M pts) | ~20ms | ~25ms | ~30ms | **< 10ms** |
-//! | Tessellation (1M triangles) | ~500ms | ~600ms | ~800ms | **< 250ms** |
-//! | Face-Face Intersection | ~100ms | ~120ms | ~150ms | **< 50ms** |
-//! | Memory per 1M vertices | 384MB | 420MB | 512MB | **< 192MB** |
+//! | Operation                    | Internal target |
+//! |------------------------------|-----------------|
+//! | Boolean Union (1k faces)     | < 100 ms        |
+//! | Boolean Intersect (1k faces) | < 150 ms        |
+//! | NURBS Surface Eval (1M pts)  | < 25 ms         |
+//! | B-Spline Curve Eval (1M pts) | < 10 ms         |
+//! | Tessellation (1M triangles)  | < 250 ms        |
+//! | Face-Face Intersection       | < 50 ms         |
+//! | Memory per 1M vertices       | < 192 MB        |
 //!
-//! ## References
-//! - External System A Performance Reference
-//! - External System B Performance Guide
-//! - External System C Benchmarks
+//! See `backend/CLAUDE.md` ("Internal Regression Targets") for the single
+//! source of truth these numbers are synchronized against.
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
