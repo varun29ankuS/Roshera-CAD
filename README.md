@@ -72,6 +72,22 @@ roshera-app/           React + Three.js + TypeScript browser client
 
 Measured numbers from the geometry kernel. See individual sections below for detail and methodology.
 
+### Math microbenchmarks
+
+Criterion, release build, median of 100 samples.
+
+| Operation | Time |
+|-----------|------|
+| Vector3 dot | 500 ps |
+| Vector3 cross | 884 ps |
+| Vector3 normalize | 1.68 ns |
+| Vector3 add | 984 ps |
+| Matrix4 multiply | 5.14 ns |
+| Matrix4 inverse | 29.4 ns |
+| Matrix4 transpose | 5.50 ns |
+| Point3 distance | 505 ps |
+| Point3 translate | 868 ps |
+
 ## Getting Started
 
 ```bash
