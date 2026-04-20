@@ -13,6 +13,7 @@
   <a href="#what-works-today"><img src="https://img.shields.io/badge/NURBS-production-brightgreen" alt="NURBS" /></a>
   <a href="#what-works-today"><img src="https://img.shields.io/badge/booleans-working-yellow" alt="Booleans" /></a>
   <a href="#what-works-today"><img src="https://img.shields.io/badge/AI--native-working-yellow" alt="AI" /></a>
+  <a href="#performance"><img src="https://img.shields.io/badge/tests-555%20passing-brightgreen" alt="Tests" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-dual-blue" alt="License" /></a>
 </p>
 
