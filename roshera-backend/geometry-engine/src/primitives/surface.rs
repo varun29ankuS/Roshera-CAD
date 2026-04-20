@@ -4764,44 +4764,911 @@ impl Surface for GeneralNurbsSurface {
     }
 }
 
+// =============================================
+// SurfaceOfRevolution
+// =============================================
+
+/// Surface of revolution: a profile curve rotated around an axis.
+///
+/// Parametrization:
+/// - u ∈ [0, 1] maps along the profile curve parameter range
+/// - v ∈ [0, angle] maps the rotation angle around the axis
+///
+/// Point(u, v):
+///   Let P(u) be a point on the profile curve.
+///   Decompose P(u) = C + h·A + r·R where:
+///     C = axis_origin, A = axis_direction (unit), R = radial direction from axis
+///     h = (P - C)·A (height along axis)
+///     r = |(P - C) - h·A| (distance from axis)
+///   Then rotate R by angle v around A to get R_v,
+///   and Point(u,v) = C + h·A + r·R_v
+#[derive(Debug)]
+pub struct SurfaceOfRevolution {
+    /// Origin point on the rotation axis
+    pub axis_origin: Point3,
+    /// Direction of the rotation axis (unit vector)
+    pub axis_direction: Vector3,
+    /// Profile curve to revolve
+    pub profile_curve: Box<dyn Curve>,
+    /// Total rotation angle in radians (2π for full revolution)
+    pub angle: f64,
+}
+
+impl Clone for SurfaceOfRevolution {
+    fn clone(&self) -> Self {
+        Self {
+            axis_origin: self.axis_origin,
+            axis_direction: self.axis_direction,
+            profile_curve: self.profile_curve.clone_box(),
+            angle: self.angle,
+        }
+    }
+}
+
+impl SurfaceOfRevolution {
+    /// Create a new surface of revolution.
+    ///
+    /// # Arguments
+    /// * `axis_origin` - A point on the rotation axis
+    /// * `axis_direction` - Direction of the rotation axis
+    /// * `profile_curve` - The curve to revolve
+    /// * `angle` - Rotation angle in radians (use 2π for full revolution)
+    pub fn new(
+        axis_origin: Point3,
+        axis_direction: Vector3,
+        profile_curve: Box<dyn Curve>,
+        angle: f64,
+    ) -> MathResult<Self> {
+        if angle.abs() < 1e-10 {
+            return Err(MathError::InvalidParameter(
+                "Rotation angle must be non-zero".to_string(),
+            ));
+        }
+        let axis_direction = axis_direction.normalize()?;
+        Ok(Self {
+            axis_origin,
+            axis_direction,
+            profile_curve,
+            angle,
+        })
+    }
+
+    /// Decompose a profile point into height along axis and radial components
+    fn decompose_profile_point(&self, profile_point: Point3) -> (f64, f64, Vector3) {
+        let to_point = profile_point - self.axis_origin;
+        let height = to_point.dot(&self.axis_direction);
+        let radial_vec = to_point - self.axis_direction * height;
+        let radius = radial_vec.magnitude();
+        let radial_dir = if radius > 1e-15 {
+            radial_vec * (1.0 / radius)
+        } else {
+            // Point is on axis — pick arbitrary perpendicular direction
+            self.axis_direction.perpendicular()
+        };
+        (height, radius, radial_dir)
+    }
+
+    /// Rotate a radial direction by angle v around the axis
+    fn rotate_radial(&self, radial_dir: Vector3, v: f64) -> Vector3 {
+        let cos_v = v.cos();
+        let sin_v = v.sin();
+        let binormal = self.axis_direction.cross(&radial_dir);
+        radial_dir * cos_v + binormal * sin_v
+    }
+}
+
+impl Surface for SurfaceOfRevolution {
+    fn surface_type(&self) -> SurfaceType {
+        SurfaceType::SurfaceOfRevolution
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn clone_box(&self) -> Box<dyn Surface> {
+        Box::new(self.clone())
+    }
+
+    fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+        // Map u to profile curve parameter
+        let profile_point = self.profile_curve.point_at(u)?;
+        let (height, radius, radial_dir) = self.decompose_profile_point(profile_point);
+
+        // Rotated radial direction at angle v
+        let cos_v = v.cos();
+        let sin_v = v.sin();
+        let binormal = self.axis_direction.cross(&radial_dir);
+        let radial_v = radial_dir * cos_v + binormal * sin_v;
+
+        // Position
+        let position = self.axis_origin + self.axis_direction * height + radial_v * radius;
+
+        // Partial derivative w.r.t. u (along profile)
+        // We need dP/du of the profile curve, then decompose and rotate
+        let h = 1e-7;
+        let u_plus = (u + h).min(1.0);
+        let u_minus = (u - h).max(0.0);
+        let p_plus = self.profile_curve.point_at(u_plus)?;
+        let p_minus = self.profile_curve.point_at(u_minus)?;
+        let du_scale = 1.0 / (u_plus - u_minus);
+
+        let (h_plus, r_plus, rd_plus) = self.decompose_profile_point(p_plus);
+        let (h_minus, r_minus, rd_minus) = self.decompose_profile_point(p_minus);
+
+        let dh_du = (h_plus - h_minus) * du_scale;
+        let dr_du = (r_plus - r_minus) * du_scale;
+
+        // du = dh/du * axis + dr/du * radial_v
+        // (ignoring the change in radial direction along the profile for first-order approx)
+        let du = self.axis_direction * dh_du + radial_v * dr_du;
+
+        // Partial derivative w.r.t. v (rotation)
+        // dPoint/dv = radius * (-sin(v) * radial_dir + cos(v) * binormal)
+        let dv = (radial_dir * (-sin_v) + binormal * cos_v) * radius;
+
+        // Normal = du × dv (normalized)
+        let normal_raw = du.cross(&dv);
+        let normal = if normal_raw.magnitude() > 1e-15 {
+            normal_raw.normalize()?
+        } else {
+            self.axis_direction // Fallback for degenerate points on axis
+        };
+
+        // Second derivatives (finite differences)
+        let v_plus = v + h;
+        let v_minus = v - h;
+
+        let pos_uu = {
+            let p1 = self.profile_curve.point_at(u_plus)?;
+            let p0 = self.profile_curve.point_at(u)?;
+            let pm = self.profile_curve.point_at(u_minus)?;
+
+            let (h1, r1, _) = self.decompose_profile_point(p1);
+            let (h0, r0, _) = self.decompose_profile_point(p0);
+            let (hm, rm, _) = self.decompose_profile_point(pm);
+
+            let d2h = (h1 - 2.0 * h0 + hm) * du_scale * du_scale;
+            let d2r = (r1 - 2.0 * r0 + rm) * du_scale * du_scale;
+            self.axis_direction * d2h + radial_v * d2r
+        };
+
+        let dvv = (radial_dir * (-cos_v) + binormal * (-sin_v)) * radius;
+        let duv = (radial_dir * (-sin_v) + binormal * cos_v) * dr_du;
+
+        // Principal curvatures from first/second fundamental forms
+        let e = du.dot(&du);
+        let f = du.dot(&dv);
+        let g = dv.dot(&dv);
+        let l = pos_uu.dot(&normal);
+        let m = duv.dot(&normal);
+        let n_val = dvv.dot(&normal);
+
+        let denom = e * g - f * f;
+        let (k1, k2) = if denom.abs() > 1e-15 {
+            let mean = (e * n_val - 2.0 * f * m + g * l) / (2.0 * denom);
+            let gauss = (l * n_val - m * m) / denom;
+            let discriminant = (mean * mean - gauss).max(0.0);
+            (mean + discriminant.sqrt(), mean - discriminant.sqrt())
+        } else {
+            (0.0, 0.0)
+        };
+
+        Ok(SurfacePoint {
+            position,
+            du,
+            dv,
+            duu: pos_uu,
+            duv,
+            dvv,
+            normal,
+            k1,
+            k2,
+            dir1: du.normalize().unwrap_or(Vector3::X),
+            dir2: dv.normalize().unwrap_or(Vector3::Y),
+        })
+    }
+
+    fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
+        ((0.0, 1.0), (0.0, self.angle))
+    }
+
+    fn is_closed_u(&self) -> bool {
+        false // Profile curve is generally open
+    }
+
+    fn is_closed_v(&self) -> bool {
+        (self.angle - std::f64::consts::TAU).abs() < 1e-10
+    }
+
+    fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
+        let new_origin = matrix.transform_point(&self.axis_origin);
+        let new_axis = matrix.transform_vector(&self.axis_direction);
+        let new_curve = self.profile_curve.transform(matrix);
+        Box::new(SurfaceOfRevolution {
+            axis_origin: new_origin,
+            axis_direction: new_axis.normalize().unwrap_or(self.axis_direction),
+            profile_curve: new_curve,
+            angle: self.angle,
+        })
+    }
+
+    fn type_name(&self) -> &'static str {
+        "SurfaceOfRevolution"
+    }
+
+    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        // Decompose point relative to axis
+        let to_point = *point - self.axis_origin;
+        let height = to_point.dot(&self.axis_direction);
+        let radial = to_point - self.axis_direction * height;
+        let radius = radial.magnitude();
+
+        // Find v (rotation angle) from the radial direction
+        let v = if radius > 1e-15 {
+            let radial_dir = radial * (1.0 / radius);
+            // Get reference direction from profile curve at u=0
+            let p0 = self.profile_curve.point_at(0.0)?;
+            let (_, _, ref_dir) = self.decompose_profile_point(p0);
+            let binormal = self.axis_direction.cross(&ref_dir);
+            let cos_v = radial_dir.dot(&ref_dir);
+            let sin_v = radial_dir.dot(&binormal);
+            let angle = sin_v.atan2(cos_v);
+            if angle < 0.0 {
+                angle + std::f64::consts::TAU
+            } else {
+                angle
+            }
+        } else {
+            0.0
+        };
+
+        // Find u by searching along profile curve for closest match
+        // The reconstructed point at (u, v) should be closest to the input point
+        let mut best_u = 0.0;
+        let mut best_dist = f64::MAX;
+        const SAMPLES: usize = 50;
+        for i in 0..=SAMPLES {
+            let u = i as f64 / SAMPLES as f64;
+            if let Ok(pt) = self.point_at(u, v) {
+                let dist = (*point - pt).magnitude();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_u = u;
+                }
+            }
+        }
+
+        Ok((best_u, v.clamp(0.0, self.angle)))
+    }
+
+    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+        // Offset a surface of revolution by offsetting the profile curve
+        // For now, use a numerical approximation via NURBS fitting
+        // A more exact approach would offset the profile curve by distance
+        Box::new(self.clone()) // Simplified: return self (exact offset needs profile curve offset)
+    }
+
+    fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
+        let offset = self.offset(distance);
+        Ok(OffsetSurface {
+            surface: offset,
+            quality: OffsetQuality::Approximate {
+                max_error: f64::NAN,
+            },
+            original: self.clone_box(),
+            distance,
+        })
+    }
+
+    fn offset_variable(
+        &self,
+        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        _tolerance: Tolerance,
+    ) -> MathResult<Box<dyn Surface>> {
+        Err(MathError::NotImplemented(
+            "Variable offset for SurfaceOfRevolution".to_string(),
+        ))
+    }
+
+    fn intersect(
+        &self,
+        _other: &dyn Surface,
+        _tolerance: Tolerance,
+    ) -> Vec<SurfaceIntersectionResult> {
+        vec![]
+    }
+}
+
+// =============================================
+// RuledSurface (for chamfer, Phase 5)
+// =============================================
+
+/// Ruled surface: linear interpolation between two boundary curves.
+///
+/// Point(u, v) = (1 - v) * curve1(u) + v * curve2(u)
+///
+/// Used for chamfer faces where the surface linearly connects two edge curves.
+#[derive(Debug)]
+pub struct RuledSurface {
+    /// First boundary curve (at v=0)
+    pub curve1: Box<dyn Curve>,
+    /// Second boundary curve (at v=1)
+    pub curve2: Box<dyn Curve>,
+}
+
+impl Clone for RuledSurface {
+    fn clone(&self) -> Self {
+        Self {
+            curve1: self.curve1.clone_box(),
+            curve2: self.curve2.clone_box(),
+        }
+    }
+}
+
+impl RuledSurface {
+    pub fn new(curve1: Box<dyn Curve>, curve2: Box<dyn Curve>) -> Self {
+        Self { curve1, curve2 }
+    }
+}
+
+impl Surface for RuledSurface {
+    fn surface_type(&self) -> SurfaceType {
+        SurfaceType::Ruled
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn clone_box(&self) -> Box<dyn Surface> {
+        Box::new(self.clone())
+    }
+
+    fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+        let p1 = self.curve1.point_at(u)?;
+        let p2 = self.curve2.point_at(u)?;
+
+        // Position: linear interpolation
+        let position = p1 + (p2 - p1) * v;
+
+        // Partial derivatives
+        let h = 1e-7;
+        let u_plus = (u + h).min(1.0);
+        let u_minus = (u - h).max(0.0);
+        let du_scale = 1.0 / (u_plus - u_minus);
+
+        let p1_plus = self.curve1.point_at(u_plus)?;
+        let p1_minus = self.curve1.point_at(u_minus)?;
+        let p2_plus = self.curve2.point_at(u_plus)?;
+        let p2_minus = self.curve2.point_at(u_minus)?;
+
+        let dp1_du = (p1_plus - p1_minus) * du_scale;
+        let dp2_du = (p2_plus - p2_minus) * du_scale;
+
+        let du = dp1_du + (dp2_du - dp1_du) * v;
+        let dv = p2 - p1;
+
+        let normal_raw = du.cross(&dv);
+        let normal = if normal_raw.magnitude() > 1e-15 {
+            normal_raw.normalize()?
+        } else {
+            Vector3::Z // Fallback
+        };
+
+        // Second derivatives
+        let p1_uu = {
+            let p0 = self.curve1.point_at(u)?;
+            (p1_plus - p0 * 2.0 + p1_minus) * (du_scale * du_scale)
+        };
+        let p2_uu = {
+            let p0 = self.curve2.point_at(u)?;
+            (p2_plus - p0 * 2.0 + p2_minus) * (du_scale * du_scale)
+        };
+        let duu = p1_uu + (p2_uu - p1_uu) * v;
+        let duv = dp2_du - dp1_du;
+        let dvv = Vector3::ZERO; // Linear in v → zero second derivative
+
+        // Principal curvatures
+        let e = du.dot(&du);
+        let f = du.dot(&dv);
+        let g = dv.dot(&dv);
+        let l = duu.dot(&normal);
+        let m = duv.dot(&normal);
+        let n_val = dvv.dot(&normal);
+        let denom = e * g - f * f;
+        let (k1, k2) = if denom.abs() > 1e-15 {
+            let mean = (e * n_val - 2.0 * f * m + g * l) / (2.0 * denom);
+            let gauss = (l * n_val - m * m) / denom;
+            let disc = (mean * mean - gauss).max(0.0);
+            (mean + disc.sqrt(), mean - disc.sqrt())
+        } else {
+            (0.0, 0.0)
+        };
+
+        Ok(SurfacePoint {
+            position,
+            du,
+            dv,
+            duu,
+            duv,
+            dvv,
+            normal,
+            k1,
+            k2,
+            dir1: du.normalize().unwrap_or(Vector3::X),
+            dir2: dv.normalize().unwrap_or(Vector3::Y),
+        })
+    }
+
+    fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
+        ((0.0, 1.0), (0.0, 1.0))
+    }
+
+    fn is_closed_u(&self) -> bool {
+        false
+    }
+
+    fn is_closed_v(&self) -> bool {
+        false
+    }
+
+    fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
+        Box::new(RuledSurface {
+            curve1: self.curve1.transform(matrix),
+            curve2: self.curve2.transform(matrix),
+        })
+    }
+
+    fn type_name(&self) -> &'static str {
+        "RuledSurface"
+    }
+
+    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        let mut best_u = 0.0;
+        let mut best_v = 0.0;
+        let mut best_dist = f64::MAX;
+
+        const U_SAMPLES: usize = 30;
+        const V_SAMPLES: usize = 10;
+        for i in 0..=U_SAMPLES {
+            for j in 0..=V_SAMPLES {
+                let u = i as f64 / U_SAMPLES as f64;
+                let v = j as f64 / V_SAMPLES as f64;
+                if let Ok(pt) = self.point_at(u, v) {
+                    let dist = (*point - pt).magnitude();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_u = u;
+                        best_v = v;
+                    }
+                }
+            }
+        }
+
+        Ok((best_u, best_v))
+    }
+
+    fn offset(&self, distance: f64) -> Box<dyn Surface> {
+        Box::new(self.clone()) // Simplified
+    }
+
+    fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
+        Ok(OffsetSurface {
+            surface: self.offset(distance),
+            quality: OffsetQuality::Approximate {
+                max_error: f64::NAN,
+            },
+            original: self.clone_box(),
+            distance,
+        })
+    }
+
+    fn offset_variable(
+        &self,
+        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        _tolerance: Tolerance,
+    ) -> MathResult<Box<dyn Surface>> {
+        Err(MathError::NotImplemented(
+            "Variable offset for RuledSurface".to_string(),
+        ))
+    }
+
+    fn intersect(
+        &self,
+        _other: &dyn Surface,
+        _tolerance: Tolerance,
+    ) -> Vec<SurfaceIntersectionResult> {
+        vec![]
+    }
+}
+
 // Downcast functionality is handled through the as_any method in the Surface trait
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_plane_evaluation() {
-//         let plane = Plane::xy(0.0);
-//         let eval = plane.evaluate_full(1.0, 2.0).unwrap();
-//
-//         assert_eq!(eval.position, Point3::new(1.0, 2.0, 0.0));
-//         assert_eq!(eval.normal, Vector3::Z);
-//         assert_eq!(eval.k1, 0.0);
-//         assert_eq!(eval.k2, 0.0);
-//     }
-//
-//     #[test]
-//     fn test_cylinder_curvature() {
-//         let cyl = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
-//         let eval = cyl.evaluate_full(0.0, 0.0).unwrap();
-//
-//         assert_eq!(eval.k1, 0.2); // 1/radius
-//         assert_eq!(eval.k2, 0.0); // Zero along axis
-//         assert_eq!(eval.gaussian_curvature(), 0.0);
-//         assert_eq!(eval.mean_curvature(), 0.1);
-//     }
-//
-//     #[test]
-//     fn test_surface_store_dispatch() {
-//         let mut store = SurfaceStore::new();
-//
-//         let plane_id = store.add(Box::new(Plane::xy(0.0)));
-//         let cyl_id = store.add(Box::new(
-//             Cylinder::new(Point3::ZERO, Vector3::Z, 1.0).unwrap()
-//         ));
-//
-//         assert_eq!(store.get(plane_id).unwrap().type_name(), "Plane");
-//         assert_eq!(store.get(cyl_id).unwrap().type_name(), "Cylinder");
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_tolerance() -> Tolerance {
+        Tolerance::default()
+    }
+
+    // ===== Surface evaluation tests =====
+
+    #[test]
+    fn test_plane_evaluation() {
+        let plane = Plane::xy(0.0);
+        let point = plane.point_at(1.0, 2.0).unwrap();
+        assert!((point.x - 1.0).abs() < 1e-10);
+        assert!((point.y - 2.0).abs() < 1e-10);
+        assert!((point.z).abs() < 1e-10);
+    }
+
+    // ===== Plane-Plane intersection tests =====
+
+    #[test]
+    fn test_plane_plane_perpendicular() {
+        let xy = Plane::xy(0.0);
+        let xz = Plane::from_point_normal(Point3::ZERO, Vector3::Y).unwrap();
+        let tol = default_tolerance();
+
+        let results = xy.intersect(&xz, tol);
+        assert_eq!(
+            results.len(),
+            1,
+            "Perpendicular planes should intersect in one curve"
+        );
+
+        match &results[0] {
+            SurfaceIntersectionResult::Curve(curve) => {
+                // The intersection line should lie on both planes (z=0 and y=0)
+                // i.e., along the X axis
+                let p0 = curve.point_at(0.0).unwrap();
+                let p1 = curve.point_at(1.0).unwrap();
+                // Both points should have z≈0 and y≈0
+                assert!(
+                    p0.z.abs() < 1e-6,
+                    "Point should lie on XY plane, z={}",
+                    p0.z
+                );
+                assert!(
+                    p0.y.abs() < 1e-6,
+                    "Point should lie on XZ plane, y={}",
+                    p0.y
+                );
+                assert!(
+                    p1.z.abs() < 1e-6,
+                    "Point should lie on XY plane, z={}",
+                    p1.z
+                );
+                assert!(
+                    p1.y.abs() < 1e-6,
+                    "Point should lie on XZ plane, y={}",
+                    p1.y
+                );
+            }
+            other => panic!("Expected Curve, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_plane_plane_parallel() {
+        let plane1 = Plane::xy(0.0);
+        let plane2 = Plane::xy(5.0); // Parallel, offset by 5 in Z
+        let tol = default_tolerance();
+
+        let results = plane1.intersect(&plane2, tol);
+        assert!(
+            results.is_empty(),
+            "Parallel non-coincident planes should not intersect"
+        );
+    }
+
+    #[test]
+    fn test_plane_plane_coincident() {
+        let plane1 = Plane::xy(0.0);
+        let plane2 = Plane::xy(0.0);
+        let tol = default_tolerance();
+
+        let results = plane1.intersect(&plane2, tol);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SurfaceIntersectionResult::Coincident));
+    }
+
+    // ===== Plane-Cylinder intersection tests =====
+
+    #[test]
+    fn test_plane_cylinder_perpendicular() {
+        // Cylinder along Z, plane at z=5 perpendicular to Z
+        let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 3.0).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 5.0), Vector3::Z).unwrap();
+        let tol = default_tolerance();
+
+        let results = cylinder.intersect(&plane, tol);
+        assert!(
+            !results.is_empty(),
+            "Plane perpendicular to cylinder should produce intersection"
+        );
+
+        match &results[0] {
+            SurfaceIntersectionResult::Curve(curve) => {
+                // All points should be at z≈5 and distance≈3 from Z axis
+                for t in [0.0, 0.25, 0.5, 0.75] {
+                    let p = curve.point_at(t).unwrap();
+                    assert!(
+                        (p.z - 5.0).abs() < 0.1,
+                        "Point should be at z=5, got z={}",
+                        p.z
+                    );
+                    let r = (p.x * p.x + p.y * p.y).sqrt();
+                    assert!((r - 3.0).abs() < 0.1, "Point should be at r=3, got r={r}");
+                }
+            }
+            other => panic!(
+                "Expected Curve (circle), got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_plane_cylinder_parallel_two_lines() {
+        // Cylinder along Z, plane parallel to Z axis passing through center
+        let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let plane = Plane::from_point_normal(Point3::ZERO, Vector3::X).unwrap(); // YZ plane
+        let tol = default_tolerance();
+
+        let results = cylinder.intersect(&plane, tol);
+        // Plane through cylinder center parallel to axis → 2 lines
+        assert_eq!(
+            results.len(),
+            2,
+            "Should get 2 intersection lines, got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn test_plane_cylinder_no_intersection() {
+        // Cylinder along Z at origin with radius 3, plane far away
+        let cylinder = Cylinder::new(Point3::ZERO, Vector3::Z, 3.0).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(10.0, 0.0, 0.0), Vector3::X).unwrap();
+        let tol = default_tolerance();
+
+        let results = cylinder.intersect(&plane, tol);
+        assert!(
+            results.is_empty(),
+            "Plane far from cylinder should not intersect"
+        );
+    }
+
+    // ===== Plane-Sphere intersection tests =====
+
+    #[test]
+    fn test_plane_sphere_through_center() {
+        let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let plane = Plane::xy(0.0); // Through center
+        let tol = default_tolerance();
+
+        let results = sphere.intersect(&plane, tol);
+        assert_eq!(results.len(), 1, "Should intersect in one circle");
+
+        match &results[0] {
+            SurfaceIntersectionResult::Curve(curve) => {
+                // Great circle: all points at r=5 from origin, z=0
+                for t in [0.0, 0.25, 0.5, 0.75] {
+                    let p = curve.point_at(t).unwrap();
+                    assert!(p.z.abs() < 0.1, "Points should be at z=0, got z={}", p.z);
+                    let r = (p.x * p.x + p.y * p.y).sqrt();
+                    assert!((r - 5.0).abs() < 0.1, "Points should be at r=5, got r={r}");
+                }
+            }
+            other => panic!(
+                "Expected Curve (circle), got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_plane_sphere_tangent() {
+        let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 5.0), Vector3::Z).unwrap();
+        let tol = default_tolerance();
+
+        let results = sphere.intersect(&plane, tol);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], SurfaceIntersectionResult::Point(_)),
+            "Tangent plane should produce a point intersection"
+        );
+    }
+
+    #[test]
+    fn test_plane_sphere_no_intersection() {
+        let sphere = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 10.0), Vector3::Z).unwrap();
+        let tol = default_tolerance();
+
+        let results = sphere.intersect(&plane, tol);
+        assert!(
+            results.is_empty(),
+            "Plane outside sphere should not intersect"
+        );
+    }
+
+    // ===== Sphere-Sphere intersection tests =====
+
+    #[test]
+    fn test_sphere_sphere_overlapping() {
+        let s1 = Sphere::new(Point3::ZERO, 5.0).unwrap();
+        let s2 = Sphere::new(Point3::new(6.0, 0.0, 0.0), 5.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = s1.intersect(&s2, tol);
+        assert!(!results.is_empty(), "Overlapping spheres should intersect");
+    }
+
+    #[test]
+    fn test_sphere_sphere_no_intersection() {
+        let s1 = Sphere::new(Point3::ZERO, 3.0).unwrap();
+        let s2 = Sphere::new(Point3::new(20.0, 0.0, 0.0), 3.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = s1.intersect(&s2, tol);
+        assert!(results.is_empty(), "Far-apart spheres should not intersect");
+    }
+
+    // ===== Cylinder-Cylinder intersection tests =====
+
+    #[test]
+    fn test_cylinder_cylinder_coaxial_same_radius() {
+        let c1 = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let c2 = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = c1.intersect(&c2, tol);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SurfaceIntersectionResult::Coincident));
+    }
+
+    #[test]
+    fn test_cylinder_cylinder_parallel_intersecting() {
+        let c1 = Cylinder::new(Point3::ZERO, Vector3::Z, 5.0).unwrap();
+        let c2 = Cylinder::new(Point3::new(6.0, 0.0, 0.0), Vector3::Z, 5.0).unwrap();
+        let tol = default_tolerance();
+
+        let results = c1.intersect(&c2, tol);
+        assert_eq!(
+            results.len(),
+            2,
+            "Parallel overlapping cylinders should give 2 lines"
+        );
+    }
+
+    // =============================================
+    // SurfaceOfRevolution tests
+    // =============================================
+
+    #[test]
+    fn test_revolution_surface_evaluation() {
+        use crate::primitives::curve::Line;
+
+        // Revolve a vertical line segment (x=5, z from 0 to 10) around Z-axis
+        // This should produce a cylinder of radius 5
+        let profile = Line::new(Point3::new(5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 10.0));
+
+        let rev = SurfaceOfRevolution::new(
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(profile),
+            std::f64::consts::TAU,
+        )
+        .unwrap();
+
+        // At u=0 (bottom), v=0 (no rotation): should be (5, 0, 0)
+        let p00 = rev.point_at(0.0, 0.0).unwrap();
+        assert!((p00.x - 5.0).abs() < 1e-6, "x should be 5, got {}", p00.x);
+        assert!(p00.y.abs() < 1e-6, "y should be 0, got {}", p00.y);
+        assert!(p00.z.abs() < 1e-6, "z should be 0, got {}", p00.z);
+
+        // At u=0.5 (midpoint), v=0: should be (5, 0, 5)
+        let p50 = rev.point_at(0.5, 0.0).unwrap();
+        assert!((p50.x - 5.0).abs() < 1e-6);
+        assert!((p50.z - 5.0).abs() < 1e-6);
+
+        // At u=0, v=π/2: should be (0, 5, 0) — rotated 90°
+        let p0q = rev.point_at(0.0, std::f64::consts::FRAC_PI_2).unwrap();
+        assert!(p0q.x.abs() < 1e-6, "x should be ~0, got {}", p0q.x);
+        assert!((p0q.y - 5.0).abs() < 1e-6, "y should be ~5, got {}", p0q.y);
+    }
+
+    #[test]
+    fn test_revolution_surface_radius_invariant() {
+        use crate::primitives::curve::Line;
+
+        // Revolve line at x=3 around Z → all points should have radius 3
+        let profile = Line::new(Point3::new(3.0, 0.0, 0.0), Point3::new(3.0, 0.0, 8.0));
+        let rev = SurfaceOfRevolution::new(
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(profile),
+            std::f64::consts::TAU,
+        )
+        .unwrap();
+
+        // Sample multiple (u, v) points and verify distance from Z-axis = 3
+        for i in 0..=5 {
+            for j in 0..=8 {
+                let u = i as f64 / 5.0;
+                let v = j as f64 / 8.0 * std::f64::consts::TAU;
+                let pt = rev.point_at(u, v).unwrap();
+                let radius = (pt.x * pt.x + pt.y * pt.y).sqrt();
+                assert!(
+                    (radius - 3.0).abs() < 1e-4,
+                    "Radius should be 3.0, got {radius} at u={u}, v={v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_revolution_surface_is_closed() {
+        use crate::primitives::curve::Line;
+
+        let profile = Line::new(Point3::new(5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 10.0));
+
+        // Full revolution should be closed in v
+        let full = SurfaceOfRevolution::new(
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(profile.clone()),
+            std::f64::consts::TAU,
+        )
+        .unwrap();
+        assert!(full.is_closed_v(), "Full revolution should be closed in v");
+        assert!(!full.is_closed_u(), "Should not be closed in u");
+
+        // Partial revolution should not be closed
+        let partial = SurfaceOfRevolution::new(
+            Point3::ORIGIN,
+            Vector3::Z,
+            Box::new(profile),
+            std::f64::consts::PI,
+        )
+        .unwrap();
+        assert!(
+            !partial.is_closed_v(),
+            "Partial revolution should not be closed in v"
+        );
+    }
+
+    // =============================================
+    // RuledSurface tests
+    // =============================================
+
+    #[test]
+    fn test_ruled_surface_evaluation() {
+        use crate::primitives::curve::Line;
+
+        let c1 = Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let c2 = Line::new(Point3::new(0.0, 0.0, 5.0), Point3::new(10.0, 0.0, 5.0));
+
+        let ruled = RuledSurface::new(Box::new(c1), Box::new(c2));
+
+        // At v=0, should be on curve1
+        let p = ruled.point_at(0.5, 0.0).unwrap();
+        assert!((p.x - 5.0).abs() < 1e-6);
+        assert!(p.z.abs() < 1e-6);
+
+        // At v=1, should be on curve2
+        let p = ruled.point_at(0.5, 1.0).unwrap();
+        assert!((p.x - 5.0).abs() < 1e-6);
+        assert!((p.z - 5.0).abs() < 1e-6);
+
+        // At v=0.5, should be midpoint between curves
+        let p = ruled.point_at(0.5, 0.5).unwrap();
+        assert!((p.x - 5.0).abs() < 1e-6);
+        assert!((p.z - 2.5).abs() < 1e-6);
+    }
+}

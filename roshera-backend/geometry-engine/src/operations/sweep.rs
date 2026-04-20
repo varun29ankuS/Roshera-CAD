@@ -615,9 +615,9 @@ fn create_bilinear_surface(
     _v3: VertexId,
     _v4: VertexId,
 ) -> OperationResult<Box<dyn Surface>> {
-    // Would create proper bilinear surface
-    use crate::primitives::surface::Plane;
-    Ok(Box::new(Plane::xy(0.0)))
+    Err(OperationError::NotImplemented(
+        "Bilinear surface not yet implemented".to_string(),
+    ))
 }
 
 /// Create profile face from edges
@@ -632,9 +632,10 @@ fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationRe
     }
     let loop_id = model.loops.add(profile_loop);
 
-    // Create planar surface (assuming planar profile)
+    // Create planar surface from profile edges
+    // For now, use XY plane — proper implementation would compute plane from edge positions
     use crate::primitives::surface::Plane;
-    let surface = Box::new(Plane::xy(0.0));
+    let surface: Box<dyn Surface> = Box::new(Plane::xy(0.0));
     let surface_id = model.surfaces.add(surface);
 
     // Create face

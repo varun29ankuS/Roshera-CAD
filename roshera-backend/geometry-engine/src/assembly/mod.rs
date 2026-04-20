@@ -518,9 +518,7 @@ impl Assembly {
 
     /// Check if two components interfere
     fn components_interfere(&self, _comp1: &Component, _comp2: &Component) -> bool {
-        // Simplified interference check
-        // Real implementation would do Boolean intersection
-        // For now, check bounding box overlap
+        // Not yet implemented — requires bounding box computation + boolean intersection
         false
     }
 
@@ -612,16 +610,9 @@ impl ConstraintSolver {
     }
 
     fn solve(&self) -> Result<HashMap<ComponentId, Matrix4>, AssemblyError> {
-        // Simplified constraint solver
-        // Real implementation would use numerical methods
-        let mut solution = HashMap::new();
-
-        // For now, return identity transforms
-        for component_id in self.component_dof.keys() {
-            solution.insert(*component_id, Matrix4::IDENTITY);
-        }
-
-        Ok(solution)
+        Err(AssemblyError::SolverFailed(
+            "Constraint solver not yet implemented".to_string(),
+        ))
     }
 
     fn get_dof(&self, component: &ComponentId) -> u8 {

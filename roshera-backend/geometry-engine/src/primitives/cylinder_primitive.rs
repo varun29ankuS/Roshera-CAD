@@ -396,13 +396,86 @@ impl Primitive for CylinderPrimitive {
         solid_id: SolidId,
         model: &BRepModel,
     ) -> Result<Self::Parameters, PrimitiveError> {
-        let _solid = model
+        let solid = model
             .solids
             .get(solid_id)
             .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
 
-        // TODO: Implement proper parameter storage in the model
-        Ok(CylinderParameters::default())
+        let shell =
+            model
+                .shells
+                .get(solid.outer_shell)
+                .ok_or_else(|| PrimitiveError::GeometryError {
+                    operation: "get_parameters".to_string(),
+                    details: "Outer shell not found".to_string(),
+                })?;
+
+        // Find the cylindrical surface among the solid's faces to extract radius and axis
+        let mut radius = None;
+        let mut axis = None;
+        let mut origin = None;
+
+        for &face_id in &shell.faces {
+            if let Some(face) = model.faces.get(face_id) {
+                if let Some(surface) = model.surfaces.get(face.surface_id) {
+                    if surface.surface_type() == crate::primitives::surface::SurfaceType::Cylinder {
+                        use crate::primitives::surface::Cylinder;
+                        if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+                            radius = Some(cyl.radius);
+                            axis = Some(cyl.axis);
+                            origin = Some(cyl.origin);
+                        }
+                    }
+                }
+            }
+        }
+
+        let radius = radius.ok_or_else(|| PrimitiveError::GeometryError {
+            operation: "get_parameters".to_string(),
+            details: "No cylindrical surface found in solid".to_string(),
+        })?;
+        let axis = axis.unwrap_or(Vector3::Z);
+        let base_center = origin.unwrap_or(Point3::ORIGIN);
+
+        // Compute height from bounding box along axis
+        let mut min_proj = f64::MAX;
+        let mut max_proj = f64::MIN;
+
+        for &face_id in &shell.faces {
+            if let Some(face) = model.faces.get(face_id) {
+                if let Some(loop_data) = model.loops.get(face.outer_loop) {
+                    for &edge_id in &loop_data.edges {
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            for vid in [edge.start_vertex, edge.end_vertex] {
+                                if let Some(v) = model.vertices.get(vid) {
+                                    let p =
+                                        Point3::new(v.position[0], v.position[1], v.position[2]);
+                                    let proj = (p - base_center).dot(&axis);
+                                    min_proj = min_proj.min(proj);
+                                    max_proj = max_proj.max(proj);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let height = if max_proj > min_proj {
+            max_proj - min_proj
+        } else {
+            1.0 // fallback
+        };
+
+        Ok(CylinderParameters {
+            radius,
+            height,
+            base_center,
+            axis,
+            segments: 32,
+            transform: None,
+            tolerance: None,
+        })
     }
 
     fn validate(solid_id: SolidId, model: &BRepModel) -> Result<ValidationReport, PrimitiveError> {
@@ -543,23 +616,23 @@ fn create_vertical_line(
     ))
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_cylinder_creation() {
-//         let mut model = BRepModel::new();
-//         let params = CylinderParameters::new(5.0, 10.0).unwrap();
-//
-//         let solid_id = CylinderPrimitive::create(params, &mut model).unwrap();
-//
-//         // Verify solid exists
-//         assert!(model.solids.get(solid_id).is_some());
-//
-//         // Validate the cylinder
-//         let report = CylinderPrimitive::validate(solid_id, &model).unwrap();
-//         assert!(report.is_valid);
-//         assert_eq!(report.euler_characteristic, 2);
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cylinder_creation() {
+        let mut model = BRepModel::new();
+        let params = CylinderParameters::new(5.0, 10.0).unwrap();
+
+        let solid_id = CylinderPrimitive::create(params, &mut model).unwrap();
+
+        // Verify solid exists
+        assert!(model.solids.get(solid_id).is_some());
+
+        // Validate the cylinder
+        let report = CylinderPrimitive::validate(solid_id, &model).unwrap();
+        assert!(report.is_valid);
+        assert_eq!(report.euler_characteristic, 2);
+    }
+}

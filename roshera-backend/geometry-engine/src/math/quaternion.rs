@@ -388,6 +388,9 @@ impl Quaternion {
 
         // Normalize to ensure unit quaternion (defensive programming)
         let norm = (w * w + x * x + y * y + z * z).sqrt();
+        if norm < f64::EPSILON {
+            return (0.0, 0.0, 0.0);
+        }
         let w = w / norm;
         let x = x / norm;
         let y = y / norm;
@@ -1066,5 +1069,15 @@ mod tests {
     fn test_memory_layout() {
         assert_eq!(std::mem::size_of::<Quaternion>(), 32);
         assert_eq!(std::mem::align_of::<Quaternion>(), 8);
+    }
+
+    #[test]
+    fn test_zero_quaternion_euler_no_nan() {
+        let q = Quaternion::new(0.0, 0.0, 0.0, 0.0);
+        let (x, y, z) = q.to_euler_xyz();
+        assert!(x.is_finite());
+        assert!(y.is_finite());
+        assert!(z.is_finite());
+        assert_eq!((x, y, z), (0.0, 0.0, 0.0));
     }
 }

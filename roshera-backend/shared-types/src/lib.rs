@@ -26,6 +26,7 @@ pub mod session;
 pub mod system_context;
 pub mod timeline_types;
 pub mod traits;
+pub mod vision;
 
 pub use api::*;
 pub use commands::*;

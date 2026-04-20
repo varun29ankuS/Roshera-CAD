@@ -21,6 +21,7 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::{Vertex, VertexId},
 };
+use tracing::debug;
 
 /// Find the solid that contains the given face
 fn find_parent_solid(model: &BRepModel, face_id: FaceId) -> Option<SolidId> {
@@ -200,15 +201,20 @@ fn create_unified_extrusion(
     let unified_shell_id = model.shells.add(unified_shell);
 
     // Log the unified shell information
-    eprintln!(
-        "Created unified shell {} with {} faces",
-        unified_shell_id,
-        unified_faces.len()
+    debug!(
+        shell_id = unified_shell_id,
+        face_count = unified_faces.len(),
+        "Created unified shell"
     );
     for (i, &face_id) in unified_faces.iter().enumerate() {
         if let Some(face) = model.faces.get(face_id) {
-            if let Some(surface) = model.surfaces.get(face.surface_id) {
-                eprintln!("  Face {}: ID={}, Surface={}", i, face_id, face.surface_id);
+            if model.surfaces.get(face.surface_id).is_some() {
+                debug!(
+                    face_idx = i,
+                    face_id,
+                    surface_id = face.surface_id,
+                    "  Face"
+                );
             }
         }
     }
@@ -217,18 +223,20 @@ fn create_unified_extrusion(
     // This maintains the same solid ID instead of creating a new one
     if let Some(parent_solid) = model.solids.get_mut(parent_solid_id) {
         parent_solid.outer_shell = unified_shell_id;
-        eprintln!(
-            "Updated parent solid {} with new shell {}",
-            parent_solid_id, unified_shell_id
+        debug!(
+            solid_id = parent_solid_id,
+            shell_id = unified_shell_id,
+            "Updated parent solid with new shell"
         );
         Ok(parent_solid_id)
     } else {
         // Fallback: create new solid if parent update fails
         let unified_solid = Solid::new(0, unified_shell_id);
         let unified_solid_id = model.solids.add(unified_solid);
-        eprintln!(
-            "Created new solid {} with shell {}",
-            unified_solid_id, unified_shell_id
+        debug!(
+            solid_id = unified_solid_id,
+            shell_id = unified_shell_id,
+            "Created new solid with shell"
         );
         Ok(unified_solid_id)
     }
@@ -347,9 +355,26 @@ fn create_complex_extrusion(
         prev_vertices.push(edge.start_vertex);
     }
 
+    // Compute face centroid from base vertices for draft angle calculation.
+    // The centroid is projected onto the plane perpendicular to the extrusion direction
+    // so that radial draft offsets are applied correctly in 3D.
+    let face_centroid = {
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        let mut cz = 0.0;
+        let n = prev_vertices.len() as f64;
+        for &vid in &prev_vertices {
+            if let Some(v) = model.vertices.get(vid) {
+                cx += v.position[0];
+                cy += v.position[1];
+                cz += v.position[2];
+            }
+        }
+        Point3::new(cx / n, cy / n, cz / n)
+    };
+
     // Create vertices and faces for each step
     for step in 1..=num_steps {
-        let t = step as f64 / num_steps as f64;
         let current_distance = step_distance * step as f64;
         let current_twist = step_twist * step as f64;
         let current_scale = 1.0 + step_scale * step as f64;
@@ -379,14 +404,13 @@ fn create_complex_extrusion(
 
             let mut pos = Point3::from(vertex.position);
 
-            // Apply draft angle (move outward from center)
+            // Apply draft angle: offset each vertex radially away from the face centroid,
+            // in the plane perpendicular to the extrusion direction.
             if options.draft_angle.abs() > 1e-10 {
-                // Simplified draft - move radially outward
-                let center = Point3::new(0.0, 0.0, 0.0); // Would be computed from face centroid
-                let to_center = pos - center;
-                let radial_dir = Vector3::new(to_center.x, to_center.y, 0.0)
-                    .normalize()
-                    .unwrap_or(Vector3::X);
+                let to_vertex = pos - face_centroid;
+                // Project onto plane perpendicular to extrusion direction
+                let radial = to_vertex - direction * to_vertex.dot(&direction);
+                let radial_dir = radial.normalize().unwrap_or(Vector3::X);
                 pos = pos + radial_dir * current_draft_offset;
             }
 
@@ -888,11 +912,12 @@ fn validate_extrude_inputs(
         ));
     }
 
-    // Check draft angle is reasonable
-    if options.draft_angle.abs() > std::f64::consts::PI / 2.0 - 0.1 {
-        return Err(OperationError::InvalidGeometry(
-            "Draft angle too large".to_string(),
-        ));
+    // Check draft angle is reasonable — must be strictly less than 90 degrees
+    if options.draft_angle.abs() >= std::f64::consts::FRAC_PI_2 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Draft angle {:.4} radians exceeds maximum (must be less than 90 degrees)",
+            options.draft_angle
+        )));
     }
 
     Ok(())
@@ -976,10 +1001,7 @@ fn create_quad_face(
     v3: VertexId,
     v4: VertexId,
 ) -> OperationResult<FaceId> {
-    eprintln!(
-        "[DEBUG] create_quad_face called with vertices: v1={}, v2={}, v3={}, v4={}",
-        v1, v2, v3, v4
-    );
+    debug!(v1, v2, v3, v4, "create_quad_face called");
 
     // Check if vertices are distinct
     if v1 == v2 || v2 == v3 || v3 == v4 || v4 == v1 || v1 == v3 || v2 == v4 {
@@ -995,10 +1017,7 @@ fn create_quad_face(
         model.vertices.get(v3),
         model.vertices.get(v4),
     ) {
-        eprintln!("[DEBUG]   v1 position: {:?}", vp1.position);
-        eprintln!("[DEBUG]   v2 position: {:?}", vp2.position);
-        eprintln!("[DEBUG]   v3 position: {:?}", vp3.position);
-        eprintln!("[DEBUG]   v4 position: {:?}", vp4.position);
+        debug!(?vp1.position, ?vp2.position, ?vp3.position, ?vp4.position, "quad vertex positions");
     }
 
     // Create edges for the quad
@@ -1088,9 +1107,9 @@ fn create_planar_surface_from_vertices(
     // Get the first three non-collinear vertices
     let mut points = Vec::new();
 
-    eprintln!(
-        "[DEBUG] create_planar_surface_from_vertices: {} vertices provided",
-        vertices.len()
+    debug!(
+        vertex_count = vertices.len(),
+        "create_planar_surface_from_vertices"
     );
 
     for &vertex_id in vertices {
@@ -1100,7 +1119,7 @@ fn create_planar_surface_from_vertices(
             .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
         let point = Point3::from(vertex.position);
 
-        eprintln!("[DEBUG]   Vertex {}: {:?}", vertex_id, point);
+        debug!(vertex_id, ?point, "vertex position");
         points.push(point);
 
         if points.len() >= 3 {
@@ -1108,21 +1127,17 @@ fn create_planar_surface_from_vertices(
             let v1 = Vector3::from(points[1] - points[0]);
             let v2 = Vector3::from(points[2] - points[0]);
 
-            eprintln!(
-                "[DEBUG]     Checking collinearity: v1={:?}, v2={:?}",
-                v1, v2
-            );
+            debug!(?v1, ?v2, "checking collinearity");
 
             if v1.magnitude() < 1e-10 || v2.magnitude() < 1e-10 {
-                // Skip if vectors are zero length
-                eprintln!("[DEBUG]     Skipping - zero length vector");
+                debug!("skipping - zero length vector");
                 continue;
             }
             let cross_mag = v1.cross(&v2).magnitude();
-            eprintln!("[DEBUG]     Cross product magnitude: {}", cross_mag);
+            debug!(cross_mag, "cross product magnitude");
 
             if cross_mag > 1e-10 {
-                eprintln!("[DEBUG]     Found three non-collinear points!");
+                debug!("found three non-collinear points");
                 break; // Found three non-collinear points
             }
         }
@@ -1143,11 +1158,8 @@ fn create_planar_surface_from_vertices(
     let cross = v1.cross(&v2);
 
     // Log vectors for debugging
-    eprintln!(
-        "[DEBUG] create_planar_surface_from_vertices: v1={:?}, v2={:?}",
-        v1, v2
-    );
-    eprintln!("[DEBUG] cross product magnitude: {}", cross.magnitude());
+    debug!(?v1, ?v2, "planar surface basis vectors");
+    debug!(cross_mag = cross.magnitude(), "cross product magnitude");
 
     if cross.magnitude() < 1e-10 {
         // Try diagonal vectors for quads
@@ -1156,10 +1168,10 @@ fn create_planar_surface_from_vertices(
             let v4 = Vector3::from(points[2] - points[0]);
             let cross_diag = v3.cross(&v4);
 
-            eprintln!("[DEBUG] Trying diagonal vectors: v3={:?}, v4={:?}", v3, v4);
-            eprintln!(
-                "[DEBUG] diagonal cross product magnitude: {}",
-                cross_diag.magnitude()
+            debug!(?v3, ?v4, "trying diagonal vectors");
+            debug!(
+                cross_mag = cross_diag.magnitude(),
+                "diagonal cross product magnitude"
             );
 
             if cross_diag.magnitude() > 1e-10 {
@@ -1199,11 +1211,7 @@ fn create_planar_surface_from_vertices(
         ));
     }
 
-    eprintln!(
-        "[DEBUG] Final cross product: {:?}, magnitude: {}",
-        cross,
-        cross.magnitude()
-    );
+    debug!(?cross, cross_mag = cross.magnitude(), "final cross product");
     let normal = cross.normalize().map_err(|e| {
         OperationError::NumericalError(format!("Normal calculation failed: {:?}", e))
     })?;

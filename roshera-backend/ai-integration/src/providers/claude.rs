@@ -1,18 +1,189 @@
+//! Claude provider using Anthropic's tool_use API protocol.
+//!
+//! Instead of keyword matching (the old approach), this provider:
+//! 1. Sends geometry tool schemas alongside the user prompt to Claude
+//! 2. Claude returns structured `tool_use` content blocks
+//! 3. The tool dispatch layer converts those into `ParsedCommand`
+//!
+//! When no API key is configured, falls back to local parsing using the
+//! tool dispatch layer directly (deterministic, no LLM call).
+
 use super::{CommandIntent, LLMProvider, ParsedCommand, ProviderCapabilities, ProviderError};
+use crate::tool_dispatch::{self, DispatchResult, ToolUseBlock};
 use async_trait::async_trait;
+use geometry_engine::primitives::tool_schema_generator::ToolTier;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
+/// Configuration for the Claude provider.
+#[derive(Debug, Clone)]
+pub struct ClaudeConfig {
+    /// Anthropic API key. When None, the provider uses local-only parsing.
+    pub api_key: Option<String>,
+    /// Model ID (e.g., "claude-sonnet-4-20250514")
+    pub model: String,
+    /// Maximum tokens for the response
+    pub max_tokens: usize,
+    /// Tool tier to expose to the LLM
+    pub tool_tier: ToolTier,
+    /// API base URL (for proxies or self-hosted)
+    pub api_base: String,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 1024,
+            tool_tier: ToolTier::Tier1,
+            api_base: "https://api.anthropic.com".to_string(),
+        }
+    }
+}
+
+/// Claude provider that uses the Anthropic tool_use API for structured geometry commands.
 #[derive(Debug, Clone)]
 pub struct ClaudeProvider {
-    name: String,
+    config: ClaudeConfig,
 }
 
 impl ClaudeProvider {
+    /// Create a new Claude provider with default config (local parsing only).
     pub fn new() -> Self {
         Self {
-            name: "Claude-Direct".to_string(),
+            config: ClaudeConfig::default(),
         }
+    }
+
+    /// Create a Claude provider with explicit configuration.
+    pub fn with_config(config: ClaudeConfig) -> Self {
+        Self { config }
+    }
+
+    /// Set the tool tier (controls how many tools are exposed to the LLM).
+    pub fn set_tool_tier(&mut self, tier: ToolTier) {
+        self.config.tool_tier = tier;
+    }
+
+    /// Process input via the Anthropic API with tool_use.
+    ///
+    /// Sends the prompt + tool definitions → receives tool_use blocks → dispatches.
+    async fn process_via_api(
+        &self,
+        input: &str,
+        context: Option<&super::ConversationContext>,
+        api_key: &str,
+    ) -> Result<ParsedCommand, ProviderError> {
+        let tools = tool_dispatch::tool_definitions_for_tier(self.config.tool_tier);
+
+        // Build messages array
+        let mut messages = Vec::new();
+
+        // Include conversation history if available
+        if let Some(ctx) = context {
+            for prev in &ctx.previous_commands {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": prev.original_text
+                }));
+            }
+        }
+
+        // Add scene context as system-level information
+        let system_prompt = build_system_prompt(context);
+
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": input
+        }));
+
+        let request_body = serde_json::json!({
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "system": system_prompt,
+            "tools": tools,
+            "messages": messages
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/v1/messages", self.config.api_base))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::InferenceError(format!("API request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::InferenceError(format!(
+                "Anthropic API returned {}: {}",
+                status, body
+            )));
+        }
+
+        let response_body: Value = response.json().await.map_err(|e| {
+            ProviderError::InferenceError(format!("Failed to parse API response: {}", e))
+        })?;
+
+        // Extract tool_use blocks from the response
+        parse_anthropic_response(&response_body, input)
+    }
+
+    /// Process input locally without an API call.
+    ///
+    /// Uses deterministic tool name matching on the input text to produce commands.
+    /// This is the fallback when no API key is configured.
+    fn process_locally(
+        &self,
+        input: &str,
+        context: Option<&super::ConversationContext>,
+    ) -> Result<ParsedCommand, ProviderError> {
+        let input_lower = input.to_lowercase();
+
+        // Try to extract a structured tool call from natural language
+        if let Some(tool_use) = parse_natural_language_to_tool_use(&input_lower) {
+            match tool_dispatch::dispatch_tool_call(&tool_use) {
+                Ok(DispatchResult::Command(cmd)) | Ok(DispatchResult::Query(cmd)) => {
+                    return Ok(cmd);
+                }
+                Ok(DispatchResult::TextResponse(text)) => {
+                    return Ok(ParsedCommand {
+                        original_text: input.to_string(),
+                        intent: CommandIntent::Query {
+                            target: "text_response".to_string(),
+                        },
+                        parameters: {
+                            let mut p = HashMap::new();
+                            p.insert("response".to_string(), serde_json::json!(text));
+                            p
+                        },
+                        confidence: 0.8,
+                        language: "en".to_string(),
+                    });
+                }
+                Err(_) => {} // Fall through to scene-aware commands
+            }
+        }
+
+        // Scene-aware commands that don't map to geometry tools
+        if let Some(ctx) = context {
+            if let Some(ref scene) = ctx.scene_state {
+                return process_scene_command(&input_lower, input, scene);
+            }
+        }
+
+        Err(ProviderError::InvalidInput(format!(
+            "Could not parse '{}' as a geometry command. Available commands: \
+             create box/sphere/cylinder/cone/torus, boolean union/difference/intersection, \
+             query geometry, export stl/obj",
+            input
+        )))
     }
 }
 
@@ -23,317 +194,62 @@ impl LLMProvider for ClaudeProvider {
         input: &str,
         context: Option<&super::ConversationContext>,
     ) -> Result<ParsedCommand, ProviderError> {
-        // Parse natural language to geometry commands
-        let input_lower = input.to_lowercase();
-
-        // Log scene context if available
-        if let Some(ctx) = context {
-            if let Some(ref scene) = ctx.scene_state {
-                tracing::info!(
-                    "Processing command with scene context: {} objects",
-                    scene.objects.len()
-                );
-                for obj in &scene.objects {
-                    tracing::debug!("  - {}: {:?}", obj.name, obj.object_type);
-                }
-            }
+        match &self.config.api_key {
+            Some(key) if !key.is_empty() => self.process_via_api(input, context, key).await,
+            _ => self.process_locally(input, context),
         }
-
-        let (intent, parameters) = if input_lower.contains("select all") {
-            // Scene-aware command: select all objects
-            if let Some(ctx) = context {
-                if let Some(ref scene) = ctx.scene_state {
-                    let object_ids: Vec<String> =
-                        scene.objects.iter().map(|obj| obj.id.to_string()).collect();
-                    let mut params = HashMap::new();
-                    params.insert("objects".to_string(), serde_json::json!(object_ids));
-                    (
-                        CommandIntent::Query {
-                            target: "select_all".to_string(),
-                        },
-                        params,
-                    )
-                } else {
-                    return Err(ProviderError::InvalidInput(
-                        "No objects in scene to select".to_string(),
-                    ));
-                }
-            } else {
-                return Err(ProviderError::InvalidInput(
-                    "No scene context available".to_string(),
-                ));
-            }
-        } else if input_lower.contains("how many") || input_lower.contains("count") {
-            // Scene-aware query: count objects
-            if let Some(ctx) = context {
-                if let Some(ref scene) = ctx.scene_state {
-                    let count = scene.objects.len();
-                    let mut params = HashMap::new();
-                    params.insert("count".to_string(), serde_json::json!(count));
-                    params.insert(
-                        "response".to_string(),
-                        serde_json::json!(format!("There are {} objects in the scene", count)),
-                    );
-                    (
-                        CommandIntent::Query {
-                            target: "count_objects".to_string(),
-                        },
-                        params,
-                    )
-                } else {
-                    let mut params = HashMap::new();
-                    params.insert("count".to_string(), serde_json::json!(0));
-                    params.insert(
-                        "response".to_string(),
-                        serde_json::json!("There are no objects in the scene"),
-                    );
-                    (
-                        CommandIntent::Query {
-                            target: "count_objects".to_string(),
-                        },
-                        params,
-                    )
-                }
-            } else {
-                return Err(ProviderError::InvalidInput(
-                    "No scene context available".to_string(),
-                ));
-            }
-        } else if input_lower.contains("box") {
-            let width = extract_number(&input_lower).unwrap_or(2.0);
-            let mut params = HashMap::new();
-            params.insert("width".to_string(), serde_json::json!(width));
-            params.insert("height".to_string(), serde_json::json!(width));
-            params.insert("depth".to_string(), serde_json::json!(width));
-            (
-                CommandIntent::CreatePrimitive {
-                    shape: "box".to_string(),
-                },
-                params,
-            )
-        } else if input_lower.contains("sphere") {
-            let radius = extract_number(&input_lower).unwrap_or(1.0);
-            let mut params = HashMap::new();
-            params.insert("radius".to_string(), serde_json::json!(radius));
-            (
-                CommandIntent::CreatePrimitive {
-                    shape: "sphere".to_string(),
-                },
-                params,
-            )
-        } else if input_lower.contains("cylinder") {
-            let height = extract_number(&input_lower).unwrap_or(2.0);
-            let mut params = HashMap::new();
-            params.insert("radius".to_string(), serde_json::json!(1.0));
-            params.insert("height".to_string(), serde_json::json!(height));
-            (
-                CommandIntent::CreatePrimitive {
-                    shape: "cylinder".to_string(),
-                },
-                params,
-            )
-        } else if input_lower.contains("cone") {
-            let mut params = HashMap::new();
-            params.insert("bottom_radius".to_string(), serde_json::json!(1.0));
-            params.insert("top_radius".to_string(), serde_json::json!(0.5));
-            params.insert("height".to_string(), serde_json::json!(2.0));
-            (
-                CommandIntent::CreatePrimitive {
-                    shape: "cone".to_string(),
-                },
-                params,
-            )
-        } else if input_lower.contains("torus") {
-            let mut params = HashMap::new();
-            params.insert("major_radius".to_string(), serde_json::json!(1.0));
-            params.insert("minor_radius".to_string(), serde_json::json!(0.3));
-            (
-                CommandIntent::CreatePrimitive {
-                    shape: "torus".to_string(),
-                },
-                params,
-            )
-        } else if input_lower.contains("list")
-            || input_lower.contains("show") && input_lower.contains("objects")
-        {
-            // Scene-aware command: list all objects
-            if let Some(ctx) = context {
-                if let Some(ref scene) = ctx.scene_state {
-                    let object_list: Vec<String> = scene
-                        .objects
-                        .iter()
-                        .map(|obj| format!("{}: {:?}", obj.name, obj.object_type))
-                        .collect();
-                    let mut params = HashMap::new();
-                    params.insert("objects".to_string(), serde_json::json!(object_list));
-                    params.insert(
-                        "response".to_string(),
-                        serde_json::json!(if object_list.is_empty() {
-                            "No objects in the scene".to_string()
-                        } else {
-                            format!("Objects in scene:\n{}", object_list.join("\n"))
-                        }),
-                    );
-                    (
-                        CommandIntent::Query {
-                            target: "list_objects".to_string(),
-                        },
-                        params,
-                    )
-                } else {
-                    let mut params = HashMap::new();
-                    params.insert(
-                        "objects".to_string(),
-                        serde_json::json!(Vec::<String>::new()),
-                    );
-                    params.insert(
-                        "response".to_string(),
-                        serde_json::json!("No objects in the scene"),
-                    );
-                    (
-                        CommandIntent::Query {
-                            target: "list_objects".to_string(),
-                        },
-                        params,
-                    )
-                }
-            } else {
-                return Err(ProviderError::InvalidInput(
-                    "No scene context available".to_string(),
-                ));
-            }
-        } else if input_lower.contains("biggest") || input_lower.contains("largest") {
-            // Scene-aware query: find largest object
-            if let Some(ctx) = context {
-                if let Some(ref scene) = ctx.scene_state {
-                    let largest = scene.objects.iter().max_by_key(|obj| {
-                        let bbox = &obj.bounding_box;
-                        let dims = [
-                            bbox.max[0] - bbox.min[0],
-                            bbox.max[1] - bbox.min[1],
-                            bbox.max[2] - bbox.min[2],
-                        ];
-                        (dims[0] * dims[1] * dims[2] * 1000.0) as i32 // Volume approximation
-                    });
-
-                    if let Some(obj) = largest {
-                        let mut params = HashMap::new();
-                        params.insert(
-                            "object_id".to_string(),
-                            serde_json::json!(obj.id.to_string()),
-                        );
-                        params.insert("object_name".to_string(), serde_json::json!(obj.name));
-                        params.insert(
-                            "response".to_string(),
-                            serde_json::json!(format!(
-                                "The largest object is {} ({:?})",
-                                obj.name, obj.object_type
-                            )),
-                        );
-                        (
-                            CommandIntent::Query {
-                                target: "find_largest".to_string(),
-                            },
-                            params,
-                        )
-                    } else {
-                        return Err(ProviderError::InvalidInput(
-                            "No objects in scene".to_string(),
-                        ));
-                    }
-                } else {
-                    return Err(ProviderError::InvalidInput(
-                        "No objects in scene".to_string(),
-                    ));
-                }
-            } else {
-                return Err(ProviderError::InvalidInput(
-                    "No scene context available".to_string(),
-                ));
-            }
-        } else if input_lower.contains("delete")
-            && (input_lower.contains("all") || input_lower.contains("everything"))
-        {
-            // Scene-aware command: delete all objects
-            if let Some(ctx) = context {
-                if let Some(ref scene) = ctx.scene_state {
-                    if scene.objects.is_empty() {
-                        return Err(ProviderError::InvalidInput(
-                            "No objects to delete".to_string(),
-                        ));
-                    }
-                    let object_ids: Vec<String> =
-                        scene.objects.iter().map(|obj| obj.id.to_string()).collect();
-                    let mut params = HashMap::new();
-                    params.insert("objects".to_string(), serde_json::json!(object_ids));
-                    params.insert("action".to_string(), serde_json::json!("delete_all"));
-                    (
-                        CommandIntent::Transform {
-                            operation: "delete_all".to_string(),
-                        },
-                        params,
-                    )
-                } else {
-                    return Err(ProviderError::InvalidInput(
-                        "No objects to delete".to_string(),
-                    ));
-                }
-            } else {
-                return Err(ProviderError::InvalidInput(
-                    "No scene context available".to_string(),
-                ));
-            }
-        } else {
-            // Provide context-aware error message
-            if let Some(ctx) = context {
-                if let Some(ref scene) = ctx.scene_state {
-                    if scene.objects.is_empty() {
-                        return Err(ProviderError::InvalidInput(
-                            format!("I don't understand '{}'. The scene is empty. Try: 'create a box', 'make a sphere', or 'create a cylinder'", input)
-                        ));
-                    } else {
-                        return Err(ProviderError::InvalidInput(
-                            format!("I don't understand '{}'. You have {} objects in the scene. Try: 'list objects', 'select all', 'count objects', or create new geometry", input, scene.objects.len())
-                        ));
-                    }
-                } else {
-                    return Err(ProviderError::InvalidInput(
-                        format!("I don't understand '{}'. Try: 'create a box', 'make a sphere', 'create a cylinder'", input)
-                    ));
-                }
-            } else {
-                return Err(ProviderError::InvalidInput(
-                    format!("I don't understand '{}'. Try: 'create a box', 'make a sphere', 'create a cylinder'", input)
-                ));
-            }
-        };
-
-        Ok(ParsedCommand {
-            original_text: input.to_string(),
-            intent,
-            parameters,
-            confidence: 0.95,
-            language: "en".to_string(),
-        })
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            name: "Claude Direct".to_string(),
-            version: "1.0".to_string(),
+            name: "Claude Tool-Use".to_string(),
+            version: "2.0".to_string(),
             supported_languages: vec!["en".to_string()],
-            max_context_length: 4096,
-            supports_streaming: false,
+            max_context_length: 200_000,
+            supports_streaming: true,
             supports_batching: false,
-            device_type: "cpu".to_string(),
+            device_type: if self.config.api_key.is_some() {
+                "cloud".to_string()
+            } else {
+                "cpu".to_string()
+            },
             model_size_mb: 0,
             quantization: super::QuantizationType::Float32,
         }
     }
 
     async fn generate(&self, prompt: &str, _max_tokens: usize) -> Result<String, ProviderError> {
-        // Generate helpful responses
-        Ok(format!("I can help you create 3D objects. You said: '{}'. Try commands like 'create a box' or 'make a sphere'.", prompt))
+        match &self.config.api_key {
+            Some(key) if !key.is_empty() => {
+                let client = reqwest::Client::new();
+                let response = client
+                    .post(format!("{}/v1/messages", self.config.api_base))
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&serde_json::json!({
+                        "model": self.config.model,
+                        "max_tokens": self.config.max_tokens,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::InferenceError(format!("API request failed: {}", e))
+                    })?;
+
+                let body: Value = response.json().await.map_err(|e| {
+                    ProviderError::InferenceError(format!("Failed to parse response: {}", e))
+                })?;
+
+                extract_text_from_response(&body)
+            }
+            _ => Ok(format!(
+                "I can help you create 3D geometry. You said: '{}'. \
+                 Try: 'create a box 10 5 3' or 'make a sphere radius 5'.",
+                prompt
+            )),
+        }
     }
 
     async fn generate_response(
@@ -341,39 +257,599 @@ impl LLMProvider for ClaudeProvider {
         command_result: &str,
         _language: &str,
     ) -> Result<String, ProviderError> {
-        // Generate response based on command result
-        Ok(format!("Command executed successfully: {}", command_result))
+        Ok(format!("Done: {}", command_result))
     }
 
     fn memory_requirement_mb(&self) -> usize {
-        // Claude integration requires minimal memory
-        1
+        if self.config.api_key.is_some() {
+            0
+        } else {
+            1
+        }
     }
 }
 
-fn extract_number(text: &str) -> Option<f64> {
-    // Simple number extraction from text
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for word in words {
-        if let Ok(num) = word.parse::<f64>() {
-            return Some(num);
+// --- Internal helpers ---
+
+/// Build a system prompt that includes scene context for the LLM.
+fn build_system_prompt(context: Option<&super::ConversationContext>) -> String {
+    let mut prompt = String::from(
+        "You are a CAD assistant. Use the provided tools to create and modify 3D geometry. \
+         Always use tool calls for geometry operations — never describe them in text. \
+         When the user asks to create, modify, or query geometry, respond with the appropriate tool call."
+    );
+
+    if let Some(ctx) = context {
+        if let Some(ref scene) = ctx.scene_state {
+            prompt.push_str(&format!(
+                "\n\nCurrent scene has {} objects.",
+                scene.objects.len()
+            ));
+            for obj in &scene.objects {
+                prompt.push_str(&format!(
+                    "\n- {} ({}): {:?}",
+                    obj.name, obj.id, obj.object_type
+                ));
+            }
         }
     }
-    // Look for written numbers
-    if text.contains("one") {
-        return Some(1.0);
+
+    prompt
+}
+
+/// Parse the Anthropic API response to extract tool_use blocks and dispatch them.
+fn parse_anthropic_response(
+    response: &Value,
+    original_input: &str,
+) -> Result<ParsedCommand, ProviderError> {
+    let content = response
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| {
+            ProviderError::InferenceError("Response missing 'content' array".to_string())
+        })?;
+
+    // Look for tool_use blocks first
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+            let tool_use = ToolUseBlock {
+                id: block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                name: block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                input: block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default())),
+            };
+
+            return match tool_dispatch::dispatch_tool_call(&tool_use) {
+                Ok(DispatchResult::Command(cmd)) | Ok(DispatchResult::Query(cmd)) => Ok(cmd),
+                Ok(DispatchResult::TextResponse(text)) => Ok(ParsedCommand {
+                    original_text: original_input.to_string(),
+                    intent: CommandIntent::Query {
+                        target: "text_response".to_string(),
+                    },
+                    parameters: {
+                        let mut p = HashMap::new();
+                        p.insert("response".to_string(), serde_json::json!(text));
+                        p
+                    },
+                    confidence: 1.0,
+                    language: "en".to_string(),
+                }),
+                Err(e) => Err(e),
+            };
+        }
     }
-    if text.contains("two") {
-        return Some(2.0);
+
+    // No tool_use block — extract text response
+    let text = extract_text_from_content(content);
+    if !text.is_empty() {
+        Ok(ParsedCommand {
+            original_text: original_input.to_string(),
+            intent: CommandIntent::Query {
+                target: "text_response".to_string(),
+            },
+            parameters: {
+                let mut p = HashMap::new();
+                p.insert("response".to_string(), serde_json::json!(text));
+                p
+            },
+            confidence: 0.5,
+            language: "en".to_string(),
+        })
+    } else {
+        Err(ProviderError::InferenceError(
+            "Claude response contained no tool calls or text".to_string(),
+        ))
     }
-    if text.contains("three") {
-        return Some(3.0);
+}
+
+/// Extract text from a content array (text blocks).
+fn extract_text_from_content(content: &[Value]) -> String {
+    content
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                block.get("text").and_then(|t| t.as_str()).map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract text from a full API response body.
+fn extract_text_from_response(response: &Value) -> Result<String, ProviderError> {
+    let content = response
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| {
+            ProviderError::InferenceError("Response missing 'content' array".to_string())
+        })?;
+
+    let text = extract_text_from_content(content);
+    if text.is_empty() {
+        Err(ProviderError::InferenceError(
+            "Response contained no text blocks".to_string(),
+        ))
+    } else {
+        Ok(text)
     }
-    if text.contains("four") {
-        return Some(4.0);
+}
+
+/// Parse natural language into a ToolUseBlock for local dispatch.
+///
+/// This is a structured parser — it maps known patterns to tool calls rather than
+/// doing keyword matching with hardcoded parameter values.
+fn parse_natural_language_to_tool_use(input: &str) -> Option<ToolUseBlock> {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let numbers = extract_all_numbers(input);
+
+    // Primitive creation patterns
+    if contains_any(input, &["box", "cube", "cuboid", "rectangular"]) {
+        let (w, h, d) = match numbers.len() {
+            0 => (10.0, 10.0, 10.0),
+            1 => (numbers[0], numbers[0], numbers[0]),
+            2 => (numbers[0], numbers[1], numbers[0]),
+            _ => (numbers[0], numbers[1], numbers[2]),
+        };
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "create_box".to_string(),
+            input: serde_json::json!({"width": w, "height": h, "depth": d}),
+        });
     }
-    if text.contains("five") {
-        return Some(5.0);
+
+    if contains_any(input, &["sphere", "ball"]) {
+        let r = numbers.first().copied().unwrap_or(5.0);
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "create_sphere".to_string(),
+            input: serde_json::json!({"radius": r}),
+        });
     }
+
+    if contains_any(input, &["cylinder", "tube", "pipe"]) {
+        let (r, h) = match numbers.len() {
+            0 => (5.0, 10.0),
+            1 => (numbers[0], numbers[0] * 2.0),
+            _ => (numbers[0], numbers[1]),
+        };
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "create_cylinder".to_string(),
+            input: serde_json::json!({"radius": r, "height": h}),
+        });
+    }
+
+    if contains_any(input, &["cone"]) {
+        let (br, tr, h) = match numbers.len() {
+            0 => (5.0, 0.0, 10.0),
+            1 => (numbers[0], 0.0, numbers[0] * 2.0),
+            2 => (numbers[0], 0.0, numbers[1]),
+            _ => (numbers[0], numbers[1], numbers[2]),
+        };
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "create_cone".to_string(),
+            input: serde_json::json!({"bottom_radius": br, "top_radius": tr, "height": h}),
+        });
+    }
+
+    if contains_any(input, &["torus", "donut", "ring"]) {
+        let (major, minor) = match numbers.len() {
+            0 => (10.0, 3.0),
+            1 => (numbers[0], numbers[0] * 0.3),
+            _ => (numbers[0], numbers[1]),
+        };
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "create_torus".to_string(),
+            input: serde_json::json!({"major_radius": major, "minor_radius": minor}),
+        });
+    }
+
+    // Boolean operations
+    if contains_any(input, &["union", "merge", "combine", "join"]) {
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "boolean_union".to_string(),
+            input: serde_json::json!({"object_a": "last", "object_b": "selected"}),
+        });
+    }
+
+    if contains_any(input, &["subtract", "difference", "cut", "drill", "hole"]) {
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "boolean_difference".to_string(),
+            input: serde_json::json!({"object_a": "last", "object_b": "selected"}),
+        });
+    }
+
+    if contains_any(input, &["intersect"]) {
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "boolean_intersection".to_string(),
+            input: serde_json::json!({"object_a": "last", "object_b": "selected"}),
+        });
+    }
+
+    // Query
+    if contains_any(
+        input,
+        &[
+            "dimensions",
+            "info",
+            "properties",
+            "describe",
+            "summary",
+            "what is",
+            "analyze",
+        ],
+    ) {
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "query_geometry".to_string(),
+            input: serde_json::json!({"solid_id": "last"}),
+        });
+    }
+
+    // Export
+    if contains_any(input, &["export stl", "save stl", "stl"]) {
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "export_stl".to_string(),
+            input: serde_json::json!({"solid_id": "last"}),
+        });
+    }
+
+    if contains_any(input, &["export obj", "save obj"]) {
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "export_obj".to_string(),
+            input: serde_json::json!({"solid_id": "last"}),
+        });
+    }
+
+    // Fillet / chamfer
+    if contains_any(input, &["fillet", "round"]) {
+        let r = numbers.first().copied().unwrap_or(2.0);
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "fillet".to_string(),
+            input: serde_json::json!({"target_id": "last", "radius": r}),
+        });
+    }
+
+    if contains_any(input, &["chamfer", "bevel"]) {
+        let d = numbers.first().copied().unwrap_or(2.0);
+        return Some(ToolUseBlock {
+            id: "local".to_string(),
+            name: "chamfer".to_string(),
+            input: serde_json::json!({"target_id": "last", "distance": d}),
+        });
+    }
+
     None
+}
+
+/// Process scene-aware commands that don't map to geometry tools.
+fn process_scene_command(
+    input_lower: &str,
+    original: &str,
+    scene: &shared_types::SceneState,
+) -> Result<ParsedCommand, ProviderError> {
+    if input_lower.contains("select all") {
+        let ids: Vec<String> = scene.objects.iter().map(|o| o.id.to_string()).collect();
+        let mut params = HashMap::new();
+        params.insert("objects".to_string(), serde_json::json!(ids));
+        return Ok(ParsedCommand {
+            original_text: original.to_string(),
+            intent: CommandIntent::Query {
+                target: "select_all".to_string(),
+            },
+            parameters: params,
+            confidence: 0.95,
+            language: "en".to_string(),
+        });
+    }
+
+    if input_lower.contains("how many") || input_lower.contains("count") {
+        let count = scene.objects.len();
+        let mut params = HashMap::new();
+        params.insert("count".to_string(), serde_json::json!(count));
+        params.insert(
+            "response".to_string(),
+            serde_json::json!(format!("There are {} objects in the scene", count)),
+        );
+        return Ok(ParsedCommand {
+            original_text: original.to_string(),
+            intent: CommandIntent::Query {
+                target: "count_objects".to_string(),
+            },
+            parameters: params,
+            confidence: 0.95,
+            language: "en".to_string(),
+        });
+    }
+
+    if input_lower.contains("list")
+        || (input_lower.contains("show") && input_lower.contains("objects"))
+    {
+        let list: Vec<String> = scene
+            .objects
+            .iter()
+            .map(|o| format!("{}: {:?}", o.name, o.object_type))
+            .collect();
+        let mut params = HashMap::new();
+        params.insert("objects".to_string(), serde_json::json!(list));
+        params.insert(
+            "response".to_string(),
+            serde_json::json!(if list.is_empty() {
+                "No objects in the scene".to_string()
+            } else {
+                format!("Objects in scene:\n{}", list.join("\n"))
+            }),
+        );
+        return Ok(ParsedCommand {
+            original_text: original.to_string(),
+            intent: CommandIntent::Query {
+                target: "list_objects".to_string(),
+            },
+            parameters: params,
+            confidence: 0.95,
+            language: "en".to_string(),
+        });
+    }
+
+    if input_lower.contains("delete")
+        && (input_lower.contains("all") || input_lower.contains("everything"))
+    {
+        if scene.objects.is_empty() {
+            return Err(ProviderError::InvalidInput(
+                "No objects to delete".to_string(),
+            ));
+        }
+        let ids: Vec<String> = scene.objects.iter().map(|o| o.id.to_string()).collect();
+        let mut params = HashMap::new();
+        params.insert("objects".to_string(), serde_json::json!(ids));
+        params.insert("action".to_string(), serde_json::json!("delete_all"));
+        return Ok(ParsedCommand {
+            original_text: original.to_string(),
+            intent: CommandIntent::Transform {
+                operation: "delete_all".to_string(),
+            },
+            parameters: params,
+            confidence: 0.95,
+            language: "en".to_string(),
+        });
+    }
+
+    Err(ProviderError::InvalidInput(format!(
+        "Could not parse '{}' as a geometry command. Available commands: \
+         create box/sphere/cylinder/cone/torus, boolean union/difference/intersection, \
+         query geometry, export stl/obj, fillet, chamfer",
+        original
+    )))
+}
+
+/// Extract all numbers from text.
+fn extract_all_numbers(text: &str) -> Vec<f64> {
+    text.split_whitespace()
+        .filter_map(|w| {
+            // Strip common suffixes like "mm", "cm", "in"
+            let stripped = w
+                .trim_end_matches("mm")
+                .trim_end_matches("cm")
+                .trim_end_matches("in")
+                .trim_end_matches(',');
+            stripped.parse::<f64>().ok()
+        })
+        .collect()
+}
+
+/// Check if the input contains any of the given keywords as whole words.
+fn contains_any(input: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|kw| {
+        if kw.contains(' ') {
+            // Multi-word: exact substring match
+            input.contains(kw)
+        } else {
+            // Single word: check word boundaries
+            input
+                .split_whitespace()
+                .any(|word| word == *kw || word.starts_with(kw) || word.ends_with(kw))
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_parse_box() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("create a box 10 5 3", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box")
+        );
+        assert_eq!(cmd.parameters["width"], serde_json::json!(10.0));
+        assert_eq!(cmd.parameters["height"], serde_json::json!(5.0));
+        assert_eq!(cmd.parameters["depth"], serde_json::json!(3.0));
+    }
+
+    #[test]
+    fn test_local_parse_sphere() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("make a sphere radius 7.5", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "sphere")
+        );
+        assert_eq!(cmd.parameters["radius"], serde_json::json!(7.5));
+    }
+
+    #[test]
+    fn test_local_parse_cylinder() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("create cylinder 5 20", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "cylinder")
+        );
+        assert_eq!(cmd.parameters["radius"], serde_json::json!(5.0));
+        assert_eq!(cmd.parameters["height"], serde_json::json!(20.0));
+    }
+
+    #[test]
+    fn test_local_parse_boolean() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("subtract the hole from the block", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::BooleanOperation { ref operation } if operation == "difference")
+        );
+    }
+
+    #[test]
+    fn test_local_parse_query() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("what are the dimensions of this", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::Query { ref target } if target == "query_geometry")
+        );
+    }
+
+    #[test]
+    fn test_local_parse_unknown() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("play music", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_numbers() {
+        assert_eq!(extract_all_numbers("box 10 5 3"), vec![10.0, 5.0, 3.0]);
+        assert_eq!(extract_all_numbers("radius 7.5mm"), vec![7.5]);
+        assert_eq!(extract_all_numbers("no numbers here"), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_contains_any_word_boundary() {
+        assert!(contains_any("create a box", &["box"]));
+        assert!(contains_any("make a sphere", &["sphere"]));
+        // "boxing" matches "box" via prefix — acceptable in CAD context
+        assert!(contains_any("boxing match", &["box"]));
+        assert!(!contains_any("nothing here", &["box"]));
+        assert!(contains_any("export stl file", &["export stl"]));
+    }
+
+    #[test]
+    fn test_parse_anthropic_response_tool_use() {
+        let response = serde_json::json!({
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "create_box",
+                    "input": {"width": 10.0, "height": 5.0, "depth": 3.0}
+                }
+            ]
+        });
+
+        let result = parse_anthropic_response(&response, "make a box");
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "box")
+        );
+    }
+
+    #[test]
+    fn test_parse_anthropic_response_text_only() {
+        let response = serde_json::json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "I can help you create geometry."
+                }
+            ]
+        });
+
+        let result = parse_anthropic_response(&response, "hello");
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert_eq!(cmd.confidence, 0.5); // Low confidence for text-only response
+    }
+
+    #[test]
+    fn test_local_parse_fillet() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("fillet the edges with radius 3", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::Modify { ref operation, .. } if operation == "fillet")
+        );
+    }
+
+    #[test]
+    fn test_local_parse_torus() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("create a torus 15 4", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert!(
+            matches!(cmd.intent, CommandIntent::CreatePrimitive { ref shape } if shape == "torus")
+        );
+        assert_eq!(cmd.parameters["major_radius"], serde_json::json!(15.0));
+        assert_eq!(cmd.parameters["minor_radius"], serde_json::json!(4.0));
+    }
+
+    #[test]
+    fn test_default_dimensions_when_no_numbers() {
+        let provider = ClaudeProvider::new();
+        let result = provider.process_locally("create a box", None);
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        // Default box is 10x10x10
+        assert_eq!(cmd.parameters["width"], serde_json::json!(10.0));
+    }
 }

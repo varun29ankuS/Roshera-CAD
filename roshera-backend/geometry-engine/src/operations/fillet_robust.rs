@@ -162,8 +162,12 @@ pub fn project_point_to_surface(
 
 /// Check if edge is degenerate (zero length or self-loop)
 pub fn is_edge_degenerate(edge: &Edge, model: &BRepModel, tolerance: &Tolerance) -> bool {
-    let start_vertex = model.vertices.get(edge.start_vertex).unwrap();
-    let end_vertex = model.vertices.get(edge.end_vertex).unwrap();
+    let Some(start_vertex) = model.vertices.get(edge.start_vertex) else {
+        return false;
+    };
+    let Some(end_vertex) = model.vertices.get(edge.end_vertex) else {
+        return false;
+    };
 
     let length =
         (Vector3::from(end_vertex.position) - Vector3::from(start_vertex.position)).magnitude();
@@ -212,8 +216,14 @@ pub fn compute_safe_fillet_radius(
     }
 
     // Check for nearby edges and vertices
-    let start_vertex = model.vertices.get(edge.start_vertex).unwrap();
-    let end_vertex = model.vertices.get(edge.end_vertex).unwrap();
+    let start_vertex = model
+        .vertices
+        .get(edge.start_vertex)
+        .ok_or_else(|| MathError::InvalidParameter("start vertex not found".into()))?;
+    let end_vertex = model
+        .vertices
+        .get(edge.end_vertex)
+        .ok_or_else(|| MathError::InvalidParameter("end vertex not found".into()))?;
 
     for edge_idx in 0..model.edges.len() {
         let other_edge_id = edge_idx as u32;
@@ -221,9 +231,15 @@ pub fn compute_safe_fillet_radius(
             continue;
         }
 
-        let other_edge = model.edges.get(other_edge_id).unwrap();
-        let other_start = model.vertices.get(other_edge.start_vertex).unwrap();
-        let other_end = model.vertices.get(other_edge.end_vertex).unwrap();
+        let Some(other_edge) = model.edges.get(other_edge_id) else {
+            continue;
+        };
+        let Some(other_start) = model.vertices.get(other_edge.start_vertex) else {
+            continue;
+        };
+        let Some(other_end) = model.vertices.get(other_edge.end_vertex) else {
+            continue;
+        };
 
         // Check distance to edge endpoints
         let distances = [
@@ -280,7 +296,10 @@ pub fn blend_vertex_fillets(
     // This is simplified - proper implementation would solve for
     // the center that maintains tangency with all fillet surfaces
     let vertex_id = vertex_edges[0].start_vertex;
-    let vertex = model.vertices.get(vertex_id).unwrap();
+    let vertex = model
+        .vertices
+        .get(vertex_id)
+        .ok_or_else(|| MathError::InvalidParameter("blend vertex not found".into()))?;
     let blend_center = Point3::from(vertex.position);
 
     // Compute angular spans for each edge

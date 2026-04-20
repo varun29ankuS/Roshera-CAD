@@ -60,6 +60,10 @@ pub struct Mesh {
     pub uvs: Option<Vec<f32>>,
     /// Vertex colors [r0, g0, b0, a0, ...] (optional)
     pub colors: Option<Vec<f32>>,
+    /// Maps each triangle to its source B-Rep face ID.
+    /// `face_map[triangle_index] = face_id`. Used for face picking in the viewport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub face_map: Option<Vec<u32>>,
 }
 
 /// Apply quaternion rotation to a 3D point
@@ -839,6 +843,7 @@ impl Mesh {
             normals: Vec::new(),
             uvs: None,
             colors: None,
+            face_map: None,
         }
     }
 
