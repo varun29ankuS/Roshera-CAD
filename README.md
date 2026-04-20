@@ -130,6 +130,14 @@ Both are above their internal regression budgets — NURBS eval by ~6× and B-sp
 
 Memory is well under budget thanks to the structure-of-arrays vertex layout. Tessellation is the single biggest performance gap (~21× over target) and is the top candidate for the next optimization pass.
 
+### Coverage gaps
+
+- **Delete primitives** — only correctness tests (`delete_solid`, `delete_face`, cascade, orphan cleanup). No Criterion target yet.
+- **2D sketch creation (sketch2d)** — ~5k LoC subsystem with 69 passing correctness tests, but no timing benchmark target.
+- **Cone / Torus** — primitive creation benchmarks only cover Box / Sphere / Cylinder.
+
+These are tracked as blind spots to add to `benches/geometry_bench.rs`.
+
 ## Getting Started
 
 ```bash
