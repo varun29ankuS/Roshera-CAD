@@ -110,6 +110,17 @@ Internal benchmark suite on 1k-face inputs, release build.
 
 All three are comfortably under their internal regression budgets.
 
+### NURBS and B-spline evaluation
+
+1M-point sweep, release build.
+
+| Operation | Measured | Internal target |
+|-----------|----------|-----------------|
+| NURBS surface eval | 158 ms | <25 ms |
+| B-spline curve eval | 36.8 ms | <10 ms |
+
+Both are above their internal regression budgets — NURBS eval by ~6× and B-spline eval by ~3.7×. Flagged for profiling and optimization.
+
 ## Getting Started
 
 ```bash
