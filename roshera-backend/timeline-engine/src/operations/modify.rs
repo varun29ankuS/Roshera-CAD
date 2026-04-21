@@ -2,7 +2,7 @@
 
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    EntityType, Modification, Operation, OperationOutputs, TimelineError, TimelineResult,
+    Modification, Operation, OperationOutputs, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 

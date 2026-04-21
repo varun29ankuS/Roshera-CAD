@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use shared_types::{ObjectId, SessionError};
 use std::collections::HashSet;
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// User role in a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

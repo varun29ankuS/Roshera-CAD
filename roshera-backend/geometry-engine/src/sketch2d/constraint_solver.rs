@@ -13,13 +13,12 @@
 
 use super::constraints::EntityRef;
 use super::{
-    Constraint, ConstraintId, ConstraintPriority, ConstraintStatus, ConstraintType,
-    DimensionalConstraint, GeometricConstraint, Point2d, Sketch2dError, Sketch2dResult,
-    Tolerance2d, Vector2d,
+    Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
+    Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Solver status
@@ -1012,7 +1011,7 @@ impl ConstraintSolver {
     }
 
     fn get_line_point(&self, entity: &EntityRef) -> Option<Point2d> {
-        if let EntityRef::Line(id) = entity {
+        if let EntityRef::Line(_id) = entity {
             self.entity_state
                 .get(entity)
                 .map(|state| Point2d::new(state.parameters[0], state.parameters[1]))
@@ -1038,7 +1037,7 @@ impl ConstraintSolver {
         }
     }
 
-    fn get_line_length(&self, entity: &EntityRef) -> Option<f64> {
+    fn get_line_length(&self, _entity: &EntityRef) -> Option<f64> {
         // Should be stored as parameter, using default for now
         Some(100.0)
     }

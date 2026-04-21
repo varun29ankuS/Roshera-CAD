@@ -3,10 +3,10 @@
 //! Projects points, curves, and other entities onto surfaces and faces.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Point3, Tolerance, Vector3};
+use crate::math::{Point3, Vector3};
 use crate::primitives::{
     curve::Curve,
-    edge::{Edge, EdgeId},
+    edge::EdgeId,
     face::{Face, FaceId},
     surface::Surface,
     topology_builder::BRepModel,
@@ -353,10 +353,10 @@ fn ray_plane_intersection(
 
 /// Ray-cylinder intersection
 fn ray_cylinder_intersection(
-    origin: Point3,
-    direction: Vector3,
-    cylinder: &dyn Surface,
-    max_distance: Option<f64>,
+    _origin: Point3,
+    _direction: Vector3,
+    _cylinder: &dyn Surface,
+    _max_distance: Option<f64>,
 ) -> OperationResult<Option<ProjectedPoint>> {
     // Would implement analytical ray-cylinder intersection
     Ok(None)
@@ -364,10 +364,10 @@ fn ray_cylinder_intersection(
 
 /// Ray-sphere intersection
 fn ray_sphere_intersection(
-    origin: Point3,
-    direction: Vector3,
-    sphere: &dyn Surface,
-    max_distance: Option<f64>,
+    _origin: Point3,
+    _direction: Vector3,
+    _sphere: &dyn Surface,
+    _max_distance: Option<f64>,
 ) -> OperationResult<Option<ProjectedPoint>> {
     // Would implement analytical ray-sphere intersection
     Ok(None)
@@ -375,10 +375,10 @@ fn ray_sphere_intersection(
 
 /// Ray-general surface intersection using iteration
 fn ray_general_surface_intersection(
-    origin: Point3,
-    direction: Vector3,
-    surface: &dyn Surface,
-    max_distance: Option<f64>,
+    _origin: Point3,
+    _direction: Vector3,
+    _surface: &dyn Surface,
+    _max_distance: Option<f64>,
 ) -> OperationResult<Option<ProjectedPoint>> {
     // Would implement Newton-Raphson or similar iterative method
     Ok(None)
@@ -451,7 +451,7 @@ pub fn find_silhouette_curves(
     model: &BRepModel,
     face_id: FaceId,
     view_direction: Vector3,
-    options: &ProjectionOptions,
+    _options: &ProjectionOptions,
 ) -> OperationResult<Vec<EdgeId>> {
     let face = model
         .faces
@@ -503,7 +503,7 @@ fn is_silhouette_edge(
     // Sample along edge
     for i in 0..=10 {
         let t = i as f64 / 10.0;
-        let point = edge.evaluate(t, &model.curves)?;
+        let _point = edge.evaluate(t, &model.curves)?;
 
         // Get surface normal at this point
         // Use simple parameter finding for now

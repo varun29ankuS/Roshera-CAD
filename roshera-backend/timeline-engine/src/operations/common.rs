@@ -5,17 +5,13 @@ use crate::{
     brep_serialization::{deserialize_brep, serialize_brep},
     entity_mapping::get_entity_mapping,
     execution::{EntityState, ExecutionContext},
-    CreatedEntity, EntityId, EntityType, TimelineError, TimelineResult,
+    EntityId, EntityType, TimelineError, TimelineResult,
 };
 use geometry_engine::{
     math::{Matrix4, Point3, Vector3},
     primitives::{
-        edge::Edge,
-        face::Face,
-        shell::Shell,
-        solid::{Solid, SolidId},
+        solid::SolidId,
         topology_builder::{BRepModel, GeometryId as GeometryEngineId},
-        vertex::Vertex,
     },
 };
 use shared_types::GeometryId;
@@ -227,7 +223,7 @@ pub fn extract_sketch_plane(
 /// Validate edges belong to the same solid
 pub fn validate_edges_same_solid(
     edges: &[EntityId],
-    context: &ExecutionContext,
+    _context: &ExecutionContext,
 ) -> TimelineResult<EntityId> {
     if edges.is_empty() {
         return Err(TimelineError::ValidationError(

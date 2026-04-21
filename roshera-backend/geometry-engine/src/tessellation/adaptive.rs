@@ -568,7 +568,6 @@ pub fn optimize_mesh(mesh: &mut TriangleMesh) {
     }
 
     // Find edges that can be flipped
-    let mut flips_performed = 0;
     let max_iterations = 10;
 
     for _ in 0..max_iterations {
@@ -593,7 +592,6 @@ pub fn optimize_mesh(mesh: &mut TriangleMesh) {
         // Perform flips
         for (edge, tri1_idx, tri2_idx) in edges_to_flip {
             flip_edge(mesh, tri1_idx, tri2_idx, edge);
-            flips_performed += 1;
         }
 
         // Rebuild adjacency for next iteration

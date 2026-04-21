@@ -11,14 +11,12 @@
 //! - **Advanced**: Topology validity, ready for extrusion/revolution
 //! - **Strict**: Production-ready with all checks passed
 
-use super::constraints::{Constraint, ConstraintId, ConstraintStatus, ConstraintType, EntityRef};
+use super::constraints::{ConstraintId, ConstraintStatus, EntityRef};
 use super::line2d::LineGeometry;
 use super::sketch_topology::{ProfileType, SketchLoop, SketchTopology, TopologyIssue};
-use super::{
-    Point2d, Sketch, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d, Vector2d,
-};
+use super::{Point2d, Sketch, SketchEntity2d, Tolerance2d, Vector2d};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Validation severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -428,7 +426,7 @@ impl SketchValidator {
         &self,
         sketch: &Sketch,
         issues: &mut Vec<ValidationIssue>,
-        stats: &mut ValidationStats,
+        _stats: &mut ValidationStats,
     ) {
         // Check polylines for self-intersection
         for entry in sketch.polylines().iter() {
@@ -467,7 +465,7 @@ impl SketchValidator {
         &self,
         sketch: &Sketch,
         issues: &mut Vec<ValidationIssue>,
-        stats: &mut ValidationStats,
+        _stats: &mut ValidationStats,
     ) {
         // Build a list of all entities with their bounding boxes
         let mut entities: Vec<(EntityRef, Point2d, Point2d)> = Vec::new();
@@ -779,7 +777,7 @@ impl SketchValidator {
         false
     }
 
-    fn is_loop_inside_loop(&self, outer: &SketchLoop, inner: &SketchLoop) -> bool {
+    fn is_loop_inside_loop(&self, _outer: &SketchLoop, _inner: &SketchLoop) -> bool {
         // Check if inner loop is fully contained in outer loop
         // This would use point-in-polygon tests
         true // Placeholder
@@ -814,10 +812,6 @@ pub mod quick_checks {
     /// Check if a sketch is ready for extrusion
     pub fn is_ready_for_extrusion(sketch: &Sketch) -> bool {
         let validator = SketchValidator::new();
-        let mut config = ValidationConfig::default();
-        config.check_self_intersections = true;
-        config.check_topology = true;
-
         let result = validator.validate(sketch);
 
         result.is_valid && matches!(result.stats.error_count, 0)
@@ -1006,7 +1000,7 @@ pub mod analysis_tools {
 
             // Overall score (weighted average)
             let overall_score =
-                (constraint_score * 0.4 + stability_score * 0.4 + manufacturability_score * 0.2);
+                constraint_score * 0.4 + stability_score * 0.4 + manufacturability_score * 0.2;
 
             // Generate recommendations
             let mut recommendations = Vec::new();

@@ -46,7 +46,6 @@ pub mod bezier_patch;
 // Surface-plane intersection for draft operations
 pub mod surface_plane_intersection;
 use crate::math::constants::DEG_TO_RAD;
-use crate::math::constants::PHI;
 use crate::math::constants::RAD_TO_DEG;
 
 // Re-export commonly used types
@@ -355,7 +354,7 @@ impl Default for MathConfig {
     }
 }
 
-/// Global math configuration (thread-local)
+// Global math configuration (thread-local)
 thread_local! {
     static MATH_CONFIG: std::cell::RefCell<MathConfig> = std::cell::RefCell::new(MathConfig::default());
 }
@@ -426,6 +425,7 @@ pub mod profile {
 }
 
 /// Debug assertions for numerical validity
+#[allow(unused_macros)]
 #[cfg(debug_assertions)]
 macro_rules! debug_assert_finite {
     ($value:expr) => {
@@ -439,12 +439,11 @@ macro_rules! debug_assert_finite {
     };
 }
 
+#[allow(unused_macros)]
 #[cfg(not(debug_assertions))]
 macro_rules! debug_assert_finite {
     ($value:expr) => {};
 }
-
-pub(crate) use debug_assert_finite;
 
 /// Precomputed lookup tables for performance
 pub mod tables {

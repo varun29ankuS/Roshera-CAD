@@ -6,7 +6,7 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use shared_types::session::UserInfo;
-use shared_types::{AICommand, CADObject, HistoryEntry, ObjectId, SessionError, SessionState};
+use shared_types::{CADObject, HistoryEntry, ObjectId, SessionError, SessionState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace};

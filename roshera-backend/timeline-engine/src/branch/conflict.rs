@@ -1,9 +1,7 @@
 //! Conflict resolution for branch merging
 
-use super::merge::{
-    ConflictResolution, ConflictStrategy, ConflictType, MergeConflict, MergeResult,
-};
-use crate::{EntityId, EventId, Operation, TimelineError, TimelineEvent, TimelineResult};
+use super::merge::{ConflictResolution, ConflictStrategy, ConflictType, MergeConflict};
+use crate::{EntityId, Operation, TimelineError, TimelineResult};
 use std::collections::{HashMap, HashSet};
 
 /// Conflict resolver for branch merging
@@ -125,13 +123,13 @@ impl ConflictResolver {
     async fn resolve_with_ai(
         &self,
         conflict: &MergeConflict,
-        model: &str,
+        _model: &str,
         criteria: &[String],
         context: &ResolutionContext,
     ) -> TimelineResult<ConflictResolution> {
-        if let Some(ai_service) = &self.ai_service {
+        if let Some(_ai_service) = &self.ai_service {
             // Prepare prompt for AI
-            let prompt = self.build_ai_prompt(conflict, criteria, context);
+            let _prompt = self.build_ai_prompt(conflict, criteria, context);
 
             // In a real implementation, this would call the AI service
             // For now, we'll use a heuristic based on the conflict type

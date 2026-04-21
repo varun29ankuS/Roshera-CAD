@@ -408,7 +408,7 @@ impl AuthManager {
         // Check if token is revoked
         let claims: TokenClaims = token
             .verify_with_key(&*self.jwt_secret)
-            .map_err(|e| SessionError::AccessDenied)?;
+            .map_err(|_e| SessionError::AccessDenied)?;
 
         if self.revoked_tokens.contains_key(&claims.jti) {
             return Err(SessionError::AccessDenied);
@@ -586,8 +586,6 @@ impl AuthManager {
 
     /// Enable 2FA for user
     pub fn enable_2fa(&self, user_id: &str) -> Result<(String, Vec<String>), SessionError> {
-        use totp_lite::{totp, Sha1};
-
         // Generate secret
         let secret = base32::encode(
             base32::Alphabet::RFC4648 { padding: false },

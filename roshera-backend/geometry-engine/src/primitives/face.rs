@@ -15,7 +15,7 @@ use crate::primitives::{
     edge::{EdgeId, EdgeStore},
     r#loop::{LoopId, LoopStore},
     surface::{SurfaceId, SurfaceStore, SurfaceType},
-    vertex::{VertexId, VertexStore},
+    vertex::VertexStore,
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -348,7 +348,7 @@ impl Face {
         loop_store: &LoopStore,
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
-        curve_store: &CurveStore,
+        _curve_store: &CurveStore,
     ) -> MathResult<bool> {
         // Quick bounds check
         if u < self.uv_bounds[0]
@@ -421,7 +421,7 @@ impl Face {
         }
 
         // Get surface
-        let surface = surface_store
+        let _surface = surface_store
             .get(self.surface_id)
             .ok_or(MathError::InvalidParameter("Surface not found".to_string()))?;
 
@@ -748,7 +748,7 @@ impl Face {
 
                 // Tessellate each edge in the loop
                 for i in 0..loop_.edges.len() {
-                    if let Some((edge_id, forward)) = loop_.edge_at(i) {
+                    if let Some((edge_id, _forward)) = loop_.edge_at(i) {
                         if let Some(edge) = edge_store.get(edge_id) {
                             // Get edge tessellation
                             let edge_points = edge.tessellate(
@@ -788,7 +788,7 @@ impl Face {
     /// Tessellate face interior
     fn tessellate_interior(
         &self,
-        boundaries: &[Vec<(f64, f64)>],
+        _boundaries: &[Vec<(f64, f64)>],
         params: &TessellationParams,
         surface_store: &SurfaceStore,
         loop_store: &LoopStore,
@@ -946,7 +946,7 @@ impl Face {
         edge_store: &EdgeStore,
         curve_store: &CurveStore,
         surface_store: &SurfaceStore,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<f64> {
         let stats = self.compute_stats(
             loop_store,
@@ -965,7 +965,7 @@ impl Face {
         loop_store: &LoopStore,
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
-        surface_store: &SurfaceStore,
+        _surface_store: &SurfaceStore,
     ) -> MathResult<bool> {
         self.contains_uv_point(
             u,

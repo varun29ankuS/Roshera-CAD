@@ -6,18 +6,11 @@ use super::common::{brep_to_entity_state, entity_state_to_brep, validate_edges_s
 use crate::{
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    EntityId, EntityType, ModifiedEntity, Operation, OperationInputs, OperationOutputs,
-    TimelineError, TimelineResult,
+    EntityType, Operation, OperationOutputs, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
-    math::Tolerance,
-    operations::chamfer::ChamferOptions,
-    primitives::{
-        edge::EdgeId,
-        solid::SolidId,
-        topology_builder::{BRepModel, GeometryId as GeometryEngineId},
-    },
+    math::Tolerance, primitives::topology_builder::GeometryId as GeometryEngineId,
 };
 
 /// Implementation of chamfer operation
@@ -37,7 +30,7 @@ impl OperationImpl for ChamferOp {
         if let Operation::Chamfer {
             edges,
             distance,
-            angle,
+            angle: _,
         } = operation
         {
             // Check we have edges
@@ -108,8 +101,8 @@ impl OperationImpl for ChamferOp {
             }
 
             // Use chamfer parameters from Operation::Chamfer
-            let chamfer_angle = angle.unwrap_or(45.0);
-            let two_distances = (*distance, *distance); // Use same distance for both sides
+            let _chamfer_angle = angle.unwrap_or(45.0);
+            let _two_distances = (*distance, *distance); // Use same distance for both sides
 
             // Apply chamfer operation using geometry-engine
             use geometry_engine::operations::chamfer::{

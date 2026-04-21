@@ -1,12 +1,8 @@
 //! Caching layer for timeline operations and computed results
 
-use crate::{
-    BranchId, EntityId, EventId, Operation, OperationOutputs, TimelineError, TimelineResult,
-};
+use crate::{BranchId, EntityId, Operation, TimelineResult};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use lru::LruCache;
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 mod dependency_cache;
@@ -257,7 +253,7 @@ pub mod cache_warmup {
 
     /// Warmup operation cache with common operations
     pub async fn warmup_operations(
-        cache: &Arc<OperationCache>,
+        _cache: &Arc<OperationCache>,
         common_ops: Vec<(BranchId, Operation, serde_json::Value)>,
     ) -> TimelineResult<()> {
         for (branch_id, op, inputs) in common_ops {
@@ -272,7 +268,7 @@ pub mod cache_warmup {
 
     /// Analyze access patterns and pre-warm cache
     pub async fn analyze_and_warmup(
-        cache_manager: &CacheManager,
+        _cache_manager: &CacheManager,
         access_log: Vec<AccessLogEntry>,
     ) -> TimelineResult<()> {
         // Analyze most frequently accessed items

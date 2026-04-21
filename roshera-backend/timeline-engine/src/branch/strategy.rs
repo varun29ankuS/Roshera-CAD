@@ -1,10 +1,7 @@
 //! Branching strategies for AI-driven design exploration
 
-use super::BranchManager;
-use crate::error::{TimelineError, TimelineResult};
 use crate::types::{
-    Author, BranchId, BranchPurpose, DesignConstraint, EntityId, EventId, EventIndex,
-    OptimizationObjective,
+    Author, BranchId, BranchPurpose, DesignConstraint, EventIndex, OptimizationObjective,
 };
 use std::collections::HashMap;
 

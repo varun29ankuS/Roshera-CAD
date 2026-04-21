@@ -7,7 +7,7 @@
 //! - Merge/split operations
 //! - Thread-safe concurrent access
 
-use crate::math::{consts, Point3, Vector3};
+use crate::math::{Point3, Vector3};
 // Note: Using DashMap globally for timeline architecture compatibility
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};

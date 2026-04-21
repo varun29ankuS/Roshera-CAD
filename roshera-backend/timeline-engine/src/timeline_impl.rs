@@ -3,9 +3,9 @@
 //! This module provides the missing methods that the API server expects,
 //! implementing a world-class event-sourced timeline system.
 
-use crate::branch::{MergeResult, MergeStatistics, MergeStrategy};
+use crate::branch::{MergeResult, MergeStatistics};
 use crate::timeline::{OperationState, SessionPosition};
-use crate::types::{BranchId, EventId, EventIndex, SessionId};
+use crate::types::{BranchId, EventId, SessionId};
 use crate::{Timeline, TimelineError, TimelineResult};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -48,10 +48,7 @@ impl Timeline {
         operation: shared_types::Operation,
         session_id: uuid::Uuid,
     ) -> TimelineResult<EventId> {
-        use crate::types::{
-            Author, EventMetadata, OperationInputs, OperationOutputs, TimelineEvent,
-        };
-        use chrono::Utc;
+        use crate::types::Author;
 
         // Convert shared_types::Operation to timeline Operation
         let timeline_op = self.convert_to_timeline_operation(operation)?;
@@ -152,7 +149,7 @@ impl Timeline {
         use crate::timeline::SessionPosition;
 
         // Get session position
-        let session_key = SessionId(session_id.to_string());
+        let _session_key = SessionId(session_id.to_string());
         let position = self
             .get_session_position(session_id)
             .unwrap_or_else(|| SessionPosition {
@@ -184,7 +181,7 @@ impl Timeline {
             shared_types::Operation::CreatePrimitive {
                 shape_type,
                 parameters,
-                position,
+                position: _,
             } => Operation::CreatePrimitive {
                 primitive_type: crate::types::PrimitiveType::from_shared_type(shape_type),
                 parameters: serde_json::to_value(parameters).unwrap_or_default(),
@@ -258,7 +255,10 @@ impl Timeline {
                     .map(|id| crate::types::EntityId::from_geometry_id(&id))
                     .collect(),
             },
-            shared_types::Operation::Custom { name, parameters } => {
+            shared_types::Operation::Custom {
+                name,
+                parameters: _,
+            } => {
                 // Timeline doesn't support custom operations yet
                 // Convert to a generic operation
                 return Err(TimelineError::InvalidOperation(format!(

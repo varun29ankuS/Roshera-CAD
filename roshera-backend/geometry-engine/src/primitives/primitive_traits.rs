@@ -4,12 +4,11 @@
 //! to meet world-class CAD requirements for parametric modeling, exact geometry,
 //! and complete topological representation.
 
-use crate::math::{Matrix4, Point3, Vector3};
+use crate::math::{Point3, Vector3};
 use crate::primitives::{
     edge::EdgeId, face::FaceId, solid::SolidId, topology_builder::BRepModel, vertex::VertexId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 

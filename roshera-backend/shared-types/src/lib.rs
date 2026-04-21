@@ -29,7 +29,11 @@ pub mod traits;
 pub mod vision;
 
 pub use api::*;
-pub use commands::*;
+// Re-export commands types, excluding CommandContext (conflicts with system_context::CommandContext)
+// and ExportFormat/ExportOptions (conflicts with geometry_commands re-exports above).
+pub use commands::{
+    AICommand, AnalysisType, CommandResult, SessionAction, TransformType, ViewState, ViewType,
+};
 pub use error::*;
 pub use geometry::*;
 pub use geometry_commands::{
@@ -41,7 +45,11 @@ pub use geometry_commands::{
     Transform as GeometryTransform, TransformOp,
 };
 pub use materials::*;
-pub use session::*;
+// Re-export session types, excluding UserInfo which conflicts with system_context::UserInfo
+pub use session::{
+    CollaborationEvent, CubeFace, GridSettings, HistoryEntry, OrientationCubeState,
+    SessionSettings, SessionState, SketchPlaneInfo, SketchState, Units, UserRole,
+};
 // Re-export scene_state types with specific names to avoid conflicts
 pub use scene_state::{
     BoundingBox as SceneBoundingBox, CameraState, GridSettings as SceneGridSettings,
@@ -70,8 +78,6 @@ pub use timeline_types::{
     BranchId, EntityReference as TimelineEntityReference, EntityType, EventId, Operation,
     OperationOutputs, TimelineError, TimelineEvent,
 };
-
-use serde::{Deserialize, Serialize};
 
 /// Unique identifier type for objects
 pub type ObjectId = uuid::Uuid;

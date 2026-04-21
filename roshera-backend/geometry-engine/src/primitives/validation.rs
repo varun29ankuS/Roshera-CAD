@@ -12,13 +12,13 @@
 
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    edge::{Edge, EdgeId, EdgeStore},
-    face::{Face, FaceId, FaceOrientation, FaceStore},
-    r#loop::{Loop, LoopId, LoopStore},
-    shell::{Shell, ShellId, ShellStore},
-    solid::{FeatureType, Solid, SolidId, SolidStore},
+    edge::EdgeId,
+    face::{FaceId, FaceOrientation},
+    r#loop::LoopId,
+    shell::ShellId,
+    solid::{FeatureType, Solid, SolidId},
     topology_builder::BRepModel,
-    vertex::{VertexId, VertexStore},
+    vertex::VertexId,
 };
 use dashmap::DashMap;
 use std::hash::Hash;
@@ -491,8 +491,8 @@ impl ParallelValidator {
 
     fn validate_geometry_parallel(
         &self,
-        model: &BRepModel,
-        tolerance: Tolerance,
+        _model: &BRepModel,
+        _tolerance: Tolerance,
     ) -> GeometryValidationResults {
         // Parallel geometry validation
         GeometryValidationResults::default()
@@ -500,8 +500,8 @@ impl ParallelValidator {
 
     fn validate_deep_parallel(
         &self,
-        model: &BRepModel,
-        tolerance: Tolerance,
+        _model: &BRepModel,
+        _tolerance: Tolerance,
     ) -> DeepValidationResults {
         // Deep validation including numerical checks
         DeepValidationResults::default()
@@ -551,7 +551,7 @@ impl ParallelValidator {
         edge_usage
     }
 
-    fn find_orphaned_entities_parallel(&self, model: &BRepModel) -> Vec<EntityLocation> {
+    fn find_orphaned_entities_parallel(&self, _model: &BRepModel) -> Vec<EntityLocation> {
         // Find orphaned entities in parallel
         Vec::new()
     }
@@ -559,10 +559,10 @@ impl ParallelValidator {
     fn combine_results(
         &self,
         topology: TopologyValidationResults,
-        geometry: GeometryValidationResults,
-        deep: DeepValidationResults,
+        _geometry: GeometryValidationResults,
+        _deep: DeepValidationResults,
         context: ValidationContext,
-        level: ValidationLevel,
+        _level: ValidationLevel,
     ) -> ValidationResult {
         // Combine all results
         let mut all_errors = Vec::new();
@@ -748,7 +748,7 @@ impl ParallelValidator {
         &self,
         model: &BRepModel,
         edge_usage: &DashMap<EdgeId, EdgeUsage>,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> Vec<ValidationError> {
         let mut gap_errors = Vec::new();
 
@@ -774,7 +774,7 @@ impl ParallelValidator {
                 // Boundary edge - check if it's intentional or a gap
                 if let Some(edge) = model.edges.get(edge_id) {
                     // Get vertices to check for gaps
-                    if let (Some(v1), Some(v2)) = (
+                    if let (Some(_v1), Some(_v2)) = (
                         model.vertices.get(edge.start_vertex),
                         model.vertices.get(edge.end_vertex),
                     ) {
@@ -977,7 +977,11 @@ pub struct ToolConstraints {
 }
 
 // Manufacturing validation helpers
-fn check_wall_thickness(model: &BRepModel, min_thickness: f64, validation: &mut ValidationResult) {
+fn check_wall_thickness(
+    _model: &BRepModel,
+    _min_thickness: f64,
+    validation: &mut ValidationResult,
+) {
     // Implementation would check minimum distances between faces
     // For now, add a placeholder warning
     validation
@@ -1012,7 +1016,7 @@ fn check_feature_sizes(model: &BRepModel, min_size: f64, validation: &mut Valida
     }
 }
 
-fn check_draft_angles(model: &BRepModel, min_angle: f64, validation: &mut ValidationResult) {
+fn check_draft_angles(_model: &BRepModel, _min_angle: f64, validation: &mut ValidationResult) {
     // Check draft angles for moldability
     validation
         .warnings
@@ -1023,8 +1027,8 @@ fn check_draft_angles(model: &BRepModel, min_angle: f64, validation: &mut Valida
 }
 
 fn check_tool_accessibility(
-    model: &BRepModel,
-    constraints: &ToolConstraints,
+    _model: &BRepModel,
+    _constraints: &ToolConstraints,
     validation: &mut ValidationResult,
 ) {
     // Check if all features are accessible by tools
@@ -1209,12 +1213,12 @@ pub struct PerformanceReport {
     pub bottlenecks: Vec<String>,
 }
 
-fn calculate_thread_efficiency(context: &ValidationContext) -> f64 {
+fn calculate_thread_efficiency(_context: &ValidationContext) -> f64 {
     // Calculate parallel efficiency
     1.0 // Placeholder
 }
 
-fn identify_bottlenecks(context: &ValidationContext) -> Vec<String> {
+fn identify_bottlenecks(_context: &ValidationContext) -> Vec<String> {
     // Identify performance bottlenecks
     Vec::new()
 }

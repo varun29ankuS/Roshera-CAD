@@ -6,15 +6,13 @@
 use dashmap::DashMap;
 use shared_types::commands::ExportFormat;
 use shared_types::{
-    AICommand, AnalysisType, BooleanOp, CADObject, CommandResult, ObjectId, Position3D,
-    PrimitiveType, SessionAction, SessionError, SessionState, ShapeParameters, TransformType,
-    ViewType,
+    AICommand, AnalysisType, BooleanOp, CommandResult, ObjectId, Position3D, PrimitiveType,
+    SessionAction, SessionError, ShapeParameters, TransformType,
 };
 use std::sync::Arc;
-use timeline_engine::{BranchId, Operation, Timeline, TimelineEvent};
+use timeline_engine::{Operation, Timeline};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
-use uuid::Uuid;
+use tracing::{info, warn};
 
 /// Command processor with timeline integration
 pub struct CommandProcessor {
@@ -52,7 +50,7 @@ impl CommandProcessor {
         &self,
         session_id: &str,
         command: AICommand,
-        user_id: &str,
+        _user_id: &str,
     ) -> Result<CommandResult, SessionError> {
         info!(
             "Processing command for session {}: {:?}",
@@ -63,8 +61,8 @@ impl CommandProcessor {
         let operation = self.command_to_operation(&command)?;
 
         // Record in timeline
-        let mut timeline = self.timeline.write().await;
-        let event_id = timeline
+        let timeline = self.timeline.write().await;
+        let _event_id = timeline
             .record_operation(
                 session_id.parse().map_err(|_| SessionError::InvalidInput {
                     field: "session_id".to_string(),
@@ -342,7 +340,7 @@ impl CommandProcessor {
         &self,
         session_id: &str,
         shape_type: PrimitiveType,
-        parameters: ShapeParameters,
+        _parameters: ShapeParameters,
         position: Position3D,
         material: Option<String>,
     ) -> Result<CommandResult, SessionError> {

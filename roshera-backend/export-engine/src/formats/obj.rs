@@ -1,10 +1,6 @@
 //! OBJ file format support
 
-use shared_types::{
-    geometry::MaterialProperties, // Use the geometry MaterialProperties specifically
-    ExportError,
-    Mesh,
-};
+use shared_types::{ExportError, Mesh};
 
 /// Generate OBJ content
 pub fn generate_obj(mesh: &Mesh, name: &str) -> Result<String, ExportError> {
