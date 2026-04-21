@@ -5,7 +5,7 @@ mod aerospace_tolerance_tests {
     /// Aerospace industry standard geometric tolerance
     const AEROSPACE_TOLERANCE: f64 = 1e-10;
 
-    /// Parasolid/ACIS standard tolerance
+    /// Typical CAD-kernel tolerance used across the industry
     const CAD_KERNEL_TOLERANCE: f64 = 1e-10;
 
     /// Maximum acceptable error for aerospace applications

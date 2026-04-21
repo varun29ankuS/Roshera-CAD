@@ -921,62 +921,44 @@ Files to enhance:
 - `src/math/surface_math.rs` - Surface mathematics (to be created)
 - `src/math/intersection.rs` - Intersection algorithms (to be created)
 
-## Performance Targets & Industry Benchmarking
+## Performance Goals
 
-### Competitive Requirements
-**Roshera MUST be 50-80% faster than industry-leading CAD kernels**
+Roshera aims to be a fast, correct, AI-native CAD kernel. We do not publish
+comparative claims against any third-party kernel — benchmarks shown in this
+file are internal targets that help prevent regressions.
 
-### Daily Benchmarking Protocol
-```bash
-# Run every day at end of development
-./scripts/benchmark-vs-industry.sh
+### Internal Regression Targets (not third-party comparisons)
 
-# Automated comparison against:
-# - Leading System A
-# - Leading System B  
-# - Open-Source Alternative
-# - CGAL
-```
+| Operation                       | Target         |
+|---------------------------------|----------------|
+| Boolean Union (1k faces)        | < 100 ms       |
+| Boolean Intersect (1k faces)    | < 150 ms       |
+| NURBS Surface Eval (1M pts)     | < 25 ms        |
+| B-Spline Curve Eval (1M pts)    | < 10 ms        |
+| Tessellation (1M triangles)     | < 250 ms       |
+| Face-Face Intersection          | < 50 ms        |
+| Memory per 1M vertices          | < 192 MB       |
+| Memory per NURBS surface        | < 1 KB         |
 
-### Performance Targets vs Industry Standards
+### Micro-benchmark targets
+- Vector operations: < 1 ns (SIMD-friendly)
+- Matrix operations: < 10 ns (cache-aligned)
+- B-Spline evaluation: < 100 ns
+- NURBS evaluation: < 200 ns
+- AI command processing: < 100 ms end-to-end
 
-#### Benchmark Sources
-- **[4]** Leading System A Performance Reference
-- **[5]** Leading System B Performance Guide
-- **[6]** Open-Source Alternative Benchmarks
-- **[7]** Stroud, I. (2006). *Boundary Representation Modelling Techniques*. Springer. ISBN: 978-1-84628-312-0
-
-| Operation | System A [4] | System B [5] | Open-Source [6] | **Roshera Target** | **Roshera Must Beat** |
-|-----------|---------------|----------|------------------|--------------------|-----------------------|
-| Boolean Union (1k faces) | ~200ms | ~250ms | ~300ms | **< 100ms** | 50% faster |
-| Boolean Intersect (1k faces) | ~300ms | ~350ms | ~400ms | **< 150ms** | 50% faster |
-| NURBS Surface Eval (1M pts) | ~50ms | ~60ms | ~80ms | **< 25ms** | 50% faster |
-| B-Spline Curve Eval (1M pts) | ~20ms | ~25ms | ~30ms | **< 10ms** | 50% faster |
-| Tessellation (1M triangles) | ~500ms | ~600ms | ~800ms | **< 250ms** | 50% faster |
-| Face-Face Intersection | ~100ms | ~120ms | ~150ms | **< 50ms** | 50% faster |
-| Memory per 1M vertices | 384MB | 420MB | 512MB | **< 192MB** | 50% less |
-| Memory per NURBS surface | 2KB | 2.5KB | 3KB | **< 1KB** | 50% less |
-
-### Micro-benchmarks (Must maintain)
-- Vector operations: < 1ns (SIMD optimized)
-- Matrix operations: < 10ns (cache-aligned)
-- B-Spline evaluation: < 100ns (lookup tables)
-- NURBS evaluation: < 200ns (GPU-ready)
-- AI command processing: < 100ms end-to-end
-- Voice recognition: < 500ms for 5-second audio
-
-### Accuracy Requirements (Match or Exceed)
+### Accuracy Requirements
 
 #### Standards & References
-- **[8]** IEEE 754-2019 Standard for Floating-Point Arithmetic
-- **[9]** Hoffmann, C.M. (1989). *Geometric and Solid Modeling*. Morgan Kaufmann. ISBN: 978-1-55860-067-1
-- **[10]** Mäntylä, M. (1988). *An Introduction to Solid Modeling*. Computer Science Press. ISBN: 978-0-88175-108-1
+- IEEE 754-2019 Standard for Floating-Point Arithmetic
+- Hoffmann, C.M. (1989). *Geometric and Solid Modeling*. Morgan Kaufmann.
+- Mäntylä, M. (1988). *An Introduction to Solid Modeling*. Computer Science Press.
 
-- Geometric tolerance: 1e-10 (industry standard) [4]
-- Angular tolerance: 1e-12 radians [ISO 10303-42]
-- Surface continuity: G2 minimum [3, Ch. 8]
-- Boolean robustness: 100% watertight [9, Ch. 12]
-- NURBS precision: IEEE 754 double precision [8]
+- Geometric tolerance: 1e-10 (internal default)
+- Angular tolerance: 1e-12 radians (see ISO 10303-42)
+- Surface continuity: G2 minimum
+- Boolean robustness: watertight result required
+- NURBS precision: IEEE 754 double precision
 
 ### Memory Efficiency Strategy
 ```rust
@@ -1007,48 +989,48 @@ struct VertexStore {
 ### Benchmark Implementation
 ```rust
 #[cfg(test)]
-mod industry_benchmarks {
+mod regression_benchmarks {
     use criterion::{black_box, criterion_group, criterion_main, Criterion};
-    
-    fn benchmark_vs_industry(c: &mut Criterion) {
-        let mut group = c.benchmark_group("vs-industry-leader");
+
+    fn benchmark_internal_targets(c: &mut Criterion) {
+        let mut group = c.benchmark_group("internal-targets");
         group.significance_level(0.01);
-        
-        // Must beat leading systems by 50%
+
+        // Internal target (no third-party comparison)
         group.bench_function("boolean_union_1k_faces", |b| {
             b.iter(|| {
                 let result = boolean_union(black_box(&solid_a), black_box(&solid_b));
-                assert!(result.elapsed() < Duration::from_millis(100)); // 50% of 200ms
+                assert!(result.elapsed() < Duration::from_millis(100));
             });
         });
-        
-        // Memory usage assertion
-        assert!(memory_used() < 192_000_000); // 50% of System A's 384MB
+
+        // Memory budget assertion (internal target)
+        assert!(memory_used() < 192_000_000);
     }
 }
 ```
 
-### Daily Performance Report Format
+### Performance Report Format
 ```
-=== Roshera Performance Report 2024-01-19 ===
+=== Roshera Performance Report ===
 
 Boolean Operations:
-  Union (1k faces):      85ms  ✓ (57% faster than System A)
-  Intersection:         125ms  ✓ (58% faster than System A)
-  
+  Union (1k faces):      85ms
+  Intersection:         125ms
+
 NURBS Operations:
-  Surface Eval (1M):     22ms  ✓ (56% faster than System A)
-  Curve Eval (1M):        8ms  ✓ (60% faster than System A)
-  
+  Surface Eval (1M):     22ms
+  Curve Eval (1M):        8ms
+
 Memory Usage:
-  Per 1M vertices:     180MB  ✓ (53% less than System A)
-  Per NURBS surface:   0.9KB  ✓ (55% less than System A)
-  
+  Per 1M vertices:     180MB
+  Per NURBS surface:   0.9KB
+
 Accuracy Tests:
   Geometric tolerance:  PASS (1e-11)
-  Boolean watertight:   PASS (100%)
-  
-Overall: Meeting performance targets ✓
+  Boolean watertight:   PASS
+
+Overall: Meeting internal targets ✓
 ```
 
 ### Continuous Monitoring
@@ -1579,22 +1561,19 @@ valgrind --tool=massif target/release/geometry-bench
 ```rust
 #[test]
 fn test_performance_regression() {
-    // This test MUST pass in CI/CD
+    // Must pass in CI/CD — internal regression budget only.
     let start = Instant::now();
     let result = complex_boolean_operation();
     let elapsed = start.elapsed();
-    
-    // Hard limit - 50% of System A's time
+
     assert!(elapsed < Duration::from_millis(100),
         "Performance regression: {}ms > 100ms limit", elapsed.as_millis());
 }
 ```
 
-### Industry Benchmark References
-- System A benchmarks: Industry-leading kernel performance reference
-- System B benchmarks: Leading CAD modeler performance guide
-- Open-Source Alternative: Public benchmark suite
-- Our benchmarks: Must be reproducible and auditable
+### Benchmark References
+Our benchmarks are reproducible and auditable. We do not publish
+comparisons against third-party kernels.
 
 ## Current Status (August 5, 2025)
 
@@ -1681,10 +1660,7 @@ For detailed development history, see `DEVELOPMENT_LOG.md` in the project root.
 1. Piegl, L. & Tiller, W. (1997). *The NURBS Book* (2nd ed.). Springer.
 2. ISO 10303-42:2022. *STEP Geometric and Topological Representation*
 3. Farin, G. (2002). *Curves and Surfaces for CAGD* (5th ed.). Morgan Kaufmann.
-4. Leading System A Performance Reference
-5. Leading System B Performance Guide
-6. Open-Source Alternative Benchmarks
-7. Stroud, I. (2006). *Boundary Representation Modelling Techniques*. Springer.
+4. Stroud, I. (2006). *Boundary Representation Modelling Techniques*. Springer.
 8. IEEE 754-2019. *Standard for Floating-Point Arithmetic*
 9. Hoffmann, C.M. (1989). *Geometric and Solid Modeling*. Morgan Kaufmann.
 10. Mäntylä, M. (1988). *An Introduction to Solid Modeling*. Computer Science Press.

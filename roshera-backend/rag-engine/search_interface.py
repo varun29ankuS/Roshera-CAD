@@ -35,10 +35,10 @@ class TurboRAGSearchInterface:
                 "shared-types/src/lib.rs - Common data types"
             ],
             "Frontend Code": [
-                "roshera-front/src/main.rs - Leptos frontend entry",
-                "roshera-front/src/viewer3d/viewer.rs - 3D visualization", 
-                "roshera-front/src/components/ai_panel.rs - AI interface",
-                "roshera-front/src/api/backend.rs - Backend communication"
+                "roshera-app/src/main.tsx - React/Vite frontend entry",
+                "roshera-app/src/viewport/viewport.tsx - Three.js 3D viewport",
+                "roshera-app/src/components/ai-panel.tsx - AI interface",
+                "roshera-app/src/api/backend.ts - Backend communication"
             ],
             "Configuration": [
                 "Cargo.toml files - Rust project configuration",
@@ -211,10 +211,10 @@ class TurboRAGSearchInterface:
                     "snippet": "async fn websocket_handler(\n    ws: WebSocketUpgrade,\n    State(session_manager): State<Arc<SessionManager>>,\n) -> impl IntoResponse {\n    ws.on_upgrade(move |socket| handle_socket(socket, session_manager))"
                 },
                 {
-                    "file": "roshera-front/src/api/websocket.rs",
-                    "location": "Line 23-40", 
+                    "file": "roshera-app/src/api/websocket.ts",
+                    "location": "Line 23-40",
                     "score": 0.83,
-                    "snippet": "pub fn connect_websocket() -> Result<WebSocket> {\n    let ws = WebSocket::new(\"ws://localhost:3000/ws\")?;\n    ws.set_onmessage_callback(Some(&handle_message));\n    Ok(ws)"
+                    "snippet": "export function connectWebSocket(): WebSocket {\n    const ws = new WebSocket('ws://localhost:3000/ws');\n    ws.onmessage = handleMessage;\n    return ws;\n}"
                 }
             ]
         }

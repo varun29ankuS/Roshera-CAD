@@ -320,6 +320,7 @@ mod performance_regression_tests {
     use std::time::Instant;
 
     #[test]
+    #[ignore = "release-only: wall-clock perf assertion; run with --release --ignored"]
     fn test_vector_performance() {
         // Ensure operations remain fast
         let v1 = Vector3::new(1.0, 2.0, 3.0);
@@ -336,6 +337,7 @@ mod performance_regression_tests {
     }
 
     #[test]
+    #[ignore = "release-only: wall-clock perf assertion; run with --release --ignored"]
     fn test_matrix_performance() {
         let m1 = Matrix4::rotation_x(0.5);
         let m2 = Matrix4::rotation_y(0.7);

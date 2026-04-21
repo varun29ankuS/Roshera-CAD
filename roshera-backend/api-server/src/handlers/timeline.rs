@@ -224,10 +224,20 @@ pub async fn create_branch(
 pub async fn switch_branch(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    // In the timeline model, switching branches is handled at the session level
-    // This would update the session's current branch
-    Ok(StatusCode::OK)
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let bid = BranchId(Uuid::parse_str(&branch_id).map_err(|_| StatusCode::BAD_REQUEST)?);
+
+    // Update the timeline's active branch
+    let mut timeline = state.timeline.write().await;
+    timeline
+        .switch_branch(bid)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "branch_id": branch_id,
+    })))
 }
 
 /// Get timeline history
@@ -271,8 +281,6 @@ pub async fn merge_branches(
     State(state): State<AppState>,
     Json(request): Json<MergeBranchesRequest>,
 ) -> Result<Json<MergeResult>, StatusCode> {
-    let branch_manager = &state.branch_manager;
-
     let source =
         BranchId(Uuid::parse_str(&request.source_branch).unwrap_or_else(|_| Uuid::new_v4()));
     let target =
@@ -291,12 +299,27 @@ pub async fn merge_branches(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    // In a real implementation, this would use the branch manager's merge functionality
-    Ok(Json(MergeResult {
-        success: true,
-        message: "Merge completed".to_string(),
-        conflicts: vec![],
-    }))
+    // Use the timeline's merge functionality
+    let mut timeline = state.timeline.write().await;
+    match timeline.merge_branches(source, target, strategy).await {
+        Ok(merge_result) => Ok(Json(MergeResult {
+            success: merge_result.success,
+            message: format!(
+                "Merged branch {} into {}",
+                request.source_branch, request.target_branch
+            ),
+            conflicts: merge_result
+                .conflicts
+                .into_iter()
+                .map(|c| format!("{:?}", c))
+                .collect(),
+        })),
+        Err(e) => Ok(Json(MergeResult {
+            success: false,
+            message: format!("Merge failed: {}", e),
+            conflicts: vec![format!("{}", e)],
+        })),
+    }
 }
 
 /// Merge result

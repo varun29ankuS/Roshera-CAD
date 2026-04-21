@@ -1,19 +1,13 @@
-//! World-class face representation for B-Rep topology
+//! Face representation for B-Rep topology.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
+//! Features:
 //! - Trimmed NURBS surface support
-//! - Multiple trim curves with complex topologies
-//! - UV space analysis and tessellation
+//! - Multiple trim curves with arbitrary topologies
+//! - UV-space analysis and tessellation
 //! - G1/G2 continuity across face boundaries
-//! - Face-face intersection computation
-//! - Adaptive meshing with curvature control
-//! - Face splitting and merging operations
-//!
-//! Performance characteristics:
-//! - Face creation: < 20ns
-//! - Point-in-face test: < 200ns
-//! - Area computation: < 1μs
-//! - Tessellation: adaptive based on curvature
+//! - Face-face intersection
+//! - Adaptive meshing driven by curvature
+//! - Face splitting and merging
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -184,7 +178,7 @@ pub struct FaceStats {
     pub max_curvature: f64,
 }
 
-/// World-class face representation
+/// Face representation
 #[derive(Debug, Clone)]
 pub struct Face {
     /// Unique identifier
@@ -420,7 +414,10 @@ impl Face {
         surface_store: &SurfaceStore,
     ) -> MathResult<&FaceStats> {
         if self.cached_stats.is_some() {
-            return Ok(self.cached_stats.as_ref().unwrap());
+            return Ok(self
+                .cached_stats
+                .as_ref()
+                .expect("cached_stats presence verified by is_some() guard above"));
         }
 
         // Get surface
@@ -474,7 +471,10 @@ impl Face {
             max_curvature,
         });
 
-        Ok(self.cached_stats.as_ref().unwrap())
+        Ok(self
+            .cached_stats
+            .as_ref()
+            .expect("cached_stats just assigned via `Some(...)` above"))
     }
 
     /// Compute accurate surface area using parametric integration
@@ -505,8 +505,23 @@ impl Face {
                 if vertices.len() == 4 {
                     let mut area = 0.0;
                     for i in 0..4 {
-                        let v1 = vertex_store.get(vertices[i]).unwrap();
-                        let v2 = vertex_store.get(vertices[(i + 1) % 4]).unwrap();
+                        // `vertices` comes from the outer loop's cached vertex list;
+                        // VertexStore invariant: every vertex referenced by an edge
+                        // must exist in the store. If either lookup fails we cannot
+                        // compute a meaningful area, so return an InvalidParameter
+                        // error rather than panicking.
+                        let v1 = vertex_store.get(vertices[i]).ok_or_else(|| {
+                            MathError::InvalidParameter(format!(
+                                "rectangular face vertex {} missing from store",
+                                vertices[i]
+                            ))
+                        })?;
+                        let v2 = vertex_store.get(vertices[(i + 1) % 4]).ok_or_else(|| {
+                            MathError::InvalidParameter(format!(
+                                "rectangular face vertex {} missing from store",
+                                vertices[(i + 1) % 4]
+                            ))
+                        })?;
                         area += v1.position[0] * v2.position[1] - v2.position[0] * v1.position[1];
                     }
                     return Ok(area.abs() / 2.0);
@@ -963,7 +978,7 @@ impl Face {
     }
 }
 
-/// World-class face storage with spatial indexing
+/// Face storage with spatial indexing
 #[derive(Debug)]
 pub struct FaceStore {
     /// Face data

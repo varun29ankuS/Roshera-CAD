@@ -1,11 +1,11 @@
-//! B-Spline and NURBS Surface Implementation
+//! B-Spline and NURBS surface implementation.
 //!
-//! Industry-standard surface representations matching Parasolid/ACIS capabilities:
-//! - Full NURBS (Non-Uniform Rational B-Spline) surfaces
-//! - Tensor product surfaces with independent U/V parameterization
-//! - Trimmed NURBS surfaces with complex boundaries
+//! Features:
+//! - NURBS (Non-Uniform Rational B-Spline) surfaces
+//! - Tensor-product surfaces with independent U/V parameterization
+//! - Trimmed NURBS surfaces with arbitrary boundaries
 //! - Surface analysis and interrogation
-//! - Efficient evaluation using de Boor's algorithm
+//! - Evaluation via de Boor's algorithm
 //!
 //! References:
 //! - Piegl & Tiller, "The NURBS Book", 2nd Ed., Chapters 5-8

@@ -66,19 +66,26 @@ pub async fn export_mesh(
     }
 
     // Handle multiple meshes
-    let final_mesh = if meshes_to_export.len() == 1 {
-        meshes_to_export.into_iter().next().unwrap()
-    } else {
-        // Merge multiple meshes into one
-        tracing::info!("Merging {} meshes for export", meshes_to_export.len());
+    let final_mesh = match meshes_to_export.len() {
+        0 => {
+            // Already guarded by the `meshes_to_export.is_empty()` check above,
+            // but handle defensively rather than panicking.
+            tracing::error!("No meshes available to export after collection");
+            return Err(StatusCode::NOT_FOUND);
+        }
+        1 => meshes_to_export.swap_remove(0),
+        _ => {
+            // Merge multiple meshes into one
+            tracing::info!("Merging {} meshes for export", meshes_to_export.len());
 
-        // Collect references and transforms for merging
-        let mesh_refs: Vec<&Mesh> = meshes_to_export.iter().collect();
-        let transforms: Vec<&Transform3D> =
-            objects_to_export.iter().map(|obj| &obj.transform).collect();
+            // Collect references and transforms for merging
+            let mesh_refs: Vec<&Mesh> = meshes_to_export.iter().collect();
+            let transforms: Vec<&Transform3D> =
+                objects_to_export.iter().map(|obj| &obj.transform).collect();
 
-        // Use the new mesh merging functionality
-        Mesh::merge_multiple(mesh_refs, Some(transforms))
+            // Use the new mesh merging functionality
+            Mesh::merge_multiple(mesh_refs, Some(transforms))
+        }
     };
 
     // Generate filename
@@ -180,6 +187,44 @@ pub async fn export_mesh(
     Ok(Json(response))
 }
 
-pub async fn download_file() -> impl axum::response::IntoResponse {
-    axum::response::Html("Download not implemented yet")
+pub async fn download_file(
+    State(state): State<AppState>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    // Construct the export directory path
+    let export_dir = std::path::PathBuf::from("exports");
+    let file_path = export_dir.join(&filename);
+
+    // Security: prevent directory traversal
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Read the file
+    let data = tokio::fs::read(&file_path).await.map_err(|e| {
+        tracing::warn!("File not found for download: {} ({})", filename, e);
+        StatusCode::NOT_FOUND
+    })?;
+
+    // Determine content type from extension
+    let content_type = if filename.ends_with(".stl") {
+        "application/sla"
+    } else if filename.ends_with(".obj") {
+        "text/plain"
+    } else if filename.ends_with(".step") || filename.ends_with(".stp") {
+        "application/step"
+    } else if filename.ends_with(".ros") {
+        "application/octet-stream"
+    } else {
+        "application/octet-stream"
+    };
+
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, content_type.to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        data,
+    ))
 }
