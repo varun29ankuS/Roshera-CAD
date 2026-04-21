@@ -175,18 +175,147 @@ fn create_revolution(
     Ok(solid_id)
 }
 
-/// Create a helical sweep
+/// Create a helical sweep — revolve with axial translation (pitch per revolution)
 fn create_helical_sweep(
     model: &mut BRepModel,
     base_face: &Face,
     base_face_id: FaceId,
     options: &RevolveOptions,
 ) -> OperationResult<SolidId> {
-    // This would implement helical sweep with pitch
-    // For now, return NotImplemented
-    Err(OperationError::NotImplemented(
-        "Helical sweep not yet implemented".to_string(),
-    ))
+    let segments = options.segments.max(4);
+    let angle_step = options.angle / segments as f64;
+    // Axial translation per angle step
+    let pitch_step = options.pitch * (angle_step / (2.0 * std::f64::consts::PI));
+
+    let outer_loop = model
+        .loops
+        .get(base_face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face loop not found".into()))?
+        .clone();
+
+    let mut shell_faces = Vec::new();
+
+    // Generate faces for each segment by composing rotation + translation
+    for seg in 0..segments {
+        let angle = angle_step * seg as f64;
+        let next_angle = angle_step * (seg + 1) as f64;
+        let axial_offset = pitch_step * seg as f64;
+        let next_axial = pitch_step * (seg + 1) as f64;
+
+        // Build combined transforms: rotate then translate along axis
+        let rot = Matrix4::from_axis_angle(&options.axis_direction, angle)?;
+        let next_rot = Matrix4::from_axis_angle(&options.axis_direction, next_angle)?;
+        let translate = Matrix4::from_translation(&(options.axis_direction * axial_offset));
+        let next_translate = Matrix4::from_translation(&(options.axis_direction * next_axial));
+        let xform = translate * rot;
+        let next_xform = next_translate * next_rot;
+
+        // Create faces for each edge in the profile loop
+        for (i, &edge_id) in outer_loop.edges.iter().enumerate() {
+            let edge = model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".into()))?
+                .clone();
+
+            // Get edge endpoints and transform them
+            let ps_arr = model
+                .vertices
+                .get_position(edge.start_vertex)
+                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".into()))?;
+            let pe_arr = model
+                .vertices
+                .get_position(edge.end_vertex)
+                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".into()))?;
+            let p_start = Vector3::new(ps_arr[0], ps_arr[1], ps_arr[2]);
+            let p_end = Vector3::new(pe_arr[0], pe_arr[1], pe_arr[2]);
+
+            let p1 = xform.transform_point(&p_start);
+            let p2 = xform.transform_point(&p_end);
+            let p3 = next_xform.transform_point(&p_end);
+            let p4 = next_xform.transform_point(&p_start);
+
+            // Create quad face from these 4 points
+            let v1 = model.vertices.add(p1.x, p1.y, p1.z);
+            let v2 = model.vertices.add(p2.x, p2.y, p2.z);
+            let v3 = model.vertices.add(p3.x, p3.y, p3.z);
+            let v4 = model.vertices.add(p4.x, p4.y, p4.z);
+
+            use crate::primitives::curve::Line;
+            use crate::primitives::edge::EdgeOrientation;
+            use crate::primitives::face::FaceOrientation;
+            use crate::primitives::r#loop::LoopType;
+            use crate::primitives::surface::Plane;
+
+            let l1 = model.curves.add(Box::new(Line::new(p1, p2)));
+            let l2 = model.curves.add(Box::new(Line::new(p2, p3)));
+            let l3 = model.curves.add(Box::new(Line::new(p3, p4)));
+            let l4 = model.curves.add(Box::new(Line::new(p4, p1)));
+
+            let e1 = model.edges.add(Edge::new_auto_range(
+                0,
+                v1,
+                v2,
+                l1,
+                EdgeOrientation::Forward,
+            ));
+            let e2 = model.edges.add(Edge::new_auto_range(
+                0,
+                v2,
+                v3,
+                l2,
+                EdgeOrientation::Forward,
+            ));
+            let e3 = model.edges.add(Edge::new_auto_range(
+                0,
+                v3,
+                v4,
+                l3,
+                EdgeOrientation::Forward,
+            ));
+            let e4 = model.edges.add(Edge::new_auto_range(
+                0,
+                v4,
+                v1,
+                l4,
+                EdgeOrientation::Forward,
+            ));
+
+            let mut face_loop = Loop::new(0, LoopType::Outer);
+            face_loop.add_edge(e1, true);
+            face_loop.add_edge(e2, true);
+            face_loop.add_edge(e3, true);
+            face_loop.add_edge(e4, true);
+            let loop_id = model.loops.add(face_loop);
+
+            // Create planar surface from the quad normal
+            let n = (p2 - p1).cross(&(p4 - p1));
+            let normal = if n.magnitude_squared() > 1e-20 {
+                n.normalize()?
+            } else {
+                Vector3::Z
+            };
+            let surf = Plane::from_point_normal(p1, normal)?;
+            let surf_id = model.surfaces.add(Box::new(surf));
+
+            let face = Face::new(0, surf_id, loop_id, FaceOrientation::Forward);
+            shell_faces.push(model.faces.add(face));
+        }
+    }
+
+    // Build shell and solid
+    let shell_type = if options.cap_ends {
+        ShellType::Closed
+    } else {
+        ShellType::Open
+    };
+    let mut shell = Shell::new(0, shell_type);
+    for &fid in &shell_faces {
+        shell.add_face(fid);
+    }
+    let shell_id = model.shells.add(shell);
+    let solid = Solid::new(0, shell_id);
+    Ok(model.solids.add(solid))
 }
 
 /// Create surface(s) by revolving an edge

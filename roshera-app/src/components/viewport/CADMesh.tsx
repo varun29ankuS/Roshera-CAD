@@ -1,6 +1,7 @@
 import { useRef, useMemo, useCallback, useEffect } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
+import { wsClient } from '@/lib/ws-client'
 import * as THREE from 'three'
 import type { ThreeEvent } from '@react-three/fiber'
 
@@ -63,23 +64,50 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
     })
   }, [object.material])
 
+  const toggleSubElementSelection = useSceneStore((s) => s.toggleSubElementSelection)
+
   const handleClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation()
-      // Object-level selection only — face/edge/vertex selection
-      // is a backend concern (send click coords to backend, it resolves topology)
+
       if (selectionMode === 'object') {
         selectObject(object.id, e.shiftKey)
-      } else {
-        // For sub-element modes, send the click info to backend
-        // which resolves topology and sends back highlight data
-        selectObject(object.id, false)
-        // TODO: send sub-element pick request to backend with:
-        // - object_id, faceIndex (from e.faceIndex), selectionMode
-        // Backend returns which faces/edges/vertices to highlight
+        return
       }
+
+      // Sub-element picking: use the face index from the raycast intersection.
+      // Three.js provides faceIndex on the intersection — this maps directly to
+      // the triangle index in the BufferGeometry. The backend resolves this to
+      // the actual B-Rep face/edge/vertex via topology lookup.
+      const faceIndex = e.faceIndex ?? 0
+      const point = e.point.toArray() as [number, number, number]
+
+      // Optimistic local selection so the UI feels instant
+      const subType = selectionMode as 'face' | 'edge' | 'vertex'
+      toggleSubElementSelection({
+        objectId: object.id,
+        type: subType,
+        index: faceIndex,
+      })
+
+      // Send pick request to backend for authoritative topology resolution.
+      // Backend responds with a SubElementResult message handled by ws-bridge.
+      wsClient.send({
+        type: 'Query',
+        data: {
+          query_type: {
+            SubElementPick: {
+              object_id: object.id,
+              face_index: faceIndex,
+              point,
+              mode: selectionMode,
+            },
+          },
+        },
+        request_id: `pick-${object.id}-${faceIndex}-${Date.now()}`,
+      })
     },
-    [selectObject, object.id, selectionMode],
+    [selectObject, toggleSubElementSelection, object.id, selectionMode],
   )
 
   const handlePointerOver = useCallback(

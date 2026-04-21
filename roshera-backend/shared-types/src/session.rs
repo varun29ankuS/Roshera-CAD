@@ -247,10 +247,7 @@ pub enum CollaborationEvent {
 impl SessionState {
     /// Create new session
     pub fn new(id: ObjectId, owner_id: String) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = crate::unix_millis_now();
 
         Self {
             id,
@@ -338,10 +335,7 @@ impl SessionState {
     }
 
     fn update_modified_time(&mut self) {
-        self.modified_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        self.modified_at = crate::unix_millis_now();
     }
 
     /// Add a sketch plane to the session
@@ -400,10 +394,7 @@ impl UserInfo {
             id,
             name,
             color: [0.5, 0.5, 1.0, 1.0], // Default blue
-            last_activity: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            last_activity: crate::unix_millis_now(),
             role: UserRole::Editor,
             cursor_position: None,
             selected_objects: Vec::new(),
@@ -412,18 +403,12 @@ impl UserInfo {
 
     /// Update activity timestamp
     pub fn update_activity(&mut self) {
-        self.last_activity = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        self.last_activity = crate::unix_millis_now();
     }
 
     /// Check if user is active
     pub fn is_active(&self, timeout_ms: u64) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = crate::unix_millis_now();
 
         now - self.last_activity < timeout_ms
     }

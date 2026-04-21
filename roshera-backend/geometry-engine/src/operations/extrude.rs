@@ -7,7 +7,7 @@
 //! - Stroud, I. (2006). Boundary Representation Modelling Techniques. Springer.
 //! - Mäntylä, M. (1988). An Introduction to Solid Modeling. Computer Science Press.
 
-use super::deep_clone::{deep_clone_faces, CloneContext};
+use super::deep_clone::deep_clone_faces;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -117,16 +117,24 @@ pub fn extrude_face(
         .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
         .clone();
 
-    // Create unified extrusion that combines original + extruded geometry
-    let unified_solid_id = create_unified_extrusion(
-        model,
-        parent_solid_id,
-        &face,
-        face_id,
-        direction,
-        options.distance,
-        options.cap_ends,
-    )?;
+    // Route to complex extrusion when draft, twist, or taper are active
+    let has_complex_options = options.draft_angle.abs() > 1e-10
+        || options.twist_angle.abs() > 1e-10
+        || (options.end_scale - 1.0).abs() > 1e-10;
+
+    let unified_solid_id = if has_complex_options {
+        create_complex_unified_extrusion(model, parent_solid_id, &face, face_id, &options)?
+    } else {
+        create_unified_extrusion(
+            model,
+            parent_solid_id,
+            &face,
+            face_id,
+            direction,
+            options.distance,
+            options.cap_ends,
+        )?
+    };
 
     // Validate result if requested
     if options.common.validate_result {
@@ -163,13 +171,6 @@ fn create_unified_extrusion(
     let mut unified_faces = Vec::new();
 
     // 1. Deep clone all faces from parent EXCEPT the base face being extruded
-    let faces_to_clone: Vec<FaceId> = parent_shell
-        .faces
-        .iter()
-        .filter(|&&face_id| face_id != base_face_id)
-        .copied()
-        .collect();
-
     let cloned_faces = deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
     unified_faces.extend(cloned_faces);
 
@@ -239,6 +240,167 @@ fn create_unified_extrusion(
             "Created new solid with shell"
         );
         Ok(unified_solid_id)
+    }
+}
+
+/// Create a unified extrusion with draft angle, twist, and/or end scale.
+///
+/// Replaces the parent solid's shell with a new one that removes the extruded
+/// base face and adds side + top faces computed via the complex transformation
+/// pipeline (draft radial offset, twist rotation, end scale).
+fn create_complex_unified_extrusion(
+    model: &mut BRepModel,
+    parent_solid_id: SolidId,
+    base_face: &Face,
+    base_face_id: FaceId,
+    options: &ExtrudeOptions,
+) -> OperationResult<SolidId> {
+    let direction = options.direction.normalize().map_err(|e| {
+        OperationError::NumericalError(format!("Direction normalization failed: {:?}", e))
+    })?;
+
+    let parent_solid = model
+        .solids
+        .get(parent_solid_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Parent solid not found".to_string()))?
+        .clone();
+
+    let parent_shell = model
+        .shells
+        .get(parent_solid.outer_shell)
+        .ok_or_else(|| OperationError::InvalidGeometry("Parent shell not found".to_string()))?
+        .clone();
+
+    // Clone all faces from parent EXCEPT the base face being extruded
+    let mut unified_faces = deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
+
+    // Get base loop vertices
+    let base_loop = model
+        .loops
+        .get(base_face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
+        .clone();
+
+    let mut prev_vertices: Vec<VertexId> = Vec::new();
+    for &edge_id in &base_loop.edges {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+        prev_vertices.push(edge.start_vertex);
+    }
+
+    // Compute face centroid for radial draft offset
+    let face_centroid = {
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        let mut cz = 0.0;
+        let mut count = 0usize;
+        for &vid in &prev_vertices {
+            if let Some(v) = model.vertices.get(vid) {
+                cx += v.position[0];
+                cy += v.position[1];
+                cz += v.position[2];
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Err(OperationError::InvalidGeometry(
+                "Face has no valid vertices for centroid computation".to_string(),
+            ));
+        }
+        let n = count as f64;
+        Point3::new(cx / n, cy / n, cz / n)
+    };
+
+    // Steps: more for twist (smooth approximation), fewer otherwise
+    let num_steps = if options.twist_angle.abs() > 1e-10 {
+        10
+    } else {
+        1
+    };
+    let step_distance = options.distance / num_steps as f64;
+    let step_twist = options.twist_angle / num_steps as f64;
+    let step_scale = (options.end_scale - 1.0) / num_steps as f64;
+    let step_draft_tan = options.draft_angle.tan();
+
+    for step in 1..=num_steps {
+        let current_distance = step_distance * step as f64;
+        let current_twist = step_twist * step as f64;
+        let current_scale = 1.0 + step_scale * step as f64;
+        let current_draft_offset = current_distance * step_draft_tan;
+
+        let translation = Matrix4::from_translation(&(direction * current_distance));
+        let rotation = if options.twist_angle.abs() > 1e-10 {
+            Matrix4::from_axis_angle(&direction, current_twist).map_err(|e| {
+                OperationError::NumericalError(format!("Rotation matrix failed: {:?}", e))
+            })?
+        } else {
+            Matrix4::IDENTITY
+        };
+        let scaling = Matrix4::uniform_scale(current_scale);
+        let transform = translation * rotation * scaling;
+
+        let mut current_vertices = Vec::new();
+        for &vertex_id in &prev_vertices {
+            let vertex = model
+                .vertices
+                .get(vertex_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
+            let mut pos = Point3::from(vertex.position);
+
+            // Draft: offset radially from centroid in plane perpendicular to direction
+            if options.draft_angle.abs() > 1e-10 {
+                let to_vertex = pos - face_centroid;
+                let radial = to_vertex - direction * to_vertex.dot(&direction);
+                let radial_dir = radial.normalize().unwrap_or(Vector3::X);
+                pos = pos + radial_dir * current_draft_offset;
+            }
+
+            let transformed_pos = transform.transform_point(&pos);
+            let new_vertex =
+                model
+                    .vertices
+                    .add(transformed_pos.x, transformed_pos.y, transformed_pos.z);
+            current_vertices.push(new_vertex);
+        }
+
+        // Side faces between prev and current rings
+        for i in 0..prev_vertices.len() {
+            let next_i = (i + 1) % prev_vertices.len();
+            let face_id = create_quad_face(
+                model,
+                prev_vertices[i],
+                prev_vertices[next_i],
+                current_vertices[next_i],
+                current_vertices[i],
+            )?;
+            unified_faces.push(face_id);
+        }
+
+        prev_vertices = current_vertices;
+    }
+
+    // Cap the top
+    if options.cap_ends {
+        let top_face = create_face_from_vertices(model, &prev_vertices)?;
+        unified_faces.push(top_face);
+    }
+
+    // Build unified shell and update parent
+    let mut unified_shell = Shell::new(0, ShellType::Closed);
+    for &fid in &unified_faces {
+        unified_shell.add_face(fid);
+    }
+    let unified_shell_id = model.shells.add(unified_shell);
+
+    if let Some(parent) = model.solids.get_mut(parent_solid_id) {
+        parent.outer_shell = unified_shell_id;
+        Ok(parent_solid_id)
+    } else {
+        let solid = Solid::new(0, unified_shell_id);
+        let solid_id = model.solids.add(solid);
+        Ok(solid_id)
     }
 }
 
@@ -362,14 +524,21 @@ fn create_complex_extrusion(
         let mut cx = 0.0;
         let mut cy = 0.0;
         let mut cz = 0.0;
-        let n = prev_vertices.len() as f64;
+        let mut count = 0usize;
         for &vid in &prev_vertices {
             if let Some(v) = model.vertices.get(vid) {
                 cx += v.position[0];
                 cy += v.position[1];
                 cz += v.position[2];
+                count += 1;
             }
         }
+        if count == 0 {
+            return Err(OperationError::InvalidGeometry(
+                "Face has no valid vertices for centroid computation".to_string(),
+            ));
+        }
+        let n = count as f64;
         Point3::new(cx / n, cy / n, cz / n)
     };
 

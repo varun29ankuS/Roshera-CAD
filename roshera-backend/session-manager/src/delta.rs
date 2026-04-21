@@ -703,10 +703,16 @@ pub fn batch_deltas(deltas: Vec<SessionDelta>) -> Option<SessionDelta> {
         return deltas.into_iter().next();
     }
 
+    // SAFETY: the early returns above ensure `deltas.len() >= 2`, so
+    // `last()` is always `Some`. We still use `expect` to surface the
+    // invariant at the call site instead of swallowing it.
+    let last = deltas
+        .last()
+        .expect("batch_deltas invariant: len >= 2 after early returns");
     let mut batched = SessionDelta {
         session_id: deltas[0].session_id,
-        sequence: deltas.last().unwrap().sequence,
-        timestamp: deltas.last().unwrap().timestamp,
+        sequence: last.sequence,
+        timestamp: last.timestamp,
         object_deltas: Vec::new(),
         timeline_delta: None,
         metadata_changes: None,

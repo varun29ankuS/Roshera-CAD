@@ -150,15 +150,22 @@ impl Rectangle2d {
         corners
     }
 
-    /// Get the four edges as line segments
+    /// Get the four edges as line segments.
+    ///
+    /// All four segments are guaranteed non-degenerate: `Rectangle2d::new_rotated`
+    /// enforces `width > STRICT_TOLERANCE.distance()` and
+    /// `height > STRICT_TOLERANCE.distance()`, so adjacent corners are never
+    /// coincident and `LineSegment2d::new` cannot fail here.
     pub fn edges(&self) -> [LineSegment2d; 4] {
         let corners = self.corners();
+        const EDGE_INVARIANT: &str =
+            "rectangle width/height > STRICT_TOLERANCE: adjacent corners are non-coincident";
 
         [
-            LineSegment2d::new(corners[0], corners[1]).unwrap(), // Bottom
-            LineSegment2d::new(corners[1], corners[2]).unwrap(), // Right
-            LineSegment2d::new(corners[2], corners[3]).unwrap(), // Top
-            LineSegment2d::new(corners[3], corners[0]).unwrap(), // Left
+            LineSegment2d::new(corners[0], corners[1]).expect(EDGE_INVARIANT), // Bottom
+            LineSegment2d::new(corners[1], corners[2]).expect(EDGE_INVARIANT), // Right
+            LineSegment2d::new(corners[2], corners[3]).expect(EDGE_INVARIANT), // Top
+            LineSegment2d::new(corners[3], corners[0]).expect(EDGE_INVARIANT), // Left
         ]
     }
 
@@ -211,9 +218,10 @@ impl Rectangle2d {
             .min_by(|p1, p2| {
                 let d1 = point.distance_squared_to(p1);
                 let d2 = point.distance_squared_to(p2);
-                d1.partial_cmp(&d2).unwrap()
+                // NaN-safe ordering: treat unorderable (NaN) distances as equal
+                d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .unwrap()
+            .expect("rectangle always has 4 edges: min_by cannot be empty")
     }
 
     /// Distance from a point to the rectangle boundary
@@ -225,8 +233,9 @@ impl Rectangle2d {
             -edges
                 .iter()
                 .map(|edge| edge.distance_to_point(point))
-                .min_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap()
+                // NaN-safe ordering
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("rectangle always has 4 edges: min_by cannot be empty")
         } else {
             // Point is outside
             let closest = self.closest_point_on_boundary(point);

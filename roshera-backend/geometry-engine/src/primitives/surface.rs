@@ -1,20 +1,14 @@
-//! World-class analytical and NURBS surface representations
+//! Analytical and NURBS surface representations.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
-//! - Complete analytical surface library (25+ types)
+//! Features:
+//! - Analytical surface library (25+ types)
 //! - NURBS surfaces with trimming support
-//! - T-spline surfaces for smooth modeling
-//! - Surface-surface intersection algorithms
+//! - T-spline surfaces
+//! - Surface-surface intersection
 //! - Offset surface generation
 //! - Curvature analysis (Gaussian, mean, principal)
 //! - Surface fitting and approximation
 //! - G2 continuity analysis
-//!
-//! Performance characteristics:
-//! - Surface evaluation: < 100ns
-//! - Normal computation: < 50ns
-//! - Curvature analysis: < 200ns
-//! - Intersection: < 10μs for simple cases
 
 use crate::math::bspline_surface::BSplineSurface;
 use crate::math::nurbs::NurbsSurface;
@@ -596,41 +590,6 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
             max_curvature_diff,
         }
     }
-}
-
-/// Surface intersection result
-#[derive(Debug, Clone)]
-pub struct SurfaceIntersection {
-    /// Type of intersection
-    pub intersection_type: SurfaceIntersectionType,
-    /// Intersection curve(s)
-    pub curves: Vec<IntersectionCurve>,
-    /// Isolated intersection points
-    pub points: Vec<(Point3, (f64, f64), (f64, f64))>, // point, (u1,v1), (u2,v2)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SurfaceIntersectionType {
-    /// Surfaces don't intersect
-    None,
-    /// Intersection is a set of curves
-    Curves,
-    /// Surfaces are coincident in a region
-    Coincident,
-    /// Surfaces touch at isolated points
-    Points,
-}
-
-#[derive(Debug, Clone)]
-pub struct IntersectionCurve {
-    /// 3D points on curve
-    pub points: Vec<Point3>,
-    /// Parameters on first surface
-    pub params1: Vec<(f64, f64)>,
-    /// Parameters on second surface
-    pub params2: Vec<(f64, f64)>,
-    /// Is curve closed
-    pub is_closed: bool,
 }
 
 /// Enhanced planar surface
@@ -3980,7 +3939,7 @@ impl Torus {
     }
 }
 
-/// World-class surface storage with type dispatch optimization
+/// Surface storage with type-dispatch optimization
 #[derive(Debug)]
 pub struct SurfaceStore {
     /// Surface data by type for fast dispatch
@@ -4095,6 +4054,16 @@ impl SurfaceStore {
     pub fn get(&self, id: SurfaceId) -> Option<&dyn Surface> {
         // FAST PATH: Direct array access using ID as index
         self.surfaces.get(id as usize).map(|s| s.as_ref())
+    }
+
+    /// Replace the surface at `id` in-place on the fast-path storage.
+    ///
+    /// Returns the previous surface, or `None` if `id` is out of range.
+    /// Only replaces entries added via [`SurfaceStore::add`]; surfaces
+    /// added via [`SurfaceStore::add_with_type_dispatch`] are not affected.
+    pub fn replace(&mut self, id: SurfaceId, new: Box<dyn Surface>) -> Option<Box<dyn Surface>> {
+        let slot = self.surfaces.get_mut(id as usize)?;
+        Some(std::mem::replace(slot, new))
     }
 
     #[inline(always)]
@@ -4582,7 +4551,10 @@ impl Surface for GeneralNurbsSurface {
             self.nurbs.degree_v,
         )
         .unwrap_or_else(|_| {
-            // If creation fails, return a clone
+            // If creation fails, return a clone. The inputs come from an
+            // already-validated `self.nurbs`, so this reconstruction cannot
+            // fail; however, we use `expect` to surface any future regression
+            // in `NurbsSurface::new` validation rather than silently panic.
             crate::math::nurbs::NurbsSurface::new(
                 self.nurbs.control_points.clone(),
                 self.nurbs.weights.clone(),
@@ -4591,7 +4563,7 @@ impl Surface for GeneralNurbsSurface {
                 self.nurbs.degree_u,
                 self.nurbs.degree_v,
             )
-            .unwrap()
+            .expect("reconstructing NurbsSurface from already-validated self.nurbs cannot fail")
         });
 
         Box::new(GeneralNurbsSurface {

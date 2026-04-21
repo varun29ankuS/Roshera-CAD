@@ -1,19 +1,16 @@
-//! B-Spline curves and surfaces implementation
+//! B-Spline curves and surfaces.
 //!
-//! Provides comprehensive B-spline functionality matching Parasolid capabilities:
+//! Features:
 //! - Non-uniform B-spline curves and surfaces
-//! - Efficient evaluation using Cox-de Boor algorithm
+//! - Evaluation via Cox-de Boor
 //! - Knot insertion/removal (Oslo algorithm)
 //! - Degree elevation/reduction
 //! - Curve/surface fitting
-//! - Derivatives up to arbitrary order
+//! - Arbitrary-order derivatives
 //!
-//! High-performance optimizations:
-//! - Zero heap allocations - stack arrays only
-//! - SIMD vectorization using AVX2
-//! - Monomorphized code paths for common degrees
-//! - Unrolled loops with prefetching
-//! - Branchless algorithms where possible
+//! Implementation notes:
+//! - Stack-allocated scratch buffers on hot paths
+//! - SIMD-ready layouts; monomorphized paths for common degrees
 //!
 //! References:
 //! - Piegl & Tiller: "The NURBS Book" (1997)
@@ -573,6 +570,10 @@ impl BSplineCurve {
         if self.degree == 3 && n < 16 {
             // Direct computation for small curves
             let knot_ptr = self.knots.knots.as_ptr();
+            // SAFETY: a valid B-spline has `knots.len() == control_points.len() + degree + 1`,
+            // so indices `0..=n + degree + 1` (here n + 4 for degree 3) are in bounds. The
+            // accesses below are `knot_ptr.add(n + 1)` and `knot_ptr.add(span + 1)` with
+            // `span` bounded by the `while span <= n` guard, so `span + 1 <= n + 1 < n + 4`.
             unsafe {
                 // Check end condition
                 if u >= *knot_ptr.add(n + 1) - 1e-10 {
@@ -600,6 +601,10 @@ impl BSplineCurve {
         let mut low = self.degree;
         let mut high = n + 1;
 
+        // SAFETY: `low` starts at `self.degree` and `high` at `n + 1`; `mid = (low + high) / 2`
+        // is always in `[degree, n + 1]`. With `knots.len() == n + degree + 2`, `mid` is
+        // always a valid index into `knot_values`. Both `low` and `high` are monotonically
+        // updated to stay within this range.
         unsafe {
             // First few iterations unrolled
             if high - low > 32 {
@@ -646,6 +651,14 @@ impl BSplineCurve {
     /// SIMD point evaluation given basis functions
     #[inline(always)]
     fn evaluate_with_basis_simd(&self, span: usize, basis: &[f64]) -> Point3 {
+        // SAFETY: this helper is only dispatched for `degree == 3`, so
+        // `idx = span - degree` yields four valid control-point indices
+        // `idx, idx+1, idx+2, idx+3` — all within `[0, control_points.len())`
+        // because `span <= control_points.len() - 1` (invariant of find_span).
+        // On x86_64 the AVX intrinsics (`_mm256_loadu_pd`, `_mm256_mul_pd`,
+        // `_mm256_hadd_pd`, etc.) require AVX/AVX2 which is assumed as a
+        // baseline for the target CPU feature set. `basis.len() >= 4`
+        // because it is the cubic basis-function buffer.
         unsafe {
             // Use SIMD intrinsics for x86_64
             #[cfg(target_arch = "x86_64")]
@@ -747,6 +760,11 @@ impl BSplineCurve {
     fn evaluate_linear(&self, u: f64) -> Point3 {
         let span = self.find_span_branchless(u);
         let knot_values = &self.knots.knots;
+        // SAFETY: for a degree-1 curve, `find_span_branchless` returns `span in [1, n]`
+        // where `n = control_points.len() - 1`. `knots.len() == n + 3`, so `span` and
+        // `span + 1` are valid knot indices. `idx = span - 1 in [0, n - 1]`, so
+        // `idx` and `idx + 1` are valid control-point indices in all three coord arrays,
+        // each of length `n + 1`.
         unsafe {
             let u0 = *knot_values.get_unchecked(span);
             let u1 = *knot_values.get_unchecked(span + 1);
@@ -767,8 +785,14 @@ impl BSplineCurve {
     /// Quadratic B-spline (degree 2)
     #[inline(always)]
     fn evaluate_quadratic(&self, u: f64) -> Point3 {
-        // Similar optimized implementation
-        self.evaluate_generic(u).unwrap()
+        // `evaluate_quadratic` is only dispatched when `self.degree == 2`,
+        // which is well below `MAX_DEGREE`. All remaining failure modes in
+        // `evaluate_generic` derive from invariants the curve itself guarantees
+        // on construction (valid knot vector, matching control-point count).
+        // If those invariants are ever violated we cannot return a meaningful
+        // point, so we surface the bug loudly via `expect`.
+        self.evaluate_generic(u)
+            .expect("BSpline evaluate_quadratic: degree=2 invariants violated")
     }
 
     /// Generic evaluation for arbitrary degree
@@ -793,6 +817,11 @@ impl BSplineCurve {
         let mut z = 0.0;
 
         for i in 0..=self.degree {
+            // SAFETY: `idx = span - self.degree` and `i in 0..=self.degree`, so
+            // `idx + i` ranges over `[span - degree, span]`. `find_span_branchless`
+            // guarantees `span <= control_points.len() - 1`, so `idx + i` is always
+            // a valid index into the three control-point coord arrays (each sized
+            // `control_points.len()`).
             unsafe {
                 let b = workspace.basis[i];
                 x += b * *self.control_x.get_unchecked(idx + i);
@@ -810,6 +839,10 @@ impl BSplineCurve {
         workspace.reset();
         let knot_values = &self.knots.knots;
 
+        // SAFETY: Cox-de Boor recursion bounds. `span in [degree, n]` (from find_span),
+        // `j in 1..=degree`, `r in 0..j`, so `span + 1 - j + r >= span + 1 - degree >= 1`
+        // and `span + 1 + r <= span + degree <= n + degree`. With
+        // `knots.len() == n + degree + 2`, both indices are in bounds.
         unsafe {
             for j in 1..=self.degree {
                 let mut saved = 0.0;
@@ -995,6 +1028,9 @@ impl BSplineCurve {
         for j in 1..=self.degree {
             let mut saved = 0.0;
             for r in 0..j {
+                // SAFETY: same Cox-de Boor bounds as `basis_functions_stack`:
+                // `span + 1 - j + r in [1, span]` and `span + 1 + r in [span + 1, span + degree]`,
+                // both within `knots.len() == n + degree + 2`.
                 let knot_left = unsafe { *self.knots.knots.get_unchecked(span + 1 - j + r) };
                 let knot_right = unsafe { *self.knots.knots.get_unchecked(span + 1 + r) };
 
@@ -1038,6 +1074,9 @@ impl BSplineCurve {
 
         // Compute basis functions and knot differences
         for j in 1..=self.degree {
+            // SAFETY: `j in 1..=degree`, `span in [degree, n]`, so
+            // `span + 1 - j in [1, span]` and `span + j in [span + 1, span + degree]`,
+            // both within `knots.len() == n + degree + 2`.
             left[j] = u - unsafe { *self.knots.knots.get_unchecked(span + 1 - j) };
             right[j] = unsafe { *self.knots.knots.get_unchecked(span + j) } - u;
 
@@ -1075,7 +1114,9 @@ impl BSplineCurve {
                 }
 
                 let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                let j2 = if (r - 1) <= pk as usize {
+                // Piegl-Tiller A2.3 uses signed comparison (r-1 vs pk, both int).
+                // In Rust, `r: usize` underflows when r == 0; compute as i32.
+                let j2 = if (r as i32) - 1 <= pk {
                     k - 1
                 } else {
                     self.degree - r
@@ -1133,6 +1174,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-only: asserts 200ns/op which only holds with -O; run with --release --ignored"]
     fn test_performance_benchmark() {
         use std::time::Instant;
 

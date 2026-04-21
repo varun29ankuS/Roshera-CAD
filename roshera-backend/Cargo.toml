@@ -38,3 +38,16 @@ opt-level = 3
 
 [profile.bench]
 debug = true
+
+# Workspace-wide clippy lint policy.
+#
+# Production code must not `unwrap()` or `expect()` outside of invariants
+# that are explicitly proven immediately above the call site. Test modules
+# and examples are allowed to unwrap freely via clippy.toml allowances.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "warn"
+todo = "deny"
+unimplemented = "deny"

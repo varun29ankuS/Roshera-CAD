@@ -158,6 +158,26 @@ function handleServerMessage(msg: ServerMessage) {
       // heartbeat response — already handled by ping timing
       break
 
+    case 'SubElementResult': {
+      // Backend resolved a sub-element pick to authoritative topology indices.
+      // Replace the optimistic local selection with the backend's answer.
+      const payload = msg.payload as {
+        object_id: string
+        elements: Array<{ type: 'face' | 'edge' | 'vertex'; index: number }>
+      }
+      if (payload?.object_id && payload.elements) {
+        scene.clearSubElementSelections()
+        for (const el of payload.elements) {
+          scene.addSubElementSelection({
+            objectId: payload.object_id,
+            type: el.type,
+            index: el.index,
+          })
+        }
+      }
+      break
+    }
+
     case 'Error': {
       const payload = msg.payload as { message: string }
       if (payload?.message) {

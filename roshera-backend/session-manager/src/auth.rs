@@ -655,11 +655,12 @@ impl AuthManager {
             return Ok(true);
         }
 
-        // Verify TOTP code
+        // Verify TOTP code. Fall back to `0` if the wall clock is pre-UNIX_EPOCH;
+        // this merely causes the TOTP window to mismatch rather than panicking.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let expected = totp::<Sha1>(&two_factor.secret.as_bytes(), now / 30);
 

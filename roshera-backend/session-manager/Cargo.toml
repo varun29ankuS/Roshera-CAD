@@ -33,3 +33,5 @@ tracing-subscriber = "0.3"
 [[example]]
 name = "delta_updates_demo"
 path = "examples/delta_updates_demo.rs"
+[lints]
+workspace = true

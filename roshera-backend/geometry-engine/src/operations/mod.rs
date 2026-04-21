@@ -1,23 +1,14 @@
-//! B-Rep Operations Module
+//! B-Rep Operations Module.
 //!
-//! World-class implementations of all standard CAD operations on B-Rep models.
-//! All operations maintain exact analytical geometry (no tessellation).
+//! Standard CAD operations on B-Rep models. All operations work on exact
+//! analytical geometry (no tessellation).
 //!
 //! # Design Principles
 //!
-//! 1. **Analytical Precision**: All operations work on exact NURBS/analytical surfaces
-//! 2. **Topological Integrity**: Maintain watertight B-Rep at all times
-//! 3. **Performance**: Match or exceed Parasolid/ACIS performance targets
-//! 4. **Thread Safety**: All operations are thread-safe and parallelizable
-//! 5. **History Tracking**: Full parametric history for all operations
-//!
-//! # Performance Targets
-//!
-//! - Boolean operations: < 100ms for 10k faces
-//! - Fillet/chamfer: < 50ms per edge
-//! - Extrude/revolve: < 20ms
-//! - Loft: < 200ms for 10 profiles
-//! - Pattern: < 10ms per instance
+//! 1. Analytical precision: operations act on exact NURBS/analytical surfaces
+//! 2. Topological integrity: maintain watertight B-Rep invariants
+//! 3. Thread-safety: operations are safe to parallelize
+//! 4. History tracking: each operation records a timeline event
 
 // Core operation modules
 pub mod blend;
@@ -44,7 +35,6 @@ pub mod intersect;
 pub mod project;
 pub mod sew;
 pub mod split;
-pub mod surface_intersection;
 
 // AI integration
 pub mod ai_operations_registry;
@@ -61,7 +51,7 @@ pub use draft::{apply_draft, DraftOptions};
 pub use extrude::{extrude_face, extrude_profile, ExtrudeOptions};
 pub use fillet::{fillet_edges, fillet_vertices, FilletOptions};
 pub use g2_blending::{BlendingComplexity, G2BlendingOperations, G2QualityReport};
-pub use loft::{loft_profiles, LoftOptions};
+pub use loft::{compute_planar_surface_from_edges, loft_profiles, LoftOptions};
 pub use offset::{offset_face, offset_solid, OffsetOptions};
 pub use pattern::{create_pattern, PatternOptions, PatternType};
 pub use revolve::{revolve_face, revolve_profile, RevolveOptions};
@@ -127,6 +117,11 @@ pub enum OperationError {
         expected: String,
         received: String,
     },
+
+    /// Operation hit a coplanar-face case it cannot yet resolve as a clean
+    /// curve-intersection. Callers should route to an imprint-then-merge path
+    /// or report the limitation to the user.
+    CoplanarFaces(String),
 }
 
 impl From<crate::math::MathError> for OperationError {
@@ -164,6 +159,7 @@ impl std::fmt::Display for OperationError {
                 "Invalid input for '{}': expected {}, received {}",
                 parameter, expected, received
             ),
+            OperationError::CoplanarFaces(msg) => write!(f, "Coplanar faces: {}", msg),
         }
     }
 }

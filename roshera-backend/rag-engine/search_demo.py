@@ -36,11 +36,11 @@ def show_indexed_files():
     print("    * + 200+ more Rust files")
     
     print("\n[FRONTEND FILES]")
-    print("  roshera-front/")
-    print("    * src/main.rs - Leptos frontend") 
-    print("    * src/viewer3d/ - 3D visualization")
+    print("  roshera-app/")
+    print("    * src/main.tsx - React/Vite entry")
+    print("    * src/viewport/ - Three.js 3D viewport")
     print("    * src/components/ - UI components")
-    print("    * + 67 more frontend files")
+    print("    * src/api/ - Backend REST/WebSocket client")
     
     print("\n[CONFIGURATION & DOCS]")
     print("    * Cargo.toml files - Project config")
@@ -205,7 +205,7 @@ def interactive_demo():
             "description": "Found AI command processing and provider system"
         },
         "websocket": {
-            "files": ["api-server/src/main.rs", "roshera-front/src/api/websocket.rs"],
+            "files": ["api-server/src/main.rs", "roshera-app/src/api/websocket.ts"],
             "description": "Found WebSocket handlers in both backend and frontend"
         }
     }

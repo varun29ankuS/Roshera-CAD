@@ -247,7 +247,10 @@ impl Ray2d {
     /// Find the closest point on the ray to a given point
     pub fn closest_point(&self, point: &Point2d) -> Point2d {
         let t = self.closest_parameter(point);
-        self.point_at(t).unwrap() // Safe because t is clamped
+        // `point_at(t)` only errors on invalid `t`; `closest_parameter`
+        // always returns a valid (clamped) ray parameter.
+        self.point_at(t)
+            .expect("closest_parameter returns a valid clamped ray parameter")
     }
 
     /// Distance from a point to the ray
@@ -351,7 +354,10 @@ impl LineSegment2d {
     /// Find the closest point on the segment to a given point
     pub fn closest_point(&self, point: &Point2d) -> Point2d {
         let t = self.closest_parameter(point);
-        self.point_at(t).unwrap() // Safe because t is clamped
+        // `closest_parameter` clamps t into [0, 1], which is always a
+        // valid parameter for `point_at` on a segment.
+        self.point_at(t)
+            .expect("closest_parameter returns a valid clamped segment parameter")
     }
 
     /// Distance from a point to the segment
@@ -397,7 +403,11 @@ impl LineSegment2d {
             && t2 >= -STRICT_TOLERANCE.distance()
             && t2 <= 1.0 + STRICT_TOLERANCE.distance()
         {
-            Some(self.point_at(t1.clamp(0.0, 1.0)).unwrap())
+            // `t1` is explicitly clamped to [0, 1] — a valid segment parameter.
+            Some(
+                self.point_at(t1.clamp(0.0, 1.0))
+                    .expect("clamp to [0, 1] yields a valid segment parameter"),
+            )
         } else {
             None
         }

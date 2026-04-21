@@ -224,10 +224,7 @@ impl ErrorResponse {
         Self {
             error: error.into(),
             code,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp: crate::unix_millis_now(),
             request_id: None,
         }
     }

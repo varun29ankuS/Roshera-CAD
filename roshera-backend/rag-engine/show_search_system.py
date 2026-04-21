@@ -22,8 +22,8 @@ def main():
     print("    * + 245 more Rust files")
     
     print("\n  Frontend Files:")
-    print("    * roshera-front/ - 67 files (Leptos UI, 3D viewer)")
-    print("    * Components, API clients, WebAssembly integration")
+    print("    * roshera-app/ - React/Vite/TypeScript UI, Three.js viewport")
+    print("    * Components, API clients, WebSocket integration")
     
     print("\n  Config & Documentation:")
     print("    * Cargo.toml files, README.md, CLAUDE.md")

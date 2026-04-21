@@ -5,6 +5,7 @@
 //! # Supported Formats
 //! - **STL** (Binary and ASCII): Triangle mesh format for 3D printing and FEA
 //! - **OBJ** (Wavefront): Triangle mesh with normals, optional vertex welding
+//! - **STEP** (ISO 10303 AP203): See `export-engine` crate for full STEP support
 
 pub mod obj;
 pub mod stl;

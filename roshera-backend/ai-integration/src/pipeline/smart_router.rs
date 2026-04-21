@@ -71,10 +71,10 @@ impl Default for SmartRouterConfig {
         Self {
             mode: ProcessingMode::Unified,
             vision_config: VisionConfig {
-                provider: VisionProviderType::Ollama,
-                url: "http://localhost:11434/api/generate".to_string(),
+                provider: VisionProviderType::Anthropic,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
                 api_key: None,
-                model_name: "bakllava:latest".to_string(),
+                model_name: "claude-3-5-sonnet-20241022".to_string(),
             },
             reasoning_config: None,
             enable_cache: true,
@@ -262,9 +262,20 @@ impl SmartRouter {
             "front", "back", "left", "right",
             "above", "below", "near", "far",
         ];
-        
+
         let lower = text.to_lowercase();
-        vision_keywords.iter().any(|keyword| lower.contains(keyword))
+        vision_keywords.iter().any(|keyword| {
+            // Word-boundary match to avoid substring false positives (e.g. "sphere" matching "here")
+            for (i, _) in lower.match_indices(keyword) {
+                let before_ok = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphabetic();
+                let after = i + keyword.len();
+                let after_ok = after >= lower.len() || !lower.as_bytes()[after].is_ascii_alphabetic();
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+            false
+        })
     }
     
     /// Convert VisionConfig to UniversalEndpointConfig
@@ -433,7 +444,7 @@ mod tests {
     fn test_config_default() {
         let config = SmartRouterConfig::default();
         assert_eq!(config.mode, ProcessingMode::Unified);
-        assert_eq!(config.vision_config.provider, VisionProviderType::Ollama);
+        assert_eq!(config.vision_config.provider, VisionProviderType::Anthropic);
     }
     
     #[test]

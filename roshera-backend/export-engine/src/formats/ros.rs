@@ -88,7 +88,12 @@ pub async fn export_brep_to_ros(
         })?;
 
         let salt = ros_fs::random_16();
-        let file_iv = ros_fs::random_bytes(8).try_into().unwrap();
+        let file_iv: [u8; 8] =
+            ros_fs::random_bytes(8)
+                .try_into()
+                .map_err(|_| ExportError::ExportFailed {
+                    reason: "random_bytes(8) did not return 8 bytes".to_string(),
+                })?;
         let key_manager = SoftwareKeyManager::default();
         let key_set = key_manager
             .generate_key_set(&password, &salt)
@@ -178,11 +183,17 @@ pub async fn export_brep_to_ros(
 
     // AIPR chunk - AI provenance (if tracking is enabled)
     if options.track_ai {
-        let ai_tracker = ros_fs::AICommandTracker::new(
-            ros_fs::TrackingLevel::from_u8(options.ai_tracking_level).unwrap(),
-            ros_fs::PrivacySettings::default(),
-            None,
-        );
+        let tracking_level =
+            ros_fs::TrackingLevel::from_u8(options.ai_tracking_level).map_err(|_| {
+                ExportError::ExportFailed {
+                    reason: format!(
+                        "Invalid AI tracking level {} (expected 0..=2)",
+                        options.ai_tracking_level
+                    ),
+                }
+            })?;
+        let ai_tracker =
+            ros_fs::AICommandTracker::new(tracking_level, ros_fs::PrivacySettings::default(), None);
 
         let aipr_chunk = ros_fs::Chunk::new(ros_fs::ChunkType::AIPR, ai_tracker.serialize());
         chunks.push(aipr_chunk);
@@ -218,9 +229,10 @@ pub async fn export_brep_to_ros(
         buffer.extend_from_slice(&chunk.data);
     }
 
-    // Write chunk index
+    // Write chunk index (append to end of buffer, after header + chunk data)
     {
-        let mut cursor = Cursor::new(&mut buffer);
+        let mut index_buf = Vec::new();
+        let mut cursor = Cursor::new(&mut index_buf);
         for chunk in &chunks {
             chunk
                 .index
@@ -229,6 +241,7 @@ pub async fn export_brep_to_ros(
                     reason: format!("Failed to write chunk index: {}", e),
                 })?;
         }
+        buffer.extend_from_slice(&index_buf);
     }
 
     // Write to file
@@ -329,11 +342,15 @@ pub async fn import_ros_to_brep(
             reason: "Geometry is encrypted but no key available".to_string(),
         })?;
 
-        let decryptor = ros_fs::ChunkEncryptor::new(
-            ros_fs::EncryptionAlgorithm::from_id(geom_entry.enc_algo).unwrap(),
-            key_set.clone(),
-            header.file_iv,
-        );
+        let enc_algo = ros_fs::EncryptionAlgorithm::from_id(geom_entry.enc_algo).map_err(|_| {
+            ExportError::ExportFailed {
+                reason: format!(
+                    "Unknown encryption algorithm id {} in chunk index",
+                    geom_entry.enc_algo
+                ),
+            }
+        })?;
+        let decryptor = ros_fs::ChunkEncryptor::new(enc_algo, key_set.clone(), header.file_iv);
 
         geom_data = decryptor
             .decrypt_chunk(

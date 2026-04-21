@@ -443,15 +443,23 @@ pub fn compute_merkle_root(hashes: Vec<MerkleHash>) -> MerkleHash {
         return [0u8; 32];
     }
 
-    let tree = MerkleTree::from_leaves(
+    let tree = match MerkleTree::from_leaves(
         hashes.into_iter().map(|h| h.to_vec()).collect(),
         HashAlgorithm::Sha256,
-    )
-    .unwrap();
+    ) {
+        Ok(t) => t,
+        // from_leaves should not fail for a non-empty input with Sha256,
+        // but if it does we return the zero hash rather than panicking.
+        Err(_) => return [0u8; 32],
+    };
 
-    let root = tree.root_hash().unwrap();
+    let Some(root) = tree.root_hash() else {
+        return [0u8; 32];
+    };
     let mut result = [0u8; 32];
-    result.copy_from_slice(root);
+    // root is always 32 bytes for Sha256; guard length defensively.
+    let take = root.len().min(32);
+    result[..take].copy_from_slice(&root[..take]);
     result
 }
 
@@ -484,13 +492,16 @@ impl MerkleTree {
         );
 
         if node.is_leaf {
+            // A node with is_leaf = true is constructed with Some(index)
+            // (see new_leaf); treat None defensively as "?" rather than panic.
+            let idx_display = match node.index {
+                Some(i) => i.to_string(),
+                None => "?".to_string(),
+            };
             writeln!(
                 f,
                 "{}{}{} (leaf {})",
-                prefix,
-                connector,
-                hash_str,
-                node.index.unwrap()
+                prefix, connector, hash_str, idx_display
             )?;
         } else {
             writeln!(f, "{}{}{}", prefix, connector, hash_str)?;

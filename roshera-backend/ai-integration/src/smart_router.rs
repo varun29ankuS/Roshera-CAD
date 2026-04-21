@@ -79,13 +79,52 @@ pub struct SmartRouter {
 
 /// Keywords that indicate a command needs visual context
 const VISION_KEYWORDS: &[&str] = &[
-    "this", "that", "these", "those", "here", "there",
-    "select", "selected", "pointing", "cursor", "click",
-    "red", "blue", "green", "yellow", "white", "black",
-    "left", "right", "top", "bottom", "front", "back",
-    "the", "move the", "rotate the", "scale the",
-    "make that", "make this",
+    "this",
+    "that",
+    "these",
+    "those",
+    "here",
+    "there",
+    "select",
+    "selected",
+    "pointing",
+    "cursor",
+    "click",
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "white",
+    "black",
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "front",
+    "back",
+    "move the",
+    "rotate the",
+    "scale the",
+    "make that",
+    "make this",
 ];
+
+/// Check if `text` contains `word` as a whole word (not as a substring).
+fn contains_word(text: &str, word: &str) -> bool {
+    if word.contains(' ') {
+        // Multi-word phrases: check the first word boundary and trailing boundary
+        return text.contains(word);
+    }
+    for (i, _) in text.match_indices(word) {
+        let before_ok = i == 0 || !text.as_bytes()[i - 1].is_ascii_alphabetic();
+        let after = i + word.len();
+        let after_ok = after >= text.len() || !text.as_bytes()[after].is_ascii_alphabetic();
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
 
 impl SmartRouter {
     /// Create a new SmartRouter with the given configuration
@@ -103,7 +142,7 @@ impl SmartRouter {
         let lower = command.to_lowercase();
         VISION_KEYWORDS
             .iter()
-            .any(|keyword| lower.contains(keyword))
+            .any(|keyword| contains_word(&lower, keyword))
     }
 
     /// Process a command with viewport vision context

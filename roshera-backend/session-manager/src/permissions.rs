@@ -545,8 +545,9 @@ impl PermissionManager {
                 });
 
         if obj_perms.locked && obj_perms.locked_by.as_deref() != Some(user_id) {
+            let holder = obj_perms.locked_by.as_deref().unwrap_or("<unknown>");
             return Err(SessionError::ConflictError {
-                details: format!("Object locked by {}", obj_perms.locked_by.as_ref().unwrap()),
+                details: format!("Object locked by {}", holder),
             });
         }
 

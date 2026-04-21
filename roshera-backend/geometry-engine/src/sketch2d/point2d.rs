@@ -465,20 +465,37 @@ impl Point2dStore {
         results
     }
 
-    /// Find the nearest point to a given position
+    /// Find the nearest point to a given position.
+    ///
+    /// When `max_distance` is `Some(r)`, uses the spatial index to query only
+    /// grid cells within radius `r`. When `max_distance` is `None`, performs
+    /// a linear scan over all points — previously this path routed through
+    /// `find_within_radius(pos, f64::MAX)`, which causes the grid-bounds
+    /// computation to saturate to `i32::MIN..=i32::MAX` and iterate ~1.8e19
+    /// empty cells (effectively an infinite loop).
     pub fn find_nearest(&self, pos: &Point2d, max_distance: Option<f64>) -> Option<Point2dId> {
-        let search_radius = max_distance.unwrap_or(f64::MAX);
-        let candidates = self.find_within_radius(pos, search_radius);
-
-        candidates
-            .into_iter()
-            .filter_map(|id| {
-                self.points
-                    .get(&id)
-                    .map(|p| (id, p.position.distance_squared_to(pos)))
-            })
-            .min_by(|(_, d1), (_, d2)| d1.partial_cmp(d2).unwrap())
-            .map(|(id, _)| id)
+        match max_distance {
+            Some(r) => {
+                let candidates = self.find_within_radius(pos, r);
+                candidates
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.points
+                            .get(&id)
+                            .map(|p| (id, p.position.distance_squared_to(pos)))
+                    })
+                    .min_by(|(_, d1), (_, d2)| {
+                        d1.partial_cmp(d2).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(id, _)| id)
+            }
+            None => self
+                .points
+                .iter()
+                .map(|entry| (*entry.key(), entry.value().position.distance_squared_to(pos)))
+                .min_by(|(_, d1), (_, d2)| d1.partial_cmp(d2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| id),
+        }
     }
 
     /// Get grid key for spatial indexing

@@ -8,6 +8,19 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// Returns the current wall-clock time as milliseconds since the Unix epoch.
+///
+/// Falls back to `0` if the system clock is set before `UNIX_EPOCH`, which
+/// would otherwise cause `duration_since` to return an error. Timestamps are
+/// non-critical audit metadata on geometry objects; returning `0` is
+/// preferable to panicking a request handler.
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Extract dimensions from natural language text (simple implementation)
 fn extract_dimensions_from_text(text: &str) -> Vec<f64> {
     text.split_whitespace()
@@ -423,14 +436,8 @@ pub async fn create_geometry(
                 parent: None,
                 children: vec![],
                 metadata: std::collections::HashMap::new(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-                modified_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
+                created_at: unix_millis_now(),
+                modified_at: unix_millis_now(),
             };
 
             // Add object to session (use first session or create one)
@@ -547,14 +554,8 @@ pub async fn boolean_operation(
             parent: None,
             children: valid_objects.clone(),
             metadata: std::collections::HashMap::new(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            modified_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            created_at: unix_millis_now(),
+            modified_at: unix_millis_now(),
         };
 
         // Add to session
@@ -708,14 +709,8 @@ pub async fn natural_language_command(
                             parent: None,
                             children: vec![],
                             metadata: std::collections::HashMap::new(),
-                            created_at: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64,
-                            modified_at: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64,
+                            created_at: unix_millis_now(),
+                            modified_at: unix_millis_now(),
                         };
 
                         let object_id = object.id;

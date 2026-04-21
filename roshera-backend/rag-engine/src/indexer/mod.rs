@@ -156,6 +156,8 @@ pub struct FileIndexer {
     vector_id_map: Arc<DashMap<u32, Uuid>>,
     stats: Arc<IndexStats>,
     config: IndexerConfig,
+    /// BM25 keyword index for text-based search
+    pub bm25_index: Arc<crate::search::bm25::BM25Index>,
 }
 
 /// Indexer configuration
@@ -231,9 +233,108 @@ impl FileIndexer {
                 end_time: None,
             }),
             config,
+            bm25_index: Arc::new(crate::search::bm25::BM25Index::default()),
         })
     }
-    
+
+    /// Search using BM25 keyword search
+    pub async fn search_bm25(&self, query: &str, limit: usize) -> Result<Vec<DocumentChunk>> {
+        let results = self.bm25_index.search(query, limit);
+        let mut chunks = Vec::new();
+        for (doc_id, _score) in results {
+            if let Ok(uuid) = doc_id.parse::<Uuid>() {
+                if let Some(chunk) = self.chunks.get(&uuid) {
+                    chunks.push(chunk.clone());
+                }
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// Search using fuzzy matching (edit-distance tolerant BM25)
+    pub async fn search_fuzzy(&self, query: &str, limit: usize) -> Result<Vec<DocumentChunk>> {
+        // Expand query with single-character edits for fuzzy matching
+        let mut expanded_query = query.to_string();
+        for word in query.split_whitespace() {
+            if word.len() > 3 {
+                // Add truncated form for prefix matching
+                expanded_query.push(' ');
+                expanded_query.push_str(&word[..word.len() - 1]);
+            }
+        }
+        self.search_bm25(&expanded_query, limit).await
+    }
+
+    /// Search by code symbols (function names, types, modules)
+    pub async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<DocumentChunk>> {
+        let query_lower = query.to_lowercase();
+        let mut scored: Vec<(DocumentChunk, f32)> = Vec::new();
+
+        for entry in self.chunks.iter() {
+            let chunk = entry.value();
+            let mut score: f32 = 0.0;
+            for sym in &chunk.symbols {
+                let sym_lower = sym.to_lowercase();
+                if sym_lower == query_lower {
+                    score += 10.0; // exact match
+                } else if sym_lower.contains(&query_lower) {
+                    score += 5.0; // substring match
+                } else if query_lower.contains(&sym_lower) {
+                    score += 2.0;
+                }
+            }
+            if score > 0.0 {
+                scored.push((chunk.clone(), score));
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(c, _)| c).collect())
+    }
+
+    /// Hybrid search combining BM25 and vector results
+    pub async fn search_hybrid(&self, query: &str, limit: usize) -> Result<Vec<DocumentChunk>> {
+        // Run both searches in parallel
+        let vector_results = self.search(query, limit * 2).await.unwrap_or_default();
+        let bm25_results = self.search_bm25(query, limit * 2).await.unwrap_or_default();
+
+        // Build score maps keyed by chunk ID
+        let mut score_map: std::collections::HashMap<Uuid, (f32, f32, DocumentChunk)> =
+            std::collections::HashMap::new();
+
+        for (rank, chunk) in vector_results.iter().enumerate() {
+            let vector_score = 1.0 - (rank as f32 / (vector_results.len().max(1)) as f32);
+            score_map
+                .entry(chunk.id)
+                .or_insert((0.0, 0.0, chunk.clone()))
+                .1 = vector_score;
+        }
+
+        for (rank, chunk) in bm25_results.iter().enumerate() {
+            let bm25_score = 1.0 - (rank as f32 / (bm25_results.len().max(1)) as f32);
+            score_map
+                .entry(chunk.id)
+                .and_modify(|e| e.0 = bm25_score)
+                .or_insert((bm25_score, 0.0, chunk.clone()));
+        }
+
+        // Combine with 0.4 BM25 + 0.6 vector weighting
+        let mut combined: Vec<(f32, DocumentChunk)> = score_map
+            .into_values()
+            .map(|(bm25, vector, chunk)| (0.4 * bm25 + 0.6 * vector, chunk))
+            .collect();
+
+        combined.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        combined.truncate(limit);
+        Ok(combined.into_iter().map(|(_, c)| c).collect())
+    }
+
+    /// Get indexing statistics snapshot
+    pub fn get_stats_snapshot(&self) -> IndexStatsSnapshot {
+        self.stats.snapshot()
+    }
+
     /// Index a directory recursively
     pub async fn index_directory(&self, path: &Path) -> Result<IndexStats> {
         println!("🚀 Starting indexing of: {}", path.display());
@@ -408,7 +509,9 @@ impl FileIndexer {
             // Store vector ID mapping
             self.vector_id_map.insert(vector_id, chunk.id);
             
-            // Store in cache
+            // Store in cache and BM25 index
+            self.bm25_index.index_document(chunk.id.to_string(), &chunk.content)
+                .unwrap_or_else(|e| tracing::warn!("BM25 index error: {}", e));
             self.chunks.insert(chunk.id, chunk.clone());
             
             // Update file cache
@@ -577,7 +680,7 @@ impl FileIndexer {
         
         // Simple regex-based extraction (can be improved)
         let re = regex::Regex::new(r"\b(fn|struct|impl|class|def|function|const|let|var)\s+(\w+)")
-            .unwrap();
+            .expect("static symbol-extraction regex must compile");
         
         for cap in re.captures_iter(content) {
             if let Some(symbol) = cap.get(2) {
@@ -622,7 +725,12 @@ impl FileIndexer {
         
         // Spawn watcher thread
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            // Failures below terminate only this file-watcher thread (not the
+            // main process). They indicate a deeper system condition (runtime
+            // start, inotify/FSEvents allocation, missing watch path) that the
+            // indexer cannot recover from on its own.
+            let rt = tokio::runtime::Runtime::new()
+                .expect("file-watcher: failed to create tokio runtime");
             rt.block_on(async {
                 let mut debouncer = new_debouncer(
                     std::time::Duration::from_secs(2),
@@ -632,12 +740,14 @@ impl FileIndexer {
                                 let _ = tx.blocking_send(event);
                             }
                         }
-                    }
-                ).unwrap();
-                
-                debouncer.watcher()
+                    },
+                )
+                .expect("file-watcher: failed to allocate debouncer");
+
+                debouncer
+                    .watcher()
                     .watch(&watch_path, RecursiveMode::Recursive)
-                    .unwrap();
+                    .expect("file-watcher: failed to start watching path");
                 
                 // Keep watcher alive
                 loop {
@@ -708,6 +818,7 @@ impl FileIndexer {
             vector_id_map: self.vector_id_map.clone(),
             stats: self.stats.clone(),
             config: self.config.clone(),
+            bm25_index: self.bm25_index.clone(),
         }
     }
 }

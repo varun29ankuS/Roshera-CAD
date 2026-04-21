@@ -16,6 +16,17 @@ use geometry_engine::{
     },
 };
 
+/// Extracts a required `f64` parameter from a JSON object, returning a
+/// structured validation error when missing or of the wrong type.
+fn require_f64(params: &serde_json::Value, key: &str) -> TimelineResult<f64> {
+    params.get(key).and_then(|v| v.as_f64()).ok_or_else(|| {
+        TimelineError::ValidationError(format!(
+            "missing or non-numeric required parameter '{}'",
+            key
+        ))
+    })
+}
+
 /// Implementation of create primitive operation
 pub struct CreatePrimitiveOp;
 
@@ -308,9 +319,9 @@ fn validate_torus_params(params: &serde_json::Value) -> TimelineResult<()> {
 
 /// Create a box primitive
 fn create_box(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)> {
-    let width = params.get("width").and_then(|v| v.as_f64()).unwrap();
-    let height = params.get("height").and_then(|v| v.as_f64()).unwrap();
-    let depth = params.get("depth").and_then(|v| v.as_f64()).unwrap();
+    let width = require_f64(params, "width")?;
+    let height = require_f64(params, "height")?;
+    let depth = require_f64(params, "depth")?;
 
     // Get optional center position
     let center = if let Some(center_val) = params.get("center") {
@@ -356,7 +367,7 @@ fn create_box(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)>
 
 /// Create a sphere primitive
 fn create_sphere(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)> {
-    let radius = params.get("radius").and_then(|v| v.as_f64()).unwrap();
+    let radius = require_f64(params, "radius")?;
 
     // Get optional center position
     let center = if let Some(center_val) = params.get("center") {
@@ -402,8 +413,8 @@ fn create_sphere(params: &serde_json::Value) -> TimelineResult<(BRepModel, Strin
 
 /// Create a cylinder primitive
 fn create_cylinder(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)> {
-    let radius = params.get("radius").and_then(|v| v.as_f64()).unwrap();
-    let height = params.get("height").and_then(|v| v.as_f64()).unwrap();
+    let radius = require_f64(params, "radius")?;
+    let height = require_f64(params, "height")?;
 
     // Get optional base position
     let base = if let Some(base_val) = params.get("base") {
@@ -471,12 +482,12 @@ fn create_cylinder(params: &serde_json::Value) -> TimelineResult<(BRepModel, Str
 
 /// Create a cone primitive
 fn create_cone(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)> {
-    let radius1 = params.get("radius1").and_then(|v| v.as_f64()).unwrap();
+    let radius1 = require_f64(params, "radius1")?;
     let radius2 = params
         .get("radius2")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    let height = params.get("height").and_then(|v| v.as_f64()).unwrap();
+    let height = require_f64(params, "height")?;
 
     // Get optional base position
     let base = if let Some(base_val) = params.get("base") {
@@ -553,8 +564,8 @@ fn create_cone(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)
 
 /// Create a torus primitive
 fn create_torus(params: &serde_json::Value) -> TimelineResult<(BRepModel, String)> {
-    let major_radius = params.get("major_radius").and_then(|v| v.as_f64()).unwrap();
-    let minor_radius = params.get("minor_radius").and_then(|v| v.as_f64()).unwrap();
+    let major_radius = require_f64(params, "major_radius")?;
+    let minor_radius = require_f64(params, "minor_radius")?;
 
     // Get optional center position
     let center = if let Some(center_val) = params.get("center") {

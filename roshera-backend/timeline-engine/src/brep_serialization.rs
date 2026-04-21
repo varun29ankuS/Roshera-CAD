@@ -306,7 +306,12 @@ pub fn serialized_to_brep(data: &SerializedBRep) -> TimelineResult<BRepModel> {
                         1.0
                     };
 
-                    Box::new(Circle::new(center, Vector3::Z, radius).unwrap())
+                    Box::new(Circle::new(center, Vector3::Z, radius).map_err(|e| {
+                        TimelineError::SerializationError(format!(
+                            "Invalid circle in serialized BRep: {:?}",
+                            e
+                        ))
+                    })?)
                 }
                 _ => {
                     // Default to a line for unknown types
@@ -346,7 +351,12 @@ pub fn serialized_to_brep(data: &SerializedBRep) -> TimelineResult<BRepModel> {
                         Vector3::Z
                     };
 
-                    Box::new(Plane::from_point_normal(point, normal).unwrap())
+                    Box::new(Plane::from_point_normal(point, normal).map_err(|e| {
+                        TimelineError::SerializationError(format!(
+                            "Invalid plane in serialized BRep: {:?}",
+                            e
+                        ))
+                    })?)
                 }
                 "Cylinder" => {
                     // Extract cylinder data from the data array
@@ -377,7 +387,12 @@ pub fn serialized_to_brep(data: &SerializedBRep) -> TimelineResult<BRepModel> {
                         1.0
                     };
 
-                    Box::new(Cylinder::new(center, axis, radius).unwrap())
+                    Box::new(Cylinder::new(center, axis, radius).map_err(|e| {
+                        TimelineError::SerializationError(format!(
+                            "Invalid cylinder in serialized BRep: {:?}",
+                            e
+                        ))
+                    })?)
                 }
                 "Sphere" => {
                     // Extract sphere data from the data array
@@ -398,11 +413,23 @@ pub fn serialized_to_brep(data: &SerializedBRep) -> TimelineResult<BRepModel> {
                         1.0
                     };
 
-                    Box::new(Sphere::new(center, radius).unwrap())
+                    Box::new(Sphere::new(center, radius).map_err(|e| {
+                        TimelineError::SerializationError(format!(
+                            "Invalid sphere in serialized BRep: {:?}",
+                            e
+                        ))
+                    })?)
                 }
                 _ => {
                     // Default to a plane for unknown types
-                    Box::new(Plane::from_point_normal(Point3::ZERO, Vector3::Z).unwrap())
+                    Box::new(
+                        Plane::from_point_normal(Point3::ZERO, Vector3::Z).map_err(|e| {
+                            TimelineError::SerializationError(format!(
+                                "Failed to construct default plane for unknown surface type: {:?}",
+                                e
+                            ))
+                        })?,
+                    )
                 }
             };
 

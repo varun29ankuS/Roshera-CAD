@@ -63,3 +63,6 @@ harness = false
 [[bin]]
 name = "bench_runner"
 path = "src/bin/bench_runner.rs"
+
+[lints]
+workspace = true
