@@ -1,21 +1,11 @@
-//! Mathematical utilities for RosheraCAD B-Rep engine
-//!
-//! World-class aerospace-grade mathematical operations with performance
-//! that rivals industry leaders like Parasolid and ACIS.
+//! Mathematical utilities for the RosheraCAD B-Rep engine.
 //!
 //! # Design Philosophy
 //!
-//! 1. **Performance First**: Every operation is optimized for speed
-//! 2. **Aerospace Precision**: Double precision with careful numerical analysis
-//! 3. **Zero Unsafe Code**: Safety through design, not hacks
-//! 4. **Cache Friendly**: Data structures optimized for modern CPUs
-//!
-//! # Performance Characteristics
-//!
-//! - Vector operations: < 1 nanosecond
-//! - Matrix operations: < 10 nanoseconds  
-//! - Root finding: < 100 nanoseconds
-//! - Zero heap allocations in hot paths
+//! 1. Double-precision numerics with explicit tolerance handling
+//! 2. No `unsafe` blocks — safety through design
+//! 3. Cache-friendly layouts (SoA where hot paths demand it)
+//! 4. Minimize heap allocations on hot paths
 
 // Core modules (existing)
 pub mod matrix4;
@@ -39,10 +29,22 @@ pub mod bspline;
 pub mod bspline_surface;
 pub mod continuity_analysis;
 pub mod nurbs;
-pub mod surface_surface_intersection;
+pub mod surface_intersection;
 pub mod test_oslo;
 pub mod trimmed_nurbs;
 pub mod tspline;
+
+// Frame computation for sweep operations
+pub mod frame;
+
+// Dense linear system solver shared across sketch constraints and G2 blending
+pub mod linear_solver;
+
+// Tensor-product Bézier patch evaluation for G2 blending surfaces
+pub mod bezier_patch;
+
+// Surface-plane intersection for draft operations
+pub mod surface_plane_intersection;
 use crate::math::constants::DEG_TO_RAD;
 use crate::math::constants::RAD_TO_DEG;
 

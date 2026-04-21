@@ -43,6 +43,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useSceneStore, type TransformTool } from '@/stores/scene-store'
+import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { cn } from '@/lib/utils'
 
@@ -68,8 +69,53 @@ interface ToolGroup {
   sections: ToolSection[]
 }
 
-// ─── AI command helper ──────────────────────────────────────────────
+// ─── Direct geometry API (bypasses NLP pipeline) ────────────────────
 
+const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+
+/**
+ * Send a structured geometry command directly to the REST API.
+ * Deterministic operations (create primitive, boolean, export) don't need
+ * NLP parsing — this eliminates latency and misinterpretation risk.
+ * Falls back to NLP pipeline if the direct endpoint fails.
+ */
+async function sendDirectGeometry(
+  shapeType: string,
+  parameters: Record<string, number>,
+) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const label = `${shapeType} (${Object.entries(parameters).map(([k, v]) => `${k}=${v}`).join(', ')})`
+  addMessage({ role: 'user', content: `Create ${label}` })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        shape_type: shapeType,
+        parameters,
+        position: [0, 0, 0],
+      }),
+    })
+
+    if (!resp.ok) throw new Error(`${resp.status}`)
+
+    const data = await resp.json()
+    addMessage({
+      role: 'assistant',
+      content: data.message || `Created ${shapeType}.`,
+      objectsAffected: data.object?.id ? [data.object.id] : undefined,
+    })
+  } catch {
+    // Direct API unavailable — fall back to NLP pipeline
+    await processUserMessage(`create a ${shapeType} ${Object.entries(parameters).map(([k, v]) => `${k} ${v}`).join(' ')}`)
+  } finally {
+    useChatStore.getState().setProcessing(false)
+  }
+}
+
+/** Fallback: route through NLP pipeline for complex/freeform commands */
 function sendCommand(cmd: string) {
   processUserMessage(cmd)
 }
@@ -225,11 +271,11 @@ export function ToolBar() {
         {
           label: 'Primitives',
           items: [
-            { icon: Box, label: 'Box', action: () => sendCommand('create a box 10 10 10') },
-            { icon: Circle, label: 'Sphere', action: () => sendCommand('create a sphere radius 5') },
-            { icon: Cylinder, label: 'Cylinder', action: () => sendCommand('create a cylinder radius 5 height 10') },
-            { icon: Triangle, label: 'Cone', action: () => sendCommand('create a cone bottom radius 5 height 10') },
-            { icon: Torus, label: 'Torus', action: () => sendCommand('create a torus major radius 8 minor radius 2') },
+            { icon: Box, label: 'Box', action: () => sendDirectGeometry('box', { width: 10, height: 10, depth: 10 }) },
+            { icon: Circle, label: 'Sphere', action: () => sendDirectGeometry('sphere', { radius: 5 }) },
+            { icon: Cylinder, label: 'Cylinder', action: () => sendDirectGeometry('cylinder', { radius: 5, height: 10 }) },
+            { icon: Triangle, label: 'Cone', action: () => sendDirectGeometry('cone', { radius: 5, height: 10 }) },
+            { icon: Torus, label: 'Torus', action: () => sendDirectGeometry('torus', { major_radius: 8, minor_radius: 2 }) },
           ],
         },
         {

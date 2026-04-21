@@ -63,8 +63,8 @@ impl SimpleRAGDemo {
             "ai-integration/src/lib.rs".to_string(),
             vec![
                 "pub struct AIIntegration {".to_string(),
-                "    whisper: Arc<WhisperProvider>,".to_string(),
-                "    llama: Arc<LlamaProvider>,".to_string(),
+                "    claude: Arc<ClaudeProvider>,".to_string(),
+                "    openai: Arc<OpenAIProvider>,".to_string(),
                 "    tts: Arc<TTSProvider>,".to_string(),
                 "}".to_string(),
             ]
@@ -126,7 +126,11 @@ impl SimpleRAGDemo {
         }
         
         // Sort by relevance
-        results.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap());
+        results.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(5); // Top 5 results
         results
     }

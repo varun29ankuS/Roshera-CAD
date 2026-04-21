@@ -262,8 +262,7 @@ mod tests {
         println!("    Curve creation: {}ns (Target: <500ns)", curve_ns);
         println!("    Edge linking:   {}ns (Target: <200ns)", linking_ns);
 
-        // Industry comparison: Parasolid ~10-50μs, ACIS ~20-100μs for edge creation
-        // Our target: <1μs total (10-100x faster)
+        // Internal target only — no third-party comparison made.
         let total_ns = curve_ns + linking_ns;
         let industry_avg_ns = 30_000; // 30μs average
         let speedup = industry_avg_ns as f64 / total_ns as f64;
@@ -399,8 +398,7 @@ mod tests {
         println!("    Avg per edge:     {}ns", avg_edge_ns);
         println!("    Throughput:       {:.1} edges/ms", edges_per_ms);
 
-        // Industry comparison: Parasolid ~100-500 edges/second, ACIS ~50-200 edges/second
-        // Our target: >10,000 edges/second (50-200x faster)
+        // Internal target only — no third-party comparison made.
         let edges_per_sec = total_edges as f64 / total_edge_time.as_secs_f64();
         println!(
             "    Edges/second:     {:.0} (Target: >10,000)",
@@ -530,8 +528,7 @@ mod tests {
         let avg_ns = total_operations / performance_data.len() as u128;
         println!("    Average:  {}ns", avg_ns);
 
-        // Industry comparison: Parasolid curve-edge integration ~5-20μs
-        // Our target: <1μs (5-20x faster)
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 12_500; // 12.5μs
         let speedup = industry_avg_ns as f64 / avg_ns as f64;
         println!(
@@ -665,7 +662,7 @@ mod tests {
         println!("    Edge creation:  {}ns (4 edges)", edge_ns);
         println!("    Loop creation:  {}ns (Target: <100μs)", loop_ns);
 
-        // Industry comparison: Parasolid ~50-200μs, ACIS ~100-500μs for loop creation
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 150_000; // 150μs average
         let speedup = industry_avg_ns as f64 / loop_ns as f64;
 
@@ -1181,7 +1178,7 @@ mod tests {
         println!("    Face creation:    {}ns (Target: <50ns)", face_ns);
         println!("    Total time:       {}ns", total_ns);
 
-        // Industry comparison: Parasolid ~100-500μs, ACIS ~200-1000μs for face creation
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 300_000; // 300μs average
         let speedup = industry_avg_ns as f64 / total_ns as f64;
 
@@ -1500,7 +1497,7 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Area computation: {}ns (Target: <10μs)", area_ns);
 
-        // Industry comparison: Parasolid ~50-200μs, ACIS ~100-500μs for area computation
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 150_000; // 150μs average
         let speedup = industry_avg_ns as f64 / area_ns as f64;
 
@@ -1687,7 +1684,7 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Avg per test:     {}ns (Target: <1μs)", avg_test_ns);
 
-        // Industry comparison: Parasolid ~500ns-2μs, ACIS ~1-5μs for point-in-face
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 1500; // 1.5μs average
         let speedup = industry_avg_ns as f64 / avg_test_ns as f64;
 
@@ -1844,7 +1841,7 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Shell creation:   {}ns (Target: <1ms)", creation_ns);
 
-        // Industry comparison: Parasolid ~500μs-2ms, ACIS ~1-5ms for shell creation
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 1_500_000; // 1.5ms average
         let speedup = industry_avg_ns as f64 / creation_ns as f64;
 
@@ -1977,7 +1974,7 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Validation:       {}ns (Target: <500μs)", validation_ns);
 
-        // Industry comparison: Parasolid ~200-800μs, ACIS ~500μs-1.5ms for shell validation
+        // Internal target only — no third-party comparison made.
         let industry_avg_ns = 500_000; // 500μs average
         let speedup = industry_avg_ns as f64 / validation_ns as f64;
 

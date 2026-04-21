@@ -22,7 +22,7 @@ graph TB
     end
     
     subgraph "Frontend"
-        front[roshera-front]
+        front[roshera-app]
     end
     
     %% Shared types is used by everything

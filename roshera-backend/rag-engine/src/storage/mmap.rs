@@ -171,8 +171,10 @@ impl MmapStorage {
             last_accessed: std::sync::atomic::AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
+                    .map(|d| d.as_secs())
+                    // If the system clock is before UNIX_EPOCH, treat as "oldest"
+                    // so the cache-eviction heuristic degrades gracefully.
+                    .unwrap_or(0)
             ),
         });
         
@@ -200,12 +202,12 @@ impl MmapStorage {
         let handle = self.mmaps.get(key)
             .ok_or_else(|| anyhow::anyhow!("Key not found: {}", key))?;
         
-        // Update access time
+        // Update access time (graceful fallback if clock < UNIX_EPOCH)
         handle.last_accessed.store(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed
         );
         

@@ -69,7 +69,7 @@ fn create_simple_tspline_mesh() -> TSplineMesh {
             let v1 = vertex_ids[i * 3 + j + 1];
             let v2 = vertex_ids[(i + 1) * 3 + j + 1];
             let v3 = vertex_ids[(i + 1) * 3 + j];
-            mesh.add_face(vec![v0, v1, v2, v3]);
+            let _ = mesh.add_face(vec![v0, v1, v2, v3]);
         }
     }
 

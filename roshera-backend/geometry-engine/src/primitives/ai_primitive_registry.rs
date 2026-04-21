@@ -1,26 +1,33 @@
-//! AI-First Primitive Registry - The Central Hub for AI-CAD Interaction
+//! AI-First primitive registry — central hub for AI-CAD interaction.
 //!
-//! This module provides the world's most AI-accessible CAD primitive system.
 //! AI agents can discover, understand, and execute CAD operations through
-//! natural language interfaces with full introspection capabilities.
+//! natural-language interfaces with full introspection.
 //!
-//! # Design Philosophy: AI-First
+//! # Design Principles
 //!
-//! 1. **Self-Documenting**: AI can discover all capabilities without external docs
-//! 2. **Natural Language**: Fuzzy matching, synonym support, unit conversion
-//! 3. **Error Recovery**: Helpful suggestions, auto-correction, examples
-//! 4. **Context Aware**: Learns from usage patterns, suggests improvements
-//! 5. **Schema Driven**: Machine-readable parameter descriptions and constraints
+//! 1. Self-documenting: capabilities discoverable without external docs
+//! 2. Natural language: fuzzy matching, synonyms, unit conversion
+//! 3. Error recovery: suggestions, auto-correction, examples
+//! 4. Context aware: learns from usage patterns
+//! 5. Schema-driven: machine-readable parameter descriptions and constraints
 
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
-    primitive_traits::{ParameterSchema, Primitive, PrimitiveError, ValidationReport},
+    edge::EdgeId,
+    face::FaceId,
+    primitive_traits::{
+        ParameterDefinition, ParameterSchema, ParameterType, Primitive, PrimitiveError,
+        ValidationReport, ValueConstraint,
+    },
     solid::SolidId,
-    topology_builder::BRepModel,
+    topology_builder::{BRepModel, PrimitiveOptions},
+    vertex::VertexId,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
@@ -144,6 +151,24 @@ pub struct AIPerformanceMetrics {
     pub creation_time_ms: f64,
     pub memory_used_bytes: usize,
     pub complexity_score: f64,
+}
+
+/// Bounding extents derived directly from vertex positions.
+#[derive(Debug, Clone)]
+struct TopologyExtents {
+    min: [f64; 3],
+    max: [f64; 3],
+    centroid: [f64; 3],
+}
+
+/// Honest structural counts walked from a `Solid`'s topology.
+#[derive(Debug, Clone)]
+struct SolidTopologyCounts {
+    vertex_count: usize,
+    edge_count: usize,
+    face_count: usize,
+    /// `None` if the solid has zero reachable vertices.
+    extents: Option<TopologyExtents>,
 }
 
 /// Comprehensive information about a primitive type for AI discovery
@@ -438,8 +463,6 @@ struct BatchProcessor {
 #[derive(Debug)]
 struct PendingCommand {
     command: AICommand,
-    // Placeholder for future async support
-    _placeholder: usize,
     queued_at: std::time::Instant,
 }
 
@@ -509,7 +532,9 @@ impl PrimitiveRegistry {
         model: &mut BRepModel,
     ) -> Result<AIResponse, PrimitiveError> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
 
         // Parse the natural language command
         let command = registry.parse_natural_language(description)?;
@@ -865,7 +890,7 @@ impl PrimitiveRegistry {
     }
 
     /// Get synonym patterns for a parameter (simplified without regex)
-    fn get_synonym_patterns(&self, _param_name: &str) -> Vec<String> {
+    fn get_synonym_patterns(&self, param_name: &str) -> Vec<String> {
         // Return empty for now - synonym handling is done in is_synonym function
         vec![]
     }
@@ -882,16 +907,21 @@ impl PrimitiveRegistry {
         }
     }
 
-    /// Calculate confidence score for parameter extraction
+    /// Calculate confidence score for parameter extraction.
+    ///
+    /// `primitive_type` must be a key present in `self.primitives`; this
+    /// helper is only reachable after `parse_natural_language` has
+    /// matched the input against a registered primitive name.
     fn calculate_confidence(
         &self,
         text: &str,
         primitive_type: &str,
         parameters: &HashMap<String, AIParameterValue>,
     ) -> f64 {
-        let Some(primitive_info) = self.primitives.get(primitive_type) else {
-            return 0.0;
-        };
+        let primitive_info = self
+            .primitives
+            .get(primitive_type)
+            .expect("calculate_confidence: primitive_type came from registry lookup above");
         let required_params = primitive_info.parameter_schema.parameters.len();
         let found_params = parameters.len();
 
@@ -917,11 +947,15 @@ impl PrimitiveRegistry {
             .max(0.0)
     }
 
-    /// Generate helpful suggestions for low-confidence parsing
-    fn generate_suggestions(&self, _text: &str, primitive_type: &str) -> Vec<String> {
-        let Some(primitive_info) = self.primitives.get(primitive_type) else {
-            return vec![];
-        };
+    /// Generate helpful suggestions for low-confidence parsing.
+    ///
+    /// `primitive_type` must be a key present in `self.primitives`
+    /// (same invariant as `calculate_confidence`).
+    fn generate_suggestions(&self, text: &str, primitive_type: &str) -> Vec<String> {
+        let primitive_info = self
+            .primitives
+            .get(primitive_type)
+            .expect("generate_suggestions: primitive_type came from registry lookup above");
         let mut suggestions = vec![];
 
         // Suggest required parameters that weren't found
@@ -983,7 +1017,8 @@ impl PrimitiveRegistry {
             success: validation.is_valid,
             geometry_id: Some(geometry_id),
             description: self.generate_description(&command, &validation),
-            technical_info: self.extract_technical_info(geometry_id, model, &validation),
+            technical_info: self
+                .extract_technical_info(geometry_id, model, &command, &validation),
             next_suggestions: self.generate_next_suggestions(&command),
             warnings: self.generate_warnings(&validation),
             metrics: AIPerformanceMetrics {
@@ -1099,7 +1134,11 @@ impl PrimitiveRegistry {
         self.primitives.insert("box".to_string(), box_info);
     }
 
-    /// Generate human-readable description of created geometry
+    /// Generate human-readable description of created geometry.
+    ///
+    /// Honest topology counts live on `AIResponse.technical_info.topology`; the
+    /// human summary intentionally omits them to avoid duplicating (and risking
+    /// disagreeing with) the structured data.
     fn generate_description(&self, command: &AICommand, validation: &ValidationReport) -> String {
         match command.primitive_type.as_str() {
             "box" => {
@@ -1114,10 +1153,7 @@ impl PrimitiveRegistry {
                     .unwrap_or(10.0);
 
                 if validation.is_valid {
-                    format!(
-                        "Created a {}×{}×{} box with {} vertices, {} edges, and {} faces",
-                        width, height, depth, 8, 12, 6
-                    )
+                    format!("Created a {}×{}×{} box", width, height, depth)
                 } else {
                     format!(
                         "Attempted to create {}×{}×{} box but topology validation failed",
@@ -1129,51 +1165,201 @@ impl PrimitiveRegistry {
         }
     }
 
-    /// Extract technical information for AI learning
+    /// Walk the topology of a solid and gather honest structural counts and
+    /// vertex-position-derived geometric extents.
+    ///
+    /// Returns `None` if the solid or its outer shell is missing from the model
+    /// (caller falls back to validation-only information).
+    fn walk_solid_topology(
+        &self,
+        geometry_id: SolidId,
+        model: &BRepModel,
+    ) -> Option<SolidTopologyCounts> {
+        use std::collections::HashSet;
+
+        let solid = model.solids.get(geometry_id)?;
+
+        let mut face_ids: HashSet<FaceId> = HashSet::new();
+        let mut edge_ids: HashSet<EdgeId> = HashSet::new();
+        let mut vertex_ids: HashSet<VertexId> = HashSet::new();
+
+        let shell_ids = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+
+        for shell_id in shell_ids {
+            let Some(shell) = model.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                if !face_ids.insert(face_id) {
+                    continue;
+                }
+                let Some(face) = model.faces.get(face_id) else {
+                    continue;
+                };
+                let loop_ids =
+                    std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied());
+                for loop_id in loop_ids {
+                    let Some(loop_ref) = model.loops.get(loop_id) else {
+                        continue;
+                    };
+                    for &edge_id in &loop_ref.edges {
+                        if !edge_ids.insert(edge_id) {
+                            continue;
+                        }
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            vertex_ids.insert(edge.start_vertex);
+                            vertex_ids.insert(edge.end_vertex);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        let mut sum = [0.0_f64; 3];
+        let mut counted: usize = 0;
+
+        for vid in &vertex_ids {
+            if let Some(vertex) = model.vertices.get(*vid) {
+                for axis in 0..3 {
+                    let v = vertex.position[axis];
+                    if v < min[axis] {
+                        min[axis] = v;
+                    }
+                    if v > max[axis] {
+                        max[axis] = v;
+                    }
+                    sum[axis] += v;
+                }
+                counted += 1;
+            }
+        }
+
+        let extents = if counted > 0 {
+            let inv = 1.0 / counted as f64;
+            Some(TopologyExtents {
+                min,
+                max,
+                centroid: [sum[0] * inv, sum[1] * inv, sum[2] * inv],
+            })
+        } else {
+            None
+        };
+
+        Some(SolidTopologyCounts {
+            vertex_count: vertex_ids.len(),
+            edge_count: edge_ids.len(),
+            face_count: face_ids.len(),
+            extents,
+        })
+    }
+
+    /// Collect numeric parameters from the command into the `final_parameters`
+    /// map. Non-numeric AIParameterValue variants (Text, Boolean, Point, Vector)
+    /// are intentionally excluded because `AITechnicalInfo::final_parameters`
+    /// is typed `HashMap<String, f64>`.
+    fn collect_numeric_parameters(
+        parameters: &HashMap<String, AIParameterValue>,
+    ) -> HashMap<String, f64> {
+        parameters
+            .iter()
+            .filter_map(|(k, v)| match v {
+                AIParameterValue::Number { value, .. } => Some((k.clone(), *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extract technical information for AI learning.
+    ///
+    /// Counts are derived from the actual B-Rep topology via
+    /// [`walk_solid_topology`]. Mass properties (`volume`, `surface_area`) are
+    /// reported as `None` because the underlying `Solid::volume` /
+    /// `Solid::surface_area` APIs require `&mut` access that is unavailable
+    /// here. Downstream consumers that need them should recompute via the
+    /// solid's mass-property cache.
     fn extract_technical_info(
         &self,
-        _geometry_id: SolidId,
-        _model: &BRepModel,
+        geometry_id: SolidId,
+        model: &BRepModel,
+        command: &AICommand,
         validation: &ValidationReport,
     ) -> AITechnicalInfo {
-        AITechnicalInfo {
-            final_parameters: HashMap::new(), // TODO: Extract from geometry
-            topology: AITopologyInfo {
-                vertex_count: 8, // TODO: Extract from actual geometry
-                edge_count: 12,
-                face_count: 6,
-                euler_characteristic: validation.euler_characteristic,
-                is_manifold: matches!(
-                    validation.manifold_check,
-                    crate::primitives::primitive_traits::ManifoldStatus::Manifold
-                ),
-                is_closed: true, // TODO: Determine from geometry
-            },
-            properties: AIGeometricProperties {
-                volume: Some(0.0),       // TODO: Calculate
-                surface_area: Some(0.0), // TODO: Calculate
-                bounding_box: AIBoundingBox {
+        let counts = self.walk_solid_topology(geometry_id, model);
+
+        let (vertex_count, edge_count, face_count, extents) = match &counts {
+            Some(c) => (c.vertex_count, c.edge_count, c.face_count, c.extents.clone()),
+            None => (0, 0, 0, None),
+        };
+
+        let is_manifold = matches!(
+            validation.manifold_check,
+            crate::primitives::primitive_traits::ManifoldStatus::Manifold
+        );
+        // A B-Rep is "closed" iff every edge is shared by exactly two faces.
+        // The manifold check enforces exactly that property for a valid
+        // watertight solid, so we reuse it here.
+        let is_closed = is_manifold;
+
+        let (bbox, centroid) = match extents {
+            Some(e) => {
+                let bbox = AIBoundingBox {
                     min: AIPoint3D {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
+                        x: e.min[0],
+                        y: e.min[1],
+                        z: e.min[2],
                     },
                     max: AIPoint3D {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
+                        x: e.max[0],
+                        y: e.max[1],
+                        z: e.max[2],
                     },
                     dimensions: AIPoint3D {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
+                        x: e.max[0] - e.min[0],
+                        y: e.max[1] - e.min[1],
+                        z: e.max[2] - e.min[2],
                     },
-                },
-                center_of_mass: AIPoint3D {
+                };
+                let centroid = AIPoint3D {
+                    x: e.centroid[0],
+                    y: e.centroid[1],
+                    z: e.centroid[2],
+                };
+                (bbox, centroid)
+            }
+            None => {
+                let zero = AIPoint3D {
                     x: 0.0,
                     y: 0.0,
                     z: 0.0,
-                },
+                };
+                (
+                    AIBoundingBox {
+                        min: zero.clone(),
+                        max: zero.clone(),
+                        dimensions: zero.clone(),
+                    },
+                    zero,
+                )
+            }
+        };
+
+        AITechnicalInfo {
+            final_parameters: Self::collect_numeric_parameters(&command.parameters),
+            topology: AITopologyInfo {
+                vertex_count,
+                edge_count,
+                face_count,
+                euler_characteristic: validation.euler_characteristic,
+                is_manifold,
+                is_closed,
+            },
+            properties: AIGeometricProperties {
+                volume: None,
+                surface_area: None,
+                bounding_box: bbox,
+                center_of_mass: centroid,
             },
         }
     }
@@ -1319,7 +1505,9 @@ impl PrimitiveRegistry {
     /// Get the full AI catalog with all available primitives
     pub fn get_full_catalog() -> serde_json::Value {
         let registry = Self::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
 
         // Serialize DashMap entries into a JSON object
         let mut json_obj = serde_json::Map::new();
@@ -1335,7 +1523,9 @@ impl PrimitiveRegistry {
     /// List all primitive names for AI discovery
     pub fn list_all_primitives() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
         registry
             .primitives
             .iter()
@@ -1346,7 +1536,9 @@ impl PrimitiveRegistry {
     /// Get examples for a specific primitive
     pub fn get_examples(primitive_type: &str) -> Vec<serde_json::Value> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
 
         registry
             .primitives
@@ -1492,7 +1684,7 @@ pub struct PerformanceMetrics {
     pub memory_usage_bytes: usize,
 }
 
-/// World-class AI interface features
+/// AI interface features
 impl PrimitiveRegistry {
     /// Get AI agent capabilities for discovery
     pub fn get_capabilities() -> serde_json::Value {
@@ -1525,7 +1717,7 @@ impl PrimitiveRegistry {
     /// AI learning endpoint - submit successful commands for optimization (production DashMap implementation)
     pub fn learn_from_success(command: &str, response: &AIResponse) {
         let registry = Self::global();
-        if let Ok(registry) = registry.try_lock() {
+        if let Ok(mut registry) = registry.try_lock() {
             // Parse the command first
             let parsed_result = registry.parse_natural_language(command);
 
@@ -1580,7 +1772,9 @@ impl PrimitiveRegistry {
     /// Get AI optimization hints based on usage patterns (production implementation)
     pub fn get_optimization_hints() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
         let mut hints = Vec::new();
 
         // Analyze usage patterns using DashMap
@@ -1627,7 +1821,9 @@ impl PrimitiveRegistry {
 
         // Parse command with time tracking
         let registry = Self::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
         let parsed = registry.parse_natural_language(command)?;
 
         // Check if we're approaching timeout
@@ -1669,7 +1865,9 @@ pub mod gpu {
         // Production implementation would use CUDA/OpenCL for parallel processing
         // For now, fall back to CPU batch processing
         let registry = PrimitiveRegistry::global();
-        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = registry
+            .lock()
+            .expect("PrimitiveRegistry global Mutex poisoned");
         registry.execute_batch(commands.to_vec(), model)
     }
 }
@@ -1694,7 +1892,7 @@ pub mod ml {
 
         let last_command = history
             .last()
-            .expect("history non-empty after is_empty check")
+            .expect("history non-empty: is_empty check above returns early")
             .to_lowercase();
 
         // Simple pattern matching for common workflows

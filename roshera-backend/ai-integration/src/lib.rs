@@ -8,7 +8,6 @@
 
 pub mod audio_processor;
 pub mod audio_processor_advanced;
-pub mod audio_processor_rnnoise;
 pub mod audio_processor_simple;
 pub mod commands;
 pub mod context_builder;
@@ -19,10 +18,10 @@ pub mod processor;
 pub mod providers;
 pub mod session_aware_processor;
 pub mod smart_router;
-pub mod universal_endpoint;
 pub mod timeline_aware_executor;
 pub mod tool_dispatch;
 pub mod translator;
+pub mod universal_endpoint;
 
 pub use commands::{Operation, VoiceCommand};
 pub use context_builder::{ContextBuilder, RichAIContext, SceneAnalysis, UserContext};
