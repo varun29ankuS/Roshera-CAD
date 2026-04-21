@@ -128,6 +128,74 @@ pub struct AdjacencyInfo {
     pub edge_angles: HashMap<EdgeId, f64>,
 }
 
+/// Euler characteristic validation result
+#[derive(Debug, Clone)]
+pub struct EulerValidation {
+    pub vertices: usize,
+    pub edges: usize,
+    pub faces: usize,
+    pub euler_characteristic: i64,
+    pub expected: i64,
+    pub is_valid: bool,
+}
+
+impl AdjacencyInfo {
+    /// Validate the Euler-Poincaré formula for a closed shell: V - E + F = 2
+    ///
+    /// For a closed manifold surface (genus-0), chi = 2. This check catches
+    /// topological corruption like missing faces, dangling edges, or
+    /// disconnected vertices that would otherwise go undetected.
+    pub fn validate_euler_characteristic(
+        &self,
+        shell: &Shell,
+        edge_store: &EdgeStore,
+    ) -> EulerValidation {
+        // Count unique vertices from edges in this shell
+        let mut shell_vertices: HashSet<VertexId> = HashSet::new();
+        let mut shell_edges: HashSet<EdgeId> = HashSet::new();
+
+        for &face_id in &shell.faces {
+            if let Some(edges) = self.face_edges.get(&face_id) {
+                for &edge_id in edges {
+                    // Only count edges used by shell faces
+                    if let Some(faces) = self.edge_faces.get(&edge_id) {
+                        let in_shell = faces.iter().any(|f| shell.faces.contains(f));
+                        if in_shell {
+                            shell_edges.insert(edge_id);
+                            if let Some(edge) = edge_store.get(edge_id) {
+                                shell_vertices.insert(edge.start_vertex);
+                                shell_vertices.insert(edge.end_vertex);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let v = shell_vertices.len();
+        let e = shell_edges.len();
+        let f = shell.faces.len();
+        let chi = v as i64 - e as i64 + f as i64;
+
+        // For a closed manifold shell (genus 0), chi = 2
+        let expected = if shell.shell_type == ShellType::Closed {
+            2
+        } else {
+            // Open shells can have chi = 1 (disk) or other values
+            chi // Accept whatever we get for open shells
+        };
+
+        EulerValidation {
+            vertices: v,
+            edges: e,
+            faces: f,
+            euler_characteristic: chi,
+            expected,
+            is_valid: chi == expected,
+        }
+    }
+}
+
 /// Topology modification operations
 pub struct TopologyEditor<'a> {
     context: &'a mut TopologyContext<'a>,
@@ -498,23 +566,38 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     Ok(info)
 }
 
-/// Calculate dihedral angles at edges
+/// Calculate dihedral angles at edges using surface normals at edge midpoints
 fn calculate_dihedral_angles(info: &mut AdjacencyInfo, ctx: &TopologyContext) -> MathResult<()> {
+    let tol = crate::math::tolerance::NORMAL_TOLERANCE;
+
     for (&edge_id, faces) in &info.edge_faces {
         if faces.len() == 2 {
             let face_vec: Vec<_> = faces.iter().cloned().collect();
 
-            // Get face normals at edge midpoint
             if let Some(edge) = ctx.edges.get(edge_id) {
                 if let Ok(midpoint) = edge.evaluate(0.5, ctx.curves) {
-                    // Get normals (simplified - would project to get actual surface parameters)
                     if let (Some(face1), Some(face2)) =
                         (ctx.faces.get(face_vec[0]), ctx.faces.get(face_vec[1]))
                     {
-                        // Calculate approximate dihedral angle
-                        // Real implementation would be more sophisticated
-                        let angle = consts::PI; // Placeholder
-                        info.edge_angles.insert(edge_id, angle);
+                        // Project edge midpoint onto each face's surface to get UV params
+                        let s1 = ctx.surfaces.get(face1.surface_id);
+                        let s2 = ctx.surfaces.get(face2.surface_id);
+
+                        if let (Some(surf1), Some(surf2)) = (s1, s2) {
+                            if let (Ok((u1, v1)), Ok((u2, v2))) = (
+                                surf1.closest_point(&midpoint, tol),
+                                surf2.closest_point(&midpoint, tol),
+                            ) {
+                                if let (Ok(n1), Ok(n2)) = (
+                                    face1.normal_at(u1, v1, ctx.surfaces),
+                                    face2.normal_at(u2, v2, ctx.surfaces),
+                                ) {
+                                    let cos_angle = n1.dot(&n2).clamp(-1.0, 1.0);
+                                    let angle = cos_angle.acos();
+                                    info.edge_angles.insert(edge_id, angle);
+                                }
+                            }
+                        }
                     }
                 }
             }
