@@ -77,7 +77,7 @@ mod math_benchmarks_tests {
             // Normalize
             let start = Instant::now();
             for _ in 0..count {
-                std::hint::black_box(v1.normalize());
+                let _ = std::hint::black_box(v1.normalize());
             }
             let duration = start.elapsed();
             print_performance("Vector3::normalize", count, duration);
@@ -157,7 +157,7 @@ mod math_benchmarks_tests {
             // Inverse
             let start = Instant::now();
             for _ in 0..count {
-                std::hint::black_box(m1.inverse());
+                let _ = std::hint::black_box(m1.inverse());
             }
             let duration = start.elapsed();
             print_performance("Matrix4::inverse", count, duration);
@@ -236,7 +236,7 @@ mod math_benchmarks_tests {
             let e1 = v1 - v0;
             let e2 = v2 - v0;
             let normal = e1.cross(&e2).normalize();
-            std::hint::black_box(normal);
+            let _ = std::hint::black_box(normal);
         }
         let duration = start.elapsed();
         print_performance("Triangle normal calculation", count, duration);

@@ -243,11 +243,17 @@ fn project_point_directional(
         ));
     }
 
-    // Use closest intersection
+    // Use closest intersection. NaN-safe ordering; `intersections` is
+    // guaranteed non-empty by the early-return check above, so `min_by`
+    // returns `Some` here.
     let closest = intersections
         .into_iter()
-        .min_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap())
-        .unwrap();
+        .min_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("intersections verified non-empty above (is_empty early-return)");
 
     Ok(closest)
 }

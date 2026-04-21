@@ -1,31 +1,26 @@
-//! World-class shell representation for B-Rep topology
+//! Shell representation for B-Rep topology.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
+//! Features:
 //! - Manifold and non-manifold shell support
-//! - Efficient face adjacency graphs
-//! - Shell sewing and healing algorithms
-//! - Advanced point-in-shell tests (winding number)
+//! - Face adjacency graphs
+//! - Shell sewing and healing
+//! - Point-in-shell tests (winding number)
 //! - Shell boolean operations
-//! - Volume and mass property calculations
+//! - Volume and mass-property calculations
 //! - Shell offset generation
 //! - Multi-threaded validation
-//!
-//! Performance characteristics:
-//! - Shell creation: < 50ns
-//! - Face adjacency query: < 10ns
-//! - Point-in-shell test: < 1μs
-//! - Volume calculation: < 10μs for 1000 faces
 
-use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
     edge::{EdgeId, EdgeStore},
     face::{Face, FaceId, FaceOrientation, FaceStore, INVALID_FACE_ID},
-    r#loop::LoopStore,
+    r#loop::{LoopId, LoopStore},
     surface::SurfaceStore,
-    vertex::VertexStore,
+    vertex::{VertexId, VertexStore},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::{Arc, RwLock};
 
 /// Shell ID type
@@ -133,7 +128,7 @@ impl Default for HealingOptions {
     }
 }
 
-/// World-class shell representation
+/// Shell representation
 #[derive(Debug, Clone)]
 pub struct Shell {
     /// Unique identifier
@@ -214,11 +209,11 @@ impl Shell {
         let mut edge_conn = self
             .edge_connectivity
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell edge_connectivity RwLock poisoned");
         let mut face_adj = self
             .face_adjacency
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell face_adjacency RwLock poisoned");
 
         edge_conn.clear();
         face_adj.clear();
@@ -295,9 +290,10 @@ impl Shell {
                 if let Some(adj) = face_adj.get_mut(&face_id) {
                     for &(other_face_id, _) in &conn.faces {
                         if other_face_id != face_id {
-                            if let Some(faces) = adj.adjacent_faces.get_mut(&edge_id) {
-                                faces.push(other_face_id);
-                            }
+                            adj.adjacent_faces
+                                .get_mut(&edge_id)
+                                .expect("adjacent_faces entry for edge_id inserted in loop above")
+                                .push(other_face_id);
                         }
                     }
                 }
@@ -312,7 +308,7 @@ impl Shell {
         let face_adj = self
             .face_adjacency
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell face_adjacency RwLock poisoned");
         if let Some(adj) = face_adj.get(&face_id) {
             let mut adjacent = HashSet::new();
             for faces in adj.adjacent_faces.values() {
@@ -329,7 +325,7 @@ impl Shell {
         let edge_conn = self
             .edge_connectivity
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell edge_connectivity RwLock poisoned");
         edge_conn
             .iter()
             .filter(|(_, conn)| conn.is_boundary)
@@ -342,7 +338,7 @@ impl Shell {
         let edge_conn = self
             .edge_connectivity
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell edge_connectivity RwLock poisoned");
         edge_conn
             .iter()
             .filter(|(_, conn)| conn.is_non_manifold)
@@ -362,7 +358,7 @@ impl Shell {
             return Ok(self
                 .cached_stats
                 .as_ref()
-                .expect("cached_stats present after is_some check"));
+                .expect("cached_stats.is_some() verified above"));
         }
 
         let mut vertices = HashSet::new();
@@ -411,7 +407,7 @@ impl Shell {
         let edge_conn = self
             .edge_connectivity
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell edge_connectivity RwLock poisoned");
         for conn in edge_conn.values() {
             if conn.is_boundary {
                 boundary_edges += 1;
@@ -448,7 +444,7 @@ impl Shell {
         Ok(self
             .cached_stats
             .as_ref()
-            .expect("cached_stats was just set"))
+            .expect("cached_stats was assigned to Some(..) immediately above"))
     }
 
     /// Calculate mass properties (cached)
@@ -466,7 +462,7 @@ impl Shell {
             return Ok(self
                 .cached_mass_props
                 .as_ref()
-                .expect("cached_mass_props present after is_some check"));
+                .expect("cached_mass_props.is_some() verified above"));
         }
 
         let mut total_area = 0.0;
@@ -513,7 +509,7 @@ impl Shell {
             let size = self
                 .cached_stats
                 .as_ref()
-                .map(|s| s.bbox_max - s.bbox_min)
+                .map(|s| (s.bbox_max - s.bbox_min))
                 .unwrap_or(Vector3::ONE);
 
             // Box approximation for inertia
@@ -542,7 +538,7 @@ impl Shell {
         Ok(self
             .cached_mass_props
             .as_ref()
-            .expect("cached_mass_props was just set"))
+            .expect("cached_mass_props was assigned to Some(..) immediately above"))
     }
 
     /// Advanced point-in-shell test using winding number
@@ -553,8 +549,8 @@ impl Shell {
         loop_store: &LoopStore,
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
-        _surface_store: &SurfaceStore,
-        _tolerance: Tolerance,
+        surface_store: &SurfaceStore,
+        tolerance: Tolerance,
     ) -> MathResult<bool> {
         if self.shell_type != ShellType::Closed {
             return Err(MathError::InvalidParameter(
@@ -760,7 +756,7 @@ impl Shell {
         face_store: &FaceStore,
         surface_store: &mut SurfaceStore,
     ) -> MathResult<Shell> {
-        let offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
+        let mut offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
 
         for &face_id in &self.faces {
             if let Some(face) = face_store.get(face_id) {
@@ -813,13 +809,13 @@ impl Shell {
 
     pub fn edges(
         &self,
-        _face_store: &FaceStore,
-        _loop_store: &LoopStore,
+        face_store: &FaceStore,
+        loop_store: &LoopStore,
     ) -> MathResult<HashSet<EdgeId>> {
         let edge_conn = self
             .edge_connectivity
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("shell edge_connectivity RwLock poisoned");
         Ok(edge_conn.keys().cloned().collect())
     }
 
@@ -830,7 +826,7 @@ impl Shell {
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
         surface_store: &SurfaceStore,
-        _tolerance: Tolerance,
+        tolerance: Tolerance,
     ) -> MathResult<f64> {
         let props = self.compute_mass_properties(
             face_store,
@@ -854,7 +850,7 @@ impl Shell {
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
         surface_store: &SurfaceStore,
-        _tolerance: Tolerance,
+        tolerance: Tolerance,
     ) -> MathResult<f64> {
         let props = self.compute_mass_properties(
             face_store,
@@ -881,7 +877,7 @@ impl Shell {
     }
 }
 
-/// World-class shell storage with efficient queries
+/// Shell storage with efficient queries
 #[derive(Debug)]
 pub struct ShellStore {
     /// Shell data
@@ -981,7 +977,7 @@ impl ShellStore {
             if let Some(ref s) = shell {
                 // Remove from face indices
                 for &face_id in &s.faces {
-                    if let Some(shells) = self.face_to_shells.get_mut(&face_id) {
+                    if let Some(mut shells) = self.face_to_shells.get_mut(&face_id) {
                         shells.retain(|&sid| sid != id);
                     }
                 }

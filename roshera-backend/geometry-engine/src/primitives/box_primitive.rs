@@ -418,7 +418,14 @@ impl Primitive for BoxPrimitive {
             // Apply transformation if provided
             if let Some(transform) = params.transform {
                 center = transform.transform_point(&center);
-                normal = transform.transform_vector(&normal).normalize().unwrap();
+                // Face normals from `BoxTopology::FACE_DATA` are unit axis
+                // vectors. Roshera transforms are expected to be rigid (or at
+                // worst uniform-scaling), so the transformed normal has
+                // non-zero magnitude. If a caller supplies a truly degenerate
+                // transform we fall back to the pre-transform unit normal
+                // rather than panicking during box construction.
+                let raw = transform.transform_vector(&normal);
+                normal = raw.normalize().unwrap_or(normal);
             }
 
             let plane = Plane::from_point_normal(center, normal).map_err(|_| {
@@ -436,9 +443,17 @@ impl Primitive for BoxPrimitive {
             let start_vertex = vertices[start_idx];
             let end_vertex = vertices[end_idx];
 
-            // Get vertex positions
-            let start_pos = model.vertices.get_position(start_vertex).unwrap();
-            let end_pos = model.vertices.get_position(end_vertex).unwrap();
+            // Get vertex positions. Both `start_vertex` and `end_vertex` were
+            // added to `model.vertices` earlier in this function, so they are
+            // guaranteed to exist by the local construction order.
+            let start_pos = model
+                .vertices
+                .get_position(start_vertex)
+                .expect("box vertex was added to model.vertices earlier in this function");
+            let end_pos = model
+                .vertices
+                .get_position(end_vertex)
+                .expect("box vertex was added to model.vertices earlier in this function");
 
             // Create line curve
             let line = Line::new(Point3::from(start_pos), Point3::from(end_pos));
@@ -614,7 +629,21 @@ impl Primitive for BoxPrimitive {
 
         // Check each shell
         for shell_id in solid.shell_ids() {
-            let shell = model.shells.get(shell_id).unwrap();
+            // `solid.shell_ids()` only returns IDs owned by this solid in the
+            // model, so a `None` here would indicate a corrupted BRep — skip
+            // the shell and record a validation issue rather than panicking.
+            let Some(shell) = model.shells.get(shell_id) else {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    description: format!(
+                        "Solid references shell {} that is missing from the model",
+                        shell_id
+                    ),
+                    entities: vec![EntityRef::Solid(solid_id)],
+                    suggested_fix: Some("Rebuild box with consistent shell references".to_string()),
+                });
+                continue;
+            };
             let face_count = shell.face_ids().len();
             entities_checked += face_count;
 

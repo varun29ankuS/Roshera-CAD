@@ -8,7 +8,8 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
+use sqlx::postgres::PgRow;
 use sha2::{Sha256, Digest};
 use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature, Signer, Verifier};
 use dashmap::DashMap;
@@ -499,10 +500,18 @@ impl AuditLogger {
         let mut hasher = Sha256::new();
         hasher.update(entry.id.as_bytes());
         hasher.update(entry.timestamp.to_rfc3339().as_bytes());
-        hasher.update(serde_json::to_string(&entry.event_type).unwrap().as_bytes());
+        hasher.update(
+            serde_json::to_string(&entry.event_type)
+                .expect("AuditEntry::event_type Serialize impl is infallible")
+                .as_bytes(),
+        );
         hasher.update(entry.action.as_bytes());
         hasher.update(entry.previous_hash.as_bytes());
-        hasher.update(serde_json::to_string(&entry.details).unwrap().as_bytes());
+        hasher.update(
+            serde_json::to_string(&entry.details)
+                .expect("AuditEntry::details Serialize impl is infallible")
+                .as_bytes(),
+        );
         
         format!("{:x}", hasher.finalize())
     }
@@ -779,14 +788,59 @@ impl AuditLogger {
         Ok(result.unwrap_or_else(|| "genesis".to_string()))
     }
     
-    fn row_to_entry(&self, _row: PgRow) -> Result<AuditEntry> {
-        // Convert database row to AuditEntry
-        todo!()
+    fn row_to_entry(&self, row: PgRow) -> Result<AuditEntry> {
+        let id: Uuid = row.try_get("id")?;
+        let timestamp: DateTime<Utc> = row.try_get("timestamp")?;
+        let event_type_str: String = row.try_get("event_type")?;
+        let event_type: AuditEventType = serde_json::from_str(&event_type_str)
+            .map_err(|e| anyhow!("Failed to deserialize event_type: {}", e))?;
+        let user_id: Option<Uuid> = row.try_get("user_id")?;
+        let session_id: Option<Uuid> = row.try_get("session_id")?;
+        let resource_id: Option<String> = row.try_get("resource_id")?;
+        let resource_type: Option<String> = row.try_get("resource_type")?;
+        let action: String = row.try_get("action")?;
+        let result_str: String = row.try_get("result")?;
+        let result: AuditResult = serde_json::from_str(&result_str)
+            .map_err(|e| anyhow!("Failed to deserialize result: {}", e))?;
+        let ip_address: Option<String> = row.try_get("ip_address")?;
+        let user_agent: Option<String> = row.try_get("user_agent")?;
+        let location: Option<String> = row.try_get("location")?;
+        let details: serde_json::Value = row.try_get("details")?;
+        let risk_score: f32 = row.try_get("risk_score")?;
+        let hash: String = row.try_get("hash")?;
+        let previous_hash: String = row.try_get("previous_hash")?;
+        let signature: Option<Vec<u8>> = row.try_get("signature")?;
+
+        Ok(AuditEntry {
+            id,
+            timestamp,
+            event_type,
+            user_id: user_id.map(UserId),
+            session_id,
+            resource_id,
+            resource_type,
+            action,
+            result,
+            ip_address,
+            user_agent,
+            location,
+            details,
+            risk_score,
+            hash,
+            previous_hash,
+            signature,
+        })
     }
     
     fn clone_for_background(&self) -> AuditLogger {
-        // Create a clone for background tasks
-        todo!()
+        AuditLogger {
+            db: self.db.clone(),
+            config: self.config.clone(),
+            signing_key: None,
+            buffer: Arc::clone(&self.buffer),
+            last_hash: Arc::clone(&self.last_hash),
+            anomaly_detector: Arc::clone(&self.anomaly_detector),
+        }
     }
 }
 

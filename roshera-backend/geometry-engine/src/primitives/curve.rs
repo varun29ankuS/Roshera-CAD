@@ -1,11 +1,11 @@
-//! Analytical curve representations for B-Rep edges
+//! Analytical curve representations for B-Rep edges.
 //!
-//! Industry-standard curve library matching Parasolid/ACIS capabilities:
+//! Supported curve kinds:
 //! - Lines, arcs, ellipses, parabolas, hyperbolas
-//! - NURBS curves with full rational support
+//! - NURBS curves (rational)
 //! - Composite curves and curve-on-surface
-//! - Efficient evaluation and derivative calculations
-//! - Robust intersection and projection algorithms
+//!
+//! Capabilities: evaluation, derivatives, intersection, projection.
 //!
 //! References:
 //! - ISO 10303-42:2022 Geometric and topological representation
@@ -361,7 +361,7 @@ impl CurvePoint {
     }
 }
 
-/// Common trait for all curve types - Parasolid/ACIS compatible
+/// Common trait for all curve types.
 pub trait Curve: fmt::Debug + Send + Sync {
     /// Get self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
@@ -2045,6 +2045,31 @@ impl NurbsCurve {
 
         ders
     }
+
+    /// Build a transient `math::nurbs::NurbsCurve` from this curve's fields.
+    ///
+    /// Used by the thin adapter layer: the math-layer NURBS owns the
+    /// authoritative numerical algorithms (split, subcurve, arc length,
+    /// closest-point) and the primitives layer delegates to it. Each call
+    /// clones the field vectors — the adapter is stateless.
+    fn to_math_curve(&self) -> MathResult<crate::math::nurbs::NurbsCurve> {
+        crate::math::nurbs::NurbsCurve::new(
+            self.control_points.clone(),
+            self.weights.clone(),
+            self.knots.clone(),
+            self.degree,
+        )
+        .map_err(|e| MathError::InvalidParameter(e.to_string()))
+    }
+
+    /// Wrap a `math::nurbs::NurbsCurve` result back into `primitives::NurbsCurve`.
+    ///
+    /// The resulting curve's `range` spans `[knots[degree], knots[n]]`, the
+    /// natural domain of a clamped NURBS curve.
+    fn from_math_curve(m: crate::math::nurbs::NurbsCurve) -> MathResult<Self> {
+        let knots = m.knots.values().to_vec();
+        Self::new(m.degree, m.control_points, m.weights, knots)
+    }
 }
 
 impl Curve for NurbsCurve {
@@ -2175,27 +2200,12 @@ impl Curve for NurbsCurve {
     }
 
     fn is_linear(&self, tolerance: Tolerance) -> bool {
-        // Check if all control points are collinear
-        if self.control_points.len() < 3 {
-            return true;
+        // Delegate to math-layer collinearity test (identical algorithm,
+        // single source of truth for the convex-hull linearity check).
+        match self.to_math_curve() {
+            Ok(m) => m.is_linear(tolerance.distance()),
+            Err(_) => self.control_points.len() < 3,
         }
-
-        let p0 = self.control_points[0];
-        let p1 = self.control_points[self.control_points.len() - 1];
-        let dir = (p1 - p0).normalize().unwrap_or(Vector3::X);
-
-        for i in 1..self.control_points.len() - 1 {
-            let p = self.control_points[i];
-            let to_p = p - p0;
-            let proj = dir * to_p.dot(&dir);
-            let dist = (to_p - proj).magnitude();
-
-            if dist > tolerance.distance() {
-                return false;
-            }
-        }
-
-        true
     }
 
     fn is_planar(&self, tolerance: Tolerance) -> bool {
@@ -2234,30 +2244,18 @@ impl Curve for NurbsCurve {
     }
 
     fn reversed(&self) -> Box<dyn Curve> {
-        let mut rev_points = self.control_points.clone();
-        rev_points.reverse();
-
-        let mut rev_weights = self.weights.clone();
-        rev_weights.reverse();
-
-        // Reverse and remap knots
-        let mut rev_knots = Vec::with_capacity(self.knots.len());
-        let (a, b) = match (self.knots.first(), self.knots.last()) {
-            (Some(first), Some(last)) => (*first, *last),
-            _ => return Box::new(self.clone()), // Return unchanged if knots are empty
-        };
-
-        for knot in self.knots.iter().rev() {
-            rev_knots.push(a + b - knot);
+        // Delegate to math-layer reversal (same k' = (u_min + u_max) - k
+        // knot remap). On the degenerate empty-knot path the math layer
+        // returns Err; fall back to an unchanged clone to preserve the
+        // existing infallible Curve::reversed contract.
+        match self
+            .to_math_curve()
+            .and_then(|m| m.reversed().map_err(|e| MathError::InvalidParameter(e.to_string())))
+            .and_then(Self::from_math_curve)
+        {
+            Ok(rev) => Box::new(rev),
+            Err(_) => Box::new(self.clone()),
         }
-
-        Box::new(NurbsCurve {
-            degree: self.degree,
-            control_points: rev_points,
-            weights: rev_weights,
-            knots: rev_knots,
-            range: self.range,
-        })
     }
 
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Curve> {
@@ -2277,16 +2275,15 @@ impl Curve for NurbsCurve {
     }
 
     fn arc_length_between(&self, t1: f64, t2: f64, tolerance: Tolerance) -> MathResult<f64> {
-        // Adaptive Gaussian quadrature for arc length
+        // Delegate to math-layer adaptive Simpson integrator with
+        // Richardson extrapolation. ParameterRange clamping matches the
+        // math layer's own bounds clamp, so pre-clamp is redundant but
+        // kept for input-validation clarity.
         let t1 = self.range.clamp(t1);
         let t2 = self.range.clamp(t2);
-
-        if (t2 - t1).abs() < consts::EPSILON {
-            return Ok(0.0);
-        }
-
-        // Use adaptive subdivision
-        self.adaptive_arc_length(t1, t2, tolerance.distance(), 8)
+        Ok(self
+            .to_math_curve()?
+            .arc_length_between(t1, t2, tolerance.distance()))
     }
 
     fn parameter_at_length(&self, target_length: f64, tolerance: Tolerance) -> MathResult<f64> {
@@ -2327,55 +2324,9 @@ impl Curve for NurbsCurve {
     }
 
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, Point3)> {
-        // Newton-Raphson iteration for closest point
-        // Initial guess using chord approximation
-        let n_samples = 20;
-        let mut best_t = 0.0;
-        let mut best_dist_sq = f64::INFINITY;
-
-        // Find initial guess
-        for i in 0..=n_samples {
-            let t = i as f64 / n_samples as f64;
-            let p = self.point_at(t)?;
-            let dist_sq = p.distance_squared(point);
-
-            if dist_sq < best_dist_sq {
-                best_dist_sq = dist_sq;
-                best_t = t;
-            }
-        }
-
-        // Refine with Newton-Raphson
-        let mut t = best_t;
-        for _ in 0..10 {
-            let eval = self.evaluate(t)?;
-            let to_point = *point - eval.position;
-
-            // f(t) = (C(t) - P) · C'(t) = 0
-            let f = to_point.dot(&eval.derivative1);
-
-            if f.abs() < tolerance.distance() {
-                break;
-            }
-
-            // f'(t) = C'(t) · C'(t) + (C(t) - P) · C''(t)
-            let df = eval.derivative1.magnitude_squared()
-                + if let Some(d2) = eval.derivative2 {
-                    to_point.dot(&d2)
-                } else {
-                    0.0
-                };
-
-            if df.abs() < consts::EPSILON {
-                break;
-            }
-
-            let dt = f / df;
-            t = (t - dt).clamp(0.0, 1.0);
-        }
-
-        let closest = self.point_at(t)?;
-        Ok((t, closest))
+        // Delegate to math-layer closest-point solver: 20-sample coarse
+        // search + bounded Newton-Raphson on f(u) = (C(u) - P) · C'(u).
+        Ok(self.to_math_curve()?.closest_point(point, tolerance.distance()))
     }
 
     fn parameters_at_point(&self, point: &Point3, tolerance: Tolerance) -> Vec<f64> {
@@ -2404,71 +2355,24 @@ impl Curve for NurbsCurve {
     }
 
     fn split(&self, t: f64) -> MathResult<(Box<dyn Curve>, Box<dyn Curve>)> {
-        // NURBS curve splitting using knot insertion
+        // Delegate to the math-layer NURBS curve. The math-layer `split`
+        // implements Piegl-Tiller Algorithm 5.4 correctly; the previous
+        // primitives-layer implementation used a `find_span` slice boundary
+        // that dropped the shared split control point on every call.
         let t = self.range.clamp(t);
-
-        // Insert knot at t with multiplicity = degree
-        let mut curve = self.clone();
-        curve.insert_knot(t, self.degree)?;
-
-        // Find the index where to split
-        let split_idx = curve.find_span(t);
-
-        // Create left curve
-        let left_points = curve.control_points[..=split_idx].to_vec();
-        let left_weights = curve.weights[..=split_idx].to_vec();
-        let mut left_knots = curve.knots[..=split_idx + self.degree + 1].to_vec();
-
-        // Normalize left knots to [0, 1]
-        let left_start = left_knots[self.degree];
-        let left_end = left_knots[split_idx + 1];
-        for k in &mut left_knots {
-            *k = (*k - left_start) / (left_end - left_start);
-        }
-
-        // Create right curve
-        let right_points = curve.control_points[split_idx..].to_vec();
-        let right_weights = curve.weights[split_idx..].to_vec();
-        let mut right_knots = curve.knots[split_idx..].to_vec();
-
-        // Normalize right knots to [0, 1]
-        let right_start = right_knots[0];
-        let right_end = right_knots[right_knots.len() - self.degree - 1];
-        for k in &mut right_knots {
-            *k = (*k - right_start) / (right_end - right_start);
-        }
-
-        let left = Box::new(NurbsCurve::new(
-            self.degree,
-            left_points,
-            left_weights,
-            left_knots,
-        )?);
-
-        let right = Box::new(NurbsCurve::new(
-            self.degree,
-            right_points,
-            right_weights,
-            right_knots,
-        )?);
-
-        Ok((left, right))
+        let (left, right) = self.to_math_curve()?.split(t)?;
+        Ok((
+            Box::new(Self::from_math_curve(left)?),
+            Box::new(Self::from_math_curve(right)?),
+        ))
     }
 
     fn subcurve(&self, t1: f64, t2: f64) -> MathResult<Box<dyn Curve>> {
+        // Delegate to math-layer subcurve (implemented on top of `split`).
         let t1 = self.range.clamp(t1);
         let t2 = self.range.clamp(t2);
-
-        if t1 > t2 {
-            return self.subcurve(t2, t1);
-        }
-
-        // Split at t2 first, then at t1
-        let (left, _) = self.split(t2)?;
-        let t1_normalized = t1 / t2; // t1 in the parameter space of left curve
-        let (_, result) = left.split(t1_normalized)?;
-
-        Ok(result)
+        let sub = self.to_math_curve()?.subcurve(t1, t2)?;
+        Ok(Box::new(Self::from_math_curve(sub)?))
     }
 
     fn check_continuity(
@@ -3621,8 +3525,13 @@ impl NurbsCurve {
             new_weights.push(new_w);
         }
 
-        // Copy remaining control points
-        for i in k + 1..n {
+        // Copy remaining control points.
+        //
+        // Boehm's algorithm: after computing Q[k-p+1..=k], the original
+        // control points P[k..=n-1] are retained with shifted indices.
+        // The previous `k + 1..n` bound silently dropped P[k], producing
+        // incorrect geometry on every knot insertion.
+        for i in k..n {
             new_points.push(self.control_points[i]);
             new_weights.push(self.weights[i]);
         }

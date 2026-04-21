@@ -87,12 +87,15 @@ pub struct TessellationCache {
 }
 
 impl TessellationCache {
-    /// Create a new tessellation cache
+    /// Create a new tessellation cache.
+    ///
+    /// `max_items` must be non-zero; a misconfigured zero is clamped to 1
+    /// rather than panicking.
     pub fn new(max_items: usize, ttl_seconds: u64) -> Self {
+        let capacity = std::num::NonZeroUsize::new(max_items)
+            .unwrap_or_else(|| std::num::NonZeroUsize::new(1).expect("1 is non-zero"));
         Self {
-            cache: Arc::new(RwLock::new(LruCache::new(
-                std::num::NonZeroUsize::new(max_items).unwrap(),
-            ))),
+            cache: Arc::new(RwLock::new(LruCache::new(capacity))),
             entity_keys: DashMap::new(),
             branch_entities: DashMap::new(),
             max_items,
@@ -237,7 +240,11 @@ impl TessellationCache {
         let mut oldest: Option<(TessellationKey, DateTime<Utc>)> = None;
 
         for (key, item) in cache.iter() {
-            if oldest.is_none() || item.last_accessed < oldest.as_ref().unwrap().1 {
+            let is_older = match oldest.as_ref() {
+                None => true,
+                Some((_, ts)) => item.last_accessed < *ts,
+            };
+            if is_older {
                 oldest = Some((key.clone(), item.last_accessed));
             }
         }

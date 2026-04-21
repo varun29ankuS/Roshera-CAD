@@ -328,21 +328,21 @@
         <h2 class="section-title">🤖 AI/LLM Performance</h2>
         <div class="grid">
             <div class="card">
-                <h2>Ollama Status</h2>
+                <h2>LLM Provider</h2>
                 <div class="metrics">
                     <div class="metric">
                         <div class="metric-label">Status</div>
-                        <div class="metric-value" id="ollama-status">
+                        <div class="metric-value" id="llm-status">
                             <span class="status warning">Checking...</span>
                         </div>
                     </div>
                     <div class="metric">
-                        <div class="metric-label">Model</div>
-                        <div class="metric-value small" id="ollama-model">mistral:7b</div>
+                        <div class="metric-label">Provider</div>
+                        <div class="metric-value small" id="llm-provider">—</div>
                     </div>
                     <div class="metric">
                         <div class="metric-label">Avg Response</div>
-                        <div class="metric-value small" id="ollama-response">0ms</div>
+                        <div class="metric-value small" id="llm-response">0ms</div>
                     </div>
                     <div class="metric">
                         <div class="metric-label">Success Rate</div>
@@ -704,11 +704,12 @@
                 }
                 
                 if (data.ai) {
-                    document.getElementById('ollama-status').innerHTML = 
-                        data.ai.ollama_available ? 
-                        '<span class="status healthy">Online</span>' : 
-                        '<span class="status error">Offline</span>';
-                    document.getElementById('ollama-response').textContent = `${data.ai.avg_response_ms}ms`;
+                    document.getElementById('llm-status').innerHTML =
+                        data.ai.llm_provider_configured ?
+                        '<span class="status healthy">Configured</span>' :
+                        '<span class="status warning">Mock</span>';
+                    document.getElementById('llm-provider').textContent = data.ai.llm_provider || '—';
+                    document.getElementById('llm-response').textContent = `${data.ai.avg_response_ms}ms`;
                     document.getElementById('parse-success').textContent = `${data.ai.success_rate}%`;
                     document.getElementById('total-commands').textContent = data.ai.total_commands;
                 }

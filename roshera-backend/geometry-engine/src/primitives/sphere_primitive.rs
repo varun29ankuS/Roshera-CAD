@@ -3,11 +3,11 @@
 //! This module implements a world-class parametric sphere primitive that meets
 //! all requirements for exact geometry, complete topology, and parametric updates.
 
-use crate::math::{consts, Matrix4, Point3, Tolerance};
+use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Arc, ParameterRange},
-    edge::{Edge, EdgeId, EdgeOrientation},
-    face::{FaceId, FaceOrientation},
+    edge::{Edge, EdgeOrientation},
+    face::FaceOrientation,
     primitive_traits::{
         EntityRef, IssueSeverity, ManifoldStatus, ParameterDefinition, ParameterSchema,
         ParameterType, Primitive, PrimitiveError, ValidationIssue, ValidationMetrics,
@@ -18,7 +18,6 @@ use crate::primitives::{
     solid::Solid,
     solid::SolidId,
     topology_builder::BRepModel,
-    vertex::VertexId,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -86,18 +85,19 @@ impl SphereParameters {
         u_segments: u32,
         v_segments: u32,
     ) -> Result<Self, PrimitiveError> {
-        if u_segments < 4 {
+        const MAX_SEGMENTS: u32 = 4096;
+        if u_segments < 4 || u_segments > MAX_SEGMENTS {
             return Err(PrimitiveError::InvalidParameters {
                 parameter: "u_segments".to_string(),
                 value: u_segments.to_string(),
-                constraint: "must be at least 4".to_string(),
+                constraint: format!("must be between 4 and {MAX_SEGMENTS}"),
             });
         }
-        if v_segments < 3 {
+        if v_segments < 3 || v_segments > MAX_SEGMENTS {
             return Err(PrimitiveError::InvalidParameters {
                 parameter: "v_segments".to_string(),
                 value: v_segments.to_string(),
-                constraint: "must be at least 3".to_string(),
+                constraint: format!("must be between 3 and {MAX_SEGMENTS}"),
             });
         }
 
@@ -130,140 +130,77 @@ impl Primitive for SpherePrimitive {
             })?;
         let surface_id = model.surfaces.add(Box::new(sphere_surface));
 
-        let _vertices: Vec<VertexId> = Vec::new();
-        let _edges: Vec<EdgeId> = Vec::new();
-        let mut faces: Vec<FaceId> = Vec::new();
+        // Analytical B-Rep sphere: minimal cell complex
+        //
+        // Topology: V=2, E=1, F=1 → χ = 2-1+1 = 2 (correct for genus-0)
+        //
+        // Two vertices at poles, one seam edge along the prime meridian
+        // (great circle from south pole to north pole at θ=0).
+        // Single face has one outer loop: seam_forward, then seam_reversed
+        // (the loop traverses the seam twice — once going up, once coming back down
+        // the "other side" — which is topologically valid for a closed surface).
 
-        // Create vertex grid
-        // Top pole
-        let top_pole = model.vertices.add_or_find(
+        // Vertices: north and south poles
+        let north_pole = model.vertices.add_or_find(
             params.center.x,
             params.center.y,
             params.center.z + params.radius,
             tolerance.distance(),
         );
-
-        // Latitude rings
-        let mut vertex_grid: Vec<Vec<VertexId>> = Vec::new();
-        for j in 1..params.v_segments {
-            let phi = consts::PI * (j as f64) / (params.v_segments as f64);
-            let z = params.radius * phi.cos();
-            let r = params.radius * phi.sin();
-
-            let mut ring = Vec::new();
-            for i in 0..params.u_segments {
-                let theta = 2.0 * consts::PI * (i as f64) / (params.u_segments as f64);
-                let x = r * theta.cos();
-                let y = r * theta.sin();
-
-                let vertex_id = model.vertices.add_or_find(
-                    params.center.x + x,
-                    params.center.y + y,
-                    params.center.z + z,
-                    tolerance.distance(),
-                );
-                ring.push(vertex_id);
-            }
-            vertex_grid.push(ring);
-        }
-
-        // Bottom pole
-        let bottom_pole = model.vertices.add_or_find(
+        let south_pole = model.vertices.add_or_find(
             params.center.x,
             params.center.y,
             params.center.z - params.radius,
             tolerance.distance(),
         );
 
-        // Create faces
-        // Top cap - triangular faces
-        for i in 0..params.u_segments {
-            let next_i = (i + 1) % params.u_segments;
+        // Seam edge: great circle arc from south pole to north pole along θ=0
+        // This is a semicircle in the XZ plane.
+        //
+        // Arc::new computes x_axis = perpendicular(normal).
+        // With normal = (0,-1,0), x_axis = -Z, y_axis = normal×x_axis = X.
+        // point_at(angle) = center + r*(cos(angle)*(-Z) + sin(angle)*X)
+        //   angle=0  → center - r*Z = south pole
+        //   angle=π  → center + r*Z = north pole
+        //   angle=π/2→ center + r*X = equator (+X side)
+        let seam_arc = Arc::new(
+            params.center,
+            Vector3::new(0.0, -1.0, 0.0), // normal: -Y
+            params.radius,
+            0.0,                  // start angle (south pole)
+            std::f64::consts::PI, // sweep angle (semicircle to north pole)
+        )
+        .map_err(|e| PrimitiveError::GeometryError {
+            operation: "create_seam_arc".to_string(),
+            details: format!("Failed to create seam arc: {:?}", e),
+        })?;
+        let seam_curve_id = model.curves.add(Box::new(seam_arc));
 
-            let v1 = vertex_grid[0][i as usize];
-            let v2 = vertex_grid[0][next_i as usize];
+        let seam_edge = Edge::new(
+            0,
+            south_pole,
+            north_pole,
+            seam_curve_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        // Use add() not add_or_find() — the seam must appear twice in the loop
+        let seam_edge_id = model.edges.add(seam_edge);
 
-            // Create edges
-            let edges = create_triangle_edges(model, &params, top_pole, v1, v2, tolerance)?;
+        // Face: single spherical face.
+        // Outer loop traverses seam forward (S→N) then reversed (N→S on opposite side).
+        let mut outer_loop = Loop::new(0, LoopType::Outer);
+        outer_loop.add_edge(seam_edge_id, true); // forward: S→N
+        outer_loop.add_edge(seam_edge_id, false); // reversed: N→S
+        let loop_id = model.loops.add(outer_loop);
 
-            // Create face
-            let mut face_loop = Loop::new(0, LoopType::Outer);
-            for edge_id in edges {
-                face_loop.add_edge(edge_id, true);
-            }
-            let loop_id = model.loops.add(face_loop);
+        let face =
+            crate::primitives::face::Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        let face_id = model.faces.add(face);
 
-            let face = crate::primitives::face::Face::new(
-                0,
-                surface_id,
-                loop_id,
-                FaceOrientation::Forward,
-            );
-            faces.push(model.faces.add(face));
-        }
-
-        // Middle bands - quadrilateral faces
-        for j in 0..(params.v_segments - 2) {
-            for i in 0..params.u_segments {
-                let next_i = (i + 1) % params.u_segments;
-
-                let v1 = vertex_grid[j as usize][i as usize];
-                let v2 = vertex_grid[j as usize][next_i as usize];
-                let v3 = vertex_grid[(j + 1) as usize][next_i as usize];
-                let v4 = vertex_grid[(j + 1) as usize][i as usize];
-
-                // Create edges
-                let edges = create_quad_edges(model, &params, v1, v2, v3, v4, j, i, tolerance)?;
-
-                // Create face
-                let mut face_loop = Loop::new(0, LoopType::Outer);
-                for edge_id in edges {
-                    face_loop.add_edge(edge_id, true);
-                }
-                let loop_id = model.loops.add(face_loop);
-
-                let face = crate::primitives::face::Face::new(
-                    0,
-                    surface_id,
-                    loop_id,
-                    FaceOrientation::Forward,
-                );
-                faces.push(model.faces.add(face));
-            }
-        }
-
-        // Bottom cap - triangular faces
-        let last_ring = vertex_grid.len() - 1;
-        for i in 0..params.u_segments {
-            let next_i = (i + 1) % params.u_segments;
-
-            let v1 = vertex_grid[last_ring][i as usize];
-            let v2 = vertex_grid[last_ring][next_i as usize];
-
-            // Create edges
-            let edges = create_triangle_edges(model, &params, v1, bottom_pole, v2, tolerance)?;
-
-            // Create face
-            let mut face_loop = Loop::new(0, LoopType::Outer);
-            for edge_id in edges {
-                face_loop.add_edge(edge_id, true);
-            }
-            let loop_id = model.loops.add(face_loop);
-
-            let face = crate::primitives::face::Face::new(
-                0,
-                surface_id,
-                loop_id,
-                FaceOrientation::Forward,
-            );
-            faces.push(model.faces.add(face));
-        }
-
-        // Create shell and solid
+        // Shell and solid
         let mut shell = Shell::new(0, ShellType::Closed);
-        for face_id in faces {
-            shell.add_face(face_id);
-        }
+        shell.add_face(face_id);
         let shell_id = model.shells.add(shell);
 
         let solid = Solid::new(0, shell_id);
@@ -448,191 +385,6 @@ impl Primitive for SpherePrimitive {
             ],
             constraints: vec![],
         }
-    }
-}
-
-// Helper functions for edge creation
-fn create_triangle_edges(
-    model: &mut BRepModel,
-    params: &SphereParameters,
-    v1: VertexId,
-    v2: VertexId,
-    v3: VertexId,
-    _tolerance: Tolerance,
-) -> Result<Vec<EdgeId>, PrimitiveError> {
-    let mut edges = Vec::new();
-
-    // Get vertex positions
-    let p1 = model
-        .vertices
-        .get_position(v1)
-        .ok_or_else(|| PrimitiveError::TopologyError {
-            message: format!("Vertex {:?} not found", v1),
-            euler_characteristic: None,
-        })?;
-    let p2 = model
-        .vertices
-        .get_position(v2)
-        .ok_or_else(|| PrimitiveError::TopologyError {
-            message: format!("Vertex {:?} not found", v2),
-            euler_characteristic: None,
-        })?;
-    let p3 = model
-        .vertices
-        .get_position(v3)
-        .ok_or_else(|| PrimitiveError::TopologyError {
-            message: format!("Vertex {:?} not found", v3),
-            euler_characteristic: None,
-        })?;
-
-    // Create arcs for sphere edges
-    // Edge 1: v1 to v2
-    let arc1 = create_sphere_arc(
-        params.center,
-        params.radius,
-        Point3::new(p1[0], p1[1], p1[2]),
-        Point3::new(p2[0], p2[1], p2[2]),
-    )?;
-    let curve1 = model.curves.add(Box::new(arc1));
-    let edge1 = Edge::new(
-        0,
-        v1,
-        v2,
-        curve1,
-        EdgeOrientation::Forward,
-        ParameterRange::new(0.0, 1.0),
-    );
-    edges.push(model.edges.add_or_find(edge1));
-
-    // Edge 2: v2 to v3
-    let arc2 = create_sphere_arc(
-        params.center,
-        params.radius,
-        Point3::new(p2[0], p2[1], p2[2]),
-        Point3::new(p3[0], p3[1], p3[2]),
-    )?;
-    let curve2 = model.curves.add(Box::new(arc2));
-    let edge2 = Edge::new(
-        0,
-        v2,
-        v3,
-        curve2,
-        EdgeOrientation::Forward,
-        ParameterRange::new(0.0, 1.0),
-    );
-    edges.push(model.edges.add_or_find(edge2));
-
-    // Edge 3: v3 to v1
-    let arc3 = create_sphere_arc(
-        params.center,
-        params.radius,
-        Point3::new(p3[0], p3[1], p3[2]),
-        Point3::new(p1[0], p1[1], p1[2]),
-    )?;
-    let curve3 = model.curves.add(Box::new(arc3));
-    let edge3 = Edge::new(
-        0,
-        v3,
-        v1,
-        curve3,
-        EdgeOrientation::Forward,
-        ParameterRange::new(0.0, 1.0),
-    );
-    edges.push(model.edges.add_or_find(edge3));
-
-    Ok(edges)
-}
-
-fn create_quad_edges(
-    model: &mut BRepModel,
-    params: &SphereParameters,
-    v1: VertexId,
-    v2: VertexId,
-    v3: VertexId,
-    v4: VertexId,
-    _j: u32,
-    _i: u32,
-    _tolerance: Tolerance,
-) -> Result<Vec<EdgeId>, PrimitiveError> {
-    let mut edges = Vec::new();
-
-    // Get vertex positions
-    let positions = [v1, v2, v3, v4]
-        .iter()
-        .map(|&v| {
-            model
-                .vertices
-                .get_position(v)
-                .ok_or_else(|| PrimitiveError::TopologyError {
-                    message: format!("Vertex {:?} not found", v),
-                    euler_characteristic: None,
-                })
-                .map(|p| Point3::new(p[0], p[1], p[2]))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Create edges
-    let edge_pairs = [(0, 1), (1, 2), (2, 3), (3, 0)];
-    for &(start_idx, end_idx) in &edge_pairs {
-        let arc = create_sphere_arc(
-            params.center,
-            params.radius,
-            positions[start_idx],
-            positions[end_idx],
-        )?;
-        let curve_id = model.curves.add(Box::new(arc));
-
-        let vertices = [v1, v2, v3, v4];
-        let edge = Edge::new(
-            0,
-            vertices[start_idx],
-            vertices[end_idx],
-            curve_id,
-            EdgeOrientation::Forward,
-            ParameterRange::new(0.0, 1.0),
-        );
-        edges.push(model.edges.add_or_find(edge));
-    }
-
-    Ok(edges)
-}
-
-fn create_sphere_arc(
-    center: Point3,
-    radius: f64,
-    start: Point3,
-    end: Point3,
-) -> Result<Arc, PrimitiveError> {
-    // Calculate axis for the arc
-    let v1 = (start - center)
-        .normalize()
-        .map_err(|_| PrimitiveError::GeometryError {
-            operation: "normalize_vector".to_string(),
-            details: "Failed to normalize start vector".to_string(),
-        })?;
-    let v2 = (end - center)
-        .normalize()
-        .map_err(|_| PrimitiveError::GeometryError {
-            operation: "normalize_vector".to_string(),
-            details: "Failed to normalize end vector".to_string(),
-        })?;
-
-    let axis = v1.cross(&v2);
-    if axis.magnitude_squared() < 1e-10 {
-        // Points are collinear, use perpendicular axis
-        let axis = v1.perpendicular();
-        let angle = if v1.dot(&v2) > 0.0 { 0.0 } else { consts::PI };
-        Arc::new(center, axis, radius, 0.0, angle).map_err(|_| PrimitiveError::GeometryError {
-            operation: "create_arc".to_string(),
-            details: "Failed to create sphere arc".to_string(),
-        })
-    } else {
-        let axis = axis.normalize().unwrap();
-        let angle = v1.angle(&v2).unwrap_or(0.0);
-        Arc::new(center, axis, radius, 0.0, angle).map_err(|_| PrimitiveError::GeometryError {
-            operation: "create_arc".to_string(),
-            details: "Failed to create sphere arc".to_string(),
-        })
     }
 }
 

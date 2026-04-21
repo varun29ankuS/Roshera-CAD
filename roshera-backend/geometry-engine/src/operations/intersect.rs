@@ -3,14 +3,15 @@
 //! Computes intersections between various geometric entities including
 //! curve-curve, curve-surface, and surface-surface intersections.
 
-use super::{OperationError, OperationResult};
-use crate::math::{MathResult, Point3, Tolerance, Vector3};
+use super::{CommonOptions, OperationError, OperationResult};
+use crate::math::{MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     surface::Surface,
     topology_builder::BRepModel,
+    vertex::VertexId,
 };
 
 /// Default tolerance for parametric comparisons
@@ -302,7 +303,7 @@ fn intersect_line_line(
     if denom.abs() < tolerance.distance() {
         // Lines are in parallel planes, check 3D
         let denom_xz = a.x * b.z - a.z * b.x;
-        let _denom_yz = a.y * b.z - a.z * b.y;
+        let denom_yz = a.y * b.z - a.z * b.y;
 
         if denom_xz.abs() > tolerance.distance() {
             let s = (c.x * b.z - c.z * b.x) / denom_xz;
@@ -392,11 +393,11 @@ fn intersect_line_line(
 
 /// Intersect line and arc
 fn intersect_line_arc(
-    _curve1: &Box<dyn Curve>,
-    _curve2: &Box<dyn Curve>,
-    _edge1: &Edge,
-    _edge2: &Edge,
-    _tolerance: Tolerance,
+    curve1: &Box<dyn Curve>,
+    curve2: &Box<dyn Curve>,
+    edge1: &Edge,
+    edge2: &Edge,
+    tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement line-arc intersection
     Ok(IntersectionResult::None)
@@ -404,11 +405,11 @@ fn intersect_line_arc(
 
 /// Intersect two arcs
 fn intersect_arc_arc(
-    _arc1: &Box<dyn Curve>,
-    _arc2: &Box<dyn Curve>,
-    _edge1: &Edge,
-    _edge2: &Edge,
-    _tolerance: Tolerance,
+    arc1: &Box<dyn Curve>,
+    arc2: &Box<dyn Curve>,
+    edge1: &Edge,
+    edge2: &Edge,
+    tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement arc-arc intersection
     Ok(IntersectionResult::None)
@@ -590,7 +591,11 @@ fn intersect_general_curves(
     // Remove duplicate intersections
     intersections.sort_by(|a, b| match &a.param1 {
         IntersectionParameter::Single(t1) => match &b.param1 {
-            IntersectionParameter::Single(t2) => t1.partial_cmp(t2).unwrap(),
+            // NaN-safe: treat unorderable values as equal so the sort
+            // remains total even if an intersection param is NaN.
+            IntersectionParameter::Single(t2) => {
+                t1.partial_cmp(t2).unwrap_or(std::cmp::Ordering::Equal)
+            }
             _ => std::cmp::Ordering::Equal,
         },
         _ => std::cmp::Ordering::Equal,
@@ -598,10 +603,16 @@ fn intersect_general_curves(
 
     let mut unique_intersections: Vec<IntersectionPoint> = Vec::new();
     for intersection in intersections {
-        if unique_intersections.is_empty()
-            || (intersection.position - unique_intersections.last().unwrap().position).magnitude()
-                > tolerance.distance()
-        {
+        // Short-circuit: if `unique_intersections` is empty we push
+        // unconditionally; only the `else` branch of the `||` accesses
+        // `.last()`, which is guaranteed `Some` there.
+        let is_distinct = match unique_intersections.last() {
+            None => true,
+            Some(last) => {
+                (intersection.position - last.position).magnitude() > tolerance.distance()
+            }
+        };
+        if is_distinct {
             unique_intersections.push(intersection);
         }
     }
@@ -766,10 +777,10 @@ fn intersect_curve_plane(
 
 /// Intersect curve with cylinder
 fn intersect_curve_cylinder(
-    _curve: &Box<dyn Curve>,
-    _cylinder: &Box<dyn Surface>,
-    _edge: &Edge,
-    _tolerance: Tolerance,
+    curve: &Box<dyn Curve>,
+    cylinder: &Box<dyn Surface>,
+    edge: &Edge,
+    tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement curve-cylinder intersection
     Ok(IntersectionResult::None)
@@ -777,10 +788,10 @@ fn intersect_curve_cylinder(
 
 /// Intersect curve with sphere
 fn intersect_curve_sphere(
-    _curve: &Box<dyn Curve>,
-    _sphere: &Box<dyn Surface>,
-    _edge: &Edge,
-    _tolerance: Tolerance,
+    curve: &Box<dyn Curve>,
+    sphere: &Box<dyn Surface>,
+    edge: &Edge,
+    tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement curve-sphere intersection
     Ok(IntersectionResult::None)
@@ -788,10 +799,10 @@ fn intersect_curve_sphere(
 
 /// General curve-surface intersection
 fn intersect_curve_general_surface(
-    _curve: &dyn Curve,
-    _surface: &dyn Surface,
-    _edge: &Edge,
-    _tolerance: Tolerance,
+    curve: &dyn Curve,
+    surface: &dyn Surface,
+    edge: &Edge,
+    tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     // Would implement general marching method
     Ok(IntersectionResult::None)
@@ -830,7 +841,7 @@ fn intersect_plane_plane(
 
         if dist < tolerance.distance() {
             // Planes are coincident - return surface intersection
-            let boundary_curves = Vec::new();
+            let mut boundary_curves = Vec::new();
 
             // For now, return the bounds as a rectangular boundary
             // In a full implementation, we'd compute the actual intersection of the bounded regions
@@ -891,36 +902,61 @@ fn intersect_plane_plane(
     }]))
 }
 
-/// Intersect plane and cylinder
-fn intersect_plane_cylinder(
-    _surface1: &Box<dyn Surface>,
-    _surface2: &Box<dyn Surface>,
-    _tolerance: Tolerance,
-) -> OperationResult<IntersectionResult> {
-    // Plane-cylinder gives ellipse, line, or nothing
-    Ok(IntersectionResult::None)
-}
-
-/// Intersect plane and sphere
-fn intersect_plane_sphere(
-    _surface1: &Box<dyn Surface>,
-    _surface2: &Box<dyn Surface>,
-    _tolerance: Tolerance,
-) -> OperationResult<IntersectionResult> {
-    // Plane-sphere gives circle, point, or nothing
-    Ok(IntersectionResult::None)
-}
-
-/// General surface-surface intersection
+/// General surface-surface intersection — delegates to the canonical math
+/// layer ([`crate::math::surface_intersection::intersect_surfaces`]) and
+/// wraps each traced polyline as a `Box<dyn Curve>` for the `IntersectionResult`.
 fn intersect_general_surfaces(
-    _surface1: &dyn Surface,
-    _surface2: &dyn Surface,
+    surface1: &dyn Surface,
+    surface2: &dyn Surface,
     _face1: &Face,
     _face2: &Face,
-    _tolerance: Tolerance,
+    tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Would implement marching method for general surfaces
-    Ok(IntersectionResult::None)
+    use crate::math::surface_intersection::{
+        intersect_surfaces as math_intersect, intersection_curve_to_nurbs,
+    };
+    use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
+
+    let raw = math_intersect(surface1, surface2, &tolerance).map_err(|e| {
+        OperationError::NumericalError(format!("surface-surface intersection failed: {:?}", e))
+    })?;
+
+    if raw.is_empty() {
+        return Ok(IntersectionResult::None);
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for curve in &raw {
+        // Need at least degree + 1 samples; use cubic degree.
+        if curve.points.len() < 4 {
+            continue;
+        }
+        let math_nurbs = intersection_curve_to_nurbs(curve, 3).map_err(|e| {
+            OperationError::NumericalError(format!("intersection curve fit failed: {:?}", e))
+        })?;
+        let prim = PrimNurbsCurve::new(
+            math_nurbs.degree,
+            math_nurbs.control_points,
+            math_nurbs.weights,
+            math_nurbs.knots.values().to_vec(),
+        )
+        .map_err(|e| {
+            OperationError::NumericalError(format!("primitive NURBS conversion failed: {:?}", e))
+        })?;
+
+        out.push(IntersectionCurve {
+            curve_3d: Box::new(prim),
+            param_curve1: None,
+            param_curve2: None,
+            t_range: (0.0, 1.0),
+        });
+    }
+
+    if out.is_empty() {
+        Ok(IntersectionResult::None)
+    } else {
+        Ok(IntersectionResult::Curves(out))
+    }
 }
 
 // #[cfg(test)]

@@ -259,21 +259,22 @@ fn transform_curves(
     edge_ids: &[EdgeId],
     _transform: &Matrix4,
 ) -> OperationResult<()> {
-    let mut transformed_curves = HashSet::new();
+    // Collect the set of distinct curve IDs referenced by the edges first, so we
+    // do not alias `model.edges` and `model.curves` mutably at the same time.
+    let mut curve_ids: Vec<_> = edge_ids
+        .iter()
+        .filter_map(|&edge_id| model.edges.get(edge_id).map(|e| e.curve_id))
+        .collect();
+    curve_ids.sort_unstable();
+    curve_ids.dedup();
 
-    for &edge_id in edge_ids {
-        if let Some(edge) = model.edges.get(edge_id) {
-            let curve_id = edge.curve_id;
-
-            // Only transform each curve once
-            if transformed_curves.contains(&curve_id) {
-                continue;
-            }
-            transformed_curves.insert(curve_id);
-
-            // Transform the curve
-            // TODO: Curves are immutable in the current design
-            // Would need to create new transformed curves
+    for curve_id in curve_ids {
+        // Swap the curve in-place for its transformed image. Since `Curve::transform`
+        // returns a fresh `Box<dyn Curve>`, we can replace the slot directly without
+        // invalidating edge references (edges keep pointing to the same CurveId).
+        if let Some(slot) = model.curves.get_mut(curve_id) {
+            let transformed = slot.transform(transform);
+            *slot = transformed;
         }
     }
 
@@ -286,24 +287,30 @@ fn transform_surfaces(
     face_ids: &[FaceId],
     transform: &Matrix4,
 ) -> OperationResult<()> {
-    let mut transformed_surfaces = HashSet::new();
+    // Collect the distinct surface IDs up front to avoid holding a reference
+    // into `model.faces` while we mutate `model.surfaces`.
+    let mut surface_ids: Vec<_> = face_ids
+        .iter()
+        .filter_map(|&face_id| model.faces.get(face_id).map(|f| f.surface_id))
+        .collect();
+    surface_ids.sort_unstable();
+    surface_ids.dedup();
 
-    for &face_id in face_ids {
-        if let Some(face) = model.faces.get(face_id) {
-            let surface_id = face.surface_id;
-
-            // Only transform each surface once
-            if transformed_surfaces.contains(&surface_id) {
-                continue;
-            }
-            transformed_surfaces.insert(surface_id);
-
-            // Transform the surface
-            if let Some(surface) = model.surfaces.get(surface_id) {
-                let _transformed_surface = surface.transform(transform);
-                // TODO: Need to add the transformed surface to the model and update face references
-                // For now, we'll just note that this needs implementation
-            }
+    for surface_id in surface_ids {
+        // Build the transformed surface from the current one and swap it in
+        // place so face references stay valid.
+        let Some(current) = model.surfaces.get(surface_id) else {
+            continue;
+        };
+        let transformed = current.transform(transform);
+        if model.surfaces.replace(surface_id, transformed).is_none() {
+            // Out-of-range id from the fast-path storage — surface was probably
+            // inserted via the type-dispatch path, which we cannot address here.
+            return Err(OperationError::NotImplemented(format!(
+                "transform_surfaces: surface {surface_id} lives in the \
+                 type-dispatched storage path, which does not yet support \
+                 in-place replacement"
+            )));
         }
     }
 

@@ -180,14 +180,156 @@ impl CommandProcessor {
                     parameters: param_value,
                 }
             }
-            _ => {
-                // For all other commands, use CreateSketch as a placeholder
-                // In a real implementation, these would be mapped to appropriate operations
-                Operation::CreateSketch {
-                    plane: timeline_engine::SketchPlane::XY, // Default plane
-                    elements: vec![],                        // Empty elements for now
+            AICommand::BooleanOperation {
+                operation,
+                target_objects,
+                keep_originals: _,
+            } => {
+                // Map each boolean variant to the corresponding typed timeline operation.
+                // For operations with two operands we use the specific typed variants; for
+                // three or more operands (union / intersection) we use the multi-operand
+                // form. BooleanDifference is defined as target minus all remaining tools.
+                let operand_ids: Vec<timeline_engine::EntityId> = target_objects
+                    .iter()
+                    .map(|id| timeline_engine::EntityId(*id))
+                    .collect();
+
+                match operation {
+                    BooleanOp::Union => Operation::BooleanUnion {
+                        operands: operand_ids,
+                    },
+                    BooleanOp::Intersection => Operation::BooleanIntersection {
+                        operands: operand_ids,
+                    },
+                    BooleanOp::Difference => {
+                        // First object is the target; the rest are the tool bodies.
+                        let (target, tools) = operand_ids
+                            .split_first()
+                            .map(|(h, t)| (*h, t.to_vec()))
+                            .unwrap_or_else(|| {
+                                let placeholder = timeline_engine::EntityId(Uuid::nil());
+                                (placeholder, vec![])
+                            });
+                        Operation::BooleanDifference { target, tools }
+                    }
                 }
             }
+            AICommand::Transform {
+                object_id,
+                transform_type,
+            } => {
+                // Build a 4x4 homogeneous transformation matrix from the command's
+                // TransformType and record it as a timeline Transform operation.
+                use shared_types::TransformType;
+                let matrix: [[f64; 4]; 4] = match transform_type {
+                    TransformType::Translate { offset } => [
+                        [1.0, 0.0, 0.0, offset[0] as f64],
+                        [0.0, 1.0, 0.0, offset[1] as f64],
+                        [0.0, 0.0, 1.0, offset[2] as f64],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    TransformType::Scale { factor } => [
+                        [factor[0] as f64, 0.0, 0.0, 0.0],
+                        [0.0, factor[1] as f64, 0.0, 0.0],
+                        [0.0, 0.0, factor[2] as f64, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    TransformType::Rotate {
+                        axis,
+                        angle_degrees,
+                    } => {
+                        // Rodrigues' rotation formula to build a rotation matrix.
+                        let theta = (*angle_degrees as f64).to_radians();
+                        let (sin_t, cos_t) = (theta.sin(), theta.cos());
+                        let one_minus_cos = 1.0 - cos_t;
+                        // Normalise the axis vector.
+                        let len = ((axis[0] as f64).powi(2)
+                            + (axis[1] as f64).powi(2)
+                            + (axis[2] as f64).powi(2))
+                        .sqrt()
+                        .max(1e-15);
+                        let (ux, uy, uz) = (
+                            axis[0] as f64 / len,
+                            axis[1] as f64 / len,
+                            axis[2] as f64 / len,
+                        );
+                        [
+                            [
+                                cos_t + ux * ux * one_minus_cos,
+                                ux * uy * one_minus_cos - uz * sin_t,
+                                ux * uz * one_minus_cos + uy * sin_t,
+                                0.0,
+                            ],
+                            [
+                                uy * ux * one_minus_cos + uz * sin_t,
+                                cos_t + uy * uy * one_minus_cos,
+                                uy * uz * one_minus_cos - ux * sin_t,
+                                0.0,
+                            ],
+                            [
+                                uz * ux * one_minus_cos - uy * sin_t,
+                                uz * uy * one_minus_cos + ux * sin_t,
+                                cos_t + uz * uz * one_minus_cos,
+                                0.0,
+                            ],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]
+                    }
+                    TransformType::Mirror { plane_normal } => {
+                        // Householder reflection through the plane whose normal is `n`.
+                        let len = ((plane_normal[0] as f64).powi(2)
+                            + (plane_normal[1] as f64).powi(2)
+                            + (plane_normal[2] as f64).powi(2))
+                        .sqrt()
+                        .max(1e-15);
+                        let (nx, ny, nz) = (
+                            plane_normal[0] as f64 / len,
+                            plane_normal[1] as f64 / len,
+                            plane_normal[2] as f64 / len,
+                        );
+                        [
+                            [1.0 - 2.0 * nx * nx, -2.0 * nx * ny, -2.0 * nx * nz, 0.0],
+                            [-2.0 * ny * nx, 1.0 - 2.0 * ny * ny, -2.0 * ny * nz, 0.0],
+                            [-2.0 * nz * nx, -2.0 * nz * ny, 1.0 - 2.0 * nz * nz, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]
+                    }
+                };
+
+                Operation::Transform {
+                    entities: vec![timeline_engine::EntityId(*object_id)],
+                    transformation: matrix,
+                }
+            }
+            AICommand::ModifyMaterial {
+                object_id,
+                material,
+            } => Operation::Modify {
+                entity: timeline_engine::EntityId(*object_id),
+                modifications: vec![timeline_engine::Modification::SetMaterial(material.clone())],
+            },
+            AICommand::Export { format, .. } => Operation::Generic {
+                command_type: "Export".to_string(),
+                parameters: serde_json::json!({ "format": format!("{:?}", format) }),
+            },
+            AICommand::ChangeView { view_type } => Operation::Generic {
+                command_type: "ChangeView".to_string(),
+                parameters: serde_json::json!({ "view_type": format!("{:?}", view_type) }),
+            },
+            AICommand::SessionControl { action } => Operation::Generic {
+                command_type: "SessionControl".to_string(),
+                parameters: serde_json::json!({ "action": format!("{:?}", action) }),
+            },
+            AICommand::Analyze {
+                analysis_type,
+                objects,
+            } => Operation::Generic {
+                command_type: "Analyze".to_string(),
+                parameters: serde_json::json!({
+                    "analysis_type": format!("{:?}", analysis_type),
+                    "object_count": objects.len(),
+                }),
+            },
         };
 
         Ok(operation)
@@ -441,40 +583,22 @@ impl CommandProcessor {
             )));
         }
 
-        // Mock analysis results
-        let analysis_data = match analysis_type {
-            AnalysisType::MassProperties => serde_json::json!({
-                "mass": 7850.0,
-                "volume": 1000.0,
-                "surface_area": 600.0,
-                "center_of_mass": [0.0, 0.0, 0.0]
-            }),
-            AnalysisType::InterferenceCheck => serde_json::json!({
-                "has_interference": false,
-                "interference_volume": 0.0,
-                "affected_objects": []
-            }),
-            AnalysisType::SurfaceAnalysis => serde_json::json!({
-                "surface_area": 600.0,
-                "curvature_range": [10.0, 100.0]
-            }),
-            AnalysisType::MeshQuality => serde_json::json!({
-                "quality_score": 0.95,
-                "problem_areas": []
-            }),
-            AnalysisType::Measurements => serde_json::json!({
-                "bounding_box": {
-                    "min": [-10.0, -10.0, -10.0],
-                    "max": [10.0, 10.0, 10.0]
-                }
-            }),
-        };
-
-        Ok(
-            CommandResult::success(format!("Analysis complete: {:?}", analysis_type))
-                .with_objects(vec![target_object])
-                .with_data(analysis_data),
-        )
+        // Analysis requires tessellated B-Rep geometry to compute accurate results.
+        // The session command layer only holds lightweight geometry metadata; the
+        // actual B-Rep solid lives in the geometry kernel.  Returning fabricated
+        // numbers here would silently corrupt any downstream decision (mass
+        // budgets, interference tolerances, mesh quality gates).  The caller must
+        // route analysis requests through the geometry engine, which has access to
+        // the full solid representation.
+        let analysis_type_str = format!("{:?}", analysis_type);
+        Err(SessionError::InvalidInput {
+            field: format!(
+                "analysis_type '{}' requires tessellated B-Rep geometry from the \
+                 geometry engine — route this request through the geometry kernel \
+                 API with the target object id '{}'",
+                analysis_type_str, target_object
+            ),
+        })
     }
 
     /// Get all objects in a session

@@ -1,20 +1,14 @@
-//! World-class solid representation for B-Rep topology
+//! Solid representation for B-Rep topology.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
+//! Features:
 //! - Boolean operations (union, intersection, difference)
 //! - Feature recognition and suppression
-//! - Parametric history tracking
+//! - Parametric history tracking via timeline events
 //! - Multi-resolution representations
 //! - Solid healing and repair
 //! - Mass properties with material support
-//! - Collision detection acceleration structures
+//! - Collision-detection acceleration structures
 //! - Feature-based modeling operations
-//!
-//! Performance characteristics:
-//! - Solid creation: < 100ns
-//! - Boolean operations: < 100ms for 10k faces
-//! - Point-in-solid: < 1μs
-//! - Mass properties: < 10μs
 
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -196,7 +190,7 @@ pub struct HistoryNode {
     pub timestamp: std::time::SystemTime,
 }
 
-/// World-class solid representation
+/// Solid representation
 #[derive(Debug, Clone)]
 pub struct Solid {
     /// Unique identifier
@@ -289,7 +283,10 @@ impl Solid {
     pub fn add_feature(&mut self, feature: Feature) -> u32 {
         let id = feature.id;
         {
-            let mut features = self.features.write().unwrap_or_else(|e| e.into_inner());
+            let mut features = self
+                .features
+                .write()
+                .expect("solid features RwLock poisoned");
             features.insert(id, feature);
         } // Lock is dropped here
         self.invalidate_cache();
@@ -299,7 +296,10 @@ impl Solid {
     /// Suppress/unsuppress feature
     pub fn suppress_feature(&mut self, feature_id: u32, suppress: bool) -> bool {
         let result = {
-            let mut features = self.features.write().unwrap_or_else(|e| e.into_inner());
+            let mut features = self
+                .features
+                .write()
+                .expect("solid features RwLock poisoned");
             if let Some(feature) = features.get_mut(&feature_id) {
                 feature.suppressed = suppress;
                 true
@@ -316,13 +316,19 @@ impl Solid {
 
     /// Get feature by ID
     pub fn get_feature(&self, feature_id: u32) -> Option<Feature> {
-        let features = self.features.read().unwrap_or_else(|e| e.into_inner());
+        let features = self
+            .features
+            .read()
+            .expect("solid features RwLock poisoned");
         features.get(&feature_id).cloned()
     }
 
     /// Get features by type
     pub fn get_features_by_type(&self, feature_type: FeatureType) -> Vec<Feature> {
-        let features = self.features.read().unwrap_or_else(|e| e.into_inner());
+        let features = self
+            .features
+            .read()
+            .expect("solid features RwLock poisoned");
         features
             .values()
             .filter(|f| f.feature_type == feature_type && !f.suppressed)
@@ -332,13 +338,13 @@ impl Solid {
 
     /// Add history node
     pub fn add_history(&mut self, node: HistoryNode) {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+        let mut history = self.history.write().expect("solid history RwLock poisoned");
         history.push(node);
     }
 
     /// Get parametric history
     pub fn get_history(&self) -> Vec<HistoryNode> {
-        let history = self.history.read().unwrap_or_else(|e| e.into_inner());
+        let history = self.history.read().expect("solid history RwLock poisoned");
         history.clone()
     }
 
@@ -355,7 +361,7 @@ impl Solid {
             return Ok(self
                 .cached_stats
                 .as_ref()
-                .expect("cached_stats present after is_some check"));
+                .expect("cached_stats.is_some() verified above"));
         }
 
         let mut total_faces = 0;
@@ -408,7 +414,10 @@ impl Solid {
         // For simple solid: χ = 2, so g = 0
         let genus = (2 - euler) / 2;
 
-        let features = self.features.read().unwrap_or_else(|e| e.into_inner());
+        let features = self
+            .features
+            .read()
+            .expect("solid features RwLock poisoned");
 
         self.cached_stats = Some(SolidStats {
             shell_count: 1 + self.inner_shells.len(),
@@ -425,7 +434,7 @@ impl Solid {
         Ok(self
             .cached_stats
             .as_ref()
-            .expect("cached_stats was just set"))
+            .expect("cached_stats was assigned to Some(..) immediately above"))
     }
 
     /// Calculate mass properties (cached)
@@ -443,7 +452,7 @@ impl Solid {
             return Ok(self
                 .cached_mass_props
                 .as_ref()
-                .expect("cached_mass_props present after is_some check"));
+                .expect("cached_mass_props.is_some() verified above"));
         }
 
         // Calculate volume using divergence theorem
@@ -536,7 +545,7 @@ impl Solid {
         Ok(self
             .cached_mass_props
             .as_ref()
-            .expect("cached_mass_props was just set"))
+            .expect("cached_mass_props was assigned to Some(..) immediately above"))
     }
 
     /// Boolean operation with another solid.
@@ -567,7 +576,7 @@ impl Solid {
 
         // Add to history
         let history_id = {
-            let history = self.history.read().unwrap_or_else(|e| e.into_inner());
+            let history = self.history.read().expect("solid history RwLock poisoned");
             history.len() as u32
         }; // Lock is dropped here
 
@@ -624,7 +633,7 @@ impl Solid {
             id: self
                 .features
                 .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .expect("solid features RwLock poisoned")
                 .len() as u32,
             feature_type: FeatureType::Fillet,
             faces: new_faces.clone(),
@@ -658,7 +667,7 @@ impl Solid {
             id: self
                 .features
                 .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .expect("solid features RwLock poisoned")
                 .len() as u32,
             feature_type: FeatureType::Chamfer,
             faces: new_faces.clone(),
@@ -692,7 +701,7 @@ impl Solid {
             id: self
                 .features
                 .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .expect("solid features RwLock poisoned")
                 .len() as u32,
             feature_type: FeatureType::Shell,
             faces: Vec::new(),
@@ -897,7 +906,7 @@ fn compute_principal_inertia(inertia: &[[f64; 3]; 3]) -> (Vector3, [Vector3; 3])
     (principal_moments, principal_axes)
 }
 
-/// World-class solid storage with feature indexing
+/// Solid storage with feature indexing
 #[derive(Debug)]
 pub struct SolidStore {
     /// Solid data
@@ -1029,7 +1038,6 @@ impl SolidStore {
     }
 
     /// Perform boolean operation
-    #[allow(deprecated)]
     pub fn boolean_operation(
         &mut self,
         solid1_id: SolidId,

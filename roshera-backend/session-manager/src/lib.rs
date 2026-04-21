@@ -37,5 +37,8 @@ pub use permissions::*;
 pub use persistence::*;
 pub use state::*;
 
-// Re-export SessionState from shared_types for convenience
+use shared_types::*;
+
+// Re-export commonly used types from shared_types for convenience
+pub use shared_types::SessionError;
 pub use shared_types::SessionState;

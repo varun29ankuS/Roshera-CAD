@@ -256,7 +256,9 @@ impl IntelligentChunker {
         ];
         
         patterns.iter().any(|pattern| {
-            Regex::new(pattern).unwrap().is_match(line)
+            Regex::new(pattern)
+                .expect("static function-signature regex pattern must compile")
+                .is_match(line)
         })
     }
 }

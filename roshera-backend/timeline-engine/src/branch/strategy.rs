@@ -245,10 +245,11 @@ impl BranchingStrategy for ExplorationStrategy {
             return None;
         }
 
-        // Find branch with highest score
+        // Find branch with highest score. Treat NaN as the smallest value so
+        // it cannot win over a finite score.
         let best = candidates
             .iter()
-            .max_by(|(_, s1), (_, s2)| s1.partial_cmp(s2).unwrap())?;
+            .max_by(|(_, s1), (_, s2)| s1.partial_cmp(s2).unwrap_or(std::cmp::Ordering::Equal))?;
 
         // Only select if improvement is significant
         if best.1 > self.min_improvement {
@@ -329,7 +330,9 @@ impl BranchingStrategy for AdaptiveBranchingStrategy {
         configs.sort_by(|a, b| {
             let score_a = self.get_objective_score(&a.purpose);
             let score_b = self.get_objective_score(&b.purpose);
-            score_b.partial_cmp(&score_a).unwrap()
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Take top branches based on success rates

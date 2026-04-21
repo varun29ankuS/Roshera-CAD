@@ -32,7 +32,10 @@ pub struct UserMetrics {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AIMetrics {
-    pub ollama_available: bool,
+    /// Whether a remote LLM provider (Claude/OpenAI) is configured via API key.
+    pub llm_provider_configured: bool,
+    /// Name of the active LLM provider, or "mock" when no API key is set.
+    pub llm_provider: String,
     pub avg_response_ms: u64,
     pub success_rate: f32,
     pub total_commands: u64,
@@ -150,8 +153,9 @@ pub async fn get_metrics(
     // Get session count
     let active_sessions = state.session_manager.list_sessions().await.len();
 
-    // Check Ollama availability
-    let ollama_available = check_ollama_status().await;
+    // LLM provider status — API-only policy. If an API key is configured,
+    // report the provider as available. No local-model health check.
+    let (llm_provider_configured, llm_provider) = detect_llm_provider();
 
     // Get geometry statistics from the model
     let (total_solids, total_faces, total_edges, total_vertices) = {
@@ -255,7 +259,8 @@ pub async fn get_metrics(
             total_users: active_sessions, // For now, same as active
         },
         ai: AIMetrics {
-            ollama_available,
+            llm_provider_configured,
+            llm_provider,
             avg_response_ms: perf_metrics.5,
             success_rate,
             total_commands: command_stats.0,
@@ -289,24 +294,18 @@ pub async fn get_metrics(
     })
 }
 
-async fn check_ollama_status() -> bool {
-    // Check if Ollama is running - use a fresh client each time to avoid caching
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(500))
-        .build()
-        .unwrap();
-
-    // Try to get Ollama version endpoint which is lightweight
-    match client
-        .get("http://localhost:11434/api/version")
-        .send()
-        .await
-    {
-        Ok(response) => {
-            // Only consider it online if we get a 200 OK
-            response.status() == reqwest::StatusCode::OK
-        }
-        Err(_) => false,
+/// Detect which hosted LLM provider is configured via environment variables.
+///
+/// Returns `(configured, provider_name)` where `configured` is true iff an
+/// API key for a supported provider is set. When no key is present, the
+/// server uses the mock provider and this reports `(false, "mock")`.
+fn detect_llm_provider() -> (bool, String) {
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        (true, "claude".to_string())
+    } else if std::env::var("OPENAI_API_KEY").is_ok() {
+        (true, "openai".to_string())
+    } else {
+        (false, "mock".to_string())
     }
 }
 

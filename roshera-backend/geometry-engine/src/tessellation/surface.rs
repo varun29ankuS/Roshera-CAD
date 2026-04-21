@@ -732,7 +732,12 @@ fn tessellate_cylindrical_face(
     params: &TessellationParams,
     mesh: &mut TriangleMesh,
 ) {
-    let surface = model.surfaces.get(face.surface_id).unwrap();
+    // Tessellation is void-return; if the face's surface has gone missing
+    // from the model (invariant violation), we skip silently rather than
+    // panicking the entire tessellation pass.
+    let Some(surface) = model.surfaces.get(face.surface_id) else {
+        return;
+    };
 
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
@@ -916,7 +921,8 @@ fn tessellate_spherical_with_poles(
 
         if at_south_pole && vertex_grid[0].len() == 1 && vertex_grid[0][0].is_some() {
             // Triangles from south pole
-            let pole_vertex = vertex_grid[0][0].unwrap();
+            let pole_vertex = vertex_grid[0][0]
+                .expect("south pole vertex presence verified by is_some() guard above");
             for u_idx in 0..u_steps {
                 if let (Some(v1), Some(v2)) = (
                     vertex_grid[1].get(u_idx).and_then(|&v| v),
@@ -930,7 +936,8 @@ fn tessellate_spherical_with_poles(
             && vertex_grid[v_steps][0].is_some()
         {
             // Triangles to north pole
-            let pole_vertex = vertex_grid[v_steps][0].unwrap();
+            let pole_vertex = vertex_grid[v_steps][0]
+                .expect("north pole vertex presence verified by is_some() guard above");
             for u_idx in 0..u_steps {
                 if let (Some(v1), Some(v2)) = (
                     vertex_grid[v_idx].get(u_idx).and_then(|&v| v),
@@ -1466,18 +1473,13 @@ fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, 
     let mut v_min = f64::MAX;
     let mut v_max = f64::MIN;
 
-    // Get surface for parameter evaluation
+    // Get surface for parameter evaluation. The original `None` arm
+    // re-queried the same missing surface and unwrapped it, which would
+    // have panicked. Since the surface is genuinely missing, return a
+    // neutral zero-extent bound rather than panicking mid-tessellation.
     let surface = match model.surfaces.get(face.surface_id) {
         Some(s) => s,
-        None => {
-            // Fallback to surface bounds
-            let (u_range, v_range) = model
-                .surfaces
-                .get(face.surface_id)
-                .unwrap()
-                .parameter_bounds();
-            return (u_range.0, u_range.1, v_range.0, v_range.1);
-        }
+        None => return (0.0, 0.0, 0.0, 0.0),
     };
 
     // Process outer loop

@@ -1,20 +1,14 @@
-//! World-class B-Rep model validation utilities
+//! B-Rep model validation utilities.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
+//! Features:
 //! - Multi-threaded validation with parallel checking
 //! - Progressive validation levels (Quick, Standard, Deep)
 //! - Self-healing suggestions and automatic repair
-//! - Manufacturing constraint validation
+//! - Manufacturing-constraint validation
 //! - Tolerance stack-up analysis
-//! - Feature recognition validation
-//! - Assembly constraint checking
+//! - Feature-recognition validation
+//! - Assembly-constraint checking
 //! - Performance profiling and optimization hints
-//!
-//! Performance characteristics:
-//! - Quick validation: < 1ms for 10k faces
-//! - Standard validation: < 10ms for 10k faces
-//! - Deep validation: < 100ms for 10k faces
-//! - Automatic healing: < 50ms for typical issues
 
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -348,11 +342,11 @@ struct ValidationProgress {
 
 impl ParallelValidator {
     pub fn new(num_threads: Option<usize>) -> Self {
-        let pool = num_threads.map(|n| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build()
-                .unwrap()
+        let pool = num_threads.and_then(|n| {
+            // Thread-pool construction can fail on invalid `n` (e.g. 0) or
+            // Rayon-internal errors. Fall back to the default (global) pool
+            // rather than panicking the validator at construction time.
+            rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
         });
 
         Self {
@@ -886,7 +880,11 @@ impl ModelRepairer {
 
         // Sort repairs by confidence
         let mut repairs = validation.repairs.clone();
-        repairs.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        repairs.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         for repair in repairs {
             match self.apply_repair(model, &repair) {
@@ -1150,10 +1148,12 @@ fn generate_signature(model: &BRepModel, validation: &ValidationResult) -> Vec<u
     validation.errors.len().hash(&mut hasher);
     validation.warnings.len().hash(&mut hasher);
 
-    // Hash timestamp
+    // Hash timestamp. `duration_since(UNIX_EPOCH)` can only fail if the
+    // system clock is set before 1970; degrade gracefully to a zero duration
+    // in that pathological case so validation signatures remain computable.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
         .hash(&mut hasher);
 

@@ -219,41 +219,73 @@ struct EntityPatterns {
 
 impl EntityPatterns {
     fn new() -> Self {
+        // All patterns below are compile-time constant regexes; a failure here
+        // is a developer/build bug, not a runtime condition, so `.expect` with
+        // a pattern-specific reason is the appropriate invariant-failure mode.
         Self {
             // Identifiers
-            email: Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").unwrap(),
-            url: Regex::new(r"https?://[^\s]+").unwrap(),
-            ip_address: Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").unwrap(),
-            phone: Regex::new(r"\b\+?[1-9]\d{1,14}\b").unwrap(),
-            
+            email: Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+                .expect("static email entity regex must compile"),
+            url: Regex::new(r"https?://[^\s]+")
+                .expect("static URL entity regex must compile"),
+            ip_address: Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+                .expect("static IPv4 entity regex must compile"),
+            phone: Regex::new(r"\b\+?[1-9]\d{1,14}\b")
+                .expect("static phone entity regex must compile"),
+
             // Code patterns
-            function_def: Regex::new(r"(?:function|fn|def|func|method|procedure)\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
-            class_def: Regex::new(r"(?:class|struct|interface|trait|enum)\s+([A-Z][a-zA-Z0-9]*)").unwrap(),
-            import_stmt: Regex::new(r"(?:import|use|require|include)\s+([a-zA-Z0-9_.]+)").unwrap(),
-            api_endpoint: Regex::new(r"(?:GET|POST|PUT|DELETE|PATCH)\s+(/[/\w-]+)").unwrap(),
-            
+            function_def: Regex::new(
+                r"(?:function|fn|def|func|method|procedure)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            )
+            .expect("static function-definition entity regex must compile"),
+            class_def: Regex::new(r"(?:class|struct|interface|trait|enum)\s+([A-Z][a-zA-Z0-9]*)")
+                .expect("static class-definition entity regex must compile"),
+            import_stmt: Regex::new(r"(?:import|use|require|include)\s+([a-zA-Z0-9_.]+)")
+                .expect("static import-statement entity regex must compile"),
+            api_endpoint: Regex::new(r"(?:GET|POST|PUT|DELETE|PATCH)\s+(/[/\w-]+)")
+                .expect("static API-endpoint entity regex must compile"),
+
             // Business patterns
-            jira_ticket: Regex::new(r"\b[A-Z]{2,}-\d+\b").unwrap(),
-            github_issue: Regex::new(r"#\d+\b").unwrap(),
-            pr_number: Regex::new(r"\bPR[-\s]?\d+\b").unwrap(),
-            
+            jira_ticket: Regex::new(r"\b[A-Z]{2,}-\d+\b")
+                .expect("static JIRA-ticket entity regex must compile"),
+            github_issue: Regex::new(r"#\d+\b")
+                .expect("static GitHub-issue entity regex must compile"),
+            pr_number: Regex::new(r"\bPR[-\s]?\d+\b")
+                .expect("static PR-number entity regex must compile"),
+
             // Temporal patterns
-            date_iso: Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").unwrap(),
-            date_us: Regex::new(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b").unwrap(),
-            date_eu: Regex::new(r"\b\d{1,2}\.\d{1,2}\.\d{2,4}\b").unwrap(),
-            time_pattern: Regex::new(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?\b").unwrap(),
-            duration: Regex::new(r"\b\d+\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?|days?|weeks?|months?|years?)\b").unwrap(),
-            
+            date_iso: Regex::new(r"\b\d{4}-\d{2}-\d{2}\b")
+                .expect("static ISO-date entity regex must compile"),
+            date_us: Regex::new(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
+                .expect("static US-date entity regex must compile"),
+            date_eu: Regex::new(r"\b\d{1,2}\.\d{1,2}\.\d{2,4}\b")
+                .expect("static EU-date entity regex must compile"),
+            time_pattern: Regex::new(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?\b")
+                .expect("static time entity regex must compile"),
+            duration: Regex::new(
+                r"\b\d+\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?|days?|weeks?|months?|years?)\b",
+            )
+            .expect("static duration entity regex must compile"),
+
             // Financial
-            amount: Regex::new(r"[\$€£¥₹]\s*\d+(?:,\d{3})*(?:\.\d{2})?|\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:USD|EUR|GBP|INR|Rs)").unwrap(),
-            currency: Regex::new(r"\b(?:USD|EUR|GBP|INR|JPY|CNY|Rs\.?|₹)\b").unwrap(),
-            
+            amount: Regex::new(
+                r"[\$€£¥₹]\s*\d+(?:,\d{3})*(?:\.\d{2})?|\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:USD|EUR|GBP|INR|Rs)",
+            )
+            .expect("static amount entity regex must compile"),
+            currency: Regex::new(r"\b(?:USD|EUR|GBP|INR|JPY|CNY|Rs\.?|₹)\b")
+                .expect("static currency entity regex must compile"),
+
             // Indian specific
-            indian_phone: Regex::new(r"\b(?:\+91[\-\s]?)?[6-9]\d{9}\b").unwrap(),
-            indian_names: Regex::new(r"\b(?:Sharma|Kumar|Singh|Patel|Gupta|Verma|Reddy|Rao|Das|Jain|Nair|Menon|Iyer|Iyengar|Pillai|Nambiar|Krishnan|Raman|Bhat|Shetty|Hegde|Kulkarni|Deshpande|Joshi|Patil|Pawar|Chavan|Desai|Shah|Mehta|Gandhi|Parikh|Trivedi|Bhatt|Pandey|Mishra|Tiwari|Dubey|Shukla|Tripathi|Srivastava|Agarwal|Goyal|Mittal|Singhal|Bansal|Jindal|Saini|Yadav|Chauhan|Thakur|Rajput|Malik|Khan|Ahmed|Ali|Hussain|Sheikh|Siddiqui|Ansari|Rahman|Begum|Khatun|Fatima|Sultana)\b").unwrap(),
-            aadhar: Regex::new(r"\b\d{4}\s?\d{4}\s?\d{4}\b").unwrap(),
-            pan: Regex::new(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b").unwrap(),
-            gst: Regex::new(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}\b").unwrap(),
+            indian_phone: Regex::new(r"\b(?:\+91[\-\s]?)?[6-9]\d{9}\b")
+                .expect("static Indian-phone entity regex must compile"),
+            indian_names: Regex::new(r"\b(?:Sharma|Kumar|Singh|Patel|Gupta|Verma|Reddy|Rao|Das|Jain|Nair|Menon|Iyer|Iyengar|Pillai|Nambiar|Krishnan|Raman|Bhat|Shetty|Hegde|Kulkarni|Deshpande|Joshi|Patil|Pawar|Chavan|Desai|Shah|Mehta|Gandhi|Parikh|Trivedi|Bhatt|Pandey|Mishra|Tiwari|Dubey|Shukla|Tripathi|Srivastava|Agarwal|Goyal|Mittal|Singhal|Bansal|Jindal|Saini|Yadav|Chauhan|Thakur|Rajput|Malik|Khan|Ahmed|Ali|Hussain|Sheikh|Siddiqui|Ansari|Rahman|Begum|Khatun|Fatima|Sultana)\b")
+                .expect("static Indian-names entity regex must compile"),
+            aadhar: Regex::new(r"\b\d{4}\s?\d{4}\s?\d{4}\b")
+                .expect("static Aadhar entity regex must compile"),
+            pan: Regex::new(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
+                .expect("static PAN entity regex must compile"),
+            gst: Regex::new(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}\b")
+                .expect("static GST entity regex must compile"),
         }
     }
 }
@@ -270,17 +302,25 @@ impl EntityExtractor {
     pub fn new(knowledge_base: Arc<KnowledgeBase>) -> Self {
         let mut code_parsers = HashMap::new();
         
-        // Initialize language parsers
+        // Initialize language parsers. Bundled tree-sitter grammars are
+        // version-matched with the `tree-sitter` runtime at build time, so a
+        // failure here is a build-configuration bug, not a runtime condition.
         let mut rust_parser = Parser::new();
-        rust_parser.set_language(tree_sitter_rust::language()).unwrap();
+        rust_parser
+            .set_language(tree_sitter_rust::language())
+            .expect("bundled tree-sitter-rust grammar must match the tree-sitter runtime");
         code_parsers.insert("rust".to_string(), rust_parser);
-        
+
         let mut python_parser = Parser::new();
-        python_parser.set_language(tree_sitter_python::language()).unwrap();
+        python_parser
+            .set_language(tree_sitter_python::language())
+            .expect("bundled tree-sitter-python grammar must match the tree-sitter runtime");
         code_parsers.insert("python".to_string(), python_parser);
-        
+
         let mut js_parser = Parser::new();
-        js_parser.set_language(tree_sitter_javascript::language()).unwrap();
+        js_parser
+            .set_language(tree_sitter_javascript::language())
+            .expect("bundled tree-sitter-javascript grammar must match the tree-sitter runtime");
         code_parsers.insert("javascript".to_string(), js_parser);
         
         Self {
@@ -430,8 +470,8 @@ impl EntityExtractor {
             entities.push(self.create_entity(
                 &cap[0],
                 EntityType::Email,
-                cap.get(0).unwrap().start(),
-                cap.get(0).unwrap().end(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").end(),
                 language,
             ));
         }
@@ -441,8 +481,8 @@ impl EntityExtractor {
             entities.push(self.create_entity(
                 &cap[0],
                 EntityType::URL,
-                cap.get(0).unwrap().start(),
-                cap.get(0).unwrap().end(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").end(),
                 language,
             ));
         }
@@ -452,8 +492,8 @@ impl EntityExtractor {
             entities.push(self.create_entity(
                 &cap[0],
                 EntityType::Date,
-                cap.get(0).unwrap().start(),
-                cap.get(0).unwrap().end(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").end(),
                 language,
             ));
         }
@@ -463,8 +503,8 @@ impl EntityExtractor {
             entities.push(self.create_entity(
                 &cap[0],
                 EntityType::Ticket,
-                cap.get(0).unwrap().start(),
-                cap.get(0).unwrap().end(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(),
+                cap.get(0).expect("regex capture group 0 always matches the whole pattern").end(),
                 language,
             ));
         }
@@ -475,21 +515,21 @@ impl EntityExtractor {
                 entities.push(self.create_entity(
                     &cap[0],
                     EntityType::Phone,
-                    cap.get(0).unwrap().start(),
-                    cap.get(0).unwrap().end(),
+                    cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(),
+                    cap.get(0).expect("regex capture group 0 always matches the whole pattern").end(),
                     language,
                 ));
             }
             
             // Indian names (with context check)
             for cap in self.patterns.indian_names.captures_iter(text) {
-                let context = self.get_context(text, cap.get(0).unwrap().start(), 20);
+                let context = self.get_context(text, cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(), 20);
                 if self.is_person_context(&context) {
                     entities.push(self.create_entity(
                         &cap[0],
                         EntityType::Person,
-                        cap.get(0).unwrap().start(),
-                        cap.get(0).unwrap().end(),
+                        cap.get(0).expect("regex capture group 0 always matches the whole pattern").start(),
+                        cap.get(0).expect("regex capture group 0 always matches the whole pattern").end(),
                         language,
                     ));
                 }

@@ -1,9 +1,12 @@
-/// Universal Endpoint for all LLM providers
+/// Universal Endpoint for all LLM providers.
 ///
 /// This module provides a single, unified interface for interacting with
-/// multiple LLM providers (Ollama, OpenAI, Anthropic, Google, etc.) without
-/// code duplication. The endpoint automatically formats requests and parses
-/// responses according to each provider's API specification.
+/// multiple hosted LLM providers (OpenAI, Anthropic, Google, HuggingFace,
+/// and a generic CustomAPI) without code duplication. The endpoint
+/// automatically formats requests and parses responses according to each
+/// provider's API specification.
+///
+/// Policy: API-only. Local-model runtimes are not supported.
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -71,16 +74,17 @@ pub struct UniversalEndpointConfig {
 impl Default for UniversalEndpointConfig {
     fn default() -> Self {
         Self {
-            provider: VisionProviderType::Ollama,
-            url: "http://localhost:11434/api/generate".to_string(),
+            provider: VisionProviderType::Anthropic,
+            url: "https://api.anthropic.com/v1/messages".to_string(),
             api_key: None,
-            model_name: "bakllava:latest".to_string(),
+            model_name: "claude-3-5-sonnet-20241022".to_string(),
             timeout_secs: 30,
             max_tokens: 1000,
             temperature: 0.7,
             system_prompt: Some(
                 "You are a CAD assistant that helps users create and modify 3D geometry. \
-                 Parse user commands and respond with structured CAD operations.".to_string()
+                 Parse user commands and respond with structured CAD operations."
+                    .to_string(),
             ),
         }
     }
@@ -139,7 +143,6 @@ impl UniversalEndpoint {
         viewport: Option<&ViewportCapture>,
     ) -> Result<Value, UniversalEndpointError> {
         let request = match self.config.provider {
-            VisionProviderType::Ollama => self.build_ollama_request(text, viewport),
             VisionProviderType::OpenAI => self.build_openai_request(text, viewport),
             VisionProviderType::Anthropic => self.build_anthropic_request(text, viewport),
             VisionProviderType::Google => self.build_google_request(text, viewport),
@@ -149,50 +152,6 @@ impl UniversalEndpoint {
         
         debug!("Built request for {:?}: {:?}", self.config.provider, request);
         Ok(request)
-    }
-    
-    /// Build Ollama request
-    fn build_ollama_request(&self, text: &str, viewport: Option<&ViewportCapture>) -> Value {
-        let mut prompt = String::new();
-        
-        // Add system prompt if configured
-        if let Some(system) = &self.config.system_prompt {
-            prompt.push_str(system);
-            prompt.push_str("\n\n");
-        }
-        
-        // Add viewport context if available
-        if let Some(vp) = viewport {
-            prompt.push_str(&self.format_viewport_context(vp));
-            prompt.push_str("\n\n");
-            
-            // For multimodal models, include image
-            if self.config.model_name.contains("llava") || self.config.model_name.contains("bakllava") {
-                return json!({
-                    "model": self.config.model_name,
-                    "prompt": format!("{}\nUser command: {}", prompt, text),
-                    "images": [vp.image],
-                    "stream": false,
-                    "options": {
-                        "temperature": self.config.temperature,
-                        "num_predict": self.config.max_tokens
-                    }
-                });
-            }
-        }
-        
-        prompt.push_str("User command: ");
-        prompt.push_str(text);
-        
-        json!({
-            "model": self.config.model_name,
-            "prompt": prompt,
-            "stream": false,
-            "options": {
-                "temperature": self.config.temperature,
-                "num_predict": self.config.max_tokens
-            }
-        })
     }
     
     /// Build OpenAI request
@@ -465,13 +424,6 @@ impl UniversalEndpoint {
     /// Parse response based on provider type
     fn parse_response(&self, response: Value) -> Result<ParsedCommand, UniversalEndpointError> {
         let text = match self.config.provider {
-            VisionProviderType::Ollama => {
-                response["response"].as_str()
-                    .ok_or_else(|| UniversalEndpointError::InvalidResponse(
-                        "Missing 'response' field".to_string()
-                    ))?
-                    .to_string()
-            }
             VisionProviderType::OpenAI => {
                 response["choices"][0]["message"]["content"].as_str()
                     .ok_or_else(|| UniversalEndpointError::InvalidResponse(
@@ -590,7 +542,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = UniversalEndpointConfig::default();
-        assert_eq!(config.provider, VisionProviderType::Ollama);
+        assert_eq!(config.provider, VisionProviderType::Anthropic);
         assert_eq!(config.timeout_secs, 30);
     }
     

@@ -531,8 +531,8 @@ impl Default for SystemContext {
             },
             status: SystemStatus {
                 ai_connected: false,
-                ai_provider: "ollama".to_string(),
-                ai_model: "phi3:mini".to_string(),
+                ai_provider: "none".to_string(),
+                ai_model: "none".to_string(),
                 websocket_connected: false,
                 object_count: 0,
                 memory_usage: 0.0,

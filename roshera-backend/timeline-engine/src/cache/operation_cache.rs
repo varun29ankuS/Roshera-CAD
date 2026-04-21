@@ -72,12 +72,14 @@ impl OperationCache {
             last_accessed: Utc::now(),
         };
 
-        // Get or create branch cache
-        let branch_cache = self.branch_caches.entry(branch_id).or_insert_with(|| {
-            Arc::new(RwLock::new(LruCache::new(
-                std::num::NonZeroUsize::new(self.max_items).unwrap(),
-            )))
-        });
+        // Get or create branch cache. If `max_items` is misconfigured to zero,
+        // fall back to a minimum of 1 rather than panicking.
+        let capacity = std::num::NonZeroUsize::new(self.max_items)
+            .unwrap_or_else(|| std::num::NonZeroUsize::new(1).expect("1 is non-zero"));
+        let branch_cache = self
+            .branch_caches
+            .entry(branch_id)
+            .or_insert_with(|| Arc::new(RwLock::new(LruCache::new(capacity))));
 
         let mut cache = branch_cache.write();
 
@@ -168,7 +170,11 @@ impl OperationCache {
             let cache = entry.value().read();
 
             for (key, item) in cache.iter() {
-                if oldest.is_none() || item.last_accessed < oldest.as_ref().unwrap().2 {
+                let is_older = match oldest.as_ref() {
+                    None => true,
+                    Some((_, _, ts)) => item.last_accessed < *ts,
+                };
+                if is_older {
                     oldest = Some((branch_id, key.clone(), item.last_accessed));
                 }
             }

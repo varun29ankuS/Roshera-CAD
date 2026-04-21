@@ -6,33 +6,24 @@
 /// - **Performance**: Provider abstraction adds < 1μs overhead
 /// - **Business Value**: No vendor lock-in, easy A/B testing of models
 ///
-/// # References
-/// - [11] Radford et al. (2022) - Whisper ASR
-/// - [12] Touvron et al. (2023) - LLaMA models
+/// # Policy
+/// API-only: all LLM/ASR/TTS inference is delegated to hosted providers
+/// (Claude, OpenAI, etc.). Local model runtimes (Ollama, LLaMA, Whisper,
+/// Candle) are not permitted in this codebase.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
 
-// Provider implementations
-pub mod claude; // Claude direct integration
-pub mod ganga_llm; // Ganga LLM for better Hindi understanding (optional)
-pub mod llama_candle; // LLaMA 8-bit quantized using Candle (supports English + Hindi)
+// Provider implementations — API-only (no local models)
+pub mod claude; // Claude API integration
 pub mod mock; // Mock providers for testing
-pub mod native_factory; // Factory for creating native providers
-pub mod native_tts; // Native Rust TTS
-pub mod ollama;
-pub mod whisper; // Whisper with C++ bindings (requires libclang) // Ollama local LLM integration
+pub mod native_factory; // Factory for creating providers
 
 // Re-exports for convenience
 pub use claude::ClaudeProvider;
-pub use ganga_llm::{GangaConfig, GangaLLMProvider};
-pub use llama_candle::{LlamaCandleProvider, ModelInfo};
 pub use mock::{MockASRProvider, MockLLMProvider, MockTTSProvider};
-pub use native_factory::{ModelAvailability, NativeProviderConfig, NativeProviderFactory};
-pub use native_tts::{NativeTTSConfig, NativeTTSProvider};
-pub use ollama::OllamaProvider;
-pub use whisper::{ModelSize as WhisperModelSize, WhisperProvider};
+pub use native_factory::{NativeProviderConfig, NativeProviderFactory};
 
 /// Error types for AI providers
 #[derive(Error, Debug)]

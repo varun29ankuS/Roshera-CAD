@@ -262,7 +262,7 @@ impl WriteAheadLog {
             .create(true)
             .append(true)
             .open(&file_path)
-            .unwrap();
+            .expect("WAL log file must be openable at the configured path");
 
         Self {
             path,

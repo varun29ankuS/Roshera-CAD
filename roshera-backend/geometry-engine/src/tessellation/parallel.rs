@@ -1,6 +1,6 @@
-//! Parallel tessellation for performance optimization
+//! Parallel tessellation.
 //!
-//! World-class parallel tessellation using Rayon for multi-threaded processing
+//! Uses Rayon for multi-threaded processing.
 
 use super::{surface, TessellationParams, ThreeJsMesh, TriangleMesh};
 use crate::primitives::{face::Face, shell::Shell, solid::Solid, topology_builder::BRepModel};
@@ -90,12 +90,17 @@ pub struct ParallelTessellator {
 }
 
 impl ParallelTessellator {
-    /// Create a new parallel tessellator with specified thread count
+    /// Create a new parallel tessellator with specified thread count.
+    ///
+    /// # Panics
+    /// Panics if the rayon thread pool fails to build. This can occur if
+    /// `num_threads` is invalid for the host (e.g. zero on some platforms)
+    /// or if the underlying OS refuses to spawn the requested threads.
     pub fn new(params: TessellationParams, num_threads: usize) -> Self {
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
-            .unwrap();
+            .expect("rayon thread pool construction failed (invalid num_threads or OS refused)");
 
         Self {
             thread_pool,
@@ -118,7 +123,9 @@ impl ParallelTessellator {
             })
             .collect();
 
-        // Sort by complexity (descending) for better load balancing
+        // Sort by complexity (descending) for better load balancing.
+        // NaN-safe ordering: treat unorderable complexity values as equal
+        // so the sort remains total even if an estimator returns NaN.
         face_complexities
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -132,7 +139,9 @@ impl ParallelTessellator {
                         let mut face_mesh = TriangleMesh::new();
                         surface::tessellate_face(face, model, &self.params, &mut face_mesh);
 
-                        let mut meshes_guard = meshes.lock().unwrap();
+                        let mut meshes_guard = meshes
+                            .lock()
+                            .expect("parallel tessellator meshes Mutex poisoned");
                         meshes_guard.push(face_mesh.to_threejs());
                     }
                 }
@@ -141,7 +150,9 @@ impl ParallelTessellator {
 
         // Merge results
         let mut final_mesh = ThreeJsMesh::new();
-        let meshes_guard = meshes.lock().unwrap();
+        let meshes_guard = meshes
+            .lock()
+            .expect("parallel tessellator meshes Mutex poisoned");
         for mesh in meshes_guard.iter() {
             final_mesh.merge(mesh);
         }
@@ -215,7 +226,9 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
 
             if is_unique {
                 let new_idx = next_index.fetch_add(1, Ordering::SeqCst);
-                let mut remap = vertex_remap.lock().unwrap();
+                let mut remap = vertex_remap
+                    .lock()
+                    .expect("parallel mesh optimizer vertex_remap Mutex poisoned");
                 remap[i] = new_idx;
             }
         }
@@ -231,7 +244,9 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
     let remapped_indices: Vec<Vec<u32>> = indices_chunks
         .par_iter()
         .map(|chunk| {
-            let remap = vertex_remap.lock().unwrap();
+            let remap = vertex_remap
+                .lock()
+                .expect("parallel mesh optimizer vertex_remap Mutex poisoned");
             chunk.iter().map(|&idx| remap[idx as usize]).collect()
         })
         .collect();

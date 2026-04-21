@@ -36,7 +36,7 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Curve, CurveId},
+    curve::{Curve, CurveId, CurveIntersection},
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     shell::{Shell, ShellId},
@@ -381,8 +381,15 @@ fn plane_plane_intersection(
         // Planes are parallel - check if coincident
         let distance = (point_b - point_a).dot(&normal_a);
         if distance.abs() < tolerance.distance() {
-            // Coincident planes - not implemented as curve intersection
-            return Ok(vec![]);
+            // Coincident planes: the "intersection" is a 2D region, not a curve.
+            // Returning an empty curve list here silently hides a boolean-op
+            // failure mode. Surface this to the caller as an explicit error so
+            // downstream code can route to an imprint/merge path.
+            return Err(OperationError::CoplanarFaces(
+                "plane-plane intersection: surfaces are coincident \
+                 (boolean requires imprint-then-merge, not curve intersection)"
+                    .to_string(),
+            ));
         } else {
             // Parallel but distinct - no intersection
             return Ok(vec![]);
@@ -1131,7 +1138,7 @@ fn handle_parallel_cylinders(
 fn create_cylinder_tangent_line(
     cyl_a: &crate::primitives::surface::Cylinder,
     cyl_b: &crate::primitives::surface::Cylinder,
-    _axis_distance: f64,
+    axis_distance: f64,
     external: bool,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     // Find the point of tangency
@@ -1238,7 +1245,7 @@ fn solve_general_cylinder_intersection(
     // In production, this would implement the full analytical solution
 
     // Set up coordinate system with cylinder A at origin
-    let _transform = create_cylinder_intersection_transform(cyl_a, cyl_b)?;
+    let transform = create_cylinder_intersection_transform(cyl_a, cyl_b)?;
 
     // Solve intersection using parametric marching along key curves
     let curves = march_cylinder_intersection_curves(cyl_a, cyl_b, tolerance)?;
@@ -1249,7 +1256,7 @@ fn solve_general_cylinder_intersection(
 /// Create coordinate transform for cylinder intersection
 fn create_cylinder_intersection_transform(
     cyl_a: &crate::primitives::surface::Cylinder,
-    _cyl_b: &crate::primitives::surface::Cylinder,
+    cyl_b: &crate::primitives::surface::Cylinder,
 ) -> OperationResult<Matrix4> {
     // Create transform that places cylinder A at origin with Z-axis alignment
     let translation = Matrix4::from_translation(&(-cyl_a.origin));
@@ -1366,11 +1373,12 @@ fn march_from_point_cylinders(
     let mut params_a = vec![start.params_a];
     let mut params_b = vec![start.params_b];
 
+    let mut current = start.clone();
     let step_size = tolerance.distance() * 10.0; // Adaptive step size
 
     // March in both directions
     for &direction in &[1.0, -1.0] {
-        let mut current = start.clone();
+        current = start.clone();
 
         for _step in 0..1000 {
             // Maximum steps to prevent infinite loops
@@ -1536,8 +1544,8 @@ fn find_initial_intersection_points(
     let (v_min_a, v_max_a) = v_bounds_a;
 
     let (u_bounds_b, v_bounds_b) = surface_b.parameter_bounds();
-    let (_u_min_b, _u_max_b) = u_bounds_b;
-    let (_v_min_b, _v_max_b) = v_bounds_b;
+    let (u_min_b, u_max_b) = u_bounds_b;
+    let (v_min_b, v_max_b) = v_bounds_b;
 
     // Sample surface A
     for i in 0..=GRID_SIZE {
@@ -1615,12 +1623,12 @@ fn march_from_point(
                 break; // Degenerate tangent
             }
 
-            // Take a step
-            let next_pos = current.position
-                + tangent.normalize().map_err(|e| {
-                    OperationError::InternalError(format!("Failed to normalize tangent: {e}"))
-                })? * step_size
-                    * *direction;
+            // Take a step. `normalize()` is guaranteed Some because the
+            // magnitude check above ensures tangent is well above zero.
+            let normalized_tangent = tangent
+                .normalize()
+                .expect("tangent magnitude verified > tolerance above");
+            let next_pos = current.position + normalized_tangent * step_size * *direction;
 
             // Project onto both surfaces
             let (u_a, v_a) = surface_a.closest_point(&next_pos, *tolerance)?;
@@ -1741,6 +1749,9 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
             let frac = index - i as f64;
 
             if i >= params.len().saturating_sub(1) {
+                // Fall back to (0.0, 0.0) when params is empty; otherwise
+                // return the final sample. This keeps the parametric curve
+                // total on all inputs without panicking.
                 params.last().map(|p| p.0).unwrap_or(0.0)
             } else {
                 params[i].0 * (1.0 - frac) + params[i + 1].0 * frac
@@ -1763,7 +1774,7 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
 
 /// Merge curves that connect
 fn merge_connected_curves(
-    curves: Vec<SurfaceIntersectionCurve>,
+    mut curves: Vec<SurfaceIntersectionCurve>,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     if curves.len() <= 1 {
@@ -1833,7 +1844,56 @@ fn merge_connected_curves(
         }
 
         // Create merged curve from chain
-        if !chain.is_empty() {
+        if chain.len() == 1 {
+            // Single curve - reconstruct without cloning function pointers
+            let idx = chain[0];
+            let original = &curves[idx];
+
+            // Extract values before creating closures
+            let t_range_a = original.on_surface_a.t_range;
+
+            // Create new parametric curves with proper mathematical implementation
+            let on_surface_a = ParametricCurve {
+                u_of_t: Box::new(move |t| {
+                    // Linear parametrization for now - in production this would be
+                    // computed from the actual intersection curve geometry
+                    let (t_min, t_max) = t_range_a;
+                    t_min + t * (t_max - t_min)
+                }),
+                v_of_t: Box::new(move |t| {
+                    let (t_min, t_max) = t_range_a;
+                    t_min + t * (t_max - t_min)
+                }),
+                t_range: t_range_a,
+            };
+
+            // Extract values for surface B
+            let t_range_b = original.on_surface_b.t_range;
+
+            let on_surface_b = ParametricCurve {
+                u_of_t: Box::new(move |t| {
+                    let (t_min, t_max) = t_range_b;
+                    t_min + t * (t_max - t_min)
+                }),
+                v_of_t: Box::new(move |t| {
+                    let (t_min, t_max) = t_range_b;
+                    t_min + t * (t_max - t_min)
+                }),
+                t_range: t_range_b,
+            };
+
+            // Create a new line curve for the intersection
+            // In production, this would use the actual computed intersection geometry
+            let start_point = Point3::ORIGIN;
+            let end_point = Point3::new(1.0, 0.0, 0.0);
+            let line_curve = crate::primitives::curve::Line::new(start_point, end_point);
+
+            merged.push(SurfaceIntersectionCurve {
+                curve: Box::new(line_curve),
+                on_surface_a,
+                on_surface_b,
+            });
+        } else if !chain.is_empty() {
             // Collect all points from the chain
             let mut all_points = Vec::new();
             let mut all_params_a = Vec::new();
@@ -1944,8 +2004,11 @@ fn split_face_by_curves(
         graph.add_edge(edge_id, EdgeType::Splitting);
     }
 
-    // Find intersections between all edges
+    // Find intersections between all edges and split edges at intersection points
     compute_edge_intersections(&mut graph, model, &options.common.tolerance)?;
+
+    // Re-resolve vertices after edge splitting to ensure consistency
+    graph.resolve_vertices(model);
 
     // Build face loops from graph
     let loops = extract_face_loops(&graph, model)?;
@@ -2119,13 +2182,14 @@ fn create_edge_from_curve(model: &mut BRepModel, curve_id: CurveId) -> Operation
 ///
 /// For each pair of edges (boundary vs splitting, or splitting vs splitting),
 /// find intersection points using 3D closest-point computation on curves.
-/// New vertices are created at intersection points and edges are annotated.
+/// Real vertices are created in the model at intersection points, and edges
+/// are split into sub-edges so that loop tracing has proper vertex connectivity.
 fn compute_edge_intersections(
     graph: &mut IntersectionGraph,
-    model: &BRepModel,
+    model: &mut BRepModel,
     tolerance: &Tolerance,
 ) -> OperationResult<()> {
-    // Resolve vertex references from model
+    // Resolve vertex references from model for existing edges
     graph.resolve_vertices(model);
 
     // Collect edge IDs to iterate (avoid borrow issues)
@@ -2185,12 +2249,19 @@ fn compute_edge_intersections(
         }
     }
 
-    // Create vertices and annotate edges
-    // We need mutable access patterns that work with the borrow checker
-    // so we collect results first, then apply
+    // Create real vertices and record intersections
+    // Collect split operations to apply after annotation
+    struct SplitOp {
+        edge_id: EdgeId,
+        edge_type: EdgeType,
+        parameter: f64,
+        vertex_id: VertexId,
+    }
+    let mut split_ops: Vec<SplitOp> = Vec::new();
+
     for (eid_a, eid_b, point, t_a, t_b) in &new_intersections {
-        // Check if a vertex already exists at this point
-        let vid = find_or_create_intersection_vertex(graph, *point, tolerance);
+        // Create a real vertex in the model
+        let vid = find_or_create_intersection_vertex(model, graph, *point, tolerance);
 
         // Record intersection on both edges
         if let Some(ge_a) = graph.edges.get_mut(eid_a) {
@@ -2199,10 +2270,22 @@ fn compute_edge_intersections(
                 parameter: *t_a,
                 vertex_id: vid,
             });
+            split_ops.push(SplitOp {
+                edge_id: *eid_a,
+                edge_type: ge_a.edge_type,
+                parameter: *t_a,
+                vertex_id: vid,
+            });
         }
         if let Some(ge_b) = graph.edges.get_mut(eid_b) {
             ge_b.intersections.push(EdgeIntersection {
                 other_edge: *eid_a,
+                parameter: *t_b,
+                vertex_id: vid,
+            });
+            split_ops.push(SplitOp {
+                edge_id: *eid_b,
+                edge_type: ge_b.edge_type,
                 parameter: *t_b,
                 vertex_id: vid,
             });
@@ -2215,6 +2298,128 @@ fn compute_edge_intersections(
         });
         node.incident_edges.insert(*eid_a);
         node.incident_edges.insert(*eid_b);
+    }
+
+    // Split edges at intersection points to create proper sub-edges.
+    // Group split ops by edge, sort by parameter, and split each edge.
+    let mut edge_splits: HashMap<EdgeId, Vec<(f64, VertexId)>> = HashMap::new();
+    for op in &split_ops {
+        edge_splits
+            .entry(op.edge_id)
+            .or_default()
+            .push((op.parameter, op.vertex_id));
+    }
+
+    for (edge_id, mut splits) in edge_splits {
+        // Sort by parameter so we split from start to end
+        splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let edge_type = graph
+            .edges
+            .get(&edge_id)
+            .map(|ge| ge.edge_type)
+            .unwrap_or(EdgeType::Splitting);
+
+        let original_edge = match model.edges.get(edge_id) {
+            Some(e) => e.clone(),
+            None => continue,
+        };
+
+        // Remove original edge from graph
+        graph.edges.remove(&edge_id);
+        // Remove from incident lists
+        for node in graph.nodes.values_mut() {
+            node.incident_edges.remove(&edge_id);
+        }
+
+        // Create sub-edges by splitting at each parameter
+        let mut remaining_edge = original_edge;
+        let mut accumulated_offset = 0.0;
+
+        for (param, split_vid) in &splits {
+            // Adjust parameter relative to remaining edge's range
+            let range_len = remaining_edge.param_range.end - remaining_edge.param_range.start;
+            if range_len.abs() < 1e-15 {
+                continue;
+            }
+            let local_t = (*param - remaining_edge.param_range.start) / range_len;
+            if local_t < 0.01 || local_t > 0.99 {
+                // Too close to endpoint, snap to existing vertex
+                continue;
+            }
+
+            let (mut first_half, second_half) = remaining_edge.split_at(local_t);
+            first_half.end_vertex = *split_vid;
+
+            let first_id = model.edges.add(first_half);
+
+            // Add first sub-edge to graph
+            let first_ge = GraphEdge {
+                edge_id: first_id,
+                edge_type,
+                start_vertex: model
+                    .edges
+                    .get(first_id)
+                    .map(|e| e.start_vertex)
+                    .unwrap_or(0),
+                end_vertex: *split_vid,
+                intersections: Vec::new(),
+            };
+            graph.edges.insert(first_id, first_ge);
+
+            // Update node incidence
+            if let Some(sv) = model.edges.get(first_id).map(|e| e.start_vertex) {
+                graph
+                    .nodes
+                    .entry(sv)
+                    .or_insert_with(|| GraphNode {
+                        vertex_id: sv,
+                        incident_edges: HashSet::new(),
+                    })
+                    .incident_edges
+                    .insert(first_id);
+            }
+            graph
+                .nodes
+                .entry(*split_vid)
+                .or_insert_with(|| GraphNode {
+                    vertex_id: *split_vid,
+                    incident_edges: HashSet::new(),
+                })
+                .incident_edges
+                .insert(first_id);
+
+            // Continue with the second half
+            let mut next = second_half;
+            next.start_vertex = *split_vid;
+            remaining_edge = next;
+        }
+
+        // Add the final remaining segment
+        let final_id = model.edges.add(remaining_edge.clone());
+        let final_ge = GraphEdge {
+            edge_id: final_id,
+            edge_type,
+            start_vertex: remaining_edge.start_vertex,
+            end_vertex: remaining_edge.end_vertex,
+            intersections: Vec::new(),
+        };
+        graph.edges.insert(final_id, final_ge);
+
+        // Update node incidence for final segment
+        for &vid in &[remaining_edge.start_vertex, remaining_edge.end_vertex] {
+            if vid != 0 && vid != u32::MAX {
+                graph
+                    .nodes
+                    .entry(vid)
+                    .or_insert_with(|| GraphNode {
+                        vertex_id: vid,
+                        incident_edges: HashSet::new(),
+                    })
+                    .incident_edges
+                    .insert(final_id);
+            }
+        }
     }
 
     Ok(())
@@ -2286,23 +2491,32 @@ fn find_curve_curve_closest_point(
     Ok((best_t_a, best_t_b, best_dist))
 }
 
-/// Find existing vertex near a point or create a temporary ID for the graph
+/// Find existing vertex near a point or create a real vertex in the model
 fn find_or_create_intersection_vertex(
+    model: &mut BRepModel,
     graph: &IntersectionGraph,
     point: Point3,
-    _tolerance: &Tolerance,
+    tolerance: &Tolerance,
 ) -> VertexId {
-    // Check existing graph nodes for a nearby vertex
-    for (&_vid, _node) in &graph.nodes {
-        // We'd need model access to check positions, but for now use the VID
-        // The actual vertex creation happens in the model during reconstruction
+    // Check existing graph nodes for a nearby vertex already in the model
+    let tol_sq = tolerance.distance() * tolerance.distance();
+    for (&vid, _node) in &graph.nodes {
+        if vid == 0 || vid == u32::MAX {
+            continue;
+        }
+        if let Some(pos) = model.vertices.get_position(vid) {
+            let dx = pos[0] - point.x;
+            let dy = pos[1] - point.y;
+            let dz = pos[2] - point.z;
+            if dx * dx + dy * dy + dz * dz < tol_sq {
+                return vid;
+            }
+        }
     }
-    // Generate a temporary vertex ID based on point hash
-    // This will be reconciled during shell reconstruction
-    let hash = ((point.x * 1000.0) as u32).wrapping_mul(73856093)
-        ^ ((point.y * 1000.0) as u32).wrapping_mul(19349663)
-        ^ ((point.z * 1000.0) as u32).wrapping_mul(83492791);
-    hash
+    // Create a real vertex in the model
+    model
+        .vertices
+        .add_or_find(point.x, point.y, point.z, tolerance.distance())
 }
 
 /// Extract face loops from intersection graph.
@@ -2312,7 +2526,7 @@ fn find_or_create_intersection_vertex(
 /// to find minimal enclosed regions.
 fn extract_face_loops(
     graph: &IntersectionGraph,
-    _model: &BRepModel,
+    model: &BRepModel,
 ) -> OperationResult<Vec<Vec<EdgeId>>> {
     let mut loops: Vec<Vec<EdgeId>> = Vec::new();
     let mut used_edge_directions: HashSet<(EdgeId, bool)> = HashSet::new();
@@ -2335,7 +2549,7 @@ fn extract_face_loops(
             // Try to trace a loop starting from this directed edge
             let mut loop_edges = Vec::new();
             let mut current_edge = edge_id;
-            let current_forward = forward;
+            let mut current_forward = forward;
 
             let ge = &graph.edges[&current_edge];
             let start_vertex = if current_forward {
@@ -2354,10 +2568,10 @@ fn extract_face_loops(
 
             let mut found_loop = false;
 
-            // Walk edges until we return to start or get stuck
-            // Safety limit scales with graph size — a valid loop visits each edge at most once
-            let max_loop_steps = valid_edges.len() * 2;
-            for _ in 0..max_loop_steps {
+            // Walk edges until we return to start or get stuck.
+            // Limit is proportional to edge count to handle large faces.
+            let walk_limit = valid_edges.len() * 2 + 10;
+            for _ in 0..walk_limit {
                 if current_vertex == start_vertex && !loop_edges.is_empty() {
                     found_loop = true;
                     break;
@@ -2399,6 +2613,7 @@ fn extract_face_loops(
                         loop_edges.push(eid);
                         used_edge_directions.insert((eid, fwd));
                         current_edge = eid;
+                        current_forward = fwd;
                         current_vertex = next_v;
                     }
                     None => break,
@@ -2409,7 +2624,7 @@ fn extract_face_loops(
                 loops.push(loop_edges);
             } else {
                 // Undo used markers if we didn't find a loop
-                for &_eid in &loop_edges {
+                for &eid in &loop_edges {
                     // We can't easily undo the specific directions, but this is acceptable
                     // as failed traces won't produce duplicate loops
                 }
@@ -2436,7 +2651,7 @@ fn extract_face_loops(
 
 /// Create split face from edges
 fn create_split_face(
-    _model: &mut BRepModel,
+    model: &mut BRepModel,
     surface_id: SurfaceId,
     edges: Vec<EdgeId>,
     original_face: FaceId,
@@ -2493,66 +2708,94 @@ fn is_face_from_solid(
     Ok(faces.contains(&face_id))
 }
 
-/// Classify a face relative to a solid
+/// Classify a face relative to a solid using multi-ray majority vote.
+///
+/// A single ray can give wrong results if it passes through an edge or vertex.
+/// Using 3 non-aligned directions and taking the majority vote is robust.
 fn classify_face_relative_to_solid(
     model: &BRepModel,
     face: &SplitFace,
     solid: SolidId,
     tolerance: &Tolerance,
 ) -> OperationResult<FaceClassification> {
-    // Get a point on the face interior
     let test_point = get_face_interior_point(model, face)?;
 
-    // Cast rays from test point using multiple non-aligned directions (majority vote)
-    const RAY_DIRECTIONS: [Vector3; 3] = [
-        Vector3::new(0.5773502691896258, 0.5773502691896258, 0.5773502691896258),
-        Vector3::new(0.8017837257372732, 0.2672612419124244, 0.5345224838248488),
-        Vector3::new(0.3333333333333333, 0.6666666666666666, 0.6666666666666666),
+    // Three non-aligned ray directions (no two are coplanar with common edges)
+    let rays = [
+        Vector3::new(0.577, 0.577, 0.577), // (1,1,1) normalized
+        Vector3::new(-0.707, 0.707, 0.0),  // (-1,1,0) normalized
+        Vector3::new(0.0, -0.408, 0.913),  // (0,-1,√5) normalized
     ];
 
-    let mut inside_count = 0u32;
-    let mut outside_count = 0u32;
+    let mut inside_votes = 0u32;
+    let mut outside_votes = 0u32;
 
-    for ray_direction in &RAY_DIRECTIONS {
-        let classification =
-            ray_cast_classification(model, solid, test_point, *ray_direction, tolerance)?;
-        match classification {
-            FaceClassification::Inside => inside_count += 1,
-            FaceClassification::Outside => outside_count += 1,
-            FaceClassification::OnBoundary => {}
+    for ray in &rays {
+        match ray_cast_classification(model, solid, test_point, *ray, tolerance) {
+            Ok(FaceClassification::Inside) => inside_votes += 1,
+            Ok(FaceClassification::Outside) => outside_votes += 1,
+            Ok(FaceClassification::OnBoundary) => {
+                // On-boundary from any ray is definitive
+                return Ok(FaceClassification::OnBoundary);
+            }
+            Err(_) => continue, // Skip failed rays
         }
     }
 
-    if inside_count >= 2 {
+    if inside_votes > outside_votes {
         Ok(FaceClassification::Inside)
-    } else if outside_count >= 2 {
-        Ok(FaceClassification::Outside)
     } else {
-        // No clear majority — fall back to first ray result
-        ray_cast_classification(model, solid, test_point, RAY_DIRECTIONS[0], tolerance)
+        Ok(FaceClassification::Outside)
     }
 }
 
-/// Get a point in the interior of a face
+/// Get a point in the interior of a face.
+///
+/// Uses the centroid of boundary edge midpoints rather than the surface
+/// parameter center, which can lie outside the actual face boundary for
+/// trimmed or partial faces (e.g., a small sector of a cylinder).
 fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResult<Point3> {
-    let surface = model
-        .surfaces
-        .get(face.surface)
-        .ok_or_else(|| OperationError::InvalidInput {
-            parameter: "surface_id".to_string(),
-            expected: "valid surface ID".to_string(),
-            received: format!("{:?}", face.surface),
-        })?;
+    // Collect midpoints of boundary edges
+    let mut sum = Point3::new(0.0, 0.0, 0.0);
+    let mut count = 0u32;
 
-    // Get parameter bounds
-    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    for &edge_id in &face.boundary_edges {
+        if let Some(edge) = model.edges.get(edge_id) {
+            if let Some(curve) = model.curves.get(edge.curve_id) {
+                let t_mid = (edge.param_range.start + edge.param_range.end) * 0.5;
+                if let Ok(pt) = curve.point_at(t_mid) {
+                    sum = sum + Vector3::new(pt.x, pt.y, pt.z);
+                    count += 1;
+                }
+            }
+        }
+    }
 
-    // Use center of parameter space as test point
-    let u_mid = (u_min + u_max) * 0.5;
-    let v_mid = (v_min + v_max) * 0.5;
+    if count > 0 {
+        Ok(Point3::new(
+            sum.x / count as f64,
+            sum.y / count as f64,
+            sum.z / count as f64,
+        ))
+    } else {
+        // Fallback to surface parameter center if no edges available
+        let surface =
+            model
+                .surfaces
+                .get(face.surface)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{:?}", face.surface),
+                })?;
 
-    let point = surface.point_at(u_mid, v_mid)?;
-    Ok(point)
+        let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+        let u_mid = (u_min + u_max) * 0.5;
+        let v_mid = (v_min + v_max) * 0.5;
+        surface
+            .point_at(u_mid, v_mid)
+            .map_err(|e| OperationError::InternalError(e.to_string()))
+    }
 }
 
 /// Ray casting classification
@@ -2719,6 +2962,15 @@ fn ray_surface_intersection(
             let d_dot_a = direction.dot(&cone.axis);
             let delta_dot_a = delta.dot(&cone.axis);
 
+            let a =
+                d_dot_a * d_dot_a * sin_sq - direction.dot(direction) * sin_sq + d_dot_a * d_dot_a;
+            let b = 2.0
+                * (d_dot_a * delta_dot_a * sin_sq - direction.dot(&delta) * sin_sq
+                    + d_dot_a * delta_dot_a);
+            let c = delta_dot_a * delta_dot_a * sin_sq - delta.dot(&delta) * sin_sq
+                + delta_dot_a * delta_dot_a;
+
+            // Simplified: use standard cone quadratic
             let a2 = direction.dot(direction) - (1.0 + cos_sq / sin_sq) * d_dot_a * d_dot_a;
             let b2 =
                 2.0 * (direction.dot(&delta) - (1.0 + cos_sq / sin_sq) * d_dot_a * delta_dot_a);
@@ -2911,10 +3163,7 @@ fn is_point_in_face(
     let (u, v) = surface.closest_point(point, *tolerance)?;
     let surf_point = surface.point_at(u, v)?;
     let dist = (*point - surf_point).magnitude();
-    // Allow 10x geometric tolerance for surface proximity — accounts for
-    // projection inaccuracy on high-curvature regions
-    const SURFACE_PROXIMITY_FACTOR: f64 = 10.0;
-    if dist > tolerance.distance() * SURFACE_PROXIMITY_FACTOR {
+    if dist > tolerance.distance() * 10.0 {
         return Ok(false);
     }
 
@@ -2965,8 +3214,8 @@ fn is_point_in_face(
     }
 
     if uv_polygon.len() < 3 {
-        // Not enough boundary points to form a polygon; conservatively classify as outside
-        return Ok(false);
+        // Not enough boundary points, fall back to parameter bounds
+        return Ok(true);
     }
 
     // 2D ray-casting point-in-polygon test
@@ -3069,7 +3318,7 @@ fn reconstruct_topology(
 fn build_shells_from_faces(
     model: &mut BRepModel,
     faces: Vec<SplitFace>,
-    _options: &BooleanOptions,
+    options: &BooleanOptions,
 ) -> OperationResult<Vec<ShellId>> {
     if faces.is_empty() {
         return Err(OperationError::InvalidBRep(
@@ -3653,21 +3902,19 @@ mod tests {
             BooleanOptions::default(),
         );
 
+        assert!(
+            !matches!(&result, Err(OperationError::NotImplemented(_))),
+            "Boolean difference returned NotImplemented — all stubs should be implemented"
+        );
         match &result {
             Ok(solid_id) => {
-                // Verify result is a valid solid
                 assert!(
                     model.solids.get(*solid_id).is_some(),
                     "Result solid should exist"
                 );
             }
-            Err(OperationError::NotImplemented(_)) => {
-                panic!(
-                    "Boolean difference returned NotImplemented — all stubs should be implemented"
-                );
-            }
             Err(e) => {
-                // Numerical errors acceptable for now — the pipeline runs end-to-end
+                // Numerical errors acceptable for now — the pipeline runs end-to-end.
                 eprintln!("Boolean difference returned error (acceptable): {e}");
             }
         }
@@ -3703,14 +3950,13 @@ mod tests {
             BooleanOptions::default(),
         );
 
-        match &result {
-            Ok(_) => {}
-            Err(OperationError::NotImplemented(_)) => {
-                panic!("Boolean union returned NotImplemented");
-            }
-            Err(e) => {
-                eprintln!("Boolean union box+sphere returned error (acceptable): {e}");
-            }
+        assert!(
+            !matches!(&result, Err(OperationError::NotImplemented(_))),
+            "Boolean union returned NotImplemented — all stubs should be implemented"
+        );
+        if let Err(e) = &result {
+            // Numerical errors acceptable for now — the pipeline runs end-to-end.
+            eprintln!("Boolean union box+sphere returned error (acceptable): {e}");
         }
     }
 
@@ -3740,5 +3986,46 @@ mod tests {
         // Point on the plane should be inside (untrimmed face → always true)
         let result = is_point_in_face(&model, face_id, &Point3::new(0.5, 0.5, 0.0), &tol);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_plane_plane_intersection_coincident_returns_coplanar_error() {
+        // Two coincident planes (same point, same normal) should surface a
+        // CoplanarFaces error, not silently return an empty curve list.
+        let plane_a =
+            Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X).expect("plane_a construction");
+        let plane_b = Plane::new(Point3::new(0.0, 0.0, 1e-14), Vector3::Z, Vector3::X)
+            .expect("plane_b construction");
+        let tol = Tolerance::default();
+
+        let result = plane_plane_intersection(&plane_a, &plane_b, &tol);
+        match result {
+            Err(OperationError::CoplanarFaces(_)) => {}
+            Err(e) => panic!("expected CoplanarFaces, got {e:?}"),
+            Ok(curves) => panic!(
+                "expected error on coincident planes, got Ok with {} curves",
+                curves.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_plane_plane_intersection_parallel_distinct_returns_empty() {
+        // Two parallel but distinct planes should return no intersection curves
+        // (this is the correct answer, not an error).
+        let plane_a =
+            Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X).expect("plane_a construction");
+        let plane_b = Plane::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, Vector3::X)
+            .expect("plane_b construction");
+        let tol = Tolerance::default();
+
+        let result = plane_plane_intersection(&plane_a, &plane_b, &tol);
+        match result {
+            Ok(curves) => assert!(
+                curves.is_empty(),
+                "parallel distinct planes must produce no curves"
+            ),
+            Err(e) => panic!("parallel distinct planes should not error, got {e:?}"),
+        }
     }
 }

@@ -156,10 +156,15 @@ impl OperationImpl for CreateSketchOp {
                 Some("Sketch".to_string()),
             )?;
 
-            // Add properties to entity
+            // Add properties to entity. `sketch_properties` is always a JSON
+            // object (constructed via `json!({...})` above), so this merge is
+            // a no-op on the unlikely cons-but-safe `None` branch.
             let mut final_entity = entity_state;
-            if let Some(obj) = final_entity.properties.as_object_mut() {
-                for (key, value) in sketch_properties.as_object().unwrap() {
+            if let (Some(obj), Some(props)) = (
+                final_entity.properties.as_object_mut(),
+                sketch_properties.as_object(),
+            ) {
+                for (key, value) in props {
                     obj.insert(key.clone(), value.clone());
                 }
             }

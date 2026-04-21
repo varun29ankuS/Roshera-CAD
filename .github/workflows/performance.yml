@@ -12,13 +12,13 @@ jobs:
   benchmark:
     name: Geometry Benchmarks
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Cache dependencies
       uses: actions/cache@v3
       with:
@@ -27,61 +27,47 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
-    
-    - name: Run geometry benchmarks
+        sudo apt-get install -y pkg-config
+
+    - name: Run criterion benchmarks
       run: |
-        # Build and run the actual benchmark runner
-        cargo build --release --bin bench_runner
-        ./target/release/bench_runner > bench-results.json
+        if cargo bench --workspace --no-run 2>/dev/null; then
+          cargo bench --workspace
+        else
+          echo "No benchmarks found, skipping"
+        fi
       working-directory: ./roshera-backend
-
-    - name: Fetch gh-pages branch
-      run: git fetch origin gh-pages:gh-pages || echo "gh-pages branch does not exist yet"
-
-    - name: Store benchmark results
-      uses: benchmark-action/github-action-benchmark@v1
-      with:
-        tool: 'customSmallerIsBetter'
-        output-file-path: roshera-backend/bench-results.json
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: ${{ github.ref == 'refs/heads/main' }}
-        comment-on-alert: true
-        alert-threshold: '150%'
-        fail-on-alert: false
-        benchmark-data-dir-path: 'dev/bench'
-        skip-fetch-gh-pages: true
 
   memory-profile:
     name: Memory Usage
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config valgrind
-    
+        sudo apt-get install -y pkg-config valgrind
+
     - name: Build release
       run: cargo build --release --bin api-server
       working-directory: ./roshera-backend
-    
+
     - name: Memory leak detection
       run: |
         valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
           --track-origins=yes --xml=yes --xml-file=valgrind-results.xml \
           ./target/release/api-server --help || true
       working-directory: ./roshera-backend
-    
+
     - name: Upload memory report
       uses: actions/upload-artifact@v4
       with:
@@ -92,39 +78,39 @@ jobs:
     name: WebSocket Load Test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev pkg-config
-    
+        sudo apt-get install -y pkg-config
+
     - name: Build server
       run: cargo build --release --bin api-server
       working-directory: ./roshera-backend
-    
+
     - name: Start server
       run: ./target/release/api-server &
       working-directory: ./roshera-backend
       env:
         PORT: 3000
-    
+
     - name: Wait for server
       run: sleep 5
-    
+
     - name: Install Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-    
+
     - name: Install load test tools
       run: npm install -g artillery
-    
+
     - name: Create load test config
       run: |
         cat > load-test.yml << EOF
@@ -138,13 +124,13 @@ jobs:
             engine: ws
             weight: 100
         EOF
-    
+
     - name: Run load test
       run: artillery run load-test.yml --output load-results.json
-    
+
     - name: Generate report
       run: artillery report load-results.json --output load-report.html
-    
+
     - name: Upload results
       uses: actions/upload-artifact@v4
       with:

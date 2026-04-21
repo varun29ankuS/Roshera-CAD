@@ -12,11 +12,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::indexer::FileIndexer;
-use crate::search::{
-    bm25::BM25Search,
-    vamana::VamanaIndex,
-    hybrid::HybridSearch,
-};
 
 /// Search request
 #[derive(Debug, Deserialize)]
@@ -93,29 +88,24 @@ pub async fn search_handler(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         },
         SearchType::BM25 => {
-            // BM25 keyword search
-            // TODO: Implement BM25 search through indexer
-            vec![]
+            indexer.search_bm25(&request.query, request.limit)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         },
         SearchType::Hybrid => {
-            // Hybrid search combining vector and BM25
-            let vector_results = indexer.search(&request.query, request.limit * 2)
+            indexer.search_hybrid(&request.query, request.limit)
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            
-            // For now, just return vector results
-            // TODO: Combine with BM25 scores
-            vector_results
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         },
         SearchType::Symbol => {
-            // Symbol-specific search
-            // TODO: Implement symbol search
-            vec![]
+            indexer.search_symbols(&request.query, request.limit)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         },
         SearchType::Fuzzy => {
-            // Fuzzy matching search
-            // TODO: Implement fuzzy search
-            vec![]
+            indexer.search_fuzzy(&request.query, request.limit)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         }
     };
     
@@ -156,17 +146,27 @@ pub async fn search_handler(
 pub async fn stats_handler(
     State(indexer): State<Arc<FileIndexer>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Get stats from indexer
-    // For now, return mock data
+    let snapshot = indexer.get_stats_snapshot();
+    let bm25_stats = indexer.bm25_index.get_stats();
+
+    let file_types: serde_json::Map<String, serde_json::Value> = snapshot
+        .file_types
+        .iter()
+        .map(|(k, v)| (format!("{:?}", k), serde_json::json!(v)))
+        .collect();
+
     Ok(Json(serde_json::json!({
-        "total_files": 423,
-        "total_chunks": 5480,
-        "index_size_mb": 15.2,
-        "file_types": {
-            "Rust": 250,
-            "Python": 50,
-            "JavaScript": 80,
-            "TypeScript": 43
-        }
+        "total_files": snapshot.total_files,
+        "total_chunks": snapshot.total_chunks,
+        "total_bytes": snapshot.total_bytes,
+        "file_types": file_types,
+        "bm25": {
+            "total_documents": bm25_stats.total_documents,
+            "total_terms": bm25_stats.total_terms,
+            "avg_doc_length": bm25_stats.avg_doc_length,
+            "index_size_bytes": bm25_stats.index_size_bytes,
+        },
+        "start_time": snapshot.start_time.to_rfc3339(),
+        "end_time": snapshot.end_time.map(|t| t.to_rfc3339()),
     })))
 }

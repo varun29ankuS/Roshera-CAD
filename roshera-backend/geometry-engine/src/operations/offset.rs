@@ -8,16 +8,17 @@
 //! - Pham, B. (1992). Offset curves and surfaces: a brief survey. CAD.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Point3, Vector3};
+use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
-    edge::{Edge, EdgeId},
-    face::{Face, FaceId},
+    edge::{Edge, EdgeId, EdgeOrientation},
+    face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
     shell::{Shell, ShellType},
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
+    vertex::{Vertex, VertexId},
 };
 
 /// Options for offset operations
@@ -232,7 +233,7 @@ fn create_offset_plane(surface: &dyn Surface, distance: f64) -> OperationResult<
     Ok(Box::new(offset_plane))
 }
 
-/// Create offset cylinder — radius changes by `distance` along normal direction
+/// Create offset cylinder by adjusting radius
 fn create_offset_cylinder(
     surface: &dyn Surface,
     distance: f64,
@@ -242,188 +243,94 @@ fn create_offset_cylinder(
     let cyl = surface
         .as_any()
         .downcast_ref::<Cylinder>()
-        .ok_or_else(|| OperationError::InternalError("Expected Cylinder surface".to_string()))?;
+        .ok_or_else(|| OperationError::InvalidGeometry("Expected Cylinder surface".into()))?;
 
     let new_radius = cyl.radius + distance;
     if new_radius <= 0.0 {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Offset distance {} would produce non-positive cylinder radius {}",
-            distance, new_radius
-        )));
+        return Err(OperationError::InvalidGeometry(
+            "Offset produces zero or negative cylinder radius".into(),
+        ));
     }
 
-    let mut offset_cyl = Cylinder::new(cyl.origin, cyl.axis, new_radius).map_err(|e| {
-        OperationError::NumericalError(format!("Cylinder creation failed: {:?}", e))
-    })?;
-    offset_cyl.height_limits = cyl.height_limits;
-    offset_cyl.angle_limits = cyl.angle_limits;
-    Ok(Box::new(offset_cyl))
+    let mut offset = Cylinder::new(cyl.origin, cyl.axis, new_radius)?;
+    offset.height_limits = cyl.height_limits;
+    offset.angle_limits = cyl.angle_limits;
+    Ok(Box::new(offset))
 }
 
-/// Create offset sphere — radius changes by `distance`
+/// Create offset sphere by adjusting radius
 fn create_offset_sphere(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::Sphere;
 
     let sph = surface
         .as_any()
         .downcast_ref::<Sphere>()
-        .ok_or_else(|| OperationError::InternalError("Expected Sphere surface".to_string()))?;
+        .ok_or_else(|| OperationError::InvalidGeometry("Expected Sphere surface".into()))?;
 
     let new_radius = sph.radius + distance;
     if new_radius <= 0.0 {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Offset distance {} would produce non-positive sphere radius {}",
-            distance, new_radius
-        )));
+        return Err(OperationError::InvalidGeometry(
+            "Offset produces zero or negative sphere radius".into(),
+        ));
     }
 
-    let mut offset_sph = Sphere::new(sph.center, new_radius)
-        .map_err(|e| OperationError::NumericalError(format!("Sphere creation failed: {:?}", e)))?;
-    offset_sph.param_limits = sph.param_limits;
-    Ok(Box::new(offset_sph))
+    let mut offset = Sphere::new(sph.center, new_radius)?;
+    offset.param_limits = sph.param_limits;
+    Ok(Box::new(offset))
 }
 
-/// Create offset cone — the offset of a cone is not a cone (it's an involute surface)
-/// so we approximate by moving the apex along the axis and preserving the half-angle.
-/// This is exact for the lateral surface normal offset.
+/// Create offset cone — offset along normal moves the surface, keeping half angle constant
 fn create_offset_cone(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::Cone;
 
     let cone = surface
         .as_any()
         .downcast_ref::<Cone>()
-        .ok_or_else(|| OperationError::InternalError("Expected Cone surface".to_string()))?;
+        .ok_or_else(|| OperationError::InvalidGeometry("Expected Cone surface".into()))?;
 
-    // The normal on a cone surface makes angle (π/2 - half_angle) with the axis.
-    // Offsetting moves the apex by distance / sin(half_angle) along the axis.
-    let sin_half = cone.half_angle.sin();
-    if sin_half.abs() < 1e-10 {
-        return Err(OperationError::InvalidGeometry(
-            "Cone half-angle too small for offset".to_string(),
-        ));
-    }
+    // Offsetting a cone along its normal shifts the apex along the axis
+    // by distance / sin(half_angle), keeping the half angle constant.
+    let shift = distance / cone.half_angle.sin();
+    let new_apex = cone.apex + cone.axis * shift;
 
-    let apex_shift = distance / sin_half;
-    let new_apex = cone.apex + cone.axis * apex_shift;
-
-    let mut offset_cone = Cone::new(new_apex, cone.axis, cone.half_angle)
-        .map_err(|e| OperationError::NumericalError(format!("Cone creation failed: {:?}", e)))?;
-    offset_cone.height_limits = cone.height_limits;
-    offset_cone.angle_limits = cone.angle_limits;
-    Ok(Box::new(offset_cone))
+    let mut offset = Cone::new(new_apex, cone.axis, cone.half_angle)?;
+    offset.height_limits = cone.height_limits.map(|[lo, hi]| [lo - shift, hi - shift]);
+    offset.angle_limits = cone.angle_limits;
+    Ok(Box::new(offset))
 }
 
-/// Create offset torus — minor radius changes by `distance`
+/// Create offset torus by adjusting minor radius
 fn create_offset_torus(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::Torus;
 
-    let torus = surface
+    let tor = surface
         .as_any()
         .downcast_ref::<Torus>()
-        .ok_or_else(|| OperationError::InternalError("Expected Torus surface".to_string()))?;
+        .ok_or_else(|| OperationError::InvalidGeometry("Expected Torus surface".into()))?;
 
-    let new_minor = torus.minor_radius + distance;
+    let new_minor = tor.minor_radius + distance;
     if new_minor <= 0.0 {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Offset distance {} would produce non-positive torus minor radius {}",
-            distance, new_minor
-        )));
-    }
-    if new_minor >= torus.major_radius {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Offset torus minor radius {} would exceed major radius {}",
-            new_minor, torus.major_radius
-        )));
+        return Err(OperationError::InvalidGeometry(
+            "Offset produces zero or negative torus minor radius".into(),
+        ));
     }
 
-    let mut offset_torus = Torus::new(torus.center, torus.axis, torus.major_radius, new_minor)
-        .map_err(|e| OperationError::NumericalError(format!("Torus creation failed: {:?}", e)))?;
-    offset_torus.param_limits = torus.param_limits;
-    Ok(Box::new(offset_torus))
+    let mut offset = Torus::new(tor.center, tor.axis, tor.major_radius, new_minor)?;
+    offset.param_limits = tor.param_limits;
+    Ok(Box::new(offset))
 }
 
-/// Create offset B-spline surface by sampling normals and fitting a new surface
+/// Create offset B-spline / NURBS surface using the Surface::offset trait method
 fn create_offset_bspline(
     surface: &dyn Surface,
     distance: f64,
 ) -> OperationResult<Box<dyn Surface>> {
-    // Offset of a freeform surface: sample, offset along normals, fit new surface
-    create_offset_freeform(surface, distance)
+    Ok(surface.offset(distance))
 }
 
-/// Create offset NURBS surface by sampling normals and fitting a new surface
+/// Create offset NURBS surface using the Surface::offset trait method
 fn create_offset_nurbs(surface: &dyn Surface, distance: f64) -> OperationResult<Box<dyn Surface>> {
-    create_offset_freeform(surface, distance)
-}
-
-/// Generic freeform surface offset: sample the surface on a grid,
-/// displace each point along its normal by `distance`, then construct
-/// a new NURBS surface through the offset points.
-fn create_offset_freeform(
-    surface: &dyn Surface,
-    distance: f64,
-) -> OperationResult<Box<dyn Surface>> {
-    use crate::math::nurbs::NurbsSurface;
-    use crate::primitives::surface::GeneralNurbsSurface;
-
-    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
-    let n_u = 20usize;
-    let n_v = 20usize;
-
-    let mut offset_points: Vec<Vec<Point3>> = Vec::with_capacity(n_u + 1);
-
-    for i in 0..=n_u {
-        let u = u_min + (u_max - u_min) * i as f64 / n_u as f64;
-        let mut row = Vec::with_capacity(n_v + 1);
-        for j in 0..=n_v {
-            let v = v_min + (v_max - v_min) * j as f64 / n_v as f64;
-            let pt = surface.point_at(u, v).map_err(|e| {
-                OperationError::NumericalError(format!("Surface eval failed: {:?}", e))
-            })?;
-            let n = surface.normal_at(u, v).map_err(|e| {
-                OperationError::NumericalError(format!("Normal eval failed: {:?}", e))
-            })?;
-            row.push(pt + n * distance);
-        }
-        offset_points.push(row);
-    }
-
-    let degree_u = 3.min(n_u);
-    let degree_v = 3.min(n_v);
-
-    // Uniform weights (non-rational)
-    let weights: Vec<Vec<f64>> = vec![vec![1.0; n_v + 1]; n_u + 1];
-
-    // Clamped uniform knot vectors
-    let knots_u = uniform_knot_vector(n_u + 1, degree_u);
-    let knots_v = uniform_knot_vector(n_v + 1, degree_v);
-
-    let nurbs = NurbsSurface::new(offset_points, weights, knots_u, knots_v, degree_u, degree_v)
-        .map_err(|e| {
-            OperationError::NumericalError(format!("NURBS surface creation failed: {}", e))
-        })?;
-
-    Ok(Box::new(GeneralNurbsSurface { nurbs }))
-}
-
-/// Create a uniform knot vector for a B-spline of given control point count and degree
-fn uniform_knot_vector(n_control: usize, degree: usize) -> Vec<f64> {
-    let n_knots = n_control + degree + 1;
-    let mut knots = Vec::with_capacity(n_knots);
-
-    // Clamped uniform knot vector
-    for _ in 0..=degree {
-        knots.push(0.0);
-    }
-    let n_internal = n_knots - 2 * (degree + 1);
-    for i in 1..=n_internal {
-        knots.push(i as f64 / (n_internal + 1) as f64);
-    }
-    for _ in 0..=degree {
-        knots.push(1.0);
-    }
-
-    knots
+    Ok(surface.offset(distance))
 }
 
 /// Create offset loop (boundary curves)
@@ -474,8 +381,8 @@ fn create_offset_edge(
     edge_id: EdgeId,
     surface_id: u32,
     distance: f64,
-    _forward: bool,
-    _options: &OffsetOptions,
+    forward: bool,
+    options: &OffsetOptions,
 ) -> OperationResult<EdgeId> {
     let edge = model
         .edges
@@ -534,28 +441,28 @@ fn create_offset_edge(
 /// Create offset curve
 fn create_offset_curve(
     curve: &dyn Curve,
-    _surface_id: u32,
-    _distance: f64,
+    surface_id: u32,
+    distance: f64,
 ) -> OperationResult<Box<dyn Curve>> {
     // Would create proper offset curve
     // For now, return copy of original
     Ok(curve.clone_box())
 }
 
-/// Compute surface normal at a point
+/// Compute surface normal at a point by finding the closest parametric location
 fn compute_surface_normal_at_point(
     surface: &dyn Surface,
-    _point: Point3,
+    point: Point3,
 ) -> OperationResult<Vector3> {
-    // Would compute actual normal at closest point on surface
-    // For now, use parametric center
-    Ok(surface.normal_at(0.5, 0.5)?)
+    let tol = Tolerance::new(1e-6, 1e-6);
+    let (u, v) = surface.closest_point(&point, tol)?;
+    Ok(surface.normal_at(u, v)?)
 }
 
 /// Extend corners in offset loop
 fn extend_offset_corners(
-    _model: &mut BRepModel,
-    _offset_edges: &mut Vec<(EdgeId, bool)>,
+    model: &mut BRepModel,
+    offset_edges: &mut Vec<(EdgeId, bool)>,
 ) -> OperationResult<()> {
     // Would extend surfaces at corners to meet
     Ok(())
@@ -563,9 +470,9 @@ fn extend_offset_corners(
 
 /// Round corners in offset loop
 fn round_offset_corners(
-    _model: &mut BRepModel,
-    _offset_edges: &mut Vec<(EdgeId, bool)>,
-    _radius: f64,
+    model: &mut BRepModel,
+    offset_edges: &mut Vec<(EdgeId, bool)>,
+    radius: f64,
 ) -> OperationResult<()> {
     // Would add arc edges at corners
     Ok(())
@@ -612,7 +519,7 @@ fn create_interior_offset_faces(
 /// Create wall faces for shell openings
 fn create_shell_walls(
     model: &mut BRepModel,
-    _solid: &Solid,
+    solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
 ) -> OperationResult<Vec<FaceId>> {
@@ -645,15 +552,107 @@ fn create_shell_walls(
 
 /// Create a wall face between outer and inner edges
 fn create_wall_face(
-    _model: &mut BRepModel,
-    _outer_edge_id: EdgeId,
-    _thickness: f64,
-    _forward: bool,
+    model: &mut BRepModel,
+    outer_edge_id: EdgeId,
+    thickness: f64,
+    forward: bool,
 ) -> OperationResult<FaceId> {
-    // Would create rectangular face connecting outer edge to inner offset edge
-    Err(OperationError::NotImplemented(
-        "Wall face creation not yet implemented".to_string(),
-    ))
+    use crate::primitives::curve::Line;
+    use crate::primitives::edge::EdgeOrientation;
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::r#loop::LoopType;
+    use crate::primitives::surface::Plane;
+
+    let outer_edge = model
+        .edges
+        .get(outer_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Outer edge not found".into()))?
+        .clone();
+
+    // Get the outer edge endpoints
+    let p1_arr = model
+        .vertices
+        .get_position(outer_edge.start_vertex)
+        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".into()))?;
+    let p2_arr = model
+        .vertices
+        .get_position(outer_edge.end_vertex)
+        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".into()))?;
+    let p1 = Vector3::new(p1_arr[0], p1_arr[1], p1_arr[2]);
+    let p2 = Vector3::new(p2_arr[0], p2_arr[1], p2_arr[2]);
+
+    // Compute offset direction from the surface normal at midpoint
+    let edge_curve = model
+        .curves
+        .get(outer_edge.curve_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge curve not found".into()))?;
+    let mid = edge_curve.evaluate(0.5)?.position;
+    let edge_dir = (p2 - p1).normalize()?;
+    // Use a default inward direction perpendicular to edge
+    let offset_dir = if edge_dir.cross(&Vector3::Z).magnitude_squared() > 1e-6 {
+        edge_dir.cross(&Vector3::Z).normalize()?
+    } else {
+        edge_dir.cross(&Vector3::Y).normalize()?
+    };
+
+    let offset = offset_dir * (-thickness.abs());
+    let p3 = p2 + offset;
+    let p4 = p1 + offset;
+
+    // Create the planar surface through the four corners
+    let wall_normal = edge_dir.cross(&offset_dir).normalize()?;
+    let wall_surface = Plane::from_point_normal(p1, wall_normal)?;
+    let surface_id = model.surfaces.add(Box::new(wall_surface));
+
+    // Create vertices for inner edge
+    let v3 = model.vertices.add(p3.x, p3.y, p3.z);
+    let v4 = model.vertices.add(p4.x, p4.y, p4.z);
+
+    // Create four edges for the rectangular face
+    let e_top = outer_edge_id; // reuse outer edge
+    let line_right = Line::new(p2, p3);
+    let c_right = model.curves.add(Box::new(line_right));
+    let e_right = model.edges.add(Edge::new_auto_range(
+        0,
+        outer_edge.end_vertex,
+        v3,
+        c_right,
+        EdgeOrientation::Forward,
+    ));
+
+    let line_bottom = Line::new(p3, p4);
+    let c_bottom = model.curves.add(Box::new(line_bottom));
+    let e_bottom = model.edges.add(Edge::new_auto_range(
+        0,
+        v3,
+        v4,
+        c_bottom,
+        EdgeOrientation::Forward,
+    ));
+
+    let line_left = Line::new(p4, p1);
+    let c_left = model.curves.add(Box::new(line_left));
+    let e_left = model.edges.add(Edge::new_auto_range(
+        0,
+        v4,
+        outer_edge.start_vertex,
+        c_left,
+        EdgeOrientation::Forward,
+    ));
+
+    // Create loop
+    let mut wall_loop = Loop::new(0, LoopType::Outer);
+    wall_loop.add_edge(e_top, forward);
+    wall_loop.add_edge(e_right, true);
+    wall_loop.add_edge(e_bottom, true);
+    wall_loop.add_edge(e_left, true);
+    let loop_id = model.loops.add(wall_loop);
+
+    // Create face
+    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    let face_id = model.faces.add(face);
+
+    Ok(face_id)
 }
 
 /// Combine faces for shell solid

@@ -1,8 +1,10 @@
 # Vision Pipeline Configuration
-# This file configures how the vision pipeline processes viewport captures
-# and routes them through AI models for spatial-aware command processing.
+#
+# Policy: API-only providers. Local-model runtimes (Ollama, LLaMA, Whisper,
+# etc.) are not supported by this codebase. Supported providers are the
+# hosted APIs listed below (OpenAI, Anthropic, Google, CustomAPI for tests).
 
-# Default profile (development)
+# Default profile — Anthropic Claude
 [default]
 # Processing mode: "unified" or "separated"
 # - unified: Single multimodal model handles both vision and reasoning
@@ -22,30 +24,31 @@ reasoning_timeout_secs = 20
 
 # Vision model configuration
 [default.vision]
-provider = "Ollama"
-url = "http://localhost:11434/api/generate"
-model_name = "bakllava:latest"
-# api_key = ""  # Not needed for Ollama
+provider = "Anthropic"
+url = "https://api.anthropic.com/v1/messages"
+model_name = "claude-3-5-sonnet-20241022"
+api_key = "${ANTHROPIC_API_KEY}"
 
 # Reasoning model configuration (only used in separated mode)
 # If not specified, uses the same as vision
 # [default.reasoning]
-# provider = "Ollama"
-# url = "http://localhost:11434/api/generate"
-# model_name = "llama3.1:latest"
+# provider = "Anthropic"
+# url = "https://api.anthropic.com/v1/messages"
+# model_name = "claude-3-5-sonnet-20241022"
 
-# Development profile - Fast local processing
+# Development profile — OpenAI GPT-4o for quick iteration
 [profiles.development]
 mode = "unified"
 enable_cache = true
 cache_ttl_secs = 600  # 10 minutes
 
 [profiles.development.vision]
-provider = "Ollama"
-url = "http://localhost:11434/api/generate"
-model_name = "bakllava:7b"  # Smaller model for faster development
+provider = "OpenAI"
+url = "https://api.openai.com/v1/chat/completions"
+model_name = "gpt-4o-mini"
+api_key = "${OPENAI_API_KEY}"
 
-# Production profile - High quality with separated models
+# Production profile — High quality with separated vision + reasoning models
 [profiles.production]
 mode = "separated"
 enable_cache = true
@@ -55,16 +58,18 @@ vision_timeout_secs = 45
 reasoning_timeout_secs = 30
 
 [profiles.production.vision]
-provider = "Ollama"
-url = "http://localhost:11434/api/generate"
-model_name = "llava:13b"  # Larger vision model for better accuracy
+provider = "OpenAI"
+url = "https://api.openai.com/v1/chat/completions"
+model_name = "gpt-4o"
+api_key = "${OPENAI_API_KEY}"
 
 [profiles.production.reasoning]
-provider = "Ollama"
-url = "http://localhost:11435/api/generate"  # Different port for second instance
-model_name = "llama3.1:70b"  # Powerful reasoning model
+provider = "Anthropic"
+url = "https://api.anthropic.com/v1/messages"
+model_name = "claude-3-5-sonnet-20241022"
+api_key = "${ANTHROPIC_API_KEY}"
 
-# Cloud profile - Using cloud providers
+# Cloud profile — OpenAI
 [profiles.cloud]
 mode = "unified"
 enable_cache = true
@@ -74,7 +79,7 @@ cache_ttl_secs = 3600  # 1 hour
 provider = "OpenAI"
 url = "https://api.openai.com/v1/chat/completions"
 model_name = "gpt-4o"
-api_key = "${OPENAI_API_KEY}"  # Environment variable
+api_key = "${OPENAI_API_KEY}"
 
 # Anthropic profile
 [profiles.anthropic]
@@ -84,7 +89,7 @@ enable_cache = true
 [profiles.anthropic.vision]
 provider = "Anthropic"
 url = "https://api.anthropic.com/v1/messages"
-model_name = "claude-3-opus-20240229"
+model_name = "claude-3-5-sonnet-20241022"
 api_key = "${ANTHROPIC_API_KEY}"
 
 # Google profile
@@ -94,11 +99,11 @@ enable_cache = true
 
 [profiles.google.vision]
 provider = "Google"
-url = "https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent"
-model_name = "gemini-pro-vision"
+url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent"
+model_name = "gemini-1.5-pro"
 api_key = "${GOOGLE_API_KEY}"
 
-# Testing profile - Uses mock providers
+# Testing profile — Uses mock endpoint
 [profiles.test]
 mode = "unified"
 enable_cache = false
@@ -111,34 +116,16 @@ provider = "CustomAPI"
 url = "http://localhost:8888/mock"
 model_name = "mock-model"
 
-# Performance testing profile
-[profiles.benchmark]
-mode = "separated"
-enable_cache = false  # Disable cache for accurate benchmarks
-max_retries = 1
-
-[profiles.benchmark.vision]
-provider = "Ollama"
-url = "http://localhost:11434/api/generate"
-model_name = "llava:7b"  # Fast model
-
-[profiles.benchmark.reasoning]
-provider = "Ollama"
-url = "http://localhost:11434/api/generate"
-model_name = "llama3.1:8b"  # Fast model
-
 # Model recommendations based on use case
-# 
+#
 # For general CAD work:
-# - bakllava:latest (unified) - Good balance of vision and reasoning
-# 
-# For complex spatial reasoning:
-# - llava:13b (vision) + llama3.1:70b (reasoning) - Best accuracy
-# 
-# For fast prototyping:
-# - bakllava:7b (unified) - Fastest response times
-# 
-# For production with cloud:
-# - gpt-4o (unified) - Best overall quality
-# - claude-3-opus (unified) - Strong reasoning
-# - gemini-pro-vision (unified) - Good for complex scenes
+# - claude-3-5-sonnet (unified) — Strong reasoning, excellent tool use
+#
+# For complex spatial reasoning (separated mode):
+# - gpt-4o (vision) + claude-3-5-sonnet (reasoning) — Best accuracy
+#
+# For fast prototyping / development:
+# - gpt-4o-mini (unified) — Fast, cost-effective
+#
+# For multi-modal scenes:
+# - gemini-1.5-pro (unified) — Strong long-context vision

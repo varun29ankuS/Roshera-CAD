@@ -14,7 +14,8 @@ interface ChatState {
   isProcessing: boolean
   isPanelOpen: boolean
 
-  addMessage: (msg: Omit<ChatMessage, 'id' | 'timestamp'>) => void
+  addMessage: (msg: Omit<ChatMessage, 'id' | 'timestamp'>) => string
+  updateMessageContent: (id: string, content: string) => void
   setProcessing: (v: boolean) => void
   togglePanel: () => void
   setPanel: (open: boolean) => void
@@ -35,12 +36,22 @@ export const useChatStore = create<ChatState>((set) => ({
   isProcessing: false,
   isPanelOpen: true,
 
-  addMessage: (msg) =>
+  addMessage: (msg) => {
+    const id = `msg-${++msgCounter}`
     set((state) => ({
       messages: [
         ...state.messages,
-        { ...msg, id: `msg-${++msgCounter}`, timestamp: Date.now() },
+        { ...msg, id, timestamp: Date.now() },
       ],
+    }))
+    return id
+  },
+
+  updateMessageContent: (id, content) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, content } : m,
+      ),
     })),
 
   setProcessing: (v) => set({ isProcessing: v }),

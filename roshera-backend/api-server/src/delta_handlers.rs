@@ -111,11 +111,18 @@ pub async fn subscribe_to_deltas(
                         // Update last sequence
                         last_sequence = last_sequence.max(delta.sequence);
 
-                        // Send delta as SSE event
-                        let event = axum::response::sse::Event::default()
+                        // Send delta as SSE event. Skip any delta whose JSON
+                        // encoding fails rather than terminating the stream.
+                        let event = match axum::response::sse::Event::default()
                             .event("delta")
                             .json_data(&delta)
-                            .unwrap();
+                        {
+                            Ok(e) => e,
+                            Err(err) => {
+                                error!("Failed to serialize delta (seq={}): {err}", delta.sequence);
+                                continue;
+                            }
+                        };
 
                         if tx.send(Ok(event)).await.is_err() {
                             break;

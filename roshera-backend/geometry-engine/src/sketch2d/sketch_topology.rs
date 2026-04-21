@@ -487,7 +487,14 @@ impl SketchTopology {
 
         // Sort loops by area (largest first)
         let mut loop_indices: Vec<usize> = (0..self.loops.len()).collect();
-        loop_indices.sort_by(|&a, &b| self.loops[b].area.partial_cmp(&self.loops[a].area).unwrap());
+        // NaN-safe: if either loop area is NaN treat them as equal so the
+        // sort remains total and deterministic.
+        loop_indices.sort_by(|&a, &b| {
+            self.loops[b]
+                .area
+                .partial_cmp(&self.loops[a].area)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Build containment hierarchy
         let mut regions = Vec::new();
