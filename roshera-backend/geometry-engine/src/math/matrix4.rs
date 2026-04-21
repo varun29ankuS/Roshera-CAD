@@ -338,6 +338,11 @@ impl Matrix4 {
                 "Invalid field of view".to_string(),
             ));
         }
+        if aspect.abs() < consts::EPSILON {
+            return Err(MathError::InvalidParameter(
+                "Aspect ratio must be non-zero".to_string(),
+            ));
+        }
 
         let f = 1.0 / (fov_y * 0.5).tan();
         let range_inv = 1.0 / (near - far);
@@ -710,6 +715,38 @@ impl Matrix4 {
         ]))
     }
 
+    /// Invert an affine 4x4 matrix using its block structure.
+    ///
+    /// For an affine matrix of the form
+    /// ```text
+    /// [ R | t ]
+    /// [ 0 | 1 ]
+    /// ```
+    /// the inverse is
+    /// ```text
+    /// [ R^-1 | -R^-1 * t ]
+    /// [  0   |     1     ]
+    /// ```
+    ///
+    /// This is faster and numerically better-behaved than the general 4x4
+    /// inverse when the matrix is known to be affine (last row = [0, 0, 0, 1]).
+    ///
+    /// # Errors
+    /// Returns `MathError::SingularMatrix` if the 3x3 linear part is singular.
+    pub fn affine_inverse(&self) -> MathResult<Self> {
+        let linear = crate::math::Matrix3::from_matrix4(self);
+        let linear_inv = linear.inverse()?;
+        let t = self.translation_vector();
+        let t_inv = linear_inv.transform_vector(&t);
+
+        let mut result = linear_inv.to_matrix4();
+        // Translation column (column 3, rows 0..3) in column-major storage.
+        result.m[12] = -t_inv.x;
+        result.m[13] = -t_inv.y;
+        result.m[14] = -t_inv.z;
+        Ok(result)
+    }
+
     /// Check if matrix is identity within tolerance
     pub fn is_identity(&self, tolerance: Tolerance) -> bool {
         self.approx_eq(&Self::IDENTITY, tolerance)
@@ -717,9 +754,8 @@ impl Matrix4 {
 
     /// Check if matrix is orthogonal (rotation only)
     pub fn is_orthogonal(&self, tolerance: Tolerance) -> bool {
-        // Check if M * M^T = I for upper-left 3x3
-        // TODO: Implement when matrix3.rs is available
-        // For now, check if column vectors are orthonormal
+        // An orthogonal 3x3 upper-left block has unit-length, mutually
+        // perpendicular columns — equivalent to M * M^T = I.
         let col0 = Vector3::new(self.m[0], self.m[1], self.m[2]);
         let col1 = Vector3::new(self.m[4], self.m[5], self.m[6]);
         let col2 = Vector3::new(self.m[8], self.m[9], self.m[10]);
@@ -1063,8 +1099,37 @@ mod tests {
 
     #[test]
     fn test_affine_inverse() {
-        // Note: affine_inverse is not implemented yet, so we skip this test
-        // TODO: Implement affine_inverse when matrix3.rs is available
+        // Translate + rotate + non-uniform scale — a general affine matrix.
+        let m = Matrix4::translation(1.0, 2.0, 3.0)
+            * Matrix4::rotation_x(0.5)
+            * Matrix4::from_scale(&Vector3::new(2.0, 3.0, 4.0));
+
+        let inv = m
+            .affine_inverse()
+            .expect("affine_inverse on invertible matrix");
+
+        // M * M^-1 must be identity.
+        let product = m * inv;
+        assert!(
+            product.is_identity(NORMAL_TOLERANCE),
+            "M * M^-1 must be identity"
+        );
+
+        // affine_inverse must agree with the general inverse up to tolerance.
+        let general = m.inverse().expect("general inverse");
+        for i in 0..16 {
+            assert!(
+                (inv.m[i] - general.m[i]).abs() < NORMAL_TOLERANCE.distance(),
+                "affine_inverse disagrees with general inverse at element {i}"
+            );
+        }
+
+        // Singular linear part must surface SingularMatrix.
+        let singular = Matrix4::from_scale(&Vector3::new(0.0, 1.0, 1.0));
+        assert!(matches!(
+            singular.affine_inverse(),
+            Err(MathError::SingularMatrix)
+        ));
     }
 
     #[test]
@@ -1192,5 +1257,44 @@ mod tests {
         let reflected = m.transform_vector(&v);
 
         assert_eq!(reflected, Vector3::new(1.0, -1.0, 0.0));
+    }
+
+    // === Kernel hardening tests ===
+
+    #[test]
+    fn test_perspective_zero_aspect_returns_error() {
+        let result = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 0.0, 0.1, 100.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_perspective_near_equals_far_returns_error() {
+        let result = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 1.0, 10.0, 10.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_perspective_invalid_fov_returns_error() {
+        assert!(Matrix4::perspective(0.0, 1.0, 0.1, 100.0).is_err());
+        assert!(Matrix4::perspective(std::f64::consts::PI, 1.0, 0.1, 100.0).is_err());
+        assert!(Matrix4::perspective(-1.0, 1.0, 0.1, 100.0).is_err());
+    }
+
+    #[test]
+    fn test_perspective_valid_produces_finite() {
+        let m = Matrix4::perspective(std::f64::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 1000.0).unwrap();
+        for i in 0..16 {
+            assert!(m.m[i].is_finite(), "m[{i}] is not finite: {}", m.m[i]);
+        }
+    }
+
+    #[test]
+    fn test_orthographic_degenerate_returns_error() {
+        // left == right
+        assert!(Matrix4::orthographic(5.0, 5.0, -1.0, 1.0, 0.1, 100.0).is_err());
+        // bottom == top
+        assert!(Matrix4::orthographic(-1.0, 1.0, 5.0, 5.0, 0.1, 100.0).is_err());
+        // near == far
+        assert!(Matrix4::orthographic(-1.0, 1.0, -1.0, 1.0, 10.0, 10.0).is_err());
     }
 }

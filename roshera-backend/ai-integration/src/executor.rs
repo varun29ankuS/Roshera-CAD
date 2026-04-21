@@ -1,5 +1,7 @@
 use dashmap::DashMap;
-use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::math::{Matrix4, Point3, Vector3};
+use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+use geometry_engine::operations::transform::{transform_solid, TransformOptions};
 /// Command executor that bridges AI commands to geometry engine
 ///
 /// # Design Rationale
@@ -138,7 +140,9 @@ impl CommandExecutor {
             };
 
             // Create sphere using the primitive system in the shared model
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = SpherePrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -179,7 +183,9 @@ impl CommandExecutor {
             };
 
             // Create cylinder using the primitive system in the shared model
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = CylinderPrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -215,7 +221,9 @@ impl CommandExecutor {
             };
 
             // Create cone using the primitive system in the shared model
-            let mut model = model_clone.write().unwrap();
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = ConePrimitive::create(&params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -230,49 +238,150 @@ impl CommandExecutor {
         Ok(geometry_id)
     }
 
-    /// Boolean union operation
+    /// Execute a boolean operation between two solids
+    ///
+    /// # Design Rationale
+    /// - **Why spawn_blocking**: Boolean operations are CPU-intensive (face-face
+    ///   intersection, face classification, topology reconstruction)
+    /// - **Why Arc clones**: The model lock must be held inside the blocking task
+    ///   to satisfy Send bounds on the spawned future
+    /// - **Performance**: Target < 150ms for 1k-face solids
+    async fn execute_boolean(
+        &mut self,
+        object_a: GeometryId,
+        object_b: GeometryId,
+        op: BooleanOp,
+    ) -> Result<GeometryId, ExecutorError> {
+        let solid_a = self.get_solid_id(&object_a)?;
+        let solid_b = self.get_solid_id(&object_b)?;
+
+        let op_name = format!("{:?}", op);
+        let model_clone = Arc::clone(&self.model);
+        let result_solid_id = tokio::task::spawn_blocking(move || {
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
+            boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default())
+                .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
+        })
+        .await
+        .map_err(|e| ExecutorError::GeometryError(format!("Task join error: {}", e)))??;
+
+        let geometry_id = self.generate_geometry_id();
+        self.id_map.insert(geometry_id.clone(), result_solid_id);
+        self.solid_to_geometry
+            .insert(result_solid_id, geometry_id.clone());
+
+        tracing::info!(
+            "Boolean {:?}: {:?} x {:?} -> {:?}",
+            op_name,
+            object_a,
+            object_b,
+            geometry_id
+        );
+
+        Ok(geometry_id)
+    }
+
+    /// Boolean union operation (A ∪ B)
     async fn boolean_union(
         &mut self,
         object_a: GeometryId,
         object_b: GeometryId,
     ) -> Result<GeometryId, ExecutorError> {
-        let _solid_a = self.get_solid_id(&object_a)?;
-        let _solid_b = self.get_solid_id(&object_b)?;
-
-        // TODO: Implement actual boolean operation when available
-        // For now, return a placeholder
-        Err(ExecutorError::NotImplemented("Boolean union".to_string()))
+        self.execute_boolean(object_a, object_b, BooleanOp::Union)
+            .await
     }
 
-    /// Boolean intersection operation
+    /// Boolean intersection operation (A ∩ B)
     async fn boolean_intersection(
         &mut self,
-        _object_a: GeometryId,
-        _object_b: GeometryId,
+        object_a: GeometryId,
+        object_b: GeometryId,
     ) -> Result<GeometryId, ExecutorError> {
-        Err(ExecutorError::NotImplemented(
-            "Boolean intersection".to_string(),
-        ))
+        self.execute_boolean(object_a, object_b, BooleanOp::Intersection)
+            .await
     }
 
-    /// Boolean difference operation
+    /// Boolean difference operation (A - B)
     async fn boolean_difference(
         &mut self,
-        _object_a: GeometryId,
-        _object_b: GeometryId,
+        object_a: GeometryId,
+        object_b: GeometryId,
     ) -> Result<GeometryId, ExecutorError> {
-        Err(ExecutorError::NotImplemented(
-            "Boolean difference".to_string(),
-        ))
+        self.execute_boolean(object_a, object_b, BooleanOp::Difference)
+            .await
     }
 
-    /// Transform operation
+    /// Transform a solid (translate, rotate, scale, or mirror)
+    ///
+    /// # Design Rationale
+    /// - **Why in-place**: Transforms modify vertex positions directly; no new
+    ///   topology is created, so we return the same GeometryId
+    /// - **Why spawn_blocking**: Matrix construction may fail (e.g., zero-length
+    ///   axis for rotation) and vertex iteration is O(n)
+    /// - **Performance**: O(V) where V is vertex count; < 5ms for typical solids
     async fn transform(
         &mut self,
-        _object: GeometryId,
-        _transform: shared_types::geometry_commands::Transform,
+        object: GeometryId,
+        xform: shared_types::geometry_commands::Transform,
     ) -> Result<GeometryId, ExecutorError> {
-        Err(ExecutorError::NotImplemented("Transform".to_string()))
+        let solid_id = self.get_solid_id(&object)?;
+
+        let model_clone = Arc::clone(&self.model);
+        tokio::task::spawn_blocking(move || {
+            let matrix = match xform {
+                shared_types::geometry_commands::Transform::Translate { offset } => Ok(
+                    Matrix4::translation(offset[0] as f64, offset[1] as f64, offset[2] as f64),
+                ),
+                shared_types::geometry_commands::Transform::Rotate {
+                    axis,
+                    angle_radians,
+                } => {
+                    let axis_vec = Vector3::new(axis[0] as f64, axis[1] as f64, axis[2] as f64);
+                    Matrix4::from_axis_angle(&axis_vec, angle_radians)
+                        .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
+                }
+                shared_types::geometry_commands::Transform::Scale { factors } => {
+                    Ok(Matrix4::from_scale(&Vector3::new(
+                        factors[0] as f64,
+                        factors[1] as f64,
+                        factors[2] as f64,
+                    )))
+                }
+                shared_types::geometry_commands::Transform::Mirror {
+                    plane_normal,
+                    plane_point,
+                } => {
+                    let normal = Vector3::new(
+                        plane_normal[0] as f64,
+                        plane_normal[1] as f64,
+                        plane_normal[2] as f64,
+                    );
+                    let point = Point3::new(
+                        plane_point[0] as f64,
+                        plane_point[1] as f64,
+                        plane_point[2] as f64,
+                    );
+                    Matrix4::mirror(point, normal)
+                        .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
+                }
+            }?;
+
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
+            transform_solid(&mut model, solid_id, matrix, TransformOptions::default())
+                .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
+
+            Ok::<(), ExecutorError>(())
+        })
+        .await
+        .map_err(|e| ExecutorError::GeometryError(format!("Task join error: {}", e)))??;
+
+        tracing::info!("Transformed solid: {:?}", object);
+
+        Ok(object)
     }
 
     /// Get solid ID from geometry ID
@@ -300,7 +409,10 @@ impl CommandExecutor {
     pub async fn clear(&mut self) {
         self.id_map.clear();
         self.solid_to_geometry.clear();
-        let mut model = self.model.write().unwrap();
+        let mut model = self
+            .model
+            .write()
+            .expect("BRep model RwLock poisoned; prior holder panicked");
         *model = BRepModel::new();
     }
 }

@@ -1,18 +1,12 @@
-//! World-class edge representation for B-Rep topology
+//! Edge representation for B-Rep topology.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS:
+//! Features:
 //! - G1/G2 continuity tracking at vertices
-//! - Edge-edge intersection computation
-//! - Adaptive tessellation with curvature
+//! - Edge-edge intersection
+//! - Adaptive tessellation by curvature
 //! - Split/merge operations
 //! - Tolerance-based coincidence detection
 //! - Thread-safe edge operations
-//!
-//! Performance characteristics:
-//! - Edge creation: < 10ns
-//! - Evaluation: < 50ns
-//! - Intersection: < 1μs
-//! - Tessellation: adaptive based on curvature
 
 use crate::math::{consts, ApproxEq, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -117,7 +111,7 @@ const DEFAULT_EDGE_ATTRIBUTES: EdgeAttributes = EdgeAttributes {
     user_data: None,
 };
 
-/// World-class edge representation
+/// Edge representation
 #[derive(Debug, Clone)]
 pub struct Edge {
     /// Unique identifier
@@ -462,7 +456,12 @@ impl Edge {
                 stack.push((t1, tmid));
             } else {
                 // Accept segment
-                if points.is_empty() || !points.last().unwrap().approx_eq(&p1, tolerance) {
+                if points.is_empty()
+                    || !points
+                        .last()
+                        .expect("points.last() safe: non-empty branch of short-circuit above")
+                        .approx_eq(&p1, tolerance)
+                {
                     points.push(p1);
                 }
                 points.push(p2);
@@ -545,7 +544,7 @@ impl Edge {
     }
 }
 
-/// World-class edge storage with advanced querying
+/// Edge storage with advanced querying
 #[derive(Debug)]
 pub struct EdgeStore {
     /// Edge data (Structure of Arrays for cache efficiency)

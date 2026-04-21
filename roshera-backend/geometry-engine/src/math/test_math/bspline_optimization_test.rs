@@ -98,6 +98,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-only: wall-clock perf assertion; run with --release --ignored"]
     fn test_performance_improvement() {
         let curve = create_test_curve();
         const ITERATIONS: usize = 100_000;

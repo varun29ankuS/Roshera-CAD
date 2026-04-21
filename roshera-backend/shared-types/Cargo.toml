@@ -26,3 +26,6 @@ wasm       = ["uuid/js", "chrono/wasmbind"]
 
 [dev-dependencies]
 proptest = "1.4"
+
+[lints]
+workspace = true

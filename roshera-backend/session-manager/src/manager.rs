@@ -31,6 +31,14 @@ pub struct SessionManager {
     ot_engine: Arc<OTEngine>,
     /// CRDT state for each session
     session_crdts: Arc<DashMap<String, GeometryCRDT>>,
+    /// Authentication manager for JWT and API key handling
+    auth_manager: Arc<crate::auth::AuthManager>,
+    /// Permission manager for RBAC enforcement
+    permission_manager: Arc<crate::permissions::PermissionManager>,
+    /// Cache manager for multi-layer caching
+    cache_manager: Arc<crate::cache::CacheManager>,
+    /// Delta manager for delta synchronization
+    delta_manager: Arc<crate::delta_manager::DeltaManager>,
 }
 
 impl SessionManager {
@@ -48,46 +56,36 @@ impl SessionManager {
             timeline,
             ot_engine,
             session_crdts: Arc::new(DashMap::new()),
+            auth_manager: Arc::new(crate::auth::AuthManager::new(
+                crate::auth::AuthConfig::default(),
+                "default-jwt-secret",
+            )),
+            permission_manager: Arc::new(crate::permissions::PermissionManager::new()),
+            cache_manager: Arc::new(crate::cache::CacheManager::new(
+                crate::cache::CacheConfig::default(),
+            )),
+            delta_manager: Arc::new(crate::delta_manager::DeltaManager::new()),
         }
     }
 
     /// Get auth manager for authentication operations
     pub fn auth_manager(&self) -> &crate::auth::AuthManager {
-        // For now, return a default auth manager
-        // In a real implementation, this would be a field in SessionManager
-        static AUTH_MANAGER: std::sync::OnceLock<crate::auth::AuthManager> =
-            std::sync::OnceLock::new();
-        AUTH_MANAGER.get_or_init(|| {
-            crate::auth::AuthManager::new(crate::auth::AuthConfig::default(), "default-jwt-secret")
-        })
+        &self.auth_manager
     }
 
     /// Get permission manager for permission operations
     pub fn permission_manager(&self) -> &crate::permissions::PermissionManager {
-        // For now, return a default permission manager
-        // In a real implementation, this would be a field in SessionManager
-        static PERMISSION_MANAGER: std::sync::OnceLock<crate::permissions::PermissionManager> =
-            std::sync::OnceLock::new();
-        PERMISSION_MANAGER.get_or_init(|| crate::permissions::PermissionManager::new())
+        &self.permission_manager
     }
 
     /// Get cache manager for caching operations
     pub fn cache_manager(&self) -> &crate::cache::CacheManager {
-        // For now, return a default cache manager
-        // In a real implementation, this would be a field in SessionManager
-        static CACHE_MANAGER: std::sync::OnceLock<crate::cache::CacheManager> =
-            std::sync::OnceLock::new();
-        CACHE_MANAGER
-            .get_or_init(|| crate::cache::CacheManager::new(crate::cache::CacheConfig::default()))
+        &self.cache_manager
     }
 
     /// Get delta manager for delta synchronization operations
     pub fn delta_manager(&self) -> &crate::delta_manager::DeltaManager {
-        // For now, return a default delta manager
-        // In a real implementation, this would be a field in SessionManager
-        static DELTA_MANAGER: std::sync::OnceLock<crate::delta_manager::DeltaManager> =
-            std::sync::OnceLock::new();
-        DELTA_MANAGER.get_or_init(|| crate::delta_manager::DeltaManager::new())
+        &self.delta_manager
     }
 
     /// Get broadcast manager for real-time updates
@@ -98,10 +96,7 @@ impl SessionManager {
     /// Creates a new session
     pub async fn create_session(&self, user_name: String) -> String {
         let session_id = Uuid::new_v4();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
+        let now = shared_types::unix_millis_now();
 
         let session = SessionState::new(session_id, user_name.clone());
 
@@ -567,10 +562,7 @@ impl SessionManager {
 
 /// Get current timestamp in milliseconds
 fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_millis() as u64
+    shared_types::unix_millis_now()
 }
 
 impl Default for SessionManager {

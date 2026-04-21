@@ -45,3 +45,6 @@ sysinfo = "0.30"
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 hyper = "1.0"
+
+[lints]
+workspace = true

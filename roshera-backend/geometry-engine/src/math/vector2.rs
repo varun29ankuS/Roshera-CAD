@@ -222,9 +222,14 @@ impl Vector2 {
     }
 
     /// Component-wise reciprocal
+    ///
+    /// Returns `Err(MathError::DivisionByZero)` if any component is zero.
     #[inline(always)]
-    pub fn recip(&self) -> Self {
-        Self::new(1.0 / self.x, 1.0 / self.y)
+    pub fn recip(&self) -> MathResult<Self> {
+        if self.x == 0.0 || self.y == 0.0 {
+            return Err(MathError::DivisionByZero);
+        }
+        Ok(Self::new(1.0 / self.x, 1.0 / self.y))
     }
 
     /// Component-wise minimum
@@ -354,9 +359,14 @@ impl Vector2 {
     }
 
     /// Component-wise divide
+    ///
+    /// Returns `Err(MathError::DivisionByZero)` if any component of `other` is zero.
     #[inline(always)]
-    pub fn component_div(&self, other: &Self) -> Self {
-        Self::new(self.x / other.x, self.y / other.y)
+    pub fn component_div(&self, other: &Self) -> MathResult<Self> {
+        if other.x == 0.0 || other.y == 0.0 {
+            return Err(MathError::DivisionByZero);
+        }
+        Ok(Self::new(self.x / other.x, self.y / other.y))
     }
 
     /// Apply function to each component
@@ -398,7 +408,12 @@ impl Vector2 {
         let dot02 = v0.dot(&v2);
         let dot12 = v1.dot(&v2);
 
-        let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
+        let denom = dot00 * dot11 - dot01 * dot01;
+        // Degenerate triangle — return equal-weight fallback
+        if denom.abs() < 1e-12 {
+            return Self::new(1.0 / 3.0, 1.0 / 3.0);
+        }
+        let inv_denom = 1.0 / denom;
         let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
         let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
 
@@ -799,7 +814,7 @@ mod tests {
         let b = Vector2::new(2.0, 2.0);
 
         assert_eq!(a.component_mul(&b), Vector2::new(2.0, 8.0));
-        assert_eq!(a.component_div(&b), Vector2::new(0.5, 2.0));
+        assert_eq!(a.component_div(&b).unwrap(), Vector2::new(0.5, 2.0));
 
         assert_eq!(a.min(&b), Vector2::new(1.0, 2.0));
         assert_eq!(a.max(&b), Vector2::new(2.0, 4.0));
@@ -853,5 +868,55 @@ mod tests {
         // Test perpendicular detection
         let v3 = v1.perp();
         assert!(v1.is_perpendicular(&v3, NORMAL_TOLERANCE));
+    }
+
+    // === Kernel hardening tests ===
+
+    #[test]
+    fn test_component_div_zero_returns_error() {
+        let a = Vector2::new(1.0, 2.0);
+        assert!(a.component_div(&Vector2::new(0.0, 1.0)).is_err());
+        assert!(a.component_div(&Vector2::new(1.0, 0.0)).is_err());
+        assert!(a.component_div(&Vector2::ZERO).is_err());
+    }
+
+    #[test]
+    fn test_component_div_valid() {
+        let r = Vector2::new(10.0, 20.0)
+            .component_div(&Vector2::new(2.0, 5.0))
+            .unwrap();
+        assert_eq!(r, Vector2::new(5.0, 4.0));
+    }
+
+    #[test]
+    fn test_recip_zero_returns_error() {
+        assert!(Vector2::new(0.0, 1.0).recip().is_err());
+        assert!(Vector2::new(1.0, 0.0).recip().is_err());
+    }
+
+    #[test]
+    fn test_recip_valid() {
+        let r = Vector2::new(2.0, 4.0).recip().unwrap();
+        assert_eq!(r, Vector2::new(0.5, 0.25));
+    }
+
+    #[test]
+    fn test_barycentric_degenerate_triangle() {
+        // Collinear points — should not produce NaN/Inf
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(1.0, 0.0);
+        let c = Point2::new(2.0, 0.0);
+        let p = Point2::new(0.5, 0.0);
+        let bary = Vector2::to_barycentric(&p, &a, &b, &c);
+        assert!(bary.x.is_finite());
+        assert!(bary.y.is_finite());
+    }
+
+    #[test]
+    fn test_barycentric_coincident_points() {
+        let p = Point2::new(1.0, 1.0);
+        let bary = Vector2::to_barycentric(&p, &p, &p, &p);
+        assert!(bary.x.is_finite());
+        assert!(bary.y.is_finite());
     }
 }

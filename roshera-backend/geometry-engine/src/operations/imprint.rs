@@ -186,7 +186,12 @@ fn imprint_edge_directly(
         ));
     }
 
-    // Create copy of edge associated with face
+    // Create copy of edge associated with face.
+    //
+    // Face association is not a property of the Edge itself — edges live in
+    // a shared EdgeStore and are referenced by Face::internal_edges (added by
+    // `update_face_with_imprinted_edges` once all imprint edges are ready)
+    // and by loop half-edges.
     let imprinted_edge = Edge::new(
         0, // ID will be assigned by store
         edge.start_vertex,
@@ -195,7 +200,6 @@ fn imprint_edge_directly(
         edge.orientation,
         edge.param_range,
     );
-    // TODO: Need to track face association somehow
     let edge_id = model.edges.add(imprinted_edge);
 
     Ok((vec![edge_id], vec![]))
@@ -308,8 +312,8 @@ fn create_edge_on_face(
         curve_id,
         crate::primitives::edge::EdgeOrientation::Forward,
     );
-    // Note: Edge doesn't have set_face_association method
-    // Face association would be tracked separately
+    // Face association is recorded later via Face::add_internal_edges inside
+    // `update_face_with_imprinted_edges`, not on the Edge itself.
 
     Ok(model.edges.add(edge))
 }
