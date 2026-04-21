@@ -3,19 +3,17 @@
 use geometry_engine::{
     math::Point3,
     primitives::{
-        curve::{CurveId, CurveStore, ParameterRange},
-        edge::{Edge, EdgeAttributes, EdgeId, EdgeOrientation, EdgeStore},
-        face::{Face, FaceAttributes, FaceId, FaceOrientation, FaceStore},
-        r#loop::{Loop, LoopId, LoopStore, LoopType},
-        shell::{Shell, ShellId, ShellStore, ShellType},
-        solid::{Solid, SolidAttributes, SolidId, SolidStore},
-        surface::{SurfaceId, SurfaceStore},
+        curve::{CurveId, ParameterRange},
+        edge::{Edge, EdgeId, EdgeOrientation},
+        face::{Face, FaceId, FaceOrientation},
+        r#loop::{Loop, LoopId, LoopType},
+        shell::{Shell, ShellId, ShellType},
+        solid::{Solid, SolidId},
+        surface::SurfaceId,
         topology_builder::BRepModel,
-        vertex::{VertexId, VertexStore},
+        vertex::VertexId,
     },
 };
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 
 /// Extension trait for BRepModel to add convenience methods
 pub trait BRepModelExt {

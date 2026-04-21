@@ -7,7 +7,6 @@ use crate::{
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Strategy for merging branches
 #[derive(Debug, Clone)]
@@ -182,7 +181,7 @@ impl BranchMerger {
         common_ancestor: EventIndex,
         strategy: MergeStrategy,
     ) -> TimelineResult<MergeResult> {
-        let start_time = std::time::Instant::now();
+        let _start_time = std::time::Instant::now();
 
         match strategy {
             MergeStrategy::FastForward => {

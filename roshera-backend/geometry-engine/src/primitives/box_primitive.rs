@@ -6,8 +6,7 @@
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Line,
-    edge::{Edge, EdgeId, EdgeOrientation},
-    face::FaceId,
+    edge::{Edge, EdgeOrientation},
     primitive_traits::{
         EntityRef, IssueSeverity, ManifoldStatus, ParameterDefinition, ParameterSchema,
         ParameterType, Primitive, PrimitiveError, ValidationIssue, ValidationMetrics,
@@ -16,7 +15,6 @@ use crate::primitives::{
     solid::SolidId,
     surface::Plane,
     topology_builder::BRepModel,
-    vertex::VertexId,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;

@@ -5,7 +5,7 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use shared_types::{AICommand, ObjectId};
+use shared_types::AICommand;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -268,8 +268,8 @@ impl GeometryCRDT {
     pub fn update_property(
         &self,
         object_id: shared_types::ObjectId,
-        property_name: String,
-        property_value: serde_json::Value,
+        _property_name: String,
+        _property_value: serde_json::Value,
         timestamp: u64,
     ) {
         // Create a synthetic operation for property updates

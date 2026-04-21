@@ -591,7 +591,7 @@ impl Timeline {
         &mut self,
         source_branch: BranchId,
         target_branch: BranchId,
-        strategy: MergeStrategy,
+        _strategy: MergeStrategy,
     ) -> TimelineResult<MergeResult> {
         // Verify branches exist
         if !self.branches.contains_key(&source_branch) {
@@ -662,7 +662,7 @@ impl Timeline {
     pub fn get_branch_events_map(
         &self,
         branch_id: &BranchId,
-    ) -> Option<dashmap::mapref::one::Ref<BranchId, DashMap<EventIndex, EventId>>> {
+    ) -> Option<dashmap::mapref::one::Ref<'_, BranchId, DashMap<EventIndex, EventId>>> {
         self.branch_events.get(branch_id)
     }
 

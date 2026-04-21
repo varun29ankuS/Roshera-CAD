@@ -372,7 +372,7 @@ impl StorageIndex {
         segment_files.sort();
 
         // Process each segment file
-        for (segment_idx, segment_path) in segment_files.iter().enumerate() {
+        for (_segment_idx, segment_path) in segment_files.iter().enumerate() {
             let file_data = tokio::fs::read(segment_path)
                 .await
                 .map_err(TimelineError::StorageError)?;

@@ -16,7 +16,6 @@ pub use curve::{tessellate_curve, tessellate_edge};
 pub use mesh::{MeshVertex, ThreeJsMesh, TriangleMesh};
 pub use surface::{tessellate_face, tessellate_surface};
 
-use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{builder::BRepModel, shell::Shell, solid::Solid};
 
 /// Tessellation parameters for controlling mesh quality

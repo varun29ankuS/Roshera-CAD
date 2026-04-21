@@ -1,11 +1,11 @@
 //! Create sketch operation implementation
 
 use super::brep_helpers::BRepModelExt;
-use super::common::{array_to_matrix4, brep_to_entity_state};
+use super::common::brep_to_entity_state;
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    CreatedEntity, EntityId, EntityType, Operation, OperationInputs, OperationOutputs,
-    SketchElement, SketchPlane, TimelineError, TimelineResult,
+    CreatedEntity, EntityId, EntityType, Operation, OperationOutputs, SketchElement, SketchPlane,
+    TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
@@ -64,7 +64,7 @@ impl OperationImpl for CreateSketchOp {
 
             // Get the transformation matrix for the sketch plane
             let transform = get_plane_transform(plane);
-            let inverse_transform = transform.inverse().map_err(|_| {
+            let _inverse_transform = transform.inverse().map_err(|_| {
                 TimelineError::ExecutionError(
                     "Failed to compute inverse transform for sketch plane".to_string(),
                 )

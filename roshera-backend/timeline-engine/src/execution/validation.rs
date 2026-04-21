@@ -1,10 +1,7 @@
 //! Operation validation
 
 use super::ExecutionContext;
-use crate::{
-    EntityReference, EntityType, Operation, OperationInputs, TimelineError, TimelineResult,
-    ValidationRequirement,
-};
+use crate::{EntityType, Operation, OperationInputs, TimelineError, TimelineResult};
 
 /// Validates operations before execution
 pub struct OperationValidator {

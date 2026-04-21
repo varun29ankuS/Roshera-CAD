@@ -4,9 +4,8 @@
 //! Implements proper inside/outside classification and intersection algorithms.
 
 use crate::math::bspline::KnotVector;
-use crate::math::nurbs::{NurbsCurve, NurbsSurface};
-use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
-use std::fmt;
+use crate::math::nurbs::NurbsSurface;
+use crate::math::{MathError, MathResult, Point3, Tolerance};
 
 /// A 2D curve in parameter space of a surface
 #[derive(Debug, Clone)]
@@ -160,7 +159,7 @@ impl TrimmedNurbsSurface {
     }
 
     /// Create default rectangular boundary in parameter space
-    fn create_default_boundary(surface: &NurbsSurface) -> TrimLoop {
+    fn create_default_boundary(_surface: &NurbsSurface) -> TrimLoop {
         // Create four linear curves for the boundary
         let corners = vec![
             Point2::new(0.0, 0.0),

@@ -7,17 +7,16 @@
 //! - Per-chunk and file-level encryption
 //! - Authenticated encryption with additional data (AEAD)
 
-use crate::ros_fs::keys::KeyManager; // Add this line to bring the trait into scope
-use crate::ros_fs::keys::{KeySet, SecureKey, SoftwareKeyManager};
-use crate::ros_fs::util::{constant_time_eq, random_bytes};
+// Add this line to bring the trait into scope
+use crate::ros_fs::keys::{KeySet, SecureKey};
+use crate::ros_fs::util::constant_time_eq;
 use crate::ros_fs::{EncryptionError, Result};
 use aes_gcm::{
     aead::{Aead, Payload},
     Aes256Gcm, KeyInit, Nonce as AesNonce,
 };
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaNonce};
-use std::io::{Cursor, Read, Write};
-use zeroize::Zeroize;
+use std::io::{Read, Write};
 
 /// Supported encryption algorithms (.ros v3)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

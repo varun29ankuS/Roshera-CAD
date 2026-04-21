@@ -308,10 +308,10 @@ pub fn delete_edge(
     edge_id: EdgeId,
     options: DeleteOptions,
 ) -> OperationResult<DeleteResult> {
-    let mut deleted_primary = vec![(EntityType::Edge, edge_id)];
+    let deleted_primary = vec![(EntityType::Edge, edge_id)];
     let mut deleted_cascade = Vec::new();
     let mut deleted_orphans = Vec::new();
-    let mut healed_entities = Vec::new();
+    let healed_entities = Vec::new();
 
     // Find loops using this edge
     let mut affected_loops = Vec::new();
@@ -567,13 +567,13 @@ fn delete_shell_cascade(
     Ok(())
 }
 
-fn heal_deletion_gaps(model: &mut BRepModel) -> OperationResult<Vec<(EntityType, u32)>> {
+fn heal_deletion_gaps(_model: &mut BRepModel) -> OperationResult<Vec<(EntityType, u32)>> {
     // This would implement gap healing algorithms
     // For now, return empty
     Ok(Vec::new())
 }
 
-fn heal_face_deletion(model: &mut BRepModel, face_id: FaceId) -> OperationResult<()> {
+fn heal_face_deletion(_model: &mut BRepModel, _face_id: FaceId) -> OperationResult<()> {
     // This would implement face deletion healing
     // Could involve extending adjacent faces, etc.
     Ok(())
@@ -670,7 +670,7 @@ fn is_shell_used(model: &BRepModel, shell_id: ShellId) -> bool {
     false
 }
 
-fn validate_model_after_deletion(model: &BRepModel) -> OperationResult<()> {
+fn validate_model_after_deletion(_model: &BRepModel) -> OperationResult<()> {
     // Validate topology integrity
     // Check for dangling references
     // Validate Euler characteristics

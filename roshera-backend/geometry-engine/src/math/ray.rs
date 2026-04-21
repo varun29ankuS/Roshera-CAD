@@ -6,7 +6,7 @@
 //! - Distance calculations
 //! - Spatial queries
 
-use super::{consts, ApproxEq, MathError, MathResult, Point3, Tolerance, Vector3};
+use super::{consts, ApproxEq, MathResult, Point3, Tolerance, Vector3};
 use std::fmt;
 
 /// Ray representation with origin and direction

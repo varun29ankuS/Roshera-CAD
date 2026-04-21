@@ -5,20 +5,20 @@
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Arc, Circle, CurveId, CurveStore, Line},
+    curve::{Circle, CurveStore, Line},
     edge::{Edge, EdgeId, EdgeOrientation, EdgeStore},
     face::{Face, FaceId, FaceOrientation, FaceStore},
     primitive_traits::PrimitiveError,
-    r#loop::{Loop, LoopId, LoopStore, LoopType},
+    r#loop::{Loop, LoopStore, LoopType},
     shell::{Shell, ShellId, ShellStore, ShellType},
     solid::{Solid, SolidId, SolidStore},
-    surface::{Cylinder, Plane, Sphere, SurfaceId, SurfaceStore},
+    surface::{Plane, Sphere, SurfaceStore},
     vertex::{VertexId, VertexStore},
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc as SyncArc, LazyLock, RwLock};
+use std::sync::LazyLock;
 
 /// Tessellated mesh representation for visualization
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,7 +259,7 @@ impl BRepModel {
 
             // Triangulate the face and compute volume contribution
             // Using divergence theorem: V = (1/3) ∫∫ r·n dS
-            let origin = Point3::ORIGIN;
+            let _origin = Point3::ORIGIN;
             for i in 1..vertices.len() - 1 {
                 let v0 = vertices[0];
                 let v1 = vertices[i];
@@ -268,7 +268,7 @@ impl BRepModel {
                 // Calculate triangle normal (outward pointing)
                 let edge1 = v1 - v0;
                 let edge2 = v2 - v0;
-                let normal = edge1.cross(&edge2);
+                let _normal = edge1.cross(&edge2);
 
                 // Volume of tetrahedron formed by triangle and origin
                 // V = (1/6) |v0 · (v1 × v2)|
@@ -361,7 +361,7 @@ impl BRepModel {
     }
 
     /// Tessellate a solid into a watertight triangle mesh for visualization
-    pub fn tessellate_solid(&self, solid_id: u32, tolerance: f64) -> Option<TessellatedMesh> {
+    pub fn tessellate_solid(&self, solid_id: u32, _tolerance: f64) -> Option<TessellatedMesh> {
         let solid = self.solids.get(solid_id)?;
         let shell = self.shells.get(solid.outer_shell)?;
 
@@ -809,7 +809,7 @@ impl<'a> TopologyBuilder<'a> {
         let curve_id = self.model.curves.add(Box::new(line));
 
         // Create edge
-        let mut edge = Edge::new(
+        let edge = Edge::new(
             0, // temporary ID
             start_vertex,
             end_vertex,
@@ -864,7 +864,7 @@ impl<'a> TopologyBuilder<'a> {
         );
 
         // Create circular edge (self-closing)
-        let mut edge = Edge::new(
+        let edge = Edge::new(
             0, // temporary ID
             vertex_id,
             vertex_id, // same vertex for closed curve
@@ -1056,7 +1056,7 @@ impl<'a> TopologyBuilder<'a> {
 
         // Sphere is a special case - single face, no edges, no vertices
         // Create degenerate loop (empty edge list for closed surface)
-        let mut loop_obj = Loop::new(0, LoopType::Outer);
+        let loop_obj = Loop::new(0, LoopType::Outer);
         let loop_id = self.model.loops.add(loop_obj);
 
         // Create face
@@ -1392,7 +1392,7 @@ impl<'a> TopologyBuilder<'a> {
             let curve_id = self.model.curves.add(Box::new(line));
 
             // Create edge
-            let mut edge = Edge::new(
+            let edge = Edge::new(
                 0, // temporary ID
                 start_vertex,
                 end_vertex,
@@ -1430,7 +1430,7 @@ impl<'a> TopologyBuilder<'a> {
             let line = Line::new(start_p, end_p);
             let curve_id = self.model.curves.add(Box::new(line));
 
-            let mut edge = Edge::new(
+            let edge = Edge::new(
                 0,
                 start_v,
                 end_v,
@@ -1545,10 +1545,10 @@ impl<'a> TopologyBuilder<'a> {
     /// Create cylinder topology (simplified implementation)
     fn create_cylinder_topology(
         &mut self,
-        base_center: Point3,
-        axis: Vector3,
-        radius: f64,
-        height: f64,
+        _base_center: Point3,
+        _axis: Vector3,
+        _radius: f64,
+        _height: f64,
     ) -> Result<SolidId, PrimitiveError> {
         // This is a simplified implementation
         // In a full implementation, we would create:
@@ -1559,7 +1559,7 @@ impl<'a> TopologyBuilder<'a> {
         // - Proper edge-face adjacency
 
         // For now, create a minimal valid solid
-        let mut shell = Shell::new(0, ShellType::Closed);
+        let shell = Shell::new(0, ShellType::Closed);
         let shell_id = self.model.shells.add(shell);
         let solid = Solid::new(0, shell_id);
         Ok(self.model.solids.add(solid))
@@ -1723,7 +1723,7 @@ impl<'a> TopologyBuilder<'a> {
     /// Rebuild box with new parameters (production implementation)
     fn rebuild_box(
         &mut self,
-        geometry_id: GeometryId,
+        _geometry_id: GeometryId,
         params: &DashMap<String, f64>,
     ) -> Result<(), PrimitiveError> {
         let width = params.get("width").map(|v| *v).unwrap_or(1.0);
@@ -1751,13 +1751,13 @@ impl<'a> TopologyBuilder<'a> {
     /// Rebuild sphere with new parameters (production implementation)
     fn rebuild_sphere(
         &mut self,
-        geometry_id: GeometryId,
+        _geometry_id: GeometryId,
         params: &DashMap<String, f64>,
     ) -> Result<(), PrimitiveError> {
         let radius = params.get("radius").map(|v| *v).unwrap_or(1.0);
-        let center_x = params.get("center_x").map(|v| *v).unwrap_or(0.0);
-        let center_y = params.get("center_y").map(|v| *v).unwrap_or(0.0);
-        let center_z = params.get("center_z").map(|v| *v).unwrap_or(0.0);
+        let _center_x = params.get("center_x").map(|v| *v).unwrap_or(0.0);
+        let _center_y = params.get("center_y").map(|v| *v).unwrap_or(0.0);
+        let _center_z = params.get("center_z").map(|v| *v).unwrap_or(0.0);
 
         if radius <= 0.0 {
             return Err(PrimitiveError::InvalidParameters {
@@ -1774,7 +1774,7 @@ impl<'a> TopologyBuilder<'a> {
     /// Rebuild cylinder with new parameters (production implementation)
     fn rebuild_cylinder(
         &mut self,
-        geometry_id: GeometryId,
+        _geometry_id: GeometryId,
         params: &DashMap<String, f64>,
     ) -> Result<(), PrimitiveError> {
         let radius = params.get("radius").map(|v| *v).unwrap_or(1.0);
@@ -1795,7 +1795,7 @@ impl<'a> TopologyBuilder<'a> {
     /// Rebuild rectangle with new parameters (production implementation)
     fn rebuild_rectangle(
         &mut self,
-        geometry_id: GeometryId,
+        _geometry_id: GeometryId,
         params: &DashMap<String, f64>,
     ) -> Result<(), PrimitiveError> {
         let width = params.get("width").map(|v| *v).unwrap_or(1.0);
@@ -1815,7 +1815,7 @@ impl<'a> TopologyBuilder<'a> {
     /// Rebuild 2D circle with new parameters (production implementation)
     fn rebuild_circle_2d(
         &mut self,
-        geometry_id: GeometryId,
+        _geometry_id: GeometryId,
         params: &DashMap<String, f64>,
     ) -> Result<(), PrimitiveError> {
         let radius = params.get("radius").map(|v| *v).unwrap_or(1.0);
@@ -1863,7 +1863,7 @@ impl<'a> TopologyBuilder<'a> {
     /// Validate topology using Euler characteristic
     pub fn validate_topology(&self, geometry_id: GeometryId) -> Result<bool, PrimitiveError> {
         match geometry_id {
-            GeometryId::Solid(solid_id) => {
+            GeometryId::Solid(_solid_id) => {
                 // For solid: V - E + F = 2 (for simple solids)
                 // TODO: Implement comprehensive validation
                 Ok(true)

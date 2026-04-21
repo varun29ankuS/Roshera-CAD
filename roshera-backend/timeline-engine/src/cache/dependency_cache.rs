@@ -1,7 +1,7 @@
 //! Cache for dependency relationships
 
 use super::CacheStats;
-use crate::{ConstraintType, DependencyType, EntityId, EventId, TimelineError, TimelineResult};
+use crate::{DependencyType, EntityId, EventId};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;

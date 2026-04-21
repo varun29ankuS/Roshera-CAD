@@ -5,17 +5,17 @@
 
 use crate::{TimelineError, TimelineResult};
 use geometry_engine::{
-    math::{Matrix4, Point3, Vector3},
+    math::{Point3, Vector3},
     primitives::{
-        curve::{CurveId, CurveStore, ParameterRange},
-        edge::{Edge, EdgeId, EdgeOrientation, EdgeStore},
-        face::{Face, FaceId, FaceOrientation, FaceStore},
-        r#loop::{Loop, LoopId, LoopStore, LoopType},
-        shell::{Shell, ShellId, ShellStore, ShellType},
-        solid::{Solid, SolidId, SolidStore},
-        surface::{SurfaceId, SurfaceStore},
+        curve::{CurveId, ParameterRange},
+        edge::{Edge, EdgeId, EdgeOrientation},
+        face::{Face, FaceId, FaceOrientation},
+        r#loop::{Loop, LoopId, LoopType},
+        shell::{Shell, ShellId, ShellType},
+        solid::{Solid, SolidId},
+        surface::SurfaceId,
         topology_builder::BRepModel,
-        vertex::{Vertex, VertexId, VertexStore},
+        vertex::VertexId,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -258,7 +258,7 @@ pub fn serialized_to_brep(data: &SerializedBRep) -> TimelineResult<BRepModel> {
     let mut loop_id_map: HashMap<LoopId, LoopId> = HashMap::new();
     let mut face_id_map: HashMap<FaceId, FaceId> = HashMap::new();
     let mut shell_id_map: HashMap<ShellId, ShellId> = HashMap::new();
-    let mut solid_id_map: HashMap<SolidId, SolidId> = HashMap::new();
+    let _solid_id_map: HashMap<SolidId, SolidId> = HashMap::new();
 
     // Reconstruct vertices
     for vertex_data in &data.vertices {

@@ -3,9 +3,9 @@
 //! Provides tools for analyzing G0, G1, and G2 continuity between
 //! curves and surfaces at their boundaries.
 
-use crate::math::bspline::{BSplineCurve, KnotVector};
+use crate::math::bspline::BSplineCurve;
 use crate::math::nurbs::{NurbsCurve, NurbsSurface};
-use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{MathError, MathResult, Tolerance, Vector3};
 use std::fmt;
 
 /// Continuity type between geometric entities
@@ -196,8 +196,8 @@ pub fn analyze_nurbs_curve_continuity(
     // Get derivatives
     let derivs1 = curve1.evaluate_derivatives(t1, 2);
     let derivs2 = curve2.evaluate_derivatives(t2, 2);
-    let pos1 = derivs1.point;
-    let pos2 = derivs2.point;
+    let _pos1 = derivs1.point;
+    let _pos2 = derivs2.point;
     let deriv1 = derivs1.derivative1.unwrap_or(Vector3::ZERO);
     let deriv2 = derivs2.derivative1.unwrap_or(Vector3::ZERO);
     let deriv2_1 = derivs1.derivative2.unwrap_or(Vector3::ZERO);
@@ -371,7 +371,7 @@ impl SurfaceEdge {
     }
 
     /// Get tangent direction along edge
-    pub fn tangent_at(&self, t: f64) -> MathResult<Vector3> {
+    pub fn tangent_at(&self, _t: f64) -> MathResult<Vector3> {
         match self.edge_type {
             0 | 1 => Ok(Vector3::new(0.0, 1.0, 0.0)), // Along v
             2 | 3 => Ok(Vector3::new(1.0, 0.0, 0.0)), // Along u

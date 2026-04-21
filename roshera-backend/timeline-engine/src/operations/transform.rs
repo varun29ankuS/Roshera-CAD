@@ -5,14 +5,11 @@ use super::common::{
 };
 use crate::{
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
-    EntityId, EntityType, Modification, ModifiedEntity, Operation, OperationInputs,
-    OperationOutputs, TimelineError, TimelineResult,
+    EntityType, Modification, ModifiedEntity, Operation, OperationOutputs, TimelineError,
+    TimelineResult,
 };
 use async_trait::async_trait;
-use geometry_engine::{
-    math::{Matrix4, Point3, Quaternion, Vector3},
-    primitives::{topology_builder::BRepModel, vertex::Vertex},
-};
+use geometry_engine::{math::Matrix4, primitives::topology_builder::BRepModel};
 
 /// Implementation of transform operation
 pub struct TransformOp;

@@ -53,6 +53,10 @@ rand = "0.8"
 [features]
 default = []
 export = []
+profile = []
+lookup_tables = []
+gpu = []
+ml = []
 
 # All tests are now in src/math/test_math/
 

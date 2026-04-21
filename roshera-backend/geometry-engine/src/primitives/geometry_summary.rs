@@ -8,7 +8,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::math::{MathResult, Point3, Vector3};
+use crate::math::MathResult;
 use crate::primitives::topology_builder::BRepModel;
 
 use super::feature_recognition::{recognize_features, RecognizedFeature};
@@ -109,7 +109,7 @@ pub fn summarize_solid(solid_id: u32, model: &BRepModel) -> MathResult<GeometryS
     let name = solid.name.clone();
 
     // --- Topology counts ---
-    let outer_shell = model
+    let _outer_shell = model
         .shells
         .get(solid.outer_shell)
         .ok_or_else(|| crate::math::MathError::InvalidParameter("Outer shell not found".into()))?;

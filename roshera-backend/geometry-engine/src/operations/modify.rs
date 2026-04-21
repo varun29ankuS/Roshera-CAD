@@ -6,10 +6,9 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
-    edge::EdgeId, face::FaceId, r#loop::LoopId, shell::ShellId, solid::SolidId,
-    topology_builder::BRepModel, vertex::VertexId,
+    edge::EdgeId, face::FaceId, r#loop::LoopId, solid::SolidId, topology_builder::BRepModel,
+    vertex::VertexId,
 };
-use std::collections::HashMap;
 
 /// Type of modification operation
 #[derive(Debug, Clone)]
@@ -361,28 +360,28 @@ fn replace_edge_curve(
 
     // Create new curve based on type
     match new_curve {
-        EdgeCurveType::Line { start, end } => {
+        EdgeCurveType::Line { start: _, end: _ } => {
             // Update edge to be a line
             // This would involve updating the edge's curve representation
         }
         EdgeCurveType::Arc {
-            center,
-            radius,
-            start_angle,
-            end_angle,
+            center: _,
+            radius: _,
+            start_angle: _,
+            end_angle: _,
         } => {
             // Update edge to be an arc
         }
         EdgeCurveType::BSpline {
-            control_points,
-            degree,
+            control_points: _,
+            degree: _,
         } => {
             // Update edge to be a B-spline
         }
         EdgeCurveType::Circle {
-            center,
-            radius,
-            normal,
+            center: _,
+            radius: _,
+            normal: _,
         } => {
             // Update edge to be a circle
         }
@@ -401,7 +400,7 @@ fn modify_face_surface(
     model: &mut BRepModel,
     face_id: FaceId,
     surface_params: SurfaceParameters,
-    options: &ModifyOptions,
+    _options: &ModifyOptions,
 ) -> OperationResult<()> {
     // Get the face
     let _face = model
@@ -429,7 +428,7 @@ fn modify_face_surface(
         }
         SurfaceType::BSpline => {
             // Convert to B-spline surface
-            if let Some(control_points) = surface_params.control_points {
+            if let Some(_control_points) = surface_params.control_points {
                 // Set control points
             }
         }
@@ -445,7 +444,7 @@ fn modify_face_surface(
 fn modify_solid_properties(
     model: &mut BRepModel,
     solid_id: SolidId,
-    properties: SolidProperties,
+    _properties: SolidProperties,
 ) -> OperationResult<()> {
     // Get the solid
     let _solid = model
@@ -555,9 +554,9 @@ fn find_edges_using_vertex(model: &BRepModel, vertex_id: VertexId) -> Vec<EdgeId
     edges
 }
 
-fn find_faces_using_edge(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
-    let mut faces = Vec::new();
-    for (face_id, face) in model.faces.iter() {
+fn find_faces_using_edge(model: &BRepModel, _edge_id: EdgeId) -> Vec<FaceId> {
+    let faces = Vec::new();
+    for (_face_id, _face) in model.faces.iter() {
         // Check if face uses this edge in any of its loops
         // This would require iterating through loops
         // Placeholder for actual implementation
@@ -566,29 +565,29 @@ fn find_faces_using_edge(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
 }
 
 fn update_edges_for_vertex(
-    model: &mut BRepModel,
-    vertex_id: VertexId,
-    old_position: Point3,
-    new_position: Point3,
+    _model: &mut BRepModel,
+    _vertex_id: VertexId,
+    _old_position: Point3,
+    _new_position: Point3,
 ) -> OperationResult<()> {
     // Update curves of edges that use this vertex
     // This would involve recalculating curve parameters
     Ok(())
 }
 
-fn update_faces_for_edge(model: &mut BRepModel, edge_id: EdgeId) -> OperationResult<()> {
+fn update_faces_for_edge(_model: &mut BRepModel, _edge_id: EdgeId) -> OperationResult<()> {
     // Update surfaces of faces that use this edge
     // This would involve recalculating surface parameters
     Ok(())
 }
 
-fn validate_vertex_constraints(model: &BRepModel, vertex_id: VertexId) -> OperationResult<()> {
+fn validate_vertex_constraints(_model: &BRepModel, _vertex_id: VertexId) -> OperationResult<()> {
     // Check that vertex position doesn't violate any constraints
     // This would involve checking geometric constraints
     Ok(())
 }
 
-fn validate_model_topology(model: &BRepModel) -> OperationResult<()> {
+fn validate_model_topology(_model: &BRepModel) -> OperationResult<()> {
     // Validate that the model topology is still valid
     // This would involve checking Euler characteristics, etc.
     Ok(())

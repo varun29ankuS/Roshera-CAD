@@ -25,8 +25,7 @@ use crate::math::{Matrix4, Point3, Quaternion, Vector3};
 use crate::primitives::topology_builder::BRepModel;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -525,7 +524,7 @@ impl Assembly {
     /// Get iterator over components
     pub fn components(
         &self,
-    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<ComponentId, Component>> + '_
+    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, ComponentId, Component>> + '_
     {
         self.components.iter()
     }
@@ -533,7 +532,7 @@ impl Assembly {
     /// Get iterator over mates
     pub fn mates(
         &self,
-    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<MateId, MateConstraint>> + '_
+    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, MateId, MateConstraint>> + '_
     {
         self.mates.iter()
     }
@@ -548,7 +547,7 @@ impl Assembly {
         // Apply motion while respecting constraints
         if let Some(mut comp) = self.components.get_mut(&component) {
             // Check motion limits
-            if let Some(limits) = self.motion_limits.get(&component) {
+            if let Some(_limits) = self.motion_limits.get(&component) {
                 // Validate motion against limits
             }
 

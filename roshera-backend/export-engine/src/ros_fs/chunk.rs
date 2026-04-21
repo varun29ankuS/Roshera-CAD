@@ -438,7 +438,7 @@ impl ChunkTable {
     }
 
     /// Iterate over all entries
-    pub fn iter(&self) -> std::slice::Iter<ChunkIndexEntry> {
+    pub fn iter(&self) -> std::slice::Iter<'_, ChunkIndexEntry> {
         self.entries.iter()
     }
 

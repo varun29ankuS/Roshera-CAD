@@ -14,8 +14,7 @@
 //! and t=1 at 2π radians. The parameterization is always counter-clockwise.
 
 use super::{
-    Arc2d, Arc2dId, Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d,
-    Vector2d,
+    Arc2d, Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d, Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use serde::{Deserialize, Serialize};

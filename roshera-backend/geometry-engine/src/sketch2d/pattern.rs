@@ -12,7 +12,6 @@
 use super::constraints::EntityRef;
 use super::{Line2d, Matrix3, Point2d, Sketch2dError, Sketch2dResult, Tolerance2d, Vector2d};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 use uuid::Uuid;
 
 /// Unique identifier for a pattern

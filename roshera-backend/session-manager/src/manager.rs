@@ -4,16 +4,15 @@
 
 use crate::broadcast::{BroadcastManager, BroadcastMessage};
 use crate::command_processor::CommandProcessor;
-use crate::conflict_resolution::{GeometryCRDT, OTEngine, Operation, TransformedOperation};
+use crate::conflict_resolution::{GeometryCRDT, OTEngine, Operation};
 use crate::state::{SessionStateExt, SharedSessionState};
 use dashmap::DashMap;
 use shared_types::session::UserInfo;
 use shared_types::*;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use timeline_engine::{Timeline, TimelineConfig};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 /// Manages multiple CAD sessions with timeline support
@@ -522,7 +521,7 @@ impl SessionManager {
     pub async fn send_snapshot_to_client(
         &self,
         session_id: &str,
-        client_id: &str,
+        _client_id: &str,
     ) -> Result<(), SessionError> {
         let session = self.get_session(session_id).await?;
         let state = session.read().await;

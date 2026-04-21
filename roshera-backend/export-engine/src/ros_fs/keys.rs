@@ -8,9 +8,9 @@
 //! - Key rotation support
 //! - Hardware security module abstraction
 
-use crate::ros_fs::util::{format_uuid, random_16, random_32, secure_zero, sha256};
+use crate::ros_fs::util::{format_uuid, random_16, secure_zero, sha256};
 use crate::ros_fs::{KeyManagementError, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};

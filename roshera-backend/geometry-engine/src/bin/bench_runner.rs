@@ -2,9 +2,9 @@ use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::primitives::topology_builder::TopologyBuilder;
 use geometry_engine::BRepModel;
 use serde_json::json;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-fn benchmark<F>(name: &str, mut f: F, iterations: u32) -> f64
+fn benchmark<F>(_name: &str, mut f: F, iterations: u32) -> f64
 where
     F: FnMut(),
 {

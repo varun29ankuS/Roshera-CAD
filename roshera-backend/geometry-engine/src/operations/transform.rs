@@ -257,7 +257,7 @@ fn transform_vertices(
 fn transform_curves(
     model: &mut BRepModel,
     edge_ids: &[EdgeId],
-    transform: &Matrix4,
+    _transform: &Matrix4,
 ) -> OperationResult<()> {
     // Collect the set of distinct curve IDs referenced by the edges first, so we
     // do not alias `model.edges` and `model.curves` mutably at the same time.

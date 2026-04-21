@@ -5,9 +5,9 @@
 
 use crate::math::{consts, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Arc, Circle, Line, ParameterRange},
-    edge::{Edge, EdgeId, EdgeOrientation},
-    face::{FaceId, FaceOrientation},
+    curve::{Arc, Line, ParameterRange},
+    edge::{Edge, EdgeOrientation},
+    face::FaceOrientation,
     primitive_traits::{
         EntityRef, IssueSeverity, ManifoldStatus, ParameterDefinition, ParameterSchema,
         ParameterType, Primitive, PrimitiveError, ValidationIssue, ValidationMetrics,
@@ -168,14 +168,14 @@ impl Primitive for CylinderPrimitive {
         }
 
         // Create center vertices for caps
-        let bottom_center = model.vertices.add_or_find(
+        let _bottom_center = model.vertices.add_or_find(
             params.base_center.x,
             params.base_center.y,
             params.base_center.z,
             tolerance.distance(),
         );
         let top_center_pt = params.base_center + z_axis * params.height;
-        let top_center = model.vertices.add_or_find(
+        let _top_center = model.vertices.add_or_find(
             top_center_pt.x,
             top_center_pt.y,
             top_center_pt.z,

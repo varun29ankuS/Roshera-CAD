@@ -1,8 +1,7 @@
 //! Execution engine for timeline operations
 
 use crate::{
-    BranchId, EntityId, EntityType, EventId, Operation, OperationInputs, OperationOutputs,
-    TimelineError, TimelineEvent, TimelineResult,
+    BranchId, Operation, OperationInputs, OperationOutputs, TimelineEvent, TimelineResult,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
