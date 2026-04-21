@@ -21,6 +21,19 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
+/// Converts a Unix timestamp (seconds since epoch) to a `DateTime<Utc>`.
+///
+/// Returns the UNIX epoch if `seconds` falls outside the representable range
+/// (approximately year -262,144 to +262,143). This keeps database binding
+/// sites infallible for audit-only fields without hiding configuration bugs,
+/// which would still be visible as a 1970-01-01 row rather than a panic.
+fn timestamp_to_datetime(seconds: i64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_else(|| {
+        DateTime::<Utc>::from_timestamp(0, 0)
+            .expect("UNIX epoch (0s, 0ns) is always a valid timestamp")
+    })
+}
+
 /// Database backend type
 #[derive(Debug, Clone, Copy)]
 pub enum DatabaseType {
@@ -464,8 +477,8 @@ impl DatabasePersistence for PostgresDatabase {
         .bind(session.id.to_string())
         .bind(&session.name)
         .bind(&session.owner_id)
-        .bind(DateTime::<Utc>::from_timestamp(session.created_at as i64, 0).unwrap())
-        .bind(DateTime::<Utc>::from_timestamp(session.modified_at as i64, 0).unwrap())
+        .bind(timestamp_to_datetime(session.created_at as i64))
+        .bind(timestamp_to_datetime(session.modified_at as i64))
         .bind(false) // is_public
         .bind(settings_json)
         .bind(metadata_json)
@@ -505,8 +518,11 @@ impl DatabasePersistence for PostgresDatabase {
                 reason: format!("Failed to deserialize metadata: {}", e),
             })?;
 
+        let parsed_id = Uuid::parse_str(&id).map_err(|e| SessionError::PersistenceError {
+            reason: format!("Invalid UUID stored for session {}: {}", id, e),
+        })?;
         Ok(SessionState {
-            id: Uuid::parse_str(&id).unwrap(),
+            id: parsed_id,
             name,
             owner_id: owner,
             objects: std::collections::HashMap::new(), // Load separately
@@ -613,8 +629,8 @@ impl DatabasePersistence for PostgresDatabase {
         .bind(&object.name)
         .bind("unknown") // Object type would be determined from mesh or other properties
         .bind(data)
-        .bind(DateTime::<Utc>::from_timestamp(object.created_at as i64, 0).unwrap())
-        .bind(DateTime::<Utc>::from_timestamp(object.modified_at as i64, 0).unwrap())
+        .bind(timestamp_to_datetime(object.created_at as i64))
+        .bind(timestamp_to_datetime(object.modified_at as i64))
         .bind("system") // TODO: Track actual creator
         .execute(&self.pool)
         .await
@@ -1149,8 +1165,8 @@ impl DatabasePersistence for PostgresDatabase {
             "#,
         )
         .bind(session_id)
-        .bind(DateTime::<Utc>::from_timestamp(start, 0).unwrap())
-        .bind(DateTime::<Utc>::from_timestamp(end, 0).unwrap())
+        .bind(timestamp_to_datetime(start))
+        .bind(timestamp_to_datetime(end))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {
@@ -1428,8 +1444,8 @@ impl DatabasePersistence for SqliteDatabase {
                 .map(|u| &u.id)
                 .unwrap_or(&"system".to_string()),
         )
-        .bind(DateTime::<Utc>::from_timestamp(session.created_at as i64, 0).unwrap())
-        .bind(DateTime::<Utc>::from_timestamp(session.modified_at as i64, 0).unwrap())
+        .bind(timestamp_to_datetime(session.created_at as i64))
+        .bind(timestamp_to_datetime(session.modified_at as i64))
         .bind(false) // Default to private
         .bind(data)
         .execute(&self.pool)
@@ -1546,8 +1562,8 @@ impl DatabasePersistence for SqliteDatabase {
         .bind(&object.name)
         .bind("unknown") // Object type would be determined from mesh or other properties
         .bind(data)
-        .bind(DateTime::<Utc>::from_timestamp(object.created_at as i64, 0).unwrap())
-        .bind(DateTime::<Utc>::from_timestamp(object.modified_at as i64, 0).unwrap())
+        .bind(timestamp_to_datetime(object.created_at as i64))
+        .bind(timestamp_to_datetime(object.modified_at as i64))
         .bind("system")
         .execute(&self.pool)
         .await
@@ -2057,8 +2073,8 @@ impl DatabasePersistence for SqliteDatabase {
             "#,
         )
         .bind(session_id)
-        .bind(DateTime::<Utc>::from_timestamp(start, 0).unwrap())
-        .bind(DateTime::<Utc>::from_timestamp(end, 0).unwrap())
+        .bind(timestamp_to_datetime(start))
+        .bind(timestamp_to_datetime(end))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {

@@ -275,8 +275,13 @@ pub fn delete_face(model: &mut BRepModel, face_id: FaceId, heal: bool) -> Operat
         }
     }
 
-    // Get face loops before deletion
-    let face = model.faces.get(face_id).unwrap();
+    // Get face loops before deletion. `face_id` was validated at the
+    // top of this function via `is_none()` -> early return; the face
+    // store has not been mutated to remove it since.
+    let face = model
+        .faces
+        .get(face_id)
+        .expect("face_id validated non-None above and not yet removed");
     let outer_loop = face.outer_loop;
     let inner_loops = face.inner_loops.to_vec();
 
@@ -342,7 +347,14 @@ pub fn delete_edge(
 
     // Get edge data before deletion
     let (start_vertex, end_vertex) = if options.delete_orphans {
-        let edge = model.edges.get(edge_id).unwrap();
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "edge_id".to_string(),
+                expected: "existing edge".to_string(),
+                received: format!("{}", edge_id),
+            })?;
         (edge.start_vertex, edge.end_vertex)
     } else {
         (0, 0) // Dummy values if not checking orphans

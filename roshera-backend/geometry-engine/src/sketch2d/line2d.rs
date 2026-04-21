@@ -12,11 +12,14 @@
 //! - Line segment: 4 DOF (2 for each endpoint)
 
 use super::{
-    Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d, Vector2d,
+    Matrix3, Point2d, Point2dId, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d,
+    Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Unique identifier for a 2D line
@@ -244,9 +247,10 @@ impl Ray2d {
     /// Find the closest point on the ray to a given point
     pub fn closest_point(&self, point: &Point2d) -> Point2d {
         let t = self.closest_parameter(point);
-        // t is always >= 0 due to closest_parameter clamping, so point_at cannot fail
+        // `point_at(t)` only errors on invalid `t`; `closest_parameter`
+        // always returns a valid (clamped) ray parameter.
         self.point_at(t)
-            .unwrap_or_else(|_| self.origin.add_vector(&self.direction.scale(t)))
+            .expect("closest_parameter returns a valid clamped ray parameter")
     }
 
     /// Distance from a point to the ray
@@ -350,9 +354,10 @@ impl LineSegment2d {
     /// Find the closest point on the segment to a given point
     pub fn closest_point(&self, point: &Point2d) -> Point2d {
         let t = self.closest_parameter(point);
-        // t is always in [0,1] due to closest_parameter clamping, so point_at cannot fail
+        // `closest_parameter` clamps t into [0, 1], which is always a
+        // valid parameter for `point_at` on a segment.
         self.point_at(t)
-            .unwrap_or_else(|_| self.start.lerp(&self.end, t))
+            .expect("closest_parameter returns a valid clamped segment parameter")
     }
 
     /// Distance from a point to the segment
@@ -398,10 +403,10 @@ impl LineSegment2d {
             && t2 >= -STRICT_TOLERANCE.distance()
             && t2 <= 1.0 + STRICT_TOLERANCE.distance()
         {
+            // `t1` is explicitly clamped to [0, 1] — a valid segment parameter.
             Some(
-                // t1 is clamped to [0,1], so point_at cannot fail
                 self.point_at(t1.clamp(0.0, 1.0))
-                    .unwrap_or_else(|_| self.start.lerp(&self.end, t1.clamp(0.0, 1.0))),
+                    .expect("clamp to [0, 1] yields a valid segment parameter"),
             )
         } else {
             None

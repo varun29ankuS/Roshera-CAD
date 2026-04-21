@@ -76,12 +76,8 @@ fn main() {
     println!("  Speed: {:.1} ns/op", elapsed.as_nanos() as f64 / 10_000.0);
     println!("  Rate: {:.1}K ops/sec", ops_per_sec / 1_000.0);
 
-    println!("\n🎯 INDUSTRY COMPARISON:");
-    println!("  Vector Ops: 60-85% faster than Parasolid/ACIS");
-    println!("  Matrix Ops: 50-65% faster than Parasolid/ACIS");
-    println!("  B-Spline:   52-62% faster than Parasolid/ACIS");
-
-    println!("\n✅ STATUS: PRODUCTION READY - AEROSPACE GRADE");
+    println!("\n📈 Raw timings reported above. Compare against your own");
+    println!("   baseline with `cargo bench` — no third-party claims are made here.");
 
     // Prevent optimization
     std::hint::black_box(sum);

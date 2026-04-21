@@ -1,28 +1,21 @@
-//! World-class T-spline implementation
+//! T-spline implementation.
 //!
-//! Industry-leading features matching Autodesk T-splines technology:
+//! Features:
 //! - Local refinement without propagating control points
 //! - Extraordinary points (valence != 4)
-//! - T-junctions in control mesh
-//! - Seamless NURBS conversion
-//! - GPU-accelerated evaluation
+//! - T-junctions in the control mesh
+//! - NURBS conversion
 //! - Watertight surface generation
-//! - Advanced modeling operations (extrude, merge, crease)
-//!
-//! Performance characteristics:
-//! - Single point evaluation: < 200ns
-//! - Local refinement: < 1ms
-//! - NURBS conversion: < 10ms for typical models
-//! - GPU evaluation: 1M points/second
+//! - Modeling operations (extrude, merge, crease)
 //!
 //! References:
 //! - Sederberg et al., "T-splines and T-NURCCs", SIGGRAPH 2003
 //! - Bazilevs et al., "Isogeometric analysis using T-splines", 2010
 
 use crate::math::bspline::KnotVector;
-use crate::math::{Point3, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 /// T-spline control point
@@ -391,7 +384,7 @@ impl TSplineMesh {
         }
 
         // Update valence and extraordinary status
-        for (&_id, vertex) in &mut self.vertices {
+        for (&id, vertex) in &mut self.vertices {
             vertex.valence = vertex.neighbors.len();
             vertex.is_extraordinary = vertex.valence != 4;
         }
@@ -400,7 +393,7 @@ impl TSplineMesh {
         *self
             .topology_cache
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = cache;
+            .expect("TSpline topology_cache RwLock poisoned") = cache;
     }
 
     /// Compute 1-ring neighborhood
@@ -650,10 +643,10 @@ impl TSplineMesh {
     /// Local subdivision
     fn local_subdivision(
         &mut self,
-        _options: &RefinementOptions,
+        options: &RefinementOptions,
     ) -> Result<Vec<usize>, &'static str> {
         // Implement Catmull-Clark style subdivision locally
-        let new_vertices = Vec::new();
+        let mut new_vertices = Vec::new();
 
         // This is a placeholder
         self.update_topology_cache();
@@ -663,10 +656,10 @@ impl TSplineMesh {
     /// Make region NURBS-compatible
     fn make_nurbs_compatible(
         &mut self,
-        _options: &RefinementOptions,
+        options: &RefinementOptions,
     ) -> Result<Vec<usize>, &'static str> {
         // Insert vertices to remove T-junctions and extraordinary points
-        let new_vertices = Vec::new();
+        let mut new_vertices = Vec::new();
 
         // This is a complex operation - placeholder
         self.update_topology_cache();
@@ -997,7 +990,7 @@ impl TSplineMesh {
 
     /// Parallel evaluation on GPU (if available)
     pub fn evaluate_gpu(&self, parameters: &[(f64, f64)]) -> Vec<TEvalResult> {
-        if let Some(ref _gpu) = self.gpu_kernel {
+        if let Some(ref gpu) = self.gpu_kernel {
             // Would dispatch to GPU
             vec![]
         } else {

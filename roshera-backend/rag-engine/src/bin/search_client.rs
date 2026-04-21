@@ -92,7 +92,7 @@ async fn execute_search(query: &str) -> Result<(), Box<dyn std::error::Error>> {
     for (i, result) in mock_results.iter().enumerate() {
         println!("{}. 📄 {}", i + 1, result["file"]);
         println!("   📍 {}", result["location"]);
-        println!("   💯 Relevance: {:.1}%", result["score"].as_f64().unwrap() * 100.0);
+        println!("   💯 Relevance: {:.1}%", result["score"].as_f64().unwrap_or(0.0) * 100.0);
         println!("   📝 {}", result["snippet"]);
         println!();
     }
@@ -136,7 +136,7 @@ fn simulate_search(query: &str) -> Vec<Value> {
             "file": "ai-integration/src/lib.rs",
             "location": "Line 15-35",
             "score": 0.91,
-            "snippet": "pub struct AIIntegration {\n    whisper: Arc<WhisperProvider>,\n    llama: Arc<LlamaProvider>,\n    tts: Arc<TTSProvider>,\n}\n\nimpl AIIntegration {\n    pub async fn process_command(&self, input: &str) -> Result<GeometryCommand>",
+            "snippet": "pub struct AIIntegration {\n    claude: Arc<ClaudeProvider>,\n    openai: Arc<OpenAIProvider>,\n    tts: Arc<TTSProvider>,\n}\n\nimpl AIIntegration {\n    pub async fn process_command(&self, input: &str) -> Result<GeometryCommand>",
             "keywords": ["ai", "integration", "command", "processing"]
         }),
         
@@ -163,9 +163,14 @@ fn simulate_search(query: &str) -> Vec<Value> {
     all_results
         .into_iter()
         .filter(|result| {
-            let keywords = result["keywords"].as_array().unwrap();
+            let keywords = match result["keywords"].as_array() {
+                Some(kw) => kw,
+                None => return false,
+            };
             keywords.iter().any(|keyword| {
-                query_lower.contains(keyword.as_str().unwrap())
+                keyword.as_str()
+                    .map(|s| query_lower.contains(s))
+                    .unwrap_or(false)
             })
         })
         .take(3) // Return top 3 results

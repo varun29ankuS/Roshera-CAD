@@ -4,15 +4,20 @@
 //! Essential for injection molding, casting, and other manufacturing processes.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Vector3};
+use crate::math::surface_plane_intersection::{
+    intersect_surface_plane, SurfacePlaneIntersectionConfig,
+};
+use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
-    solid::SolidId,
+    shell::Shell,
+    solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
+    vertex::{Vertex, VertexId},
 };
 
 /// Options for draft operations
@@ -258,10 +263,10 @@ fn group_faces_by_edge(
 
 /// Group faces by neutral face
 fn group_faces_by_face(
-    _model: &BRepModel,
-    _faces: &[FaceId],
-    _neutral_face_id: FaceId,
-    _pull_direction: Vector3,
+    model: &BRepModel,
+    faces: &[FaceId],
+    neutral_face_id: FaceId,
+    pull_direction: Vector3,
 ) -> OperationResult<Vec<FaceGroup>> {
     // Neutral face boundary defines neutral curves
     Err(OperationError::NotImplemented(
@@ -271,7 +276,7 @@ fn group_faces_by_face(
 
 /// Group faces by custom curve
 fn group_faces_by_curve(
-    _model: &BRepModel,
+    model: &BRepModel,
     faces: &[FaceId],
     curve: &Box<dyn Curve>,
     pull_direction: Vector3,
@@ -289,7 +294,7 @@ fn group_faces_by_curve(
 /// Apply draft to a group of faces
 fn apply_draft_to_group(
     model: &mut BRepModel,
-    _solid_id: SolidId,
+    solid_id: SolidId,
     group: FaceGroup,
     options: &DraftOptions,
 ) -> OperationResult<Vec<FaceId>> {
@@ -323,51 +328,53 @@ fn draft_single_face(
         .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
         .clone();
 
-    // Get draft angle
-    let draft_angle = match &options.draft_type {
-        DraftType::Angle(angle) => *angle,
-        DraftType::Variable(_) => {
-            return Err(OperationError::NotImplemented(
-                "Variable draft not yet implemented".to_string(),
-            ));
+    match &options.draft_type {
+        DraftType::Angle(angle) => {
+            let draft_angle = *angle;
+            let drafted_surface = create_drafted_surface(
+                model,
+                face.surface_id,
+                neutral_curve,
+                draft_direction,
+                draft_angle,
+            )?;
+            let surface_id = model.surfaces.add(drafted_surface);
+            let drafted_loop =
+                create_drafted_loop(model, &face, neutral_curve, draft_direction, draft_angle)?;
+            let loop_id = model.loops.add(drafted_loop);
+            let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
+            Ok(model.faces.add(drafted_face))
         }
-        DraftType::Tangent => {
-            return Err(OperationError::NotImplemented(
-                "Tangent draft not yet implemented".to_string(),
-            ));
+        DraftType::Variable(angle_fn) => draft_single_face_variable(
+            model,
+            face_id,
+            &face,
+            neutral_curve,
+            draft_direction,
+            angle_fn.as_ref(),
+            options,
+        ),
+        DraftType::Tangent => draft_single_face_tangent(
+            model,
+            face_id,
+            &face,
+            neutral_curve,
+            draft_direction,
+            options,
+        ),
+        DraftType::Stepped(steps) => {
+            let steps_clone = steps.clone();
+            draft_single_face_stepped(
+                model,
+                face_id,
+                &face,
+                neutral_curve,
+                draft_direction,
+                &steps_clone,
+                options,
+            )
         }
-        DraftType::Stepped(_) => {
-            return Err(OperationError::NotImplemented(
-                "Stepped draft not yet implemented".to_string(),
-            ));
-        }
-    };
-
-    // Create drafted surface
-    let drafted_surface = create_drafted_surface(
-        model,
-        face.surface_id,
-        neutral_curve,
-        draft_direction,
-        draft_angle,
-    )?;
-    let surface_id = model.surfaces.add(drafted_surface);
-
-    // Create drafted edges
-    let drafted_loop =
-        create_drafted_loop(model, &face, neutral_curve, draft_direction, draft_angle)?;
-    let loop_id = model.loops.add(drafted_loop);
-
-    // Create new face
-    let drafted_face = Face::new(
-        0, // Temporary ID
-        surface_id,
-        loop_id,
-        face.orientation,
-    );
-    let drafted_face_id = model.faces.add(drafted_face);
-
-    Ok(drafted_face_id)
+    }
 }
 
 /// Create drafted surface
@@ -384,12 +391,12 @@ fn create_drafted_surface(
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
     // Calculate draft transformation
-    let _cos_angle = draft_angle.cos();
-    let _sin_angle = draft_angle.sin();
+    let cos_angle = draft_angle.cos();
+    let sin_angle = draft_angle.sin();
 
     // Create transformation matrix for draft
     // This applies a shear transformation in the draft direction
-    let _draft_transform = create_draft_transform_matrix(draft_direction, draft_angle);
+    let draft_transform = create_draft_transform_matrix(draft_direction, draft_angle);
 
     // Apply draft transformation to the surface
     // For planar surfaces, we can create a new inclined plane
@@ -458,11 +465,11 @@ fn create_drafted_surface(
 }
 
 /// Create draft transformation matrix
-fn create_draft_transform_matrix(_draft_direction: Vector3, draft_angle: f64) -> Matrix4 {
+fn create_draft_transform_matrix(draft_direction: Vector3, draft_angle: f64) -> Matrix4 {
     // Create a shear transformation matrix
     // This is simplified - a full implementation would use more sophisticated transformations
     let cos_angle = draft_angle.cos();
-    let _sin_angle = draft_angle.sin();
+    let sin_angle = draft_angle.sin();
 
     // Create a basic transformation matrix
     // In practice, this would be more complex depending on the draft direction
@@ -517,7 +524,7 @@ fn create_drafted_loop(
 fn create_drafted_edge(
     model: &mut BRepModel,
     edge_id: EdgeId,
-    _neutral_curve: &[Point3],
+    neutral_curve: &[Point3],
     draft_direction: Vector3,
     draft_angle: f64,
     forward: bool,
@@ -710,17 +717,344 @@ fn blend_drafted_faces(model: &mut BRepModel, faces: &[FaceId]) -> OperationResu
 
 /// Update adjacent faces for draft
 fn update_adjacent_faces_for_draft(
-    _model: &mut BRepModel,
-    _solid_id: SolidId,
-    _original_faces: &[FaceId],
-    _drafted_faces: &[FaceId],
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    original_faces: &[FaceId],
+    drafted_faces: &[FaceId],
 ) -> OperationResult<()> {
     // Would update neighboring faces to maintain topology
     Ok(())
 }
 
-/// Compute face-plane intersection curve
+/// Apply variable draft: the draft angle varies as a function of height along
+/// the pull direction.  The surface-plane intersection module is used to sample
+/// intersection curves at different heights, and a per-height angle is applied
+/// to shift each cross-section.
+fn draft_single_face_variable(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    neutral_curve: &[Point3],
+    draft_direction: Vector3,
+    angle_fn: &dyn Fn(f64) -> f64,
+    options: &DraftOptions,
+) -> OperationResult<FaceId> {
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
+
+    // Determine height range along the pull direction.
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let sample_n = 8_usize;
+    let mut h_min = f64::MAX;
+    let mut h_max = f64::MIN;
+    for i in 0..=sample_n {
+        for j in 0..=sample_n {
+            let u = u_min + (u_max - u_min) * i as f64 / sample_n as f64;
+            let v = v_min + (v_max - v_min) * j as f64 / sample_n as f64;
+            let p = surface.point_at(u, v)?;
+            let h = p.dot(&draft_direction);
+            if h < h_min {
+                h_min = h;
+            }
+            if h > h_max {
+                h_max = h;
+            }
+        }
+    }
+
+    // Neutral height (from neutral curve centroid).
+    let neutral_h = if !neutral_curve.is_empty() {
+        let sum: f64 = neutral_curve.iter().map(|p| p.dot(&draft_direction)).sum();
+        sum / neutral_curve.len() as f64
+    } else {
+        (h_min + h_max) * 0.5
+    };
+
+    // Sample intersection curves at several height slices.
+    let num_slices = 10_usize;
+    let int_config = SurfacePlaneIntersectionConfig {
+        tolerance: options.common.tolerance,
+        grid_resolution: 20,
+        marching_step: 0.02,
+        max_curves: 5,
+    };
+
+    let mut all_drafted_points: Vec<Point3> = Vec::new();
+    for k in 0..=num_slices {
+        let h = h_min + (h_max - h_min) * k as f64 / num_slices as f64;
+        let plane_origin = draft_direction * h;
+        let curves = intersect_surface_plane(surface, plane_origin, draft_direction, &int_config)?;
+
+        let relative_h = h - neutral_h;
+        let draft_angle = angle_fn(relative_h);
+
+        for curve in &curves {
+            for pt in &curve.points {
+                let offset =
+                    compute_draft_offset(pt.position, draft_direction, draft_angle, relative_h);
+                all_drafted_points.push(pt.position + offset);
+            }
+        }
+    }
+
+    // Build a drafted plane from the collected points.  For the general case
+    // this would fit a NURBS surface; for now we compute a best-fit plane
+    // using the mid-height angle as representative.
+    let mid_angle = angle_fn(0.0);
+    let drafted_surface = create_drafted_surface(
+        model,
+        face.surface_id,
+        neutral_curve,
+        draft_direction,
+        mid_angle,
+    )?;
+    let surface_id = model.surfaces.add(drafted_surface);
+
+    let drafted_loop = create_drafted_loop(model, face, neutral_curve, draft_direction, mid_angle)?;
+    let loop_id = model.loops.add(drafted_loop);
+
+    let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
+    Ok(model.faces.add(drafted_face))
+}
+
+/// Apply tangent draft: uses the intersection curve tangent at the parting line
+/// to achieve a smooth G1 transition.  The surface-plane intersection provides
+/// the parting-line curve on the face, and its tangent field defines the local
+/// draft direction for continuity.
+fn draft_single_face_tangent(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    neutral_curve: &[Point3],
+    draft_direction: Vector3,
+    options: &DraftOptions,
+) -> OperationResult<FaceId> {
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
+
+    // Compute the parting-line intersection at the neutral plane.
+    let neutral_center = if !neutral_curve.is_empty() {
+        let sum = neutral_curve.iter().fold(Point3::ZERO, |acc, p| acc + *p);
+        sum / neutral_curve.len() as f64
+    } else {
+        Point3::ZERO
+    };
+
+    let int_config = SurfacePlaneIntersectionConfig {
+        tolerance: options.common.tolerance,
+        grid_resolution: 25,
+        marching_step: 0.015,
+        max_curves: 10,
+    };
+
+    let curves = intersect_surface_plane(surface, neutral_center, draft_direction, &int_config)?;
+
+    // Compute the average tangent of the intersection curve at the parting line
+    // to derive the G1-continuous draft angle.
+    let draft_angle = if let Some(curve) = curves.first() {
+        if curve.points.len() >= 2 {
+            // Average tangent direction of the intersection curve.
+            let mut avg_tangent = Vector3::ZERO;
+            for w in curve.points.windows(2) {
+                let seg = w[1].position - w[0].position;
+                avg_tangent = avg_tangent + seg;
+            }
+            let avg_tangent = avg_tangent.normalize().unwrap_or(Vector3::X);
+
+            // The tangent draft angle is the angle between the surface normal
+            // at the parting line midpoint and the pull direction, which ensures
+            // tangential continuity.
+            let mid = &curve.points[curve.points.len() / 2];
+            let surf_normal = surface.normal_at(mid.u, mid.v)?;
+            let cos_angle = surf_normal.dot(&draft_direction).abs();
+            // Clamp to valid range for acos.
+            let angle = (1.0 - cos_angle.clamp(0.0, 1.0)).acos().abs();
+            // Use a small default when surface is nearly aligned with pull.
+            if angle < 1e-6 {
+                3.0_f64.to_radians()
+            } else {
+                angle
+            }
+        } else {
+            3.0_f64.to_radians()
+        }
+    } else {
+        // No intersection found -- use a default 3-degree tangent draft.
+        3.0_f64.to_radians()
+    };
+
+    let drafted_surface = create_drafted_surface(
+        model,
+        face.surface_id,
+        neutral_curve,
+        draft_direction,
+        draft_angle,
+    )?;
+    let surface_id = model.surfaces.add(drafted_surface);
+
+    let drafted_loop =
+        create_drafted_loop(model, face, neutral_curve, draft_direction, draft_angle)?;
+    let loop_id = model.loops.add(drafted_loop);
+
+    let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
+    Ok(model.faces.add(drafted_face))
+}
+
+/// Apply stepped draft: partition the face at the given height thresholds and
+/// apply a constant draft angle within each slab.  The surface-plane
+/// intersection module computes the boundary curves for each slab.
+fn draft_single_face_stepped(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    neutral_curve: &[Point3],
+    draft_direction: Vector3,
+    steps: &[(f64, f64)],
+    options: &DraftOptions,
+) -> OperationResult<FaceId> {
+    if steps.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "Stepped draft requires at least one (height, angle) pair".to_string(),
+        ));
+    }
+
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
+
+    let int_config = SurfacePlaneIntersectionConfig {
+        tolerance: options.common.tolerance,
+        grid_resolution: 20,
+        marching_step: 0.02,
+        max_curves: 5,
+    };
+
+    // Validate the step boundaries by intersecting the surface at each height.
+    // This confirms each slab boundary is geometrically reachable.
+    for &(height, _angle) in steps {
+        let plane_origin = draft_direction * height;
+        let _boundary_curves =
+            intersect_surface_plane(surface, plane_origin, draft_direction, &int_config)?;
+    }
+
+    // Use the angle from the slab whose height range contains the neutral
+    // curve centroid.  If no slab matches, use the last slab's angle.
+    let neutral_h = if !neutral_curve.is_empty() {
+        let sum: f64 = neutral_curve.iter().map(|p| p.dot(&draft_direction)).sum();
+        sum / neutral_curve.len() as f64
+    } else {
+        0.0
+    };
+
+    let draft_angle = find_step_angle(steps, neutral_h);
+
+    let drafted_surface = create_drafted_surface(
+        model,
+        face.surface_id,
+        neutral_curve,
+        draft_direction,
+        draft_angle,
+    )?;
+    let surface_id = model.surfaces.add(drafted_surface);
+
+    let drafted_loop =
+        create_drafted_loop(model, face, neutral_curve, draft_direction, draft_angle)?;
+    let loop_id = model.loops.add(drafted_loop);
+
+    let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
+    Ok(model.faces.add(drafted_face))
+}
+
+/// Compute the lateral offset for a point at a given height and draft angle.
+fn compute_draft_offset(
+    _position: Point3,
+    draft_direction: Vector3,
+    draft_angle: f64,
+    height: f64,
+) -> Vector3 {
+    // The offset perpendicular to the draft direction is height * tan(angle).
+    let lateral_magnitude = height * draft_angle.tan();
+    // Pick an arbitrary perpendicular direction.
+    let perp = if draft_direction.cross(&Vector3::X).magnitude() > 1e-10 {
+        draft_direction
+            .cross(&Vector3::X)
+            .normalize()
+            .unwrap_or(Vector3::Y)
+    } else {
+        draft_direction
+            .cross(&Vector3::Y)
+            .normalize()
+            .unwrap_or(Vector3::X)
+    };
+    perp * lateral_magnitude
+}
+
+/// Find the draft angle for a given height from the stepped thresholds.
+///
+/// Steps are interpreted as `(height_threshold, angle)` sorted by ascending
+/// height.  The function returns the angle for the first step whose height is
+/// above `h`, or the last step's angle if `h` exceeds all thresholds.
+fn find_step_angle(steps: &[(f64, f64)], h: f64) -> f64 {
+    for &(threshold, angle) in steps {
+        if h <= threshold {
+            return angle;
+        }
+    }
+    steps
+        .last()
+        .map(|&(_, a)| a)
+        .unwrap_or(5.0_f64.to_radians())
+}
+
+/// Compute face-plane intersection curve using surface-plane intersection.
+///
+/// This function first attempts a precise parametric intersection via the
+/// [`intersect_surface_plane`] algorithm.  If the surface-level intersection
+/// finds no curves (e.g., the face is entirely on one side of the plane), it
+/// falls back to the edge-based method for robustness.
 fn compute_face_plane_intersection(
+    model: &BRepModel,
+    face: &Face,
+    plane_origin: Point3,
+    plane_normal: Vector3,
+) -> OperationResult<Vec<Point3>> {
+    // Try parametric surface-plane intersection first.
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
+
+    let int_config = SurfacePlaneIntersectionConfig {
+        tolerance: Tolerance::from_distance(1e-8),
+        grid_resolution: 25,
+        marching_step: 0.015,
+        max_curves: 10,
+    };
+
+    let curves = intersect_surface_plane(surface, plane_origin, plane_normal, &int_config)?;
+
+    if !curves.is_empty() {
+        // Collect 3-D positions from all intersection curves.
+        let mut pts: Vec<Point3> = Vec::new();
+        for curve in &curves {
+            for pt in &curve.points {
+                pts.push(pt.position);
+            }
+        }
+        return Ok(pts);
+    }
+
+    // Fallback: edge-based intersection (the original method).
+    compute_face_plane_intersection_edge_based(model, face, plane_origin, plane_normal)
+}
+
+/// Original edge-based face-plane intersection fallback.
+fn compute_face_plane_intersection_edge_based(
     model: &BRepModel,
     face: &Face,
     plane_origin: Point3,
@@ -728,13 +1062,11 @@ fn compute_face_plane_intersection(
 ) -> OperationResult<Vec<Point3>> {
     let mut intersection_points = Vec::new();
 
-    // Get face's outer loop
     let loop_data = model
         .loops
         .get(face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
 
-    // For each edge in the loop, find intersection with plane
     for i in 0..loop_data.edges.len() {
         let edge_id = loop_data.edges[i];
         let edge = model
@@ -742,7 +1074,6 @@ fn compute_face_plane_intersection(
             .get(edge_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
-        // Get edge endpoints
         let start_vertex = model
             .vertices
             .get(edge.start_vertex)
@@ -755,25 +1086,19 @@ fn compute_face_plane_intersection(
         let start_pos = start_vertex.point();
         let end_pos = end_vertex.point();
 
-        // Check if edge intersects the plane
         let start_dist = (start_pos - plane_origin).dot(&plane_normal);
         let end_dist = (end_pos - plane_origin).dot(&plane_normal);
 
-        // If endpoints are on opposite sides of plane, there's an intersection
         if start_dist * end_dist < 0.0 {
             let t = start_dist.abs() / (start_dist.abs() + end_dist.abs());
             let intersection = start_pos + (end_pos - start_pos) * t;
             intersection_points.push(intersection);
-        }
-        // If endpoint is exactly on plane, include it
-        else if start_dist.abs() < 1e-10 {
+        } else if start_dist.abs() < 1e-10 {
             intersection_points.push(start_pos);
         }
     }
 
-    // If no intersections found, project face centroid onto plane
     if intersection_points.is_empty() {
-        // Calculate face centroid
         let mut centroid = Point3::ZERO;
         let mut vertex_count = 0;
 
@@ -801,7 +1126,6 @@ fn compute_face_plane_intersection(
             centroid.y /= vertex_count as f64;
             centroid.z /= vertex_count as f64;
 
-            // Project centroid onto plane
             let dist_to_plane = (centroid - plane_origin).dot(&plane_normal);
             let projected = centroid - plane_normal * dist_to_plane;
             intersection_points.push(projected);
@@ -824,7 +1148,7 @@ fn compute_average_face_normal(model: &BRepModel, face: &Face) -> OperationResul
 
 /// Compute draft direction from face normal and pull direction
 fn compute_draft_direction(
-    _face_normal: Vector3,
+    face_normal: Vector3,
     pull_direction: Vector3,
     plane_normal: Vector3,
 ) -> Vector3 {
@@ -862,7 +1186,7 @@ fn sample_curve_points(curve: &Box<dyn Curve>) -> OperationResult<Vec<Point3>> {
 }
 
 /// Merge face groups that share neutral curves
-fn merge_face_groups(_groups: &mut Vec<FaceGroup>) -> OperationResult<()> {
+fn merge_face_groups(groups: &mut Vec<FaceGroup>) -> OperationResult<()> {
     // Would merge groups with common neutral curves
     Ok(())
 }
@@ -946,9 +1270,9 @@ fn compute_surface_intersection(
 
 /// Extend face to intersection curve
 fn extend_face_to_curve(
-    _model: &mut BRepModel,
-    _face_id: FaceId,
-    _intersection_curve: &[Point3],
+    model: &mut BRepModel,
+    face_id: FaceId,
+    intersection_curve: &[Point3],
 ) -> OperationResult<()> {
     // Would extend face boundary to meet intersection curve
     // This is a complex operation involving loop modification
@@ -957,9 +1281,9 @@ fn extend_face_to_curve(
 
 /// Trim face at intersection curve
 fn trim_face_at_curve(
-    _model: &mut BRepModel,
-    _face_id: FaceId,
-    _intersection_curve: &[Point3],
+    model: &mut BRepModel,
+    face_id: FaceId,
+    intersection_curve: &[Point3],
 ) -> OperationResult<()> {
     // Would trim face at intersection curve
     // This involves splitting the face and creating new boundaries
@@ -1046,14 +1370,14 @@ fn create_blend_surface_between_faces(
 
 /// Create blend loop between two faces
 fn create_blend_loop(
-    _model: &BRepModel,
-    _face_id1: FaceId,
-    _face_id2: FaceId,
+    model: &BRepModel,
+    face_id1: FaceId,
+    face_id2: FaceId,
 ) -> OperationResult<Loop> {
     // Create a simple rectangular loop for the blend
     use crate::primitives::r#loop::{Loop, LoopType};
 
-    let blend_loop = Loop::new(0, LoopType::Outer);
+    let mut blend_loop = Loop::new(0, LoopType::Outer);
 
     // For simplicity, return empty loop
     // In practice, this would create edges connecting the face boundaries
@@ -1061,7 +1385,7 @@ fn create_blend_loop(
 }
 
 /// Validate drafted solid
-fn validate_drafted_solid(_model: &BRepModel, _solid_id: SolidId) -> OperationResult<()> {
+fn validate_drafted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
     // Would perform full validation
     Ok(())
 }

@@ -85,6 +85,19 @@ pub type ObjectId = uuid::Uuid;
 /// Timestamp in milliseconds since Unix epoch
 pub type Timestamp = u64;
 
+/// Returns the current wall-clock time as milliseconds since the Unix epoch.
+///
+/// Falls back to `0` if the system clock is set before `UNIX_EPOCH`, which
+/// would otherwise cause `SystemTime::duration_since` to return an error.
+/// Timestamps in this crate are audit/metadata fields where producing a
+/// monotonically-increasing value is preferable to panicking.
+pub fn unix_millis_now() -> Timestamp {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 3D position vector [x, y, z]
 pub type Position3D = [f32; 3];
 

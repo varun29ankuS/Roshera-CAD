@@ -6,16 +6,17 @@
 use crate::{
     math::{consts, Point3, Vector3},
     primitives::{
-        curve::{Arc, Circle, ParameterRange},
-        edge::{Edge, EdgeOrientation},
-        face::{Face, FaceOrientation},
+        curve::{Arc, Circle, CurveId, ParameterRange},
+        edge::{Edge, EdgeId, EdgeOrientation},
+        face::{Face, FaceId, FaceOrientation},
         primitive_traits::PrimitiveError,
-        r#loop::{Loop, LoopType},
-        shell::{Shell, ShellType},
+        r#loop::{Loop, LoopId, LoopType},
+        shell::{Shell, ShellId, ShellType},
         solid::{Solid, SolidId},
-        surface::Torus,
+        surface::{Plane, SurfaceId, Torus},
         topology_builder::BRepModel,
         topology_builder::TopologyBuilder,
+        vertex::VertexId,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -129,11 +130,11 @@ pub struct TorusPrimitive;
 impl TorusPrimitive {
     /// Create a torus with B-Rep topology
     pub fn create(params: &TorusParameters, model: &mut BRepModel) -> PrimitiveResult<SolidId> {
-        let _builder = TopologyBuilder::new(model);
+        let mut builder = TopologyBuilder::new(model);
 
         // Create reference directions
         let ref_dir = params.axis.perpendicular();
-        let _y_dir = params.axis.cross(&ref_dir);
+        let y_dir = params.axis.cross(&ref_dir);
 
         // Angle ranges
         let major_angle_range = params.major_angle_range.unwrap_or([0.0, consts::TWO_PI]);
@@ -367,29 +368,17 @@ impl TorusPrimitive {
         let height = params.minor_radius * sin_v;
 
         let center = params.center + params.axis * height;
-        let _ref_dir = params.axis.perpendicular();
+        let ref_dir = params.axis.perpendicular();
 
         if (u_end - u_start - consts::TWO_PI).abs() < consts::EPSILON {
             Box::new(
-                Circle::new(center, params.axis, radius).unwrap_or_else(|_| {
-                    Circle::new(center, Vector3::Z, radius.abs().max(consts::EPSILON))
-                        .expect("fallback circle")
-                }),
+                Circle::new(center, params.axis, radius)
+                    .expect("Circle inputs derived from validated TorusParameters"),
             )
         } else {
             Box::new(
-                Arc::new(center, params.axis, radius, u_start, u_end - u_start).unwrap_or_else(
-                    |_| {
-                        Arc::new(
-                            center,
-                            Vector3::Z,
-                            radius.abs().max(consts::EPSILON),
-                            0.0,
-                            consts::TWO_PI,
-                        )
-                        .expect("fallback arc")
-                    },
-                ),
+                Arc::new(center, params.axis, radius, u_start, u_end - u_start)
+                    .expect("Arc inputs derived from validated TorusParameters"),
             )
         }
     }
@@ -411,19 +400,13 @@ impl TorusPrimitive {
             + y_dir * (params.major_radius * sin_u);
 
         let radial_dir = ref_dir * cos_u + y_dir * sin_u;
-        let _minor_ref = radial_dir;
+        let minor_ref = radial_dir;
         let minor_axis = params.axis;
 
         if (v_end - v_start - consts::TWO_PI).abs() < consts::EPSILON {
             Box::new(
-                Circle::new(center, minor_axis, params.minor_radius).unwrap_or_else(|_| {
-                    Circle::new(
-                        center,
-                        Vector3::Z,
-                        params.minor_radius.abs().max(consts::EPSILON),
-                    )
-                    .expect("fallback circle")
-                }),
+                Circle::new(center, minor_axis, params.minor_radius)
+                    .expect("Circle inputs derived from validated TorusParameters"),
             )
         } else {
             Box::new(
@@ -434,25 +417,16 @@ impl TorusPrimitive {
                     v_start,
                     v_end - v_start,
                 )
-                .unwrap_or_else(|_| {
-                    Arc::new(
-                        center,
-                        Vector3::Z,
-                        params.minor_radius.abs().max(consts::EPSILON),
-                        0.0,
-                        consts::TWO_PI,
-                    )
-                    .expect("fallback arc")
-                }),
+                .expect("Arc inputs derived from validated TorusParameters"),
             )
         }
     }
 
     /// Update torus parameters
     pub fn update_parameters(
-        _solid_id: SolidId,
-        _params: &TorusParameters,
-        _model: &mut BRepModel,
+        solid_id: SolidId,
+        params: &TorusParameters,
+        model: &mut BRepModel,
     ) -> PrimitiveResult<()> {
         // TODO: Implement parametric update
         Err(PrimitiveError::GeometryError {

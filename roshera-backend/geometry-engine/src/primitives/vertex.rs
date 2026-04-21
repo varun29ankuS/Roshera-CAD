@@ -1,18 +1,11 @@
-//! World-class vertex representation for B-Rep topology
+//! Vertex representation for B-Rep topology.
 //!
-//! Enhanced with industry-leading features matching Parasolid/ACIS capabilities:
-//! - Structure of Arrays (SoA) for 4x better cache performance
-//! - Spatial hashing for O(1) deduplication
-//! - Vertex attributes system for custom data
-//! - Merge/split operations for topology modification
-//! - Thread-safe concurrent access patterns
-//! - Memory-mapped file support for huge models
-//!
-//! Performance characteristics:
-//! - Vertex creation: < 5ns
-//! - Deduplication lookup: < 10ns
-//! - Batch operations: SIMD-optimized
-//! - Memory usage: 12 bytes/vertex (vs 48-64 bytes in competitors)
+//! Features:
+//! - Structure-of-Arrays layout for cache efficiency
+//! - Spatial hashing for deduplication
+//! - Vertex-attributes system for custom data
+//! - Merge/split operations
+//! - Thread-safe concurrent access
 
 use crate::math::{Point3, Vector3};
 // Note: Using DashMap globally for timeline architecture compatibility
@@ -165,7 +158,7 @@ impl SpatialHashKey {
     }
 }
 
-/// World-class vertex storage with advanced features
+/// Vertex storage with advanced features
 #[derive(Debug)]
 pub struct VertexStore {
     /// X coordinates packed together (SIMD-friendly)

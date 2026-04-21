@@ -19,9 +19,6 @@ pub trait SessionStateExt {
 
 impl SessionStateExt for SessionState {
     fn update_modified_timestamp(&mut self) {
-        self.modified_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
+        self.modified_at = shared_types::unix_millis_now();
     }
 }

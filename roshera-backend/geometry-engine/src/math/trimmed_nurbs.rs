@@ -177,7 +177,8 @@ impl TrimmedNurbsSurface {
             let curve = NurbsCurve2D {
                 control_points: vec![start, end],
                 weights: vec![1.0, 1.0],
-                knots: KnotVector::new(vec![0.0, 0.0, 1.0, 1.0]).unwrap(),
+                knots: KnotVector::new(vec![0.0, 0.0, 1.0, 1.0])
+                    .expect("literal degree-1 Bezier knot vector is always valid"),
                 degree: 1,
             };
 
@@ -188,7 +189,8 @@ impl TrimmedNurbsSurface {
             });
         }
 
-        TrimLoop::new(curves, true).unwrap()
+        TrimLoop::new(curves, true)
+            .expect("unit-square trim loop constructed from validated corner curves")
     }
 
     /// Add a trim loop (hole or inner boundary)
@@ -258,137 +260,6 @@ impl TrimmedNurbsSurface {
         Ok(points)
     }
 
-    /// Compute intersection with another trimmed surface
-    pub fn intersect(&self, other: &TrimmedNurbsSurface) -> MathResult<Vec<IntersectionCurve>> {
-        // First compute surface-surface intersection ignoring trims
-        let raw_intersections = self.surface.intersect(&other.surface)?;
-
-        let mut trimmed_intersections = Vec::new();
-
-        for intersection in raw_intersections {
-            // Trim the intersection curve based on both surfaces' trim regions
-            let trimmed = self.trim_intersection_curve(&intersection, other)?;
-            trimmed_intersections.extend(trimmed);
-        }
-
-        Ok(trimmed_intersections)
-    }
-
-    /// Trim an intersection curve based on trim regions
-    fn trim_intersection_curve(
-        &self,
-        curve: &IntersectionCurve,
-        other: &TrimmedNurbsSurface,
-    ) -> MathResult<Vec<IntersectionCurve>> {
-        let mut result = Vec::new();
-        let mut segments = Vec::new();
-        let mut current_segment = Vec::new();
-        let mut in_region = false;
-
-        // Sample the curve and check trim regions
-        let num_samples = 100;
-        for i in 0..=num_samples {
-            let t = i as f64 / num_samples as f64;
-            let point = curve.evaluate(t)?;
-
-            // Check if point is inside both trimmed regions
-            let in_self = self.is_inside(point.u1, point.v1)?;
-            let in_other = other.is_inside(point.u2, point.v2)?;
-            let in_both = in_self && in_other;
-
-            if in_both && !in_region {
-                // Starting a new segment
-                in_region = true;
-                current_segment.clear();
-                current_segment.push(point);
-            } else if in_both && in_region {
-                // Continuing current segment
-                current_segment.push(point);
-            } else if !in_both && in_region {
-                // Ending current segment
-                in_region = false;
-                if current_segment.len() >= 2 {
-                    segments.push(current_segment.clone());
-                }
-            }
-        }
-
-        // Handle last segment
-        if in_region && current_segment.len() >= 2 {
-            segments.push(current_segment);
-        }
-
-        // Convert segments to intersection curves
-        for segment in segments {
-            if let Some(curve) = IntersectionCurve::from_points(&segment) {
-                result.push(curve);
-            }
-        }
-
-        Ok(result)
-    }
-}
-
-/// Intersection curve between two surfaces
-#[derive(Debug, Clone)]
-pub struct IntersectionCurve {
-    /// Points on the curve with parameter values
-    pub points: Vec<IntersectionPoint>,
-}
-
-/// A point on an intersection curve
-#[derive(Debug, Clone, Copy)]
-pub struct IntersectionPoint {
-    /// 3D position
-    pub position: Point3,
-    /// Parameters on first surface
-    pub u1: f64,
-    pub v1: f64,
-    /// Parameters on second surface
-    pub u2: f64,
-    pub v2: f64,
-}
-
-impl IntersectionCurve {
-    /// Evaluate the intersection curve at parameter t ∈ [0,1]
-    pub fn evaluate(&self, t: f64) -> MathResult<IntersectionPoint> {
-        if self.points.is_empty() {
-            return Err(MathError::InvalidParameter(
-                "Empty intersection curve".into(),
-            ));
-        }
-
-        // Linear interpolation for now
-        let n = self.points.len() - 1;
-        let segment = (t * n as f64).floor() as usize;
-        let local_t = t * n as f64 - segment as f64;
-
-        if segment >= n {
-            Ok(self.points[n])
-        } else {
-            let p0 = &self.points[segment];
-            let p1 = &self.points[segment + 1];
-
-            Ok(IntersectionPoint {
-                position: p0.position + (p1.position - p0.position) * local_t,
-                u1: p0.u1 + (p1.u1 - p0.u1) * local_t,
-                v1: p0.v1 + (p1.v1 - p0.v1) * local_t,
-                u2: p0.u2 + (p1.u2 - p0.u2) * local_t,
-                v2: p0.v2 + (p1.v2 - p0.v2) * local_t,
-            })
-        }
-    }
-
-    /// Create intersection curve from points
-    pub fn from_points(points: &[IntersectionPoint]) -> Option<Self> {
-        if points.len() < 2 {
-            None
-        } else {
-            Some(Self {
-                points: points.to_vec(),
-            })
-        }
-    }
 }
 
 // Implementation for NurbsCurve2D

@@ -1,6 +1,6 @@
 //! Performance validation tests for production readiness
 //!
-//! Tests mathematical operations at scale to validate aerospace-grade performance
+//! Tests mathematical operations at scale against internal performance targets.
 
 #[cfg(test)]
 mod performance_validation {
@@ -330,9 +330,9 @@ mod performance_validation {
         );
 
         if length_error < 1e-10 {
-            println!("  Status:           ✅ AEROSPACE GRADE");
+            println!("  Status:           ✅ within 1e-10 target");
         } else if length_error < 1e-6 {
-            println!("  Status:           ✅ PRODUCTION READY");
+            println!("  Status:           ✅ within 1e-6 target");
         } else {
             println!("  Status:           ❌ NEEDS IMPROVEMENT");
         }
@@ -344,24 +344,17 @@ mod performance_validation {
         println!("║                        PERFORMANCE SUMMARY                        ║");
         println!("╚══════════════════════════════════════════════════════════════════╝");
         println!();
-        println!("🎯 TARGET PERFORMANCE (Aerospace Grade):");
+        println!("Internal performance targets (informational only):");
         println!("   • Vector operations:     < 1 ns/op");
         println!("   • Matrix operations:     < 10 ns/op");
         println!("   • B-spline evaluation:   < 100 ns/op");
         println!("   • Quaternion operations: < 5 ns/op");
         println!();
-        println!("📊 INDUSTRY COMPARISON:");
-        println!("   • Parasolid NURBS eval:  ~200 ns/op");
-        println!("   • ACIS vector ops:       ~2-5 ns/op");
-        println!("   • OpenCASCADE matrix:    ~15-20 ns/op");
-        println!();
-        println!("✅ ROSHERA ACHIEVEMENTS:");
-        println!("   • Sub-nanosecond vector operations");
-        println!("   • 50-80% faster than industry leaders");
-        println!("   • Aerospace-grade numerical stability");
-        println!("   • Zero unsafe code with full memory safety");
+        println!("Design properties:");
+        println!("   • No unsafe code");
         println!("   • Thread-safe concurrent operations");
         println!();
-        println!("🚀 PRODUCTION READINESS: CONFIRMED");
+        println!("No third-party kernel comparisons are made here; use your own");
+        println!("baseline via `cargo bench` for apples-to-apples measurements.");
     }
 }

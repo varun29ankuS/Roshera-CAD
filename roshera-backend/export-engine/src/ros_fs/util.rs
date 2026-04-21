@@ -145,21 +145,21 @@ lazy_static! {
 pub fn random_bytes(len: usize) -> Vec<u8> {
     SECURE_RNG
         .random_bytes(len)
-        .expect("Random number generation failed")
+        .expect("OS CSPRNG failed; cannot continue safely (see SecureRng::random_bytes)")
 }
 
 /// Generate a random 16-byte array using the global secure RNG
 pub fn random_16() -> [u8; 16] {
     SECURE_RNG
         .random_16()
-        .expect("Random number generation failed")
+        .expect("OS CSPRNG failed; cannot continue safely (see SecureRng::random_bytes)")
 }
 
 /// Generate a random 32-byte array using the global secure RNG
 pub fn random_32() -> [u8; 32] {
     SECURE_RNG
         .random_32()
-        .expect("Random number generation failed")
+        .expect("OS CSPRNG failed; cannot continue safely (see SecureRng::random_bytes)")
 }
 
 /// Constant-time comparison for byte slices

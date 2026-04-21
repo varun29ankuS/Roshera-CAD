@@ -34,7 +34,7 @@ lazy_static! {
     static ref PATTERNS: Vec<Pattern> = vec![
         // Create box patterns
         Pattern {
-            regex: Regex::new(r"(?i)create\s+(?:a\s+)?box\s+(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)").unwrap(),
+            regex: Regex::new(r"(?i)create\s+(?:a\s+)?box\s+(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)").expect("static create-box regex must compile"),
             command_type: CommandType::CreateBox,
             extractor: Box::new(|caps| {
                 let width = caps.get(1)?.as_str().parse().ok()?;
@@ -56,7 +56,7 @@ lazy_static! {
 
         // Create sphere patterns
         Pattern {
-            regex: Regex::new(r"(?i)create\s+(?:a\s+)?sphere\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)").unwrap(),
+            regex: Regex::new(r"(?i)create\s+(?:a\s+)?sphere\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)").expect("static create-sphere regex must compile"),
             command_type: CommandType::CreateSphere,
             extractor: Box::new(|caps| {
                 let radius = caps.get(1)?.as_str().parse().ok()?;
@@ -74,7 +74,7 @@ lazy_static! {
 
         // Create cylinder patterns
         Pattern {
-            regex: Regex::new(r"(?i)create\s+(?:a\s+)?cylinder\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)\s+(?:and\s+)?height\s+(\d+(?:\.\d+)?)").unwrap(),
+            regex: Regex::new(r"(?i)create\s+(?:a\s+)?cylinder\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)\s+(?:and\s+)?height\s+(\d+(?:\.\d+)?)").expect("static create-cylinder regex must compile"),
             command_type: CommandType::CreateCylinder,
             extractor: Box::new(|caps| {
                 let radius = caps.get(1)?.as_str().parse().ok()?;
@@ -94,7 +94,7 @@ lazy_static! {
 
         // Extrude patterns
         Pattern {
-            regex: Regex::new(r"(?i)extrude(?:\s+face)?(?:\s+(\d+))?(?:\s+by\s+(\d+(?:\.\d+)?))?").unwrap(),
+            regex: Regex::new(r"(?i)extrude(?:\s+face)?(?:\s+(\d+))?(?:\s+by\s+(\d+(?:\.\d+)?))?").expect("static extrude regex must compile"),
             command_type: CommandType::Extrude,
             extractor: Box::new(|caps| {
                 let face_index = caps.get(1).and_then(|m| m.as_str().parse().ok());

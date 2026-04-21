@@ -21,21 +21,6 @@ regex = "1.10"
 lazy_static = "1.4"
 ordered-float = "4.5"
 
-# AI Model Integration - Pure Rust implementation
-candle-core = "0.9.1"  # Pure Rust tensor operations
-candle-nn = "0.9.1"    # Neural network layers
-candle-transformers = "0.9.1"  # Transformer models including Whisper
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
-half = "2.3"  # For 16-bit float operations
-hf-hub = "0.3"  # For downloading models from Hugging Face
-
-# Audio Processing
-hound = "3.5"  # WAV file handling
-rubato = "0.16"  # Audio resampling
-whisper-rs = "0.11"  # Whisper ASR C++ bindings
-nnnoiseless = "0.5"  # RNNoise bindings without conflicts
-dasp = "0.11"  # Digital audio signal processing
-
 # Async & Concurrency
 async-trait = "0.1"
 futures = "0.3"
@@ -48,7 +33,7 @@ dotenvy = "0.15"
 tracing = { workspace = true }
 metrics = "0.21"
 
-# HTTP client for Ollama
+# HTTP client for hosted LLM APIs (Claude, OpenAI, etc.)
 reqwest = { version = "0.12", features = ["json"] }
 
 # For TTS - Native implementations
@@ -57,10 +42,6 @@ base64 = "0.22"  # For encoding audio data in JSON
 # CLI tools
 clap = { version = "4.5", features = ["derive"], optional = true }
 
-# GUI dependencies for examples
-eframe = { version = "0.29", optional = true }
-egui = { version = "0.29", optional = true }
-cpal = { version = "0.15", optional = true }  # For audio input
 
 # For debug tools
 chrono = "0.4"  # For timestamps
@@ -68,14 +49,11 @@ sha2 = "0.10"   # For computing audio cache keys
 dashmap = "6.1" # For concurrent hash maps
 
 [features]
-default = ["whisper", "llama"]
-whisper = []
-llama = []
+default = []
 openai = []
 anthropic = []
 mock-providers = []  # For testing
 cli = ["clap"]  # For CLI tools
-gui = ["eframe", "egui", "cpal"]  # For GUI examples
 [dev-dependencies]
 tokio-test = "0.4"
 tokio = { version = "1.35", features = ["test-util", "macros", "rt-multi-thread"] }
@@ -88,42 +66,6 @@ env_logger = "0.11"
 name = "ai_benchmarks"
 harness = false
 
-[[bin]]
-name = "convert_whisper_model"
-path = "src/bin/convert_whisper_model.rs"
-required-features = ["cli"]
 
-# Missing example files - commented out
-# [[example]]
-# name = "voice_to_cad_demo"
-# path = "examples/voice_to_cad_demo.rs"
-# required-features = ["gui"]
-
-# [[example]]
-# name = "voice_to_cad_noisy"
-# path = "examples/voice_to_cad_noisy.rs"
-# required-features = ["gui"]
-
-# [[example]]
-# name = "voice_to_cad_with_llama"
-# path = "examples/voice_to_cad_with_llama.rs"
-# required-features = ["gui"]
-
-# [[example]]
-# name = "voice_to_cad_rnnoise"
-# path = "examples/voice_to_cad_rnnoise.rs"
-# required-features = ["gui"]
-
-# [[example]]
-# name = "voice_to_cad_simple"
-# path = "examples/voice_to_cad_simple.rs"
-# required-features = ["gui"]
-
-# [[example]]
-# name = "voice_to_cad_debug"
-# path = "examples/voice_to_cad_debug.rs"
-# required-features = ["gui"]
-
-# [[example]]
-# name = "session_aware_ai_demo"
-# path = "examples/session_aware_ai_demo.rs"
+[lints]
+workspace = true
