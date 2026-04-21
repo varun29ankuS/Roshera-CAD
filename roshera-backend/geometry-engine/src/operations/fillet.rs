@@ -458,7 +458,13 @@ fn create_chord_fillet(
 ) -> OperationResult<FaceId> {
     // Compute radius from chord length and face angle
     let angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
-    let radius = chord_length / (2.0 * (angle / 2.0).sin());
+    let half_sin = (angle / 2.0).sin();
+    if half_sin.abs() < 1e-10 {
+        return Err(OperationError::InvalidGeometry(
+            "Cannot fillet flat or reflex edge".into(),
+        ));
+    }
+    let radius = chord_length / (2.0 * half_sin);
 
     create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius)
 }

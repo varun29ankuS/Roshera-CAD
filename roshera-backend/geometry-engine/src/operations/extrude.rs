@@ -1081,11 +1081,12 @@ fn validate_extrude_inputs(
         ));
     }
 
-    // Check draft angle is reasonable
-    if options.draft_angle.abs() > std::f64::consts::PI / 2.0 - 0.1 {
-        return Err(OperationError::InvalidGeometry(
-            "Draft angle too large".to_string(),
-        ));
+    // Check draft angle is reasonable — must be strictly less than 90 degrees
+    if options.draft_angle.abs() >= std::f64::consts::FRAC_PI_2 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Draft angle {:.4} radians exceeds maximum (must be less than 90 degrees)",
+            options.draft_angle
+        )));
     }
 
     Ok(())
