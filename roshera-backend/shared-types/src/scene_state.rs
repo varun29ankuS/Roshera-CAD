@@ -70,46 +70,71 @@ pub struct SceneObject {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "params")]
 pub enum ObjectType {
-    /// Primitive shapes
+    /// Rectangular box primitive.
     Box {
+        /// Width along the X axis.
         width: f32,
+        /// Height along the Y axis.
         height: f32,
+        /// Depth along the Z axis.
         depth: f32,
     },
+    /// Sphere primitive.
     Sphere {
+        /// Sphere radius.
         radius: f32,
     },
+    /// Cylinder primitive aligned along its local axis.
     Cylinder {
+        /// Cylinder radius.
         radius: f32,
+        /// Cylinder height.
         height: f32,
     },
+    /// Cone or truncated cone (frustum).
     Cone {
+        /// Radius at the base of the cone.
         bottom_radius: f32,
+        /// Radius at the top of the cone (0 for a pointed cone).
         top_radius: f32,
+        /// Cone height.
         height: f32,
     },
+    /// Torus primitive.
     Torus {
+        /// Distance from torus center to tube center.
         major_radius: f32,
+        /// Radius of the tube itself.
         minor_radius: f32,
     },
 
-    /// Complex geometry
+    /// Arbitrary triangle mesh.
     Mesh {
+        /// Number of vertices in the mesh.
         vertex_count: usize,
+        /// Number of faces (triangles) in the mesh.
         face_count: usize,
     },
+    /// NURBS surface patch.
     NurbsSurface {
+        /// Polynomial degree in the U direction.
         degree_u: u32,
+        /// Polynomial degree in the V direction.
         degree_v: u32,
     },
+    /// Compound object containing multiple child parts.
     Compound {
+        /// Number of immediate child parts.
         part_count: usize,
     },
 
-    /// Other types
+    /// Logical grouping of objects (no geometry).
     Group,
+    /// Assembly of parts/sub-assemblies.
     Assembly,
+    /// Geometry imported from an external file.
     ImportedGeometry {
+        /// Source file format (e.g. "STEP", "STL").
         format: String,
     },
 }
@@ -117,24 +142,33 @@ pub enum ObjectType {
 /// 3D transformation
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transform3D {
+    /// Translation in world space.
     pub position: Position3D,
+    /// Rotation stored as a quaternion.
     pub rotation: Quaternion,
+    /// Per-axis scale factors.
     pub scale: Vector3D,
 }
 
 /// Quaternion for rotation representation
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Quaternion {
+    /// X component (imaginary i).
     pub x: f32,
+    /// Y component (imaginary j).
     pub y: f32,
+    /// Z component (imaginary k).
     pub z: f32,
+    /// Scalar (real) component.
     pub w: f32,
 }
 
 /// Axis-aligned bounding box
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BoundingBox {
+    /// Minimum corner [x, y, z].
     pub min: Position3D,
+    /// Maximum corner [x, y, z].
     pub max: Position3D,
 }
 
@@ -167,8 +201,11 @@ impl BoundingBox {
 /// Material reference
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaterialRef {
+    /// Material identifier.
     pub id: String,
+    /// Human-readable material name.
     pub name: String,
+    /// Base RGBA color of the material.
     pub color: Color,
 }
 
@@ -194,10 +231,14 @@ pub struct ObjectProperties {
 /// Mass properties of an object
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MassProperties {
+    /// Volume of the solid in cubic world units.
     pub volume: f32,
+    /// Total surface area in square world units.
     pub surface_area: f32,
+    /// Center of mass in world space.
     pub center_of_mass: Position3D,
-    pub mass: Option<f32>, // If density is known
+    /// Mass in kilograms (only available when density is known).
+    pub mass: Option<f32>,
 }
 
 /// Camera state for understanding viewport
@@ -231,14 +272,18 @@ pub struct CameraState {
 /// Viewport dimensions
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Viewport {
+    /// Viewport width in pixels.
     pub width: u32,
+    /// Viewport height in pixels.
     pub height: u32,
 }
 
 /// Camera projection type
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum ProjectionType {
+    /// Perspective projection with foreshortening.
     Perspective,
+    /// Orthographic projection (parallel rays).
     Orthographic,
 }
 
@@ -258,9 +303,13 @@ pub struct SelectionState {
 /// Selection mode
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum SelectionMode {
+    /// Select whole objects.
     Object,
+    /// Select individual faces.
     Face,
+    /// Select individual edges.
     Edge,
+    /// Select individual vertices.
     Vertex,
 }
 
@@ -283,36 +332,52 @@ pub struct SceneMetadata {
 /// Unit system
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum UnitSystem {
+    /// Millimeters (default metric unit).
     Millimeters,
+    /// Centimeters.
     Centimeters,
+    /// Meters.
     Meters,
+    /// Inches (imperial).
     Inches,
+    /// Feet (imperial).
     Feet,
 }
 
 /// Grid display settings
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GridSettings {
+    /// Whether the grid is rendered.
     pub visible: bool,
+    /// Distance between adjacent minor grid lines.
     pub spacing: f32,
+    /// Number of minor lines between major grid lines.
     pub major_lines: u32,
 }
 
 /// Scene statistics
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SceneStatistics {
+    /// Total number of objects in the scene.
     pub total_objects: usize,
+    /// Total vertex count across all tessellated objects.
     pub total_vertices: usize,
+    /// Total face count across all tessellated objects.
     pub total_faces: usize,
+    /// Combined axis-aligned bounding box of all visible objects.
     pub bounding_box: Option<BoundingBox>,
 }
 
 /// Spatial relationship between objects
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpatialRelationship {
+    /// First object in the relationship.
     pub object_a: ObjectId,
+    /// Second object in the relationship.
     pub object_b: ObjectId,
+    /// Type of spatial relationship.
     pub relationship: RelationshipType,
+    /// Confidence score in [0, 1] that the relationship holds.
     pub confidence: f32,
 }
 
@@ -321,28 +386,48 @@ pub struct SpatialRelationship {
 #[serde(tag = "type", content = "details")]
 pub enum RelationshipType {
     /// Objects are touching
-    Contact { contact_area: f32 },
+    Contact {
+        /// Estimated contact area shared between the objects.
+        contact_area: f32,
+    },
 
     /// One object contains another
     Contains,
 
     /// Objects are aligned
-    Aligned { axis: Vector3D },
+    Aligned {
+        /// Axis along which the objects are aligned.
+        axis: Vector3D,
+    },
 
     /// Objects are concentric
-    Concentric { center: Position3D },
+    Concentric {
+        /// Shared center point of concentricity.
+        center: Position3D,
+    },
 
     /// Objects are at a specific distance
-    Distance { value: f32 },
+    Distance {
+        /// Measured distance in world units.
+        value: f32,
+    },
 
     /// Objects are parallel
-    Parallel { direction: Vector3D },
+    Parallel {
+        /// Shared direction vector.
+        direction: Vector3D,
+    },
 
     /// Objects are perpendicular
     Perpendicular,
 
     /// Objects form a pattern
-    Pattern { pattern_type: String, count: usize },
+    Pattern {
+        /// Pattern category (e.g. "linear", "circular").
+        pattern_type: String,
+        /// Number of elements participating in the pattern.
+        count: usize,
+    },
 }
 
 /// Scene query for AI context
@@ -363,10 +448,16 @@ pub enum SceneQueryType {
     AllObjects,
 
     /// Get objects by type
-    ByType { object_type: String },
+    ByType {
+        /// Object type discriminator (e.g. "box", "sphere").
+        object_type: String,
+    },
 
     /// Get objects in region
-    InRegion { bounding_box: BoundingBox },
+    InRegion {
+        /// Region expressed as an axis-aligned bounding box.
+        bounding_box: BoundingBox,
+    },
 
     /// Get selected objects
     Selected,
@@ -375,18 +466,28 @@ pub enum SceneQueryType {
     Visible,
 
     /// Get objects with specific material
-    ByMaterial { material_id: String },
+    ByMaterial {
+        /// Material identifier to match.
+        material_id: String,
+    },
 
     /// Get objects matching pattern
-    ByPattern { pattern: String },
+    ByPattern {
+        /// Glob-style or regex pattern matched against object names.
+        pattern: String,
+    },
 }
 
 /// Filters for scene queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneFilters {
+    /// Include hidden objects in the results.
     pub include_hidden: bool,
+    /// Include locked objects in the results.
     pub include_locked: bool,
+    /// Minimum bounding-box diagonal to include.
     pub min_size: Option<f32>,
+    /// Maximum bounding-box diagonal to include.
     pub max_size: Option<f32>,
 }
 
@@ -395,25 +496,42 @@ pub struct SceneFilters {
 #[serde(tag = "type", content = "data")]
 pub enum SceneUpdate {
     /// Object added
-    ObjectAdded { object: SceneObject },
+    ObjectAdded {
+        /// New object added to the scene.
+        object: SceneObject,
+    },
 
     /// Object modified
     ObjectModified {
+        /// Identifier of the modified object.
         id: ObjectId,
+        /// Subset of fields that changed.
         changes: ObjectChanges,
     },
 
     /// Object removed
-    ObjectRemoved { id: ObjectId },
+    ObjectRemoved {
+        /// Identifier of the removed object.
+        id: ObjectId,
+    },
 
     /// Selection changed
-    SelectionChanged { selection: SelectionState },
+    SelectionChanged {
+        /// New selection state.
+        selection: SelectionState,
+    },
 
     /// Camera moved
-    CameraChanged { camera: CameraState },
+    CameraChanged {
+        /// New camera state.
+        camera: CameraState,
+    },
 
     /// Tool changed
-    ToolChanged { tool: Option<String> },
+    ToolChanged {
+        /// Name of the newly active tool, or `None` if no tool is active.
+        tool: Option<String>,
+    },
 
     /// Scene cleared
     SceneCleared,
@@ -422,10 +540,15 @@ pub enum SceneUpdate {
 /// Changes to an object
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectChanges {
+    /// New transform, if it changed.
     pub transform: Option<Transform3D>,
+    /// New visibility flag, if it changed.
     pub visibility: Option<bool>,
+    /// New material, if it changed.
     pub material: Option<MaterialRef>,
+    /// New display name, if it changed.
     pub name: Option<String>,
+    /// Updated custom properties, if any changed.
     pub properties: Option<HashMap<String, serde_json::Value>>,
 }
 
