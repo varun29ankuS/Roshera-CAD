@@ -180,6 +180,12 @@ pub struct BRepModel {
     pub solids: SolidStore,
     /// Sketch plane storage
     pub sketch_planes: DashMap<String, SketchPlane>,
+    /// Optional recorder receiving one event per successful operation.
+    /// `None` by default — tests and unattached models incur zero overhead.
+    /// Attached via `attach_recorder` by the orchestration layer
+    /// (api-server, AI batch driver, …). Not serialized; recorder identity
+    /// is an orchestration concern, not a model invariant.
+    pub recorder: Option<std::sync::Arc<dyn crate::operations::recorder::OperationRecorder>>,
 }
 
 impl BRepModel {
@@ -203,6 +209,37 @@ impl BRepModel {
             shells: ShellStore::with_capacity(shell_capacity),
             solids: SolidStore::with_capacity(solid_capacity),
             sketch_planes: DashMap::new(),
+            recorder: None,
+        }
+    }
+
+    /// Attach a recorder that will receive one event per successful
+    /// operation on this model. Returns the previous recorder, if any.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// let model = BRepModel::new();
+    /// let rec: Arc<dyn OperationRecorder> = Arc::new(my_recorder);
+    /// model.attach_recorder(Some(rec));
+    /// ```
+    pub fn attach_recorder(
+        &mut self,
+        recorder: Option<std::sync::Arc<dyn crate::operations::recorder::OperationRecorder>>,
+    ) -> Option<std::sync::Arc<dyn crate::operations::recorder::OperationRecorder>> {
+        std::mem::replace(&mut self.recorder, recorder)
+    }
+
+    /// Emit a record of a just-completed operation. Silently no-ops when no
+    /// recorder is attached; logs a warning via `tracing` when the recorder
+    /// returns an error (the operation has already mutated the model —
+    /// recorder failures never become geometry failures).
+    pub fn record_operation(&self, operation: crate::operations::recorder::RecordedOperation) {
+        if let Some(rec) = self.recorder.as_ref() {
+            if let Err(e) = rec.record(operation) {
+                tracing::warn!("operation recorder returned error: {}", e);
+            }
         }
     }
 
@@ -722,6 +759,23 @@ impl std::fmt::Display for GeometryId {
     }
 }
 
+/// Flatten a typed `GeometryId` to the plain `u64` entity handle exposed
+/// to external recorders.
+///
+/// `FaceId`, `SolidId`, `EdgeId`, and `VertexId` are all `u32` aliases, so
+/// this is a widening cast with no data loss. The entity *kind* is **not**
+/// preserved in the returned u64 — callers relying on round-trip identity
+/// must consult the accompanying `RecordedOperation::parameters` payload,
+/// which serializes the original `TimelineOperation` in full.
+fn geometry_id_to_u64(id: GeometryId) -> u64 {
+    match id {
+        GeometryId::Face(i)
+        | GeometryId::Solid(i)
+        | GeometryId::Edge(i)
+        | GeometryId::Vertex(i) => i as u64,
+    }
+}
+
 /// Boolean operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BooleanOp {
@@ -766,6 +820,90 @@ impl<'a> TopologyBuilder<'a> {
         ts
     }
 
+    /// Push a `TimelineOperation` to the builder's internal timeline **and**
+    /// forward a canonical `RecordedOperation` to the model's attached
+    /// recorder (if any).
+    ///
+    /// This is the single emission point that keeps the two history paths
+    /// in sync:
+    ///
+    /// 1. `self.timeline` — the kernel-internal accumulator (kept for any
+    ///    existing consumer of `get_timeline`).
+    /// 2. `self.model.record_operation` — the dependency-inverted trait
+    ///    handoff to `timeline-engine` (or any other recorder) living
+    ///    outside the kernel.
+    ///
+    /// `outputs` should list entity IDs produced by the operation (e.g. the
+    /// newly created solid/face/edge). Pass an empty `Vec` when the call
+    /// is purely destructive or modifies existing entities in place.
+    fn record_and_push(&mut self, operation: TimelineOperation, outputs: Vec<u64>) {
+        // Preserve existing in-builder timeline semantics verbatim.
+        self.timeline.push(operation.clone());
+
+        // Build the canonical outward record.
+        let kind = match &operation {
+            TimelineOperation::Create2D { primitive_type, .. } => {
+                format!("create_{}_2d", primitive_type)
+            }
+            TimelineOperation::Create3D { primitive_type, .. } => {
+                format!("create_{}_3d", primitive_type)
+            }
+            TimelineOperation::Extrude { .. } => "extrude".to_string(),
+            TimelineOperation::Revolve { .. } => "revolve".to_string(),
+            TimelineOperation::Boolean {
+                operation: op_kind, ..
+            } => {
+                let suffix = match op_kind {
+                    BooleanOp::Union => "union",
+                    BooleanOp::Intersection => "intersection",
+                    BooleanOp::Difference => "difference",
+                    BooleanOp::SymmetricDifference => "symmetric_difference",
+                };
+                format!("boolean_{}", suffix)
+            }
+            TimelineOperation::UpdateParameters { .. } => "update_parameters".to_string(),
+        };
+
+        // Derive inputs structurally from variants that reference existing
+        // entities. Downstream recorders rely on `parameters` (below) for
+        // full semantic detail; `inputs`/`outputs` are opaque entity
+        // handles for lineage tracking.
+        let inputs: Vec<u64> = match &operation {
+            TimelineOperation::Extrude { profile_id, .. } => {
+                vec![geometry_id_to_u64(*profile_id)]
+            }
+            TimelineOperation::Boolean { operand_ids, .. } => operand_ids
+                .iter()
+                .copied()
+                .map(geometry_id_to_u64)
+                .collect(),
+            TimelineOperation::UpdateParameters { geometry_id, .. } => {
+                vec![geometry_id_to_u64(*geometry_id)]
+            }
+            _ => Vec::new(),
+        };
+
+        // Serialize the full TimelineOperation as the parameters payload
+        // so a recorder can replay without lossy encoding.
+        let parameters = match serde_json::to_value(&operation) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to serialize TimelineOperation for recorder: {}",
+                    e
+                );
+                serde_json::Value::Null
+            }
+        };
+
+        let record = crate::operations::recorder::RecordedOperation::new(kind)
+            .with_parameters(parameters)
+            .with_inputs(inputs)
+            .with_outputs(outputs);
+
+        self.model.record_operation(record);
+    }
+
     // =====================================
     // 2D PRIMITIVE CREATION METHODS
     // =====================================
@@ -777,13 +915,13 @@ impl<'a> TopologyBuilder<'a> {
             .vertices
             .add_or_find(x, y, 0.0, self.tolerance.distance());
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create2D {
             primitive_type: "point".to_string(),
             parameters: [("x".to_string(), x), ("y".to_string(), y)].into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![vertex_id as u64]);
 
         Ok(GeometryId::Vertex(vertex_id))
     }
@@ -819,7 +957,7 @@ impl<'a> TopologyBuilder<'a> {
         );
         let edge_id = self.model.edges.add(edge);
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create2D {
             primitive_type: "line".to_string(),
             parameters: [
@@ -831,7 +969,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![edge_id as u64]);
 
         Ok(GeometryId::Edge(edge_id))
     }
@@ -874,7 +1012,7 @@ impl<'a> TopologyBuilder<'a> {
         );
         let edge_id = self.model.edges.add(edge);
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create2D {
             primitive_type: "circle".to_string(),
             parameters: [
@@ -885,7 +1023,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![edge_id as u64]);
 
         Ok(GeometryId::Edge(edge_id))
     }
@@ -965,7 +1103,7 @@ impl<'a> TopologyBuilder<'a> {
         face.outer_loop = loop_id;
         let face_id = self.model.faces.add(face);
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create2D {
             primitive_type: "rectangle".to_string(),
             parameters: [
@@ -977,7 +1115,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![face_id as u64]);
 
         Ok(GeometryId::Face(face_id))
     }
@@ -1020,7 +1158,7 @@ impl<'a> TopologyBuilder<'a> {
         // Create solid
         let solid_id = self.create_box_solid(shell)?;
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "box".to_string(),
             parameters: [
@@ -1031,7 +1169,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![solid_id as u64]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -1073,7 +1211,7 @@ impl<'a> TopologyBuilder<'a> {
         let solid = Solid::new(0, shell_id);
         let solid_id = self.model.solids.add(solid);
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "sphere".to_string(),
             parameters: [
@@ -1085,7 +1223,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![solid_id as u64]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -1118,7 +1256,7 @@ impl<'a> TopologyBuilder<'a> {
         // Create cylinder topology
         let solid_id = self.create_cylinder_topology(base_center, axis, radius, height)?;
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "cylinder".to_string(),
             parameters: [
@@ -1134,7 +1272,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![solid_id as u64]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -1177,7 +1315,7 @@ impl<'a> TopologyBuilder<'a> {
         let solid_id =
             self.create_cone_topology(base_center, axis, base_radius, top_radius, height)?;
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "cone".to_string(),
             parameters: [
@@ -1194,7 +1332,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![solid_id as u64]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -1283,7 +1421,7 @@ impl<'a> TopologyBuilder<'a> {
         // Create solid
         let solid_id = self.create_box_solid(shell)?;
 
-        // Record in timeline
+        // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "plane".to_string(),
             parameters: [
@@ -1300,7 +1438,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation);
+        self.record_and_push(operation, vec![solid_id as u64]);
 
         Ok(solid_id)
     }
@@ -1637,7 +1775,9 @@ impl<'a> TopologyBuilder<'a> {
             new_parameters: new_parameters.clone(),
             timestamp: self.next_timestamp(),
         };
-        self.timeline.push(operation.clone());
+        // Purely mutating — no new outputs produced. Inputs are derived
+        // inside `record_and_push` from the variant itself.
+        self.record_and_push(operation.clone(), Vec::new());
 
         // Update global parameter cache for fast access
         let param_map = DashMap::new();
