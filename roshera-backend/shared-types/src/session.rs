@@ -61,12 +61,18 @@ pub struct OrientationCubeState {
 /// Cube face identifiers
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CubeFace {
-    Top,    // XY plane (Z normal)
-    Bottom, // XY plane (-Z normal)
-    Front,  // XZ plane (-Y normal)
-    Back,   // XZ plane (Y normal)
-    Right,  // YZ plane (X normal)
-    Left,   // YZ plane (-X normal)
+    /// Top face — XY plane with +Z normal.
+    Top,
+    /// Bottom face — XY plane with -Z normal.
+    Bottom,
+    /// Front face — XZ plane with -Y normal.
+    Front,
+    /// Back face — XZ plane with +Y normal.
+    Back,
+    /// Right face — YZ plane with +X normal.
+    Right,
+    /// Left face — YZ plane with -X normal.
+    Left,
 }
 
 /// Sketch state for tracking drawing operations
@@ -217,29 +223,48 @@ pub struct HistoryEntry {
 #[serde(tag = "type")]
 pub enum CollaborationEvent {
     /// User joined session
-    UserJoined { user: UserInfo },
+    UserJoined {
+        /// User that joined the session.
+        user: UserInfo,
+    },
     /// User left session
-    UserLeft { user_id: String },
+    UserLeft {
+        /// Identifier of the user that left.
+        user_id: String,
+    },
     /// Object was created
-    ObjectCreated { object: CADObject, user_id: String },
+    ObjectCreated {
+        /// Newly created object.
+        object: CADObject,
+        /// Identifier of the user that created the object.
+        user_id: String,
+    },
     /// Object was modified
     ObjectModified {
+        /// Identifier of the modified object.
         object_id: ObjectId,
+        /// Identifier of the user that performed the modification.
         user_id: String,
     },
     /// Object was deleted
     ObjectDeleted {
+        /// Identifier of the deleted object.
         object_id: ObjectId,
+        /// Identifier of the user that deleted the object.
         user_id: String,
     },
     /// Cursor moved
     CursorMoved {
+        /// Identifier of the user whose cursor moved.
         user_id: String,
+        /// New cursor position in world space.
         position: Position3D,
     },
     /// Selection changed
     SelectionChanged {
+        /// Identifier of the user whose selection changed.
         user_id: String,
+        /// Currently selected object IDs.
         objects: Vec<ObjectId>,
     },
 }
