@@ -85,13 +85,27 @@ pub enum AICommand {
 #[serde(tag = "type")]
 pub enum TransformType {
     /// Move object
-    Translate { offset: Vector3D },
+    Translate {
+        /// Translation offset in world space.
+        offset: Vector3D,
+    },
     /// Rotate object
-    Rotate { axis: Vector3D, angle_degrees: f32 },
+    Rotate {
+        /// Rotation axis (unit vector).
+        axis: Vector3D,
+        /// Rotation angle in degrees.
+        angle_degrees: f32,
+    },
     /// Scale object
-    Scale { factor: Vector3D },
+    Scale {
+        /// Per-axis scale factors.
+        factor: Vector3D,
+    },
     /// Mirror object
-    Mirror { plane_normal: Vector3D },
+    Mirror {
+        /// Unit normal of the mirror plane.
+        plane_normal: Vector3D,
+    },
 }
 
 /// View types for camera
@@ -113,7 +127,9 @@ pub enum ViewType {
     Isometric,
     /// Custom view with angles
     Custom {
+        /// Horizontal angle in degrees (rotation around Y axis).
         azimuth: NotNan<f32>,
+        /// Vertical angle in degrees (rotation above/below the horizon).
         elevation: NotNan<f32>,
     },
 }
@@ -171,9 +187,15 @@ pub enum SessionAction {
     /// Clear all objects
     Clear,
     /// Save session
-    Save { name: Option<String> },
+    Save {
+        /// Optional session name (defaults to the current session name).
+        name: Option<String>,
+    },
     /// Load session
-    Load { name: String },
+    Load {
+        /// Name of the session to load.
+        name: String,
+    },
 }
 
 /// Analysis types
