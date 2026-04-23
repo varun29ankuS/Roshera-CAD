@@ -233,7 +233,7 @@ pub fn tessellate_uniform(curve: &dyn Curve, num_points: usize) -> Vec<Point3> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::consts;
+    use crate::math::{consts, Vector3};
     use crate::primitives::curve::{Arc, Line};
 
     #[test]

@@ -98,6 +98,30 @@ pub fn revolve_face(
         validate_revolved_solid(model, solid_id)?;
     }
 
+    // Record for attached recorders.
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("revolve_face")
+            .with_parameters(serde_json::json!({
+                "face_id": face_id,
+                "axis_origin": [
+                    options.axis_origin.x,
+                    options.axis_origin.y,
+                    options.axis_origin.z,
+                ],
+                "axis_direction": [
+                    options.axis_direction.x,
+                    options.axis_direction.y,
+                    options.axis_direction.z,
+                ],
+                "angle": options.angle,
+                "pitch": options.pitch,
+                "segments": options.segments,
+                "cap_ends": options.cap_ends,
+            }))
+            .with_inputs(vec![face_id as u64])
+            .with_outputs(vec![solid_id as u64]),
+    );
+
     Ok(solid_id)
 }
 
@@ -177,10 +201,10 @@ fn create_revolution(
 
 /// Create a helical sweep — revolve with axial translation (pitch per revolution)
 fn create_helical_sweep(
-    _model: &mut BRepModel,
-    _base_face: &Face,
+    model: &mut BRepModel,
+    base_face: &Face,
     _base_face_id: FaceId,
-    _options: &RevolveOptions,
+    options: &RevolveOptions,
 ) -> OperationResult<SolidId> {
     let segments = options.segments.max(4);
     let angle_step = options.angle / segments as f64;

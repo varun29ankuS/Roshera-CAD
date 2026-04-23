@@ -558,8 +558,11 @@ impl Assembly {
             new_transform[(1, 3)] += delta.y;
             new_transform[(2, 3)] += delta.z;
 
-            if let Some(_rotation) = delta_rotation {
-                // TODO: Apply rotation quaternion to transform
+            if let Some(rotation) = delta_rotation {
+                // Post-multiply: rotation applied in the component's local
+                // frame, after the translation column has been updated.
+                // Standard rigid-body convention for incremental motion.
+                new_transform = new_transform * rotation.to_matrix4();
             }
             comp.transform = new_transform;
         }

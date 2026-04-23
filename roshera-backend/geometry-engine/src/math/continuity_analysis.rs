@@ -552,6 +552,7 @@ fn enforce_g2_continuity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::Point3;
 
     #[test]
     fn test_g0_continuity() {

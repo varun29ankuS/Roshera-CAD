@@ -158,6 +158,24 @@ pub fn boolean_operation(
     // Step 5: Reconstruct topology from selected faces
     let result_solid = reconstruct_topology(model, selected_faces, &options)?;
 
+    // Record the successful operation for attached recorders (timeline, audit, …).
+    // Recording never propagates failure — see BRepModel::record_operation.
+    let op_kind = match operation {
+        BooleanOp::Union => "boolean_union",
+        BooleanOp::Intersection => "boolean_intersection",
+        BooleanOp::Difference => "boolean_difference",
+    };
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new(op_kind)
+            .with_parameters(serde_json::json!({
+                "solid_a": solid_a,
+                "solid_b": solid_b,
+                "operation": format!("{:?}", operation),
+            }))
+            .with_inputs(vec![solid_a as u64, solid_b as u64])
+            .with_outputs(vec![result_solid as u64]),
+    );
+
     Ok(result_solid)
 }
 
@@ -2729,6 +2747,7 @@ fn classify_face_relative_to_solid(
 
     let mut inside_votes = 0u32;
     let mut outside_votes = 0u32;
+    let mut last_err: Option<OperationError> = None;
 
     for ray in &rays {
         match ray_cast_classification(model, solid, test_point, *ray, tolerance) {
@@ -2738,14 +2757,35 @@ fn classify_face_relative_to_solid(
                 // On-boundary from any ray is definitive
                 return Ok(FaceClassification::OnBoundary);
             }
-            Err(_) => continue, // Skip failed rays
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
         }
+    }
+
+    let total_votes = inside_votes + outside_votes;
+    if total_votes == 0 {
+        // Every ray failed — we have no information to classify the face.
+        // Surface the underlying failure instead of silently returning Outside.
+        return Err(OperationError::NumericalError(format!(
+            "face classification failed: all 3 ray casts errored (last: {})",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )));
     }
 
     if inside_votes > outside_votes {
         Ok(FaceClassification::Inside)
-    } else {
+    } else if outside_votes > inside_votes {
         Ok(FaceClassification::Outside)
+    } else {
+        // Split vote is ambiguous — escalate rather than pick a side arbitrarily.
+        Err(OperationError::NumericalError(format!(
+            "face classification ambiguous: {} inside vs {} outside across {} successful rays",
+            inside_votes, outside_votes, total_votes
+        )))
     }
 }
 

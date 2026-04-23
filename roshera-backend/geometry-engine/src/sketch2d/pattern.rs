@@ -509,6 +509,7 @@ impl PatternOperations {
 mod tests {
     use super::*;
     use crate::sketch2d::{Line2dId, Point2dId};
+    use std::f64::consts::PI;
 
     #[test]
     fn test_linear_pattern_creation() {

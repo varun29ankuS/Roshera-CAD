@@ -14,12 +14,6 @@ mod math_benchmarks;
 mod simple_nurbs_bench;
 
 #[cfg(test)]
-mod simple_tspline_bench;
-
-#[cfg(test)]
-mod tspline_bench;
-
-#[cfg(test)]
 mod bspline_optimization_bench;
 
 #[cfg(test)]

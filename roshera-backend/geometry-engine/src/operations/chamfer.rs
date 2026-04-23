@@ -88,6 +88,9 @@ pub fn chamfer_edges(
     // Validate inputs
     validate_chamfer_inputs(model, solid_id, &edges, &options)?;
 
+    // Capture input edges before the Vec is consumed by propagation.
+    let input_edges_for_record: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
+
     // Propagate edge selection if requested
     let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
@@ -110,6 +113,25 @@ pub fn chamfer_edges(
     if options.common.validate_result {
         validate_chamfered_solid(model, solid_id)?;
     }
+
+    // Record the operation for timeline / event-sourcing consumers.
+    let mut inputs = input_edges_for_record;
+    inputs.insert(0, solid_id as u64);
+    let chamfer_face_ids: Vec<u64> = chamfer_faces.iter().map(|&f| f as u64).collect();
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("chamfer_edges")
+            .with_parameters(serde_json::json!({
+                "solid_id": solid_id,
+                "chamfer_type": format!("{:?}", options.chamfer_type),
+                "distance1": options.distance1,
+                "distance2": options.distance2,
+                "symmetric": options.symmetric,
+                "propagation": format!("{:?}", options.propagation),
+                "preserve_edges": options.preserve_edges,
+            }))
+            .with_inputs(inputs)
+            .with_outputs(chamfer_face_ids),
+    );
 
     Ok(chamfer_faces)
 }

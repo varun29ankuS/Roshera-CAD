@@ -470,6 +470,7 @@ impl GeometrySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::Point3;
     use crate::primitives::primitive_traits::Primitive;
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
 

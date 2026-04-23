@@ -39,6 +39,72 @@ pub enum SurfaceIntersectionResult {
     Coincident,
 }
 
+/// Dispatch a surface-surface intersection to the canonical math-layer
+/// implementation when no analytical closed-form is available.
+///
+/// The inherent `intersect()` trait method returns `Vec<SurfaceIntersectionResult>`
+/// with no error channel; any math-layer failure is logged via `tracing::warn!`
+/// and degrades to an empty vector. This replaces the previous silent
+/// `_ => vec![]` fallthrough in analytical primitive dispatchers, so failures
+/// become observable without changing the trait signature.
+fn dispatch_via_math_ssi(
+    surface1: &dyn Surface,
+    surface2: &dyn Surface,
+    tolerance: Tolerance,
+) -> Vec<SurfaceIntersectionResult> {
+    use crate::math::surface_intersection::{intersect_surfaces, intersection_curve_to_nurbs};
+    use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
+
+    let raw = match intersect_surfaces(surface1, surface2, &tolerance) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "surface-surface intersection failed ({:?} vs {:?}): {:?}",
+                surface1.surface_type(),
+                surface2.surface_type(),
+                e,
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::with_capacity(raw.len());
+    for curve in &raw {
+        // Need at least degree + 1 samples for a cubic fit; skip sparse tracings.
+        if curve.points.len() < 4 {
+            continue;
+        }
+        let math_nurbs = match intersection_curve_to_nurbs(curve, 3) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "intersection curve fit failed ({:?} vs {:?}): {:?}",
+                    surface1.surface_type(),
+                    surface2.surface_type(),
+                    e,
+                );
+                continue;
+            }
+        };
+        match PrimNurbsCurve::new(
+            math_nurbs.degree,
+            math_nurbs.control_points,
+            math_nurbs.weights,
+            math_nurbs.knots.values().to_vec(),
+        ) {
+            Ok(prim) => out.push(SurfaceIntersectionResult::Curve(Box::new(prim))),
+            Err(e) => tracing::warn!(
+                "primitive NURBS conversion failed ({:?} vs {:?}): {:?}",
+                surface1.surface_type(),
+                surface2.surface_type(),
+                e,
+            ),
+        }
+    }
+
+    out
+}
+
 /// Quality of offset surface representation
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OffsetQuality {
@@ -140,7 +206,6 @@ pub enum SurfaceType {
     // Parametric surfaces
     BSpline,
     NURBS,
-    TSpline,
     // Composite surfaces
     Offset,
     Blended,
@@ -1719,7 +1784,7 @@ impl Surface for Cylinder {
                     vec![]
                 }
             }
-            _ => vec![], // Other surface types handled by generic method
+            _ => dispatch_via_math_ssi(self, other, tolerance),
         }
     }
 }
@@ -2511,7 +2576,7 @@ impl Surface for Sphere {
                     vec![]
                 }
             }
-            _ => vec![],
+            _ => dispatch_via_math_ssi(self, other, tolerance),
         }
     }
 }
@@ -3071,7 +3136,7 @@ impl Surface for Cone {
                     vec![]
                 }
             }
-            _ => vec![],
+            _ => dispatch_via_math_ssi(self, other, tolerance),
         }
     }
 }
@@ -3738,7 +3803,7 @@ impl Surface for Torus {
                     vec![]
                 }
             }
-            _ => vec![],
+            _ => dispatch_via_math_ssi(self, other, tolerance),
         }
     }
 }
