@@ -340,11 +340,30 @@ fn maybe_add_seed(
     seeds: &mut Vec<ParametricIntersectionPoint>,
     config: &SurfacePlaneIntersectionConfig,
 ) {
-    if d_a * d_b >= 0.0 {
-        return; // No sign change on this edge.
+    if d_a * d_b > 0.0 {
+        return; // Strictly same sign: no crossing.
     }
-    // Linear interpolation parameter.
-    let t = d_a.abs() / (d_a.abs() + d_b.abs());
+    // Degenerate edge: both endpoints lie on the plane. Seed at midpoint so
+    // grid-aligned intersections (where d = 0 at grid nodes) are not lost.
+    let sum_abs = d_a.abs() + d_b.abs();
+    if sum_abs < 1e-30 {
+        let u_seed = 0.5 * (u_a + u_b);
+        let v_seed = 0.5 * (v_a + v_b);
+        if let Some(refined) =
+            newton_correct(surface, normal, plane_origin, u_seed, v_seed, config)
+        {
+            seeds.push(refined);
+        } else if let Ok(pos) = surface.point_at(u_seed, v_seed) {
+            seeds.push(ParametricIntersectionPoint {
+                position: pos,
+                u: u_seed,
+                v: v_seed,
+            });
+        }
+        return;
+    }
+    // Linear interpolation parameter. Safe now because sum_abs > 0.
+    let t = d_a.abs() / sum_abs;
     let u_seed = u_a + t * (u_b - u_a);
     let v_seed = v_a + t * (v_b - v_a);
 
