@@ -6,7 +6,7 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::Curve,
+    curve::{Arc, Curve, Line},
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     surface::Surface,
@@ -110,10 +110,43 @@ pub fn intersect_curves(
         .get(edge2.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Second curve not found".to_string()))?;
 
-    // For now, always use general intersection
-    // In a full implementation, we would use dynamic dispatch or type IDs
-    // to optimize for specific curve type combinations
-    intersect_general_curves(curve1, curve2, edge1, edge2, tolerance)
+    // Type-specific fast paths via downcasting; fall through to the
+    // general subdivision-based routine when the pair is unrecognized.
+    let is_line1 = curve1.as_any().is::<Line>();
+    let is_line2 = curve2.as_any().is::<Line>();
+    let is_arc1 = curve1.as_any().is::<Arc>();
+    let is_arc2 = curve2.as_any().is::<Arc>();
+
+    match (is_line1, is_line2, is_arc1, is_arc2) {
+        (true, true, _, _) => intersect_line_line(curve1, curve2, edge1, edge2, tolerance),
+        (true, false, false, true) => intersect_line_arc(curve1, curve2, edge1, edge2, tolerance),
+        (false, true, true, false) => {
+            // Swap arguments so the line is first, but preserve param
+            // ordering by transposing each resulting point.
+            let swapped = intersect_line_arc(curve2, curve1, edge2, edge1, tolerance)?;
+            Ok(swap_intersection_params(swapped))
+        }
+        (_, _, true, true) => intersect_arc_arc(curve1, curve2, edge1, edge2, tolerance),
+        _ => intersect_general_curves(curve1, curve2, edge1, edge2, tolerance),
+    }
+}
+
+/// Swap the two parameter sides of every point in a curve-curve result.
+fn swap_intersection_params(result: IntersectionResult) -> IntersectionResult {
+    match result {
+        IntersectionResult::Points(points) => IntersectionResult::Points(
+            points
+                .into_iter()
+                .map(|p| IntersectionPoint {
+                    position: p.position,
+                    param1: p.param2,
+                    param2: p.param1,
+                    intersection_type: p.intersection_type,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Compute curve-surface intersection
@@ -224,8 +257,8 @@ pub fn intersect_surfaces(
 
 /// Intersect two lines
 fn intersect_line_line(
-    curve1: &Box<dyn Curve>,
-    curve2: &Box<dyn Curve>,
+    curve1: &dyn Curve,
+    curve2: &dyn Curve,
     edge1: &Edge,
     edge2: &Edge,
     tolerance: Tolerance,
@@ -391,28 +424,399 @@ fn intersect_line_line(
     Ok(IntersectionResult::None)
 }
 
-/// Intersect line and arc
-fn intersect_line_arc(
-    curve1: &Box<dyn Curve>,
-    curve2: &Box<dyn Curve>,
-    edge1: &Edge,
-    edge2: &Edge,
-    tolerance: Tolerance,
-) -> OperationResult<IntersectionResult> {
-    // Would implement line-arc intersection
-    Ok(IntersectionResult::None)
+/// Normalize an angle offset into [0, 2π).
+#[inline]
+fn normalize_angle(mut a: f64) -> f64 {
+    let two_pi = std::f64::consts::TAU;
+    a %= two_pi;
+    if a < 0.0 {
+        a += two_pi;
+    }
+    a
 }
 
-/// Intersect two arcs
-fn intersect_arc_arc(
-    arc1: &Box<dyn Curve>,
-    arc2: &Box<dyn Curve>,
+/// For a point `p` assumed to lie on the circle of `arc`, return the
+/// normalized arc parameter `t ∈ [0, 1]` if the angle falls within the
+/// arc's sweep, or `None` otherwise. Tolerance is applied to angular checks.
+fn arc_parameter_for_point(arc: &Arc, p: Point3, tolerance: Tolerance) -> Option<f64> {
+    let rel = p - arc.center;
+    let y_axis = arc.normal.cross(&arc.x_axis);
+    let x = rel.dot(&arc.x_axis);
+    let y = rel.dot(&y_axis);
+    let angle = y.atan2(x);
+    let delta = normalize_angle(angle - arc.start_angle);
+    let sweep = arc.sweep_angle;
+    let t = if sweep > 0.0 {
+        // Forward sweep: need delta ∈ [0, sweep]
+        if delta <= sweep + tolerance.angle() {
+            delta / sweep
+        } else if (std::f64::consts::TAU - delta) < tolerance.angle() {
+            // Near the start boundary from the other side — clamp to 0.
+            0.0
+        } else {
+            return None;
+        }
+    } else if sweep < 0.0 {
+        // Reverse sweep: equivalent positive-sweep reading via (2π − delta).
+        let delta_rev = std::f64::consts::TAU - delta;
+        let sweep_abs = -sweep;
+        if delta_rev <= sweep_abs + tolerance.angle() {
+            delta_rev / sweep_abs
+        } else if delta < tolerance.angle() {
+            0.0
+        } else {
+            return None;
+        }
+    } else {
+        // Degenerate zero-sweep arc: only the start point qualifies.
+        if delta < tolerance.angle() || (std::f64::consts::TAU - delta) < tolerance.angle() {
+            0.0
+        } else {
+            return None;
+        }
+    };
+    Some(t.clamp(0.0, 1.0))
+}
+
+/// Map an arc-local parameter `t_arc ∈ [0, 1]` into its enclosing edge
+/// parameter space using the edge's stored `param_range`.
+#[inline]
+fn arc_to_edge_param(edge: &Edge, t_arc: f64) -> f64 {
+    edge.param_range.start + t_arc * (edge.param_range.end - edge.param_range.start)
+}
+
+/// Map a line-local parameter `s ∈ [0, 1]` into the edge parameter space.
+#[inline]
+fn line_to_edge_param(edge: &Edge, s: f64) -> f64 {
+    edge.param_range.start + s * (edge.param_range.end - edge.param_range.start)
+}
+
+/// Build an intersection point for a line-parameter/arc-parameter pair.
+#[allow(clippy::too_many_arguments)]
+fn build_line_arc_point(
+    position: Point3,
+    line_edge: &Edge,
+    s_line: f64,
+    arc_edge: &Edge,
+    t_arc: f64,
+    line_first: bool,
+    exact: bool,
+) -> IntersectionPoint {
+    let p_line = IntersectionParameter::Single(line_to_edge_param(line_edge, s_line));
+    let p_arc = IntersectionParameter::Single(arc_to_edge_param(arc_edge, t_arc));
+    let (param1, param2) = if line_first {
+        (p_line, p_arc)
+    } else {
+        (p_arc, p_line)
+    };
+    IntersectionPoint {
+        position,
+        param1,
+        param2,
+        intersection_type: if exact {
+            PointIntersectionType::Transverse
+        } else {
+            PointIntersectionType::Touch
+        },
+    }
+}
+
+/// Raw line-arc hit record: unbounded 3D position plus the corresponding
+/// line parameter `s` (defined over the segment [line.start, line.end])
+/// and arc parameter `t_arc ∈ [0, 1]`. `exact` is true for transverse
+/// intersections and false for grazes at/beyond the segment boundaries.
+#[derive(Debug, Clone, Copy)]
+struct LineArcHit {
+    position: Point3,
+    s: f64,
+    t_arc: f64,
+    exact: bool,
+}
+
+/// Compute analytical line-arc hits without committing to edge parameters.
+/// The line is treated as the full [`Line`] segment (s ∈ [0, 1]); callers
+/// can discard hits outside their segment of interest. Returned points
+/// satisfy both the arc's sweep and the segment bound (within tolerance).
+fn line_arc_hits(line: &Line, arc: &Arc, tolerance: Tolerance) -> Vec<LineArcHit> {
+    let p0 = line.start;
+    let dir = line.end - line.start;
+    let dir_mag = dir.magnitude();
+    if dir_mag < tolerance.distance() {
+        return Vec::new();
+    }
+
+    let n = arc.normal;
+    let denom = dir.dot(&n);
+    let y_axis = n.cross(&arc.x_axis);
+    let mut hits: Vec<LineArcHit> = Vec::new();
+
+    if denom.abs() < tolerance.angle() {
+        if (p0 - arc.center).dot(&n).abs() > tolerance.distance() {
+            return hits;
+        }
+        let rel = p0 - arc.center;
+        let qx = rel.dot(&arc.x_axis);
+        let qy = rel.dot(&y_axis);
+        let dx = dir.dot(&arc.x_axis);
+        let dy = dir.dot(&y_axis);
+        let a = dx * dx + dy * dy;
+        let b = 2.0 * (qx * dx + qy * dy);
+        let c = qx * qx + qy * qy - arc.radius * arc.radius;
+        let disc = b * b - 4.0 * a * c;
+        if a < tolerance.distance() * tolerance.distance() || disc < -tolerance.distance() {
+            return hits;
+        }
+        let sqrt_disc = disc.max(0.0).sqrt();
+        let transverse = disc > tolerance.distance();
+        let roots: &[f64] = if transverse {
+            &[(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
+        } else {
+            // Tangent case — both roots coincide; emit only one hit.
+            &[-b / (2.0 * a)][..]
+        };
+        for &s in roots {
+            if s < -PARAMETRIC_TOLERANCE || s > 1.0 + PARAMETRIC_TOLERANCE {
+                continue;
+            }
+            let s_clamped = s.clamp(0.0, 1.0);
+            let pos = p0 + dir * s_clamped;
+            if let Some(t_arc) = arc_parameter_for_point(arc, pos, tolerance) {
+                hits.push(LineArcHit {
+                    position: pos,
+                    s: s_clamped,
+                    t_arc,
+                    exact: transverse,
+                });
+            }
+        }
+    } else {
+        let s = (arc.center - p0).dot(&n) / denom;
+        if s < -PARAMETRIC_TOLERANCE || s > 1.0 + PARAMETRIC_TOLERANCE {
+            return hits;
+        }
+        let s_clamped = s.clamp(0.0, 1.0);
+        let pos = p0 + dir * s_clamped;
+        let dist = (pos - arc.center).magnitude();
+        if (dist - arc.radius).abs() > tolerance.distance() {
+            return hits;
+        }
+        if let Some(t_arc) = arc_parameter_for_point(arc, pos, tolerance) {
+            hits.push(LineArcHit {
+                position: pos,
+                s: s_clamped,
+                t_arc,
+                exact: (s_clamped - s).abs() < PARAMETRIC_TOLERANCE,
+            });
+        }
+    }
+
+    hits
+}
+
+/// Core analytical line-arc intersection with edge-parameter mapping.
+/// The `line_first` flag controls which side of each returned
+/// [`IntersectionPoint`] holds the line vs arc parameter.
+fn intersect_line_arc_inner(
+    line: &Line,
+    line_edge: &Edge,
+    arc: &Arc,
+    arc_edge: &Edge,
+    tolerance: Tolerance,
+    line_first: bool,
+) -> OperationResult<IntersectionResult> {
+    let hits = line_arc_hits(line, arc, tolerance);
+    if hits.is_empty() {
+        return Ok(IntersectionResult::None);
+    }
+    let points = hits
+        .into_iter()
+        .map(|h| {
+            build_line_arc_point(
+                h.position,
+                line_edge,
+                h.s,
+                arc_edge,
+                h.t_arc,
+                line_first,
+                h.exact,
+            )
+        })
+        .collect();
+    Ok(IntersectionResult::Points(points))
+}
+
+/// Intersect line and arc.
+///
+/// The caller must ensure `curve1` is a [`Line`] and `curve2` is an [`Arc`]
+/// via prior downcasting. Curves of other concrete types return
+/// [`IntersectionResult::None`].
+fn intersect_line_arc(
+    curve1: &dyn Curve,
+    curve2: &dyn Curve,
     edge1: &Edge,
     edge2: &Edge,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Would implement arc-arc intersection
-    Ok(IntersectionResult::None)
+    let line = match curve1.as_any().downcast_ref::<Line>() {
+        Some(l) => l,
+        None => return Ok(IntersectionResult::None),
+    };
+    let arc = match curve2.as_any().downcast_ref::<Arc>() {
+        Some(a) => a,
+        None => return Ok(IntersectionResult::None),
+    };
+    intersect_line_arc_inner(line, edge1, arc, edge2, tolerance, true)
+}
+
+/// Emit an [`IntersectionPoint`] for a pair of arc parameters.
+fn build_arc_arc_point(
+    position: Point3,
+    edge1: &Edge,
+    t1: f64,
+    edge2: &Edge,
+    t2: f64,
+    exact: bool,
+) -> IntersectionPoint {
+    IntersectionPoint {
+        position,
+        param1: IntersectionParameter::Single(arc_to_edge_param(edge1, t1)),
+        param2: IntersectionParameter::Single(arc_to_edge_param(edge2, t2)),
+        intersection_type: if exact {
+            PointIntersectionType::Transverse
+        } else {
+            PointIntersectionType::Tangent
+        },
+    }
+}
+
+/// Intersect two arcs analytically.
+///
+/// Coplanar arcs reduce to the standard 2D circle-circle intersection.
+/// Non-coplanar arcs are resolved by finding the arc-plane/arc-plane
+/// intersection line and treating it as a line-arc problem against each
+/// circle; the resulting candidates are cross-validated on both arcs'
+/// angular ranges.
+fn intersect_arc_arc(
+    arc1: &dyn Curve,
+    arc2: &dyn Curve,
+    edge1: &Edge,
+    edge2: &Edge,
+    tolerance: Tolerance,
+) -> OperationResult<IntersectionResult> {
+    let a = match arc1.as_any().downcast_ref::<Arc>() {
+        Some(a) => a,
+        None => return Ok(IntersectionResult::None),
+    };
+    let b = match arc2.as_any().downcast_ref::<Arc>() {
+        Some(a) => a,
+        None => return Ok(IntersectionResult::None),
+    };
+
+    let cross_normals = a.normal.cross(&b.normal);
+    let mut points: Vec<IntersectionPoint> = Vec::new();
+
+    if cross_normals.magnitude() < tolerance.angle() {
+        // Planes are parallel. Verify coincidence.
+        if (b.center - a.center).dot(&a.normal).abs() > tolerance.distance() {
+            return Ok(IntersectionResult::None);
+        }
+        // 2D circle-circle intersection in arc A's plane.
+        let y_axis_a = a.normal.cross(&a.x_axis);
+        let center_delta = b.center - a.center;
+        let cx = center_delta.dot(&a.x_axis);
+        let cy = center_delta.dot(&y_axis_a);
+        let d2 = cx * cx + cy * cy;
+        let d = d2.sqrt();
+        let r1 = a.radius;
+        let r2 = b.radius;
+
+        if d > r1 + r2 + tolerance.distance() || d + tolerance.distance() < (r1 - r2).abs() {
+            return Ok(IntersectionResult::None);
+        }
+        if d < tolerance.distance() && (r1 - r2).abs() < tolerance.distance() {
+            // Coincident circles — out of scope for point intersection.
+            return Ok(IntersectionResult::None);
+        }
+        let h2 = r1 * r1 - ((d2 + r1 * r1 - r2 * r2) / (2.0 * d)).powi(2);
+        let h = h2.max(0.0).sqrt();
+        let ax = (d2 + r1 * r1 - r2 * r2) / (2.0 * d);
+        let ux = cx / d;
+        let uy = cy / d;
+        // Perpendicular in the 2D plane.
+        let px = -uy;
+        let py = ux;
+        let candidates_2d = [(ax * ux + h * px, ax * uy + h * py),
+                             (ax * ux - h * px, ax * uy - h * py)];
+
+        let tangential = h < tolerance.distance();
+        for (i, (x2d, y2d)) in candidates_2d.iter().enumerate() {
+            if tangential && i == 1 {
+                break;
+            }
+            let pos = a.center + a.x_axis * *x2d + y_axis_a * *y2d;
+            let t1 = match arc_parameter_for_point(a, pos, tolerance) {
+                Some(t) => t,
+                None => continue,
+            };
+            let t2 = match arc_parameter_for_point(b, pos, tolerance) {
+                Some(t) => t,
+                None => continue,
+            };
+            points.push(build_arc_arc_point(pos, edge1, t1, edge2, t2, !tangential));
+        }
+    } else {
+        // Non-coplanar: intersect the two arc planes, giving a line.
+        // Arc-plane intersection line direction = n1 × n2 (already computed).
+        // Find a point on the line via solving:
+        //   (P - C_a) · n_a = 0
+        //   (P - C_b) · n_b = 0
+        // plus P · d = 0 to pin a unique basepoint, where d = n1 × n2.
+        let dir = cross_normals.normalize().unwrap_or(cross_normals);
+        let n1 = a.normal;
+        let n2 = b.normal;
+        let d1 = a.center.dot(&n1);
+        let d2 = b.center.dot(&n2);
+        // Basepoint P = α·n1 + β·n2 for scalars α, β solving
+        //   α(n1·n1) + β(n1·n2) = d1
+        //   α(n1·n2) + β(n2·n2) = d2
+        let m11 = n1.dot(&n1);
+        let m22 = n2.dot(&n2);
+        let m12 = n1.dot(&n2);
+        let det = m11 * m22 - m12 * m12;
+        if det.abs() < tolerance.distance() {
+            return Ok(IntersectionResult::None);
+        }
+        let alpha = (m22 * d1 - m12 * d2) / det;
+        let beta = (m11 * d2 - m12 * d1) / det;
+        let base = Point3::ORIGIN + n1 * alpha + n2 * beta;
+
+        // Treat the resulting line as a segment centered at `base` with
+        // length sufficient to cover both disks (diameter 2·max_radius on
+        // each side). Then find geometric hits against arc A and verify
+        // each hit also lies on arc B's sweep.
+        let span = (a.radius + b.radius) * 2.0 + tolerance.distance();
+        let synthetic_line = Line::new(base - dir * span, base + dir * span);
+        for hit in line_arc_hits(&synthetic_line, a, tolerance) {
+            let t2 = match arc_parameter_for_point(b, hit.position, tolerance) {
+                Some(t) => t,
+                None => continue,
+            };
+            points.push(build_arc_arc_point(
+                hit.position,
+                edge1,
+                hit.t_arc,
+                edge2,
+                t2,
+                hit.exact,
+            ));
+        }
+    }
+
+    if points.is_empty() {
+        Ok(IntersectionResult::None)
+    } else {
+        Ok(IntersectionResult::Points(points))
+    }
 }
 
 /// General curve-curve intersection
@@ -959,12 +1363,151 @@ fn intersect_general_surfaces(
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_intersection_types() {
-//         // Test intersection result types
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::ParameterRange;
+    use crate::primitives::edge::EdgeOrientation;
+
+    fn unit_edge() -> Edge {
+        Edge::new(0, 0, 0, 0, EdgeOrientation::Forward, ParameterRange::unit())
+    }
+
+    fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
+        (a - b).abs() < eps
+    }
+
+    #[test]
+    fn line_arc_transverse_two_points() {
+        // Full circle of radius 2 in XY plane, line from (-5,0,0)→(5,0,0)
+        // crosses at (-2,0,0) and (2,0,0).
+        let arc = Arc::circle(Point3::ORIGIN, Vector3::Z, 2.0).expect("circle");
+        let line = Line::new(Point3::new(-5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 0.0));
+        let tol = Tolerance::from_distance(1e-9);
+        let hits = line_arc_hits(&line, &arc, tol);
+        assert_eq!(hits.len(), 2);
+        let xs: Vec<f64> = hits.iter().map(|h| h.position.x).collect();
+        assert!(xs.iter().any(|x| approx_eq(*x, -2.0, 1e-6)));
+        assert!(xs.iter().any(|x| approx_eq(*x, 2.0, 1e-6)));
+        assert!(hits.iter().all(|h| h.exact));
+    }
+
+    #[test]
+    fn line_arc_tangent_one_point() {
+        // Circle r=1 at origin in XY plane. Line at y=1 tangent touches (0,1,0).
+        let arc = Arc::circle(Point3::ORIGIN, Vector3::Z, 1.0).expect("circle");
+        let line = Line::new(Point3::new(-3.0, 1.0, 0.0), Point3::new(3.0, 1.0, 0.0));
+        let tol = Tolerance::from_distance(1e-6);
+        let hits = line_arc_hits(&line, &arc, tol);
+        assert_eq!(hits.len(), 1);
+        assert!(approx_eq(hits[0].position.y, 1.0, 1e-6));
+        assert!(approx_eq(hits[0].position.x, 0.0, 1e-4));
+    }
+
+    #[test]
+    fn line_arc_miss_none() {
+        // Line far from circle.
+        let arc = Arc::circle(Point3::ORIGIN, Vector3::Z, 1.0).expect("circle");
+        let line = Line::new(Point3::new(-5.0, 10.0, 0.0), Point3::new(5.0, 10.0, 0.0));
+        let tol = Tolerance::from_distance(1e-9);
+        let hits = line_arc_hits(&line, &arc, tol);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn line_arc_parallel_off_plane_none() {
+        // Line parallel to arc plane but offset in Z.
+        let arc = Arc::circle(Point3::ORIGIN, Vector3::Z, 1.0).expect("circle");
+        let line = Line::new(Point3::new(-5.0, 0.0, 2.0), Point3::new(5.0, 0.0, 2.0));
+        let tol = Tolerance::from_distance(1e-9);
+        let hits = line_arc_hits(&line, &arc, tol);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn line_arc_outside_sweep_discarded() {
+        // Semicircle (sweep = π) from (+X direction, normal=+Z). Only upper
+        // half plane y>=0 is swept. A line at y=-0.5 would intersect a full
+        // circle in 2 points but both are in the discarded half.
+        let arc =
+            Arc::new(Point3::ORIGIN, Vector3::Z, 1.0, 0.0, std::f64::consts::PI).expect("arc");
+        let line = Line::new(Point3::new(-2.0, -0.5, 0.0), Point3::new(2.0, -0.5, 0.0));
+        let tol = Tolerance::from_distance(1e-9);
+        let hits = line_arc_hits(&line, &arc, tol);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn intersect_line_arc_dispatch_transverse() {
+        let arc = Arc::circle(Point3::ORIGIN, Vector3::Z, 2.0).expect("circle");
+        let line = Line::new(Point3::new(-5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_line_arc(&line as &dyn Curve, &arc as &dyn Curve, &edge, &edge, tol)
+                .expect("dispatch");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 2);
+                for p in &pts {
+                    assert!(matches!(p.intersection_type, PointIntersectionType::Transverse));
+                }
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn arc_arc_coplanar_two_points() {
+        // Two r=1 circles in XY plane, centers on X axis separated by 1.0.
+        // Standard intersection: x = 0.5, y = ±√(3)/2.
+        let a = Arc::circle(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 1.0).expect("a");
+        let b = Arc::circle(Point3::new(1.0, 0.0, 0.0), Vector3::Z, 1.0).expect("b");
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_arc_arc(&a as &dyn Curve, &b as &dyn Curve, &edge, &edge, tol).expect("ok");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 2);
+                let expected_y = 3.0_f64.sqrt() / 2.0;
+                for p in &pts {
+                    assert!(approx_eq(p.position.x, 0.5, 1e-6));
+                    assert!(approx_eq(p.position.y.abs(), expected_y, 1e-6));
+                }
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn arc_arc_coplanar_disjoint_none() {
+        let a = Arc::circle(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 1.0).expect("a");
+        let b = Arc::circle(Point3::new(5.0, 0.0, 0.0), Vector3::Z, 1.0).expect("b");
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_arc_arc(&a as &dyn Curve, &b as &dyn Curve, &edge, &edge, tol).expect("ok");
+        assert!(matches!(result, IntersectionResult::None));
+    }
+
+    #[test]
+    fn arc_arc_non_coplanar_orthogonal() {
+        // Circle A in XY plane r=1, circle B in XZ plane r=1 both centered
+        // at origin. They share exactly the two points (±1, 0, 0).
+        let a = Arc::circle(Point3::ORIGIN, Vector3::Z, 1.0).expect("a");
+        let b = Arc::circle(Point3::ORIGIN, Vector3::Y, 1.0).expect("b");
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-6);
+        let result =
+            intersect_arc_arc(&a as &dyn Curve, &b as &dyn Curve, &edge, &edge, tol).expect("ok");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 2);
+                let xs: Vec<f64> = pts.iter().map(|p| p.position.x).collect();
+                assert!(xs.iter().any(|x| approx_eq(x.abs(), 1.0, 1e-6)));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+}
