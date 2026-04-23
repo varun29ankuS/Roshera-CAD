@@ -1933,139 +1933,6 @@ impl NurbsCurve {
         Self::from_bspline(degree, control_points, knots)
     }
 
-    /// Find knot span for parameter
-    fn find_span(&self, t: f64) -> usize {
-        let n = self.control_points.len() - 1;
-
-        // Special cases
-        if t >= self.knots[n + 1] {
-            return n;
-        }
-        if t <= self.knots[self.degree] {
-            return self.degree;
-        }
-
-        // Binary search
-        let mut low = self.degree;
-        let mut high = n + 1;
-        let mut mid = (low + high) / 2;
-
-        while t < self.knots[mid] || t >= self.knots[mid + 1] {
-            if t < self.knots[mid] {
-                high = mid;
-            } else {
-                low = mid;
-            }
-            mid = (low + high) / 2;
-        }
-
-        mid
-    }
-
-    /// Compute basis functions
-    fn basis_functions(&self, span: usize, t: f64) -> Vec<f64> {
-        let mut basis = vec![0.0; self.degree + 1];
-        let mut left = vec![0.0; self.degree + 1];
-        let mut right = vec![0.0; self.degree + 1];
-
-        basis[0] = 1.0;
-
-        for j in 1..=self.degree {
-            left[j] = t - self.knots[span + 1 - j];
-            right[j] = self.knots[span + j] - t;
-
-            let mut saved = 0.0;
-            for r in 0..j {
-                let temp = basis[r] / (right[r + 1] + left[j - r]);
-                basis[r] = saved + right[r + 1] * temp;
-                saved = left[j - r] * temp;
-            }
-            basis[j] = saved;
-        }
-
-        basis
-    }
-
-    /// Compute derivatives of basis functions
-    fn basis_derivatives(&self, span: usize, t: f64, deriv_order: usize) -> Vec<Vec<f64>> {
-        let mut ders = vec![vec![0.0; self.degree + 1]; deriv_order + 1];
-        let mut ndu = vec![vec![0.0; self.degree + 1]; self.degree + 1];
-        let mut left = vec![0.0; self.degree + 1];
-        let mut right = vec![0.0; self.degree + 1];
-
-        ndu[0][0] = 1.0;
-
-        for j in 1..=self.degree {
-            left[j] = t - self.knots[span + 1 - j];
-            right[j] = self.knots[span + j] - t;
-
-            let mut saved = 0.0;
-            for r in 0..j {
-                ndu[j][r] = right[r + 1] + left[j - r];
-                let temp = ndu[r][j - 1] / ndu[j][r];
-                ndu[r][j] = saved + right[r + 1] * temp;
-                saved = left[j - r] * temp;
-            }
-            ndu[j][j] = saved;
-        }
-
-        // Load basis functions
-        for j in 0..=self.degree {
-            ders[0][j] = ndu[j][self.degree];
-        }
-
-        // Compute derivatives
-        for r in 0..=self.degree {
-            let mut s1 = 0;
-            let mut s2 = 1;
-            let mut a = vec![vec![0.0; self.degree + 1]; 2];
-
-            a[0][0] = 1.0;
-
-            for k in 1..=deriv_order.min(self.degree) {
-                let mut d = 0.0;
-                let rk = r as i32 - k as i32;
-                let pk = self.degree as i32 - k as i32;
-
-                if r >= k {
-                    a[s2][0] = a[s1][0] / ndu[pk as usize + 1][rk as usize];
-                    d = a[s2][0] * ndu[rk as usize][pk as usize];
-                }
-
-                let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                let j2 = if (r as i32 - 1) <= pk {
-                    (k - 1) as usize
-                } else {
-                    (self.degree - r) as usize
-                };
-
-                for j in j1..=j2 {
-                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][rk as usize + j];
-                    d += a[s2][j] * ndu[rk as usize + j][pk as usize];
-                }
-
-                if r <= pk as usize {
-                    a[s2][k] = -a[s1][k - 1] / ndu[pk as usize + 1][r];
-                    d += a[s2][k] * ndu[r][pk as usize];
-                }
-
-                ders[k][r] = d;
-                std::mem::swap(&mut s1, &mut s2);
-            }
-        }
-
-        // Multiply by factorial
-        let mut r = self.degree as f64;
-        for k in 1..=deriv_order.min(self.degree) {
-            for j in 0..=self.degree {
-                ders[k][j] *= r;
-            }
-            r *= (self.degree - k) as f64;
-        }
-
-        ders
-    }
-
     /// Build a transient `math::nurbs::NurbsCurve` from this curve's fields.
     ///
     /// Used by the thin adapter layer: the math-layer NURBS owns the
@@ -2098,86 +1965,20 @@ impl Curve for NurbsCurve {
     }
 
     fn evaluate(&self, t: f64) -> MathResult<CurvePoint> {
+        // Delegate to math-layer rational-NURBS evaluator (Piegl-Tiller A4.2
+        // with quotient rule extended to the 3rd derivative). The primitives
+        // layer is a pure adapter — `to_math_curve` clones field vectors to
+        // build a transient math-layer curve, then wraps the resulting
+        // `NurbsPoint` back into the `CurvePoint` contract expected by the
+        // `Curve` trait.
         let t = self.range.clamp(t);
-        let span = self.find_span(t);
-        let ders = self.basis_derivatives(span, t, 3);
-
-        let mut point = Point3::ZERO;
-        let mut deriv1 = Vector3::ZERO;
-        let mut deriv2 = Vector3::ZERO;
-        let mut deriv3 = Vector3::ZERO;
-        let mut weight_sum = 0.0;
-        let mut weight_deriv1 = 0.0;
-        let mut weight_deriv2 = 0.0;
-        let mut weight_deriv3 = 0.0;
-
-        // Compute weighted sums
-        for i in 0..=self.degree {
-            let idx = span - self.degree + i;
-            let w = self.weights[idx];
-            let p = self.control_points[idx];
-
-            // Position
-            point += p * (ders[0][i] * w);
-            weight_sum += ders[0][i] * w;
-
-            // First derivative
-            if ders.len() > 1 {
-                deriv1 += p * (ders[1][i] * w);
-                weight_deriv1 += ders[1][i] * w;
-            }
-
-            // Second derivative
-            if ders.len() > 2 {
-                deriv2 += p * (ders[2][i] * w);
-                weight_deriv2 += ders[2][i] * w;
-            }
-
-            // Third derivative
-            if ders.len() > 3 {
-                deriv3 += p * (ders[3][i] * w);
-                weight_deriv3 += ders[3][i] * w;
-            }
-        }
-
-        // Apply quotient rule for rational curves
-        point = point / weight_sum;
-
-        // First derivative: (f'g - fg') / g²
-        let derivative1 = (deriv1 - point * weight_deriv1) / weight_sum;
-
-        // Second derivative (quotient rule)
-        let derivative2 = if ders.len() > 2 {
-            let a2 = deriv2;
-            let w1 = weight_deriv1;
-            let w2 = weight_deriv2;
-            let w0 = weight_sum;
-
-            Some((a2 - derivative1 * w1 * 2.0 - point * w2) / w0)
-        } else {
-            None
-        };
-
-        // Third derivative
-        let derivative3 = if ders.len() > 3 {
-            let a3 = deriv3;
-            let w1 = weight_deriv1;
-            let w2 = weight_deriv2;
-            let w3 = weight_deriv3;
-            let w0 = weight_sum;
-
-            let d2 = derivative2.unwrap_or(Vector3::ZERO);
-
-            Some((a3 - derivative1 * w2 * 3.0 - d2 * w1 * 3.0 - point * w3) / w0)
-        } else {
-            None
-        };
-
+        let m = self.to_math_curve()?;
+        let p = m.evaluate_derivatives(t, 3);
         Ok(CurvePoint {
-            position: point,
-            derivative1,
-            derivative2,
-            derivative3,
+            position: p.point,
+            derivative1: p.derivative1.unwrap_or(Vector3::ZERO),
+            derivative2: p.derivative2,
+            derivative3: p.derivative3,
         })
     }
 
@@ -2844,8 +2645,33 @@ impl NurbsCurve {
         work_curve.insert_knot(t_start, self.degree)?;
         work_curve.insert_knot(t_end, self.degree)?;
 
-        // Find the segment in the modified curve
-        let start_idx = work_curve.find_span(t_start);
+        // Find the knot span containing t_start in the modified curve.
+        // Inline binary search (same algorithm as math::bspline::KnotVector::find_span)
+        // — after inserting t_start with full multiplicity, the span index is the
+        // last knot position equal to t_start, which anchors the Bezier segment.
+        let start_idx = {
+            let n = work_curve.control_points.len() - 1;
+            let degree = work_curve.degree;
+            let knots = &work_curve.knots;
+            if t_start >= knots[n + 1] {
+                n
+            } else if t_start <= knots[degree] {
+                degree
+            } else {
+                let mut low = degree;
+                let mut high = n + 1;
+                let mut mid = (low + high) / 2;
+                while t_start < knots[mid] || t_start >= knots[mid + 1] {
+                    if t_start < knots[mid] {
+                        high = mid;
+                    } else {
+                        low = mid;
+                    }
+                    mid = (low + high) / 2;
+                }
+                mid
+            }
+        };
         let control_points: Vec<Point4> = (0..=self.degree)
             .map(|i| {
                 let cp = work_curve.control_points[start_idx - self.degree + i];
@@ -3498,7 +3324,12 @@ impl NurbsCurve {
         }
     }
 
-    /// Insert knot using Boehm's algorithm
+    /// Insert knot using Boehm's algorithm.
+    ///
+    /// Delegates to the math-layer NURBS curve, which owns the corrected
+    /// Boehm implementation (primitives layer is a pure adapter). The
+    /// math-layer algorithm is the single source of truth for the knot
+    /// insertion control-point remap `Q[i] = α·P[i] + (1-α)·P[i-1]`.
     pub fn insert_knot(&mut self, u: f64, times: usize) -> MathResult<()> {
         if u <= self.knots[self.degree] || u >= self.knots[self.control_points.len()] {
             return Err(MathError::InvalidParameter(
@@ -3506,65 +3337,13 @@ impl NurbsCurve {
             ));
         }
 
-        for _ in 0..times {
-            self.insert_knot_once(u)?;
-        }
+        let mut m = self.to_math_curve()?;
+        m.insert_knot(u, times)
+            .map_err(|e| MathError::InvalidParameter(e.to_string()))?;
 
-        Ok(())
-    }
-
-    /// Internal single knot insertion
-    fn insert_knot_once(&mut self, u: f64) -> MathResult<()> {
-        let k = self.find_span(u);
-        let p = self.degree;
-        let n = self.control_points.len();
-
-        // New control points and weights
-        let mut new_points = Vec::with_capacity(n + 1);
-        let mut new_weights = Vec::with_capacity(n + 1);
-
-        // Copy unchanged control points
-        for i in 0..=k - p {
-            new_points.push(self.control_points[i]);
-            new_weights.push(self.weights[i]);
-        }
-
-        // Compute new control points
-        for i in k - p + 1..=k {
-            let alpha = (u - self.knots[i]) / (self.knots[i + p] - self.knots[i]);
-
-            let w1 = self.weights[i - 1];
-            let w2 = self.weights[i];
-            let new_w = (1.0 - alpha) * w1 + alpha * w2;
-
-            let p1 = self.control_points[i - 1] * w1;
-            let p2 = self.control_points[i] * w2;
-            let new_p = (p1 * (1.0 - alpha) + p2 * alpha) / new_w;
-
-            new_points.push(new_p);
-            new_weights.push(new_w);
-        }
-
-        // Copy remaining control points.
-        //
-        // Boehm's algorithm: after computing Q[k-p+1..=k], the original
-        // control points P[k..=n-1] are retained with shifted indices.
-        // The previous `k + 1..n` bound silently dropped P[k], producing
-        // incorrect geometry on every knot insertion.
-        for i in k..n {
-            new_points.push(self.control_points[i]);
-            new_weights.push(self.weights[i]);
-        }
-
-        // Update knot vector
-        let mut new_knots = Vec::with_capacity(self.knots.len() + 1);
-        new_knots.extend_from_slice(&self.knots[..=k]);
-        new_knots.push(u);
-        new_knots.extend_from_slice(&self.knots[k + 1..]);
-
-        self.control_points = new_points;
-        self.weights = new_weights;
-        self.knots = new_knots;
+        self.control_points = m.control_points;
+        self.weights = m.weights;
+        self.knots = m.knots.values().to_vec();
 
         Ok(())
     }
