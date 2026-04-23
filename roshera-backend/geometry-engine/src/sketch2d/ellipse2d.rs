@@ -345,6 +345,7 @@ impl Ellipse2d {
     }
 
     /// Intersect with a line
+    #[allow(non_snake_case)] // A, B, C are standard quadratic coefficient names
     pub fn intersect_line(&self, line_point: &Point2d, line_dir: &Vector2d) -> Vec<Point2d> {
         // Transform line to local coordinates
         let dx = line_point.x - self.center.x;

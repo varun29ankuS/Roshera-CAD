@@ -2157,6 +2157,7 @@ impl NurbsSurface {
     /// References:
     /// - Do Carmo (1976). "Differential Geometry of Curves and Surfaces"
     /// - Patrikalakis & Maekawa (2002). "Shape Interrogation for Computer Aided Design and Manufacturing"
+    #[allow(non_snake_case)] // E, F, G, L, M, N are standard First/Second Fundamental Form names
     pub fn gaussian_curvature(&self, u: f64, v: f64) -> Result<f64, &'static str> {
         let derivs = self.evaluate_derivatives(u, v, 2, 2);
 
@@ -2188,6 +2189,7 @@ impl NurbsSurface {
     }
 
     /// Compute mean curvature at a parameter point
+    #[allow(non_snake_case)] // E, F, G, L, M, N are standard First/Second Fundamental Form names
     pub fn mean_curvature(&self, u: f64, v: f64) -> Result<f64, &'static str> {
         let derivs = self.evaluate_derivatives(u, v, 2, 2);
 

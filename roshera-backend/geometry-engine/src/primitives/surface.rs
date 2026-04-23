@@ -4477,6 +4477,7 @@ impl Surface for GeneralNurbsSurface {
         Box::new(self.clone())
     }
 
+    #[allow(non_snake_case)] // E, F, G, L, M, N, H, K are standard First/Second Fundamental Form names
     fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
         // Evaluate NURBS surface with derivatives
         let eval_result = self.nurbs.evaluate_derivatives(u, v, 2, 2);
@@ -4640,6 +4641,7 @@ impl Surface for GeneralNurbsSurface {
         "NurbsSurface"
     }
 
+    #[allow(non_snake_case)] // E, F, G are standard First Fundamental Form names
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
         // Use Newton-Raphson iteration to find closest point
         let (u_bounds, v_bounds) = self.parameter_bounds();

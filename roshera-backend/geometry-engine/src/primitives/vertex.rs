@@ -54,6 +54,7 @@ pub struct Vertex {
 }
 
 /// Vertex flags for efficient topology queries
+#[allow(non_snake_case)] // Pascal-case module name used as bit-flag namespace
 pub mod VertexFlags {
     pub const ON_EDGE: u8 = 0b00000001;
     pub const ON_FACE: u8 = 0b00000010;
