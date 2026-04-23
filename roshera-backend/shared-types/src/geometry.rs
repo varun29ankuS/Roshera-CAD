@@ -109,8 +109,11 @@ pub enum DisplayQuality {
     High,
     /// Custom quality parameters
     Custom {
+        /// Maximum edge length allowed in the tessellation.
         max_edge_length: f64,
+        /// Maximum deviation between adjacent face normals (radians).
         max_angle_deviation: f64,
+        /// Chordal tolerance between tessellated mesh and exact surface.
         chord_tolerance: f64,
     },
 }
