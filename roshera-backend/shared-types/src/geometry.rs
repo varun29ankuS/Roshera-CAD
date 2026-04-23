@@ -240,10 +240,12 @@ impl GeometryRepresentation {
 
     /// Invalidate cached mesh (when analytical geometry changes)
     pub fn invalidate_cache(&mut self) {
-        if let GeometryRepresentation::Analytical { cached_mesh, .. } = self {
-            if let Some(cached) = cached_mesh {
-                cached.is_valid = false;
-            }
+        if let GeometryRepresentation::Analytical {
+            cached_mesh: Some(cached),
+            ..
+        } = self
+        {
+            cached.is_valid = false;
         }
     }
 
@@ -461,9 +463,9 @@ impl BoundingBox {
 
     /// Expand the box to include a point
     pub fn expand_to_include(&mut self, point: &[f32; 3]) {
-        for i in 0..3 {
-            self.min[i] = self.min[i].min(point[i]);
-            self.max[i] = self.max[i].max(point[i]);
+        for (i, &p) in point.iter().enumerate() {
+            self.min[i] = self.min[i].min(p);
+            self.max[i] = self.max[i].max(p);
         }
     }
 
