@@ -569,9 +569,12 @@ mod tests {
         let corners = rect.corners();
         let sqrt2 = 2.0_f64.sqrt();
 
-        // Check first corner (bottom-left rotated by 45°)
-        assert!((corners[0].x - (-sqrt2 - 0.5 * sqrt2)).abs() < 1e-10);
-        assert!((corners[0].y - (-sqrt2 + 0.5 * sqrt2)).abs() < 1e-10);
+        // Check first corner (bottom-left rotated by 45°).
+        // Local (-2, -1) rotated by +45° → (−√2/2, −3√2/2).
+        //   x' = -2·cos45 - (-1)·sin45 = -√2 + √2/2 = -0.5·√2
+        //   y' = -2·sin45 + (-1)·cos45 = -√2 - √2/2 = -1.5·√2
+        assert!((corners[0].x - (-0.5 * sqrt2)).abs() < 1e-10);
+        assert!((corners[0].y - (-sqrt2 - 0.5 * sqrt2)).abs() < 1e-10);
     }
 
     #[test]
