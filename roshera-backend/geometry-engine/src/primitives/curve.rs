@@ -947,11 +947,31 @@ impl Arc {
     ) -> MathResult<Self> {
         let normal = normal.normalize()?;
 
-        // Compute x_axis perpendicular to normal
-        let x_axis = normal
-            .perpendicular()
-            .normalize()
-            .unwrap_or(Vector3::new(1.0, 0.0, 0.0));
+        // Canonical x_axis for cardinal-axis normals so that an arc with
+        // normal = +Z and start_angle = 0 begins at world +X — standard
+        // CAD convention (DXF/STEP/OpenCascade). The generic
+        // `perpendicular()` returns a cross product whose sign depends on
+        // the seed axis, which is mathematically valid but surprising.
+        // Right-handed cyclic mapping: ±Z→+X, ±X→+Y, ±Y→+Z.
+        const AXIS_EPS: f64 = 1e-10;
+        let x_axis = if (normal - Vector3::Z).magnitude() < AXIS_EPS
+            || (normal + Vector3::Z).magnitude() < AXIS_EPS
+        {
+            Vector3::X
+        } else if (normal - Vector3::X).magnitude() < AXIS_EPS
+            || (normal + Vector3::X).magnitude() < AXIS_EPS
+        {
+            Vector3::Y
+        } else if (normal - Vector3::Y).magnitude() < AXIS_EPS
+            || (normal + Vector3::Y).magnitude() < AXIS_EPS
+        {
+            Vector3::Z
+        } else {
+            normal
+                .perpendicular()
+                .normalize()
+                .unwrap_or(Vector3::new(1.0, 0.0, 0.0))
+        };
 
         Ok(Self {
             center,
