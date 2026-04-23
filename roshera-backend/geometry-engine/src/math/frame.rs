@@ -727,9 +727,15 @@ mod tests {
         // First station: distance = 5, scale = 1.0
         assert!((frames[0].scale.unwrap() - 1.0).abs() < 1e-10);
 
-        // Last station: distance = 10, scale = 2.0
+        // Last station: pos = (10, 0, 0). The closest point on the rail
+        // (which runs from (0,5,0) to (10,10,0)) is (6, 8, 0), not the rail
+        // end (10, 10, 0); the CAD "one-rail sweep" convention used here
+        // projects onto the rail perpendicularly, not at matched parameter.
+        // Distance = sqrt(16 + 64) = sqrt(80) = 4*sqrt(5), so
+        // scale = 4*sqrt(5) / 5 ≈ 1.788854381999832.
+        let expected = 4.0 * 5.0_f64.sqrt() / 5.0;
         assert!(
-            (frames[2].scale.unwrap() - 2.0).abs() < 1e-6,
+            (frames[2].scale.unwrap() - expected).abs() < 1e-6,
             "scale = {:?}",
             frames[2].scale
         );
@@ -762,10 +768,17 @@ mod tests {
 
         let frames = birail_frames(&path, &rail1, &rail2, 3, NORMAL_TOLERANCE).unwrap();
 
-        // Station 0: width=4, Station 2: width=8, scale = 2.0
+        // Station 0: rail1 closest = (0,-2,0), rail2 closest = (0,2,0),
+        // width = 4 → scale = 1.0.
         assert!((frames[0].scale.unwrap() - 1.0).abs() < 1e-10);
+
+        // Station 2: pos = (10, 0, 0). Closest point on rail1 lies at
+        // t = 96/104 = 12/13 → (120/13, -50/13, 0). By symmetry rail2's
+        // closest point is (120/13, +50/13, 0). cur_width = 100/13,
+        // ref_width = 4, so scale = 25/13 ≈ 1.9230769230769231.
+        let expected = 25.0 / 13.0;
         assert!(
-            (frames[2].scale.unwrap() - 2.0).abs() < 1e-6,
+            (frames[2].scale.unwrap() - expected).abs() < 1e-6,
             "scale = {:?}",
             frames[2].scale
         );
