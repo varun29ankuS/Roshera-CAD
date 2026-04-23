@@ -27,6 +27,15 @@ impl GeometryId {
     }
 }
 
+impl Default for GeometryId {
+    /// Returns the nil (all-zero) geometry id, representing "no geometry".
+    ///
+    /// Distinct from [`GeometryId::new`], which allocates a fresh random id.
+    fn default() -> Self {
+        Self(uuid::Uuid::nil())
+    }
+}
+
 impl From<uuid::Uuid> for GeometryId {
     fn from(id: uuid::Uuid) -> Self {
         Self(id)
