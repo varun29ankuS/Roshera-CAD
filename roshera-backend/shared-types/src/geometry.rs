@@ -190,6 +190,12 @@ pub struct CachedMesh {
 }
 
 /// Geometry representation that can be either analytical or mesh-based
+///
+/// The Analytical variant is the common case for kernel-produced objects and
+/// is intentionally kept inline (not boxed) so that creation and matching
+/// avoid an extra heap allocation on every operation. The size disparity
+/// with the Mesh variant is accepted.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeometryRepresentation {
     /// Analytical B-Rep solid (exact mathematical representation)
