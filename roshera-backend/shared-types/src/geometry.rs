@@ -469,20 +469,25 @@ impl BoundingBox {
 
     /// Expand the box to include a point
     pub fn expand_to_include(&mut self, point: &[f32; 3]) {
-        for (i, &p) in point.iter().enumerate() {
-            self.min[i] = self.min[i].min(p);
-            self.max[i] = self.max[i].max(p);
+        for ((min_c, max_c), &p) in self
+            .min
+            .iter_mut()
+            .zip(self.max.iter_mut())
+            .zip(point.iter())
+        {
+            *min_c = min_c.min(p);
+            *max_c = max_c.max(p);
         }
     }
 
     /// Check if this box intersects with another
     pub fn intersects(&self, other: &BoundingBox) -> bool {
-        for i in 0..3 {
-            if self.max[i] < other.min[i] || self.min[i] > other.max[i] {
-                return false;
-            }
-        }
-        true
+        self.max
+            .iter()
+            .zip(other.min.iter())
+            .zip(self.min.iter())
+            .zip(other.max.iter())
+            .all(|(((&s_max, &o_min), &s_min), &o_max)| s_max >= o_min && s_min <= o_max)
     }
 
     /// Compute the intersection of two bounding boxes
@@ -954,10 +959,12 @@ impl Mesh {
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
 
-        for i in (0..self.vertices.len()).step_by(3) {
-            for j in 0..3 {
-                min[j] = min[j].min(self.vertices[i + j]);
-                max[j] = max[j].max(self.vertices[i + j]);
+        for chunk in self.vertices.chunks_exact(3) {
+            for ((min_c, max_c), &v) in
+                min.iter_mut().zip(max.iter_mut()).zip(chunk.iter())
+            {
+                *min_c = min_c.min(v);
+                *max_c = max_c.max(v);
             }
         }
 
@@ -978,15 +985,16 @@ impl Mesh {
         // Apply transformation if provided
         if let Some(t) = transform {
             // Merge transformed vertices
-            for i in (0..other.vertices.len()).step_by(3) {
-                let mut x = other.vertices[i];
-                let mut y = other.vertices[i + 1];
-                let mut z = other.vertices[i + 2];
+            for chunk in other.vertices.chunks_exact(3) {
+                let [vx, vy, vz] = match *chunk {
+                    [a, b, c] => [a, b, c],
+                    _ => continue,
+                };
 
                 // Apply scale
-                x *= t.scale[0];
-                y *= t.scale[1];
-                z *= t.scale[2];
+                let x = vx * t.scale[0];
+                let y = vy * t.scale[1];
+                let z = vz * t.scale[2];
 
                 // Apply rotation (quaternion)
                 let (rx, ry, rz) = apply_quaternion_rotation(
@@ -1006,11 +1014,15 @@ impl Mesh {
             }
 
             // Transform normals (rotation only, no translation/scale)
-            for i in (0..other.normals.len()).step_by(3) {
+            for chunk in other.normals.chunks_exact(3) {
+                let [nx_in, ny_in, nz_in] = match *chunk {
+                    [a, b, c] => [a, b, c],
+                    _ => continue,
+                };
                 let (nx, ny, nz) = apply_quaternion_rotation(
-                    other.normals[i],
-                    other.normals[i + 1],
-                    other.normals[i + 2],
+                    nx_in,
+                    ny_in,
+                    nz_in,
                     t.rotation[0],
                     t.rotation[1],
                     t.rotation[2],
@@ -1103,14 +1115,13 @@ impl Mesh {
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
 
-        for i in (0..self.vertices.len()).step_by(3) {
-            min[0] = min[0].min(self.vertices[i]);
-            min[1] = min[1].min(self.vertices[i + 1]);
-            min[2] = min[2].min(self.vertices[i + 2]);
-
-            max[0] = max[0].max(self.vertices[i]);
-            max[1] = max[1].max(self.vertices[i + 1]);
-            max[2] = max[2].max(self.vertices[i + 2]);
+        for chunk in self.vertices.chunks_exact(3) {
+            for ((min_c, max_c), &v) in
+                min.iter_mut().zip(max.iter_mut()).zip(chunk.iter())
+            {
+                *min_c = min_c.min(v);
+                *max_c = max_c.max(v);
+            }
         }
 
         (min, max)
