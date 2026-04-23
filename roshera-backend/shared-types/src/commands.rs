@@ -135,6 +135,12 @@ pub enum ViewType {
 }
 
 /// Export file formats
+///
+/// Variant names preserve the canonical all-caps spelling of each industry
+/// file format (STL, OBJ, STEP/ISO 10303, IGES, glTF, ROS) as used in their
+/// respective standards; renaming them to PascalCase would diverge from
+/// documented convention.
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExportFormat {
     /// STL format
