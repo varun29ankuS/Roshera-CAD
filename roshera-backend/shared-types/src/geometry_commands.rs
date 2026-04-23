@@ -112,7 +112,7 @@ pub struct FilletParams {
 
 /// Direct geometry commands
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "command", content = "params")]
+#[serde(tag = "command", content = "params", rename_all = "snake_case")]
 pub enum Command {
     /// Create a box
     CreateBox {
