@@ -99,11 +99,12 @@ pub struct Transform3D {
 }
 
 /// Display quality for tessellation
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum DisplayQuality {
     /// Low quality for fast preview
     Low,
     /// Medium quality for normal use
+    #[default]
     Medium,
     /// High quality for production
     High,
@@ -116,12 +117,6 @@ pub enum DisplayQuality {
         /// Chordal tolerance between tessellated mesh and exact surface.
         chord_tolerance: f64,
     },
-}
-
-impl Default for DisplayQuality {
-    fn default() -> Self {
-        DisplayQuality::Medium
-    }
 }
 
 /// Analytical geometry representation (exact mathematical form)
