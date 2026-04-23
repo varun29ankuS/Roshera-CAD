@@ -4068,4 +4068,202 @@ mod tests {
             Err(e) => panic!("parallel distinct planes should not error, got {e:?}"),
         }
     }
+
+    // =====================================================================
+    // Randomized robustness harness (task #11)
+    // =====================================================================
+    //
+    // Scoped property-style tests for boolean operations. Uses `rand` with a
+    // fixed seed (deterministic & reproducible — no `proptest` crate
+    // dependency introduced).
+    //
+    // ## What is tested
+    //
+    // These tests assert the *robustness* invariants that the current
+    // boolean implementation is expected to uphold across a wider random
+    // input space than the handful of hand-written smoke tests:
+    //
+    // - **No panic**: boolean_operation must never panic for any pair of
+    //   well-formed primitive solids with positive dimensions.
+    // - **No `NotImplemented`**: all three ops (union/intersection/
+    //   difference) have been wired end-to-end; NotImplemented is a
+    //   regression.
+    // - **Result validity**: when the operation returns `Ok`, the result
+    //   `SolidId` must resolve to an existing solid in the model.
+    //
+    // ## What is NOT tested (and why)
+    //
+    // Full correctness invariants (volume conservation, De Morgan
+    // identities, watertight output, idempotence of `A ∪ A`) are *not*
+    // asserted here. Existing hand-written smoke tests in this file
+    // (`test_boolean_union_box_sphere_runs`, `test_boolean_difference_
+    // box_cylinder_runs`) explicitly accept "numerical errors" as the
+    // current robustness ceiling — enabling strict correctness asserts
+    // across a randomized input space would produce a flood of
+    // false-positive failures without exposing new bugs. Those asserts
+    // will be added as separate tasks once the boolean pipeline's
+    // numerical robustness is hardened on coincident/tangent surface
+    // configurations.
+    //
+    // Primitives are created at the origin (the only placement the
+    // TopologyBuilder factory methods currently support); overlapping
+    // configurations are therefore the only ones exercised here. This
+    // is in fact the most demanding scenario for the boolean engine —
+    // disjoint-input coverage would be a strictly *easier* case.
+
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
+
+    /// Deterministic seed so CI reproduces the exact same input sequence.
+    /// Bump this when the harness is extended to sample a different space.
+    const BOOLEAN_HARNESS_SEED: u64 = 0xB001_EAF1_C0DE_F1FE;
+
+    /// Number of randomized iterations per op. Kept small to keep the
+    /// test suite runtime under control — each iteration spins up two
+    /// fresh primitives plus the full boolean pipeline.
+    const HARNESS_ITERATIONS: usize = 8;
+
+    /// Build two random boxes and run `operation` against them, asserting
+    /// only the robustness invariants documented above.
+    fn run_random_box_pair(rng: &mut StdRng, operation: BooleanOp) {
+        let mut model = BRepModel::new();
+
+        // Dimensions in [1.0, 20.0] — avoids the zero-volume edge while
+        // keeping both primitives within each other's bounding-box for
+        // the overlapping-input scenario.
+        let w1 = rng.gen_range(1.0..20.0);
+        let h1 = rng.gen_range(1.0..20.0);
+        let d1 = rng.gen_range(1.0..20.0);
+        let w2 = rng.gen_range(1.0..20.0);
+        let h2 = rng.gen_range(1.0..20.0);
+        let d2 = rng.gen_range(1.0..20.0);
+
+        let geom_a = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(w1, h1, d1)
+                .expect("valid positive dimensions must produce a solid")
+        };
+        let geom_b = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(w2, h2, d2)
+                .expect("valid positive dimensions must produce a solid")
+        };
+
+        let solid_a = match geom_a {
+            crate::primitives::topology_builder::GeometryId::Solid(id) => id,
+            other => panic!("create_box_3d must return Solid, got {other:?}"),
+        };
+        let solid_b = match geom_b {
+            crate::primitives::topology_builder::GeometryId::Solid(id) => id,
+            other => panic!("create_box_3d must return Solid, got {other:?}"),
+        };
+
+        let result = boolean_operation(
+            &mut model,
+            solid_a,
+            solid_b,
+            operation,
+            BooleanOptions::default(),
+        );
+
+        // Robustness invariant 1: never returns NotImplemented.
+        if let Err(OperationError::NotImplemented(msg)) = &result {
+            panic!(
+                "{op:?} returned NotImplemented('{msg}') for boxes ({w1}x{h1}x{d1}) vs ({w2}x{h2}x{d2}) — this is a regression",
+                op = operation
+            );
+        }
+
+        // Robustness invariant 2: Ok results must resolve to an existing solid.
+        if let Ok(solid_id) = result {
+            assert!(
+                model.solids.get(solid_id).is_some(),
+                "{operation:?} returned Ok({solid_id:?}) but the solid is not in the model — topology reconstruction regression"
+            );
+        }
+        // Err(_) for numerical edge cases is accepted — the boolean engine's
+        // robustness ceiling is documented in the module header above.
+    }
+
+    #[test]
+    fn prop_boolean_union_random_boxes_no_panic() {
+        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED);
+        for _ in 0..HARNESS_ITERATIONS {
+            run_random_box_pair(&mut rng, BooleanOp::Union);
+        }
+    }
+
+    #[test]
+    fn prop_boolean_intersection_random_boxes_no_panic() {
+        // Fresh RNG seeded with an offset so the three ops don't exercise
+        // the exact same input sequence.
+        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x01);
+        for _ in 0..HARNESS_ITERATIONS {
+            run_random_box_pair(&mut rng, BooleanOp::Intersection);
+        }
+    }
+
+    #[test]
+    fn prop_boolean_difference_random_boxes_no_panic() {
+        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x02);
+        for _ in 0..HARNESS_ITERATIONS {
+            run_random_box_pair(&mut rng, BooleanOp::Difference);
+        }
+    }
+
+    #[test]
+    fn prop_boolean_box_sphere_random_no_panic() {
+        // Box-vs-sphere exercises the plane/sphere surface pairing —
+        // a different classification path than box-vs-box.
+        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x10);
+        for _ in 0..HARNESS_ITERATIONS {
+            let mut model = BRepModel::new();
+            let side = rng.gen_range(2.0..15.0);
+            let radius = rng.gen_range(1.0..10.0);
+
+            let geom_a = {
+                let mut builder = TopologyBuilder::new(&mut model);
+                builder
+                    .create_box_3d(side, side, side)
+                    .expect("valid box dimensions")
+            };
+            let geom_b = {
+                let mut builder = TopologyBuilder::new(&mut model);
+                builder
+                    .create_sphere_3d(Point3::ORIGIN, radius)
+                    .expect("valid sphere radius")
+            };
+            let solid_a = match geom_a {
+                crate::primitives::topology_builder::GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            };
+            let solid_b = match geom_b {
+                crate::primitives::topology_builder::GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            };
+
+            for op in [BooleanOp::Union, BooleanOp::Intersection, BooleanOp::Difference] {
+                let result = boolean_operation(
+                    &mut model,
+                    solid_a,
+                    solid_b,
+                    op,
+                    BooleanOptions::default(),
+                );
+                if let Err(OperationError::NotImplemented(msg)) = &result {
+                    panic!(
+                        "{op:?} returned NotImplemented('{msg}') for box({side}) vs sphere({radius})"
+                    );
+                }
+                if let Ok(solid_id) = result {
+                    assert!(
+                        model.solids.get(solid_id).is_some(),
+                        "{op:?} produced dangling SolidId {solid_id:?}"
+                    );
+                }
+            }
+        }
+    }
 }
