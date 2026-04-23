@@ -76,7 +76,7 @@ pub enum CubeFace {
 }
 
 /// Sketch state for tracking drawing operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SketchState {
     /// Center point for circle being drawn (during two-click circle creation)
     pub circle_center: Option<[f64; 3]>,
@@ -88,16 +88,6 @@ pub struct SketchState {
     pub active_tool: Option<String>,
 }
 
-impl Default for SketchState {
-    fn default() -> Self {
-        Self {
-            circle_center: None,
-            line_start: None,
-            rect_start: None,
-            active_tool: None,
-        }
-    }
-}
 
 /// Sketch plane information
 #[derive(Debug, Clone, Serialize, Deserialize)]
