@@ -878,9 +878,14 @@ impl BSplineCurve {
         let span = self.find_span(u);
         let ders = self.basis_functions_derivatives(span, u, deriv_order);
 
+        // A degree-`p` B-spline has identically-zero derivatives of order > p,
+        // and `basis_functions_derivatives` therefore caps its output at
+        // `n = min(deriv_order, degree)`. Fill `result[0..=n]` from `ders`
+        // and leave the rest zero.
         let mut result = vec![Vector3::new(0.0, 0.0, 0.0); deriv_order + 1];
+        let n = deriv_order.min(self.degree);
 
-        for k in 0..=deriv_order {
+        for k in 0..=n {
             for i in 0..=self.degree {
                 let cp = &self.control_points[span - self.degree + i];
                 result[k].x += cp.x * ders[k][i];
