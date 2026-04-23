@@ -473,6 +473,13 @@ impl BSplineSurface {
     }
 
     /// Compute basis function derivatives
+    /// B-spline basis functions and their derivatives up to `deriv_order`.
+    ///
+    /// Implements Piegl & Tiller, *The NURBS Book* (2nd ed.), Algorithm A2.3.
+    /// Returns a matrix `ders` where `ders[k][j]` is the k-th derivative of the
+    /// j-th non-zero basis function at parameter `t`. Derivatives of order
+    /// strictly greater than the degree are identically zero; the
+    /// corresponding rows remain filled with zeros.
     fn basis_derivatives(
         &self,
         knots: &[f64],
@@ -481,6 +488,7 @@ impl BSplineSurface {
         t: f64,
         deriv_order: usize,
     ) -> Vec<Vec<f64>> {
+        let n = deriv_order.min(degree);
         let mut ders = vec![vec![0.0; degree + 1]; deriv_order + 1];
         let mut ndu = vec![vec![0.0; degree + 1]; degree + 1];
         let mut left = vec![0.0; degree + 1];
@@ -502,13 +510,63 @@ impl BSplineSurface {
             ndu[j][j] = saved;
         }
 
-        // Load basis functions
+        // Row 0: the basis functions themselves.
         for j in 0..=degree {
             ders[0][j] = ndu[j][degree];
         }
 
-        // Compute derivatives (similar to curve implementation)
-        // ... (implementation details omitted for brevity)
+        // Derivative rows 1..=n via Piegl-Tiller A2.3.
+        for r in 0..=degree {
+            let mut s1: usize = 0;
+            let mut s2: usize = 1;
+            let mut a = vec![vec![0.0_f64; degree + 1]; 2];
+            a[0][0] = 1.0;
+
+            for k in 1..=n {
+                let mut d = 0.0;
+                let rk = r as i32 - k as i32;
+                let pk = degree as i32 - k as i32;
+
+                if r >= k {
+                    a[s2][0] = a[s1][0] / ndu[pk as usize + 1][rk as usize];
+                    d = a[s2][0] * ndu[rk as usize][pk as usize];
+                }
+
+                let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
+                // Signed comparison mirrors the i32 version in Piegl-Tiller;
+                // `r: usize` would underflow when r == 0.
+                let j2 = if (r as i32) - 1 <= pk {
+                    k - 1
+                } else {
+                    degree - r
+                };
+
+                for j in j1..=j2 {
+                    a[s2][j] =
+                        (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][rk as usize + j];
+                    d += a[s2][j] * ndu[rk as usize + j][pk as usize];
+                }
+
+                if r <= pk as usize {
+                    a[s2][k] = -a[s1][k - 1] / ndu[pk as usize + 1][r];
+                    d += a[s2][k] * ndu[r][pk as usize];
+                }
+
+                ders[k][r] = d;
+                std::mem::swap(&mut s1, &mut s2);
+            }
+        }
+
+        // Multiply by the falling factorial  p! / (p-k)!.
+        let mut factor = degree as f64;
+        for k in 1..=n {
+            for j in 0..=degree {
+                ders[k][j] *= factor;
+            }
+            if k < degree {
+                factor *= (degree - k) as f64;
+            }
+        }
 
         ders
     }
