@@ -11,7 +11,10 @@ use uuid::Uuid;
 pub enum TimelineError {
     /// Operation not found
     #[error("Operation not found: {id}")]
-    NotFound { id: String },
+    NotFound {
+        /// Identifier of the operation that was not found.
+        id: String,
+    },
 
     /// Invalid timeline operation
     #[error("Invalid timeline operation")]
@@ -27,11 +30,17 @@ pub enum TimelineError {
 
     /// Session expired
     #[error("Session expired: {id}")]
-    Expired { id: String },
+    Expired {
+        /// Identifier of the expired session.
+        id: String,
+    },
 
     /// Timeline operation failed
     #[error("Timeline operation failed: {operation}")]
-    HistoryFailed { operation: String },
+    HistoryFailed {
+        /// Name of the operation that failed.
+        operation: String,
+    },
 
     /// Session not found
     #[error("Session not found in timeline")]
@@ -156,36 +165,51 @@ pub struct TimelineEvent {
 pub enum Operation {
     /// Create a primitive shape
     CreatePrimitive {
+        /// Primitive category (box, sphere, cylinder, etc.).
         shape_type: crate::PrimitiveType,
+        /// Dimensional parameters for the primitive.
         parameters: crate::ShapeParameters,
+        /// World-space position where the primitive is placed.
         position: crate::Position3D,
     },
 
     /// Boolean operation
     Boolean {
+        /// Boolean operator (union, intersection, difference).
         operation: crate::BooleanOp,
+        /// Operands for the boolean operation.
         objects: Vec<crate::GeometryId>,
     },
 
     /// Transform operation
     Transform {
+        /// Object being transformed.
         object_id: crate::GeometryId,
+        /// Transform applied to the object.
         transform: crate::Transform3D,
     },
 
     /// Extrude operation
     Extrude {
+        /// Sketch profile used as the extrusion base.
         sketch_id: crate::GeometryId,
+        /// Extrusion distance along the direction vector.
         distance: f64,
+        /// Optional explicit direction; defaults to the sketch plane normal.
         direction: Option<crate::Vector3D>,
     },
 
     /// Delete operation
-    Delete { object_ids: Vec<crate::GeometryId> },
+    Delete {
+        /// Objects removed by this operation.
+        object_ids: Vec<crate::GeometryId>,
+    },
 
     /// Other operations can be added here
     Custom {
+        /// Custom operation name (discriminator for downstream handlers).
         name: String,
+        /// Free-form JSON payload for the custom operation.
         parameters: serde_json::Value,
     },
 }
