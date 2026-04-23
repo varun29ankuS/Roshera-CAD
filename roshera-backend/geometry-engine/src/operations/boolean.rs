@@ -123,8 +123,15 @@ struct SplitFace {
     surface: SurfaceId,
     boundary_edges: Vec<EdgeId>,
     classification: FaceClassification,
-    /// Which solid this face originally came from (set during classification)
-    from_solid: Option<SolidId>,
+    /// Which solid this face originally came from.
+    ///
+    /// Set at split time by `split_faces_along_curves`, preserving the
+    /// parent-solid mapping that `FaceIntersection::{face_a_id, face_b_id}`
+    /// carries. Do NOT re-derive post-hoc from `original_face` — when the
+    /// split pipeline creates new face IDs that are absent from either
+    /// solid's current shell, a post-hoc query would mis-attribute origin
+    /// (see history of task #48 follow-up to task #44).
+    from_solid: SolidId,
 }
 
 /// Classification of face relative to other solid
@@ -147,7 +154,8 @@ pub fn boolean_operation(
     let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
 
     // Step 2: Split faces along intersection curves
-    let split_faces = split_faces_along_curves(model, &intersections, &options)?;
+    let split_faces =
+        split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
 
     // Step 3: Classify split faces (inside/outside/on boundary)
     let classified_faces = classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
@@ -1954,40 +1962,55 @@ fn merge_connected_curves(
     Ok(merged)
 }
 
-/// Split faces along intersection curves
+/// Split faces along intersection curves.
+///
+/// Each entry in the intersection list contributes curves to exactly one face
+/// on `solid_a` (`face_a_id`) and one face on `solid_b` (`face_b_id`). We
+/// preserve that parent-solid mapping into the per-face curve table so that
+/// the downstream `SplitFace`s inherit their true origin rather than having
+/// to re-derive it post-hoc (which mis-fires for newly created face IDs that
+/// aren't yet in either solid's shell — see task #48).
 fn split_faces_along_curves(
     model: &mut BRepModel,
     intersections: &[FaceIntersection],
+    solid_a: SolidId,
+    solid_b: SolidId,
     options: &BooleanOptions,
 ) -> OperationResult<Vec<SplitFace>> {
     let mut split_faces = Vec::new();
-    let mut face_curves: HashMap<FaceId, Vec<CurveId>> = HashMap::new();
+    let mut face_curves: HashMap<FaceId, (SolidId, Vec<CurveId>)> = HashMap::new();
 
-    // Collect curves for each face
+    // Collect curves for each face, tagged with the solid the face came from.
     for intersection in intersections {
         face_curves
             .entry(intersection.face_a_id)
-            .or_default()
+            .or_insert_with(|| (solid_a, Vec::new()))
+            .1
             .extend(intersection.curves.iter().map(|c| c.curve_id));
         face_curves
             .entry(intersection.face_b_id)
-            .or_default()
+            .or_insert_with(|| (solid_b, Vec::new()))
+            .1
             .extend(intersection.curves.iter().map(|c| c.curve_id));
     }
 
-    // Split each face
-    for (face_id, curves) in face_curves {
-        let faces = split_face_by_curves(model, face_id, &curves, options)?;
+    // Split each face, carrying its origin solid through to the SplitFace.
+    for (face_id, (origin_solid, curves)) in face_curves {
+        let faces = split_face_by_curves(model, face_id, origin_solid, &curves, options)?;
         split_faces.extend(faces);
     }
 
     Ok(split_faces)
 }
 
-/// Split a single face by multiple curves
+/// Split a single face by multiple curves.
+///
+/// `origin_solid` identifies which of the two boolean operands this face
+/// belongs to; it is propagated verbatim into every produced `SplitFace`.
 fn split_face_by_curves(
     model: &mut BRepModel,
     face_id: FaceId,
+    origin_solid: SolidId,
     curves: &[CurveId],
     options: &BooleanOptions,
 ) -> OperationResult<Vec<SplitFace>> {
@@ -2034,7 +2057,7 @@ fn split_face_by_curves(
     // Create split faces from loops
     let mut split_faces = Vec::new();
     for loop_edges in loops {
-        let split_face = create_split_face(model, surface_id, loop_edges, face_id)?;
+        let split_face = create_split_face(surface_id, loop_edges, face_id, origin_solid)?;
         split_faces.push(split_face);
     }
 
@@ -2667,23 +2690,31 @@ fn extract_face_loops(
     Ok(loops)
 }
 
-/// Create split face from edges
+/// Create split face from edges. `origin_solid` is stamped directly on the
+/// result; classification fills in `classification` later.
 fn create_split_face(
-    model: &mut BRepModel,
     surface_id: SurfaceId,
     edges: Vec<EdgeId>,
     original_face: FaceId,
+    origin_solid: SolidId,
 ) -> OperationResult<SplitFace> {
     Ok(SplitFace {
         original_face,
         surface: surface_id,
         boundary_edges: edges,
         classification: FaceClassification::OnBoundary,
-        from_solid: None, // set during classification
+        from_solid: origin_solid,
     })
 }
 
-/// Classify split faces relative to the other solid
+/// Classify split faces relative to the other solid.
+///
+/// `face.from_solid` is trusted: it was set at split time from the
+/// `FaceIntersection::{face_a_id, face_b_id}` mapping (see
+/// `split_faces_along_curves`). The test solid is simply "the other one".
+/// We do NOT re-derive origin by searching each solid's current face list —
+/// after splitting, new face IDs may be absent from either shell, which
+/// caused mis-attribution and bbox violations in the result (task #48).
 fn classify_split_faces(
     model: &BRepModel,
     split_faces: &[SplitFace],
@@ -2696,17 +2727,21 @@ fn classify_split_faces(
     for face in split_faces {
         let mut classified_face = face.clone();
 
-        // Determine which solid this face originally came from
-        let (test_solid, origin_solid) = if is_face_from_solid(model, face.original_face, solid_a)?
-        {
-            (solid_b, solid_a)
+        let test_solid = if face.from_solid == solid_a {
+            solid_b
+        } else if face.from_solid == solid_b {
+            solid_a
         } else {
-            (solid_a, solid_b)
+            // Should never happen: split faces are always produced from one
+            // of the two operands. Surface a loud error rather than silently
+            // classifying against the wrong reference.
+            return Err(OperationError::InvalidInput {
+                parameter: "SplitFace::from_solid".to_string(),
+                expected: format!("solid_a ({solid_a}) or solid_b ({solid_b})"),
+                received: format!("{}", face.from_solid),
+            });
         };
 
-        classified_face.from_solid = Some(origin_solid);
-
-        // Classify face relative to test solid
         classified_face.classification =
             classify_face_relative_to_solid(model, face, test_solid, &options.common.tolerance)?;
 
@@ -2714,16 +2749,6 @@ fn classify_split_faces(
     }
 
     Ok(classified)
-}
-
-/// Check if a face belongs to a solid
-fn is_face_from_solid(
-    model: &BRepModel,
-    face_id: FaceId,
-    solid_id: SolidId,
-) -> OperationResult<bool> {
-    let faces = get_solid_faces(model, solid_id)?;
-    Ok(faces.contains(&face_id))
 }
 
 /// Classify a face relative to a solid using multi-ray majority vote.
@@ -3305,8 +3330,8 @@ fn select_faces_for_operation(
     classified_faces
         .iter()
         .filter(|face| {
-            let from_a = face.from_solid == Some(solid_a);
-            let from_b = face.from_solid == Some(solid_b);
+            let from_a = face.from_solid == solid_a;
+            let from_b = face.from_solid == solid_b;
 
             match operation {
                 // Union (A ∪ B): keep faces outside the other solid + shared boundary
@@ -3591,20 +3616,21 @@ mod tests {
 
     #[test]
     fn test_face_grouping_all_isolated() {
+        // face-grouping is origin-agnostic; use solid 0 as a placeholder.
         let faces = vec![
             SplitFace {
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![1, 2, 3],
                 classification: FaceClassification::Outside,
-                from_solid: None,
+                from_solid: 0,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![4, 5, 6],
                 classification: FaceClassification::Outside,
-                from_solid: None,
+                from_solid: 0,
             },
         ];
 
@@ -3615,27 +3641,28 @@ mod tests {
 
     #[test]
     fn test_face_grouping_shared_edges() {
+        // face-grouping is origin-agnostic; use solid 0 as a placeholder.
         let faces = vec![
             SplitFace {
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![1, 2, 3],
                 classification: FaceClassification::Outside,
-                from_solid: None,
+                from_solid: 0,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![3, 4, 5],
                 classification: FaceClassification::Outside,
-                from_solid: None,
+                from_solid: 0,
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![10, 11, 12],
                 classification: FaceClassification::Outside,
-                from_solid: None,
+                from_solid: 0,
             },
         ];
 
@@ -3698,37 +3725,32 @@ mod tests {
 
     #[test]
     fn test_select_faces_union() {
+        // Origins: face 0 from A, face 1 from B, face 2 boundary from A.
         let faces = vec![
             SplitFace {
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
-                from_solid: None,
+                from_solid: 0,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
-                from_solid: None,
+                from_solid: 1,
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
                 classification: FaceClassification::OnBoundary,
-                from_solid: None,
+                from_solid: 0,
             },
         ];
 
-        // Assign origins: face 0 from A, face 1 from B, face 2 boundary from A
-        let mut faces_with_origin = faces;
-        faces_with_origin[0].from_solid = Some(0);
-        faces_with_origin[1].from_solid = Some(1);
-        faces_with_origin[2].from_solid = Some(0);
-
-        let selected = select_faces_for_operation(&faces_with_origin, BooleanOp::Union, 0, 1);
+        let selected = select_faces_for_operation(&faces, BooleanOp::Union, 0, 1);
         assert_eq!(selected.len(), 2);
         assert!(selected
             .iter()
@@ -3743,21 +3765,21 @@ mod tests {
                 surface: 0,
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
-                from_solid: Some(0),
+                from_solid: 0,
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
-                from_solid: Some(1),
+                from_solid: 1,
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
                 classification: FaceClassification::OnBoundary,
-                from_solid: Some(0),
+                from_solid: 0,
             },
         ];
 
@@ -3776,28 +3798,28 @@ mod tests {
                 surface: 0,
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
-                from_solid: Some(0), // A outside B → keep
+                from_solid: 0, // A outside B → keep
             },
             SplitFace {
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
-                from_solid: Some(0), // A inside B → discard
+                from_solid: 0, // A inside B → discard
             },
             SplitFace {
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
-                from_solid: Some(1), // B inside A → keep (cavity wall)
+                from_solid: 1, // B inside A → keep (cavity wall)
             },
             SplitFace {
                 original_face: 3,
                 surface: 3,
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
-                from_solid: Some(1), // B outside A → discard
+                from_solid: 1, // B outside A → discard
             },
         ];
 
@@ -4499,14 +4521,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME(task #44 follow-up): intersection bbox can exceed bbox(A) when B extends beyond A on an \
-        axis where A doesn't touch. First observed failure: bbox(A∩B).z = [-5.31, 5.31] vs bbox(A).z = [-3.56, 3.56]. \
-        Coincident-plane detection was added in classify_face_relative_to_solid (OnBoundary short-circuit) and \
-        did not help — the proptest's failing case is non-coincident. Refined hypothesis: is_face_from_solid \
-        at classify_split_faces:2700 tests face.original_face against each solid's current face list; after \
-        splitting, new face IDs may not be in either solid's shell, causing the else-branch to misattribute \
-        origin — see classify_split_faces branch at boolean.rs:2700-2705. Un-ignore once split-face origin \
-        tracking is carried through the split pipeline rather than re-derived post-hoc."]
+    #[ignore = "FIXME: bbox(A ∩ B) can exceed bbox(A) when B extends beyond A. Reproducible failure: \
+        bbox(A∩B).z = [-5.31, 5.31] vs bbox(A).z = [-3.56, 3.56] (seed BOOLEAN_HARNESS_SEED ^ 0x51, iter 0). \
+        Task #48 ruled out origin-attribution as the cause: SplitFace::from_solid is now stamped at split \
+        time (see split_faces_along_curves), so classification uses correct origins. The remaining defect \
+        is earlier in the pipeline — either compute_face_intersections misses pairs of faces that DO \
+        clip each other (likely B's side walls against A's top/bottom caps, which bound the result Z), \
+        or classify_face_relative_to_solid votes Inside for faces lying wholly outside the test solid. \
+        Needs a dedicated investigation, not a drop-in fix."]
     fn prop_tier3_intersection_bbox_within_both_inputs() {
         // `bbox(A ∩ B) ⊆ bbox(A)` and `⊆ bbox(B)` always — the intersection
         // cannot exceed either operand in any axis.
@@ -4551,12 +4573,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME(task #44 follow-up): difference bbox can exceed bbox(A) when B extends beyond A. \
-        First observed failure: bbox(A-B).x = [-8.68, 8.68] vs bbox(A).x = [-3.17, 3.17] — result ~2.7× \
-        larger than minuend on X. Same root cause as prop_tier3_intersection_bbox_within_both_inputs: \
-        split-face origin attribution via is_face_from_solid mis-fires when split produces new face IDs \
-        not present in either solid's current face list. Un-ignore once origin tracking is embedded in \
-        the split pipeline."]
+    #[ignore = "FIXME: bbox(A - B) can exceed bbox(A). Reproducible failure: bbox(A-B).x = [-8.68, 8.68] \
+        vs bbox(A).x = [-3.17, 3.17] (seed BOOLEAN_HARNESS_SEED ^ 0x52, iter 0). Same root cause as \
+        prop_tier3_intersection_bbox_within_both_inputs: not origin attribution (fixed by task #48), but \
+        a deeper defect in face-pair intersection or relative-to-solid classification. See that test's \
+        FIXME for details."]
     fn prop_tier3_difference_bbox_within_minuend() {
         // `bbox(A - B) ⊆ bbox(A)` — subtracting cannot grow the operand.
         let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x52);
