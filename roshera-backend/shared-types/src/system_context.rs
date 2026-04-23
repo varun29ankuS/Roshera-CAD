@@ -1,7 +1,8 @@
-/// System context for AI awareness
-///
-/// This module provides comprehensive system state information for AI to understand
-/// the current environment, users, workflow, and available commands.
+//! System context for AI awareness
+//!
+//! This module provides comprehensive system state information for AI to understand
+//! the current environment, users, workflow, and available commands.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -81,17 +82,24 @@ pub struct UserInfo {
 /// User connection status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UserStatus {
+    /// User is actively interacting with the session.
     Active,
+    /// User is connected but idle (no recent input).
     Idle,
+    /// User is connected but marked away.
     Away,
+    /// User has disconnected from the session.
     Disconnected,
 }
 
 /// User disconnection info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserDisconnection {
+    /// User who disconnected.
     pub user: UserInfo,
+    /// Timestamp (ms since epoch) when the disconnection occurred.
     pub disconnected_at: u64,
+    /// Reason reported for the disconnection.
     pub reason: String,
 }
 
@@ -123,20 +131,30 @@ pub struct WorkflowContext {
 /// Workflow stages
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WorkflowStage {
+    /// 2D sketching stage.
     Sketch,
+    /// Single-part modeling stage.
     Part,
+    /// Multi-part assembly stage.
     Assembly,
+    /// 2D drawing/drafting stage.
     Drawing,
+    /// Simulation / analysis stage.
     Simulation,
+    /// Manufacturing / CAM stage.
     Manufacturing,
 }
 
 /// Workflow history entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowHistoryEntry {
+    /// Workflow stage at the time of the action.
     pub stage: WorkflowStage,
+    /// Name of the action performed.
     pub action: String,
+    /// Timestamp (ms since epoch) the action was recorded.
     pub timestamp: u64,
+    /// Identifier of the user that performed the action.
     pub user_id: String,
 }
 
@@ -190,10 +208,15 @@ pub struct CommandInfo {
 /// Parameter information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParameterInfo {
+    /// Parameter name.
     pub name: String,
+    /// Parameter type descriptor (number, string, bool, etc.).
     pub param_type: String,
+    /// Human-readable description of the parameter.
     pub description: String,
+    /// Default value applied when the caller omits this parameter.
     pub default_value: Option<serde_json::Value>,
+    /// Optional JSON-encoded constraints (min/max/enum/etc.).
     pub constraints: Option<serde_json::Value>,
 }
 
@@ -256,36 +279,52 @@ pub struct EnvironmentContext {
 /// Grid information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridInfo {
+    /// Whether grid snapping/display is enabled.
     pub enabled: bool,
+    /// Spacing between minor grid lines in world units.
     pub spacing: f64,
+    /// Number of minor lines between major grid lines.
     pub major_lines: u32,
+    /// Whether the grid is currently visible.
     pub visible: bool,
 }
 
 /// Snap settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapSettings {
+    /// Snap pointer positions to the grid.
     pub grid_snap: bool,
+    /// Snap to object features (endpoints, midpoints, centers).
     pub object_snap: bool,
+    /// Snap rotations to angular increments.
     pub angle_snap: bool,
+    /// Snap pickup tolerance in world units.
     pub snap_tolerance: f64,
 }
 
 /// Display settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplaySettings {
+    /// Show the world-space coordinate axes.
     pub show_axes: bool,
+    /// Show a marker at the world origin.
     pub show_origin: bool,
+    /// Show scene statistics overlay (tri/vertex counts, FPS, etc.).
     pub show_statistics: bool,
+    /// Render geometry as wireframe rather than shaded.
     pub wireframe_mode: bool,
+    /// Global transparency multiplier in [0, 1].
     pub transparency: f32,
 }
 
 /// Precision settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecisionSettings {
+    /// Number of decimal places displayed for length values.
     pub decimal_places: u32,
+    /// Decimal precision used for angular displays.
     pub angle_precision: u32,
+    /// Numerical tolerance used for geometric comparisons.
     pub tolerance: f64,
 }
 
