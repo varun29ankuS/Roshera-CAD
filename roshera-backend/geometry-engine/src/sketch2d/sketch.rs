@@ -429,7 +429,9 @@ impl Sketch {
             match entity {
                 EntityRef::Point(id) => {
                     if let Some(mut point) = self.points.get_mut(id) {
-                        point.value_mut().add_constraint();
+                        if let Err(e) = point.value_mut().add_constraint() {
+                            tracing::warn!(point_id = ?id, error = %e, "point add_constraint failed (over-constrained); outer constraint still recorded");
+                        }
                     }
                 }
                 EntityRef::Line(id) => {
@@ -481,7 +483,9 @@ impl Sketch {
                 match entity {
                     EntityRef::Point(id) => {
                         if let Some(mut point) = self.points.get_mut(id) {
-                            point.value_mut().remove_constraint();
+                            if let Err(e) = point.value_mut().remove_constraint() {
+                                tracing::warn!(point_id = ?id, error = %e, "point remove_constraint failed (counter already zero); outer constraint still removed");
+                            }
                         }
                     }
                     EntityRef::Line(id) => {
