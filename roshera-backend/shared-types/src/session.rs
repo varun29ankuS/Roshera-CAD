@@ -209,6 +209,12 @@ pub struct HistoryEntry {
 }
 
 /// Collaboration event
+///
+/// The ObjectCreated variant carries a full CADObject and is larger than the
+/// other variants, but these events are rare broadcast payloads rather than
+/// hot-path values; keeping the object inline avoids indirection at the
+/// match/serialize call sites in session-manager.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum CollaborationEvent {
@@ -480,8 +486,8 @@ impl Units {
         }
     }
 
-    /// Convert value from millimeters
-    pub fn from_mm(&self, value: f32) -> f32 {
+    /// Convert a value expressed in millimeters into this unit.
+    pub fn convert_from_mm(&self, value: f32) -> f32 {
         match self {
             Units::Millimeters => value,
             Units::Centimeters => value / 10.0,
@@ -548,7 +554,7 @@ mod tests {
     #[test]
     fn test_unit_conversion() {
         assert_eq!(Units::Inches.to_mm(1.0), 25.4);
-        assert_eq!(Units::Millimeters.from_mm(25.4), 25.4);
-        assert_eq!(Units::Inches.from_mm(25.4), 1.0);
+        assert_eq!(Units::Millimeters.convert_from_mm(25.4), 25.4);
+        assert_eq!(Units::Inches.convert_from_mm(25.4), 1.0);
     }
 }
