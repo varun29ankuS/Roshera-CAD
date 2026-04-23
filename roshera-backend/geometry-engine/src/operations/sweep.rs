@@ -159,6 +159,9 @@ pub fn sweep_profile(
     // Validate inputs
     validate_sweep_inputs(model, &profile, path, &options)?;
 
+    // Capture profile edges before they're consumed, for recording.
+    let profile_edges_for_record: Vec<u64> = profile.iter().map(|&e| e as u64).collect();
+
     // Create face from profile if needed
     let profile_face = create_profile_face(model, profile)?;
 
@@ -183,6 +186,21 @@ pub fn sweep_profile(
     if options.common.validate_result {
         validate_swept_solid(model, solid_id)?;
     }
+
+    // Record for attached recorders. Include the sweep type discriminant
+    // by Debug-formatting since SweepOptions is not Serialize.
+    let mut inputs = profile_edges_for_record;
+    inputs.push(path as u64);
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("sweep_profile")
+            .with_parameters(serde_json::json!({
+                "path_edge": path,
+                "sweep_type": format!("{:?}", options.sweep_type),
+                "quality": format!("{:?}", options.quality),
+            }))
+            .with_inputs(inputs)
+            .with_outputs(vec![solid_id as u64]),
+    );
 
     Ok(solid_id)
 }

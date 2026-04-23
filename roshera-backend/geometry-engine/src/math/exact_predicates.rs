@@ -504,6 +504,7 @@ pub fn cospherical(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Poin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::consts;
     use crate::math::tolerance::NORMAL_TOLERANCE;
 
     #[test]

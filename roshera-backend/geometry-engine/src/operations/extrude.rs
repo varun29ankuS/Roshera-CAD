@@ -141,6 +141,24 @@ pub fn extrude_face(
         validate_extruded_solid(model, unified_solid_id)?;
     }
 
+    // Record for attached recorders. `direction` above was moved into
+    // `create_*_unified_extrusion`, so re-read from `options` (the option
+    // struct is still borrowed and un-normalized — sufficient for a record).
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("extrude_face")
+            .with_parameters(serde_json::json!({
+                "face_id": face_id,
+                "distance": options.distance,
+                "direction": [options.direction.x, options.direction.y, options.direction.z],
+                "cap_ends": options.cap_ends,
+                "draft_angle": options.draft_angle,
+                "twist_angle": options.twist_angle,
+                "end_scale": options.end_scale,
+            }))
+            .with_inputs(vec![face_id as u64])
+            .with_outputs(vec![unified_solid_id as u64]),
+    );
+
     Ok(unified_solid_id)
 }
 

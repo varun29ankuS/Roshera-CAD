@@ -77,6 +77,19 @@ pub fn transform_solid(
         validate_transformed_solid(model, solid)?;
     }
 
+    // Record the operation for timeline / event-sourcing consumers.
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("transform_solid")
+            .with_parameters(serde_json::json!({
+                "solid_id": solid_id,
+                "transform": transform,
+                "copy": options.copy,
+                "update_parameterization": options.update_parameterization,
+            }))
+            .with_inputs(vec![solid_id as u64])
+            .with_outputs(vec![solid as u64]),
+    );
+
     Ok(TransformResult {
         transformed_ids: vec![solid],
         transform,
@@ -91,6 +104,8 @@ pub fn transform_faces(
     options: TransformOptions,
 ) -> OperationResult<TransformResult> {
     validate_transform_inputs(model, &transform)?;
+
+    let input_face_ids: Vec<u64> = face_ids.iter().map(|&f| f as u64).collect();
 
     let faces = if options.copy {
         copy_faces(model, &face_ids)?
@@ -112,6 +127,18 @@ pub fn transform_faces(
         transform_surfaces(model, &faces, &transform)?;
     }
 
+    let output_face_ids: Vec<u64> = faces.iter().map(|&f| f as u64).collect();
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("transform_faces")
+            .with_parameters(serde_json::json!({
+                "transform": transform,
+                "copy": options.copy,
+                "update_parameterization": options.update_parameterization,
+            }))
+            .with_inputs(input_face_ids)
+            .with_outputs(output_face_ids),
+    );
+
     Ok(TransformResult {
         transformed_ids: faces.into_iter().map(|f| f as u32).collect(),
         transform,
@@ -126,6 +153,8 @@ pub fn transform_edges(
     options: TransformOptions,
 ) -> OperationResult<TransformResult> {
     validate_transform_inputs(model, &transform)?;
+
+    let input_edge_ids: Vec<u64> = edge_ids.iter().map(|&e| e as u64).collect();
 
     let edges = if options.copy {
         copy_edges(model, &edge_ids)?
@@ -148,6 +177,18 @@ pub fn transform_edges(
 
     // Transform curves
     transform_curves(model, &edges, &transform)?;
+
+    let output_edge_ids: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("transform_edges")
+            .with_parameters(serde_json::json!({
+                "transform": transform,
+                "copy": options.copy,
+                "update_parameterization": options.update_parameterization,
+            }))
+            .with_inputs(input_edge_ids)
+            .with_outputs(output_edge_ids),
+    );
 
     Ok(TransformResult {
         transformed_ids: edges.into_iter().map(|e| e as u32).collect(),
@@ -257,7 +298,7 @@ fn transform_vertices(
 fn transform_curves(
     model: &mut BRepModel,
     edge_ids: &[EdgeId],
-    _transform: &Matrix4,
+    transform: &Matrix4,
 ) -> OperationResult<()> {
     // Collect the set of distinct curve IDs referenced by the edges first, so we
     // do not alias `model.edges` and `model.curves` mutably at the same time.

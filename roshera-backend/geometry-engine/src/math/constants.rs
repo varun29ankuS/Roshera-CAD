@@ -6,8 +6,8 @@
 /// Legacy module for backward compatibility
 pub mod consts {
     pub use super::{
-        ANGULAR_TOLERANCE, EPSILON, FRAC_PI_2, HALF_PI, PI, QUARTER_PI, SIXTH_PI, SQRT_EPSILON,
-        THIRD_PI, TWO_PI,
+        ANGULAR_TOLERANCE, EPSILON, FRAC_PI_2, HALF_PI, PHI, PI, QUARTER_PI, SIXTH_PI,
+        SQRT_EPSILON, THIRD_PI, TWO_PI,
     };
 }
 

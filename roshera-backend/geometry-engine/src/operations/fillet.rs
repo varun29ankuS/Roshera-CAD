@@ -128,6 +128,10 @@ pub fn fillet_edges(
     // Validate inputs
     validate_fillet_inputs(model, solid_id, &edges, &options)?;
 
+    // Capture input edges before `edges` is consumed by the propagation
+    // step below — needed for the recorder payload.
+    let input_edges_for_record: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
+
     // Additional robust validation
     for &edge_id in &edges {
         let radius = match &options.fillet_type {
@@ -172,6 +176,22 @@ pub fn fillet_edges(
     if options.common.validate_result {
         validate_filleted_solid(model, solid_id)?;
     }
+
+    // Record for attached recorders. `inputs` lists the user-supplied
+    // edges (not the propagated superset — that's a derived detail).
+    let mut inputs = input_edges_for_record;
+    inputs.insert(0, solid_id as u64);
+    let fillet_face_ids: Vec<u64> = fillet_faces.iter().map(|&f| f as u64).collect();
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("fillet_edges")
+            .with_parameters(serde_json::json!({
+                "solid_id": solid_id,
+                "fillet_type": format!("{:?}", options.fillet_type),
+                "propagation": format!("{:?}", options.propagation),
+            }))
+            .with_inputs(inputs)
+            .with_outputs(fillet_face_ids),
+    );
 
     Ok(fillet_faces)
 }

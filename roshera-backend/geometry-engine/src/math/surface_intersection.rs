@@ -776,4 +776,102 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn sphere_plane_equator_yields_closed_circle() {
+        // Plane through sphere center produces the equator — a closed unit circle.
+        let sphere = Sphere::new(Point3::ORIGIN, 1.0).expect("sphere");
+        let plane = Plane::xy(0.0);
+        let t = tol();
+        let curves = intersect_surfaces(&sphere, &plane, &t).expect("ssi");
+        assert!(!curves.is_empty(), "sphere equator must intersect plane");
+        // At least one traced curve should be closed and lie on the unit circle.
+        let mut found_equator = false;
+        for c in &curves {
+            if c.points.is_empty() {
+                continue;
+            }
+            let all_on_equator = c.points.iter().all(|p| {
+                let r = (p.x * p.x + p.y * p.y).sqrt();
+                p.z.abs() < 1e-3 && (r - 1.0).abs() < 1e-2
+            });
+            // Closure: explicit flag or polyline endpoints within tolerance.
+            let endpoint_close = {
+                let first = c.points[0];
+                let last = c.points[c.points.len() - 1];
+                (first - last).magnitude() < 1e-2
+            };
+            if all_on_equator && (c.is_closed || endpoint_close) {
+                found_equator = true;
+                break;
+            }
+        }
+        assert!(
+            found_equator,
+            "expected at least one closed equator curve on the unit circle"
+        );
+    }
+
+    #[test]
+    fn cylinder_cylinder_orthogonal_yields_intersection() {
+        // Two unit cylinders whose axes cross at the origin at a right angle
+        // (Z-axis and X-axis). The marching algorithm should find at least one
+        // traced curve whose samples lie on both surfaces within tolerance.
+        let cyl_z =
+            Cylinder::new(Point3::new(0.0, 0.0, -3.0), Vector3::Z, 1.0).expect("cyl_z");
+        let cyl_x =
+            Cylinder::new(Point3::new(-3.0, 0.0, 0.0), Vector3::X, 1.0).expect("cyl_x");
+        let t = tol();
+        let curves = intersect_surfaces(&cyl_z, &cyl_x, &t).expect("ssi");
+        assert!(
+            !curves.is_empty(),
+            "orthogonal cylinder pair must intersect"
+        );
+        // Every sample must lie on both cylindrical surfaces: radius 1 from each axis.
+        for c in &curves {
+            for p in &c.points {
+                let r_z = (p.x * p.x + p.y * p.y).sqrt();
+                let r_x = (p.y * p.y + p.z * p.z).sqrt();
+                assert!(
+                    (r_z - 1.0).abs() < 5e-2,
+                    "distance from Z-axis {} not near 1",
+                    r_z
+                );
+                assert!(
+                    (r_x - 1.0).abs() < 5e-2,
+                    "distance from X-axis {} not near 1",
+                    r_x
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sphere_sphere_overlap_yields_intersection() {
+        // Two unit spheres offset by 1 along X — they intersect in the plane x = 0.5
+        // on a circle of radius sqrt(3)/2. Exercises marching on a purely numerical
+        // path (no analytical specialization), analogous to a NURBS-NURBS case.
+        let s1 = Sphere::new(Point3::ORIGIN, 1.0).expect("s1");
+        let s2 = Sphere::new(Point3::new(1.0, 0.0, 0.0), 1.0).expect("s2");
+        let t = tol();
+        let curves = intersect_surfaces(&s1, &s2, &t).expect("ssi");
+        assert!(!curves.is_empty(), "overlapping spheres must intersect");
+        let expected_radius = (3.0_f64).sqrt() / 2.0;
+        for c in &curves {
+            for p in &c.points {
+                assert!(
+                    (p.x - 0.5).abs() < 5e-2,
+                    "sample x = {} not near 0.5",
+                    p.x
+                );
+                let r = (p.y * p.y + p.z * p.z).sqrt();
+                assert!(
+                    (r - expected_radius).abs() < 5e-2,
+                    "radius {} not near {}",
+                    r,
+                    expected_radius
+                );
+            }
+        }
+    }
 }

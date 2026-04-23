@@ -84,6 +84,11 @@ pub fn loft_profiles(
     // Validate inputs
     validate_loft_inputs(model, &profiles, &options)?;
 
+    // Capture profile edges (flattened) before they're consumed, for recording.
+    let profile_edges_for_record: Vec<u64> =
+        profiles.iter().flatten().map(|&e| e as u64).collect();
+    let profile_count = profiles.len();
+
     // Convert edge profiles to face profiles if needed
     let face_profiles = create_face_profiles(model, profiles)?;
 
@@ -107,6 +112,19 @@ pub fn loft_profiles(
     if options.common.validate_result {
         validate_lofted_solid(model, solid_id)?;
     }
+
+    // Record for attached recorders.
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("loft_profiles")
+            .with_parameters(serde_json::json!({
+                "profile_count": profile_count,
+                "loft_type": format!("{:?}", options.loft_type),
+                "closed": options.closed,
+                "create_solid": options.create_solid,
+            }))
+            .with_inputs(profile_edges_for_record)
+            .with_outputs(vec![solid_id as u64]),
+    );
 
     Ok(solid_id)
 }

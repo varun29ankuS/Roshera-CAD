@@ -459,23 +459,50 @@ fn compute_surface_normal_at_point(
     Ok(surface.normal_at(u, v)?)
 }
 
-/// Extend corners in offset loop
+/// Extend offset loop corners by intersecting adjacent offset surfaces.
+///
+/// Not yet implemented. Correct handling requires:
+/// 1. Detecting tangent discontinuities between consecutive offset edges.
+/// 2. Intersecting the two adjacent offset surfaces (SSI) to obtain the
+///    extended corner curve.
+/// 3. Rewriting each neighbour edge's parametric range to terminate on the
+///    new corner vertex, then inserting that vertex and the corner edge.
+///
+/// Until that work lands, this function returns `NotImplemented` so callers
+/// of `CornerType::Extended` are not silently given a non-watertight result.
 fn extend_offset_corners(
-    model: &mut BRepModel,
-    offset_edges: &mut Vec<(EdgeId, bool)>,
+    _model: &mut BRepModel,
+    _offset_edges: &mut Vec<(EdgeId, bool)>,
 ) -> OperationResult<()> {
-    // Would extend surfaces at corners to meet
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "CornerType::Extended offset corners not implemented; \
+         use CornerType::Natural for the current kernel"
+            .to_string(),
+    ))
 }
 
-/// Round corners in offset loop
+/// Insert fillet arcs between consecutive offset edges.
+///
+/// Not yet implemented. Correct handling requires:
+/// 1. Detecting tangent discontinuities between consecutive offset edges.
+/// 2. Constructing an arc edge of the requested `radius` tangent to both
+///    neighbour edges on the offset surface, with centre at the corner
+///    normal offset inward.
+/// 3. Trimming the two neighbour edges back to the arc tangency points and
+///    stitching the new arc edge + two tangency vertices into the loop.
+///
+/// Until that work lands, this function returns `NotImplemented` so callers
+/// of `CornerType::Round` are not silently given a non-watertight result.
 fn round_offset_corners(
-    model: &mut BRepModel,
-    offset_edges: &mut Vec<(EdgeId, bool)>,
-    radius: f64,
+    _model: &mut BRepModel,
+    _offset_edges: &mut Vec<(EdgeId, bool)>,
+    _radius: f64,
 ) -> OperationResult<()> {
-    // Would add arc edges at corners
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "CornerType::Round offset corners not implemented; \
+         use CornerType::Natural for the current kernel"
+            .to_string(),
+    ))
 }
 
 /// Create interior offset faces for shell

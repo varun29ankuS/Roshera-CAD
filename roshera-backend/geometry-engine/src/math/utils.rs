@@ -44,7 +44,12 @@ pub fn solve_quadratic(a: f64, b: f64, c: f64, tolerance: Tolerance) -> Vec<f64>
         let sqrt_disc = discriminant.sqrt();
         let q = -0.5 * (b + b.signum() * sqrt_disc);
         let mut roots = vec![q, c / q];
-        roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // NaN-safe: drop non-finite roots (possible from degenerate
+        // discriminants or cancellation) before sorting. total_cmp gives a
+        // total order on the remaining finite values so dedup_roots works
+        // correctly.
+        roots.retain(|r| r.is_finite());
+        roots.sort_by(|a, b| a.total_cmp(b));
 
         // Remove near-duplicates
         if roots.len() == 2 && (roots[1] - roots[0]).abs() < tol {
@@ -119,7 +124,9 @@ pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64, tolerance: Tolerance) -> Vec<
     };
 
     // Sort and remove near-duplicates
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // NaN-safe: drop non-finite roots before sorting; total_cmp for determinism.
+    roots.retain(|r| r.is_finite());
+    roots.sort_by(|a, b| a.total_cmp(b));
     dedup_roots(&mut roots, tol);
     roots
 }
@@ -207,7 +214,12 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
                 }
             }
         }
-        roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // NaN-safe: drop non-finite roots (possible from degenerate
+        // discriminants or cancellation) before sorting. total_cmp gives a
+        // total order on the remaining finite values so dedup_roots works
+        // correctly.
+        roots.retain(|r| r.is_finite());
+        roots.sort_by(|a, b| a.total_cmp(b));
         dedup_roots(&mut roots, tol);
         return roots;
     }
@@ -252,7 +264,9 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
         roots.push(y + shift);
     }
 
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // NaN-safe: drop non-finite roots before sorting; total_cmp for determinism.
+    roots.retain(|r| r.is_finite());
+    roots.sort_by(|a, b| a.total_cmp(b));
     dedup_roots(&mut roots, tol);
     roots
 }
@@ -285,7 +299,7 @@ where
     let mut stagnation_count = 0;
 
     for i in 0..max_iterations {
-        let dfx = df(x);
+        let mut dfx = df(x);
 
         // Check for zero derivative with better tolerance
         if dfx.abs() < consts::SQRT_EPSILON {
@@ -296,6 +310,12 @@ where
             if dfx_num.abs() < consts::SQRT_EPSILON {
                 return Err(MathError::NumericalInstability);
             }
+
+            // Use the numerical derivative for this iteration so the
+            // fallback actually takes effect (previously dfx was not
+            // updated, causing the division below to use the near-zero
+            // analytical derivative and diverge).
+            dfx = dfx_num;
         }
 
         // Adaptive damping for better convergence
@@ -1017,7 +1037,9 @@ where
         f_prev = fx;
     }
 
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // NaN-safe: drop non-finite roots before sorting; total_cmp for determinism.
+    roots.retain(|r| r.is_finite());
+    roots.sort_by(|a, b| a.total_cmp(b));
     roots
 }
 
@@ -1202,6 +1224,52 @@ mod tests {
     }
 
     #[test]
+    fn test_polynomial_solvers_never_return_non_finite_roots() {
+        // Regression: partial_cmp().unwrap_or(Equal) in root sorting was
+        // NaN-unsafe — NaN roots from degenerate/ill-conditioned inputs
+        // could survive sorting and corrupt dedup_roots. All solvers must
+        // now filter non-finite roots before returning.
+        let pathological_inputs: Vec<(f64, f64, f64, f64, f64)> = vec![
+            // Near-zero leading coefficient (discriminant explosion)
+            (1e-300, 1.0, 1.0, 0.0, 0.0),
+            // Overflow-prone coefficients
+            (1.0, 1e150, 1e150, 1e150, 1e150),
+            // Underflow-prone
+            (1.0, 1e-200, 1e-200, 1e-200, 1e-200),
+        ];
+
+        for (a, b, c, d, e) in pathological_inputs {
+            let q = solve_quadratic(a, b, c, NORMAL_TOLERANCE);
+            assert!(
+                q.iter().all(|r| r.is_finite()),
+                "solve_quadratic produced non-finite root for ({}, {}, {})",
+                a,
+                b,
+                c
+            );
+            let c_roots = solve_cubic(a, b, c, d, NORMAL_TOLERANCE);
+            assert!(
+                c_roots.iter().all(|r| r.is_finite()),
+                "solve_cubic produced non-finite root for ({}, {}, {}, {})",
+                a,
+                b,
+                c,
+                d
+            );
+            let q_roots = solve_quartic(a, b, c, d, e, NORMAL_TOLERANCE);
+            assert!(
+                q_roots.iter().all(|r| r.is_finite()),
+                "solve_quartic produced non-finite root for ({}, {}, {}, {}, {})",
+                a,
+                b,
+                c,
+                d,
+                e
+            );
+        }
+    }
+
+    #[test]
     fn test_solve_cubic() {
         // (x - 1)(x - 2)(x - 3) = x³ - 6x² + 11x - 6
         let roots = solve_cubic(1.0, -6.0, 11.0, -6.0, NORMAL_TOLERANCE);
@@ -1236,6 +1304,30 @@ mod tests {
         let tight = Tolerance::from_distance(1e-12);
         let root = newton_raphson(f, df, 1.0, tight, 100).unwrap();
         assert!((root * root - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_newton_raphson_numerical_derivative_fallback() {
+        // Regression test for bug where analytical-derivative-near-zero fallback
+        // computed dfx_num but never substituted it into dfx, causing the
+        // subsequent `fx / dfx` divide to use the original near-zero value and
+        // produce an infinite step (→ NonFiniteResult).
+        //
+        // Use a deliberately buggy `df` that always returns 0 to force the
+        // fallback branch. If the fallback is correctly applied, Newton still
+        // converges because the numerical derivative recovers the true slope
+        // of the affine function f(x) = x - 5 (slope = 1).
+        let f = |x: f64| x - 5.0;
+        let df = |_: f64| 0.0;
+
+        let tight = Tolerance::from_distance(1e-12);
+        let root = newton_raphson(f, df, 0.0, tight, 100)
+            .expect("numerical-derivative fallback must recover convergence");
+        assert!(
+            (root - 5.0).abs() < 1e-8,
+            "expected root ≈ 5.0, got {}",
+            root
+        );
     }
 
     #[test]

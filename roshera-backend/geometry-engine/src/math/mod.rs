@@ -32,7 +32,6 @@ pub mod nurbs;
 pub mod surface_intersection;
 pub mod test_oslo;
 pub mod trimmed_nurbs;
-pub mod tspline;
 
 // Frame computation for sweep operations
 pub mod frame;
@@ -490,7 +489,7 @@ mod tests {
         assert!(consts::EPSILON > 0.0);
         assert!(consts::SQRT_EPSILON > consts::EPSILON);
         assert!((consts::TWO_PI - 2.0 * consts::PI).abs() < consts::EPSILON);
-        assert!((PHI * PHI - PHI - 1.0).abs() < consts::EPSILON);
+        assert!((consts::PHI * consts::PHI - consts::PHI - 1.0).abs() < consts::EPSILON);
     }
 
     #[test]
