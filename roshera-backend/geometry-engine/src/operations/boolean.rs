@@ -1995,12 +1995,63 @@ fn split_faces_along_curves(
     }
 
     // Split each face, carrying its origin solid through to the SplitFace.
+    let intersected_faces: HashSet<FaceId> = face_curves.keys().copied().collect();
     for (face_id, (origin_solid, curves)) in face_curves {
         let faces = split_face_by_curves(model, face_id, origin_solid, &curves, options)?;
         split_faces.extend(faces);
     }
 
+    // A face that does NOT intersect any face on the other solid must still
+    // flow into classification, otherwise it vanishes from the result. Two
+    // common cases in boolean operands:
+    //
+    //   * A's cap sits entirely inside B (no face-pair intersection): still
+    //     needs to be classified Inside B and kept for A ∩ B / dropped for
+    //     A ∪ B.
+    //   * B's cap sits entirely outside A: classified Outside A and dropped
+    //     for A ∩ B.
+    //
+    // Before this step only intersected faces reached classify_split_faces,
+    // which caused results to be bounded by the union of intersecting faces
+    // instead of by the true inside/outside partitioning (task #48 tier-3
+    // bbox tests).
+    add_non_intersecting_faces(model, solid_a, &intersected_faces, &mut split_faces)?;
+    add_non_intersecting_faces(model, solid_b, &intersected_faces, &mut split_faces)?;
+
     Ok(split_faces)
+}
+
+/// Push every face of `solid` that is not in `intersected` into `out` as a
+/// whole (unsplit) `SplitFace`. The origin solid is stamped directly.
+fn add_non_intersecting_faces(
+    model: &BRepModel,
+    solid: SolidId,
+    intersected: &HashSet<FaceId>,
+    out: &mut Vec<SplitFace>,
+) -> OperationResult<()> {
+    for face_id in get_solid_faces(model, solid)? {
+        if intersected.contains(&face_id) {
+            continue;
+        }
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "face_id".to_string(),
+                expected: "valid face ID".to_string(),
+                received: format!("{face_id:?}"),
+            })?;
+        let surface_id = face.surface_id;
+        let boundary_edges = get_face_boundary_edges(model, face_id)?;
+        out.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges,
+            classification: FaceClassification::OnBoundary,
+            from_solid: solid,
+        });
+    }
+    Ok(())
 }
 
 /// Split a single face by multiple curves.
@@ -4521,14 +4572,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME: bbox(A ∩ B) can exceed bbox(A) when B extends beyond A. Reproducible failure: \
-        bbox(A∩B).z = [-5.31, 5.31] vs bbox(A).z = [-3.56, 3.56] (seed BOOLEAN_HARNESS_SEED ^ 0x51, iter 0). \
-        Task #48 ruled out origin-attribution as the cause: SplitFace::from_solid is now stamped at split \
-        time (see split_faces_along_curves), so classification uses correct origins. The remaining defect \
-        is earlier in the pipeline — either compute_face_intersections misses pairs of faces that DO \
-        clip each other (likely B's side walls against A's top/bottom caps, which bound the result Z), \
-        or classify_face_relative_to_solid votes Inside for faces lying wholly outside the test solid. \
-        Needs a dedicated investigation, not a drop-in fix."]
+    #[ignore = "FIXME: bbox(A ∩ B) can exceed bbox(A) when B extends beyond A. Reproducible \
+        failure: bbox(A∩B).z=[-5.31,5.31] vs bbox(A).z=[-3.56,3.56] (seed BOOLEAN_HARNESS_SEED^0x51, \
+        iter 0). Task #48 established that origin-attribution is correct (SplitFace::from_solid \
+        stamped at split time). Task #48 also added add_non_intersecting_faces so wholly-contained \
+        or wholly-separated caps flow into classification. The REMAINING defect is in face-region \
+        subdivision: split_face_by_curves→extract_face_loops walks edges by HashMap iteration \
+        order and picks the first unused incident edge (boolean.rs:2678-2700), with NO angular \
+        sort. A planar face split by a straight line should yield TWO planar regions (arrangement \
+        subdivision), but the current walk can emerge with the original loop unchanged and the \
+        cutting curve dangling. Result: classify_face_relative_to_solid samples the ORIGINAL \
+        face's interior point, so pieces that should be Outside the test solid get grouped with \
+        pieces that are Inside. Fixing this requires DCEL half-edge construction with angular \
+        sort per vertex to correctly subdivide each face into connected regions (Vida-Martin-Varady \
+        1994; Piegl-Tiller §17). Out of scope for task #48."]
     fn prop_tier3_intersection_bbox_within_both_inputs() {
         // `bbox(A ∩ B) ⊆ bbox(A)` and `⊆ bbox(B)` always — the intersection
         // cannot exceed either operand in any axis.
@@ -4573,11 +4630,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME: bbox(A - B) can exceed bbox(A). Reproducible failure: bbox(A-B).x = [-8.68, 8.68] \
-        vs bbox(A).x = [-3.17, 3.17] (seed BOOLEAN_HARNESS_SEED ^ 0x52, iter 0). Same root cause as \
-        prop_tier3_intersection_bbox_within_both_inputs: not origin attribution (fixed by task #48), but \
-        a deeper defect in face-pair intersection or relative-to-solid classification. See that test's \
-        FIXME for details."]
+    #[ignore = "FIXME: bbox(A - B) can exceed bbox(A). Reproducible failure: \
+        bbox(A-B).x=[-8.68,8.68] vs bbox(A).x=[-3.17,3.17] (seed BOOLEAN_HARNESS_SEED^0x52, iter \
+        0). Same root cause as prop_tier3_intersection_bbox_within_both_inputs: \
+        extract_face_loops (boolean.rs:2619) does not correctly subdivide a planar face along \
+        intersection curves because it walks the intersection graph without angular sort at \
+        each vertex. Requires DCEL-based face arrangement. See that test's FIXME for details."]
     fn prop_tier3_difference_bbox_within_minuend() {
         // `bbox(A - B) ⊆ bbox(A)` — subtracting cannot grow the operand.
         let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x52);
