@@ -87,6 +87,8 @@ pub struct NurbsPoint {
     pub derivative1: Option<Vector3>,
     /// Second derivative (if requested)
     pub derivative2: Option<Vector3>,
+    /// Third derivative (populated when `num_derivatives >= 3`)
+    pub derivative3: Option<Vector3>,
     /// Parameter value
     pub parameter: f64,
 }
@@ -278,6 +280,7 @@ impl NurbsCurve {
             point: Point3::ZERO,
             derivative1: None,
             derivative2: None,
+            derivative3: None,
             parameter: u,
         };
 
@@ -315,9 +318,9 @@ impl NurbsCurve {
         }
 
         // Second derivative
+        let mut dw2 = 0.0;
         if num_derivatives >= 2 && ders.len() > 2 {
             let mut d2 = Vector3::ZERO;
-            let mut dw2 = 0.0;
 
             for i in 0..=self.degree {
                 let idx = span - self.degree + i;
@@ -329,6 +332,29 @@ impl NurbsCurve {
             if let Some(d1) = result.derivative1 {
                 result.derivative2 =
                     Some((d2 - result.point.to_vec() * dw2 - d1 * (2.0 * dw1)) / weight_sum);
+            }
+        }
+
+        // Third derivative — quotient rule applied to rational curve:
+        //   C'''(u) = (A'''(u) - 3·dw1·C''(u) - 3·dw2·C'(u) - dw3·C(u)) / w(u)
+        // where A(u) = Σ wᵢ · Pᵢ · Nᵢ,p(u) is the weighted control polygon.
+        if num_derivatives >= 3 && ders.len() > 3 {
+            let mut a3 = Vector3::ZERO;
+            let mut dw3 = 0.0;
+
+            for i in 0..=self.degree {
+                let idx = span - self.degree + i;
+                let w = self.weights[idx];
+                a3 += self.control_points[idx].to_vec() * (ders[3][i] * w);
+                dw3 += ders[3][i] * w;
+            }
+
+            if let (Some(d1), Some(d2)) = (result.derivative1, result.derivative2) {
+                result.derivative3 = Some(
+                    (a3 - d2 * (3.0 * dw1) - d1 * (3.0 * dw2)
+                        - result.point.to_vec() * dw3)
+                        / weight_sum,
+                );
             }
         }
 
@@ -417,6 +443,7 @@ impl NurbsCurve {
             point,
             derivative1: None,
             derivative2: None,
+            derivative3: None,
             parameter: u,
         }
     }
@@ -588,6 +615,9 @@ impl NurbsCurve {
             point,
             derivative1,
             derivative2,
+            // SIMD path does not currently compute the 3rd derivative;
+            // callers that need C''' must use the scalar `evaluate_derivatives`.
+            derivative3: None,
             parameter: u,
         }
     }
