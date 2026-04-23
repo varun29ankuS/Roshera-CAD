@@ -13,6 +13,7 @@ use std::sync::Arc;
 use timeline_engine::{Operation, Timeline};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Command processor with timeline integration
 pub struct CommandProcessor {
