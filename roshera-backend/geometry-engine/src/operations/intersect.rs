@@ -9,7 +9,7 @@ use crate::primitives::{
     curve::{Arc, Curve, Line},
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
-    surface::Surface,
+    surface::{Cylinder, Sphere, Surface, SurfaceType},
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -174,23 +174,14 @@ pub fn intersect_curve_surface(
         .get(face.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
-    // For now, check if it's a plane by sampling normals
-    // In a full implementation, we would use type IDs or dynamic dispatch
-    let (u_range, v_range) = surface.parameter_bounds();
-    let u1 = u_range.0 + 0.25 * (u_range.1 - u_range.0);
-    let u2 = u_range.0 + 0.75 * (u_range.1 - u_range.0);
-    let v1 = v_range.0 + 0.25 * (v_range.1 - v_range.0);
-    let v2 = v_range.0 + 0.75 * (v_range.1 - v_range.0);
-
-    let n1 = surface.normal_at(u1, v1)?;
-    let n2 = surface.normal_at(u2, v2)?;
-
-    if (n1 - n2).magnitude() < tolerance.angle() {
-        // Constant normal suggests a plane
-        intersect_curve_plane(curve, surface, edge, tolerance)
-    } else {
-        // Use general surface intersection
-        intersect_curve_general_surface(curve, surface, edge, tolerance)
+    // Dispatch on surface type; analytical fast paths are specialized for
+    // planes, cylinders, and spheres. All other surfaces fall back to the
+    // general subdivision + Newton refinement routine.
+    match surface.surface_type() {
+        SurfaceType::Plane => intersect_curve_plane(curve, surface, edge, tolerance),
+        SurfaceType::Cylinder => intersect_curve_cylinder(curve, surface, edge, tolerance),
+        SurfaceType::Sphere => intersect_curve_sphere(curve, surface, edge, tolerance),
+        _ => intersect_curve_general_surface(curve, surface, edge, tolerance),
     }
 }
 
@@ -1179,37 +1170,443 @@ fn intersect_curve_plane(
     }
 }
 
-/// Intersect curve with cylinder
+/// Map a local line parameter `t_local ∈ [0,1]` to the edge's declared
+/// parameter range. Mirrors the convention used by `intersect_curve_plane`.
+#[inline]
+fn edge_param_from_line_local(edge: &Edge, t_local: f64) -> f64 {
+    edge.param_range.start + t_local * (edge.param_range.end - edge.param_range.start)
+}
+
+/// Compute the UV parameter on a surface for a point known to lie on the
+/// surface. Falls back to `(0.0, 0.0)` if the projection fails so callers
+/// retain the analytical 3D hit even when parameterization is degenerate.
+#[inline]
+fn surface_uv_for_point(
+    surface: &dyn Surface,
+    point: &Point3,
+    tolerance: Tolerance,
+) -> (f64, f64) {
+    surface
+        .closest_point(point, tolerance)
+        .unwrap_or((0.0, 0.0))
+}
+
+/// Check whether `t_local ∈ [0, 1]` is valid for the line-based analytical
+/// path (allowing a small parametric slop at the endpoints).
+#[inline]
+fn line_local_param_in_bounds(t: f64) -> bool {
+    t >= -PARAMETRIC_TOLERANCE && t <= 1.0 + PARAMETRIC_TOLERANCE
+}
+
+/// Solutions of `a t² + b t + c = 0` returned as a small vector of real
+/// roots. Treats `|a| < tol` as a linear equation and `disc < -tol` as "no
+/// real roots". Discriminants within `±tol` of zero return a single
+/// (tangent) root so callers never get duplicate hits from a degenerate
+/// ±√0 split.
+fn solve_real_quadratic(a: f64, b: f64, c: f64, tol: f64) -> Vec<f64> {
+    if a.abs() < tol {
+        if b.abs() < tol {
+            return Vec::new();
+        }
+        return vec![-c / b];
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < -tol {
+        return Vec::new();
+    }
+    if disc.abs() <= tol {
+        return vec![-b / (2.0 * a)];
+    }
+    let sqrt_disc = disc.sqrt();
+    vec![(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
+}
+
+/// Filter a quadratic root to the line's local parameter band `[0, 1]`
+/// (with parametric slop) and clamp to the band for downstream evaluation.
+#[inline]
+fn clamp_line_root(t: f64) -> Option<f64> {
+    if line_local_param_in_bounds(t) {
+        Some(t.clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
+
+/// Analytical line-cylinder intersection.
+///
+/// Substituting the line `P(t) = P0 + t·D` into the cylinder equation
+/// `|P − origin|⊥_axis² = r²` yields a quadratic in `t`. Roots are
+/// filtered against the edge's local parameter band and the cylinder's
+/// optional finite bounds (`height_limits`, `angle_limits`).
+fn intersect_line_cylinder_analytical(
+    line: &Line,
+    cylinder: &Cylinder,
+    surface: &dyn Surface,
+    edge: &Edge,
+    tolerance: Tolerance,
+) -> OperationResult<IntersectionResult> {
+    let tol_d = tolerance.distance();
+    let p0 = line.start;
+    let d = line.end - line.start;
+    let axis = cylinder.axis;
+
+    // Perpendicular components in cylinder frame.
+    let q = p0 - cylinder.origin;
+    let q_axial = axis * q.dot(&axis);
+    let q_perp = q - q_axial;
+    let d_axial = axis * d.dot(&axis);
+    let d_perp = d - d_axial;
+
+    let a = d_perp.dot(&d_perp);
+    let b = 2.0 * q_perp.dot(&d_perp);
+    let c = q_perp.dot(&q_perp) - cylinder.radius * cylinder.radius;
+
+    // Line parallel to the cylinder axis: either it lies on the surface
+    // (entire line is an intersection — outside the current return shape)
+    // or it never intersects. Either way, analytical point output is empty.
+    if a < tol_d {
+        return Ok(IntersectionResult::None);
+    }
+
+    let roots = solve_real_quadratic(a, b, c, tol_d);
+    let mut intersections = Vec::new();
+    for t in roots {
+        let Some(t_clamped) = clamp_line_root(t) else {
+            continue;
+        };
+        let point = line.start + d * t_clamped;
+
+        // Enforce optional cylinder finite bounds by inspecting the
+        // axial coordinate of the hit point.
+        if let Some([h_min, h_max]) = cylinder.height_limits {
+            let h = (point - cylinder.origin).dot(&axis);
+            if h < h_min - tol_d || h > h_max + tol_d {
+                continue;
+            }
+        }
+
+        let (u, v) = surface_uv_for_point(surface, &point, tolerance);
+
+        // Enforce angular limits, if any.
+        if let Some([a_min, a_max]) = cylinder.angle_limits {
+            if u < a_min - tolerance.angle() || u > a_max + tolerance.angle() {
+                continue;
+            }
+        }
+
+        let hit_type = if t == t_clamped {
+            // Single-root or clean-interior roots → transverse
+            PointIntersectionType::Transverse
+        } else {
+            PointIntersectionType::Touch
+        };
+
+        intersections.push(IntersectionPoint {
+            position: point,
+            param1: IntersectionParameter::Single(edge_param_from_line_local(edge, t_clamped)),
+            param2: IntersectionParameter::UV(u, v),
+            intersection_type: hit_type,
+        });
+    }
+
+    // Mark coincident roots (tangent contact) as Tangent rather than
+    // Transverse. This is detected by a zero discriminant earlier, which
+    // produces a single root in `solve_real_quadratic`.
+    if intersections.len() == 1 && intersections[0].intersection_type == PointIntersectionType::Transverse {
+        let disc = b * b - 4.0 * a * c;
+        if disc.abs() <= tol_d {
+            intersections[0].intersection_type = PointIntersectionType::Tangent;
+        }
+    }
+
+    if intersections.is_empty() {
+        Ok(IntersectionResult::None)
+    } else {
+        Ok(IntersectionResult::Points(intersections))
+    }
+}
+
+/// Analytical line-sphere intersection.
+///
+/// Substituting the line into `|P − center|² = r²` yields a quadratic
+/// whose real roots are the intersection parameters.
+fn intersect_line_sphere_analytical(
+    line: &Line,
+    sphere: &Sphere,
+    surface: &dyn Surface,
+    edge: &Edge,
+    tolerance: Tolerance,
+) -> OperationResult<IntersectionResult> {
+    let tol_d = tolerance.distance();
+    let d = line.end - line.start;
+    let q = line.start - sphere.center;
+
+    let a = d.dot(&d);
+    let b = 2.0 * q.dot(&d);
+    let c = q.dot(&q) - sphere.radius * sphere.radius;
+
+    if a < tol_d {
+        // Zero-length segment → no meaningful intersection
+        return Ok(IntersectionResult::None);
+    }
+
+    let roots = solve_real_quadratic(a, b, c, tol_d);
+    let disc = b * b - 4.0 * a * c;
+    let tangent = disc.abs() <= tol_d;
+
+    let mut intersections = Vec::new();
+    for t in roots {
+        let Some(t_clamped) = clamp_line_root(t) else {
+            continue;
+        };
+        let point = line.start + d * t_clamped;
+        let (u, v) = surface_uv_for_point(surface, &point, tolerance);
+
+        // Enforce optional sphere patch limits.
+        if let Some([u_min, u_max, v_min, v_max]) = sphere.param_limits {
+            if u < u_min - tolerance.angle()
+                || u > u_max + tolerance.angle()
+                || v < v_min - tolerance.angle()
+                || v > v_max + tolerance.angle()
+            {
+                continue;
+            }
+        }
+
+        let hit_type = if tangent {
+            PointIntersectionType::Tangent
+        } else if t == t_clamped {
+            PointIntersectionType::Transverse
+        } else {
+            PointIntersectionType::Touch
+        };
+
+        intersections.push(IntersectionPoint {
+            position: point,
+            param1: IntersectionParameter::Single(edge_param_from_line_local(edge, t_clamped)),
+            param2: IntersectionParameter::UV(u, v),
+            intersection_type: hit_type,
+        });
+    }
+
+    if intersections.is_empty() {
+        Ok(IntersectionResult::None)
+    } else {
+        Ok(IntersectionResult::Points(intersections))
+    }
+}
+
+/// Intersect curve with cylinder.
+///
+/// Lines take an analytical quadratic path; all other curves fall through
+/// to the general subdivision + Newton routine.
 fn intersect_curve_cylinder(
-    curve: &Box<dyn Curve>,
-    cylinder: &Box<dyn Surface>,
+    curve: &dyn Curve,
+    surface: &dyn Surface,
     edge: &Edge,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Would implement curve-cylinder intersection
-    Ok(IntersectionResult::None)
+    if let (Some(line), Some(cylinder)) = (
+        curve.as_any().downcast_ref::<Line>(),
+        surface.as_any().downcast_ref::<Cylinder>(),
+    ) {
+        return intersect_line_cylinder_analytical(line, cylinder, surface, edge, tolerance);
+    }
+    intersect_curve_general_surface(curve, surface, edge, tolerance)
 }
 
-/// Intersect curve with sphere
+/// Intersect curve with sphere.
+///
+/// Lines take an analytical quadratic path; all other curves fall through
+/// to the general subdivision + Newton routine.
 fn intersect_curve_sphere(
-    curve: &Box<dyn Curve>,
-    sphere: &Box<dyn Surface>,
+    curve: &dyn Curve,
+    surface: &dyn Surface,
     edge: &Edge,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Would implement curve-sphere intersection
-    Ok(IntersectionResult::None)
+    if let (Some(line), Some(sphere)) = (
+        curve.as_any().downcast_ref::<Line>(),
+        surface.as_any().downcast_ref::<Sphere>(),
+    ) {
+        return intersect_line_sphere_analytical(line, sphere, surface, edge, tolerance);
+    }
+    intersect_curve_general_surface(curve, surface, edge, tolerance)
 }
 
-/// General curve-surface intersection
+/// General curve-surface intersection via subdivision + Newton refinement.
+///
+/// Follows Patrikalakis & Maekawa (*Shape Interrogation for CAD*, 2002,
+/// §4.5): seed candidates on signed-distance sign changes along a uniform
+/// sampling of the curve's parameter range, then refine each seed with a
+/// 3×3 Newton step on the residual `F(t, u, v) = C(t) − S(u, v)`. The
+/// Jacobian columns are `C'(t)`, `−S_u`, and `−S_v`; the linear system is
+/// solved by the shared Gaussian-elimination routine in `math::linear_solver`.
 fn intersect_curve_general_surface(
     curve: &dyn Curve,
     surface: &dyn Surface,
     edge: &Edge,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Would implement general marching method
-    Ok(IntersectionResult::None)
+    let tol_d = tolerance.distance();
+    let t_start = edge.param_range.start;
+    let t_end = edge.param_range.end;
+    if !(t_end - t_start).is_finite() || t_end <= t_start {
+        return Ok(IntersectionResult::None);
+    }
+
+    // Uniform subdivision density; matches the density used in the
+    // existing curve-plane fallback so behaviour is consistent across
+    // surface types.
+    const NUM_SAMPLES: usize = 64;
+
+    let signed_distance = |t: f64| -> MathResult<(f64, Point3, (f64, f64))> {
+        let p = curve.point_at(t)?;
+        let (u, v) = surface.closest_point(&p, tolerance)?;
+        let s = surface.point_at(u, v)?;
+        let n = surface.normal_at(u, v).unwrap_or(Vector3::Z);
+        let n_mag = n.magnitude();
+        let signed = if n_mag > tol_d {
+            (p - s).dot(&n) / n_mag
+        } else {
+            (p - s).magnitude()
+        };
+        Ok((signed, p, (u, v)))
+    };
+
+    // Collect sampled signed distances.
+    let mut samples: Vec<(f64, f64, Point3, (f64, f64))> = Vec::with_capacity(NUM_SAMPLES + 1);
+    for i in 0..=NUM_SAMPLES {
+        let t = t_start + (i as f64 / NUM_SAMPLES as f64) * (t_end - t_start);
+        let (d, p, uv) = signed_distance(t)?;
+        samples.push((t, d, p, uv));
+    }
+
+    // Seed intersections: any sample with |d| < tol is already on the
+    // surface; any pair of consecutive samples with opposite signs
+    // brackets a root.
+    let mut seeds: Vec<(f64, (f64, f64))> = Vec::new();
+    for i in 0..samples.len() {
+        if samples[i].1.abs() < tol_d {
+            seeds.push((samples[i].0, samples[i].3));
+        }
+        if i + 1 < samples.len() {
+            let (ta, da, _, uva) = samples[i];
+            let (tb, db, _, uvb) = samples[i + 1];
+            if da * db < 0.0 {
+                // Linear interpolation for an initial (t, u, v) guess.
+                let alpha = da.abs() / (da.abs() + db.abs());
+                let t_seed = ta + alpha * (tb - ta);
+                let uv_seed = (
+                    uva.0 + alpha * (uvb.0 - uva.0),
+                    uva.1 + alpha * (uvb.1 - uva.1),
+                );
+                seeds.push((t_seed, uv_seed));
+            }
+        }
+    }
+
+    // Newton refinement on each seed.
+    let mut raw_hits: Vec<IntersectionPoint> = Vec::new();
+    for (t_seed, uv_seed) in seeds {
+        if let Some(hit) = newton_refine_curve_surface(
+            curve,
+            surface,
+            edge,
+            t_seed,
+            uv_seed.0,
+            uv_seed.1,
+            tolerance,
+        ) {
+            raw_hits.push(hit);
+        }
+    }
+
+    // Deduplicate in 3-space (tolerance-based).
+    let mut unique: Vec<IntersectionPoint> = Vec::new();
+    for hit in raw_hits {
+        let dup = unique
+            .iter()
+            .any(|u| u.position.distance(&hit.position) < tol_d);
+        if !dup {
+            unique.push(hit);
+        }
+    }
+
+    if unique.is_empty() {
+        Ok(IntersectionResult::None)
+    } else {
+        Ok(IntersectionResult::Points(unique))
+    }
+}
+
+/// Refine a curve-surface intersection seed `(t, u, v)` by Newton's method.
+///
+/// Solves `F(t, u, v) = C(t) − S(u, v) = 0` via the 3×3 linear system
+/// `J · Δ = −F`, where the Jacobian columns are `C'(t)`, `−S_u`, `−S_v`.
+/// Falls back to `None` if the residual fails to converge within a small
+/// iteration budget or the Jacobian becomes singular.
+fn newton_refine_curve_surface(
+    curve: &dyn Curve,
+    surface: &dyn Surface,
+    edge: &Edge,
+    mut t: f64,
+    mut u: f64,
+    mut v: f64,
+    tolerance: Tolerance,
+) -> Option<IntersectionPoint> {
+    use crate::math::linear_solver::gaussian_elimination;
+
+    let tol_d = tolerance.distance();
+    let t_start = edge.param_range.start;
+    let t_end = edge.param_range.end;
+    let (u_range, v_range) = surface.parameter_bounds();
+
+    const MAX_ITERS: usize = 20;
+
+    for _ in 0..MAX_ITERS {
+        let p = curve.point_at(t).ok()?;
+        let s = surface.point_at(u, v).ok()?;
+        let f = p - s;
+        if f.magnitude() < tol_d {
+            let n = surface.normal_at(u, v).ok()?;
+            let tangent = curve.tangent_at(t).ok()?;
+            let cos_angle = tangent.dot(&n).abs();
+            let hit_type = if cos_angle < tolerance.angle() {
+                PointIntersectionType::Tangent
+            } else {
+                PointIntersectionType::Transverse
+            };
+            return Some(IntersectionPoint {
+                position: p,
+                param1: IntersectionParameter::Single(t),
+                param2: IntersectionParameter::UV(u, v),
+                intersection_type: hit_type,
+            });
+        }
+
+        let eval = curve.evaluate(t).ok()?;
+        let (du_vec, dv_vec) = surface.derivatives_at(u, v).ok()?;
+        let dt = eval.derivative1;
+
+        // Jacobian columns: [C'(t), -S_u, -S_v]. System J·Δ = -F.
+        let a = vec![
+            vec![dt.x, -du_vec.x, -dv_vec.x],
+            vec![dt.y, -du_vec.y, -dv_vec.y],
+            vec![dt.z, -du_vec.z, -dv_vec.z],
+        ];
+        let b = vec![-f.x, -f.y, -f.z];
+
+        let step = gaussian_elimination(a, b, tolerance).ok()?;
+        let dt_step = step.first().copied().unwrap_or(0.0);
+        let du_step = step.get(1).copied().unwrap_or(0.0);
+        let dv_step = step.get(2).copied().unwrap_or(0.0);
+
+        t = (t + dt_step).clamp(t_start, t_end);
+        u = (u + du_step).clamp(u_range.0, u_range.1);
+        v = (v + dv_step).clamp(v_range.0, v_range.1);
+    }
+    None
 }
 
 /// Intersect two planes
@@ -1509,5 +1906,161 @@ mod tests {
             }
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    // ---------------- curve-surface: cylinder ----------------
+
+    #[test]
+    fn line_cylinder_secant_two_points() {
+        // Infinite cylinder of radius 1 along +Z, line along +X at z=0.
+        // Analytical intersections: (±1, 0, 0).
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cyl");
+        let line = Line::new(Point3::new(-5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_cylinder(&line as &dyn Curve, &cyl as &dyn Surface, &edge, tol)
+                .expect("ok");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 2);
+                assert!(pts.iter().any(|p| approx_eq(p.position.x, 1.0, 1e-6)));
+                assert!(pts.iter().any(|p| approx_eq(p.position.x, -1.0, 1e-6)));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn line_cylinder_miss_none() {
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cyl");
+        // Line parallel to X axis at y=2 — outside radius 1.
+        let line = Line::new(Point3::new(-5.0, 2.0, 0.0), Point3::new(5.0, 2.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_cylinder(&line as &dyn Curve, &cyl as &dyn Surface, &edge, tol)
+                .expect("ok");
+        assert!(matches!(result, IntersectionResult::None));
+    }
+
+    #[test]
+    fn line_cylinder_tangent_one_point() {
+        // Line tangent at x=1.
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cyl");
+        let line = Line::new(Point3::new(1.0, -5.0, 0.0), Point3::new(1.0, 5.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-6);
+        let result =
+            intersect_curve_cylinder(&line as &dyn Curve, &cyl as &dyn Surface, &edge, tol)
+                .expect("ok");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 1);
+                assert!(approx_eq(pts[0].position.x, 1.0, 1e-6));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn line_cylinder_axial_no_hit() {
+        // Line along +Z coincident with cylinder axis: parallel, returns None
+        // since the analytical path cannot emit a curve-shaped result here.
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cyl");
+        let line = Line::new(Point3::new(0.0, 0.0, -5.0), Point3::new(0.0, 0.0, 5.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_cylinder(&line as &dyn Curve, &cyl as &dyn Surface, &edge, tol)
+                .expect("ok");
+        assert!(matches!(result, IntersectionResult::None));
+    }
+
+    #[test]
+    fn line_cylinder_finite_height_clipping() {
+        // Finite cylinder height [0, 10] along +Z; line crosses at z=-5,
+        // which is outside the finite region → no points.
+        let cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 1.0, 10.0).expect("cyl");
+        let line = Line::new(Point3::new(-5.0, 0.0, -5.0), Point3::new(5.0, 0.0, -5.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_cylinder(&line as &dyn Curve, &cyl as &dyn Surface, &edge, tol)
+                .expect("ok");
+        assert!(matches!(result, IntersectionResult::None));
+    }
+
+    // ---------------- curve-surface: sphere ----------------
+
+    #[test]
+    fn line_sphere_secant_two_points() {
+        // Unit sphere at origin, X-axis line → (±1, 0, 0).
+        let sphere = Sphere::new(Point3::ORIGIN, 1.0).expect("sphere");
+        let line = Line::new(Point3::new(-5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_sphere(&line as &dyn Curve, &sphere as &dyn Surface, &edge, tol)
+                .expect("ok");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 2);
+                assert!(pts.iter().any(|p| approx_eq(p.position.x, 1.0, 1e-6)));
+                assert!(pts.iter().any(|p| approx_eq(p.position.x, -1.0, 1e-6)));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn line_sphere_miss_none() {
+        let sphere = Sphere::new(Point3::ORIGIN, 1.0).expect("sphere");
+        // Line far from sphere.
+        let line = Line::new(Point3::new(-5.0, 5.0, 0.0), Point3::new(5.0, 5.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_sphere(&line as &dyn Curve, &sphere as &dyn Surface, &edge, tol)
+                .expect("ok");
+        assert!(matches!(result, IntersectionResult::None));
+    }
+
+    #[test]
+    fn line_sphere_tangent_one_point() {
+        let sphere = Sphere::new(Point3::ORIGIN, 1.0).expect("sphere");
+        // Line tangent at (0, 1, 0).
+        let line = Line::new(Point3::new(-5.0, 1.0, 0.0), Point3::new(5.0, 1.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-6);
+        let result =
+            intersect_curve_sphere(&line as &dyn Curve, &sphere as &dyn Surface, &edge, tol)
+                .expect("ok");
+        match result {
+            IntersectionResult::Points(pts) => {
+                assert_eq!(pts.len(), 1);
+                assert!(approx_eq(pts[0].position.y, 1.0, 1e-6));
+                assert!(matches!(
+                    pts[0].intersection_type,
+                    PointIntersectionType::Tangent
+                ));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn line_sphere_segment_outside_bounds() {
+        // The sphere lies beyond the line segment [0, 1] in world space
+        // (segment is short and offset in X). Analytical intersection
+        // exists for the infinite line, but both roots fall outside [0,1].
+        let sphere = Sphere::new(Point3::new(100.0, 0.0, 0.0), 1.0).expect("sphere");
+        let line = Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0));
+        let edge = unit_edge();
+        let tol = Tolerance::from_distance(1e-9);
+        let result =
+            intersect_curve_sphere(&line as &dyn Curve, &sphere as &dyn Surface, &edge, tol)
+                .expect("ok");
+        assert!(matches!(result, IntersectionResult::None));
     }
 }
