@@ -844,6 +844,10 @@ pub struct HolePosition {
 }
 
 /// Export format
+///
+/// Variants preserve the canonical all-caps spelling of each industry file
+/// format; renaming to PascalCase would diverge from documented convention.
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExportFormat {
     /// Stereolithography (STL) mesh format.
@@ -1232,6 +1236,11 @@ pub struct ThreadSpecification {
 }
 
 /// Thread standards
+///
+/// Variants preserve the canonical acronyms as published in each thread
+/// standard (UTS = Unified Thread Standard, BSW = British Standard Whitworth,
+/// NPT = National Pipe Thread).
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThreadStandard {
     /// ISO Metric
