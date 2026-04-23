@@ -740,9 +740,9 @@ impl Transform3D {
     }
 }
 
-impl MaterialProperties {
-    /// Create default material (gray plastic)
-    pub fn default() -> Self {
+impl Default for MaterialProperties {
+    /// Default material: neutral gray plastic.
+    fn default() -> Self {
         Self {
             diffuse_color: [0.7, 0.7, 0.7, 1.0],
             metallic: 0.0,
@@ -751,6 +751,9 @@ impl MaterialProperties {
             name: "default".to_string(),
         }
     }
+}
+
+impl MaterialProperties {
 
     /// Create steel material
     pub fn steel() -> Self {
