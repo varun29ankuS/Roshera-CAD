@@ -2738,6 +2738,20 @@ fn classify_face_relative_to_solid(
 ) -> OperationResult<FaceClassification> {
     let test_point = get_face_interior_point(model, face)?;
 
+    // Coincident-boundary detection: if the face's interior point lies on any
+    // face of the test solid, the split face is coincident with a face of the
+    // other solid (e.g., two axis-aligned boxes sharing a plane). Ray-casting
+    // can't detect this because the coincident face is filtered out by the
+    // `t > tolerance.distance()` guard, and the resulting parity flips into
+    // either Inside or Outside depending on surrounding faces — producing
+    // mis-selection in `select_faces_for_operation` and a bbox violation in
+    // the final result. Must run before the ray-cast loop.
+    for face_id in get_solid_faces(model, solid)? {
+        if is_point_in_face(model, face_id, &test_point, tolerance)? {
+            return Ok(FaceClassification::OnBoundary);
+        }
+    }
+
     // Three non-aligned ray directions (no two are coplanar with common edges)
     let rays = [
         Vector3::new(0.577, 0.577, 0.577), // (1,1,1) normalized
@@ -4485,12 +4499,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME(task #11 follow-up): boolean intersection currently violates bbox(A∩B) ⊆ bbox(A) on random box pairs. \
-        First observed failure: result bbox [-6.21,-3.75,-5.31]→[6.21,3.75,5.31] vs A bbox \
-        [-6.21,-3.75,-3.56]→[6.21,3.75,3.56] (Z-axis extends 1.75 beyond A). \
-        Root cause hypothesis: face classification returns union-selected faces for intersection op \
-        when random box dimensions produce coincident-plane subsets. Un-ignore once classify_split_faces \
-        + select_faces_for_operation are hardened on coincident axis-aligned plane configurations."]
+    #[ignore = "FIXME(task #44 follow-up): intersection bbox can exceed bbox(A) when B extends beyond A on an \
+        axis where A doesn't touch. First observed failure: bbox(A∩B).z = [-5.31, 5.31] vs bbox(A).z = [-3.56, 3.56]. \
+        Coincident-plane detection was added in classify_face_relative_to_solid (OnBoundary short-circuit) and \
+        did not help — the proptest's failing case is non-coincident. Refined hypothesis: is_face_from_solid \
+        at classify_split_faces:2700 tests face.original_face against each solid's current face list; after \
+        splitting, new face IDs may not be in either solid's shell, causing the else-branch to misattribute \
+        origin — see classify_split_faces branch at boolean.rs:2700-2705. Un-ignore once split-face origin \
+        tracking is carried through the split pipeline rather than re-derived post-hoc."]
     fn prop_tier3_intersection_bbox_within_both_inputs() {
         // `bbox(A ∩ B) ⊆ bbox(A)` and `⊆ bbox(B)` always — the intersection
         // cannot exceed either operand in any axis.
@@ -4535,11 +4551,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME(task #11 follow-up): boolean difference currently violates bbox(A-B) ⊆ bbox(A) on random box pairs. \
-        First observed failure: result bbox x∈[-8.68,8.68] vs A bbox x∈[-3.17,3.17] (result ~2.7× larger than \
-        minuend on X). Root cause hypothesis: face classification under coincident axis-aligned planes selects \
-        A's boundary + B's boundary instead of (A's outside ∪ B-inside-A). Un-ignore once boolean's coincident-\
-        plane handling is hardened."]
+    #[ignore = "FIXME(task #44 follow-up): difference bbox can exceed bbox(A) when B extends beyond A. \
+        First observed failure: bbox(A-B).x = [-8.68, 8.68] vs bbox(A).x = [-3.17, 3.17] — result ~2.7× \
+        larger than minuend on X. Same root cause as prop_tier3_intersection_bbox_within_both_inputs: \
+        split-face origin attribution via is_face_from_solid mis-fires when split produces new face IDs \
+        not present in either solid's current face list. Un-ignore once origin tracking is embedded in \
+        the split pipeline."]
     fn prop_tier3_difference_bbox_within_minuend() {
         // `bbox(A - B) ⊆ bbox(A)` — subtracting cannot grow the operand.
         let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x52);
