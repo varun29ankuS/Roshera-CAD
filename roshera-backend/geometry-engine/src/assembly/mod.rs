@@ -351,9 +351,10 @@ impl Assembly {
 
         self.mates.insert(id, mate);
 
-        // Trigger constraint solver
-        self.solve_constraints()?;
-
+        // Mate is registered; solving is deferred. Callers must invoke
+        // `solve_constraints` explicitly when they are ready — matching
+        // the CATIA/NX/SolidWorks convention where add/remove of mates
+        // does not auto-rebuild the kinematic state.
         Ok(id)
     }
 
