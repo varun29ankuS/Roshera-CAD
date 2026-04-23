@@ -560,7 +560,12 @@ impl SketchTopology {
         let closed_count = self.loops.len();
         let open_count = self.edges.len() - self.loops.iter().map(|l| l.edges.len()).sum::<usize>();
 
-        self.profile_type = if closed_count == 0 && open_count > 0 {
+        self.profile_type = if closed_count == 0 && open_count == 0 {
+            // Empty sketch: no edges, no loops. Treat as trivially valid
+            // (no profile to classify); callers that need a region can
+            // short-circuit on an empty sketch.
+            ProfileType::Simple
+        } else if closed_count == 0 && open_count > 0 {
             ProfileType::Open
         } else if closed_count == 1 && open_count == 0 {
             ProfileType::Simple
