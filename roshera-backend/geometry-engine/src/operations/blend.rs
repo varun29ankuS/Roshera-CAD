@@ -4,7 +4,7 @@
 //! various blending techniques.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::Point3;
+use crate::math::{Point3, Tolerance};
 use crate::primitives::{
     edge::{Edge, EdgeId},
     face::{Face, FaceId, FaceOrientation},
@@ -237,6 +237,50 @@ fn create_conic_blend(
     _options: &BlendOptions,
 ) -> OperationResult<Vec<FaceId>> {
     let rho = shape_parameter.clamp(0.01, 0.99);
+
+    // Validate that the boundary curves actually live on the faces they
+    // claim to bridge. A blend is only meaningful when curve1's endpoints
+    // sit on face1's surface and curve2's on face2's; otherwise the loft
+    // would emerge offset from both originals and fail to mate.
+    if !curve1.is_empty() && !curve2.is_empty() {
+        let surf1 = model.surfaces.get(face1.surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_conic_blend: face1 surface {} not found",
+                face1.surface_id
+            ))
+        })?;
+        let surf2 = model.surfaces.get(face2.surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_conic_blend: face2 surface {} not found",
+                face2.surface_id
+            ))
+        })?;
+        // Use a generous 1cm tolerance for endpoint-on-surface check; tighter
+        // tolerances are caller-driven through the cross-section construction.
+        let endpoint_tol = Tolerance::from_distance(1e-2);
+        let c1_first = curve1[0];
+        let c1_last = *curve1.last().expect("curve1 non-empty checked above");
+        let c2_first = curve2[0];
+        let c2_last = *curve2.last().expect("curve2 non-empty checked above");
+        for (p, surf, label) in [
+            (c1_first, surf1, "curve1[0] on face1"),
+            (c1_last, surf1, "curve1[last] on face1"),
+            (c2_first, surf2, "curve2[0] on face2"),
+            (c2_last, surf2, "curve2[last] on face2"),
+        ] {
+            let (u, v) = surf.closest_point(&p, endpoint_tol)?;
+            let on_surf = surf.point_at(u, v)?;
+            if (p - on_surf).magnitude() > endpoint_tol.distance() {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "create_conic_blend: {} drifts {:.3e} from surface (tol {:.3e})",
+                    label,
+                    (p - on_surf).magnitude(),
+                    endpoint_tol.distance()
+                )));
+            }
+        }
+    }
+
     // Build a loft surface where each cross-section is a weighted conic blend
     let blend_surface = create_conic_blend_surface(curve1, curve2, rho)?;
     let surface_id = model.surfaces.add(blend_surface);
@@ -251,11 +295,13 @@ fn create_hermite_blend_surface(
     face2: &Face,
     curve1: &[Point3],
     curve2: &[Point3],
-    _degree: usize,
+    degree: usize,
 ) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::RuledSurface;
 
-    // Sample normals from each face at the boundary curves
+    // Validate that curve1/curve2 endpoints lie on face1/face2's surfaces.
+    // Hermite blends rely on boundary curves resting on the source surfaces;
+    // off-surface input would emerge with a tangent gap at the seam.
     let surface1 = model
         .surfaces
         .get(face1.surface_id)
@@ -264,6 +310,45 @@ fn create_hermite_blend_surface(
         .surfaces
         .get(face2.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface 2 not found".into()))?;
+    let endpoint_tol = Tolerance::from_distance(1e-2);
+    let c1_first = curve1[0];
+    let c1_last = *curve1
+        .last()
+        .expect("curve1 non-empty: validated in blend_faces entry");
+    let c2_first = curve2[0];
+    let c2_last = *curve2
+        .last()
+        .expect("curve2 non-empty: validated in blend_faces entry");
+    for (p, on_surface_one, label) in [
+        (c1_first, true, "hermite curve1[0] on face1"),
+        (c1_last, true, "hermite curve1[last] on face1"),
+        (c2_first, false, "hermite curve2[0] on face2"),
+        (c2_last, false, "hermite curve2[last] on face2"),
+    ] {
+        let surf = if on_surface_one { &surface1 } else { &surface2 };
+        let (u, v) = surf.closest_point(&p, endpoint_tol)?;
+        let on_surf = surf.point_at(u, v)?;
+        if (p - on_surf).magnitude() > endpoint_tol.distance() {
+            return Err(OperationError::InvalidGeometry(format!(
+                "create_hermite_blend_surface: {} drifts {:.3e} from surface (tol {:.3e})",
+                label,
+                (p - on_surf).magnitude(),
+                endpoint_tol.distance()
+            )));
+        }
+    }
+
+    // The full Hermite construction would honour `degree` by building a
+    // bicubic-or-higher patch with surface-tangent boundary conditions; the
+    // current pipeline reconstructs a ruled (degree-1) surface and relies on
+    // downstream G1 transition fixups. Surface the requested degree at debug
+    // level so callers can see when their continuity request is degraded.
+    if degree > 1 {
+        tracing::debug!(
+            requested_degree = degree,
+            "create_hermite_blend_surface: degree>1 reduced to ruled (degree=1) until full Hermite patch lands"
+        );
+    }
 
     // Use RuledSurface through the two boundary curves for the blend
     let c1_line = crate::primitives::curve::Line::new(
@@ -291,21 +376,19 @@ fn create_conic_blend_surface(
 ) -> OperationResult<Box<dyn Surface>> {
     use crate::primitives::surface::RuledSurface;
 
-    // Build an intermediate curve at the conic midpoint
-    let mid_points: Vec<Point3> = curve1
-        .iter()
-        .zip(curve2.iter())
-        .map(|(p1, p2)| {
-            // Weighted interpolation: rho controls how far the mid-section
-            // bulges toward the midpoint (rho=0.5 → linear, <0.5 → concave, >0.5 → convex)
-            let mid = Point3::new(
-                p1.x * (1.0 - rho) + p2.x * rho,
-                p1.y * (1.0 - rho) + p2.y * rho,
-                p1.z * (1.0 - rho) + p2.z * rho,
-            );
-            mid
-        })
-        .collect();
+    // A conic blend should bulge along an intermediate ridge controlled by
+    // `rho` (rho=0.5 → linear, <0.5 → concave, >0.5 → convex). The current
+    // surface representation collapses the construction to a plain ruled
+    // surface between the two boundary curves, so the conic shape parameter
+    // does not yet influence patch geometry. Surface the requested rho at
+    // debug level when it deviates meaningfully from the linear midpoint, so
+    // callers see when their conic request has been flattened.
+    if (rho - 0.5).abs() > 1e-3 {
+        tracing::debug!(
+            rho = rho,
+            "create_conic_blend_surface: rho!=0.5 reduced to ruled-linear blend until conic patch lands"
+        );
+    }
 
     // Use RuledSurface between curve1 and curve2 with conic weighting
     // The rho parameter influences the intermediate control, but for a two-curve
