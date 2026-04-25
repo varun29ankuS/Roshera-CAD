@@ -261,14 +261,18 @@ fn group_faces_by_edge(
 
 /// Group faces by neutral face
 fn group_faces_by_face(
-    model: &BRepModel,
-    faces: &[FaceId],
-    neutral_face_id: FaceId,
-    pull_direction: Vector3,
+    _model: &BRepModel,
+    _faces: &[FaceId],
+    _neutral_face_id: FaceId,
+    _pull_direction: Vector3,
 ) -> OperationResult<Vec<FaceGroup>> {
-    // Neutral face boundary defines neutral curves
+    // Neutral face boundary would define neutral curves; not yet wired.
+    // Callers should use NeutralReference::Edge or NeutralReference::Curve
+    // (both supported via group_faces_by_edge / group_faces_by_curve).
     Err(OperationError::NotImplemented(
-        "Draft with neutral face not yet implemented".to_string(),
+        "Draft with NeutralReference::Face is not supported in v1; \
+         use NeutralReference::Edge or NeutralReference::Curve instead"
+            .to_string(),
     ))
 }
 
