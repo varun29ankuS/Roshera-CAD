@@ -3521,4 +3521,155 @@ mod tests {
         // In a manifold configuration, vertex neighborhoods should be disk-like
         // This is not - it's two separate disk neighborhoods touching at a point
     }
+
+    // ========================================================================
+    // BOX FACE ORIENTATION TEST
+    // ------------------------------------------------------------------------
+    // Regression for the create_box_faces orientation bug. For every face of a
+    // box, the outer-loop vertex traversal must produce a polygon whose
+    // right-hand-rule normal points in the same direction as the face's
+    // outward surface normal. Three of the six faces previously produced
+    // degenerate quads (repeated vertex pairs) and three produced inverted
+    // quads (correct vertices, wrong winding).
+    // ========================================================================
+    /// Compute and assert that every face on `solid_id` has its outer-loop
+    /// vertex winding aligned with the surface's outward normal.
+    fn assert_box_face_normals_match_loop_winding(model: &BRepModel, solid_id: u32) {
+        use crate::primitives::surface::Surface;
+
+        let solid = model
+            .solids
+            .get(solid_id)
+            .expect("solid should exist after creation");
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .expect("outer shell should exist");
+        assert_eq!(shell.faces.len(), 6, "box must have exactly 6 faces");
+
+        for &face_id in &shell.faces {
+            let face = model
+                .faces
+                .get(face_id)
+                .expect("face should exist in store");
+            let outer_loop = model
+                .loops
+                .get(face.outer_loop)
+                .expect("outer loop should exist");
+
+            // Pull the loop's vertex chain (this is the same path every
+            // downstream consumer uses).
+            let vertex_ids = outer_loop
+                .vertices_cached(&model.edges)
+                .expect("loop should resolve to a vertex sequence");
+            assert_eq!(
+                vertex_ids.len(),
+                4,
+                "every box face must be a quad (got {} vertices)",
+                vertex_ids.len()
+            );
+
+            // Vertices must be all distinct — the bug produced
+            // [v_a, v_a, v_b, v_b] patterns on three faces.
+            let mut sorted = vertex_ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                4,
+                "face {:?} has duplicate vertices in its outer loop: {:?}",
+                face_id, vertex_ids
+            );
+
+            // Resolve positions.
+            let positions: Vec<Point3> = vertex_ids
+                .iter()
+                .map(|&vid| {
+                    let p = model
+                        .vertices
+                        .get_position(vid)
+                        .expect("vertex should have a position");
+                    Point3::new(p[0], p[1], p[2])
+                })
+                .collect();
+
+            // Newell's method for the polygon normal — robust to
+            // non-planarity but exact for planar quads.
+            let mut nx = 0.0_f64;
+            let mut ny = 0.0_f64;
+            let mut nz = 0.0_f64;
+            for i in 0..positions.len() {
+                let cur = positions[i];
+                let nxt = positions[(i + 1) % positions.len()];
+                nx += (cur.y - nxt.y) * (cur.z + nxt.z);
+                ny += (cur.z - nxt.z) * (cur.x + nxt.x);
+                nz += (cur.x - nxt.x) * (cur.y + nxt.y);
+            }
+            let loop_normal = Vector3::new(nx, ny, nz);
+            let loop_mag = loop_normal.magnitude();
+            assert!(
+                loop_mag > 1e-9,
+                "face {:?} produced a degenerate (zero-area) loop polygon",
+                face_id
+            );
+            let loop_unit = loop_normal * (1.0 / loop_mag);
+
+            // Compare against the surface's outward normal at the face
+            // centroid.
+            let surface = model
+                .surfaces
+                .get(face.surface_id)
+                .expect("face must reference an existing surface");
+            let surf_normal = surface
+                .normal_at(0.0, 0.0)
+                .expect("planar face normal should be defined");
+
+            let dot = loop_unit.x * surf_normal.x
+                + loop_unit.y * surf_normal.y
+                + loop_unit.z * surf_normal.z;
+            assert!(
+                dot > 0.99,
+                "face {:?} loop winding disagrees with outward surface normal \
+                 (loop_normal={:?}, surface_normal={:?}, dot={})",
+                face_id, loop_unit, surf_normal, dot
+            );
+        }
+    }
+
+    /// Verifies the `TopologyBuilder::create_box_3d` path.
+    #[test]
+    fn test_create_box_face_outward_normals_match_loop_winding() {
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+        let mut model = BRepModel::new();
+        let geom_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(2.0, 4.0, 6.0)
+                .expect("box creation should succeed")
+        };
+
+        let solid_id = match geom_id {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid id, got {:?}", other),
+        };
+
+        assert_box_face_normals_match_loop_winding(&model, solid_id);
+    }
+
+    /// Verifies the `BoxPrimitive::create` path (the canonical box constructor
+    /// used by benches and the timeline). Same orientation rules as the
+    /// `TopologyBuilder` path.
+    #[test]
+    fn test_box_primitive_face_outward_normals_match_loop_winding() {
+        use crate::primitives::box_primitive::{BoxParameters, BoxPrimitive};
+        use crate::primitives::primitive_traits::Primitive;
+
+        let mut model = BRepModel::new();
+        let params = BoxParameters::new(2.0, 4.0, 6.0).expect("valid box dimensions");
+        let solid_id =
+            BoxPrimitive::create(params, &mut model).expect("box primitive should construct");
+
+        assert_box_face_normals_match_loop_winding(&model, solid_id);
+    }
 }
