@@ -122,6 +122,75 @@ fn approximate_surface_offset_to_nurbs(
     Ok(GeneralNurbsSurface { nurbs })
 }
 
+/// Refine a `(u, v)` seed for `closest_point` using Newton iteration on the
+/// foot-of-perpendicular condition `(S(u,v) - P) · S_u = 0` and
+/// `(S(u,v) - P) · S_v = 0`.
+///
+/// Stops when the parameter step is below `tolerance.distance()` or after
+/// `max_iters` steps. Each step requires one `evaluate_full` (already costing
+/// derivatives + second derivatives), and the 2×2 Jacobian is solved
+/// analytically. Falls back to the seed if the Hessian is singular.
+///
+/// # References
+/// - Piegl & Tiller, *The NURBS Book* (2nd ed.), §6.1 "Point Inversion".
+/// - Patrikalakis & Maekawa, *Shape Interrogation for CAD* (2002), §5.2.
+fn newton_refine_closest_point(
+    surface: &dyn Surface,
+    target: &Point3,
+    seed_u: f64,
+    seed_v: f64,
+    tolerance: Tolerance,
+    max_iters: usize,
+) -> (f64, f64) {
+    let bounds = surface.parameter_bounds();
+    let (u_min, u_max) = bounds.0;
+    let (v_min, v_max) = bounds.1;
+    let tol = tolerance.distance().max(1.0e-12);
+
+    let mut u = seed_u.clamp(u_min, u_max);
+    let mut v = seed_v.clamp(v_min, v_max);
+
+    for _ in 0..max_iters {
+        let sp = match surface.evaluate_full(u, v) {
+            Ok(p) => p,
+            Err(_) => return (u, v),
+        };
+        let r = sp.position - *target; // residual vector S(u,v) - P
+        // Gradient of f(u,v) = 0.5 |r|² is (r·S_u, r·S_v).
+        let g_u = r.dot(&sp.du);
+        let g_v = r.dot(&sp.dv);
+
+        // Hessian (Gauss-Newton + second-order term):
+        //   H_uu = S_u·S_u + r·S_uu
+        //   H_uv = S_u·S_v + r·S_uv
+        //   H_vv = S_v·S_v + r·S_vv
+        let h_uu = sp.du.dot(&sp.du) + r.dot(&sp.duu);
+        let h_uv = sp.du.dot(&sp.dv) + r.dot(&sp.duv);
+        let h_vv = sp.dv.dot(&sp.dv) + r.dot(&sp.dvv);
+        let det = h_uu * h_vv - h_uv * h_uv;
+        if det.abs() < 1.0e-14 {
+            return (u, v);
+        }
+        // Solve H * step = -g for step.
+        let step_u = (-g_u * h_vv + g_v * h_uv) / det;
+        let step_v = (g_u * h_uv - g_v * h_uu) / det;
+
+        let new_u = (u + step_u).clamp(u_min, u_max);
+        let new_v = (v + step_v).clamp(v_min, v_max);
+        let du_step = new_u - u;
+        let dv_step = new_v - v;
+        u = new_u;
+        v = new_v;
+
+        // Convergence: parameter step small enough that further refinement
+        // contributes less than `tol` to the foot-of-perpendicular distance.
+        if du_step.abs() < tol && dv_step.abs() < tol {
+            break;
+        }
+    }
+    (u, v)
+}
+
 /// Picks a per-axis sample count for offset NURBS approximation as a
 /// function of the requested distance tolerance. Returns a sample count in
 /// the closed range `[8, 64]`; tighter tolerances request denser nets.
@@ -629,14 +698,13 @@ impl Surface for G2BlendingSurface {
         "G2BlendingSurface"
     }
 
-    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Uniform grid search over parameter domain; refined Newton-Raphson
-        // can be added in a future pass. For the clamped biquartic NURBS
-        // produced by `G2BlendingSurface::new` this is sufficient to
-        // identify the closest cell. 20×20 samples cover a tight grid.
+    fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        // Two-stage search: uniform 20×20 grid to seed, then Newton iteration
+        // on (S - P)·S_u = 0, (S - P)·S_v = 0 to refine to `tolerance`.
+        // Piegl & Tiller §6.1.
         let samples = 20;
         let mut best = f64::MAX;
-        let mut best_uv = (0.0_f64, 0.0_f64);
+        let mut seed = (0.0_f64, 0.0_f64);
         for i in 0..=samples {
             for j in 0..=samples {
                 let u = i as f64 / samples as f64;
@@ -645,12 +713,14 @@ impl Surface for G2BlendingSurface {
                     let d2 = sp.position.distance_squared(point);
                     if d2 < best {
                         best = d2;
-                        best_uv = (u, v);
+                        seed = (u, v);
                     }
                 }
             }
         }
-        Ok(best_uv)
+        Ok(newton_refine_closest_point(
+            self, point, seed.0, seed.1, tolerance, 16,
+        ))
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
@@ -846,31 +916,30 @@ impl Surface for CubicG2Blend {
     }
 
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Simplified closest point - production would use Newton-Raphson
+        // Two-stage: 20×20 grid seed in parameter bounds, then Newton on the
+        // foot-of-perpendicular condition (Piegl & Tiller §6.1).
         let bounds = self.parameter_bounds();
         let mut best_dist = f64::MAX;
-        let mut best_u = bounds.0 .0;
-        let mut best_v = bounds.1 .0;
-
-        // Grid search (simplified)
+        let mut seed_u = bounds.0 .0;
+        let mut seed_v = bounds.1 .0;
         let samples = 20;
         for i in 0..=samples {
             for j in 0..=samples {
                 let u = bounds.0 .0 + (bounds.0 .1 - bounds.0 .0) * (i as f64 / samples as f64);
                 let v = bounds.1 .0 + (bounds.1 .1 - bounds.1 .0) * (j as f64 / samples as f64);
-
                 if let Ok(pt) = self.point_at(u, v) {
                     let dist = point.distance(&pt);
                     if dist < best_dist {
                         best_dist = dist;
-                        best_u = u;
-                        best_v = v;
+                        seed_u = u;
+                        seed_v = v;
                     }
                 }
             }
         }
-
-        Ok((best_u, best_v))
+        Ok(newton_refine_closest_point(
+            self, point, seed_u, seed_v, tolerance, 16,
+        ))
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
@@ -1041,31 +1110,31 @@ impl Surface for QuarticG2Blend {
     }
 
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Simplified closest point - production would use Newton-Raphson
+        // Two-stage: 20×20 grid seed, then Newton on the foot-of-perpendicular
+        // condition (Piegl & Tiller §6.1). Quartic surface curvature can be
+        // sharper than cubic, so we also use 16 Newton iterations.
         let bounds = self.parameter_bounds();
         let mut best_dist = f64::MAX;
-        let mut best_u = bounds.0 .0;
-        let mut best_v = bounds.1 .0;
-
-        // Grid search (simplified)
+        let mut seed_u = bounds.0 .0;
+        let mut seed_v = bounds.1 .0;
         let samples = 20;
         for i in 0..=samples {
             for j in 0..=samples {
                 let u = bounds.0 .0 + (bounds.0 .1 - bounds.0 .0) * (i as f64 / samples as f64);
                 let v = bounds.1 .0 + (bounds.1 .1 - bounds.1 .0) * (j as f64 / samples as f64);
-
                 if let Ok(pt) = self.point_at(u, v) {
                     let dist = point.distance(&pt);
                     if dist < best_dist {
                         best_dist = dist;
-                        best_u = u;
-                        best_v = v;
+                        seed_u = u;
+                        seed_v = v;
                     }
                 }
             }
         }
-
-        Ok((best_u, best_v))
+        Ok(newton_refine_closest_point(
+            self, point, seed_u, seed_v, tolerance, 16,
+        ))
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {

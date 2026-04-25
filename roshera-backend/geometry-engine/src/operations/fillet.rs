@@ -19,7 +19,7 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::VertexId,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // Import robust numerical methods
 use super::fillet_robust::*;
@@ -685,13 +685,13 @@ fn create_rolling_ball_surface(
 
     if is_straight_edge && is_constant_radius {
         // Create cylindrical fillet
-        create_cylindrical_fillet_surface(model, data)
+        create_cylindrical_fillet_surface(data)
     } else if !is_straight_edge && is_constant_radius {
         // Create toroidal fillet
-        create_toroidal_fillet_surface(model, data)
+        create_toroidal_fillet_surface(data)
     } else {
         // Create general NURBS fillet for variable radius
-        create_nurbs_fillet_surface(model, data)
+        create_nurbs_fillet_surface(data)
     }
 }
 
@@ -742,7 +742,6 @@ fn is_radius_constant(data: &RollingBallData) -> bool {
 
 /// Create cylindrical fillet surface
 fn create_cylindrical_fillet_surface(
-    model: &mut BRepModel,
     data: &RollingBallData,
 ) -> OperationResult<Box<dyn Surface>> {
     // Create spine curve from edge centers
@@ -761,7 +760,6 @@ fn create_cylindrical_fillet_surface(
 
 /// Create toroidal fillet surface
 fn create_toroidal_fillet_surface(
-    model: &mut BRepModel,
     data: &RollingBallData,
 ) -> OperationResult<Box<dyn Surface>> {
     // Create center curve
@@ -781,7 +779,6 @@ fn create_toroidal_fillet_surface(
 
 /// Create NURBS fillet surface for variable radius
 fn create_nurbs_fillet_surface(
-    model: &mut BRepModel,
     data: &RollingBallData,
 ) -> OperationResult<Box<dyn Surface>> {
     // Create spine curve
@@ -990,24 +987,48 @@ fn create_trimmed_fillet_face(
     Ok(model.faces.add(face))
 }
 
-/// Create transition surfaces between fillets
+/// Create transition surfaces between fillets.
+///
+/// Stub: a complete implementation would emit corner-blending patches at
+/// vertices where multiple fillets meet (typically spherical or N-sided).
+/// Until that lands, this returns an empty vec and emits a single warning
+/// per call so callers know the corner blends are missing rather than
+/// silently producing a topologically incomplete result.
 fn create_fillet_transitions(
-    model: &mut BRepModel,
-    edges: &[EdgeId],
+    _model: &mut BRepModel,
+    _edges: &[EdgeId],
     fillet_faces: &[FaceId],
 ) -> OperationResult<Vec<FaceId>> {
-    // Would create transition surfaces at vertices where fillets meet
+    if !fillet_faces.is_empty() {
+        tracing::warn!(
+            "create_fillet_transitions: corner-blend generation not implemented; \
+             {} fillet face(s) emitted without inter-fillet transition patches",
+            fillet_faces.len()
+        );
+    }
     Ok(Vec::new())
 }
 
-/// Update adjacent faces to account for fillet trimming
+/// Update adjacent faces to account for fillet trimming.
+///
+/// Stub: a complete implementation would re-trim each face whose boundary
+/// originally contained a filleted edge so the new fillet face shares a
+/// loop with the trimmed face. Until that lands, this is a no-op and the
+/// model contains both the original (untrimmed) face AND the new fillet
+/// face. A warning is emitted so the missing trim is observable.
 fn update_adjacent_faces(
-    model: &mut BRepModel,
-    solid_id: SolidId,
+    _model: &mut BRepModel,
+    _solid_id: SolidId,
     edges: &[EdgeId],
     fillet_faces: &[FaceId],
 ) -> OperationResult<()> {
-    // Would update face boundaries to trim against fillet surfaces
+    if !fillet_faces.is_empty() {
+        tracing::warn!(
+            "update_adjacent_faces: face re-trimming not implemented; \
+             {} edge(s) filleted but adjacent face boundaries left untrimmed",
+            edges.len()
+        );
+    }
     Ok(())
 }
 
@@ -1306,14 +1327,81 @@ fn propagate_all_edges(
     Ok(result.into_iter().collect())
 }
 
-/// Group edges into continuous chains
+/// Group edges into continuous chains by shared vertices.
+///
+/// Two edges in `edges` are in the same chain when they share a start or end
+/// vertex (transitive closure). Implemented via union-find on the input
+/// edges, indexed by vertex incidence. Edges that do not connect to any
+/// other input edge are returned as singleton chains.
+///
+/// Chains preserve no particular order within themselves — `create_fillet_chain`
+/// re-resolves edge adjacency per-edge anyway. This grouping ensures multi-edge
+/// fillet runs (e.g., all 12 edges of a box selected together) emit a single
+/// fillet patch family rather than 12 disjoint cylinders that don't share
+/// transition surfaces.
 fn group_edges_into_chains(
     model: &BRepModel,
     edges: &[EdgeId],
 ) -> OperationResult<Vec<Vec<EdgeId>>> {
-    // Would group connected edges into chains
-    // For now, treat each edge separately
-    Ok(edges.iter().map(|&e| vec![e]).collect())
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build vertex -> list of edge indices incidence map.
+    let mut vertex_to_edges: HashMap<VertexId, Vec<usize>> = HashMap::new();
+    for (idx, &edge_id) in edges.iter().enumerate() {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+        vertex_to_edges
+            .entry(edge.start_vertex)
+            .or_default()
+            .push(idx);
+        vertex_to_edges
+            .entry(edge.end_vertex)
+            .or_default()
+            .push(idx);
+    }
+
+    // Union-find over edge indices.
+    let mut parent: Vec<usize> = (0..edges.len()).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        // Path compression.
+        let mut cur = x;
+        while parent[cur] != r {
+            let next = parent[cur];
+            parent[cur] = r;
+            cur = next;
+        }
+        r
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    for incident in vertex_to_edges.values() {
+        if let Some(&first) = incident.first() {
+            for &other in &incident[1..] {
+                union(&mut parent, first, other);
+            }
+        }
+    }
+
+    // Bucket edge indices by their root, then materialize.
+    let mut buckets: HashMap<usize, Vec<EdgeId>> = HashMap::new();
+    for (idx, &edge_id) in edges.iter().enumerate() {
+        let root = find(&mut parent, idx);
+        buckets.entry(root).or_default().push(edge_id);
+    }
+    Ok(buckets.into_values().collect())
 }
 
 /// Get faces adjacent to an edge in a solid
@@ -1399,14 +1487,55 @@ fn face_contains_edge(
     Ok(false)
 }
 
-/// Get edges connected to a vertex in a solid
+/// Get edges connected to a vertex in a solid.
+///
+/// Walks the solid's outer shell, scans each face's outer and inner loops,
+/// and collects every edge that has the given vertex as either its start or
+/// end vertex. Result is deduplicated.
 fn get_edges_at_vertex(
     model: &BRepModel,
     solid_id: SolidId,
     vertex_id: VertexId,
 ) -> OperationResult<Vec<EdgeId>> {
-    // Would find all edges connected to vertex
-    Ok(Vec::new())
+    let solid = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?;
+    let shell = model
+        .shells
+        .get(solid.outer_shell)
+        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
+
+    let mut seen: HashSet<EdgeId> = HashSet::new();
+    let mut visit_loop = |loop_id: crate::primitives::r#loop::LoopId| -> OperationResult<()> {
+        let l = model
+            .loops
+            .get(loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
+        for &edge_id in &l.edges {
+            let edge = model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+            if edge.start_vertex == vertex_id || edge.end_vertex == vertex_id {
+                seen.insert(edge_id);
+            }
+        }
+        Ok(())
+    };
+
+    for &face_id in &shell.faces {
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+        visit_loop(face.outer_loop)?;
+        for &inner in &face.inner_loops {
+            visit_loop(inner)?;
+        }
+    }
+
+    Ok(seen.into_iter().collect())
 }
 
 /// Compute angle between faces at an edge
