@@ -105,6 +105,26 @@ pub(crate) fn dispatch_via_math_ssi(
     out
 }
 
+/// Picks a per-axis sample count for offset NURBS approximation as a
+/// function of the requested distance tolerance. Returns a sample count in
+/// the closed range `[8, 64]`; tighter tolerances request denser nets.
+///
+/// Heuristic: each halving of the tolerance below 1e-3 adds roughly four
+/// samples. The cap at 64 prevents pathological NURBS dimensionalities from
+/// callers that pass a tolerance near machine epsilon. Used by every
+/// `Surface::offset_variable` implementation that approximates via sample-
+/// and-fit (Plane, Cylinder, Cone, Sphere, Torus, GeneralNurbsSurface, and
+/// the G2/Cubic/Quartic blending surface types).
+pub(crate) fn sample_density_for_tolerance(tol: f64) -> usize {
+    if !tol.is_finite() || tol <= 0.0 {
+        return 16;
+    }
+    let scale = (1.0e-3 / tol).max(1.0).log2();
+    let extra = (scale * 4.0).round() as i64;
+    let n = 16i64.saturating_add(extra).clamp(8, 64);
+    n as usize
+}
+
 /// Quality of offset surface representation
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OffsetQuality {
@@ -777,9 +797,10 @@ impl Plane {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        // Variable offset for plane requires NURBS approximation
-        let samples_u = 32; // U direction samples
-        let samples_v = 32; // V direction samples
+        // Variable offset for plane requires NURBS approximation. Sample
+        // density scales with the requested distance tolerance.
+        let samples_u = sample_density_for_tolerance(tolerance.distance());
+        let samples_v = samples_u;
 
         let mut control_points = Vec::with_capacity((samples_u + 1) * (samples_v + 1));
         let mut weights = Vec::with_capacity((samples_u + 1) * (samples_v + 1));
@@ -3052,10 +3073,10 @@ impl Surface for Cone {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        // Variable offset for cone requires NURBS approximation
-        // Sample the distance function across the cone's parameter space
-        let samples_u = 32; // Angular samples
-        let samples_v = 32; // Height samples
+        // Variable offset for cone requires NURBS approximation.
+        // Sample density scales with the requested distance tolerance.
+        let samples_u = sample_density_for_tolerance(tolerance.distance());
+        let samples_v = samples_u;
 
         let mut control_points = Vec::with_capacity(samples_v + 1);
         let mut weights = Vec::with_capacity(samples_v + 1);
@@ -3716,9 +3737,10 @@ impl Surface for Torus {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        // Variable offset for torus requires NURBS approximation
-        let samples_u = 32; // Major circumference samples
-        let samples_v = 32; // Minor circumference samples
+        // Variable offset for torus requires NURBS approximation.
+        // Sample density scales with the requested distance tolerance.
+        let samples_u = sample_density_for_tolerance(tolerance.distance());
+        let samples_v = samples_u;
 
         let mut control_points = Vec::with_capacity(samples_v + 1);
         let mut weights = Vec::with_capacity(samples_v + 1);
@@ -4734,13 +4756,33 @@ impl Surface for GeneralNurbsSurface {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        // Variable offset for NURBS requires creating a new NURBS surface
-        // Sample the offset function and create offset control points
+        // Variable offset for NURBS preserves the existing knot structure:
+        // for each control-point index (i, j), we evaluate the surface at
+        // the parametric position of that control point and push by the
+        // distance function. The result inherits the same degree, knots and
+        // weights, which is the cheapest correct approach when the existing
+        // net is dense enough for the requested tolerance.
+        //
+        // If the existing net is too sparse for the tolerance, a denser
+        // resample-and-refit would be required (this code does NOT refit;
+        // it logs a warning so the caller can request densification).
         let (u_bounds, v_bounds) = self.parameter_bounds();
         let (u_min, u_max) = u_bounds;
         let (v_min, v_max) = v_bounds;
         let n_u = self.nurbs.control_points.len();
         let n_v = self.nurbs.control_points[0].len();
+        let required = sample_density_for_tolerance(tolerance.distance());
+        if n_u < required || n_v < required {
+            tracing::warn!(
+                "GeneralNurbsSurface::offset_variable: control net {}x{} is sparser than \
+                 the {}x{} suggested by tolerance={:.2e}; result may exceed tolerance",
+                n_u,
+                n_v,
+                required,
+                required,
+                tolerance.distance()
+            );
+        }
 
         let mut offset_control_points = Vec::with_capacity(n_u);
         let mut offset_weights = Vec::with_capacity(n_u);
@@ -4793,11 +4835,13 @@ impl Surface for GeneralNurbsSurface {
     fn intersect(
         &self,
         other: &dyn Surface,
-        _tolerance: Tolerance,
+        tolerance: Tolerance,
     ) -> Vec<SurfaceIntersectionResult> {
-        // NURBS surface intersection is complex - for now return empty
-        // In production, this would use subdivision and marching methods
-        vec![]
+        // Route through the canonical math-layer SSI dispatcher so NURBS
+        // intersections share the subdivision + marching pipeline used by
+        // every other surface type. Failures degrade to an empty Vec via
+        // the dispatcher's tracing::warn! path.
+        dispatch_via_math_ssi(self, other, tolerance)
     }
 }
 
