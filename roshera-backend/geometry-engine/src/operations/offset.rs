@@ -384,10 +384,43 @@ fn create_offset_edge(
     forward: bool,
     options: &OffsetOptions,
 ) -> OperationResult<EdgeId> {
+    // Validate that the requested offset distance is geometrically meaningful
+    // relative to the user-supplied tolerance. A near-zero offset would
+    // produce vertices coincident with the source edge, generating a
+    // numerical artifact rather than a real offset.
+    let tol = options.common.tolerance.distance();
+    if !distance.is_finite() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_offset_edge: distance {} is not finite",
+            distance
+        )));
+    }
+    if distance.abs() <= tol {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_offset_edge: |distance|={:.3e} is not greater than tolerance {:.3e}",
+            distance.abs(),
+            tol
+        )));
+    }
+    // Reject offsets that exceed the configured deviation budget — those
+    // approximations would silently degrade surface quality without warning.
+    if options.max_deviation > 0.0 && distance.abs() > options.max_deviation * 1e6 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_offset_edge: distance {:.3e} far exceeds max_deviation {:.3e}",
+            distance, options.max_deviation,
+        )));
+    }
+    // Honor the caller's direction preference: forward=false flips the offset
+    // sign so callers can request either side of the source curve.
+    let signed_distance = if forward { distance } else { -distance };
+
     let edge = model
         .edges
         .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+        .ok_or_else(|| OperationError::InvalidGeometry(format!(
+            "create_offset_edge: edge {} not found",
+            edge_id
+        )))?
         .clone();
 
     // Get edge curve
@@ -396,8 +429,9 @@ fn create_offset_edge(
         .get(edge.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
 
-    // Create offset curve
-    let offset_curve = create_offset_curve(curve, surface_id, distance)?;
+    // Create offset curve along the requested side (signed distance honors
+    // forward=false by flipping the side of the source curve).
+    let offset_curve = create_offset_curve(curve, surface_id, signed_distance)?;
     let curve_id = model.curves.add(offset_curve);
 
     // Create offset vertices
@@ -409,19 +443,19 @@ fn create_offset_edge(
         .get(surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
-    // Offset vertices along surface normal
+    // Offset vertices along surface normal (signed by forward flag)
     let start_normal = compute_surface_normal_at_point(surface, start_pos)?;
     let end_normal = compute_surface_normal_at_point(surface, end_pos)?;
 
     let offset_start = model.vertices.add(
-        start_pos.x + start_normal.x * distance,
-        start_pos.y + start_normal.y * distance,
-        start_pos.z + start_normal.z * distance,
+        start_pos.x + start_normal.x * signed_distance,
+        start_pos.y + start_normal.y * signed_distance,
+        start_pos.z + start_normal.z * signed_distance,
     );
     let offset_end = model.vertices.add(
-        end_pos.x + end_normal.x * distance,
-        end_pos.y + end_normal.y * distance,
-        end_pos.z + end_normal.z * distance,
+        end_pos.x + end_normal.x * signed_distance,
+        end_pos.y + end_normal.y * signed_distance,
+        end_pos.z + end_normal.z * signed_distance,
     );
 
     // Create new edge

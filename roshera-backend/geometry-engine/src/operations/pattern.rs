@@ -435,7 +435,13 @@ fn generate_curve_transforms(pattern: &CurvePattern) -> OperationResult<Vec<Matr
     Ok(transforms)
 }
 
-/// Create a single pattern instance
+/// Create a single pattern instance.
+///
+/// Generates a transformed copy of every source face. Honors
+/// `options.skip_interferences`: if the freshly minted instance overlaps
+/// itself (which can happen for near-zero spacings or rotation patterns
+/// near a fixed point), drop the instance and emit a diagnostic instead
+/// of producing degenerate topology.
 fn create_pattern_instance(
     model: &mut BRepModel,
     source_features: &[FaceId],
@@ -443,11 +449,28 @@ fn create_pattern_instance(
     instance_index: usize,
     options: &PatternOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    let mut instance_faces = Vec::new();
+    let mut instance_faces = Vec::with_capacity(source_features.len());
 
     for &face_id in source_features {
         let transformed_face = transform_face(model, face_id, transform)?;
         instance_faces.push(transformed_face);
+    }
+
+    // Self-interference check: pattern instance whose own faces overlap
+    // each other in 3-space cannot represent valid solid geometry.
+    if options.skip_interferences && check_interference(model, &instance_faces)? {
+        tracing::warn!(
+            instance_index = instance_index,
+            tolerance = options.common.tolerance.distance(),
+            "create_pattern_instance: instance {} self-interferes; skipping per options.skip_interferences",
+            instance_index
+        );
+        // Roll back the just-added faces? They were already pushed into the
+        // model store. Caller treats an empty Vec as "skip this instance"
+        // and the orphaned faces remain unreferenced (garbage-collected
+        // when the model is later compacted). This matches the contract
+        // documented above check_interference.
+        return Ok(Vec::new());
     }
 
     Ok(instance_faces)
@@ -661,21 +684,40 @@ fn merge_pattern_geometry(
     Ok(())
 }
 
-/// Validate pattern inputs
+/// Validate pattern inputs.
+///
+/// Source features must exist in the model and pattern parameters must be
+/// finite + non-degenerate. Spacings are checked against
+/// `options.common.tolerance.distance()` rather than hard-coded literals so
+/// the user-supplied tolerance drives the "too small to matter" cutoff.
 fn validate_pattern_inputs(
     model: &BRepModel,
     source_features: &[FaceId],
     pattern_type: &PatternType,
     options: &PatternOptions,
 ) -> OperationResult<()> {
+    // Empty source list: no faces to pattern, hard error rather than
+    // silently producing zero results.
+    if source_features.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "validate_pattern_inputs: source_features is empty".to_string(),
+        ));
+    }
+
     // Check source features exist
     for &face_id in source_features {
         if model.faces.get(face_id).is_none() {
-            return Err(OperationError::InvalidGeometry(
-                "Source face not found".to_string(),
-            ));
+            return Err(OperationError::InvalidGeometry(format!(
+                "validate_pattern_inputs: source face {} not found",
+                face_id
+            )));
         }
     }
+
+    // The user's tolerance drives the lower bound for spacings and
+    // direction magnitudes — anything smaller would produce coincident
+    // instances or undefined directions.
+    let tol = options.common.tolerance.distance();
 
     // Validate pattern parameters
     match pattern_type {
@@ -689,15 +731,18 @@ fn validate_pattern_inputs(
                     "Pattern count must be at least 1".to_string(),
                 ));
             }
-            if *spacing <= 0.0 {
-                return Err(OperationError::InvalidPattern(
-                    "Pattern spacing must be positive".to_string(),
-                ));
+            if !spacing.is_finite() || *spacing <= tol {
+                return Err(OperationError::InvalidPattern(format!(
+                    "Linear pattern spacing {:.3e} not greater than tolerance {:.3e}",
+                    spacing, tol
+                )));
             }
-            if direction.magnitude() < 1e-10 {
-                return Err(OperationError::InvalidPattern(
-                    "Invalid pattern direction".to_string(),
-                ));
+            if direction.magnitude() <= tol {
+                return Err(OperationError::InvalidPattern(format!(
+                    "Linear pattern direction magnitude {:.3e} not greater than tolerance {:.3e}",
+                    direction.magnitude(),
+                    tol
+                )));
             }
         }
         PatternType::Circular {
@@ -711,10 +756,13 @@ fn validate_pattern_inputs(
                     "Pattern count must be at least 1".to_string(),
                 ));
             }
-            if axis_direction.magnitude() < 1e-10 {
-                return Err(OperationError::InvalidPattern(
-                    "Invalid axis direction".to_string(),
-                ));
+            if axis_direction.magnitude() <= tol {
+                return Err(OperationError::InvalidPattern(format!(
+                    "Circular pattern axis_direction magnitude {:.3e} \
+                     not greater than tolerance {:.3e}",
+                    axis_direction.magnitude(),
+                    tol
+                )));
             }
         }
         PatternType::Rectangular(rect) => {
@@ -723,10 +771,15 @@ fn validate_pattern_inputs(
                     "Pattern counts must be at least 1".to_string(),
                 ));
             }
-            if rect.spacing1 <= 0.0 || rect.spacing2 <= 0.0 {
-                return Err(OperationError::InvalidPattern(
-                    "Pattern spacings must be positive".to_string(),
-                ));
+            if !rect.spacing1.is_finite()
+                || !rect.spacing2.is_finite()
+                || rect.spacing1 <= tol
+                || rect.spacing2 <= tol
+            {
+                return Err(OperationError::InvalidPattern(format!(
+                    "Rectangular spacings ({:.3e}, {:.3e}) must both exceed tolerance {:.3e}",
+                    rect.spacing1, rect.spacing2, tol
+                )));
             }
         }
         _ => {} // Other types validated during generation
