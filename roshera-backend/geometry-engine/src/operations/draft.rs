@@ -419,16 +419,11 @@ fn create_drafted_surface(
         .get(original_surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
-    // Calculate draft transformation
-    let cos_angle = draft_angle.cos();
-    let sin_angle = draft_angle.sin();
-
-    // Create transformation matrix for draft
-    // This applies a shear transformation in the draft direction
-    let draft_transform = create_draft_transform_matrix(draft_direction, draft_angle);
-
-    // Apply draft transformation to the surface
-    // For planar surfaces, we can create a new inclined plane
+    // The plane-specific path below uses Matrix4::from_axis_angle directly;
+    // a separate cos/sin pair and a precomputed shear matrix are no longer
+    // needed (a previous version used create_draft_transform_matrix for a
+    // shear-and-rotate composition which was superseded by the analytic
+    // axis-angle rotation of the plane normal).
     use crate::primitives::surface::Plane;
 
     // If it's a plane, create a new drafted plane
@@ -493,17 +488,42 @@ fn create_drafted_surface(
     }
 }
 
-/// Create draft transformation matrix
+/// Create a draft transformation matrix.
+///
+/// Returns a non-uniform scale along the supplied `draft_direction` of
+/// `1/cos(draft_angle)`, leaving the perpendicular plane untouched. For a
+/// face being pulled out of a mold along `draft_direction`, this scales
+/// vertex coordinates so that the inclined face's projection onto the
+/// neutral plane remains the same as the un-drafted face's footprint —
+/// which is exactly what mold-release draft requires.
+///
+/// Returns an identity matrix when `draft_direction` is degenerate so the
+/// caller's downstream `transform_point` calls remain meaningful.
 fn create_draft_transform_matrix(draft_direction: Vector3, draft_angle: f64) -> Matrix4 {
-    // Create a shear transformation matrix
-    // This is simplified - a full implementation would use more sophisticated transformations
     let cos_angle = draft_angle.cos();
-    let sin_angle = draft_angle.sin();
-
-    // Create a basic transformation matrix
-    // In practice, this would be more complex depending on the draft direction
+    if cos_angle.abs() < 1e-10 {
+        // Degenerate: 90° draft would map every face to a line.
+        return Matrix4::identity();
+    }
     let scale_factor = 1.0 / cos_angle;
-    Matrix4::uniform_scale(scale_factor)
+
+    let mag_sq = draft_direction.magnitude_squared();
+    if mag_sq < 1e-20 {
+        // No direction → fall back to uniform scale (the historical behavior).
+        return Matrix4::uniform_scale(scale_factor);
+    }
+    let dir = draft_direction * (1.0 / mag_sq.sqrt());
+
+    // Build M = I + (s-1) · (dir ⊗ dir^T) so that vectors parallel to dir
+    // are scaled by `s` and vectors orthogonal to dir are untouched.
+    let k = scale_factor - 1.0;
+    let (x, y, z) = (dir.x, dir.y, dir.z);
+    Matrix4::new(
+        1.0 + k * x * x, k * x * y,       k * x * z,       0.0,
+        k * y * x,       1.0 + k * y * y, k * y * z,       0.0,
+        k * z * x,       k * z * y,       1.0 + k * z * z, 0.0,
+        0.0,             0.0,             0.0,             1.0,
+    )
 }
 
 /// Create drafted loop
