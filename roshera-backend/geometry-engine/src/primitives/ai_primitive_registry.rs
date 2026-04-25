@@ -11,23 +11,18 @@
 //! 4. Context aware: learns from usage patterns
 //! 5. Schema-driven: machine-readable parameter descriptions and constraints
 
-use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
     edge::EdgeId,
     face::FaceId,
-    primitive_traits::{
-        ParameterDefinition, ParameterSchema, ParameterType, Primitive, PrimitiveError,
-        ValidationReport, ValueConstraint,
-    },
+    primitive_traits::{ParameterSchema, Primitive, PrimitiveError, ValidationReport},
     solid::SolidId,
-    topology_builder::{BRepModel, PrimitiveOptions},
+    topology_builder::BRepModel,
     vertex::VertexId,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
@@ -1717,7 +1712,7 @@ impl PrimitiveRegistry {
     /// AI learning endpoint - submit successful commands for optimization (production DashMap implementation)
     pub fn learn_from_success(command: &str, response: &AIResponse) {
         let registry = Self::global();
-        if let Ok(mut registry) = registry.try_lock() {
+        if let Ok(registry) = registry.try_lock() {
             // Parse the command first
             let parsed_result = registry.parse_natural_language(command);
 

@@ -8,17 +8,17 @@
 //! - Pham, B. (1992). Offset curves and surfaces: a brief survey. CAD.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
-    edge::{Edge, EdgeId, EdgeOrientation},
-    face::{Face, FaceId, FaceOrientation},
+    edge::{Edge, EdgeId},
+    face::{Face, FaceId},
     r#loop::Loop,
     shell::{Shell, ShellType},
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex,
 };
 
 /// Options for offset operations

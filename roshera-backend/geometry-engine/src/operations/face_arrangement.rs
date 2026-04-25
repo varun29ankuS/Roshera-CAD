@@ -31,7 +31,7 @@
 //! - Piegl & Tiller (1997). *The NURBS Book*, §17 (trimmed-surface face
 //!   construction).
 
-use super::boolean::{EdgeType, GraphEdge, IntersectionGraph};
+use super::boolean::{GraphEdge, IntersectionGraph};
 use super::{OperationError, OperationResult};
 use crate::math::{Tolerance, Vector3};
 use crate::primitives::{

@@ -6,17 +6,16 @@
 use crate::{
     math::{consts, Point3, Vector3},
     primitives::{
-        curve::{Arc, Circle, CurveId, ParameterRange},
-        edge::{Edge, EdgeId, EdgeOrientation},
-        face::{Face, FaceId, FaceOrientation},
+        curve::{Arc, Circle, ParameterRange},
+        edge::{Edge, EdgeOrientation},
+        face::{Face, FaceOrientation},
         primitive_traits::PrimitiveError,
-        r#loop::{Loop, LoopId, LoopType},
-        shell::{Shell, ShellId, ShellType},
+        r#loop::{Loop, LoopType},
+        shell::{Shell, ShellType},
         solid::{Solid, SolidId},
-        surface::{Plane, SurfaceId, Torus},
+        surface::Torus,
         topology_builder::BRepModel,
         topology_builder::TopologyBuilder,
-        vertex::VertexId,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -130,7 +129,7 @@ pub struct TorusPrimitive;
 impl TorusPrimitive {
     /// Create a torus with B-Rep topology
     pub fn create(params: &TorusParameters, model: &mut BRepModel) -> PrimitiveResult<SolidId> {
-        let mut builder = TopologyBuilder::new(model);
+        let builder = TopologyBuilder::new(model);
 
         // Create reference directions
         let ref_dir = params.axis.perpendicular();

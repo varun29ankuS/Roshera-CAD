@@ -3,15 +3,14 @@
 //! Computes intersections between various geometric entities including
 //! curve-curve, curve-surface, and surface-surface intersections.
 
-use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{MathResult, Matrix4, Point3, Tolerance, Vector3};
+use super::{OperationError, OperationResult};
+use crate::math::{MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Arc, Curve, Line},
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     surface::{Cylinder, Sphere, Surface, SurfaceType},
     topology_builder::BRepModel,
-    vertex::VertexId,
 };
 
 /// Default tolerance for parametric comparisons
@@ -1650,7 +1649,7 @@ fn intersect_plane_plane(
 
         if dist < tolerance.distance() {
             // Planes are coincident - return surface intersection
-            let mut boundary_curves = Vec::new();
+            let boundary_curves = Vec::new();
 
             // For now, return the bounds as a rectangular boundary
             // In a full implementation, we'd compute the actual intersection of the bounded regions

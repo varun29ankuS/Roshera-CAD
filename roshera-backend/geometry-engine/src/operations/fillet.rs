@@ -14,11 +14,10 @@ use crate::primitives::{
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     fillet_surfaces::{CylindricalFillet, SphericalFillet, ToroidalFillet, VariableRadiusFillet},
-    r#loop::Loop,
     solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 use std::collections::HashSet;
 
@@ -832,8 +831,6 @@ fn compute_fillet_trim_curves(
     face1_id: FaceId,
     face2_id: FaceId,
 ) -> OperationResult<(Vec<Point3>, Vec<Point3>)> {
-    use crate::math::surface_intersection::intersection_curve_to_nurbs;
-    // use crate::math::tolerance::NORMAL_TOLERANCE;
 
     // For trim curve computation, we use the contact curves from the rolling ball data
     // The actual fillet surface is created separately

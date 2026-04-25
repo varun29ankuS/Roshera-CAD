@@ -5,7 +5,7 @@
 //! numerical instabilities.
 
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
-use crate::primitives::curve::{Line, NurbsCurve, ParameterRange};
+use crate::primitives::curve::NurbsCurve;
 use crate::primitives::edge::Edge;
 use crate::primitives::face::Face;
 use crate::primitives::surface::{RuledSurface, Surface};
@@ -478,7 +478,7 @@ fn build_cubic_transition(
     // Row 2: position - (1/3) * tangent at boundary 2
     // Row 3: position on boundary 2
     let mut control_points = vec![Vec::with_capacity(n); 4];
-    let mut weights = vec![vec![1.0; n]; 4];
+    let weights = vec![vec![1.0; n]; 4];
 
     for i in 0..n {
         let p0 = pts1[i];

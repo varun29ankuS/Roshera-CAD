@@ -10,19 +10,19 @@
 //! - Topology fingerprinting and comparison
 //! - Multi-resolution topology representations
 
-use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{consts, MathError, MathResult, Point3, Tolerance};
 use crate::primitives::{
     curve::CurveStore,
-    edge::{Edge, EdgeId, EdgeStore},
-    face::{Face, FaceId, FaceStore},
+    edge::{EdgeId, EdgeStore},
+    face::{FaceId, FaceStore},
     r#loop::{Loop, LoopId, LoopStore},
     shell::{Shell, ShellId, ShellStore, ShellType},
-    solid::{Solid, SolidId, SolidStore},
+    solid::SolidStore,
     surface::SurfaceStore,
     vertex::{VertexId, VertexStore},
 };
 use rayon::prelude::*;
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
