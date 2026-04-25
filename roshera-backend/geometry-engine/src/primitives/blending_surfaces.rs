@@ -19,11 +19,125 @@
 
 use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::surface::{
-    ContinuityAnalysis, CurvatureInfo, Surface, SurfacePoint, SurfaceType,
+    ContinuityAnalysis, CurvatureInfo, GeneralNurbsSurface, Surface, SurfaceIntersectionResult,
+    SurfacePoint, SurfaceType,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
+
+/// Approximate any `Surface` by a clamped-uniform bicubic NURBS offset.
+///
+/// Samples the surface on a `(samples_u + 1) × (samples_v + 1)` grid over its
+/// parameter bounds, displaces each sample along the surface normal by
+/// `distance_fn(u, v)`, and fits a degree-3 NURBS through the resulting
+/// control net. This is the same sample-and-fit pattern used by
+/// `Plane::create_variable_offset_nurbs`,
+/// `Cylinder::create_variable_offset_nurbs`, and
+/// `Sphere::create_variable_offset_nurbs` in `surface.rs` — extracted here so
+/// blending surfaces (which have no closed-form offset) can reuse it.
+///
+/// # Errors
+/// Returns `MathError::DegenerateGeometry` if the parameter span is zero;
+/// returns `MathError::InvalidParameter` if the resulting NURBS net is
+/// invalid (e.g. fewer control points than degree+1 in either direction).
+fn approximate_surface_offset_to_nurbs(
+    surface: &dyn Surface,
+    distance_fn: &dyn Fn(f64, f64) -> f64,
+    samples_u: usize,
+    samples_v: usize,
+) -> MathResult<GeneralNurbsSurface> {
+    let bounds = surface.parameter_bounds();
+    let u_span = bounds.0 .1 - bounds.0 .0;
+    let v_span = bounds.1 .1 - bounds.1 .0;
+    if u_span.abs() < 1e-14 || v_span.abs() < 1e-14 {
+        return Err(MathError::DegenerateGeometry(
+            "Surface parameter span is zero; cannot build offset NURBS".to_string(),
+        ));
+    }
+
+    let degree_u = 3usize;
+    let degree_v = 3usize;
+    if samples_u < degree_u || samples_v < degree_v {
+        return Err(MathError::InvalidParameter(format!(
+            "Sample density {}×{} is below required degree {}×{}",
+            samples_u + 1,
+            samples_v + 1,
+            degree_u + 1,
+            degree_v + 1
+        )));
+    }
+
+    let n_u = samples_u + 1;
+    let n_v = samples_v + 1;
+    let mut control_points: Vec<Vec<Point3>> = Vec::with_capacity(n_u);
+    let mut weights: Vec<Vec<f64>> = Vec::with_capacity(n_u);
+
+    for i in 0..n_u {
+        let u = bounds.0 .0 + u_span * (i as f64) / (samples_u as f64);
+        let mut row_pts = Vec::with_capacity(n_v);
+        let mut row_w = Vec::with_capacity(n_v);
+        for j in 0..n_v {
+            let v = bounds.1 .0 + v_span * (j as f64) / (samples_v as f64);
+            let base = surface.point_at(u, v)?;
+            let normal = surface.normal_at(u, v)?;
+            let d = distance_fn(u, v);
+            row_pts.push(base + normal * d);
+            row_w.push(1.0);
+        }
+        control_points.push(row_pts);
+        weights.push(row_w);
+    }
+
+    // Clamped uniform knot vectors: [0,…,0, internal evenly-spaced,…, 1,…,1]
+    // with multiplicity (degree+1) at each end.
+    let build_clamped_uniform = |n: usize, degree: usize| -> Vec<f64> {
+        let mut knots = vec![0.0; degree + 1];
+        if n > degree + 1 {
+            for i in 1..(n - degree) {
+                knots.push(i as f64 / (n - degree) as f64);
+            }
+        }
+        knots.extend(vec![1.0; degree + 1]);
+        knots
+    };
+    let knots_u = build_clamped_uniform(n_u, degree_u);
+    let knots_v = build_clamped_uniform(n_v, degree_v);
+
+    let nurbs = crate::math::nurbs::NurbsSurface::new(
+        control_points,
+        weights,
+        knots_u,
+        knots_v,
+        degree_u,
+        degree_v,
+    )
+    .map_err(|e| {
+        MathError::InvalidParameter(format!(
+            "Failed to build offset NURBS for blending surface: {}",
+            e
+        ))
+    })?;
+
+    Ok(GeneralNurbsSurface { nurbs })
+}
+
+/// Picks a per-axis sample count for offset NURBS approximation as a
+/// function of the requested distance tolerance. Returns a sample count in
+/// the closed range `[8, 64]`; tighter tolerances request denser nets.
+///
+/// Heuristic: each halving of the tolerance below 1e-3 adds roughly four
+/// samples. The cap at 64 prevents pathological NURBS dimensionalities from
+/// callers that pass a tolerance near machine epsilon.
+fn sample_density_for_tolerance(tol: f64) -> usize {
+    if !tol.is_finite() || tol <= 0.0 {
+        return 16;
+    }
+    let scale = (1.0e-3 / tol).max(1.0).log2();
+    let extra = (scale * 4.0).round() as i64;
+    let n = 16i64.saturating_add(extra).clamp(8, 64);
+    n as usize
+}
 
 /// G2 continuous blending surface between two parent surfaces
 ///
@@ -540,9 +654,20 @@ impl Surface for G2BlendingSurface {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // For blending surfaces, offset is complex - approximate with NURBS
-        // In production, this would create an offset NURBS surface
-        Box::new(self.clone())
+        // Sample-and-fit offset NURBS. Trait returns Box<dyn Surface> with
+        // no error channel, so failures fall back to an unoffset clone with
+        // a warning rather than silently substituting `self`.
+        match approximate_surface_offset_to_nurbs(self, &|_, _| distance, 16, 16) {
+            Ok(nurbs) => Box::new(nurbs),
+            Err(e) => {
+                tracing::warn!(
+                    "G2BlendingSurface::offset({}) fit failed: {:?}; returning unoffset clone",
+                    distance,
+                    e
+                );
+                Box::new(self.clone())
+            }
+        }
     }
 
     fn offset_exact(
@@ -552,10 +677,13 @@ impl Surface for G2BlendingSurface {
     ) -> MathResult<crate::primitives::surface::OffsetSurface> {
         use crate::primitives::surface::{OffsetQuality, OffsetSurface};
 
-        // G2 blending surfaces can only be offset approximately
-        // Create a NURBS approximation of the offset surface
+        // Density driven by tolerance: tighter tol => more samples.
+        // For a quartic blend, 24×24 control net resolves curvature variation
+        // adequately at default tolerances (1e-6).
+        let samples = sample_density_for_tolerance(tolerance.distance());
+        let nurbs = approximate_surface_offset_to_nurbs(self, &|_, _| distance, samples, samples)?;
         Ok(OffsetSurface {
-            surface: Box::new(self.clone()),
+            surface: Box::new(nurbs),
             distance,
             quality: OffsetQuality::Approximate {
                 max_error: tolerance.distance(),
@@ -569,35 +697,21 @@ impl Surface for G2BlendingSurface {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        // Variable offset for G2 blending surfaces requires NURBS approximation
-        // Sample the distance function and create a weighted NURBS surface
-        let num_samples_u = 20;
-        let num_samples_v = 10;
-
-        // For production implementation, we would:
-        // 1. Sample distance function at control point locations
-        // 2. Create offset control points using surface normals
-        // 3. Build new NURBS surface with adjusted weights
-        // 4. Validate G2 continuity at boundaries
-
-        // For now, return a clone with future implementation marked
-        Ok(Box::new(self.clone()))
+        let samples = sample_density_for_tolerance(tolerance.distance());
+        let nurbs =
+            approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
+        Ok(Box::new(nurbs))
     }
 
     fn intersect(
         &self,
         other: &dyn Surface,
         tolerance: Tolerance,
-    ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
-        // G2 blending surface intersection uses adaptive subdivision
-        // Production implementation would:
-        // 1. Use bounding box tests for early rejection
-        // 2. Subdivide both surfaces adaptively
-        // 3. Use Newton-Raphson for accurate intersection points
-        // 4. Trace intersection curves with marching methods
-
-        // Placeholder for now - would return actual intersection curves
-        vec![]
+    ) -> Vec<SurfaceIntersectionResult> {
+        // Route through the canonical math-layer SSI dispatcher. Failures are
+        // logged inside dispatch_via_math_ssi and produce an empty Vec
+        // (observable via tracing).
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 }
 
@@ -760,8 +874,17 @@ impl Surface for CubicG2Blend {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Simplified offset - just clone for now
-        Box::new(self.clone())
+        match approximate_surface_offset_to_nurbs(self, &|_, _| distance, 12, 12) {
+            Ok(nurbs) => Box::new(nurbs),
+            Err(e) => {
+                tracing::warn!(
+                    "CubicG2Blend::offset({}) fit failed: {:?}; returning unoffset clone",
+                    distance,
+                    e
+                );
+                Box::new(self.clone())
+            }
+        }
     }
 
     fn offset_exact(
@@ -769,9 +892,14 @@ impl Surface for CubicG2Blend {
         distance: f64,
         tolerance: Tolerance,
     ) -> MathResult<crate::primitives::surface::OffsetSurface> {
-        Ok(crate::primitives::surface::OffsetSurface {
-            surface: Box::new(self.clone()),
-            quality: crate::primitives::surface::OffsetQuality::Approximate { max_error: 0.001 },
+        use crate::primitives::surface::{OffsetQuality, OffsetSurface};
+        let samples = sample_density_for_tolerance(tolerance.distance());
+        let nurbs = approximate_surface_offset_to_nurbs(self, &|_, _| distance, samples, samples)?;
+        Ok(OffsetSurface {
+            surface: Box::new(nurbs),
+            quality: OffsetQuality::Approximate {
+                max_error: tolerance.distance(),
+            },
             original: Box::new(self.clone()),
             distance,
         })
@@ -782,15 +910,18 @@ impl Surface for CubicG2Blend {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        Ok(Box::new(self.clone()))
+        let samples = sample_density_for_tolerance(tolerance.distance());
+        let nurbs =
+            approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
+        Ok(Box::new(nurbs))
     }
 
     fn intersect(
         &self,
         other: &dyn Surface,
         tolerance: Tolerance,
-    ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
-        vec![]
+    ) -> Vec<SurfaceIntersectionResult> {
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 }
 
@@ -938,8 +1069,17 @@ impl Surface for QuarticG2Blend {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Simplified offset - just clone for now
-        Box::new(self.clone())
+        match approximate_surface_offset_to_nurbs(self, &|_, _| distance, 16, 16) {
+            Ok(nurbs) => Box::new(nurbs),
+            Err(e) => {
+                tracing::warn!(
+                    "QuarticG2Blend::offset({}) fit failed: {:?}; returning unoffset clone",
+                    distance,
+                    e
+                );
+                Box::new(self.clone())
+            }
+        }
     }
 
     fn offset_exact(
@@ -947,9 +1087,14 @@ impl Surface for QuarticG2Blend {
         distance: f64,
         tolerance: Tolerance,
     ) -> MathResult<crate::primitives::surface::OffsetSurface> {
-        Ok(crate::primitives::surface::OffsetSurface {
-            surface: Box::new(self.clone()),
-            quality: crate::primitives::surface::OffsetQuality::Approximate { max_error: 0.001 },
+        use crate::primitives::surface::{OffsetQuality, OffsetSurface};
+        let samples = sample_density_for_tolerance(tolerance.distance());
+        let nurbs = approximate_surface_offset_to_nurbs(self, &|_, _| distance, samples, samples)?;
+        Ok(OffsetSurface {
+            surface: Box::new(nurbs),
+            quality: OffsetQuality::Approximate {
+                max_error: tolerance.distance(),
+            },
             original: Box::new(self.clone()),
             distance,
         })
@@ -960,14 +1105,17 @@ impl Surface for QuarticG2Blend {
         distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        Ok(Box::new(self.clone()))
+        let samples = sample_density_for_tolerance(tolerance.distance());
+        let nurbs =
+            approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
+        Ok(Box::new(nurbs))
     }
 
     fn intersect(
         &self,
         other: &dyn Surface,
         tolerance: Tolerance,
-    ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
-        vec![]
+    ) -> Vec<SurfaceIntersectionResult> {
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 }

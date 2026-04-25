@@ -47,7 +47,7 @@ pub enum SurfaceIntersectionResult {
 /// and degrades to an empty vector. This replaces the previous silent
 /// `_ => vec![]` fallthrough in analytical primitive dispatchers, so failures
 /// become observable without changing the trait signature.
-fn dispatch_via_math_ssi(
+pub(crate) fn dispatch_via_math_ssi(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
     tolerance: Tolerance,
