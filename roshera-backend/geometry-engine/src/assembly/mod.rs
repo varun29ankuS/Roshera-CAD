@@ -68,6 +68,15 @@ pub struct Assembly {
     exploded_config: Option<ExplodedViewConfig>,
     /// Motion limits for moving parts
     motion_limits: Arc<DashMap<ComponentId, MotionLimits>>,
+    /// Persistent neutral-pose transforms for kinematic mates that
+    /// require a fixed reference frame (Gear). Captured at the moment
+    /// the mate is created and never overwritten — distinct from the
+    /// solver's `initial_transforms`, which is reseeded from the
+    /// current state on every relaxation pass.
+    ///
+    /// Keyed by `MateId`; values are `(neutral_transform_for_component1,
+    /// neutral_transform_for_component2)`.
+    gear_neutrals: Arc<DashMap<MateId, (Matrix4, Matrix4)>>,
 }
 
 /// Component in an assembly (part instance)
@@ -243,6 +252,7 @@ impl Assembly {
             root_component: None,
             exploded_config: None,
             motion_limits: Arc::new(DashMap::new()),
+            gear_neutrals: Arc::new(DashMap::new()),
         }
     }
 
@@ -351,6 +361,24 @@ impl Assembly {
 
         self.mates.insert(id, mate);
 
+        // For Gear mates, capture the components' current transforms as
+        // the persistent neutral pose. This must be frozen at mate
+        // creation; the solver's `initial_transforms` is reseeded each
+        // solve pass and would otherwise erase the gear reference.
+        if matches!(mate_type, MateType::Gear { .. }) {
+            let t1 = self
+                .components
+                .get(&component1)
+                .map(|c| c.transform.clone())
+                .unwrap_or(Matrix4::IDENTITY);
+            let t2 = self
+                .components
+                .get(&component2)
+                .map(|c| c.transform.clone())
+                .unwrap_or(Matrix4::IDENTITY);
+            self.gear_neutrals.insert(id, (t1, t2));
+        }
+
         // Solve the constraint system immediately so the assembly state
         // reflects the new mate. The solver tolerates mates whose named
         // references are not yet registered on their components (common
@@ -386,6 +414,14 @@ impl Assembly {
             if component.is_fixed {
                 solver.fixed_components.insert(component.id);
             }
+        }
+
+        // Copy persistent gear-neutral transforms (frozen at mate
+        // creation, never overwritten by solve passes).
+        for entry in self.gear_neutrals.iter() {
+            solver
+                .gear_neutrals
+                .insert(*entry.key(), entry.value().clone());
         }
 
         // Register active mates with pre-resolved local-frame references.
@@ -680,6 +716,9 @@ struct ConstraintSolver {
     component_dof: HashMap<ComponentId, u8>,
     initial_transforms: HashMap<ComponentId, Matrix4>,
     fixed_components: HashSet<ComponentId>,
+    /// Per-mate persistent neutral transforms (Gear). See
+    /// `Assembly::gear_neutrals`.
+    gear_neutrals: HashMap<MateId, (Matrix4, Matrix4)>,
 }
 
 /// Maximum Gauss-Seidel iterations before the solver gives up.
@@ -696,6 +735,7 @@ impl ConstraintSolver {
             component_dof: HashMap::new(),
             initial_transforms: HashMap::new(),
             fixed_components: HashSet::new(),
+            gear_neutrals: HashMap::new(),
         }
     }
 
@@ -875,7 +915,15 @@ impl ConstraintSolver {
         // Compute the correction transform (in world space) that, when
         // pre-multiplied onto the movable component's current transform,
         // brings it into compliance with the constraint.
-        let correction = match compute_correction(c, &t1, &t2, ref1, ref2, movable) {
+        let correction = match compute_correction(
+            c,
+            &t1,
+            &t2,
+            ref1,
+            ref2,
+            movable,
+            &self.gear_neutrals,
+        ) {
             Ok(Some(delta)) => delta,
             Ok(None) => {
                 return ConstraintOutcome::Satisfied {
@@ -1016,6 +1064,7 @@ fn compute_correction(
     ref1: &MateReference,
     ref2: &MateReference,
     movable: ComponentId,
+    gear_neutrals: &HashMap<MateId, (Matrix4, Matrix4)>,
 ) -> Result<Option<RigidCorrection>, String> {
     // `a` = the side we keep fixed for this correction (the anchor);
     // `b` = the movable side. We always move the movable component's
@@ -1141,15 +1190,47 @@ fn compute_correction(
             angle_correction(ad, md, target, pivot)
         }
 
-        MateType::Tangent
-        | MateType::Symmetric
-        | MateType::Gear { .. }
-        | MateType::Cam
-        | MateType::Path => Err(format!(
-            "Mate type {:?} requires a higher-order kinematic solver \
-             and is not handled by the rigid-body constraint relaxation",
-            c.mate_type
-        )),
+        MateType::Symmetric => {
+            // Mirror across world XY plane: enforces movable.origin =
+            // (anchor.x, anchor.y, -anchor.z). Pure translational
+            // constraint that locks all three coordinates.
+            symmetric_correction(anchor_origin, movable_origin)
+        }
+
+        MateType::Tangent => {
+            // Movable origin lies on the anchor's plane (planar tangency).
+            // For non-planar tangency (cylinder-plane, sphere-plane), the
+            // anchor's reference is treated as the contacting plane via
+            // its normal/direction. The follower contact-point's
+            // perpendicular distance to that plane is driven to zero.
+            tangent_correction(anchor_origin, anchor_dir, movable_origin)
+        }
+
+        MateType::Gear { ratio } => {
+            // Couples the rotational positions of the two components
+            // about their respective reference axes:
+            //     theta_movable = -ratio * theta_anchor
+            // measured from the gear's persistent neutral pose
+            // (captured at mate-creation time and never overwritten).
+            gear_correction(c, t1, t2, ref1, ref2, movable, gear_neutrals, ratio)
+        }
+
+        MateType::Cam => {
+            // Cam-follower: the follower contact-point (movable origin)
+            // remains in contact with the cam surface. With the current
+            // 2-reference API and no explicit cam-profile parameterization,
+            // this reduces to the planar-tangent case using anchor's
+            // direction as the local cam-surface normal.
+            cam_correction(anchor_origin, anchor_dir, movable_origin)
+        }
+
+        MateType::Path => {
+            // Path mate: movable origin is constrained to lie on the line
+            // (origin, direction) carried by the anchor reference. Two
+            // perpendicular-distance components are driven to zero,
+            // leaving one free DOF along the path direction.
+            path_correction(anchor_origin, anchor_dir, movable_origin)
+        }
     }
 }
 
@@ -1428,6 +1509,289 @@ fn compose(rotation: Option<RigidCorrection>, translation: Vector3) -> RigidCorr
     }
 }
 
+/// Symmetric mate (2-reference variant): the movable origin is the
+/// reflection of the anchor origin across the world XY plane (z = 0).
+///
+/// In standard CAD UIs a Symmetric mate takes three references — two
+/// entities and a symmetry plane. With only two references in this
+/// solver's API, the world XY plane serves as the implicit symmetry
+/// plane. Only origin positions are mirrored; orientations are not
+/// (a reflection is not a rigid motion).
+///
+/// Locks all three translational DOFs of the movable component.
+fn symmetric_correction(
+    anchor_origin: Option<Point3>,
+    movable_origin: Option<Point3>,
+) -> Result<Option<RigidCorrection>, String> {
+    let ao = anchor_origin.ok_or_else(|| {
+        "Symmetric mate requires an origin on the anchor reference".to_string()
+    })?;
+    let mo = movable_origin.ok_or_else(|| {
+        "Symmetric mate requires an origin on the movable reference".to_string()
+    })?;
+    let target = Point3::new(ao.x, ao.y, -ao.z);
+    let t = Vector3::new(target.x - mo.x, target.y - mo.y, target.z - mo.z);
+    if t.magnitude() < 1e-14 {
+        Ok(None)
+    } else {
+        Ok(Some(RigidCorrection::pure_translation(t)))
+    }
+}
+
+/// Tangent mate (planar contact): the movable origin lies on the plane
+/// defined by `(anchor_origin, anchor_dir)`. Signed perpendicular
+/// distance is driven to zero by translation along the anchor normal.
+///
+/// Locks one translational DOF (along the anchor normal); leaves the
+/// other five DOFs free.
+fn tangent_correction(
+    anchor_origin: Option<Point3>,
+    anchor_dir: Option<Vector3>,
+    movable_origin: Option<Point3>,
+) -> Result<Option<RigidCorrection>, String> {
+    let ao = anchor_origin.ok_or_else(|| {
+        "Tangent mate requires an origin on the anchor reference".to_string()
+    })?;
+    let ad = anchor_dir.ok_or_else(|| {
+        "Tangent mate requires a direction on the anchor reference".to_string()
+    })?;
+    let mo = movable_origin.ok_or_else(|| {
+        "Tangent mate requires an origin on the movable reference".to_string()
+    })?;
+    let an = ad.normalize().map_err(|e| e.to_string())?;
+    let diff = Vector3::new(mo.x - ao.x, mo.y - ao.y, mo.z - ao.z);
+    let signed_dist = diff.dot(&an);
+    if signed_dist.abs() < 1e-14 {
+        Ok(None)
+    } else {
+        Ok(Some(RigidCorrection::pure_translation(Vector3::new(
+            -an.x * signed_dist,
+            -an.y * signed_dist,
+            -an.z * signed_dist,
+        ))))
+    }
+}
+
+/// Cam-follower mate: with the current 2-reference API and no explicit
+/// cam-profile parameterization, this reduces to the planar-tangent
+/// case using the anchor's direction as the local cam-surface normal.
+///
+/// Locks one translational DOF.
+fn cam_correction(
+    anchor_origin: Option<Point3>,
+    anchor_dir: Option<Vector3>,
+    movable_origin: Option<Point3>,
+) -> Result<Option<RigidCorrection>, String> {
+    tangent_correction(anchor_origin, anchor_dir, movable_origin)
+}
+
+/// Path mate: the movable origin must lie on the line through
+/// `anchor_origin` with direction `anchor_dir`. Two perpendicular-
+/// distance components are driven to zero by translation; the parallel
+/// component is left free.
+///
+/// Locks two translational DOFs; one translational DOF along the path
+/// remains free.
+fn path_correction(
+    anchor_origin: Option<Point3>,
+    anchor_dir: Option<Vector3>,
+    movable_origin: Option<Point3>,
+) -> Result<Option<RigidCorrection>, String> {
+    let ao = anchor_origin.ok_or_else(|| {
+        "Path mate requires an origin on the anchor reference".to_string()
+    })?;
+    let ad = anchor_dir.ok_or_else(|| {
+        "Path mate requires a direction on the anchor reference".to_string()
+    })?;
+    let mo = movable_origin.ok_or_else(|| {
+        "Path mate requires an origin on the movable reference".to_string()
+    })?;
+    let an = ad.normalize().map_err(|e| e.to_string())?;
+    let diff = Vector3::new(mo.x - ao.x, mo.y - ao.y, mo.z - ao.z);
+    let parallel = diff.dot(&an);
+    // Perpendicular component (the offset from the line we must cancel).
+    let perp = Vector3::new(
+        diff.x - an.x * parallel,
+        diff.y - an.y * parallel,
+        diff.z - an.z * parallel,
+    );
+    if perp.magnitude() < 1e-14 {
+        Ok(None)
+    } else {
+        Ok(Some(RigidCorrection::pure_translation(Vector3::new(
+            -perp.x, -perp.y, -perp.z,
+        ))))
+    }
+}
+
+/// Gear mate: couples the rotational positions of two components about
+/// their respective reference axes:
+///
+/// ```text
+/// theta_movable + ratio * theta_anchor == 0    (modulo 2*pi)
+/// ```
+///
+/// where `theta_X` is the signed rotation of component X about its
+/// reference axis, measured from the component's initial transform
+/// (the "neutral" gear position).
+///
+/// Locks one rotational DOF: the movable component's rotation about
+/// its reference axis is fully determined by the anchor's rotation.
+/// Translation along/perpendicular to the gear axis is unaffected;
+/// gear-pair center distance is typically enforced by a separate
+/// Distance or Concentric mate on the same component pair.
+fn gear_correction(
+    c: &ResolvedConstraint,
+    t1: &Matrix4,
+    t2: &Matrix4,
+    ref1: &MateReference,
+    ref2: &MateReference,
+    movable: ComponentId,
+    gear_neutrals: &HashMap<MateId, (Matrix4, Matrix4)>,
+    ratio: f64,
+) -> Result<Option<RigidCorrection>, String> {
+    // Identify which side is the anchor and which is the movable, and
+    // pick the corresponding references, current transforms, and
+    // matching slot in the persistent neutral pair (which is keyed
+    // by the constraint's component1/component2 order, NOT by
+    // anchor/movable).
+    let (anchor_ref, anchor_t, movable_ref, movable_t, neutral_anchor, neutral_movable) = {
+        let (n1, n2) = gear_neutrals.get(&c.mate_id).ok_or_else(|| {
+            "Gear mate: persistent neutral transforms missing — was the mate \
+             registered through Assembly::add_mate?"
+                .to_string()
+        })?;
+        if movable == c.component2 {
+            (ref1, t1, ref2, t2, n1, n2)
+        } else {
+            (ref2, t2, ref1, t1, n2, n1)
+        }
+    };
+
+    let (ao_opt, ad_opt) = world_origin_direction(anchor_ref, anchor_t);
+    let (mo_opt, md_opt) = world_origin_direction(movable_ref, movable_t);
+    let _ao = ao_opt.ok_or_else(|| {
+        "Gear mate requires an origin on the anchor reference".to_string()
+    })?;
+    let ad = ad_opt.ok_or_else(|| {
+        "Gear mate requires a direction on the anchor reference".to_string()
+    })?;
+    let mo = mo_opt.ok_or_else(|| {
+        "Gear mate requires an origin on the movable reference".to_string()
+    })?;
+    let md = md_opt.ok_or_else(|| {
+        "Gear mate requires a direction on the movable reference".to_string()
+    })?;
+
+    // The "neutral" axis directions live in the neutral world frame.
+    // Since each component's axis rotates with the component, we
+    // measure each component's rotation relative to its own neutral
+    // transform, projected onto its neutral-world axis.
+    let anchor_initial = neutral_anchor;
+    let movable_initial = neutral_movable;
+
+    let anchor_axis_initial = anchor_initial.transform_vector(match anchor_ref {
+        MateReference::Face { normal, .. } => normal,
+        MateReference::Edge { direction, .. } => direction,
+        MateReference::Axis { direction, .. } => direction,
+        MateReference::Plane { normal, .. } => normal,
+        MateReference::Point { .. } => {
+            return Err(
+                "Gear mate: anchor reference is a Point with no axis direction".to_string(),
+            );
+        }
+    });
+    let movable_axis_initial = movable_initial.transform_vector(match movable_ref {
+        MateReference::Face { normal, .. } => normal,
+        MateReference::Edge { direction, .. } => direction,
+        MateReference::Axis { direction, .. } => direction,
+        MateReference::Plane { normal, .. } => normal,
+        MateReference::Point { .. } => {
+            return Err(
+                "Gear mate: movable reference is a Point with no axis direction".to_string(),
+            );
+        }
+    });
+
+    // Compute delta = t_current * t_initial^-1 — the world-frame rigid
+    // motion that takes the component from its neutral position to its
+    // current position.
+    let anchor_initial_inv = anchor_initial.inverse().map_err(|_| {
+        "Gear mate: anchor initial transform is non-invertible".to_string()
+    })?;
+    let movable_initial_inv = movable_initial.inverse().map_err(|_| {
+        "Gear mate: movable initial transform is non-invertible".to_string()
+    })?;
+    let anchor_delta = *anchor_t * anchor_initial_inv;
+    let movable_delta = *movable_t * movable_initial_inv;
+
+    let theta_anchor = signed_rotation_about_axis(&anchor_delta, anchor_axis_initial)?;
+    let theta_movable = signed_rotation_about_axis(&movable_delta, movable_axis_initial)?;
+
+    // Constraint: theta_movable + ratio * theta_anchor == 0.
+    // Apply correction to the movable side: rotate by
+    //     delta_theta = -(theta_movable + ratio * theta_anchor)
+    // about the movable axis at the movable origin.
+    let delta_theta = -(theta_movable + ratio * theta_anchor);
+
+    // Wrap into (-pi, pi] to take the shortest signed rotation each
+    // iteration; the constraint is intrinsically modulo 2*pi anyway.
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let mut wrapped = delta_theta % two_pi;
+    if wrapped > std::f64::consts::PI {
+        wrapped -= two_pi;
+    } else if wrapped <= -std::f64::consts::PI {
+        wrapped += two_pi;
+    }
+    if wrapped.abs() < 1e-12 {
+        return Ok(None);
+    }
+
+    // Rotate about the *current* world axis of the movable reference,
+    // not the initial axis — the component may have translated.
+    let axis_world = md.normalize().map_err(|e| e.to_string())?;
+    let _ = ad; // anchor axis only needed to verify presence above
+    Ok(Some(RigidCorrection::pure_rotation(axis_world, wrapped, mo)))
+}
+
+/// Extract the signed scalar rotation of a rigid motion about a given
+/// world-space axis. Computes the angle by transforming a reference
+/// vector perpendicular to the axis and measuring the signed angle in
+/// the plane normal to the axis.
+///
+/// Returns 0 for pure translations or when the rotation has no
+/// component about the requested axis.
+fn signed_rotation_about_axis(
+    delta: &Matrix4,
+    axis: Vector3,
+) -> Result<f64, String> {
+    let axis_n = axis.normalize().map_err(|e| e.to_string())?;
+    // Pick any unit vector perpendicular to axis.
+    let r = axis_n.perpendicular();
+    let r_rot = delta.transform_vector(&r);
+    // Project r_rot onto the plane normal to axis (defensive — for a
+    // pure rotation about axis the projection is exact).
+    let r_rot_parallel = r_rot.dot(&axis_n);
+    let r_rot_perp = Vector3::new(
+        r_rot.x - axis_n.x * r_rot_parallel,
+        r_rot.y - axis_n.y * r_rot_parallel,
+        r_rot.z - axis_n.z * r_rot_parallel,
+    );
+    if r_rot_perp.magnitude() < 1e-12 {
+        // Degenerate: r_rot is collinear with axis — only happens if the
+        // delta has rotated r entirely onto the axis (a 90° rotation
+        // about an axis perpendicular to both r and axis_n). For a
+        // gear coupling this is non-physical; return 0 conservatively.
+        return Ok(0.0);
+    }
+    // Signed angle in the plane: theta = atan2(axis · (r × r_perp),
+    //                                          r · r_perp).
+    let cross = r.cross(&r_rot_perp);
+    let sin_t = axis_n.dot(&cross);
+    let cos_t = r.dot(&r_rot_perp);
+    Ok(sin_t.atan2(cos_t))
+}
+
 /// Assembly errors
 #[derive(Debug, thiserror::Error)]
 pub enum AssemblyError {
@@ -1660,5 +2024,189 @@ mod tests {
         assert!((t.x - 3.0).abs() < 1e-6);
         assert!((t.y - 4.0).abs() < 1e-6);
         assert!((t.z - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_symmetric_mate_mirrors_origin_across_xy_plane() {
+        let mut assembly = Assembly::new("symmetric");
+        let comp1 = assembly.add_part(Arc::new(BRepModel::new()), "Anchor");
+        let comp2 = assembly.add_part(Arc::new(BRepModel::new()), "Movable");
+
+        // Anchor sits at z = +5; movable starts off-mirror at z = +2.
+        {
+            let mut c1 = assembly.components.get_mut(&comp1).unwrap();
+            c1.transform = Matrix4::from_translation(&Vector3::new(2.0, 3.0, 5.0));
+        }
+        {
+            let mut c2 = assembly.components.get_mut(&comp2).unwrap();
+            c2.transform = Matrix4::from_translation(&Vector3::new(0.0, 0.0, 2.0));
+        }
+
+        register_plane_reference(
+            &assembly,
+            comp1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &assembly,
+            comp2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+
+        assembly
+            .add_mate(MateType::Symmetric, comp1, "p1", comp2, "p2")
+            .expect("symmetric mate accepted");
+
+        // After solve, comp2's plane-origin in world coords must be the
+        // reflection of comp1's through z = 0: (2, 3, -5).
+        let c2_final = assembly.get_component(comp2).unwrap();
+        let world_origin = c2_final
+            .transform
+            .transform_point(&Point3::new(0.0, 0.0, 0.0));
+        assert!((world_origin.x - 2.0).abs() < 1e-6);
+        assert!((world_origin.y - 3.0).abs() < 1e-6);
+        assert!((world_origin.z + 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_tangent_mate_drives_origin_onto_anchor_plane() {
+        let mut assembly = Assembly::new("tangent");
+        let comp1 = assembly.add_part(Arc::new(BRepModel::new()), "Anchor");
+        let comp2 = assembly.add_part(Arc::new(BRepModel::new()), "Movable");
+
+        // Movable starts 7 units above the anchor's z = 0 plane.
+        {
+            let mut c2 = assembly.components.get_mut(&comp2).unwrap();
+            c2.transform = Matrix4::from_translation(&Vector3::new(4.0, -2.0, 7.0));
+        }
+
+        register_plane_reference(
+            &assembly,
+            comp1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &assembly,
+            comp2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+
+        assembly
+            .add_mate(MateType::Tangent, comp1, "p1", comp2, "p2")
+            .expect("tangent mate accepted");
+
+        // Movable origin's z-component is driven to zero (on the anchor
+        // plane); x and y are unchanged.
+        let c2_final = assembly.get_component(comp2).unwrap();
+        let world_origin = c2_final
+            .transform
+            .transform_point(&Point3::new(0.0, 0.0, 0.0));
+        assert!((world_origin.x - 4.0).abs() < 1e-6);
+        assert!((world_origin.y + 2.0).abs() < 1e-6);
+        assert!(world_origin.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_path_mate_drives_origin_onto_anchor_axis() {
+        let mut assembly = Assembly::new("path");
+        let comp1 = assembly.add_part(Arc::new(BRepModel::new()), "Anchor");
+        let comp2 = assembly.add_part(Arc::new(BRepModel::new()), "Movable");
+
+        // Movable starts at (3, 4, 5); anchor's path is the X-axis
+        // through the world origin. After solve, the y and z
+        // coordinates must both go to zero; x is free (ends at 3).
+        {
+            let mut c2 = assembly.components.get_mut(&comp2).unwrap();
+            c2.transform = Matrix4::from_translation(&Vector3::new(3.0, 4.0, 5.0));
+        }
+
+        register_axis_reference(
+            &assembly,
+            comp1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        register_axis_reference(
+            &assembly,
+            comp2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+
+        assembly
+            .add_mate(MateType::Path, comp1, "a1", comp2, "a2")
+            .expect("path mate accepted");
+
+        let c2_final = assembly.get_component(comp2).unwrap();
+        let world_origin = c2_final
+            .transform
+            .transform_point(&Point3::new(0.0, 0.0, 0.0));
+        assert!((world_origin.x - 3.0).abs() < 1e-6);
+        assert!(world_origin.y.abs() < 1e-6);
+        assert!(world_origin.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_gear_mate_couples_rotations_with_ratio() {
+        let mut assembly = Assembly::new("gear");
+        let comp1 = assembly.add_part(Arc::new(BRepModel::new()), "Anchor");
+        let comp2 = assembly.add_part(Arc::new(BRepModel::new()), "Movable");
+
+        // Both gears spin about the world Z-axis at the origin in their
+        // neutral pose (no initial rotation, no offset).
+        register_axis_reference(
+            &assembly,
+            comp1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_axis_reference(
+            &assembly,
+            comp2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+
+        // Add the gear mate at the neutral pose: ratio = 2 means
+        // theta_movable + 2 * theta_anchor == 0.
+        assembly
+            .add_mate(MateType::Gear { ratio: 2.0 }, comp1, "a1", comp2, "a2")
+            .expect("gear mate accepted");
+
+        // Rotate the anchor by +pi/4 about Z. The solver must rotate the
+        // movable by -2*pi/4 = -pi/2 about Z to satisfy the coupling.
+        {
+            let mut c1 = assembly.components.get_mut(&comp1).unwrap();
+            let q = Quaternion::from_axis_angle(
+                &Vector3::new(0.0, 0.0, 1.0),
+                std::f64::consts::FRAC_PI_4,
+            )
+            .expect("axis-angle valid");
+            c1.transform = q.to_matrix4();
+        }
+        assembly.solve_constraints().expect("solver ok");
+
+        let c2_final = assembly.get_component(comp2).unwrap();
+        // Decompose movable transform: it should be a pure rotation
+        // about Z by -pi/2. Probe by rotating a unit X vector and
+        // checking the result is approximately (cos(-pi/2), sin(-pi/2), 0) = (0, -1, 0).
+        let probe = c2_final
+            .transform
+            .transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        assert!(probe.x.abs() < 1e-6, "probe.x = {}", probe.x);
+        assert!((probe.y + 1.0).abs() < 1e-6, "probe.y = {}", probe.y);
+        assert!(probe.z.abs() < 1e-6, "probe.z = {}", probe.z);
     }
 }
