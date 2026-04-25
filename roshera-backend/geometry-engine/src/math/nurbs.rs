@@ -778,12 +778,20 @@ impl NurbsCurve {
         results
     }
 
-    /// Evaluate exactly 4 points simultaneously using SIMD
-    /// This is the most optimized path for batch evaluation
+    /// Evaluate exactly 4 points simultaneously using true cross-parameter SIMD.
+    ///
+    /// Each `f64x4` lane carries one parameter's state through the entire
+    /// Cox-de Boor recurrence and rational accumulation. Knot and control-point
+    /// reads are gathered scalar-by-scalar (because spans differ per lane) and
+    /// packed into `f64x4` lanes; the arithmetic — divisions, multiplies,
+    /// fused-style accumulations — runs vectorized.
+    ///
+    /// Algorithmic identity to `evaluate_simd` is preserved: same Cox-de Boor
+    /// recurrence (Piegl & Tiller A2.2) and same rational projection.
     fn evaluate_quad_simd(&self, params: [f64; 4]) -> [NurbsPoint; 4] {
-        // Clamp all parameters
-        let knot_min = self.knots.values()[self.degree];
-        let knot_max = self.knots.values()[self.knots.len() - self.degree - 1];
+        let knots_vals = self.knots.values();
+        let knot_min = knots_vals[self.degree];
+        let knot_max = knots_vals[self.knots.len() - self.degree - 1];
 
         let clamped = [
             params[0].clamp(knot_min, knot_max),
@@ -791,17 +799,121 @@ impl NurbsCurve {
             params[2].clamp(knot_min, knot_max),
             params[3].clamp(knot_min, knot_max),
         ];
+        let u_vec = f64x4::new(clamped);
 
-        // Per-point evaluation. `evaluate_simd` re-finds its own knot span
-        // internally, so a pre-computed `spans` array would just duplicate
-        // the lookup. Note: this 4-lane wrapper is currently unused by the
-        // kernel; promotion to true SIMD is deferred until a hot caller
-        // actually exercises it.
+        // Per-lane span lookup. Knot vectors are short (typically O(degree+n)),
+        // so a vectorized binary search would not pay off versus four scalar
+        // calls; the win is in the per-lane arithmetic that follows.
+        let spans = [
+            self.find_span(clamped[0]),
+            self.find_span(clamped[1]),
+            self.find_span(clamped[2]),
+            self.find_span(clamped[3]),
+        ];
+
+        let p = self.degree;
+        let mut n = vec![f64x4::ZERO; p + 1];
+        let mut left = vec![f64x4::ZERO; p + 1];
+        let mut right = vec![f64x4::ZERO; p + 1];
+        n[0] = f64x4::splat(1.0);
+
+        // Vectorized Cox-de Boor recurrence across 4 parameter lanes.
+        for j in 1..=p {
+            // Gather knots[span + 1 - j] and knots[span + j] per lane,
+            // then pack into f64x4 for the arithmetic step.
+            let left_knots = f64x4::new([
+                knots_vals[spans[0] + 1 - j],
+                knots_vals[spans[1] + 1 - j],
+                knots_vals[spans[2] + 1 - j],
+                knots_vals[spans[3] + 1 - j],
+            ]);
+            let right_knots = f64x4::new([
+                knots_vals[spans[0] + j],
+                knots_vals[spans[1] + j],
+                knots_vals[spans[2] + j],
+                knots_vals[spans[3] + j],
+            ]);
+            left[j] = u_vec - left_knots;
+            right[j] = right_knots - u_vec;
+
+            let mut saved = f64x4::ZERO;
+            for r in 0..j {
+                let denom = right[r + 1] + left[j - r];
+                let temp = n[r] / denom;
+                n[r] = saved + right[r + 1] * temp;
+                saved = left[j - r] * temp;
+            }
+            n[j] = saved;
+        }
+
+        // Vectorized rational accumulation: sum_w[lane] = Σ_i N_i(u_lane) · w_i,
+        // sum_p[lane] = Σ_i N_i(u_lane) · w_i · cp_i. Each lane uses its own
+        // span's control-point window, so cp/weight loads are gathered.
+        let mut x_acc = f64x4::ZERO;
+        let mut y_acc = f64x4::ZERO;
+        let mut z_acc = f64x4::ZERO;
+        let mut w_acc = f64x4::ZERO;
+
+        for i in 0..=p {
+            let i0 = spans[0] - p + i;
+            let i1 = spans[1] - p + i;
+            let i2 = spans[2] - p + i;
+            let i3 = spans[3] - p + i;
+            let cp0 = self.control_points[i0];
+            let cp1 = self.control_points[i1];
+            let cp2 = self.control_points[i2];
+            let cp3 = self.control_points[i3];
+            let x_vec = f64x4::new([cp0.x, cp1.x, cp2.x, cp3.x]);
+            let y_vec = f64x4::new([cp0.y, cp1.y, cp2.y, cp3.y]);
+            let z_vec = f64x4::new([cp0.z, cp1.z, cp2.z, cp3.z]);
+            let w_vec = f64x4::new([
+                self.weights[i0],
+                self.weights[i1],
+                self.weights[i2],
+                self.weights[i3],
+            ]);
+
+            let basis_w = n[i] * w_vec;
+            x_acc += basis_w * x_vec;
+            y_acc += basis_w * y_vec;
+            z_acc += basis_w * z_vec;
+            w_acc += basis_w;
+        }
+
+        let xa = x_acc.as_array_ref();
+        let ya = y_acc.as_array_ref();
+        let za = z_acc.as_array_ref();
+        let wa = w_acc.as_array_ref();
+
         [
-            self.evaluate_simd(clamped[0]),
-            self.evaluate_simd(clamped[1]),
-            self.evaluate_simd(clamped[2]),
-            self.evaluate_simd(clamped[3]),
+            NurbsPoint {
+                point: Point3::new(xa[0] / wa[0], ya[0] / wa[0], za[0] / wa[0]),
+                derivative1: None,
+                derivative2: None,
+                derivative3: None,
+                parameter: clamped[0],
+            },
+            NurbsPoint {
+                point: Point3::new(xa[1] / wa[1], ya[1] / wa[1], za[1] / wa[1]),
+                derivative1: None,
+                derivative2: None,
+                derivative3: None,
+                parameter: clamped[1],
+            },
+            NurbsPoint {
+                point: Point3::new(xa[2] / wa[2], ya[2] / wa[2], za[2] / wa[2]),
+                derivative1: None,
+                derivative2: None,
+                derivative3: None,
+                parameter: clamped[2],
+            },
+            NurbsPoint {
+                point: Point3::new(xa[3] / wa[3], ya[3] / wa[3], za[3] / wa[3]),
+                derivative1: None,
+                derivative2: None,
+                derivative3: None,
+                parameter: clamped[3],
+            },
         ]
     }
 
@@ -2489,6 +2601,73 @@ pub enum ParameterizationType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-parameter SIMD path must produce results identical to the scalar
+    /// `evaluate` (up to floating-point rounding). Exercises a degree-3 NURBS
+    /// curve at four parameters that fall in different knot spans, so each
+    /// SIMD lane carries a different span/control-point window.
+    #[test]
+    fn test_evaluate_quad_simd_matches_scalar() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 2.0, 0.0),
+            Point3::new(2.0, 2.0, 0.0),
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(4.0, -1.0, 0.0),
+            Point3::new(5.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.5, 0.7, 1.2, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let curve = NurbsCurve::new(control_points, weights, knots, 3).unwrap();
+
+        // Four parameters intentionally chosen to land in different spans.
+        let params = [0.05, 0.30, 0.60, 0.90];
+        let simd = curve.evaluate_quad_simd(params);
+        let scalar: Vec<NurbsPoint> = params.iter().map(|&u| curve.evaluate(u)).collect();
+
+        for (s, q) in scalar.iter().zip(simd.iter()) {
+            assert!(
+                (s.point - q.point).magnitude() < 1e-12,
+                "SIMD lane diverged from scalar: scalar={:?} simd={:?}",
+                s.point,
+                q.point
+            );
+            assert!((s.parameter - q.parameter).abs() < 1e-15);
+        }
+    }
+
+    /// `evaluate_batch_simd` must agree with scalar `evaluate` for both the
+    /// 4-aligned chunks (which hit `evaluate_quad_simd`) and the trailing
+    /// remainder (which falls back to single-point SIMD).
+    #[test]
+    fn test_evaluate_batch_simd_full_and_remainder() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+            Point3::new(3.0, 0.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.0, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let curve = NurbsCurve::new(control_points, weights, knots, 3).unwrap();
+
+        // 7 = one chunk of 4 + remainder of 3
+        let params = [0.0, 0.15, 0.33, 0.5, 0.66, 0.85, 1.0];
+        let batch = curve.evaluate_batch_simd(&params);
+        assert_eq!(batch.len(), params.len());
+
+        for (i, &u) in params.iter().enumerate() {
+            let scalar = curve.evaluate(u);
+            assert!(
+                (scalar.point - batch[i].point).magnitude() < 1e-12,
+                "batch[{}] diverged at u={}: scalar={:?} batch={:?}",
+                i,
+                u,
+                scalar.point,
+                batch[i].point
+            );
+        }
+    }
 
     #[test]
     fn test_nurbs_curve_creation() {
