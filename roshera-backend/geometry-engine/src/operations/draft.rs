@@ -276,14 +276,25 @@ fn group_faces_by_face(
     ))
 }
 
-/// Group faces by custom curve
+/// Group faces by custom curve.
+///
+/// Validates each face exists in the model before assembling the group
+/// so a draft operation against stale face IDs fails up front instead
+/// of producing a zero-faced group that silently drafts nothing.
 fn group_faces_by_curve(
     model: &BRepModel,
     faces: &[FaceId],
     curve: &Box<dyn Curve>,
     pull_direction: Vector3,
 ) -> OperationResult<Vec<FaceGroup>> {
-    // Use provided curve as neutral
+    for &face_id in faces {
+        if model.faces.get(face_id).is_none() {
+            return Err(OperationError::InvalidGeometry(format!(
+                "group_faces_by_curve: face {} missing from model",
+                face_id
+            )));
+        }
+    }
     let neutral_curve = sample_curve_points(curve)?;
 
     Ok(vec![FaceGroup {
@@ -293,15 +304,31 @@ fn group_faces_by_curve(
     }])
 }
 
-/// Apply draft to a group of faces
+/// Apply draft to a group of faces.
+///
+/// Verifies the target solid exists before iterating so a stale
+/// `solid_id` fails up front, and logs the solid scope when the group
+/// is empty rather than silently producing a no-op result.
 fn apply_draft_to_group(
     model: &mut BRepModel,
     solid_id: SolidId,
     group: FaceGroup,
     options: &DraftOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    let mut drafted_faces = Vec::new();
-
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "apply_draft_to_group: solid {} missing",
+            solid_id
+        )));
+    }
+    if group.faces.is_empty() {
+        tracing::debug!(
+            solid_id = solid_id,
+            "apply_draft_to_group: empty face group, no draft applied"
+        );
+        return Ok(Vec::new());
+    }
+    let mut drafted_faces = Vec::with_capacity(group.faces.len());
     for face_id in group.faces {
         let drafted_face = draft_single_face(
             model,
@@ -717,14 +744,39 @@ fn blend_drafted_faces(model: &mut BRepModel, faces: &[FaceId]) -> OperationResu
     Ok(())
 }
 
-/// Update adjacent faces for draft
+/// Update adjacent faces for draft.
+///
+/// A complete implementation re-trims every face whose boundary touched
+/// a drafted face so that drafted faces share a common edge with their
+/// neighbors instead of overlapping or leaving gaps. That requires loop-
+/// editing infrastructure that lives in a follow-up; here we surface a
+/// diagnostic with the actual face/solid IDs so callers can detect the
+/// missing topology stitch rather than chase a silent failure later.
 fn update_adjacent_faces_for_draft(
     model: &mut BRepModel,
     solid_id: SolidId,
     original_faces: &[FaceId],
     drafted_faces: &[FaceId],
 ) -> OperationResult<()> {
-    // Would update neighboring faces to maintain topology
+    if drafted_faces.is_empty() {
+        return Ok(());
+    }
+    // Confirm the solid still exists; if it doesn't the caller is
+    // operating on a stale reference and the diagnostic should be a
+    // hard error.
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "update_adjacent_faces_for_draft: solid {} missing",
+            solid_id
+        )));
+    }
+    tracing::warn!(
+        solid_id = solid_id,
+        original_face_count = original_faces.len(),
+        drafted_face_count = drafted_faces.len(),
+        "draft: adjacent-face re-trimming not yet implemented; \
+         neighboring faces left untrimmed against drafted faces"
+    );
     Ok(())
 }
 
@@ -741,6 +793,15 @@ fn draft_single_face_variable(
     angle_fn: &dyn Fn(f64) -> f64,
     options: &DraftOptions,
 ) -> OperationResult<FaceId> {
+    // Defensive ID consistency: caller passes both face_id and face,
+    // and the two must agree or downstream face-store edits target the
+    // wrong record. Failing fast here catches the bug at its source.
+    if face.id != face_id {
+        return Err(OperationError::InvalidGeometry(format!(
+            "draft_single_face_variable: face_id {} does not match face.id {}",
+            face_id, face.id
+        )));
+    }
     let surface = model
         .surfaces
         .get(face.surface_id)
@@ -833,6 +894,12 @@ fn draft_single_face_tangent(
     draft_direction: Vector3,
     options: &DraftOptions,
 ) -> OperationResult<FaceId> {
+    if face.id != face_id {
+        return Err(OperationError::InvalidGeometry(format!(
+            "draft_single_face_tangent: face_id {} does not match face.id {}",
+            face_id, face.id
+        )));
+    }
     let surface = model
         .surfaces
         .get(face.surface_id)
@@ -918,6 +985,12 @@ fn draft_single_face_stepped(
     steps: &[(f64, f64)],
     options: &DraftOptions,
 ) -> OperationResult<FaceId> {
+    if face.id != face_id {
+        return Err(OperationError::InvalidGeometry(format!(
+            "draft_single_face_stepped: face_id {} does not match face.id {}",
+            face_id, face.id
+        )));
+    }
     if steps.is_empty() {
         return Err(OperationError::InvalidGeometry(
             "Stepped draft requires at least one (height, angle) pair".to_string(),
@@ -1270,25 +1343,72 @@ fn compute_surface_intersection(
     Ok(vec![])
 }
 
-/// Extend face to intersection curve
+/// Extend face to intersection curve.
+///
+/// Validates that the target face exists and the intersection curve has
+/// at least 2 points (anything less can't define an extension boundary)
+/// before logging the missing extension. The full loop-editing work is
+/// scheduled separately; surfacing the IDs here lets callers detect the
+/// gap deterministically.
 fn extend_face_to_curve(
     model: &mut BRepModel,
     face_id: FaceId,
     intersection_curve: &[Point3],
 ) -> OperationResult<()> {
-    // Would extend face boundary to meet intersection curve
-    // This is a complex operation involving loop modification
+    if model.faces.get(face_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "extend_face_to_curve: face {} missing",
+            face_id
+        )));
+    }
+    if intersection_curve.len() < 2 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "extend_face_to_curve: face {} given degenerate \
+             intersection curve ({} points)",
+            face_id,
+            intersection_curve.len()
+        )));
+    }
+    tracing::warn!(
+        face_id = face_id,
+        curve_points = intersection_curve.len(),
+        "draft: face-extension to intersection curve not yet implemented; \
+         face boundary left at original extent"
+    );
     Ok(())
 }
 
-/// Trim face at intersection curve
+/// Trim face at intersection curve.
+///
+/// Same shape as `extend_face_to_curve`: validate inputs and log the
+/// gap with concrete IDs/sizes. Full splitting of the face by the
+/// intersection curve (creating new edges + replacement loop topology)
+/// is a follow-up.
 fn trim_face_at_curve(
     model: &mut BRepModel,
     face_id: FaceId,
     intersection_curve: &[Point3],
 ) -> OperationResult<()> {
-    // Would trim face at intersection curve
-    // This involves splitting the face and creating new boundaries
+    if model.faces.get(face_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "trim_face_at_curve: face {} missing",
+            face_id
+        )));
+    }
+    if intersection_curve.len() < 2 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "trim_face_at_curve: face {} given degenerate \
+             intersection curve ({} points)",
+            face_id,
+            intersection_curve.len()
+        )));
+    }
+    tracing::warn!(
+        face_id = face_id,
+        curve_points = intersection_curve.len(),
+        "draft: face-trimming at intersection curve not yet implemented; \
+         face boundary left untrimmed"
+    );
     Ok(())
 }
 
@@ -1370,20 +1490,33 @@ fn create_blend_surface_between_faces(
     Ok(Box::new(Plane::xy(0.0)))
 }
 
-/// Create blend loop between two faces
+/// Create blend loop between two faces.
+///
+/// Returns an empty outer loop today — the blend topology is generated
+/// elsewhere (see `blend.rs`). This validator-style stub exists so the
+/// draft pipeline has a uniform "ask for a blend loop" hook; we still
+/// confirm both faces exist so callers operating on stale IDs fail
+/// loudly instead of silently receiving an empty loop.
 fn create_blend_loop(
     model: &BRepModel,
     face_id1: FaceId,
     face_id2: FaceId,
 ) -> OperationResult<Loop> {
-    // Create a simple rectangular loop for the blend
     use crate::primitives::r#loop::{Loop, LoopType};
 
-    let blend_loop = Loop::new(0, LoopType::Outer);
-
-    // For simplicity, return empty loop
-    // In practice, this would create edges connecting the face boundaries
-    Ok(blend_loop)
+    if model.faces.get(face_id1).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_blend_loop: face {} missing",
+            face_id1
+        )));
+    }
+    if model.faces.get(face_id2).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_blend_loop: face {} missing",
+            face_id2
+        )));
+    }
+    Ok(Loop::new(0, LoopType::Outer))
 }
 
 /// Validate drafted solid via the kernel's parallel B-Rep validator.
