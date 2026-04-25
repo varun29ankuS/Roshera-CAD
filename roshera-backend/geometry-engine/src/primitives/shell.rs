@@ -571,6 +571,17 @@ impl Shell {
                 .get(face_id)
                 .ok_or(MathError::InvalidParameter("Face not found".to_string()))?;
 
+            // Verify the face's underlying surface is still reachable in the
+            // surface store. A dangling surface_id would produce silently
+            // wrong winding contributions because the solid angle ignores
+            // which surface the face lives on; this guard fails loudly.
+            if surface_store.get(face.surface_id).is_none() {
+                return Err(MathError::InvalidParameter(format!(
+                    "Shell::contains_point: face {} references missing surface {}",
+                    face_id, face.surface_id
+                )));
+            }
+
             // Calculate solid angle subtended by face at point
             let solid_angle =
                 self.calculate_solid_angle(point, face, loop_store, vertex_store, edge_store)?;
@@ -831,7 +842,42 @@ impl Shell {
             .edge_connectivity
             .read()
             .expect("shell edge_connectivity RwLock poisoned");
-        Ok(edge_conn.keys().cloned().collect())
+
+        // Hot path: the cache was populated by build_edge_connectivity and
+        // mirrors the union of edges across every face's loops.
+        if !edge_conn.is_empty() {
+            return Ok(edge_conn.keys().cloned().collect());
+        }
+
+        // Cold path: cache empty. Walk every face → outer loop → loop edges
+        // and compose the set. This branch keeps the public edges() API
+        // working for shells that haven't run build_edge_connectivity yet.
+        let mut out: HashSet<EdgeId> = HashSet::new();
+        for &face_id in &self.faces {
+            let face = face_store.get(face_id).ok_or_else(|| {
+                MathError::InvalidParameter(format!(
+                    "Shell::edges: face {} not found in store",
+                    face_id
+                ))
+            })?;
+            let outer = loop_store.get(face.outer_loop).ok_or_else(|| {
+                MathError::InvalidParameter(format!(
+                    "Shell::edges: face {} outer_loop {} not found",
+                    face_id, face.outer_loop
+                ))
+            })?;
+            for &eid in &outer.edges {
+                out.insert(eid);
+            }
+            for &inner_loop_id in &face.inner_loops {
+                if let Some(inner) = loop_store.get(inner_loop_id) {
+                    for &eid in &inner.edges {
+                        out.insert(eid);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn volume(
