@@ -792,16 +792,11 @@ impl NurbsCurve {
             params[3].clamp(knot_min, knot_max),
         ];
 
-        // Find spans for all 4 parameters
-        let spans = [
-            self.find_span(clamped[0]),
-            self.find_span(clamped[1]),
-            self.find_span(clamped[2]),
-            self.find_span(clamped[3]),
-        ];
-
-        // For now, evaluate each point individually
-        // TODO: Further optimize by vectorizing span finding and basis computation
+        // Per-point evaluation. `evaluate_simd` re-finds its own knot span
+        // internally, so a pre-computed `spans` array would just duplicate
+        // the lookup. Note: this 4-lane wrapper is currently unused by the
+        // kernel; promotion to true SIMD is deferred until a hot caller
+        // actually exercises it.
         [
             self.evaluate_simd(clamped[0]),
             self.evaluate_simd(clamped[1]),
@@ -1014,10 +1009,12 @@ impl NurbsCurve {
             return Err("Parameter u outside curve bounds");
         }
 
-        let n = self.control_points.len();
         let p = self.degree;
 
-        // Check multiplicity
+        // Check multiplicity. We don't carry the pre-insertion control
+        // point count separately because each call to `insert_single_knot`
+        // grows `self.control_points` by 1; the multiplicity test below is
+        // the only invariant that needs to hold before the loop.
         let mut mult = 0;
         for knot in self.knots.values() {
             if (*knot - u).abs() < 1e-12 {
@@ -1670,8 +1667,10 @@ impl NurbsSurface {
             return Err("Empty control point grid in V direction");
         }
 
-        // Validate rectangular grid structure
-        for (i, row) in control_points.iter().enumerate() {
+        // Validate rectangular grid structure. The row index isn't echoed
+        // through the static `&str` error type; in a refactor to a richer
+        // error enum it would be the natural payload to carry.
+        for row in control_points.iter() {
             if row.len() != n_v {
                 return Err("Inconsistent control point grid - must be rectangular");
             }
@@ -1682,12 +1681,12 @@ impl NurbsSurface {
             return Err("Weight grid U dimension mismatch");
         }
 
-        for (i, row) in weights.iter().enumerate() {
+        for row in weights.iter() {
             if row.len() != n_v {
                 return Err("Weight grid V dimension mismatch");
             }
             // Validate all weights are positive (NURBS requirement)
-            for (j, &w) in row.iter().enumerate() {
+            for &w in row.iter() {
                 if w < 0.0 {
                     return Err("Negative weight detected - NURBS requires positive weights");
                 }
