@@ -449,8 +449,9 @@ fn plane_plane_intersection(
     let point_b = eval_b.position;
 
     // Check if planes are parallel
+    // For unit normals, |n_a × n_b| = sin(θ); compare against sin(angle_tol).
     let cross_product = normal_a.cross(&normal_b);
-    if cross_product.magnitude() < tolerance.angle() {
+    if cross_product.magnitude() < tolerance.parallel_threshold() {
         // Planes are parallel - check if coincident
         let distance = (point_b - point_a).dot(&normal_a);
         if distance.abs() < tolerance.distance() {
@@ -706,7 +707,9 @@ fn plane_cylinder_intersection(
         return Ok(vec![]);
     }
 
-    if angle_cos < tolerance.angle() {
+    // angle_cos = |axis · normal| = |cos θ| between cylinder axis and plane normal.
+    // Plane parallel to axis ⇔ axis ⊥ normal ⇔ |cos θ| ≈ 0; compare against sin(angle_tol).
+    if angle_cos < tolerance.parallel_threshold() {
         // Plane is parallel to cylinder axis
         if axis_to_plane_dist < tolerance.distance() {
             // Plane passes through cylinder axis - intersection is two lines
@@ -723,8 +726,11 @@ fn plane_cylinder_intersection(
             // No intersection
             Ok(vec![])
         }
-    } else if (angle_cos - 1.0).abs() < tolerance.angle() {
-        // Plane is perpendicular to cylinder axis - intersection is a circle
+    } else if (1.0 - angle_cos).abs() < tolerance.aligned_threshold() {
+        // Plane perpendicular to cylinder axis ⇔ axis ∥ normal ⇔ cos θ ≈ 1.
+        // Compare (1 − cos θ) against (1 − cos(angle_tol)); for small θ this
+        // is ≈ θ²/2, much stricter than θ itself but semantically correct.
+        // Intersection is a circle.
         create_cylinder_perpendicular_intersection_circle(cylinder_impl, plane_normal, plane_point)
     } else {
         // General case - intersection is an ellipse
@@ -1140,9 +1146,9 @@ fn cylinders_are_coaxial(
     cyl_b: &crate::primitives::surface::Cylinder,
     tolerance: &Tolerance,
 ) -> bool {
-    // Check if axes are parallel
+    // Check if axes are parallel: |axis_a × axis_b| = sin(θ) for unit axes.
     let axis_cross = cyl_a.axis.cross(&cyl_b.axis);
-    if axis_cross.magnitude() > tolerance.angle() {
+    if axis_cross.magnitude() > tolerance.parallel_threshold() {
         return false;
     }
 
@@ -1158,8 +1164,9 @@ fn cylinders_are_parallel(
     cyl_b: &crate::primitives::surface::Cylinder,
     tolerance: &Tolerance,
 ) -> bool {
+    // |axis_a × axis_b| = sin(θ) for unit axes; parallel ⇔ sin(θ) ≈ 0.
     let axis_cross = cyl_a.axis.cross(&cyl_b.axis);
-    axis_cross.magnitude() < tolerance.angle()
+    axis_cross.magnitude() < tolerance.parallel_threshold()
 }
 
 /// Handle coaxial cylinders
@@ -3494,8 +3501,11 @@ fn ray_surface_intersection(
             let normal = eval.normal;
             let plane_point = eval.position;
 
+            // For unit `direction` and unit `normal`, denom = cos(θ).
+            // Ray parallel to plane ⇔ direction ⊥ normal ⇔ |cos θ| ≈ 0;
+            // compare against sin(angle_tol).
             let denom = direction.dot(&normal);
-            if denom.abs() < tolerance.angle() {
+            if denom.abs() < tolerance.parallel_threshold() {
                 // Ray is parallel to plane
                 return Ok(None);
             }
