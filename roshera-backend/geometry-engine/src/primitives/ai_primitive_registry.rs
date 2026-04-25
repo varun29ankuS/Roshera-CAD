@@ -231,8 +231,6 @@ struct NLPRules {
     synonyms: DashMap<String, String>,
     /// Unit conversion factors to millimeters
     unit_conversions: DashMap<String, f64>,
-    /// Common parameter patterns
-    parameter_patterns: Vec<ParameterPattern>,
     /// Reverse synonym index for O(1) lookup
     synonym_index: DashMap<String, Vec<String>>,
     /// Pre-compiled extraction functions
@@ -246,7 +244,6 @@ impl std::fmt::Debug for NLPRules {
         f.debug_struct("NLPRules")
             .field("synonyms", &self.synonyms)
             .field("unit_conversions", &self.unit_conversions)
-            .field("parameter_patterns", &self.parameter_patterns)
             .field("synonym_index", &self.synonym_index)
             .field("compiled_extractors", &"<DashMap<String, Arc<dyn Fn>>>")
             .field("parameter_bloom", &self.parameter_bloom)
@@ -291,13 +288,6 @@ impl NLPRules {
         self.compiled_extractors
             .insert(param_name.to_string(), Arc::from(extractor));
     }
-}
-
-#[derive(Debug, Clone)]
-struct ParameterPattern {
-    pattern: String,
-    parameter_name: String,
-    examples: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,23 +360,7 @@ impl CommandCache {
 #[derive(Debug, Clone)]
 struct CachedCommand {
     command: AICommand,
-    result: AIResponse,
     created_at: std::time::Instant,
-}
-
-/// SIMD-accelerated parameter extraction
-#[derive(Debug, Clone)]
-struct FastParameterExtractor {
-    /// Pre-compiled patterns for common parameters
-    compiled_patterns: DashMap<String, CompiledPattern>,
-    /// Bloom filter for quick rejection
-    bloom_filter: BloomFilter,
-}
-
-#[derive(Debug, Clone)]
-struct CompiledPattern {
-    pattern_hash: u64,
-    extraction_fn: fn(&str) -> Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -442,23 +416,6 @@ impl BloomFilter {
         std::hash::Hash::hash(&item.chars().rev().collect::<String>(), &mut hasher);
         std::hash::Hasher::finish(&hasher)
     }
-}
-
-/// Batch command processor for parallel execution
-#[derive(Debug)]
-struct BatchProcessor {
-    /// Commands queued for batch processing
-    queue: Vec<PendingCommand>,
-    /// Maximum batch size before forcing execution
-    max_batch_size: usize,
-    /// Maximum wait time before forcing execution
-    max_wait_time: std::time::Duration,
-}
-
-#[derive(Debug)]
-struct PendingCommand {
-    command: AICommand,
-    queued_at: std::time::Instant,
 }
 
 impl PrimitiveRegistry {
@@ -559,7 +516,7 @@ impl PrimitiveRegistry {
 
         // Generate suggestions if confidence is low
         let suggestions = if confidence < 0.8 {
-            self.generate_suggestions(&text, &primitive_type)
+            self.generate_suggestions(&primitive_type)
         } else {
             vec![]
         };
@@ -680,55 +637,6 @@ impl PrimitiveRegistry {
     fn cache_command(&self, hash: u64, command: AICommand) {
         let cached_command = CachedCommand {
             command: command.clone(),
-            result: AIResponse {
-                success: true,
-                geometry_id: None,
-                description: "Cached command".to_string(),
-                technical_info: AITechnicalInfo {
-                    final_parameters: HashMap::new(),
-                    topology: AITopologyInfo {
-                        vertex_count: 0,
-                        edge_count: 0,
-                        face_count: 0,
-                        euler_characteristic: 0,
-                        is_manifold: true,
-                        is_closed: true,
-                    },
-                    properties: AIGeometricProperties {
-                        volume: None,
-                        surface_area: None,
-                        bounding_box: AIBoundingBox {
-                            min: AIPoint3D {
-                                x: 0.0,
-                                y: 0.0,
-                                z: 0.0,
-                            },
-                            max: AIPoint3D {
-                                x: 0.0,
-                                y: 0.0,
-                                z: 0.0,
-                            },
-                            dimensions: AIPoint3D {
-                                x: 0.0,
-                                y: 0.0,
-                                z: 0.0,
-                            },
-                        },
-                        center_of_mass: AIPoint3D {
-                            x: 0.0,
-                            y: 0.0,
-                            z: 0.0,
-                        },
-                    },
-                },
-                next_suggestions: vec![],
-                warnings: vec![],
-                metrics: AIPerformanceMetrics {
-                    creation_time_ms: 0.0,
-                    memory_used_bytes: 0,
-                    complexity_score: 0.0,
-                },
-            },
             created_at: std::time::Instant::now(),
         };
 
@@ -765,33 +673,6 @@ impl PrimitiveRegistry {
                     .join(", ")
             ),
         })
-    }
-
-    /// Extract parameters from natural language text
-    fn extract_parameters(
-        &self,
-        text: &str,
-        primitive_type: &str,
-    ) -> Result<HashMap<String, AIParameterValue>, PrimitiveError> {
-        let mut parameters = HashMap::new();
-
-        // Get the primitive info for parameter schema
-        let primitive_info = self.primitives.get(primitive_type).ok_or_else(|| {
-            PrimitiveError::InvalidParameters {
-                parameter: "primitive_type".to_string(),
-                value: primitive_type.to_string(),
-                constraint: "Primitive type not found".to_string(),
-            }
-        })?;
-
-        // Extract each parameter using various patterns
-        for param_def in &primitive_info.parameter_schema.parameters {
-            if let Some(value) = self.extract_parameter_value(text, &param_def.name)? {
-                parameters.insert(param_def.name.clone(), value);
-            }
-        }
-
-        Ok(parameters)
     }
 
     /// Extract a specific parameter value from text
@@ -884,24 +765,6 @@ impl PrimitiveRegistry {
         Ok(None)
     }
 
-    /// Get synonym patterns for a parameter (simplified without regex)
-    fn get_synonym_patterns(&self, param_name: &str) -> Vec<String> {
-        // Return empty for now - synonym handling is done in is_synonym function
-        vec![]
-    }
-
-    /// Convert value to standard units (millimeters)
-    fn convert_to_standard_units(&self, value: f64, unit: Option<&str>) -> f64 {
-        match unit {
-            Some("mm") | None => value,
-            Some("cm") => value * 10.0,
-            Some("m") => value * 1000.0,
-            Some("in") => value * 25.4,
-            Some("ft") => value * 304.8,
-            _ => value, // Unknown unit, assume mm
-        }
-    }
-
     /// Calculate confidence score for parameter extraction.
     ///
     /// `primitive_type` must be a key present in `self.primitives`; this
@@ -946,7 +809,7 @@ impl PrimitiveRegistry {
     ///
     /// `primitive_type` must be a key present in `self.primitives`
     /// (same invariant as `calculate_confidence`).
-    fn generate_suggestions(&self, text: &str, primitive_type: &str) -> Vec<String> {
+    fn generate_suggestions(&self, primitive_type: &str) -> Vec<String> {
         let primitive_info = self
             .primitives
             .get(primitive_type)
@@ -1586,7 +1449,6 @@ impl Default for NLPRules {
                 units.insert("yards".to_string(), 914.4);
                 units
             },
-            parameter_patterns: vec![],
             synonym_index: DashMap::new(),
             compiled_extractors: DashMap::new(),
             parameter_bloom: BloomFilter::new(1024),
