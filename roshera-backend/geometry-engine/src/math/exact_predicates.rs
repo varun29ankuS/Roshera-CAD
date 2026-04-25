@@ -46,20 +46,16 @@ pub enum CircleLocation {
     OnBoundary,
 }
 
-// Error bounds for fast filters (Shewchuk's constants)
+// Error bounds for adaptive precision filters (Shewchuk 1997, "Adaptive
+// Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates",
+// Discrete & Computational Geometry 18:305–363). Only the first-stage
+// A-bound is needed by the single-pass filters below; multi-stage refinement
+// (B and C bounds) is not implemented in this kernel.
 const RESULTERRBOUND: f64 = 3.0e-15;
 const CCWERRBOUNDSA: f64 = 3.3306690738754716e-16;
-const CCWERRBOUNDSB: f64 = 2.2204460492503131e-16;
-const CCWERRBOUNDSC: f64 = 1.109335647967049e-31;
 const O3DERRBOUNDSA: f64 = 7.7715611723760958e-16;
-const O3DERRBOUNDSB: f64 = 3.3306690738754706e-16;
-const O3DERRBOUNDSC: f64 = 6.661338147750939e-32;
 const ICCERRBOUNDSA: f64 = 1.0e-15;
-const ICCERRBOUNDSB: f64 = 1.1102230246251568e-16;
-const ICCERRBOUNDSC: f64 = 3.1636919313722576e-30;
 const ISPERRBOUNDSA: f64 = 1.6e-15;
-const ISPERRBOUNDSB: f64 = 2.2204460492503131e-16;
-const ISPERRBOUNDSC: f64 = 1.0020872162465583e-29;
 
 // Splitter for exact arithmetic (2^27 + 1 for IEEE 754 double)
 const SPLITTER: f64 = 134217729.0;
