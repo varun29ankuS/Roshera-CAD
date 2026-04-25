@@ -1590,47 +1590,77 @@ impl<'a> TopologyBuilder<'a> {
         hh: f64,
         hd: f64,
     ) -> Result<[FaceId; 6], PrimitiveError> {
-        // Face topology: which edges and their orientations
+        // Face topology: edges and per-edge orientations chosen so that the
+        // outer-loop vertex traversal is CCW when viewed from outside the
+        // solid, i.e. the right-hand-rule normal of the loop matches the
+        // outward face normal stored on the surface.
+        //
+        // Vertex layout (set in `create_box_vertices`):
+        //   v0=(-,-,-) v1=(+,-,-) v2=(+,+,-) v3=(-,+,-)   bottom (z=-hd)
+        //   v4=(-,-,+) v5=(+,-,+) v6=(+,+,+) v7=(-,+,+)   top    (z=+hd)
+        //
+        // Edge layout (set in `create_box_edges`, all stored start→end):
+        //   e0:v0→v1  e1:v1→v2  e2:v2→v3  e3:v3→v0  (bottom)
+        //   e4:v4→v5  e5:v5→v6  e6:v6→v7  e7:v7→v4  (top)
+        //   e8:v0→v4  e9:v1→v5  e10:v2→v6 e11:v3→v7 (vertical)
+        //
+        // `Loop::vertices_cached` derives vertex i as edge.start if
+        // orientations[i] is true, else edge.end. The arrays below were
+        // chosen so that the resulting vertex chain is a continuous,
+        // non-degenerate quad whose right-hand normal matches the face
+        // surface normal.
         let face_edge_data = [
-            // Bottom face (Z = -hd): edges 0,1,2,3
+            // Bottom (z=-hd, outward -Z): traversal v0→v3→v2→v1→v0
+            //   v0→v3 = e3 reversed (e3:v3→v0)
+            //   v3→v2 = e2 reversed (e2:v2→v3)
+            //   v2→v1 = e1 reversed (e1:v1→v2)
+            //   v1→v0 = e0 reversed (e0:v0→v1)
             (
-                [0, 1, 2, 3],
-                [true, true, true, true],
+                [3, 2, 1, 0],
+                [false, false, false, false],
                 Point3::new(0.0, 0.0, -hd),
                 Vector3::new(0.0, 0.0, -1.0),
             ),
-            // Top face (Z = +hd): edges 4,5,6,7 (reversed for outward normal)
+            // Top (z=+hd, outward +Z): traversal v4→v5→v6→v7→v4
             (
-                [7, 6, 5, 4],
+                [4, 5, 6, 7],
                 [true, true, true, true],
                 Point3::new(0.0, 0.0, hd),
                 Vector3::new(0.0, 0.0, 1.0),
             ),
-            // Front face (Y = -hh): edges 0,9,4,8
+            // Front (y=-hh, outward -Y): traversal v0→v1→v5→v4→v0
+            //   vertices come out as [e0.start, e9.start, e4.end, e8.end]
+            //   = [v0, v1, v5, v4] — Newell normal in (x,z) = -Y. ✓
             (
                 [0, 9, 4, 8],
                 [true, true, false, false],
                 Point3::new(0.0, -hh, 0.0),
                 Vector3::new(0.0, -1.0, 0.0),
             ),
-            // Back face (Y = +hh): edges 2,10,6,11
+            // Back (y=+hh, outward +Y): traversal v2→v3→v7→v6→v2
+            //   v2→v3 = e2 forward, v3→v7 = e11 forward,
+            //   v7→v6 = e6 reversed, v6→v2 = e10 reversed
             (
-                [2, 10, 6, 11],
-                [false, true, false, false],
+                [2, 11, 6, 10],
+                [true, true, false, false],
                 Point3::new(0.0, hh, 0.0),
                 Vector3::new(0.0, 1.0, 0.0),
             ),
-            // Left face (X = -hw): edges 3,8,7,11
+            // Left (x=-hw, outward -X): traversal v0→v4→v7→v3→v0
+            //   v0→v4 = e8 forward, v4→v7 = e7 reversed (e7:v7→v4),
+            //   v7→v3 = e11 reversed (e11:v3→v7), v3→v0 = e3 forward
             (
-                [3, 8, 7, 11],
-                [false, true, true, false],
+                [8, 7, 11, 3],
+                [true, false, false, true],
                 Point3::new(-hw, 0.0, 0.0),
                 Vector3::new(-1.0, 0.0, 0.0),
             ),
-            // Right face (X = +hw): edges 1,10,5,9
+            // Right (x=+hw, outward +X): traversal v1→v2→v6→v5→v1
+            //   v1→v2 = e1 forward, v2→v6 = e10 forward,
+            //   v6→v5 = e5 reversed, v5→v1 = e9 reversed
             (
                 [1, 10, 5, 9],
-                [false, true, false, false],
+                [true, true, false, false],
                 Point3::new(hw, 0.0, 0.0),
                 Vector3::new(1.0, 0.0, 0.0),
             ),

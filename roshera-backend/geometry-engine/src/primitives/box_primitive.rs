@@ -208,14 +208,29 @@ impl BoxTopology {
         (3, 7),
     ];
 
-    /// Face topology (which edges form each face)
+    /// Face topology (which edges form each face) and per-edge orientations.
+    ///
+    /// Both arrays are chosen so that `Loop::vertices_cached` produces a
+    /// non-degenerate quad whose right-hand-rule normal points along the
+    /// face's outward `FACE_DATA` normal. See the analogous fix in
+    /// `topology_builder::create_box_faces` for the derivation.
     const FACE_EDGES: [[usize; 4]; 6] = [
-        [0, 1, 2, 3],   // Bottom face
-        [7, 6, 5, 4],   // Top face (reversed for outward normal)
-        [0, 9, 4, 8],   // Front face
-        [2, 10, 6, 11], // Back face
-        [3, 8, 7, 11],  // Left face
-        [1, 10, 5, 9],  // Right face
+        [3, 2, 1, 0],   // Bottom (-Z): traversal v0→v3→v2→v1
+        [4, 5, 6, 7],   // Top    (+Z): traversal v4→v5→v6→v7
+        [0, 9, 4, 8],   // Front  (-Y): traversal v0→v1→v5→v4
+        [2, 11, 6, 10], // Back   (+Y): traversal v2→v3→v7→v6
+        [8, 7, 11, 3],  // Left   (-X): traversal v0→v4→v7→v3
+        [1, 10, 5, 9],  // Right  (+X): traversal v1→v2→v6→v5
+    ];
+
+    /// Per-edge orientations for `FACE_EDGES`: true = forward, false = reversed.
+    const FACE_EDGE_ORIENTATIONS: [[bool; 4]; 6] = [
+        [false, false, false, false], // Bottom
+        [true, true, true, true],     // Top
+        [true, true, false, false],   // Front
+        [true, true, false, false],   // Back
+        [true, false, false, true],   // Left
+        [true, true, false, false],   // Right
     ];
 
     /// Face normals and centers (normalized)
@@ -478,9 +493,11 @@ impl Primitive for BoxPrimitive {
             let mut face_loop =
                 crate::primitives::r#loop::Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
 
-            // Add edges to loop
-            for &edge_idx in &edge_indices {
-                face_loop.add_edge(edges[edge_idx], true);
+            // Add edges to loop with per-edge orientation so the resulting
+            // vertex traversal matches the outward face normal.
+            let orientations = BoxTopology::FACE_EDGE_ORIENTATIONS[face_idx];
+            for (i, &edge_idx) in edge_indices.iter().enumerate() {
+                face_loop.add_edge(edges[edge_idx], orientations[i]);
             }
             let loop_id = model.loops.add(face_loop);
 
