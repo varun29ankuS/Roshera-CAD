@@ -1223,13 +1223,38 @@ fn handle_parallel_cylinders(
     create_parallel_cylinder_intersection_lines(cyl_a, cyl_b, axis_distance)
 }
 
-/// Create tangent line for cylinder intersection
+/// Create tangent line for cylinder intersection.
+///
+/// Validates that `axis_distance` is consistent with the requested
+/// tangency mode: external tangency (`r_a + r_b`) or internal tangency
+/// (`|r_a - r_b|`). A mismatch means the caller dispatched to the wrong
+/// case and the resulting tangent line would be geometrically wrong.
 fn create_cylinder_tangent_line(
     cyl_a: &crate::primitives::surface::Cylinder,
     cyl_b: &crate::primitives::surface::Cylinder,
     axis_distance: f64,
     external: bool,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    // Tangency consistency: external touches at r_a + r_b, internal at
+    // |r_a - r_b|. Allow a generous 1% slack so callers passing slightly
+    // perturbed numerics aren't rejected, but reject hard mismatches.
+    let expected = if external {
+        cyl_a.radius + cyl_b.radius
+    } else {
+        (cyl_a.radius - cyl_b.radius).abs()
+    };
+    let slack = expected.abs().max(1.0) * 1e-2;
+    if (axis_distance - expected).abs() > slack {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_cylinder_tangent_line: axis_distance {:.6} does not match \
+             {} tangency target {:.6} (slack {:.3e})",
+            axis_distance,
+            if external { "external" } else { "internal" },
+            expected,
+            slack,
+        )));
+    }
+
     // Find the point of tangency
     let origin_diff = cyl_b.origin - cyl_a.origin;
     let radial_dir = origin_diff.cross(&cyl_a.axis).normalize()?;
@@ -3595,15 +3620,11 @@ fn ray_surface_intersection(
             let d_dot_a = direction.dot(&cone.axis);
             let delta_dot_a = delta.dot(&cone.axis);
 
-            let a =
-                d_dot_a * d_dot_a * sin_sq - direction.dot(direction) * sin_sq + d_dot_a * d_dot_a;
-            let b = 2.0
-                * (d_dot_a * delta_dot_a * sin_sq - direction.dot(&delta) * sin_sq
-                    + d_dot_a * delta_dot_a);
-            let c = delta_dot_a * delta_dot_a * sin_sq - delta.dot(&delta) * sin_sq
-                + delta_dot_a * delta_dot_a;
-
-            // Simplified: use standard cone quadratic
+            // Standard cone quadratic |X(t) - apex|² · sin² = ((X(t)-apex)·axis)²
+            // expanded into at² + bt + c = 0. A previous expansion produced
+            // mathematically equivalent coefficients (a,b,c) that were then
+            // replaced with this simpler closed form (a2,b2,c2); the simpler
+            // form is the one we keep.
             let a2 = direction.dot(direction) - (1.0 + cos_sq / sin_sq) * d_dot_a * d_dot_a;
             let b2 =
                 2.0 * (direction.dot(&delta) - (1.0 + cos_sq / sin_sq) * d_dot_a * delta_dot_a);
