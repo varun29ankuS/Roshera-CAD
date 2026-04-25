@@ -1462,12 +1462,11 @@ fn march_from_point_cylinders(
     let mut params_a = vec![start.params_a];
     let mut params_b = vec![start.params_b];
 
-    let mut current = start.clone();
     let step_size = tolerance.distance() * 10.0; // Adaptive step size
 
     // March in both directions
     for &direction in &[1.0, -1.0] {
-        current = start.clone();
+        let mut current = start.clone();
 
         for _step in 0..1000 {
             // Maximum steps to prevent infinite loops
