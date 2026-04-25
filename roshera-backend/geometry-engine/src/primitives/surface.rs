@@ -1016,8 +1016,8 @@ impl Plane {
     ) -> Vec<SurfaceIntersectionResult> {
         let normal_dot = self.normal.dot(&other.normal);
 
-        // Check if planes are parallel
-        if (normal_dot.abs() - 1.0).abs() < tolerance.angle() {
+        // Check if planes are parallel: unit normals → |n_a · n_b| = |cos θ|.
+        if (1.0 - normal_dot.abs()) < tolerance.aligned_threshold() {
             // Planes are parallel
             let distance = (other.origin - self.origin).dot(&self.normal);
             if distance.abs() < tolerance.distance() {
@@ -1801,8 +1801,9 @@ impl Cylinder {
         // Check angle between cylinder axis and plane normal
         let axis_dot_normal = self.axis.dot(&plane.normal);
 
-        // Case 1: Plane perpendicular to cylinder axis (circle)
-        if (axis_dot_normal.abs() - 1.0).abs() < tolerance.angle() {
+        // Case 1: Plane perpendicular to cylinder axis (circle).
+        // axis · normal = ±cos θ for unit vectors; perpendicular ⇔ |cos θ| = 1.
+        if (1.0 - axis_dot_normal.abs()) < tolerance.aligned_threshold() {
             // Find intersection height
             let plane_to_origin = plane.origin - self.origin;
             let height = plane_to_origin.dot(&self.axis);
@@ -1824,8 +1825,8 @@ impl Cylinder {
 
             intersections.push(SurfaceIntersectionResult::Curve(Box::new(circle)));
         }
-        // Case 2: Plane parallel to cylinder axis
-        else if axis_dot_normal.abs() < tolerance.angle() {
+        // Case 2: Plane parallel to cylinder axis ⇔ axis ⊥ normal ⇔ cos θ ≈ 0.
+        else if axis_dot_normal.abs() < tolerance.parallel_threshold() {
             // Check distance from plane to cylinder axis
             let origin_to_plane = plane.origin - self.origin;
             let distance = origin_to_plane.dot(&plane.normal);
@@ -1915,8 +1916,8 @@ impl Cylinder {
         // Check if axes are parallel
         let axis_dot = self.axis.dot(&other.axis);
 
-        // Case 1: Coaxial cylinders
-        if (axis_dot.abs() - 1.0).abs() < tolerance.angle() {
+        // Case 1: Coaxial cylinders — axes parallel ⇔ |axis_a · axis_b| ≈ 1.
+        if (1.0 - axis_dot.abs()) < tolerance.aligned_threshold() {
             // Check if axes are actually the same line
             let axis_distance = (other.origin - self.origin).cross(&self.axis).magnitude();
 
@@ -1932,8 +1933,8 @@ impl Cylinder {
             }
         }
 
-        // Case 2: Parallel axes
-        if (axis_dot.abs() - 1.0).abs() < tolerance.angle() {
+        // Case 2: Parallel axes — same alignment test as coaxial.
+        if (1.0 - axis_dot.abs()) < tolerance.aligned_threshold() {
             let connecting = other.origin - self.origin;
             let distance = connecting.cross(&self.axis).magnitude();
 
@@ -3836,8 +3837,8 @@ impl Torus {
             return vec![];
         }
 
-        // Special case: plane perpendicular to torus axis
-        if axis_dot_normal.abs() > 1.0 - tolerance.angle() {
+        // Special case: plane perpendicular to torus axis ⇔ axis ∥ normal ⇔ |cos θ| ≈ 1.
+        if axis_dot_normal.abs() > 1.0 - tolerance.aligned_threshold() {
             // Plane is perpendicular to axis
             if distance < tolerance.distance() {
                 // Plane passes through center - two circles
@@ -3904,8 +3905,8 @@ impl Torus {
             }
         }
 
-        // Special case: plane contains torus axis
-        if axis_dot_normal.abs() < tolerance.angle() {
+        // Special case: plane contains torus axis ⇔ axis ⊥ normal ⇔ cos θ ≈ 0.
+        if axis_dot_normal.abs() < tolerance.parallel_threshold() {
             // Plane contains the axis - up to 4 circle arcs
             // This is complex - for now approximate with two circles
             if distance < self.minor_radius {

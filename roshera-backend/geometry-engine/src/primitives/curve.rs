@@ -713,7 +713,9 @@ impl Curve for Line {
             Err(_) => return Continuity::G0,
         };
 
-        if (my_tangent - other_tangent).magnitude() > tolerance.angle() {
+        // Unit-tangent chord distance: |t_a − t_b| = 2·sin(θ/2) where θ is
+        // the angle between the unit tangents.
+        if (my_tangent - other_tangent).magnitude() > tolerance.chord_threshold() {
             return Continuity::G0;
         }
 
@@ -883,9 +885,11 @@ impl Curve for Line {
     ) -> Vec<f64> {
         let dir = self.direction();
         let plane_normal = plane.normal;
+        // For unit `dir` and unit `plane_normal`, denom = cos θ.
+        // Line parallel to plane ⇔ dir ⊥ normal ⇔ |cos θ| ≈ 0.
         let denom = dir.dot(&plane_normal);
 
-        if denom.abs() < tolerance.angle() {
+        if denom.abs() < tolerance.parallel_threshold() {
             // Line is parallel to plane
             return vec![];
         }
@@ -1317,7 +1321,9 @@ impl Curve for Arc {
             Err(_) => return Continuity::G0,
         };
 
-        if (my_tangent - other_tangent).magnitude() > tolerance.angle() {
+        // Unit-tangent chord distance: |t_a − t_b| = 2·sin(θ/2) where θ is
+        // the angle between the unit tangents.
+        if (my_tangent - other_tangent).magnitude() > tolerance.chord_threshold() {
             return Continuity::G0;
         }
 
@@ -1477,9 +1483,10 @@ impl Curve for Arc {
         // Arc-plane intersection
         let mut parameters = Vec::new();
 
-        // Check if arc plane is parallel to intersection plane
+        // Check if arc plane is parallel to intersection plane: unit normals
+        // → |n_a · n_b| = |cos θ|; parallel ⇔ |cos θ| ≈ 1.
         let dot = self.normal.dot(&plane.normal);
-        if dot.abs() > 1.0 - tolerance.angle() {
+        if dot.abs() > 1.0 - tolerance.aligned_threshold() {
             // Planes are nearly parallel
             return vec![];
         }
@@ -1633,9 +1640,10 @@ impl Arc {
     fn intersect_arc(&self, other: &Arc, tolerance: Tolerance) -> Vec<CurveIntersection> {
         let mut intersections = Vec::new();
 
-        // Check if arcs are coplanar
+        // Check if arcs are coplanar: unit normals → |n_a · n_b| = |cos θ|;
+        // coplanar ⇔ |cos θ| ≈ 1.
         let normal_dot = self.normal.dot(&other.normal).abs();
-        if (normal_dot - 1.0).abs() > tolerance.angle() {
+        if (1.0 - normal_dot) > tolerance.aligned_threshold() {
             // Non-coplanar arcs - use general 3D arc-arc intersection
             return self.intersect_arc_3d(other, tolerance);
         }
@@ -2229,7 +2237,9 @@ impl Curve for NurbsCurve {
             Err(_) => return Continuity::G0,
         };
 
-        if (my_tangent - other_tangent).magnitude() > tolerance.angle() {
+        // Unit-tangent chord distance: |t_a − t_b| = 2·sin(θ/2) where θ is
+        // the angle between the unit tangents.
+        if (my_tangent - other_tangent).magnitude() > tolerance.chord_threshold() {
             return Continuity::G0;
         }
 
@@ -2776,7 +2786,8 @@ impl NurbsCurve {
             .dot(&p2.derivative1.normalize().unwrap_or(Vector3::X))
             .abs();
 
-        if tangent_dot > 1.0 - tolerance.angle() {
+        // Tangent intersection ⇔ unit tangents aligned ⇔ |t_a · t_b| ≈ 1.
+        if tangent_dot > 1.0 - tolerance.aligned_threshold() {
             IntersectionType::Tangent
         } else {
             IntersectionType::Transverse
