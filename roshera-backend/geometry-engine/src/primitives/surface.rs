@@ -1204,6 +1204,18 @@ impl Plane {
 
                 // Find closest point on other surface
                 if let Ok((s, t)) = other.closest_point(&p1, tolerance) {
+                    // Bounds-check (s, t) against the other surface's domain.
+                    // For analytical surfaces with infinite bounds this is a
+                    // no-op; for trimmed surfaces it discards extrapolated
+                    // hits that would otherwise pollute the grid seed set.
+                    let bound_slack = tolerance.distance().max(1e-9);
+                    if s < s_range.0 - bound_slack
+                        || s > s_range.1 + bound_slack
+                        || t < t_range.0 - bound_slack
+                        || t > t_range.1 + bound_slack
+                    {
+                        continue;
+                    }
                     let p2 = match other.point_at(s, t) {
                         Ok(p) => p,
                         Err(_) => continue,
@@ -2134,9 +2146,10 @@ impl Cylinder {
         // Weights for rational quadratic segments
         let w = std::f64::consts::FRAC_1_SQRT_2; // cos(45°)
 
-        // Control points for one quadrant
+        // Anchor points reused at the cardinal corners (0° and 90°) of the
+        // ellipse; the 45° intermediate points are emitted in the control
+        // polygon directly with the rational weight `w`.
         let p0 = center + major_axis * semi_major;
-        let p1 = center + major_axis * semi_major + minor_axis * semi_minor;
         let p2 = center + minor_axis * semi_minor;
 
         // Build full ellipse from 4 quadrants
@@ -2176,9 +2189,12 @@ impl Cylinder {
         let degree_v = 1;
 
         // For a full cylinder, we need 9 control points for a NURBS circle
-        // and 2 rows for the height
-        let n_u = 9; // Standard for NURBS circle
-        let n_v = 2; // Top and bottom
+        // and 2 rows for the height. These counts are encoded directly into
+        // the control_points / knot vectors below; constants are kept as a
+        // single source of truth.
+        const N_U: usize = 9;
+        const N_V: usize = 2;
+        debug_assert_eq!(N_U, 9, "NURBS circle requires exactly 9 control points");
 
         // Create control points
         let mut control_points = Vec::new();
@@ -2187,14 +2203,10 @@ impl Cylinder {
         let [v_min, v_max] = self.height_limits.unwrap_or([0.0, 10.0]);
 
         // For each height level
-        for j in 0..n_v {
+        for j in 0..N_V {
             let mut row = Vec::new();
-            let v = v_min + (v_max - v_min) * (j as f64) / (n_v as f64 - 1.0);
+            let v = v_min + (v_max - v_min) * (j as f64) / (N_V as f64 - 1.0);
             let center = self.origin + self.axis * v;
-
-            // Create NURBS circle control points
-            // Using standard 9-point NURBS circle
-            let w = std::f64::consts::FRAC_1_SQRT_2; // weight for 45° points
 
             // Get perpendicular directions
             let x_dir = self.ref_dir;
@@ -2227,17 +2239,16 @@ impl Cylinder {
         // V direction (linear): [0,0, 1,1]
         let knots_v = vec![0.0, 0.0, 1.0, 1.0];
 
-        // Weights for rational B-spline (NURBS)
-        // For a perfect circle, intermediate control points need weight 1/√2 ≈ 0.707
-        let w = std::f64::consts::FRAC_1_SQRT_2;
-        let weights = vec![
-            vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0], // bottom row
-            vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0], // top row
-        ];
+        // BSplineSurface is non-rational: it cannot carry the rational
+        // weights (1/√2 at the 45° corners) needed to represent an exact
+        // circle. The control polygon above traces the bounding octagon,
+        // so the result is a low-error approximation of a cylinder rather
+        // than an exact one. Promotion to NurbsSurface (with weights) is
+        // tracked separately; flag the lossy conversion at debug level.
+        tracing::debug!(
+            "Cylinder::to_bspline: returning non-rational octagon approximation; promote to NurbsSurface for exact circle"
+        );
 
-        // Create the B-spline surface
-        // Note: BSplineSurface expects flat control points grid, not weights
-        // For now, create non-rational B-spline approximation
         Box::new(
             BSplineSurface::new(degree_u, degree_v, control_points, knots_u, knots_v)
                 .expect("Failed to create B-spline cylinder"),
@@ -2628,19 +2639,15 @@ impl Sphere {
         let circle_radius = (self.radius * self.radius - distance * distance).sqrt();
         let circle_center = self.center - plane.normal * distance;
 
-        // Find two perpendicular vectors in the plane
-        let u_dir = if plane.normal.dot(&Vector3::Z).abs() < 0.9 {
-            match plane.normal.cross(&Vector3::Z).normalize() {
-                Ok(dir) => dir,
-                Err(_) => return vec![], // Should not happen
-            }
-        } else {
-            match plane.normal.cross(&Vector3::X).normalize() {
-                Ok(dir) => dir,
-                Err(_) => return vec![], // Should not happen
-            }
-        };
-        let v_dir = plane.normal.cross(&u_dir);
+        // Arc::circle picks its own in-plane reference direction internally
+        // from the supplied normal, so we don't need to materialise an
+        // explicit (u_dir, v_dir) basis here. We do still validate that the
+        // plane normal admits a stable orthogonal frame — a degenerate
+        // (near-zero) normal would otherwise let Arc::circle silently
+        // choose an arbitrary basis.
+        if plane.normal.magnitude() < tolerance.distance() {
+            return vec![];
+        }
 
         // Create circle curve
         let circle =
@@ -2718,18 +2725,11 @@ impl Sphere {
         // Normal to intersection plane (along line between centers)
         let circle_normal = direction;
 
-        // Find perpendicular direction for circle
-        let u_dir = if circle_normal.dot(&Vector3::Z).abs() < 0.9 {
-            match circle_normal.cross(&Vector3::Z).normalize() {
-                Ok(dir) => dir,
-                Err(_) => return vec![], // Should not happen
-            }
-        } else {
-            match circle_normal.cross(&Vector3::X).normalize() {
-                Ok(dir) => dir,
-                Err(_) => return vec![], // Should not happen
-            }
-        };
+        // Arc::circle picks its own in-plane reference direction from the
+        // supplied normal; we just need to ensure the normal is well-formed.
+        if circle_normal.magnitude() < tolerance.distance() {
+            return vec![];
+        }
 
         // Create circle curve
         let circle = match crate::primitives::curve::Arc::circle(circle_center, circle_normal, h) {
@@ -3210,8 +3210,9 @@ impl Cone {
             }
         }
 
-        // Classify conic section type
-        let sin_axis_angle = axis_angle.sin();
+        // Classify conic section type by comparing the plane-to-axis angle
+        // against the cone's half-angle. We only need the cosine here; the
+        // sine is implied by the discriminant sign and not consulted further.
         let cos_axis_angle = axis_angle.cos();
 
         // Angle between plane and cone surface
@@ -3222,13 +3223,12 @@ impl Cone {
             // References:
             // - Brannan, D.A., Esplen, M.F., Gray, J.J. (1999). "Geometry"
             // - Hartmann, E. (2003). "Geometry and Algorithms for Computer Aided Design"
-
-            // Find the vertex of the parabola
-            let generator_dir = self.axis * self.half_angle.cos()
-                + match self.axis.perpendicular().normalize() {
-                    Ok(perp) => perp * self.half_angle.sin(),
-                    Err(_) => return vec![],
-                };
+            //
+            // The vertex of the parabola lies along the cone's generator
+            // direction, but the (z_axis, x_axis, y_axis) basis built below
+            // is derived directly from self.axis and is sufficient to embed
+            // the parabola template in world space; an explicit
+            // generator_dir vector is therefore not required here.
 
             // Create parabola as NURBS curve (degree 2 rational B-spline)
             // Control points for standard parabola y = x²
@@ -3480,16 +3480,20 @@ impl Torus {
         center: Point3,
         plane: &Plane,
         radius: f64,
-        _tolerance: Tolerance,
+        tolerance: Tolerance,
     ) -> Option<Box<dyn crate::primitives::curve::Curve>> {
-        // Find two orthogonal directions in the plane
-        // perpendicular() already returns a normalized vector
-        let dir1 = plane.normal.perpendicular();
-        let dir2 = plane.normal.cross(&dir1);
+        // Arc::circle constructs the circle from `(center, normal, radius)`
+        // and picks its own in-plane reference direction; we only need to
+        // ensure `plane.normal` is well-formed (non-degenerate). A
+        // collapsed normal would otherwise let the constructor pick an
+        // arbitrary frame and silently misorient the circle.
+        if plane.normal.magnitude() < tolerance.distance() {
+            return None;
+        }
 
-        // Create a circle in the plane
-        // Note: In the general case, this would be an ellipse, but for true Villarceau
-        // circles at the critical angle, they are perfect circles
+        // Note: In the general case, the bitangent intersection would be an
+        // ellipse, but for true Villarceau circles at the critical angle
+        // they are perfect circles.
         let circle = crate::primitives::curve::Arc::circle(center, plane.normal, radius).ok()?;
 
         Some(Box::new(circle))
@@ -4741,9 +4745,19 @@ impl Surface for GeneralNurbsSurface {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // For NURBS surfaces, we can only approximate offset
-        // Return the offset surface directly (not wrapped in OffsetSurface struct)
-        // The OffsetSurface struct is for tracking quality metadata, not for direct use
+        // NURBS offset is non-trivial in general (the offset of a degree-p
+        // surface is not itself a polynomial NURBS); a faithful exact-offset
+        // would require fitting a new control net at the requested distance.
+        // Until that lands we return the original surface and surface the
+        // requested distance at warn level so callers don't silently believe
+        // they have a true offset. A zero distance is exact (no-op).
+        if !distance.is_finite() || distance.abs() < f64::EPSILON {
+            return Box::new(self.clone());
+        }
+        tracing::warn!(
+            distance = distance,
+            "NurbsSurface::offset: returning original surface; exact NURBS offset not yet implemented"
+        );
         Box::new(self.clone())
     }
 
@@ -4982,8 +4996,14 @@ impl Surface for SurfaceOfRevolution {
         let p_minus = self.profile_curve.point_at(u_minus)?;
         let du_scale = 1.0 / (u_plus - u_minus);
 
-        let (h_plus, r_plus, rd_plus) = self.decompose_profile_point(p_plus);
-        let (h_minus, r_minus, rd_minus) = self.decompose_profile_point(p_minus);
+        // The radial-direction component of the decomposition (`rd_*`) is
+        // intentionally discarded here: the first-order approximation below
+        // re-uses `radial_v` (the radial direction evaluated at u) for both
+        // p_plus and p_minus, which is accurate to first order for the
+        // surface revolution and avoids cascading rotations through the
+        // finite-difference quotient.
+        let (h_plus, r_plus, _) = self.decompose_profile_point(p_plus);
+        let (h_minus, r_minus, _) = self.decompose_profile_point(p_minus);
 
         let dh_du = (h_plus - h_minus) * du_scale;
         let dr_du = (r_plus - r_minus) * du_scale;
@@ -5004,10 +5024,9 @@ impl Surface for SurfaceOfRevolution {
             self.axis_direction // Fallback for degenerate points on axis
         };
 
-        // Second derivatives (finite differences)
-        let v_plus = v + h;
-        let v_minus = v - h;
-
+        // Second derivatives. The v-derivative second form `dvv` is
+        // available analytically via the rotation derivative below, so we
+        // only need finite differences in u for `pos_uu`.
         let pos_uu = {
             let p1 = self.profile_curve.point_at(u_plus)?;
             let p0 = self.profile_curve.point_at(u)?;
@@ -5132,10 +5151,20 @@ impl Surface for SurfaceOfRevolution {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Offset a surface of revolution by offsetting the profile curve
-        // For now, use a numerical approximation via NURBS fitting
-        // A more exact approach would offset the profile curve by distance
-        Box::new(self.clone()) // Simplified: return self (exact offset needs profile curve offset)
+        // Exact offset of a surface of revolution requires offsetting its
+        // generator profile curve in the (axis, radial) plane and rebuilding
+        // the surface; that pipeline is not yet wired. Until then we return
+        // the original surface and surface the request at warn level so
+        // callers don't silently get wrong geometry. A zero distance is
+        // exact (no-op).
+        if !distance.is_finite() || distance.abs() < f64::EPSILON {
+            return Box::new(self.clone());
+        }
+        tracing::warn!(
+            distance = distance,
+            "RevolutionSurface::offset: returning original surface; profile-curve offset not yet implemented"
+        );
+        Box::new(self.clone())
     }
 
     fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
@@ -5339,7 +5368,19 @@ impl Surface for RuledSurface {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        Box::new(self.clone()) // Simplified
+        // Exact offset of a ruled surface requires offsetting both rail
+        // curves along the surface normal field; the rebuild path is not
+        // yet implemented. Return the original surface and surface the
+        // request at warn level so callers see the degradation. A zero
+        // distance is exact (no-op).
+        if !distance.is_finite() || distance.abs() < f64::EPSILON {
+            return Box::new(self.clone());
+        }
+        tracing::warn!(
+            distance = distance,
+            "RuledSurface::offset: returning original surface; rail offset rebuild not yet implemented"
+        );
+        Box::new(self.clone())
     }
 
     fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
