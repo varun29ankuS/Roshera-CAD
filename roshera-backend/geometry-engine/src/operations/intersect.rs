@@ -328,7 +328,6 @@ fn intersect_line_line(
     if denom.abs() < tolerance.distance() {
         // Lines are in parallel planes, check 3D
         let denom_xz = a.x * b.z - a.z * b.x;
-        let denom_yz = a.y * b.z - a.z * b.y;
 
         if denom_xz.abs() > tolerance.distance() {
             let s = (c.x * b.z - c.z * b.x) / denom_xz;

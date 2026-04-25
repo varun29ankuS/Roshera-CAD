@@ -341,7 +341,7 @@ where
 
         // Try acceleration techniques if converging slowly
         if i > 5 && stagnation_count > 3 {
-            if let Some(x_accel) = try_aitken_acceleration(&f, x, dx) {
+            if let Some(x_accel) = try_aitken_acceleration(x, dx) {
                 if f(x_accel).abs() < fx.abs() {
                     x = x_accel;
                     fx = f(x);
@@ -376,10 +376,7 @@ fn compute_damping_factor(error: f64, prev_error: f64, stagnation_count: &mut u3
 
 /// Try Aitken's acceleration for faster convergence
 #[inline]
-fn try_aitken_acceleration<F>(f: &F, x: f64, dx: f64) -> Option<f64>
-where
-    F: Fn(f64) -> f64,
-{
+fn try_aitken_acceleration(x: f64, dx: f64) -> Option<f64> {
     let x1 = x - dx;
     let x2 = x - 2.0 * dx;
 
@@ -1169,7 +1166,7 @@ pub mod ulp {
             u64::MAX
         } else {
             // Same sign
-            (a_bits.max(b_bits) - a_bits.min(b_bits))
+            a_bits.max(b_bits) - a_bits.min(b_bits)
         }
     }
 

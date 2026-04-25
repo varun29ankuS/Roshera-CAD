@@ -30,9 +30,6 @@ const MAX_BASIS: usize = MAX_DEGREE + 1;
 pub struct BSplineWorkspaceStack {
     /// Basis functions - fixed size array
     basis: [f64; MAX_BASIS],
-    /// Left/right arrays for Cox-de Boor
-    left: [f64; MAX_BASIS],
-    right: [f64; MAX_BASIS],
 }
 
 impl BSplineWorkspaceStack {
@@ -40,8 +37,6 @@ impl BSplineWorkspaceStack {
     pub const fn new() -> Self {
         Self {
             basis: [0.0; MAX_BASIS],
-            left: [0.0; MAX_BASIS],
-            right: [0.0; MAX_BASIS],
         }
     }
 
@@ -646,98 +641,6 @@ impl BSplineCurve {
         // The optimized version has issues with clamped knots
         self.evaluate_generic(u)
             .unwrap_or_else(|_| Point3::new(0.0, 0.0, 0.0))
-    }
-
-    /// SIMD point evaluation given basis functions
-    #[inline(always)]
-    fn evaluate_with_basis_simd(&self, span: usize, basis: &[f64]) -> Point3 {
-        // SAFETY: this helper is only dispatched for `degree == 3`, so
-        // `idx = span - degree` yields four valid control-point indices
-        // `idx, idx+1, idx+2, idx+3` — all within `[0, control_points.len())`
-        // because `span <= control_points.len() - 1` (invariant of find_span).
-        // On x86_64 the AVX intrinsics (`_mm256_loadu_pd`, `_mm256_mul_pd`,
-        // `_mm256_hadd_pd`, etc.) require AVX/AVX2 which is assumed as a
-        // baseline for the target CPU feature set. `basis.len() >= 4`
-        // because it is the cubic basis-function buffer.
-        unsafe {
-            // Use SIMD intrinsics for x86_64
-            #[cfg(target_arch = "x86_64")]
-            {
-                use std::arch::x86_64::*;
-
-                // Load basis functions
-                let _b0 = _mm256_set1_pd(basis[0]);
-                let _b1 = _mm256_set1_pd(basis[1]);
-                let _b2 = _mm256_set1_pd(basis[2]);
-                let _b3 = _mm256_set1_pd(basis[3]);
-
-                // Load control points (4 at a time for AVX)
-                let idx = span - self.degree;
-                let cx = self.control_x.as_ptr().add(idx);
-                let cy = self.control_y.as_ptr().add(idx);
-                let cz = self.control_z.as_ptr().add(idx);
-
-                let px = _mm256_loadu_pd(cx);
-                let py = _mm256_loadu_pd(cy);
-                let pz = _mm256_loadu_pd(cz);
-
-                // Compute weighted sum
-                let x = _mm256_mul_pd(px, _mm256_set_pd(basis[3], basis[2], basis[1], basis[0]));
-                let y = _mm256_mul_pd(py, _mm256_set_pd(basis[3], basis[2], basis[1], basis[0]));
-                let z = _mm256_mul_pd(pz, _mm256_set_pd(basis[3], basis[2], basis[1], basis[0]));
-
-                // Horizontal sum
-                let sum_x = _mm256_hadd_pd(x, x);
-                let sum_y = _mm256_hadd_pd(y, y);
-                let sum_z = _mm256_hadd_pd(z, z);
-
-                let lo_x = _mm256_extractf128_pd(sum_x, 0);
-                let hi_x = _mm256_extractf128_pd(sum_x, 1);
-                let result_x = _mm_add_pd(lo_x, hi_x);
-
-                let lo_y = _mm256_extractf128_pd(sum_y, 0);
-                let hi_y = _mm256_extractf128_pd(sum_y, 1);
-                let result_y = _mm_add_pd(lo_y, hi_y);
-
-                let lo_z = _mm256_extractf128_pd(sum_z, 0);
-                let hi_z = _mm256_extractf128_pd(sum_z, 1);
-                let result_z = _mm_add_pd(lo_z, hi_z);
-
-                Point3::new(
-                    _mm_cvtsd_f64(result_x),
-                    _mm_cvtsd_f64(result_y),
-                    _mm_cvtsd_f64(result_z),
-                )
-            }
-
-            // Fallback for non-x86_64
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                let idx = span - self.degree;
-                let mut x = 0.0;
-                let mut y = 0.0;
-                let mut z = 0.0;
-
-                // Unrolled loop for degree 3
-                x += basis[0] * *self.control_x.get_unchecked(idx);
-                y += basis[0] * *self.control_y.get_unchecked(idx);
-                z += basis[0] * *self.control_z.get_unchecked(idx);
-
-                x += basis[1] * *self.control_x.get_unchecked(idx + 1);
-                y += basis[1] * *self.control_y.get_unchecked(idx + 1);
-                z += basis[1] * *self.control_z.get_unchecked(idx + 1);
-
-                x += basis[2] * *self.control_x.get_unchecked(idx + 2);
-                y += basis[2] * *self.control_y.get_unchecked(idx + 2);
-                z += basis[2] * *self.control_z.get_unchecked(idx + 2);
-
-                x += basis[3] * *self.control_x.get_unchecked(idx + 3);
-                y += basis[3] * *self.control_y.get_unchecked(idx + 3);
-                z += basis[3] * *self.control_z.get_unchecked(idx + 3);
-
-                Point3::new(x, y, z)
-            }
-        }
     }
 
     /// Generic evaluation for any degree

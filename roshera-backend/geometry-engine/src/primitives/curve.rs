@@ -2361,67 +2361,6 @@ impl Curve for NurbsCurve {
 }
 
 impl NurbsCurve {
-    /// Helper method for intersection refinement
-    fn refine_intersection(
-        &self,
-        other: &dyn Curve,
-        mut t1: f64,
-        mut t2: f64,
-        tolerance: Tolerance,
-    ) -> Option<CurveIntersection> {
-        const MAX_ITERATIONS: usize = 20;
-
-        for _ in 0..MAX_ITERATIONS {
-            let p1 = self.evaluate(t1).ok()?;
-            let p2 = other.evaluate(t2).ok()?;
-
-            let distance = p2.position - p1.position;
-            if distance.magnitude() < tolerance.distance() {
-                // Found intersection
-                return Some(CurveIntersection {
-                    t1,
-                    t2,
-                    point: (p1.position + p2.position) * 0.5,
-                    intersection_type: IntersectionType::Transverse,
-                });
-            }
-
-            // Newton-Raphson step
-            // J * [dt1, dt2]^T = -F
-            // where F = p2 - p1
-            // and J = [-dp1/dt1, dp2/dt2]
-
-            let j11 = -p1.derivative1;
-            let j12 = p2.derivative1;
-
-            // Solve 3x2 system using least squares
-            let jt_j_11 = j11.dot(&j11);
-            let jt_j_12 = j11.dot(&j12);
-            let jt_j_22 = j12.dot(&j12);
-            let jt_f_1 = j11.dot(&distance);
-            let jt_f_2 = j12.dot(&distance);
-
-            let det = jt_j_11 * jt_j_22 - jt_j_12 * jt_j_12;
-            if det.abs() < 1e-10 {
-                break; // Singular system
-            }
-
-            let dt1 = (jt_j_22 * jt_f_1 - jt_j_12 * jt_f_2) / det;
-            let dt2 = (jt_j_11 * jt_f_2 - jt_j_12 * jt_f_1) / det;
-
-            // Update with damping
-            let damping = 0.5;
-            t1 = (t1 + damping * dt1).clamp(0.0, 1.0);
-            t2 = (t2 + damping * dt2).clamp(0.0, 1.0);
-
-            if dt1.abs() < 1e-10 && dt2.abs() < 1e-10 {
-                break; // Converged
-            }
-        }
-
-        None
-    }
-
     fn intersect_plane_nurbs(
         &self,
         plane: &crate::primitives::surface::Plane,
@@ -3309,32 +3248,6 @@ impl NurbsCurve {
         (plane, false)
     }
 
-    /// Adaptive arc length computation
-    fn adaptive_arc_length(&self, t1: f64, t2: f64, tol: f64, max_depth: usize) -> MathResult<f64> {
-        let p1 = self.point_at(t1)?;
-        let p2 = self.point_at(t2)?;
-        let chord_length = p1.distance(&p2);
-
-        if max_depth == 0 {
-            return Ok(chord_length);
-        }
-
-        let tm = (t1 + t2) / 2.0;
-        let pm = self.point_at(tm)?;
-
-        let length1 = p1.distance(&pm);
-        let length2 = pm.distance(&p2);
-        let arc_approx = length1 + length2;
-
-        if (arc_approx - chord_length).abs() < tol {
-            Ok(arc_approx)
-        } else {
-            let left = self.adaptive_arc_length(t1, tm, tol / 2.0, max_depth - 1)?;
-            let right = self.adaptive_arc_length(tm, t2, tol / 2.0, max_depth - 1)?;
-            Ok(left + right)
-        }
-    }
-
     /// Insert knot using Boehm's algorithm.
     ///
     /// Delegates to the math-layer NURBS curve, which owns the corrected
@@ -3397,15 +3310,6 @@ impl NurbsCurve {
 
         let closest = self.point_at(t)?;
         Ok((t, closest))
-    }
-
-    /// Greville abscissa for control point
-    fn greville_abscissa(&self, i: usize) -> f64 {
-        let mut sum = 0.0;
-        for j in i + 1..=i + self.degree {
-            sum += self.knots[j];
-        }
-        sum / self.degree as f64
     }
 
     /// Fit a NURBS curve to a set of points

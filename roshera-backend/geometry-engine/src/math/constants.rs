@@ -341,8 +341,6 @@ pub mod angle_utils {
     /// Normalize angle to [-π, π]
     #[inline]
     pub fn normalize_angle_signed(angle: f64) -> f64 {
-        use std::f64::consts::PI;
-        const TWO_PI: f64 = 2.0 * PI;
         const EPSILON: f64 = 1e-10;
 
         // Use atan2 for the general case

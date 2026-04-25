@@ -10,7 +10,6 @@
 //! - Surface fitting and approximation
 //! - G2 continuity analysis
 
-use crate::math::bspline_surface::BSplineSurface;
 use crate::math::nurbs::NurbsSurface;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::curve::Curve;
@@ -2181,79 +2180,6 @@ impl Cylinder {
         )
     }
 
-    /// Convert to B-spline representation
-    fn to_bspline(&self) -> Box<BSplineSurface> {
-        // Create NURBS cylinder representation
-        // For a cylinder, we need degree 2 in u (circular) and degree 1 in v (linear)
-        let degree_u = 2;
-        let degree_v = 1;
-
-        // For a full cylinder, we need 9 control points for a NURBS circle
-        // and 2 rows for the height. These counts are encoded directly into
-        // the control_points / knot vectors below; constants are kept as a
-        // single source of truth.
-        const N_U: usize = 9;
-        const N_V: usize = 2;
-        debug_assert_eq!(N_U, 9, "NURBS circle requires exactly 9 control points");
-
-        // Create control points
-        let mut control_points = Vec::new();
-
-        // Get height limits
-        let [v_min, v_max] = self.height_limits.unwrap_or([0.0, 10.0]);
-
-        // For each height level
-        for j in 0..N_V {
-            let mut row = Vec::new();
-            let v = v_min + (v_max - v_min) * (j as f64) / (N_V as f64 - 1.0);
-            let center = self.origin + self.axis * v;
-
-            // Get perpendicular directions
-            let x_dir = self.ref_dir;
-            let y_dir = self.axis.cross(&x_dir);
-
-            // Control points for NURBS circle (rational quadratic B-spline)
-            row.push(center + x_dir * self.radius); // 0°
-            row.push(center + (x_dir + y_dir) * self.radius); // 45° (weighted)
-            row.push(center + y_dir * self.radius); // 90°
-            row.push(center + (-x_dir + y_dir) * self.radius); // 135° (weighted)
-            row.push(center - x_dir * self.radius); // 180°
-            row.push(center + (-x_dir - y_dir) * self.radius); // 225° (weighted)
-            row.push(center - y_dir * self.radius); // 270°
-            row.push(center + (x_dir - y_dir) * self.radius); // 315° (weighted)
-            row.push(center + x_dir * self.radius); // 360° = 0°
-
-            control_points.push(row);
-        }
-
-        // Knot vectors
-        // U direction (circular): [0,0,0, 0.25,0.25, 0.5,0.5, 0.75,0.75, 1,1,1]
-        let knots_u = vec![
-            0.0, 0.0, 0.0, // multiplicity 3 at start
-            0.25, 0.25, // multiplicity 2
-            0.5, 0.5, // multiplicity 2
-            0.75, 0.75, // multiplicity 2
-            1.0, 1.0, 1.0, // multiplicity 3 at end
-        ];
-
-        // V direction (linear): [0,0, 1,1]
-        let knots_v = vec![0.0, 0.0, 1.0, 1.0];
-
-        // BSplineSurface is non-rational: it cannot carry the rational
-        // weights (1/√2 at the 45° corners) needed to represent an exact
-        // circle. The control polygon above traces the bounding octagon,
-        // so the result is a low-error approximation of a cylinder rather
-        // than an exact one. Promotion to NurbsSurface (with weights) is
-        // tracked separately; flag the lossy conversion at debug level.
-        tracing::debug!(
-            "Cylinder::to_bspline: returning non-rational octagon approximation; promote to NurbsSurface for exact circle"
-        );
-
-        Box::new(
-            BSplineSurface::new(degree_u, degree_v, control_points, knots_u, knots_v)
-                .expect("Failed to create B-spline cylinder"),
-        )
-    }
 }
 
 /// Spherical surface
@@ -4951,13 +4877,6 @@ impl SurfaceOfRevolution {
         (height, radius, radial_dir)
     }
 
-    /// Rotate a radial direction by angle v around the axis
-    fn rotate_radial(&self, radial_dir: Vector3, v: f64) -> Vector3 {
-        let cos_v = v.cos();
-        let sin_v = v.sin();
-        let binormal = self.axis_direction.cross(&radial_dir);
-        radial_dir * cos_v + binormal * sin_v
-    }
 }
 
 impl Surface for SurfaceOfRevolution {

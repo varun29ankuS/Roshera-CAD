@@ -538,17 +538,6 @@ fn validate_imprint_result(
     Ok(())
 }
 
-// Extension trait for Edge to support face association
-trait EdgeFaceAssociation {
-    fn set_face_association(&self, face_id: FaceId);
-}
-
-impl EdgeFaceAssociation for Edge {
-    fn set_face_association(&self, _face_id: FaceId) {
-        // Would store face association
-    }
-}
-
 // Extension trait for Face to support internal edges
 trait FaceInternalEdges {
     fn add_internal_edges(&mut self, edges: &[EdgeId]);

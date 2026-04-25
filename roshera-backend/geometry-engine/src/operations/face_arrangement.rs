@@ -74,9 +74,6 @@ pub(super) struct HalfEdge {
 /// Planar-arrangement DCEL built from an [`IntersectionGraph`].
 pub(super) struct Arrangement {
     pub(super) half_edges: Vec<HalfEdge>,
-    /// For each vertex, the list of outgoing half-edge IDs sorted CCW
-    /// around the surface normal at that vertex.
-    pub(super) outgoing: HashMap<VertexId, Vec<HalfEdgeId>>,
 }
 
 impl Arrangement {
@@ -89,11 +86,6 @@ impl Arrangement {
     #[inline]
     fn get(&self, id: HalfEdgeId) -> &HalfEdge {
         &self.half_edges[id.index()]
-    }
-
-    #[inline]
-    fn get_mut(&mut self, id: HalfEdgeId) -> &mut HalfEdge {
-        &mut self.half_edges[id.index()]
     }
 }
 
@@ -266,10 +258,7 @@ pub(super) fn build_arrangement(
         half_edges[h_idx].next = ring[next_idx];
     }
 
-    Ok(Arrangement {
-        half_edges,
-        outgoing,
-    })
+    Ok(Arrangement { half_edges })
 }
 
 /// Walk minimal-face cycles in the arrangement and return each as a list
@@ -541,10 +530,7 @@ mod tests {
                 forward: true,
             });
         }
-        Arrangement {
-            half_edges,
-            outgoing: HashMap::new(),
-        }
+        Arrangement { half_edges }
     }
 
     #[test]

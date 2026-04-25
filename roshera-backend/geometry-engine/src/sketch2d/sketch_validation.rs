@@ -898,14 +898,12 @@ pub mod analysis_tools {
     }
 
     /// Sketch analysis engine
-    pub struct SketchAnalyzer {
-        tolerance: Tolerance2d,
-    }
+    pub struct SketchAnalyzer;
 
     impl SketchAnalyzer {
         /// Create new sketch analyzer
-        pub fn new(tolerance: Tolerance2d) -> Self {
-            Self { tolerance }
+        pub fn new() -> Self {
+            Self
         }
 
         /// Analyze constraint status of all entities in sketch
@@ -1191,20 +1189,20 @@ pub mod analysis_tools {
 
     /// Quick analysis functions
     pub fn is_sketch_fully_constrained(sketch: &Sketch) -> bool {
-        let analyzer = SketchAnalyzer::new(sketch.tolerance);
+        let analyzer = SketchAnalyzer::new();
         let analysis = analyzer.analyze_constraints(sketch);
 
         analysis.under_constrained_entities.is_empty() && analysis.conflicting_constraints == 0
     }
 
     pub fn get_sketch_dof_count(sketch: &Sketch) -> isize {
-        let analyzer = SketchAnalyzer::new(sketch.tolerance);
+        let analyzer = SketchAnalyzer::new();
         let analysis = analyzer.analyze_constraints(sketch);
         analysis.degrees_of_freedom
     }
 
     pub fn find_problematic_entities(sketch: &Sketch) -> Vec<(EntityRef, EntityConstraintStatus)> {
-        let analyzer = SketchAnalyzer::new(sketch.tolerance);
+        let analyzer = SketchAnalyzer::new();
         let mut problematic = Vec::new();
 
         // Check all entity types

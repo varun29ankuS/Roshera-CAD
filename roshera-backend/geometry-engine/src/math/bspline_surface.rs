@@ -14,7 +14,6 @@
 
 use crate::math::nurbs::NurbsCurve;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
-use std::sync::RwLock;
 
 /// 2D parameter for surface evaluation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -229,9 +228,6 @@ pub struct BSplineSurface {
     pub knots_v: Vec<f64>,
     /// Parameter domain
     pub domain: ParameterDomain,
-    /// Cached basis functions for performance
-    #[allow(dead_code)]
-    basis_cache: RwLock<Option<SurfaceBasisCache>>,
 }
 
 impl Clone for BSplineSurface {
@@ -243,21 +239,8 @@ impl Clone for BSplineSurface {
             knots_u: self.knots_u.clone(),
             knots_v: self.knots_v.clone(),
             domain: self.domain.clone(),
-            basis_cache: RwLock::new(None),
         }
     }
-}
-
-/// Cache for surface basis function evaluations
-#[derive(Debug, Clone)]
-struct SurfaceBasisCache {
-    param: Parameter2D,
-    span_u: usize,
-    span_v: usize,
-    basis_u: Vec<f64>,
-    basis_v: Vec<f64>,
-    derivatives_u: Vec<Vec<f64>>,
-    derivatives_v: Vec<Vec<f64>>,
 }
 
 impl BSplineSurface {
@@ -346,7 +329,6 @@ impl BSplineSurface {
             knots_u,
             knots_v,
             domain,
-            basis_cache: RwLock::new(None),
         })
     }
 
@@ -1063,7 +1045,6 @@ impl BSplineSurface {
             knots_u: self.knots_u.clone(),
             knots_v: self.knots_v.clone(),
             domain: self.domain,
-            basis_cache: RwLock::new(None),
         }
     }
 
