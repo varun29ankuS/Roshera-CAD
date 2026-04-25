@@ -844,12 +844,11 @@ impl Plane {
         )
         .map_err(|_| MathError::InvalidParameter("Failed to create NURBS surface".to_string()))?;
 
-        // For variable offset, we need to create a custom implementation
-        // For now, let's return a simple offset surface
-        // In production, we'd implement a proper variable offset surface
-        Err(MathError::NotImplemented(
-            "Variable offset for NURBS not yet implemented".to_string(),
-        ))
+        // Wrap NurbsSurface in a GeneralNurbsSurface that implements Surface trait.
+        // This mirrors the Cone/Torus/Cylinder offset_variable pattern.
+        Ok(Box::new(GeneralNurbsSurface {
+            nurbs: nurbs_surface,
+        }))
     }
 }
 
@@ -1755,11 +1754,11 @@ impl Surface for Cylinder {
         )
         .map_err(|_| MathError::InvalidParameter("Failed to create NURBS surface".to_string()))?;
 
-        // For now, return an error - variable offset requires a proper implementation
-        // In production, we'd create a wrapper that implements the Surface trait properly
-        Err(MathError::NotImplemented(
-            "Variable offset not yet implemented".to_string(),
-        ))
+        // Wrap NurbsSurface in a GeneralNurbsSurface that implements Surface trait.
+        // This mirrors the Cone/Torus offset_variable pattern.
+        Ok(Box::new(GeneralNurbsSurface {
+            nurbs: nurbs_surface,
+        }))
     }
 
     fn intersect(
@@ -2546,11 +2545,11 @@ impl Surface for Sphere {
         )
         .map_err(|_| MathError::InvalidParameter("Failed to create NURBS surface".to_string()))?;
 
-        // For now, return an error - variable offset requires a proper implementation
-        // In production, we'd create a wrapper that implements the Surface trait properly
-        Err(MathError::NotImplemented(
-            "Variable offset not yet implemented".to_string(),
-        ))
+        // Wrap NurbsSurface in a GeneralNurbsSurface that implements Surface trait.
+        // This mirrors the Cone/Torus offset_variable pattern.
+        Ok(Box::new(GeneralNurbsSurface {
+            nurbs: nurbs_surface,
+        }))
     }
 
     fn intersect(

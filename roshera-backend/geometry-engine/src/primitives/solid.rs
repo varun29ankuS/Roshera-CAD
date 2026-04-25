@@ -548,26 +548,6 @@ impl Solid {
             .expect("cached_mass_props was assigned to Some(..) immediately above"))
     }
 
-    /// Boolean operation with another solid.
-    ///
-    /// **DEPRECATED**: Use `operations::boolean::boolean_operation()` instead,
-    /// which operates on BRepModel and performs real face-face intersection,
-    /// classification, and topology reconstruction.
-    #[deprecated(note = "Use operations::boolean::boolean_operation() with BRepModel instead")]
-    pub fn boolean_op(
-        &self,
-        _other: &Solid,
-        _operation: BooleanOp,
-        _tolerance: Tolerance,
-    ) -> MathResult<Solid> {
-        Err(MathError::NotImplemented(
-            "Solid::boolean_op is deprecated. Use operations::boolean::boolean_operation() \
-             with BRepModel for real boolean operations with face-face intersection, \
-             classification, and topology reconstruction."
-                .to_string(),
-        ))
-    }
-
     /// Transform solid
     pub fn transform(&mut self, matrix: &Matrix4) -> MathResult<()> {
         // Transform would modify all vertices
@@ -1035,30 +1015,6 @@ impl SolidStore {
             .get(&shell_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Perform boolean operation
-    pub fn boolean_operation(
-        &mut self,
-        solid1_id: SolidId,
-        solid2_id: SolidId,
-        operation: BooleanOp,
-        tolerance: Tolerance,
-    ) -> MathResult<SolidId> {
-        let solid1 = self
-            .get(solid1_id)
-            .ok_or(MathError::InvalidParameter("Solid 1 not found".to_string()))?
-            .clone();
-        let solid2 = self
-            .get(solid2_id)
-            .ok_or(MathError::InvalidParameter("Solid 2 not found".to_string()))?;
-
-        let result = solid1.boolean_op(solid2, operation, tolerance)?;
-        let result_id = self.add(result);
-
-        self.stats.boolean_operations += 1;
-
-        Ok(result_id)
     }
 
     #[inline(always)]

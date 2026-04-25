@@ -602,9 +602,12 @@ impl OperationsRegistry {
             "extrude" => self.execute_extrude(&command, model),
             "revolve" => self.execute_revolve(&command, model),
             "pattern" => self.execute_pattern(&command, model),
-            _ => Err(OperationError::NotImplemented(
-                command.operation_type.clone(),
-            )),
+            other => Err(OperationError::InvalidInput {
+                parameter: "operation_type".to_string(),
+                expected: "boolean | fillet | chamfer | extrude | revolve | pattern"
+                    .to_string(),
+                received: other.to_string(),
+            }),
         }?;
 
         let execution_time = start.elapsed().as_secs_f64() * 1000.0;
