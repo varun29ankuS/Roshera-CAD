@@ -222,9 +222,11 @@ pub fn intersect_surfaces(
         let v1 = v1_range.0 + 0.25 * (v1_range.1 - v1_range.0);
         let v2 = v1_range.0 + 0.75 * (v1_range.1 - v1_range.0);
 
+        // Plane heuristic: two unit normals at distinct uv samples should
+        // coincide for a plane. |n_a − n_b| = 2·sin(θ/2) chord-distance.
         let n1 = surface1.normal_at(u1, v1)?;
         let n2 = surface1.normal_at(u2, v2)?;
-        (n1 - n2).magnitude() < tolerance.angle()
+        (n1 - n2).magnitude() < tolerance.chord_threshold()
     };
 
     let is_plane2 = {
@@ -235,7 +237,7 @@ pub fn intersect_surfaces(
 
         let n1 = surface2.normal_at(u1, v1)?;
         let n2 = surface2.normal_at(u2, v2)?;
-        (n1 - n2).magnitude() < tolerance.angle()
+        (n1 - n2).magnitude() < tolerance.chord_threshold()
     };
 
     if is_plane1 && is_plane2 {
@@ -267,11 +269,11 @@ fn intersect_line_line(
     // Vector from line1 start to line2 start
     let w = p3 - p1;
 
-    // Check if lines are parallel
+    // Check if lines are parallel: unit directions → |d_a × d_b| = sin θ.
     let cross = d1.cross(&d2);
     let cross_mag = cross.magnitude();
 
-    if cross_mag < tolerance.angle() {
+    if cross_mag < tolerance.parallel_threshold() {
         // Lines are parallel or coincident
         // Check if they are coincident
         let dist_to_line = w.cross(&d1).magnitude();
@@ -537,11 +539,13 @@ fn line_arc_hits(line: &Line, arc: &Arc, tolerance: Tolerance) -> Vec<LineArcHit
     }
 
     let n = arc.normal;
+    // dir and n are unit → denom = cos θ between line and arc-plane normal.
+    // Line lies in arc plane ⇔ dir ⊥ n ⇔ |cos θ| ≈ 0.
     let denom = dir.dot(&n);
     let y_axis = n.cross(&arc.x_axis);
     let mut hits: Vec<LineArcHit> = Vec::new();
 
-    if denom.abs() < tolerance.angle() {
+    if denom.abs() < tolerance.parallel_threshold() {
         if (p0 - arc.center).dot(&n).abs() > tolerance.distance() {
             return hits;
         }
@@ -703,10 +707,11 @@ fn intersect_arc_arc(
         None => return Ok(IntersectionResult::None),
     };
 
+    // Unit normals → |n_a × n_b| = sin θ; arc planes parallel ⇔ sin θ ≈ 0.
     let cross_normals = a.normal.cross(&b.normal);
     let mut points: Vec<IntersectionPoint> = Vec::new();
 
-    if cross_normals.magnitude() < tolerance.angle() {
+    if cross_normals.magnitude() < tolerance.parallel_threshold() {
         // Planes are parallel. Verify coincidence.
         if (b.center - a.center).dot(&a.normal).abs() > tolerance.distance() {
             return Ok(IntersectionResult::None);
@@ -1046,9 +1051,10 @@ fn intersect_curve_plane(
         // Treat as line-plane intersection
         let line_dir = (end_point - start_point).normalize()?;
 
-        // Check if line is parallel to plane
+        // Check if line is parallel to plane: unit line_dir and unit plane_normal
+        // → dot = |cos θ|; parallel ⇔ |cos θ| ≈ 0.
         let dot = line_dir.dot(&plane_normal).abs();
-        if dot < tolerance.angle() {
+        if dot < tolerance.parallel_threshold() {
             // Line is parallel to plane
             // Check if line lies in plane
             let dist = (start_point - plane_point).dot(&plane_normal).abs();
@@ -1571,8 +1577,10 @@ fn newton_refine_curve_surface(
         if f.magnitude() < tol_d {
             let n = surface.normal_at(u, v).ok()?;
             let tangent = curve.tangent_at(t).ok()?;
+            // Tangent intersection ⇔ curve tangent ⊥ surface normal ⇔ cos θ ≈ 0
+            // (unit tangent, unit normal).
             let cos_angle = tangent.dot(&n).abs();
-            let hit_type = if cos_angle < tolerance.angle() {
+            let hit_type = if cos_angle < tolerance.parallel_threshold() {
                 PointIntersectionType::Tangent
             } else {
                 PointIntersectionType::Transverse
@@ -1631,11 +1639,11 @@ fn intersect_plane_plane(
     let p2 = surface2.point_at(u2_mid, v2_mid)?;
     let n2 = surface2.normal_at(u2_mid, v2_mid)?;
 
-    // Check if planes are parallel
+    // Check if planes are parallel: unit normals → |n_a × n_b| = sin θ.
     let cross = n1.cross(&n2);
     let cross_mag = cross.magnitude();
 
-    if cross_mag < tolerance.angle() {
+    if cross_mag < tolerance.parallel_threshold() {
         // Planes are parallel
         // Check if they're coincident
         let dist = (p2 - p1).dot(&n1).abs();

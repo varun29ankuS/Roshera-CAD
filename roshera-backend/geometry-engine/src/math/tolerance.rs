@@ -85,6 +85,26 @@ impl Tolerance {
         1.0 - self.angle.cos()
     }
 
+    /// Threshold for `|a − b|` chord-distance comparisons against
+    /// `self.angle()`, where `a` and `b` are unit vectors.
+    ///
+    /// For unit vectors `a, b` separated by angle θ,
+    /// `|a − b| = 2·sin(θ/2)`. Use this when code computes the magnitude
+    /// of the *difference* of two unit vectors and wants to know whether
+    /// they agree to within angular tolerance:
+    ///
+    /// ```ignore
+    /// if (a - b).magnitude() < tol.chord_threshold() { /* aligned */ }
+    /// ```
+    ///
+    /// Returns `2·sin(self.angle()/2)`. For small angles this is
+    /// numerically very close to `self.angle()` (since `sin(x) ≈ x`),
+    /// but the semantic is unambiguous.
+    #[inline]
+    pub fn chord_threshold(&self) -> f64 {
+        2.0 * (self.angle * 0.5).sin()
+    }
+
     /// Get squared distance tolerance (for optimization)
     #[inline]
     pub fn distance_squared(&self) -> f64 {
