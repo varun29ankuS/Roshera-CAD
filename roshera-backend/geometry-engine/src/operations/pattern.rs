@@ -4,17 +4,12 @@
 //! rectangular, and custom patterns.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
-    curve::Curve,
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     r#loop::Loop,
-    shell::Shell,
-    solid::{Solid, SolidId},
-    surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
 };
 
 /// Type of pattern

@@ -850,7 +850,7 @@ impl VariableRadiusFillet {
         let num_u = 20;
         let num_v = 5;
         let mut control_points = vec![vec![Point3::ZERO; num_v]; num_u];
-        let mut weights = vec![vec![1.0; num_v]; num_u];
+        let weights = vec![vec![1.0; num_v]; num_u];
 
         // Sample along spine
         for i in 0..num_u {

@@ -10,17 +10,16 @@
 //! - Shell offset generation
 //! - Multi-threaded validation
 
-use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
     edge::{EdgeId, EdgeStore},
     face::{Face, FaceId, FaceOrientation, FaceStore, INVALID_FACE_ID},
-    r#loop::{LoopId, LoopStore},
+    r#loop::LoopStore,
     surface::SurfaceStore,
-    vertex::{VertexId, VertexStore},
+    vertex::VertexStore,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Shell ID type
@@ -756,7 +755,7 @@ impl Shell {
         face_store: &FaceStore,
         surface_store: &mut SurfaceStore,
     ) -> MathResult<Shell> {
-        let mut offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
+        let offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
 
         for &face_id in &self.faces {
             if let Some(face) = face_store.get(face_id) {
@@ -977,7 +976,7 @@ impl ShellStore {
             if let Some(ref s) = shell {
                 // Remove from face indices
                 for &face_id in &s.faces {
-                    if let Some(mut shells) = self.face_to_shells.get_mut(&face_id) {
+                    if let Some(shells) = self.face_to_shells.get_mut(&face_id) {
                         shells.retain(|&sid| sid != id);
                     }
                 }

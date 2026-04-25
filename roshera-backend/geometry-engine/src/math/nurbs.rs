@@ -16,7 +16,6 @@
 
 use crate::math::bspline::KnotVector;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Vector3};
-use rayon::prelude::*;
 use std::sync::Arc;
 
 // SIMD optimizations

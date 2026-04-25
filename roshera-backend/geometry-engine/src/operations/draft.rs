@@ -13,11 +13,9 @@ use crate::primitives::{
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
-    shell::Shell,
-    solid::{Solid, SolidId},
+    solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
 };
 
 /// Options for draft operations
@@ -1377,7 +1375,7 @@ fn create_blend_loop(
     // Create a simple rectangular loop for the blend
     use crate::primitives::r#loop::{Loop, LoopType};
 
-    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    let blend_loop = Loop::new(0, LoopType::Outer);
 
     // For simplicity, return empty loop
     // In practice, this would create edges connecting the face boundaries

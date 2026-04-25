@@ -36,7 +36,7 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Curve, CurveId, CurveIntersection},
+    curve::{Curve, CurveId},
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     shell::{Shell, ShellId},
@@ -1863,7 +1863,7 @@ fn create_parametric_curve(params: &[(f64, f64)]) -> ParametricCurve {
 
 /// Merge curves that connect
 fn merge_connected_curves(
-    mut curves: Vec<SurfaceIntersectionCurve>,
+    curves: Vec<SurfaceIntersectionCurve>,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     if curves.len() <= 1 {
@@ -3040,7 +3040,6 @@ fn compute_edge_intersections(
 
         // Create sub-edges by splitting at each parameter
         let mut remaining_edge = original_edge;
-        let mut accumulated_offset = 0.0;
 
         for (param, split_vid) in &splits {
             // Adjust parameter relative to remaining edge's range

@@ -17,7 +17,7 @@
 //! - DeRose, T., Kass, M., Truong, T. (1993). "Functional composition algorithms via blossoming"
 //! - Vida, J., Martin, R., Varady, T. (1994). "A survey of blending methods that use parametric surfaces"
 
-use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::surface::{
     ContinuityAnalysis, CurvatureInfo, Surface, SurfacePoint, SurfaceType,
 };
@@ -589,8 +589,6 @@ impl Surface for G2BlendingSurface {
         other: &dyn Surface,
         tolerance: Tolerance,
     ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
-        use crate::primitives::surface::SurfaceIntersectionResult;
-
         // G2 blending surface intersection uses adaptive subdivision
         // Production implementation would:
         // 1. Use bounding box tests for early rejection

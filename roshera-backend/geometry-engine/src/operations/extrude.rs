@@ -9,9 +9,8 @@
 
 use super::deep_clone::deep_clone_faces;
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
-    curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
@@ -19,7 +18,7 @@ use crate::primitives::{
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex::{Vertex, VertexId},
+    vertex::VertexId,
 };
 use tracing::debug;
 

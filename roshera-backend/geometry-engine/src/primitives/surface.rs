@@ -1104,7 +1104,7 @@ impl Plane {
         // - Kriezis et al. (1992). "Rational polynomial surface intersections"
 
         // Start with a grid search to find initial intersection points
-        let mut initial_points = self.find_initial_intersection_points(other, tolerance);
+        let initial_points = self.find_initial_intersection_points(other, tolerance);
 
         if initial_points.is_empty() {
             return vec![];
@@ -2014,9 +2014,7 @@ impl Cylinder {
             }
 
             // For skew cylinders, the intersection is generally a space curve
-            // We'll use a marching approach to find it
-            use crate::math::Vector3;
-
+            // We'll use a marching approach to find it.
             // Start with a grid of test points on first cylinder
             const THETA_SAMPLES: usize = 24;
             const HEIGHT_SAMPLES: usize = 20;
@@ -3822,7 +3820,7 @@ impl Torus {
         // 3. One circle (tangent plane)
         // 4. No intersection
 
-        let mut intersections = Vec::new();
+        let intersections = Vec::new();
 
         // Distance from torus center to plane
         let center_to_plane = plane.normal.dot(&(self.center - plane.origin));
