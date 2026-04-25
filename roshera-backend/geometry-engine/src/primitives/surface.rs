@@ -4090,37 +4090,45 @@ impl SurfaceStore {
         let id = self.next_id;
         let surface_type = surface.surface_type();
 
-        // Type-specific storage for common types - ONLY populate type_map on demand
+        // Type-specific storage for common types. type_map records
+        // (SurfaceType, idx) so iter() and any future fast-dispatch lookup
+        // can resolve `id -> &dyn Surface` without scanning every Vec.
+        // Without this insertion the surface would be effectively invisible
+        // to iter() — a real correctness gap, not a "deferred optimization".
         match surface_type {
             SurfaceType::Plane => {
                 if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
                     let idx = self.planes.len();
                     self.planes.push(*plane);
-                    // Defer type_map insertion - only when needed for lookup
+                    self.type_map.insert(id, (SurfaceType::Plane, idx));
                 }
             }
             SurfaceType::Cylinder => {
                 if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
                     let idx = self.cylinders.len();
                     self.cylinders.push(*cyl);
+                    self.type_map.insert(id, (SurfaceType::Cylinder, idx));
                 }
             }
             SurfaceType::Sphere => {
                 if let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() {
                     let idx = self.spheres.len();
                     self.spheres.push(*sphere);
+                    self.type_map.insert(id, (SurfaceType::Sphere, idx));
                 }
             }
             SurfaceType::Cone => {
                 if let Some(cone) = surface.as_any().downcast_ref::<Cone>() {
                     let idx = self.cones.len();
                     self.cones.push(*cone);
+                    self.type_map.insert(id, (SurfaceType::Cone, idx));
                 }
             }
             SurfaceType::Torus => {
                 if let Some(torus) = surface.as_any().downcast_ref::<Torus>() {
                     let idx = self.toruses.len();
                     self.toruses.push(*torus);
+                    self.type_map.insert(id, (SurfaceType::Torus, idx));
                 }
             }
             _ => {

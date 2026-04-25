@@ -472,14 +472,37 @@ fn create_offset_edge(
     Ok(offset_edge_id)
 }
 
-/// Create offset curve
+/// Create offset curve.
+///
+/// Currently returns a topological clone of the source curve. A proper
+/// offset requires the surface's normal field along the curve's parameter
+/// range and per-curve-type analytic offsets (parallel line for Line,
+/// concentric arc for Circle, NURBS-rebuild for splines). Until that
+/// arrives, this function validates its inputs and emits a diagnostic so
+/// callers know the returned curve is geometry-coincident with the
+/// source rather than silently shipping a wrong curve.
 fn create_offset_curve(
     curve: &dyn Curve,
     surface_id: u32,
     distance: f64,
 ) -> OperationResult<Box<dyn Curve>> {
-    // Would create proper offset curve
-    // For now, return copy of original
+    if !distance.is_finite() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_offset_curve: distance {} is not finite",
+            distance
+        )));
+    }
+    if surface_id == 0 {
+        return Err(OperationError::InvalidGeometry(
+            "create_offset_curve: surface_id 0 is reserved/invalid".to_string(),
+        ));
+    }
+    tracing::debug!(
+        surface_id = surface_id,
+        distance = distance,
+        "create_offset_curve: per-curve analytic offset not yet implemented; \
+         returning clone of source curve (vertex offset still applied)"
+    );
     Ok(curve.clone_box())
 }
 
@@ -577,13 +600,41 @@ fn create_interior_offset_faces(
     Ok(interior_faces)
 }
 
-/// Create wall faces for shell openings
+/// Create wall faces for shell openings.
+///
+/// Walls are erected at every face the caller wants to remove (the
+/// "openings"). We first verify each `faces_to_remove` actually belongs
+/// to the solid's outer shell — otherwise the wall topology would
+/// connect the new shell to faces that don't share boundary edges, and
+/// the resulting solid would be non-manifold.
 fn create_shell_walls(
     model: &mut BRepModel,
     solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
 ) -> OperationResult<Vec<FaceId>> {
+    // Confirm every face being removed lives on this solid's outer shell.
+    let outer_shell_faces: std::collections::HashSet<FaceId> = model
+        .shells
+        .get(solid.outer_shell)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!(
+            "create_shell_walls: outer shell {} of solid {} not found",
+            solid.outer_shell, solid.id
+        )))?
+        .faces
+        .iter()
+        .copied()
+        .collect();
+
+    for &face_id in faces_to_remove {
+        if !outer_shell_faces.contains(&face_id) {
+            return Err(OperationError::InvalidGeometry(format!(
+                "create_shell_walls: face {} is not on outer shell {} of solid {}",
+                face_id, solid.outer_shell, solid.id
+            )));
+        }
+    }
+
     let mut wall_faces = Vec::new();
 
     for &face_id in faces_to_remove {
@@ -642,12 +693,29 @@ fn create_wall_face(
     let p1 = Vector3::new(p1_arr[0], p1_arr[1], p1_arr[2]);
     let p2 = Vector3::new(p2_arr[0], p2_arr[1], p2_arr[2]);
 
-    // Compute offset direction from the surface normal at midpoint
+    // Compute offset direction from edge geometry. The mid-parameter
+    // evaluation acts as a sanity check: a well-formed edge must have its
+    // curve mid-point lie on the segment between the two stored vertex
+    // positions. If they diverge, the edge's curve is inconsistent with
+    // its vertices and we should refuse to build a wall on top of it.
     let edge_curve = model
         .curves
         .get(outer_edge.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge curve not found".into()))?;
     let mid = edge_curve.evaluate(0.5)?.position;
+    let segment_mid = (p1 + p2) * 0.5;
+    let drift = (mid - segment_mid).magnitude();
+    // Use 0.5% of the edge length as the per-edge consistency budget;
+    // anything beyond that signals a curve/vertex mismatch worth aborting on.
+    let edge_len = (p2 - p1).magnitude();
+    let drift_budget = (edge_len * 5e-3).max(1e-9);
+    if drift > drift_budget {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_wall_face: edge {} curve mid-point drift {:.3e} \
+             exceeds budget {:.3e} (edge length {:.3e})",
+            outer_edge_id, drift, drift_budget, edge_len
+        )));
+    }
     let edge_dir = (p2 - p1).normalize()?;
     // Use a default inward direction perpendicular to edge
     let offset_dir = if edge_dir.cross(&Vector3::Z).magnitude_squared() > 1e-6 {

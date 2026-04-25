@@ -675,12 +675,40 @@ fn aabbs_overlap(a: &[f64; 6], b: &[f64; 6]) -> bool {
     a[0] <= b[3] && a[3] >= b[0] && a[1] <= b[4] && a[4] >= b[1] && a[2] <= b[5] && a[5] >= b[2]
 }
 
-/// Merge coincident geometry in pattern
+/// Merge coincident geometry in pattern.
+///
+/// Currently a no-op placeholder for the planned vertex/edge/face merge
+/// pass. We still validate the inputs so misuse surfaces immediately:
+/// every face referenced by every instance must exist in the model. An
+/// empty instance list is treated as a successful no-op.
 fn merge_pattern_geometry(
     model: &mut BRepModel,
     instances: &mut Vec<Vec<FaceId>>,
 ) -> OperationResult<()> {
-    // Would merge vertices, edges, and faces that are coincident
+    if instances.is_empty() {
+        tracing::debug!("merge_pattern_geometry: no instances; skipping merge");
+        return Ok(());
+    }
+
+    let mut total_faces: usize = 0;
+    for (i, instance) in instances.iter().enumerate() {
+        for &face_id in instance {
+            if model.faces.get(face_id).is_none() {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "merge_pattern_geometry: instance {} references non-existent face {}",
+                    i, face_id
+                )));
+            }
+            total_faces += 1;
+        }
+    }
+
+    tracing::debug!(
+        instances = instances.len(),
+        total_faces = total_faces,
+        "merge_pattern_geometry: coincidence merge not yet implemented; faces left untouched"
+    );
+
     Ok(())
 }
 
