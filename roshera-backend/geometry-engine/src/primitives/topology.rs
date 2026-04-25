@@ -524,8 +524,10 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
         }
     }
 
-    // Build face-face adjacency
-    for (&edge_id, faces) in &info.edge_faces {
+    // Build face-face adjacency. We only need the per-edge face sets
+    // here; the edge id itself is not stored on `face_faces` (which is
+    // an unweighted FaceId → {FaceId} mapping).
+    for faces in info.edge_faces.values() {
         if faces.len() >= 2 {
             let face_vec: Vec<_> = faces.iter().cloned().collect();
             for i in 0..face_vec.len() {
@@ -947,10 +949,86 @@ fn compute_entity_differences(counts1: &[usize; 7], counts2: &[usize; 7]) -> Has
     differences
 }
 
-/// Find all cycles in edge graph
+/// Find simple cycles in the edge graph induced by vertex adjacency.
+///
+/// Performs a DFS over the vertex graph (`adjacency.vertex_vertices`); any
+/// back-edge to an already-visited ancestor closes a cycle, which is then
+/// translated from a vertex sequence into the corresponding edge sequence
+/// via `adjacency.vertex_edges`. Cycles longer than `max_length` (when
+/// supplied) are skipped, which keeps runtime bounded on dense
+/// triangulations.
+///
+/// Returned cycles are minimal (no repeated vertices except the closing
+/// one) but are not deduplicated under rotation/reflection — callers that
+/// need a canonical representative should canonicalise on the receiving
+/// side.
+///
+/// # Performance
+/// O((V + E) · max_length) worst case; effectively linear on sparse
+/// topology that dominates B-Rep meshes.
 pub fn find_edge_cycles(adjacency: &AdjacencyInfo, max_length: Option<usize>) -> Vec<Vec<EdgeId>> {
-    // Implementation would use cycle detection algorithm
-    Vec::new()
+    let cap = max_length.unwrap_or(usize::MAX);
+    let mut cycles: Vec<Vec<EdgeId>> = Vec::new();
+    let mut visited: HashSet<VertexId> = HashSet::new();
+
+    // Helper: resolve the EdgeId connecting two vertices (HashSet
+    // intersection of their vertex_edges entries).
+    let edge_between = |a: VertexId, b: VertexId| -> Option<EdgeId> {
+        let ea = adjacency.vertex_edges.get(&a)?;
+        let eb = adjacency.vertex_edges.get(&b)?;
+        ea.intersection(eb).copied().next()
+    };
+
+    for &start in adjacency.vertex_vertices.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        // Iterative DFS: stack holds (current vertex, parent vertex, path).
+        let mut stack: Vec<(VertexId, Option<VertexId>, Vec<VertexId>)> =
+            vec![(start, None, vec![start])];
+        while let Some((v, parent, path)) = stack.pop() {
+            visited.insert(v);
+            let neighbors = match adjacency.vertex_vertices.get(&v) {
+                Some(n) => n,
+                None => continue,
+            };
+            for &n in neighbors {
+                if Some(n) == parent {
+                    continue;
+                }
+                if let Some(idx) = path.iter().position(|&p| p == n) {
+                    // Back-edge to an ancestor — extract cycle.
+                    let cycle_vertices = &path[idx..];
+                    if cycle_vertices.len() < 3 || cycle_vertices.len() > cap {
+                        continue;
+                    }
+                    let mut cycle_edges: Vec<EdgeId> = Vec::with_capacity(cycle_vertices.len());
+                    let mut ok = true;
+                    for window in cycle_vertices.windows(2) {
+                        match edge_between(window[0], window[1]) {
+                            Some(e) => cycle_edges.push(e),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        if let Some(e_close) = edge_between(*cycle_vertices.last().expect("non-empty"), n) {
+                            cycle_edges.push(e_close);
+                            cycles.push(cycle_edges);
+                        }
+                    }
+                } else if path.len() < cap {
+                    let mut next_path = path.clone();
+                    next_path.push(n);
+                    stack.push((n, Some(v), next_path));
+                }
+            }
+        }
+    }
+
+    cycles
 }
 
 /// Analyze topology for simplification opportunities
@@ -1141,12 +1219,56 @@ pub struct TopologicalFeatures {
     pub is_manifold: bool,
 }
 
+/// Partition the supplied edge set into connected components under the
+/// shared-vertex relation: two edges are in the same component iff they
+/// share at least one endpoint vertex (transitively).
+///
+/// Uses BFS over an implicit edge-graph derived from
+/// `adjacency.vertex_edges`. Edges absent from `vertex_edges` (e.g.
+/// floating ids) are still emitted as singleton components so callers can
+/// surface them as unattached topology rather than dropping them.
 fn find_connected_edge_components(
     edges: &HashSet<EdgeId>,
     adjacency: &AdjacencyInfo,
 ) -> Vec<Vec<EdgeId>> {
-    // Implementation would find connected components of edges
-    Vec::new()
+    // Build EdgeId → endpoint vertices map by inverting vertex_edges.
+    let mut edge_endpoints: HashMap<EdgeId, Vec<VertexId>> = HashMap::new();
+    for (&v, es) in &adjacency.vertex_edges {
+        for &e in es {
+            if edges.contains(&e) {
+                edge_endpoints.entry(e).or_default().push(v);
+            }
+        }
+    }
+
+    let mut components: Vec<Vec<EdgeId>> = Vec::new();
+    let mut visited: HashSet<EdgeId> = HashSet::new();
+    for &start in edges {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut component: Vec<EdgeId> = Vec::new();
+        let mut frontier: Vec<EdgeId> = vec![start];
+        while let Some(e) = frontier.pop() {
+            if !visited.insert(e) {
+                continue;
+            }
+            component.push(e);
+            if let Some(verts) = edge_endpoints.get(&e) {
+                for &v in verts {
+                    if let Some(siblings) = adjacency.vertex_edges.get(&v) {
+                        for &sib in siblings {
+                            if edges.contains(&sib) && !visited.contains(&sib) {
+                                frontier.push(sib);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+    components
 }
 
 fn is_shell_manifold(shell: &Shell, adjacency: &AdjacencyInfo) -> bool {
@@ -1658,16 +1780,30 @@ pub fn is_shell_orientable(shell: &Shell, ctx: &TopologyContext) -> bool {
     true
 }
 
-/// Find holes (inner loops) in all faces
+/// Find holes (inner loops) in all faces.
+///
+/// Returns only inner loops that resolve to a real entry in `loops` —
+/// dangling LoopIds (left behind by a partial topology rebuild) are
+/// silently dropped so downstream consumers don't dereference invalid
+/// ids.
 pub fn find_face_holes(faces: &FaceStore, loops: &LoopStore) -> HashMap<FaceId, Vec<LoopId>> {
     (0..faces.len() as u32)
         .into_par_iter()
         .filter_map(|face_id| {
             faces.get(face_id).and_then(|face| {
-                if !face.inner_loops.is_empty() {
-                    Some((face_id, face.inner_loops.clone()))
-                } else {
+                if face.inner_loops.is_empty() {
+                    return None;
+                }
+                let valid: Vec<LoopId> = face
+                    .inner_loops
+                    .iter()
+                    .copied()
+                    .filter(|&lid| loops.get(lid).is_some())
+                    .collect();
+                if valid.is_empty() {
                     None
+                } else {
+                    Some((face_id, valid))
                 }
             })
         })
