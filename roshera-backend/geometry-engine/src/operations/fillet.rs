@@ -1592,17 +1592,56 @@ fn validate_fillet_inputs(
 ) -> OperationResult<()> {
     // Check solid exists
     if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "validate_fillet_inputs: solid {} not found",
+            solid_id
+        )));
+    }
+
+    // Reject empty edge lists up front — every fillet operation requires at
+    // least one edge to round.
+    if edges.is_empty() {
         return Err(OperationError::InvalidGeometry(
-            "Solid not found".to_string(),
+            "validate_fillet_inputs: edges list is empty".to_string(),
         ));
     }
 
     // Check edges exist
     for &edge_id in edges {
         if model.edges.get(edge_id).is_none() {
-            return Err(OperationError::InvalidGeometry(
-                "Edge not found".to_string(),
-            ));
+            return Err(OperationError::InvalidGeometry(format!(
+                "validate_fillet_inputs: edge {} not found",
+                edge_id
+            )));
+        }
+    }
+
+    // Validate option-driven parameters: radius must exceed tolerance to be
+    // geometrically meaningful, otherwise the resulting blend collapses to a
+    // numerical artifact rather than a real round.
+    let tol = options.common.tolerance.distance();
+    if !options.radius.is_finite() || options.radius <= tol {
+        return Err(OperationError::InvalidGeometry(format!(
+            "validate_fillet_inputs: radius {:.6} is not greater than tolerance {:.3e}",
+            options.radius, tol
+        )));
+    }
+
+    // For variable-radius / chord-based / setback fillets, defer per-segment
+    // radius validation to the variant-specific code paths; constant fillets
+    // are already covered above.
+    match &options.fillet_type {
+        FilletType::Constant(r) => {
+            if !r.is_finite() || *r <= tol {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "validate_fillet_inputs: Constant fillet radius {:.6} \
+                     is not greater than tolerance {:.3e}",
+                    r, tol
+                )));
+            }
+        }
+        _ => {
+            // Variant-specific validators handle their own radius checks.
         }
     }
 

@@ -165,7 +165,14 @@ fn create_g1_blend(
     Ok(vec![blend_face])
 }
 
-/// Create G2 continuous blend using cubic Hermite interpolation
+/// Create G2 continuous blend using cubic Hermite interpolation.
+///
+/// Validates that both boundary curves carry enough samples to support
+/// curvature estimation (≥ 3 points each — fewer makes the second
+/// derivative undefined and the resulting Hermite surface degenerates
+/// to G1 silently). The caller's `options.common.tolerance` is honored
+/// downstream by the blend-surface fitter; we surface it explicitly
+/// here so a future tolerance-driven sample upsampling has a hook.
 fn create_g2_blend(
     model: &mut BRepModel,
     face1: &Face,
@@ -174,15 +181,27 @@ fn create_g2_blend(
     curve2: &[Point3],
     options: &BlendOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    // G2 blend: position + tangent + curvature continuous
-    // Build a cubic loft surface that matches curvature at boundaries
+    if curve1.len() < 3 || curve2.len() < 3 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_g2_blend: G2 continuity needs ≥3 samples per boundary, \
+             got {} and {} (tolerance={:.3e})",
+            curve1.len(),
+            curve2.len(),
+            options.common.tolerance.distance()
+        )));
+    }
     let blend_surface = create_hermite_blend_surface(model, face1, face2, curve1, curve2, 3)?;
     let surface_id = model.surfaces.add(blend_surface);
     let blend_face = create_blend_face(model, surface_id, curve1, curve2)?;
     Ok(vec![blend_face])
 }
 
-/// Create G3 continuous blend using quintic Hermite interpolation
+/// Create G3 continuous blend using quintic Hermite interpolation.
+///
+/// G3 needs jerk continuity, which means the boundary curves must carry
+/// enough samples to estimate the third derivative — at least 5 per
+/// curve. Returns InvalidGeometry up front rather than producing a
+/// silently-G2-degraded surface from an under-sampled G3 request.
 fn create_g3_blend(
     model: &mut BRepModel,
     face1: &Face,
@@ -191,7 +210,15 @@ fn create_g3_blend(
     curve2: &[Point3],
     options: &BlendOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    // G3 blend: uses degree-5 interpolation across the blend
+    if curve1.len() < 5 || curve2.len() < 5 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "create_g3_blend: G3 continuity needs ≥5 samples per boundary, \
+             got {} and {} (tolerance={:.3e})",
+            curve1.len(),
+            curve2.len(),
+            options.common.tolerance.distance()
+        )));
+    }
     let blend_surface = create_hermite_blend_surface(model, face1, face2, curve1, curve2, 5)?;
     let surface_id = model.surfaces.add(blend_surface);
     let blend_face = create_blend_face(model, surface_id, curve1, curve2)?;

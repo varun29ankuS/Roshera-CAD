@@ -3950,18 +3950,44 @@ fn build_shells_from_faces(
     options: &BooleanOptions,
 ) -> OperationResult<Vec<ShellId>> {
     if faces.is_empty() {
-        return Err(OperationError::InvalidBRep(
-            "No faces to build shell from".to_string(),
-        ));
+        return Err(OperationError::InvalidBRep(format!(
+            "No faces to build shell from (tolerance={:.3e}, allow_non_manifold={})",
+            options.common.tolerance.distance(),
+            options.allow_non_manifold,
+        )));
     }
 
     // Group faces into connected components by shared edges
     let components = group_faces_by_adjacency(&faces);
 
+    // Closed-manifold sanity: a closed orientable surface needs ≥4 faces
+    // (tetrahedron). If non-manifold results aren't allowed, reject under-sized
+    // components up front rather than emitting a degenerate shell.
+    if !options.allow_non_manifold {
+        for (i, component) in components.iter().enumerate() {
+            if component.len() < 4 {
+                return Err(OperationError::InvalidBRep(format!(
+                    "build_shells_from_faces: component {} has only {} face(s); \
+                     closed manifold requires ≥4 (set allow_non_manifold=true to bypass)",
+                    i,
+                    component.len(),
+                )));
+            }
+        }
+    }
+
     let mut shell_ids = Vec::new();
 
     for component in components {
-        let mut shell = Shell::new(0, crate::primitives::shell::ShellType::Closed);
+        // Pick shell type per options: when non-manifold is permitted, we may
+        // legitimately produce an open shell (e.g., difference produces a
+        // bounded surface patch without full closure).
+        let shell_type = if options.allow_non_manifold && component.len() < 4 {
+            crate::primitives::shell::ShellType::Open
+        } else {
+            crate::primitives::shell::ShellType::Closed
+        };
+        let mut shell = Shell::new(0, shell_type);
 
         for face_idx in component {
             let split_face = &faces[face_idx];
