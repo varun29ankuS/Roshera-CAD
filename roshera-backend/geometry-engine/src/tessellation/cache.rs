@@ -22,7 +22,6 @@ enum EntityType {
     Face,
     Shell,
     Solid,
-    Surface,
 }
 
 /// Tessellation cache with LRU eviction
