@@ -29,18 +29,6 @@ use std::sync::{Arc, Mutex};
 static OPERATIONS_REGISTRY: LazyLock<Arc<Mutex<OperationsRegistry>>> =
     LazyLock::new(|| Arc::new(Mutex::new(OperationsRegistry::new())));
 
-/// Global operation execution cache for sub-millisecond performance
-static OPERATION_CACHE: LazyLock<DashMap<u64, CachedOperationResult>> =
-    LazyLock::new(|| DashMap::new());
-
-/// Cached operation result for high-performance execution
-#[derive(Debug, Clone)]
-struct CachedOperationResult {
-    result: AIOperationResult,
-    created_at: std::time::Instant,
-    hit_count: u64,
-}
-
 /// AI-friendly operation command
 #[derive(Debug, Clone)]
 pub struct AIOperationCommand {
@@ -171,8 +159,6 @@ pub struct OperationsRegistry {
     nlp_patterns: OperationPatterns,
     /// Operation chains for complex workflows (thread-safe)
     operation_chains: DashMap<String, Vec<String>>,
-    /// Performance optimizer with thread-safe caching
-    optimizer: OperationOptimizer,
     /// Usage statistics (thread-safe with DashMap)
     usage_stats: DashMap<String, OperationStats>,
 }
@@ -183,38 +169,6 @@ struct OperationPatterns {
     patterns: Vec<(String, String)>, // (pattern, operation)
     /// Entity reference patterns
     entity_patterns: DashMap<String, String>,
-    /// Parameter extraction patterns
-    param_patterns: DashMap<String, Vec<String>>,
-}
-
-#[derive(Debug)]
-struct OperationOptimizer {
-    /// Cached operation plans (thread-safe with DashMap)
-    cached_plans: DashMap<u64, ExecutionPlan>,
-    /// Parallelization strategies (thread-safe with DashMap)
-    parallel_strategies: DashMap<String, ParallelStrategy>,
-}
-
-#[derive(Debug, Clone)]
-struct ExecutionPlan {
-    steps: Vec<PlannedStep>,
-    estimated_time_ms: f64,
-    parallelizable: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PlannedStep {
-    operation: String,
-    targets: Vec<EntityReference>,
-    parameters: DashMap<String, AIOperationParameter>,
-    dependencies: Vec<usize>,
-}
-
-#[derive(Debug, Clone)]
-enum ParallelStrategy {
-    Independent,    // Can run fully parallel
-    Batched(usize), // Process in batches
-    Sequential,     // Must be sequential
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +177,6 @@ struct OperationStats {
     success_rate: f64,
     avg_execution_time: f64,
     last_used: std::time::Instant,
-    common_parameters: DashMap<String, Vec<(String, u64)>>,
 }
 
 impl OperationsRegistry {
@@ -234,13 +187,8 @@ impl OperationsRegistry {
             nlp_patterns: OperationPatterns {
                 patterns: vec![],
                 entity_patterns: DashMap::new(),
-                param_patterns: DashMap::new(),
             },
             operation_chains: DashMap::new(),
-            optimizer: OperationOptimizer {
-                cached_plans: DashMap::new(),
-                parallel_strategies: DashMap::new(),
-            },
             usage_stats: DashMap::new(),
         };
 
@@ -268,77 +216,9 @@ impl OperationsRegistry {
         registry.execute_operation(command, model)
     }
 
-    /// Check operation cache for fast execution
-    fn check_operation_cache(&self, text: &str) -> Option<AIOperationResult> {
-        let hash = self.hash_operation_text(text);
-        OPERATION_CACHE.get(&hash).and_then(|cached| {
-            // Check if cache entry is fresh (not older than 30 minutes)
-            if cached.created_at.elapsed().as_secs() < 1800 {
-                Some(cached.result.clone())
-            } else {
-                // Remove stale entry
-                OPERATION_CACHE.remove(&hash);
-                None
-            }
-        })
-    }
-
-    /// Cache operation result for future fast execution
-    fn cache_operation_result(&self, text: &str, result: &AIOperationResult) {
-        let hash = self.hash_operation_text(text);
-        let cached = CachedOperationResult {
-            result: result.clone(),
-            created_at: std::time::Instant::now(),
-            hit_count: 1,
-        };
-
-        // Limit cache size to prevent memory bloat
-        if OPERATION_CACHE.len() > 5000 {
-            // Remove oldest entries (simple eviction strategy)
-            let mut to_remove = vec![];
-            for entry in OPERATION_CACHE.iter() {
-                if entry.created_at.elapsed().as_secs() > 3600 {
-                    // 1 hour
-                    to_remove.push(*entry.key());
-                }
-                if to_remove.len() > 1000 {
-                    break;
-                }
-            }
-            for key in to_remove {
-                OPERATION_CACHE.remove(&key);
-            }
-        }
-
-        OPERATION_CACHE.insert(hash, cached);
-    }
-
-    /// Hash operation text for caching
-    fn hash_operation_text(&self, text: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        hasher.finish()
-    }
-
     /// Parse natural language into operation command
     fn parse_operation_command(&self, text: &str) -> OperationResult<AIOperationCommand> {
         let text = text.to_lowercase();
-        let _start = std::time::Instant::now();
-
-        // Check cache first for instant response
-        if let Some(_cached_result) = self.check_operation_cache(&text) {
-            return Ok(AIOperationCommand {
-                operation_type: "cached".to_string(),
-                targets: vec![],
-                parameters: DashMap::new(),
-                confidence: 1.0,
-                original_text: text.clone(),
-                suggestions: vec![],
-            });
-        }
 
         // Detect operation type
         let operation_type = self.detect_operation_type(&text)?;
@@ -591,9 +471,6 @@ impl OperationsRegistry {
     ) -> OperationResult<AIOperationResult> {
         let start = std::time::Instant::now();
 
-        // Get execution plan
-        let _plan = self.create_execution_plan(&command)?;
-
         // Execute based on operation type
         let result = match command.operation_type.as_str() {
             "boolean" => self.execute_boolean(&command, model),
@@ -634,24 +511,6 @@ impl OperationsRegistry {
             warnings: vec![],
             next_operations: self.suggest_next_operations(&command),
             undo_token: Some(uuid::Uuid::new_v4().to_string()),
-        })
-    }
-
-    /// Create execution plan for optimization
-    fn create_execution_plan(
-        &self,
-        command: &AIOperationCommand,
-    ) -> OperationResult<ExecutionPlan> {
-        // For now, simple single-step plan
-        Ok(ExecutionPlan {
-            steps: vec![PlannedStep {
-                operation: command.operation_type.clone(),
-                targets: command.targets.clone(),
-                parameters: command.parameters.clone(),
-                dependencies: vec![],
-            }],
-            estimated_time_ms: 10.0, // Placeholder
-            parallelizable: false,
         })
     }
 
@@ -1188,7 +1047,6 @@ impl OperationsRegistry {
                 success_rate: if success { 1.0 } else { 0.0 },
                 avg_execution_time: execution_time,
                 last_used: std::time::Instant::now(),
-                common_parameters: DashMap::new(),
             });
     }
 
