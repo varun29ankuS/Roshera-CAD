@@ -19,8 +19,8 @@
 
 use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::surface::{
-    ContinuityAnalysis, CurvatureInfo, GeneralNurbsSurface, Surface, SurfaceIntersectionResult,
-    SurfacePoint, SurfaceType,
+    sample_density_for_tolerance, ContinuityAnalysis, CurvatureInfo, GeneralNurbsSurface, Surface,
+    SurfaceIntersectionResult, SurfacePoint, SurfaceType,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -189,23 +189,6 @@ fn newton_refine_closest_point(
         }
     }
     (u, v)
-}
-
-/// Picks a per-axis sample count for offset NURBS approximation as a
-/// function of the requested distance tolerance. Returns a sample count in
-/// the closed range `[8, 64]`; tighter tolerances request denser nets.
-///
-/// Heuristic: each halving of the tolerance below 1e-3 adds roughly four
-/// samples. The cap at 64 prevents pathological NURBS dimensionalities from
-/// callers that pass a tolerance near machine epsilon.
-fn sample_density_for_tolerance(tol: f64) -> usize {
-    if !tol.is_finite() || tol <= 0.0 {
-        return 16;
-    }
-    let scale = (1.0e-3 / tol).max(1.0).log2();
-    let extra = (scale * 4.0).round() as i64;
-    let n = 16i64.saturating_add(extra).clamp(8, 64);
-    n as usize
 }
 
 /// G2 continuous blending surface between two parent surfaces
