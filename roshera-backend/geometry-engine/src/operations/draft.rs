@@ -603,9 +603,47 @@ fn create_drafted_edge(
     let start_pos = start_vertex.point();
     let end_pos = end_vertex.point();
 
-    // Apply draft transformation to vertices
-    let drafted_start = draft_transform.transform_point(&start_pos);
-    let drafted_end = draft_transform.transform_point(&end_pos);
+    // Vertices that lie on the neutral curve are fixed: the draft pivots
+    // around the neutral, so points at the parting line don't move.
+    // Anywhere else, apply the directional draft transform. This matches
+    // the molding-tooling intuition: the neutral curve is the parting
+    // line at z=0 in the draft frame.
+    let neutral_eps = 1e-6;
+    let on_neutral = |p: Point3| -> bool {
+        if neutral_curve.len() < 2 {
+            return false;
+        }
+        // Polyline closest-point: scan each segment, take min squared dist.
+        let mut min_d2 = f64::INFINITY;
+        for w in neutral_curve.windows(2) {
+            let a = w[0];
+            let b = w[1];
+            let ab = b - a;
+            let ab_len2 = ab.magnitude_squared();
+            if ab_len2 < 1e-20 {
+                let d2 = (p - a).magnitude_squared();
+                if d2 < min_d2 { min_d2 = d2; }
+                continue;
+            }
+            let t = ((p - a).dot(&ab) / ab_len2).clamp(0.0, 1.0);
+            let proj = a + ab * t;
+            let d2 = (p - proj).magnitude_squared();
+            if d2 < min_d2 { min_d2 = d2; }
+        }
+        min_d2 < neutral_eps * neutral_eps
+    };
+
+    // Apply draft transformation to vertices, holding neutral-line points fixed
+    let drafted_start = if on_neutral(start_pos) {
+        start_pos
+    } else {
+        draft_transform.transform_point(&start_pos)
+    };
+    let drafted_end = if on_neutral(end_pos) {
+        end_pos
+    } else {
+        draft_transform.transform_point(&end_pos)
+    };
 
     // Create new vertices
     let start_vertex_id = model
@@ -946,11 +984,15 @@ fn draft_single_face_tangent(
     // to derive the G1-continuous draft angle.
     let draft_angle = if let Some(curve) = curves.first() {
         if curve.points.len() >= 2 {
-            // Average tangent direction of the intersection curve.
+            // Average tangent direction of the intersection curve. We sum
+            // the unit-segment displacements rather than raw segments so a
+            // few long segments don't dominate the average.
             let mut avg_tangent = Vector3::ZERO;
             for w in curve.points.windows(2) {
                 let seg = w[1].position - w[0].position;
-                avg_tangent = avg_tangent + seg;
+                if let Ok(unit) = seg.normalize() {
+                    avg_tangent = avg_tangent + unit;
+                }
             }
             let avg_tangent = avg_tangent.normalize().unwrap_or(Vector3::X);
 
@@ -962,9 +1004,23 @@ fn draft_single_face_tangent(
             let cos_angle = surf_normal.dot(&draft_direction).abs();
             // Clamp to valid range for acos.
             let angle = (1.0 - cos_angle.clamp(0.0, 1.0)).acos().abs();
-            // Use a small default when surface is nearly aligned with pull.
+
+            // Tangent-based fallback: when the surface normal is nearly
+            // parallel to the pull direction (cos≈1), the normal-based
+            // angle collapses to ~0 and we lose G1 information. Use the
+            // angle between the curve tangent and the draft direction
+            // instead, which is well-defined whenever the tangent is not
+            // along the pull. acos(|t·d|) sits in [0,π/2]; we subtract
+            // from π/2 so a tangent perpendicular to pull (the normal
+            // parting case) yields zero, matching the surface-normal path.
             if angle < 1e-6 {
-                3.0_f64.to_radians()
+                let tangent_pull_cos = avg_tangent.dot(&draft_direction).abs().clamp(0.0, 1.0);
+                let tangent_angle = std::f64::consts::FRAC_PI_2 - tangent_pull_cos.acos();
+                if tangent_angle.abs() < 1e-6 {
+                    3.0_f64.to_radians()
+                } else {
+                    tangent_angle.abs()
+                }
             } else {
                 angle
             }
