@@ -401,8 +401,6 @@ impl Default for ToleranceContext {
 /// Extended tolerance context for advanced operations
 pub struct ToleranceContextEx {
     stack: Vec<ToleranceEx>,
-    model_tolerance: Option<ToleranceEx>,
-    global_scale: f64,
 }
 
 impl ToleranceContextEx {
@@ -410,19 +408,13 @@ impl ToleranceContextEx {
     pub fn from_basic(base: Tolerance) -> Self {
         Self {
             stack: vec![base.to_extended()],
-            model_tolerance: None,
-            global_scale: 1.0,
         }
     }
 
     /// Create for model
     pub fn for_model(size: f64) -> Self {
         let tol = ToleranceEx::adaptive(size);
-        Self {
-            stack: vec![tol],
-            model_tolerance: Some(tol),
-            global_scale: size,
-        }
+        Self { stack: vec![tol] }
     }
 
     /// Get current extended tolerance

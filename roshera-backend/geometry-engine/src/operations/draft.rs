@@ -219,8 +219,7 @@ fn group_faces_by_plane(
             compute_face_plane_intersection(model, face, plane_origin, plane_normal)?;
 
         // Determine draft direction based on face orientation relative to pull
-        let face_normal = compute_average_face_normal(model, face)?;
-        let draft_direction = compute_draft_direction(face_normal, pull_direction, plane_normal);
+        let draft_direction = compute_draft_direction(pull_direction, plane_normal);
 
         groups.push(FaceGroup {
             faces: vec![face_id],
@@ -228,9 +227,6 @@ fn group_faces_by_plane(
             draft_direction,
         });
     }
-
-    // Merge groups that share neutral curves
-    merge_face_groups(&mut groups)?;
 
     Ok(groups)
 }
@@ -1286,24 +1282,9 @@ fn compute_face_plane_intersection_edge_based(
     Ok(intersection_points)
 }
 
-/// Compute average face normal
-fn compute_average_face_normal(model: &BRepModel, face: &Face) -> OperationResult<Vector3> {
-    let surface = model
-        .surfaces
-        .get(face.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
-
-    // Sample normal at center
-    Ok(surface.normal_at(0.5, 0.5)?)
-}
-
-/// Compute draft direction from face normal and pull direction
-fn compute_draft_direction(
-    face_normal: Vector3,
-    pull_direction: Vector3,
-    plane_normal: Vector3,
-) -> Vector3 {
-    // Project pull direction onto plane tangent to neutral
+/// Compute draft direction by projecting pull direction onto the plane
+/// tangent to the neutral curve (perpendicular to `plane_normal`).
+fn compute_draft_direction(pull_direction: Vector3, plane_normal: Vector3) -> Vector3 {
     let tangent = pull_direction - pull_direction.dot(&plane_normal) * plane_normal;
     tangent.normalize().unwrap_or(Vector3::Z)
 }
@@ -1334,12 +1315,6 @@ fn sample_curve_points(curve: &Box<dyn Curve>) -> OperationResult<Vec<Point3>> {
     }
 
     Ok(points)
-}
-
-/// Merge face groups that share neutral curves
-fn merge_face_groups(groups: &mut Vec<FaceGroup>) -> OperationResult<()> {
-    // Would merge groups with common neutral curves
-    Ok(())
 }
 
 /// Validate draft inputs

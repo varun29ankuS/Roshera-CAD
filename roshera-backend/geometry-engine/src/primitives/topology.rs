@@ -1291,6 +1291,11 @@ fn is_shell_manifold(shell: &Shell, adjacency: &AdjacencyInfo) -> bool {
 }
 
 /// Multi-resolution topology representation
+///
+/// Builds a sequence of progressively simplified topology levels for
+/// level-of-detail display. Level 0 is the full-resolution mesh; each
+/// subsequent level marks more low-importance edges (and adjacent faces)
+/// for collapse based on a vertex-valence × edge-length importance score.
 pub struct MultiResolutionTopology {
     levels: Vec<TopologyLevel>,
     current_level: usize,
@@ -1298,9 +1303,68 @@ pub struct MultiResolutionTopology {
 
 #[derive(Debug)]
 struct TopologyLevel {
+    /// Normalized resolution for this level: 1.0 at level 0 (full
+    /// detail) and approaching 0.0 as more edges are collapsed.
     resolution: f64,
+    /// Collapsed edges at this level. Each key is a removed edge; the
+    /// value is currently empty (a placeholder for future remap targets).
     simplified_edges: HashMap<EdgeId, Vec<EdgeId>>,
+    /// Faces affected by collapsed edges, mapped to their surviving
+    /// neighbour faces at this LOD tier.
     simplified_faces: HashMap<FaceId, Vec<FaceId>>,
+}
+
+impl TopologyLevel {
+    /// Resolution factor for this level (1.0 = full detail).
+    pub fn resolution(&self) -> f64 {
+        self.resolution
+    }
+
+    /// Number of edges collapsed at this level.
+    pub fn collapsed_edge_count(&self) -> usize {
+        self.simplified_edges.len()
+    }
+
+    /// Number of faces affected by edge collapses at this level.
+    pub fn affected_face_count(&self) -> usize {
+        self.simplified_faces.len()
+    }
+}
+
+impl MultiResolutionTopology {
+    /// Currently active level index (0 = full resolution).
+    pub fn current_level(&self) -> usize {
+        self.current_level
+    }
+
+    /// Number of LOD levels that were built.
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Resolution of the currently active level, or 1.0 if no levels exist.
+    pub fn current_resolution(&self) -> f64 {
+        self.levels
+            .get(self.current_level)
+            .map(|lvl| lvl.resolution())
+            .unwrap_or(1.0)
+    }
+
+    /// Collapsed edge count at the active level.
+    pub fn collapsed_edge_count(&self) -> usize {
+        self.levels
+            .get(self.current_level)
+            .map(|lvl| lvl.collapsed_edge_count())
+            .unwrap_or(0)
+    }
+
+    /// Affected face count at the active level.
+    pub fn affected_face_count(&self) -> usize {
+        self.levels
+            .get(self.current_level)
+            .map(|lvl| lvl.affected_face_count())
+            .unwrap_or(0)
+    }
 }
 
 impl MultiResolutionTopology {

@@ -6,7 +6,7 @@
 use crate::math::bspline::KnotVector;
 use crate::math::nurbs::NurbsSurface;
 use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
-use crate::primitives::curve::{Curve, NurbsCurve};
+use crate::primitives::curve::Curve;
 use crate::primitives::surface::{
     OffsetQuality, OffsetSurface, Surface, SurfaceIntersectionResult, SurfacePoint, SurfaceType,
 };
@@ -1060,52 +1060,6 @@ impl Surface for VariableRadiusFillet {
             dir2: eval.dir2,
         })
     }
-}
-
-/// Compute trim curves on adjacent surfaces for fillet intersection
-pub fn compute_fillet_trim_curves(
-    fillet_surface: &dyn Surface,
-    adjacent_surface1: &dyn Surface,
-    adjacent_surface2: &dyn Surface,
-    num_samples: usize,
-) -> MathResult<(Box<dyn Curve>, Box<dyn Curve>)> {
-    // This is a critical function that computes surface-surface intersection curves
-    // For production, this would use marching methods or Newton-Raphson iteration
-
-    let mut points1 = Vec::with_capacity(num_samples);
-    let mut points2 = Vec::with_capacity(num_samples);
-
-    for i in 0..num_samples {
-        let u = i as f64 / (num_samples - 1) as f64;
-
-        // Get fillet boundary curves (simplified)
-        let fillet_point1 = fillet_surface.point_at(u, 0.0)?;
-        let fillet_point2 = fillet_surface.point_at(u, 1.0)?;
-
-        // Project onto adjacent surfaces (simplified - would use Newton iteration)
-        points1.push(fillet_point1);
-        points2.push(fillet_point2);
-    }
-
-    // Fit NURBS curves through intersection points
-    let curve1 = fit_nurbs_curve(&points1, 3)?;
-    let curve2 = fit_nurbs_curve(&points2, 3)?;
-
-    Ok((Box::new(curve1), Box::new(curve2)))
-}
-
-/// Fit NURBS curve through points
-fn fit_nurbs_curve(points: &[Point3], degree: usize) -> MathResult<NurbsCurve> {
-    // Simplified curve fitting
-    let num_control_points = points.len().min(degree + 1);
-    let knots = KnotVector::uniform(degree, num_control_points);
-
-    NurbsCurve::new(
-        degree,
-        points[..num_control_points].to_vec(),
-        vec![1.0; num_control_points], // uniform weights
-        knots.values().to_vec(),
-    )
 }
 
 // #[cfg(test)]

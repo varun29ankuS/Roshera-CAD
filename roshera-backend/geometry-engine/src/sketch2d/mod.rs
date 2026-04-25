@@ -59,7 +59,7 @@ pub use polyline2d::{Polyline2d, Polyline2dId};
 pub use rectangle2d::{Rectangle2d, Rectangle2dId};
 pub use spline2d::{BSpline2d, NurbsCurve2d, Spline2d, Spline2dId};
 
-pub use constraint_solver::{ConstraintSolver, SolverResult, SolverStatus};
+pub use constraint_solver::{ConstraintSolver, EntityState, SolverResult, SolverStatus};
 pub use constraints::{
     Constraint, ConstraintId, ConstraintPriority, ConstraintStatus, ConstraintType,
     DimensionalConstraint, GeometricConstraint,

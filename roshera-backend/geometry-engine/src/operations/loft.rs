@@ -155,8 +155,6 @@ fn create_linear_loft(
     for (i, j) in profile_pairs {
         let lateral_faces = create_ruled_surfaces_between_profiles(
             model,
-            profiles[i],
-            profiles[j],
             &correspondence[i],
             &correspondence[j],
         )?;
@@ -673,8 +671,6 @@ fn create_guided_loft(
     for (i, j) in profile_pairs {
         let lateral_faces = create_ruled_surfaces_between_profiles(
             model,
-            profiles[i],
-            profiles[j],
             &snapped_correspondence[i],
             &snapped_correspondence[j],
         )?;
@@ -707,8 +703,6 @@ fn create_guided_loft(
 /// Create ruled surfaces between two profiles
 fn create_ruled_surfaces_between_profiles(
     model: &mut BRepModel,
-    profile1: FaceId,
-    profile2: FaceId,
     vertices1: &[VertexId],
     vertices2: &[VertexId],
 ) -> OperationResult<Vec<FaceId>> {

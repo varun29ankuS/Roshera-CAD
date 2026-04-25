@@ -272,7 +272,7 @@ pub fn rail_constrained_frames(
     let (_, rail_pt0) = rail.closest_point(&pos0, tolerance)?;
     let ref_dist = pos0.distance(&rail_pt0);
 
-    for (i, &t) in params.iter().enumerate() {
+    for &t in params.iter() {
         let pos = path.point_at(t)?;
         let tan = path.tangent_at(t)?.normalize()?;
 

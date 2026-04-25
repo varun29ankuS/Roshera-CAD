@@ -10,7 +10,7 @@
 //! - Collision-detection acceleration structures
 //! - Feature-based modeling operations
 
-use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{consts, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
     edge::{EdgeId, EdgeStore},

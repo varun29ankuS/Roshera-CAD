@@ -514,7 +514,7 @@ impl Shell {
             let size = self
                 .cached_stats
                 .as_ref()
-                .map(|s| (s.bbox_max - s.bbox_min))
+                .map(|s| s.bbox_max - s.bbox_min)
                 .unwrap_or(Vector3::ONE);
 
             // Box approximation for inertia

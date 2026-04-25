@@ -34,7 +34,7 @@
 //! - Patrikalakis & Maekawa (2002). Shape Interrogation for Computer Aided Design.
 
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix3, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Curve, CurveId},
     edge::{Edge, EdgeId},

@@ -317,7 +317,7 @@ fn create_frame_driven_sweep(
 
         let transform = build_sweep_transform(frame.position, frame.matrix, scale_val, twist_val);
 
-        let section = create_sweep_section(model, profile_face, frame.parameter, transform)?;
+        let section = create_sweep_section(model, profile_face, transform)?;
         sections.push(section);
     }
 
@@ -363,10 +363,6 @@ fn create_frame_driven_sweep(
 struct SweepSection {
     /// Face at this section
     face_id: FaceId,
-    /// Position along path (0 to 1)
-    parameter: f64,
-    /// Transform applied to profile
-    transform: Matrix4,
     /// Vertices in order
     vertices: Vec<VertexId>,
 }
@@ -398,7 +394,7 @@ fn generate_sweep_sections(
         let transform = build_sweep_transform(position, frame, scale, twist);
 
         // Create transformed section
-        let section = create_sweep_section(model, profile_face, t, transform)?;
+        let section = create_sweep_section(model, profile_face, transform)?;
         sections.push(section);
     }
 
@@ -571,7 +567,6 @@ fn build_sweep_transform(position: Point3, frame: Matrix4, scale: f64, twist: f6
 fn create_sweep_section(
     model: &mut BRepModel,
     profile_face: FaceId,
-    parameter: f64,
     transform: Matrix4,
 ) -> OperationResult<SweepSection> {
     // Transform the profile face
@@ -582,8 +577,6 @@ fn create_sweep_section(
 
     Ok(SweepSection {
         face_id: transformed_face,
-        parameter,
-        transform,
         vertices,
     })
 }

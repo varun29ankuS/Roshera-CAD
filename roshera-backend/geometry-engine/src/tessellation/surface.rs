@@ -1,7 +1,7 @@
 //! Surface tessellation algorithms
 
 use super::adaptive::compute_plane_axes;
-use super::{AdaptiveTessellator, MeshVertex, TessellationParams, ThreeJsMesh, TriangleMesh};
+use super::{AdaptiveTessellator, MeshVertex, TessellationParams, TriangleMesh};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
 use crate::primitives::surface::Surface;
@@ -11,79 +11,6 @@ use tracing;
 
 /// Tessellate a face into triangles
 pub fn tessellate_face(
-    face: &Face,
-    model: &BRepModel,
-    params: &TessellationParams,
-    mesh: &mut TriangleMesh,
-) {
-    // Get surface
-    let surface = match model.surfaces.get(face.surface_id) {
-        Some(s) => s,
-        None => return,
-    };
-
-    match surface.type_name() {
-        "Plane" => tessellate_planar_face(face, model, mesh),
-        "Cylinder" => tessellate_cylindrical_face(face, model, params, mesh),
-        "Sphere" => tessellate_spherical_face(face, model, params, mesh),
-        "Cone" => tessellate_conical_face(face, model, params, mesh),
-        "Torus" => tessellate_toroidal_face(face, model, params, mesh),
-        "NURBS" => tessellate_nurbs_face(face, model, params, mesh),
-        _ => tessellate_generic_face(face, model, params, mesh),
-    }
-}
-
-/// Convert ThreeJsMesh to TriangleMesh
-fn threejs_mesh_to_triangle_mesh(threejs_mesh: &ThreeJsMesh) -> TriangleMesh {
-    let mut triangle_mesh = TriangleMesh::new();
-
-    // Convert vertices
-    for i in 0..threejs_mesh.vertex_count() {
-        let idx = i * 3;
-        let position = Point3::new(
-            threejs_mesh.positions[idx] as f64,
-            threejs_mesh.positions[idx + 1] as f64,
-            threejs_mesh.positions[idx + 2] as f64,
-        );
-        let normal = Vector3::new(
-            threejs_mesh.normals[idx] as f64,
-            threejs_mesh.normals[idx + 1] as f64,
-            threejs_mesh.normals[idx + 2] as f64,
-        );
-
-        let uv = if let Some(ref uvs) = threejs_mesh.uvs {
-            let uv_idx = i * 2;
-            if uv_idx + 1 < uvs.len() {
-                Some((uvs[uv_idx] as f64, uvs[uv_idx + 1] as f64))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        triangle_mesh.add_vertex(MeshVertex {
-            position,
-            normal,
-            uv,
-        });
-    }
-
-    // Convert triangles
-    for i in 0..threejs_mesh.triangle_count() {
-        let idx = i * 3;
-        triangle_mesh.add_triangle(
-            threejs_mesh.indices[idx],
-            threejs_mesh.indices[idx + 1],
-            threejs_mesh.indices[idx + 2],
-        );
-    }
-
-    triangle_mesh
-}
-
-/// Internal function that uses ThreeJsMesh
-fn tessellate_face_threejs(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,

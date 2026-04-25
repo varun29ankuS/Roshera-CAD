@@ -225,23 +225,6 @@ impl BSpline2d {
         Self::bezier(vec![p0, p1, p2, p3])
     }
 
-    /// Get the internal 3D curve for evaluation
-    fn get_internal_curve(&self) -> Result<&BSplineCurve, Sketch2dError> {
-        // Note: In a real implementation, we'd cache this conversion
-        // For now, convert on each call (not optimal but correct)
-        let _points_3d: Vec<Point3> = self
-            .control_points
-            .iter()
-            .map(|p| Point3::new(p.x, p.y, 0.0))
-            .collect();
-
-        // Create temporary curve for evaluation
-        // In production, this would be cached in internal_curve field
-        Err(Sketch2dError::NumericalError {
-            description: "Internal curve caching not implemented".to_string(),
-        })
-    }
-
     /// Evaluate the B-spline at parameter u
     pub fn evaluate(&self, u: f64) -> Sketch2dResult<Point2d> {
         // Convert to 3D, evaluate, then project back to 2D

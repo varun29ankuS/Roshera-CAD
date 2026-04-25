@@ -18,7 +18,6 @@ use crate::primitives::{
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
-    vertex,
 };
 
 /// Options for offset operations

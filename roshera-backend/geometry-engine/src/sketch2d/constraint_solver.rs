@@ -80,13 +80,17 @@ pub struct ConstraintSolver {
     dependency_graph: HashMap<ConstraintId, HashSet<EntityRef>>,
 }
 
-/// Internal entity state for solver
+/// Solver state for a single sketch entity.
+///
+/// Stores the entity's parameter vector together with a per-parameter
+/// fixed-mask used by the Newton–Raphson solver. Construct one via
+/// [`EntityState::point`], [`EntityState::line`], or
+/// [`EntityState::circle`] and register it with
+/// [`ConstraintSolver::add_entity`].
 #[derive(Debug, Clone)]
-struct EntityState {
+pub struct EntityState {
     /// Current parameters (position, angles, etc.)
     parameters: Vec<f64>,
-    /// Parameter names for debugging
-    parameter_names: Vec<String>,
     /// Fixed parameters (indices that cannot change)
     fixed_mask: Vec<bool>,
 }
@@ -1073,7 +1077,6 @@ impl EntityState {
     pub fn point(pos: Point2d, fixed: bool) -> Self {
         Self {
             parameters: vec![pos.x, pos.y],
-            parameter_names: vec!["x".to_string(), "y".to_string()],
             fixed_mask: vec![fixed, fixed],
         }
     }
@@ -1082,12 +1085,6 @@ impl EntityState {
     pub fn line(point: Point2d, direction: Vector2d, point_fixed: bool, dir_fixed: bool) -> Self {
         Self {
             parameters: vec![point.x, point.y, direction.x, direction.y],
-            parameter_names: vec![
-                "point.x".to_string(),
-                "point.y".to_string(),
-                "dir.x".to_string(),
-                "dir.y".to_string(),
-            ],
             fixed_mask: vec![point_fixed, point_fixed, dir_fixed, dir_fixed],
         }
     }
@@ -1096,11 +1093,6 @@ impl EntityState {
     pub fn circle(center: Point2d, radius: f64, center_fixed: bool, radius_fixed: bool) -> Self {
         Self {
             parameters: vec![center.x, center.y, radius],
-            parameter_names: vec![
-                "center.x".to_string(),
-                "center.y".to_string(),
-                "radius".to_string(),
-            ],
             fixed_mask: vec![center_fixed, center_fixed, radius_fixed],
         }
     }

@@ -430,7 +430,6 @@ enum PlaneConstraint {
     PassesThrough(Point3),
     Normal(Vector3),
     ParallelTo(Plane),
-    PerpendicularTo(Plane),
 }
 
 impl PlaneBuilder {
@@ -459,13 +458,6 @@ impl PlaneBuilder {
         self
     }
 
-    /// Constrain the plane to be perpendicular to another plane
-    pub fn perpendicular_to(mut self, plane: Plane) -> Self {
-        self.constraints
-            .push(PlaneConstraint::PerpendicularTo(plane));
-        self
-    }
-
     /// Build the plane from constraints
     pub fn build(&self) -> MathResult<Plane> {
         // Extract normal constraint or derive from parallel plane
@@ -477,9 +469,6 @@ impl PlaneBuilder {
                 PlaneConstraint::Normal(n) => normal = Some(*n),
                 PlaneConstraint::ParallelTo(p) => normal = Some(p.normal),
                 PlaneConstraint::PassesThrough(pt) => points.push(*pt),
-                PlaneConstraint::PerpendicularTo(_) => {
-                    // Handle perpendicular constraints later
-                }
             }
         }
 

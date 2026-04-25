@@ -16,7 +16,6 @@
 
 use crate::math::bspline::KnotVector;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Vector3};
-use std::sync::Arc;
 
 // SIMD optimizations
 use wide::f64x4;
@@ -32,8 +31,6 @@ pub struct NurbsCurve {
     pub knots: KnotVector,
     /// Degree of the curve
     pub degree: usize,
-    /// Cached basis function values
-    basis_cache: Option<Arc<BasisCache>>,
 }
 
 /// NURBS surface representation
@@ -51,30 +48,6 @@ pub struct NurbsSurface {
     pub degree_u: usize,
     /// Degree in V direction
     pub degree_v: usize,
-    /// Cached basis functions
-    basis_cache: Option<Arc<BasisCache>>,
-}
-
-/// Basis function cache for performance
-#[derive(Debug)]
-struct BasisCache {
-    /// Cached N values for curves
-    n_values: parking_lot::RwLock<lru::LruCache<u64, Vec<f64>>>,
-    /// Cached derivative values
-    dn_values: parking_lot::RwLock<lru::LruCache<u64, Vec<Vec<f64>>>>,
-}
-
-impl Default for BasisCache {
-    fn default() -> Self {
-        Self {
-            n_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1000).expect("literal 1000 is non-zero"),
-            )),
-            dn_values: parking_lot::RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(500).expect("literal 500 is non-zero"),
-            )),
-        }
-    }
 }
 
 /// NURBS evaluation result
@@ -155,7 +128,6 @@ impl NurbsCurve {
             weights,
             knots: knot_vector,
             degree,
-            basis_cache: Some(Arc::new(BasisCache::default())),
         })
     }
 
@@ -1223,7 +1195,6 @@ impl NurbsCurve {
         self.control_points = new_control_points;
         self.weights = new_weights;
         self.knots = new_knots;
-        self.basis_cache = Some(Arc::new(BasisCache::default())); // Reset cache
 
         Ok(())
     }
@@ -1273,7 +1244,6 @@ impl NurbsCurve {
         self.knots = KnotVector::new(new_knots)
             .map_err(|_| "degree elevation produced an invalid knot vector")?;
         self.degree = new_degree;
-        self.basis_cache = Some(Arc::new(BasisCache::default()));
 
         Ok(())
     }
@@ -1856,7 +1826,6 @@ impl NurbsSurface {
             knots_v: knot_vector_v,
             degree_u,
             degree_v,
-            basis_cache: Some(Arc::new(BasisCache::default())),
         })
     }
 
@@ -2407,9 +2376,6 @@ impl NurbsSurface {
         self.knots_u =
             KnotVector::new(new_knot_values).map_err(|_| "Failed to create new knot vector")?;
 
-        // Reset cache
-        self.basis_cache = Some(Arc::new(BasisCache::default()));
-
         Ok(())
     }
 
@@ -2434,9 +2400,6 @@ impl NurbsSurface {
         // Swap knot vectors and degrees
         std::mem::swap(&mut self.knots_u, &mut self.knots_v);
         std::mem::swap(&mut self.degree_u, &mut self.degree_v);
-
-        // Reset cache
-        self.basis_cache = Some(Arc::new(BasisCache::default()));
     }
 
     /// Compute derivative in U direction
@@ -2514,9 +2477,6 @@ impl NurbsSurface {
                 *point = matrix.transform_point(point);
             }
         }
-
-        // Reset cache after transformation
-        self.basis_cache = Some(Arc::new(BasisCache::default()));
 
         Ok(())
     }
