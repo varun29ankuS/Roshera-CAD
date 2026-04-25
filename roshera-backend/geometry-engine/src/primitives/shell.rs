@@ -144,6 +144,10 @@ pub struct Shell {
     cached_stats: Option<ShellStats>,
     /// Cached mass properties
     cached_mass_props: Option<MassProperties>,
+    /// Distance tolerance under which the cached mass properties were
+    /// computed. Used to invalidate the cache when a caller requests
+    /// volume/surface_area at a tighter precision than what's stored.
+    cached_mass_props_tolerance: Option<f64>,
     /// Parent solid (if part of a solid)
     pub parent_solid: Option<u32>,
 }
@@ -159,6 +163,7 @@ impl Shell {
             face_adjacency: Arc::new(RwLock::new(HashMap::new())),
             cached_stats: None,
             cached_mass_props: None,
+            cached_mass_props_tolerance: None,
             parent_solid: None,
         }
     }
@@ -197,6 +202,7 @@ impl Shell {
     fn invalidate_cache(&mut self) {
         self.cached_stats = None;
         self.cached_mass_props = None;
+        self.cached_mass_props_tolerance = None;
     }
 
     /// Build connectivity information
@@ -575,8 +581,18 @@ impl Shell {
         // Normalize to [-1, 1]
         winding_number /= 4.0 * consts::PI;
 
-        // Point is inside if winding number is ±1
-        Ok(winding_number.abs() > 0.5)
+        // For a closed manifold shell, the analytic winding number is
+        // exactly ±1 inside and 0 outside; numerical solid-angle
+        // integration broadens this to a band whose half-width scales
+        // with tolerance.distance(). We accept any |w| > (0.5 - tol)
+        // as inside so that points genuinely interior to the shell —
+        // but slightly perturbed by floating-point error in solid-
+        // angle accumulation — still classify correctly. With the
+        // default tolerance (~1e-10) this is functionally identical
+        // to the previous |w| > 0.5 threshold; with looser tolerances
+        // it widens the inside-band conservatively.
+        let band = (tolerance.distance().clamp(0.0, 0.5)).min(0.49);
+        Ok(winding_number.abs() > 0.5 - band)
     }
 
     /// Calculate solid angle subtended by face at point
@@ -827,19 +843,25 @@ impl Shell {
         surface_store: &SurfaceStore,
         tolerance: Tolerance,
     ) -> MathResult<f64> {
-        let props = self.compute_mass_properties(
-            face_store,
-            loop_store,
-            vertex_store,
-            edge_store,
-            &CurveStore::new(),
-            surface_store,
-            1.0, // Unit density
-        )?;
-
-        props.volume.ok_or(MathError::InvalidParameter(
-            "Shell is not closed".to_string(),
-        ))
+        self.invalidate_mass_cache_if_coarser(tolerance);
+        let value = {
+            let props = self.compute_mass_properties(
+                face_store,
+                loop_store,
+                vertex_store,
+                edge_store,
+                &CurveStore::new(),
+                surface_store,
+                1.0, // Unit density
+            )?;
+            props.volume.ok_or(MathError::InvalidParameter(
+                "Shell is not closed".to_string(),
+            ))?
+        };
+        // Record the precision the cached value was computed at so a
+        // subsequent call at a tighter tolerance re-runs the integration.
+        self.cached_mass_props_tolerance = Some(tolerance.distance());
+        Ok(value)
     }
 
     pub fn surface_area(
@@ -851,17 +873,37 @@ impl Shell {
         surface_store: &SurfaceStore,
         tolerance: Tolerance,
     ) -> MathResult<f64> {
-        let props = self.compute_mass_properties(
-            face_store,
-            loop_store,
-            vertex_store,
-            edge_store,
-            &CurveStore::new(),
-            surface_store,
-            1.0,
-        )?;
+        self.invalidate_mass_cache_if_coarser(tolerance);
+        let area = {
+            let props = self.compute_mass_properties(
+                face_store,
+                loop_store,
+                vertex_store,
+                edge_store,
+                &CurveStore::new(),
+                surface_store,
+                1.0,
+            )?;
+            props.surface_area
+        };
+        self.cached_mass_props_tolerance = Some(tolerance.distance());
+        Ok(area)
+    }
 
-        Ok(props.surface_area)
+    /// Drop the cached mass properties when the cache was computed at a
+    /// looser tolerance than the caller now requests. Without this,
+    /// repeated calls with progressively tighter tolerances would all
+    /// return the first (coarse) result — a silent precision regression
+    /// that callers like solid mass-property aggregation rely on
+    /// avoiding.
+    fn invalidate_mass_cache_if_coarser(&mut self, requested: Tolerance) {
+        let req = requested.distance();
+        if let Some(cached) = self.cached_mass_props_tolerance {
+            if req < cached {
+                self.cached_mass_props = None;
+                self.cached_mass_props_tolerance = None;
+            }
+        }
     }
 
     pub fn bounding_box(

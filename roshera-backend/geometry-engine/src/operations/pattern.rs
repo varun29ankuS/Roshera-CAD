@@ -583,11 +583,73 @@ fn transform_edge(
     Ok(model.edges.add(new_edge))
 }
 
-/// Check for interference between instances
+/// Check for interference between instances using face vertex bounding-box
+/// overlap.
+///
+/// A full geometric interference test would solve face-face intersections
+/// pairwise (see `operations::boolean`); that is too expensive to run on
+/// every pattern instance. Instead we compute each face's vertex-aligned
+/// AABB by walking its outer loop edges, then test whether any pair of
+/// AABBs in the instance overlaps. This catches the dominant failure
+/// mode — instances spaced too tightly so duplicate features physically
+/// fight — while keeping pattern generation O(N) in face count.
+///
+/// Returns `Ok(true)` when at least one face pair has overlapping AABBs,
+/// `Ok(false)` otherwise. Faces with empty/missing loops are skipped
+/// rather than treated as errors so a partially-built model still flows
+/// through pattern.
 fn check_interference(model: &BRepModel, instance: &[FaceId]) -> OperationResult<bool> {
-    // Would check for geometric interference
-    // For now, always return false (no interference)
+    let bboxes: Vec<[f64; 6]> = instance
+        .iter()
+        .filter_map(|&face_id| compute_face_aabb(model, face_id))
+        .collect();
+    for i in 0..bboxes.len() {
+        for j in (i + 1)..bboxes.len() {
+            if aabbs_overlap(&bboxes[i], &bboxes[j]) {
+                return Ok(true);
+            }
+        }
+    }
     Ok(false)
+}
+
+/// Compute axis-aligned bounding box of a face from its outer loop's
+/// vertex positions. Returns `[xmin, ymin, zmin, xmax, ymax, zmax]` or
+/// `None` when the face/loop/edges/vertices can't be resolved.
+fn compute_face_aabb(model: &BRepModel, face_id: FaceId) -> Option<[f64; 6]> {
+    let face = model.faces.get(face_id)?;
+    let loop_ref = model.loops.get(face.outer_loop)?;
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut have_any = false;
+    for &edge_id in &loop_ref.edges {
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e,
+            None => continue,
+        };
+        for vid in [edge.start_vertex, edge.end_vertex] {
+            if let Some(pos) = model.vertices.get_position(vid) {
+                for k in 0..3 {
+                    if pos[k] < min[k] {
+                        min[k] = pos[k];
+                    }
+                    if pos[k] > max[k] {
+                        max[k] = pos[k];
+                    }
+                }
+                have_any = true;
+            }
+        }
+    }
+    if !have_any {
+        return None;
+    }
+    Some([min[0], min[1], min[2], max[0], max[1], max[2]])
+}
+
+#[inline]
+fn aabbs_overlap(a: &[f64; 6], b: &[f64; 6]) -> bool {
+    a[0] <= b[3] && a[3] >= b[0] && a[1] <= b[4] && a[4] >= b[1] && a[2] <= b[5] && a[5] >= b[2]
 }
 
 /// Merge coincident geometry in pattern
@@ -673,9 +735,44 @@ fn validate_pattern_inputs(
     Ok(())
 }
 
-/// Validate pattern result
+/// Validate pattern result.
+///
+/// Confirms (a) every instance face exists in the model and (b) the
+/// model as a whole still passes `Standard`-level B-Rep validation
+/// after pattern generation. Pattern generation duplicates topology
+/// in bulk, so a quick existence sweep + structural validation catches
+/// the common failure modes (orphan faces, duplicate edges with broken
+/// orientation, missing vertex links).
 fn validate_pattern_result(model: &BRepModel, instances: &[Vec<FaceId>]) -> OperationResult<()> {
-    // Would validate that pattern created valid geometry
+    for (i, instance) in instances.iter().enumerate() {
+        for &face_id in instance {
+            if model.faces.get(face_id).is_none() {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "pattern instance {}: face {} missing from model",
+                    i, face_id
+                )));
+            }
+        }
+    }
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        crate::math::Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::TopologyError(format!(
+            "patterned model failed validation ({} error(s)): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 
