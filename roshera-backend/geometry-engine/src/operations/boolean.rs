@@ -132,6 +132,22 @@ struct SplitFace {
     /// solid's current shell, a post-hoc query would mis-attribute origin
     /// (see history of task #48 follow-up to task #44).
     from_solid: SolidId,
+    /// Pre-computed 3D point known to lie in this face's interior.
+    ///
+    /// When DCEL extraction produces an outer cycle that encloses a
+    /// disjoint inner cycle (a "face with hole"), the inner cycle is a
+    /// sibling `SplitFace` rather than being attached as a hole loop.
+    /// The outer cycle's naive centroid (average of boundary edge
+    /// midpoints) can land inside the hole region, which breaks ray-cast
+    /// classification against the opposite solid. When this situation is
+    /// detected during splitting, a corrected interior point is stored
+    /// here and used in preference to recomputing from boundary midpoints
+    /// in `get_face_interior_point`.
+    ///
+    /// `None` means "compute from boundary edge midpoints" — the
+    /// historical behavior, still correct for faces without enclosed
+    /// siblings (convex and simply-connected cases).
+    interior_point: Option<Point3>,
 }
 
 /// Classification of face relative to other solid
@@ -290,9 +306,40 @@ fn intersect_faces(
         return Ok(None);
     }
 
+    // Drop the immutable surface borrows before we mutate `model` below.
+    let _ = (surface_a, surface_b);
+
+    // Clip each cutting curve to the overlap of both faces' trim regions.
+    // For plane-plane pairs, `surface_surface_intersection` produces a
+    // `Line` whose endpoints reflect `Surface::parameter_bounds`, which is
+    // unbounded for surfaces constructed via `Plane::from_point_normal`
+    // (face-scope is carried by the outer loop, not the surface). Without
+    // this trim, the line spans `MAX_LINE_EXTENT` in 3D and downstream
+    // coarse samplers (e.g. `find_curve_curve_closest_point` at 20
+    // samples) miss every finite boundary-edge crossing, which caused
+    // Task #55's perpendicular-box regression.
+    let mut clipped_curves = Vec::new();
+    for curve in curves {
+        if let Some(trimmed) = clip_surface_intersection_curve_to_faces(
+            curve,
+            face_a,
+            face_b,
+            model,
+            &options.common.tolerance,
+        )? {
+            clipped_curves.push(trimmed);
+        }
+        // `None` → the cutting line misses one or both faces entirely.
+        // Drop silently; an empty `clipped_curves` yields `Ok(None)` below.
+    }
+
+    if clipped_curves.is_empty() {
+        return Ok(None);
+    }
+
     // Convert to intersection curves with parametric representations
     let mut intersection_curves = Vec::new();
-    for curve in curves {
+    for curve in clipped_curves {
         let curve_id = model.curves.add(curve.curve);
         intersection_curves.push(IntersectionCurve {
             curve_id,
@@ -544,15 +591,24 @@ fn create_line_intersection_curve(
 
     // Derive extent from surfaces' parameter bounds rather than hardcoding.
     // For bounded surfaces (finite faces), this gives a tight extent.
-    // For unbounded surfaces (infinite planes), parameter bounds are typically
-    // large finite values set by the surface implementation.
+    // For unbounded surfaces (infinite planes), `parameter_bounds()` returns
+    // `(-∞, +∞)` — a literal infinity. Capping at MAX_LINE_EXTENT keeps the
+    // resulting `Line` finite so downstream samplers (e.g.
+    // `find_curve_curve_closest_point`) get useful sample density. The
+    // authoritative fix for planar faces is `clip_line_to_planar_face` in
+    // `intersect_faces`; this cap is the fallback for non-planar faces or
+    // non-Line cutting curves that that clipper does not yet handle.
+    const MAX_LINE_EXTENT: f64 = 1.0e6;
     let bounds_a = surface_a.parameter_bounds();
     let bounds_b = surface_b.parameter_bounds();
     let extent_a =
         ((bounds_a.0 .1 - bounds_a.0 .0).abs()).max((bounds_a.1 .1 - bounds_a.1 .0).abs());
     let extent_b =
         ((bounds_b.0 .1 - bounds_b.0 .0).abs()).max((bounds_b.1 .1 - bounds_b.1 .0).abs());
-    let line_extent = extent_a.max(extent_b).max(10.0); // floor at 10.0 for degenerate bounds
+    let line_extent = extent_a
+        .max(extent_b)
+        .max(10.0) // floor at 10.0 for degenerate bounds
+        .min(MAX_LINE_EXTENT); // cap unbounded (infinite plane) surfaces
 
     let start_point = line_point - line_direction * line_extent;
     let end_point = line_point + line_direction * line_extent;
@@ -2049,6 +2105,7 @@ fn add_non_intersecting_faces(
             boundary_edges,
             classification: FaceClassification::OnBoundary,
             from_solid: solid,
+            interior_point: None,
         });
     }
     Ok(())
@@ -2102,42 +2159,279 @@ fn split_face_by_curves(
     // Re-resolve vertices after edge splitting to ensure consistency
     graph.resolve_vertices(model);
 
-    // Build face loops from graph
-    let loops = extract_face_loops(&graph, model)?;
+    // Build face loops via DCEL planar arrangement.
+    //
+    // Scoped borrow: `build_arrangement` needs `&BRepModel` and
+    // `extract_regions` needs `&dyn Surface`. We borrow the surface for
+    // exactly as long as `extract_regions` runs, so that `model` is free
+    // for the split-face creation loop below.
+    let arrangement =
+        super::face_arrangement::build_arrangement(&graph, model, surface_id)?;
+    let loops = {
+        let surface = model
+            .surfaces
+            .get(surface_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "surface_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{surface_id:?}"),
+            })?;
+        super::face_arrangement::extract_regions(&arrangement, model, surface)
+    };
+
+    // Detect cycle nesting and compute corrected interior points for any
+    // "annular" faces whose naive centroid would land inside an enclosed
+    // sibling cycle. For simply-connected faces (no nested siblings) the
+    // pre-computed point is left as None and the caller falls back to the
+    // boundary-midpoint centroid.
+    let interior_points = compute_split_face_interior_points(&loops, model, surface_id);
 
     // Create split faces from loops
     let mut split_faces = Vec::new();
-    for loop_edges in loops {
-        let split_face = create_split_face(surface_id, loop_edges, face_id, origin_solid)?;
+    for (idx, loop_edges) in loops.into_iter().enumerate() {
+        let mut split_face = create_split_face(surface_id, loop_edges, face_id, origin_solid)?;
+        split_face.interior_point = interior_points.get(idx).copied().flatten();
         split_faces.push(split_face);
     }
 
     Ok(split_faces)
 }
 
+/// Compute a corrected interior point for each extracted DCEL cycle in the
+/// rare case where one cycle lies fully inside another on the same face.
+///
+/// # Why this exists
+///
+/// `extract_regions` walks each CCW boundary cycle independently. When a
+/// face has an outer boundary AND a disjoint inner cutting polygon (the
+/// "face-with-hole" situation that arises when box B's face passes
+/// through box A such that all four of A's intersecting planes cut B's
+/// face without touching B's outer edges), two separate cycles are
+/// emitted. `SplitFace` carries a flat `boundary_edges`, so the outer
+/// cycle becomes a SplitFace whose naive centroid lands inside the inner
+/// hole. Ray-cast classification of that point then picks the wrong
+/// Inside/Outside verdict, and the outer face leaks into the result with
+/// the wrong selection — inflating the boolean bbox.
+///
+/// The corrected point is picked in the surface's tangent plane:
+///
+///   * Build an orthonormal `(e1, e2)` basis at the face's anchor (the
+///     surface point closest to the centroid of all loop vertices).
+///   * Project each loop to 2D.
+///   * For each loop with siblings whose centroid lies inside it, walk
+///     the outer cycle's edges; for each, take the midpoint and nudge
+///     progressively toward the outer centroid. The first candidate that
+///     is inside the outer cycle AND outside every sibling cycle wins.
+///   * Back-project to 3D via `origin + u·e1 + v·e2`.
+///
+/// When no correction is needed (simply-connected cycle) or the surface
+/// evaluation fails, the slot is left `None` so callers fall back to the
+/// default boundary-midpoint centroid.
+fn compute_split_face_interior_points(
+    loops: &[Vec<EdgeId>],
+    model: &BRepModel,
+    surface_id: SurfaceId,
+) -> Vec<Option<Point3>> {
+    let mut result: Vec<Option<Point3>> = vec![None; loops.len()];
+    if loops.len() < 2 {
+        return result;
+    }
+
+    let surface = match model.surfaces.get(surface_id) {
+        Some(s) => s,
+        None => return result,
+    };
+
+    // Extract ordered 3D vertices per cycle. If any cycle is malformed we
+    // abandon the whole correction pass — falling back is always safe.
+    let mut loop_vertices_3d: Vec<Vec<Point3>> = Vec::with_capacity(loops.len());
+    for cycle in loops {
+        let verts = extract_cycle_vertices_3d(cycle, model);
+        if verts.len() < 3 {
+            return result;
+        }
+        loop_vertices_3d.push(verts);
+    }
+
+    // Anchor for the tangent-frame projection.
+    let (mut ax, mut ay, mut az) = (0.0f64, 0.0f64, 0.0f64);
+    let mut n_total = 0usize;
+    for verts in &loop_vertices_3d {
+        for v in verts {
+            ax += v.x;
+            ay += v.y;
+            az += v.z;
+            n_total += 1;
+        }
+    }
+    if n_total == 0 {
+        return result;
+    }
+    let anchor = Point3::new(
+        ax / n_total as f64,
+        ay / n_total as f64,
+        az / n_total as f64,
+    );
+
+    let tol = Tolerance::default();
+    let (u0, v0) = match surface.closest_point(&anchor, tol) {
+        Ok(uv) => uv,
+        Err(_) => return result,
+    };
+    let sp = match surface.evaluate_full(u0, v0) {
+        Ok(s) => s,
+        Err(_) => return result,
+    };
+    let origin = sp.position;
+    let e1 = match sp.du.normalize() {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
+    let e2 = match dv_perp.normalize() {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+
+    // Project 3D → 2D into the tangent frame.
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
+
+    let loop_vertices_2d: Vec<Vec<(f64, f64)>> = loop_vertices_3d
+        .iter()
+        .map(|verts| verts.iter().map(project).collect())
+        .collect();
+
+    // 2D centroid per loop.
+    let loop_centroids_2d: Vec<(f64, f64)> = loop_vertices_2d
+        .iter()
+        .map(|poly| {
+            let (sx, sy) = poly
+                .iter()
+                .fold((0.0, 0.0), |(cx, cy), &(x, y)| (cx + x, cy + y));
+            let n = poly.len() as f64;
+            (sx / n, sy / n)
+        })
+        .collect();
+
+    // Sibling-containment graph: children[i] = indices of loops whose 2D
+    // centroid lies inside loop i's 2D polygon.
+    let n = loops.len();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let (cx, cy) = loop_centroids_2d[j];
+            if point_in_polygon_2d(cx, cy, &loop_vertices_2d[i]) {
+                children[i].push(j);
+            }
+        }
+    }
+
+    // For each loop with children, find a point inside the loop but
+    // outside every child polygon.
+    let nudge_fractions = [0.05f64, 0.1, 0.2, 0.35, 0.5];
+    for i in 0..n {
+        if children[i].is_empty() {
+            continue;
+        }
+        let poly_i = &loop_vertices_2d[i];
+        let (cx, cy) = loop_centroids_2d[i];
+        let n_edges = poly_i.len();
+        let mut found: Option<(f64, f64)> = None;
+        'outer: for &f_nudge in &nudge_fractions {
+            for k in 0..n_edges {
+                let (x1, y1) = poly_i[k];
+                let (x2, y2) = poly_i[(k + 1) % n_edges];
+                let mx = (x1 + x2) * 0.5;
+                let my = (y1 + y2) * 0.5;
+                let tx = mx + (cx - mx) * f_nudge;
+                let ty = my + (cy - my) * f_nudge;
+                if !point_in_polygon_2d(tx, ty, poly_i) {
+                    continue;
+                }
+                let mut in_child = false;
+                for &cj in &children[i] {
+                    if point_in_polygon_2d(tx, ty, &loop_vertices_2d[cj]) {
+                        in_child = true;
+                        break;
+                    }
+                }
+                if !in_child {
+                    found = Some((tx, ty));
+                    break 'outer;
+                }
+            }
+        }
+        if let Some((u, v)) = found {
+            let p = Vector3::new(origin.x, origin.y, origin.z) + e1 * u + e2 * v;
+            result[i] = Some(Point3::new(p.x, p.y, p.z));
+        }
+    }
+
+    result
+}
+
+/// Walk a cycle of EdgeIds in walk order and return the shared vertex
+/// position between each consecutive edge pair. Returns an empty Vec if
+/// the cycle is malformed (missing edge, no shared endpoint).
+fn extract_cycle_vertices_3d(cycle: &[EdgeId], model: &BRepModel) -> Vec<Point3> {
+    let n = cycle.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let mut out: Vec<Point3> = Vec::with_capacity(n);
+    for i in 0..n {
+        let e_a = match model.edges.get(cycle[i]) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let e_b = match model.edges.get(cycle[(i + 1) % n]) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let shared = if e_a.end_vertex == e_b.start_vertex || e_a.end_vertex == e_b.end_vertex {
+            e_a.end_vertex
+        } else if e_a.start_vertex == e_b.start_vertex || e_a.start_vertex == e_b.end_vertex {
+            e_a.start_vertex
+        } else {
+            return Vec::new();
+        };
+        match model.vertices.get_position(shared) {
+            Some(pos) => out.push(Point3::new(pos[0], pos[1], pos[2])),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
 /// Intersection graph for face splitting
-struct IntersectionGraph {
-    nodes: HashMap<VertexId, GraphNode>,
-    edges: HashMap<EdgeId, GraphEdge>,
+pub(super) struct IntersectionGraph {
+    pub(super) nodes: HashMap<VertexId, GraphNode>,
+    pub(super) edges: HashMap<EdgeId, GraphEdge>,
 }
 
 #[derive(Debug, Clone)]
-struct GraphNode {
-    vertex_id: VertexId,
-    incident_edges: HashSet<EdgeId>,
+pub(super) struct GraphNode {
+    pub(super) vertex_id: VertexId,
+    pub(super) incident_edges: HashSet<EdgeId>,
 }
 
 #[derive(Debug, Clone)]
-struct GraphEdge {
-    edge_id: EdgeId,
-    edge_type: EdgeType,
-    start_vertex: VertexId,
-    end_vertex: VertexId,
-    intersections: Vec<EdgeIntersection>,
+pub(super) struct GraphEdge {
+    pub(super) edge_id: EdgeId,
+    pub(super) edge_type: EdgeType,
+    pub(super) start_vertex: VertexId,
+    pub(super) end_vertex: VertexId,
+    pub(super) intersections: Vec<EdgeIntersection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum EdgeType {
+pub(super) enum EdgeType {
     Boundary,
     Splitting,
 }
@@ -2158,12 +2452,16 @@ impl IntersectionGraph {
     }
 
     fn add_edge(&mut self, edge_id: EdgeId, edge_type: EdgeType) {
-        // Store edge in graph with placeholder vertices (resolved when model is available)
+        // Store edge in graph with placeholder vertices (resolved when model is available).
+        // `u32::MAX` is used as the "unresolved" sentinel because vertex ID 0 is a
+        // legitimate VertexId (VertexStore::next_id starts at 0). Using 0 here would
+        // conflate an unresolved placeholder with a real corner vertex whenever the
+        // first vertex created in the model participates in a boundary edge.
         let graph_edge = GraphEdge {
             edge_id,
             edge_type,
-            start_vertex: 0, // Will be resolved during compute_edge_intersections
-            end_vertex: 0,
+            start_vertex: u32::MAX, // Will be resolved during compute_edge_intersections
+            end_vertex: u32::MAX,
             intersections: Vec::new(),
         };
         self.edges.insert(edge_id, graph_edge);
@@ -2231,6 +2529,315 @@ fn get_face_boundary_edges(model: &BRepModel, face_id: FaceId) -> OperationResul
     }
 
     Ok(edges)
+}
+
+/// Outcome of attempting to clip a cutting line to a face's trim boundary.
+#[derive(Debug, Clone, Copy)]
+enum ClipOutcome {
+    /// Line lies (partly) inside the face; keep the `[t_min, t_max]` segment
+    /// on the original line (with `t_min < t_max`, both clamped to `[0, 1]`).
+    Trimmed(f64, f64),
+    /// Line does not enter the face's trim region. Caller should drop the
+    /// face pair from the intersection list.
+    Misses,
+    /// Face is not planar, or its outer loop has non-line edges. Caller
+    /// should pass the original cutting curve through unchanged (the 1e6
+    /// extent cap in `create_line_intersection_curve` keeps it finite).
+    NotApplicable,
+}
+
+/// Clip a straight cutting line to a planar face's outer trim loop.
+///
+/// The cutting line (produced by `plane_plane_intersection`) already lies
+/// in the face's plane by construction, so we can project the line and the
+/// face's boundary edges into the plane's `(u_dir, v_dir)` frame and run
+/// 2D segment-segment intersections.
+///
+/// Returns the parameter interval `[t_min, t_max]` on the original 3D line
+/// (via `line.point_at(t)`) that lies inside the face's outer loop.
+fn clip_line_to_planar_face(
+    line: &crate::primitives::curve::Line,
+    face_id: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<ClipOutcome> {
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::Plane;
+
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_id".to_string(),
+            expected: "valid face ID".to_string(),
+            received: format!("{:?}", face_id),
+        })?;
+
+    let surface =
+        model
+            .surfaces
+            .get(face.surface_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "surface_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{:?}", face.surface_id),
+            })?;
+
+    if surface.surface_type() != SurfaceType::Plane {
+        return Ok(ClipOutcome::NotApplicable);
+    }
+    let plane = match surface.as_any().downcast_ref::<Plane>() {
+        Some(p) => p,
+        None => return Ok(ClipOutcome::NotApplicable),
+    };
+
+    let boundary_edges = get_face_boundary_edges(model, face_id)?;
+    if boundary_edges.is_empty() {
+        return Ok(ClipOutcome::NotApplicable);
+    }
+
+    // 2D projection helper: a point P in 3D maps to
+    // (u, v) = ((P - origin)·u_dir, (P - origin)·v_dir) under the plane's
+    // orthonormal frame. Because u_dir ⟂ v_dir ⟂ normal, the in-plane
+    // distance equals the 3D distance — parameter `t` on the cutting line
+    // coincides with the 2D parameter after projection.
+    let origin = plane.origin;
+    let u_dir = plane.u_dir;
+    let v_dir = plane.v_dir;
+    let project = |p: Point3| -> (f64, f64) {
+        let d = p - origin;
+        (d.dot(&u_dir), d.dot(&v_dir))
+    };
+
+    // Project cutting line endpoints. `line.start` corresponds to t=0,
+    // `line.end` to t=1 (see `Line::evaluate` at curve.rs:543).
+    let (lu0, lv0) = project(line.start);
+    let (lu1, lv1) = project(line.end);
+    let ldu = lu1 - lu0;
+    let ldv = lv1 - lv0;
+
+    // Guard against degenerate cutting lines (should not happen — the
+    // surface-intersection line direction is unit-length * line_extent).
+    let line_len_sq = ldu * ldu + ldv * ldv;
+    if line_len_sq <= tolerance.distance() * tolerance.distance() {
+        return Ok(ClipOutcome::NotApplicable);
+    }
+
+    // Collect 2D polygon vertices for the outer loop (for point-in-polygon)
+    // and accumulate crossing parameters along the cutting line.
+    let mut poly_uv: Vec<(f64, f64)> = Vec::with_capacity(boundary_edges.len());
+    let mut crossings: Vec<f64> = Vec::new();
+
+    // Param-slack on the boundary edge — relative to the edge's own [0, 1]
+    // parameterization. Using `tolerance.distance() / edge_length` keeps
+    // the test independent of world scale.
+    let edge_param_slack = 1e-9_f64;
+
+    for &edge_id in &boundary_edges {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "edge_id".to_string(),
+                expected: "valid edge ID".to_string(),
+                received: format!("{:?}", edge_id),
+            })?;
+        let curve =
+            model
+                .curves
+                .get(edge.curve_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "curve_id".to_string(),
+                    expected: "valid curve ID".to_string(),
+                    received: format!("{:?}", edge.curve_id),
+                })?;
+
+        // Require straight-line boundary. Non-line edges in a planar face
+        // are unusual (fillets in 3D live in non-planar faces); treat as
+        // "not applicable" and let caller pass through.
+        let edge_line = match curve.as_any().downcast_ref::<Line>() {
+            Some(l) => l,
+            None => return Ok(ClipOutcome::NotApplicable),
+        };
+
+        let (eu0, ev0) = project(edge_line.start);
+        let (eu1, ev1) = project(edge_line.end);
+        poly_uv.push((eu0, ev0));
+
+        // Solve for crossing: cutting line L(s) = L0 + s * dL, edge
+        // E(t) = E0 + t * dE, where s ∈ ℝ (we'll filter to [0,1] later)
+        // and t ∈ [0, 1]. Setting L(s) = E(t) and subtracting:
+        //   [ ldu  -edu ] [s]   [ eu0 - lu0 ]
+        //   [ ldv  -edv ] [t] = [ ev0 - lv0 ]
+        // Cramer's rule.
+        let edu = eu1 - eu0;
+        let edv = ev1 - ev0;
+        let det = ldu * (-edv) - ldv * (-edu); // = -ldu*edv + ldv*edu
+        if det.abs() < 1e-18 {
+            // Parallel in 2D. Either no crossing or the cutting line lies
+            // along this edge; in either case the endpoints of the
+            // intersection with this edge will be picked up by the
+            // adjacent (non-parallel) boundary edges.
+            continue;
+        }
+        let rhs_u = eu0 - lu0;
+        let rhs_v = ev0 - lv0;
+        let s_num = rhs_u * (-edv) - rhs_v * (-edu); // s = s_num / det
+        let t_num = ldu * rhs_v - ldv * rhs_u; // t = t_num / det
+        let s = s_num / det;
+        let t = t_num / det;
+
+        if t >= -edge_param_slack && t <= 1.0 + edge_param_slack {
+            crossings.push(s);
+        }
+    }
+
+    // Mark poly_uv as intentionally used (for future non-convex support);
+    // the current extremes-based path below does not consult it.
+    let _ = &poly_uv;
+
+    if crossings.len() < 2 {
+        return Ok(ClipOutcome::Misses);
+    }
+
+    // Sort + merge crossings within 2D-tolerance relative to line length.
+    // Crossings that coincide (line passes through a boundary vertex)
+    // would otherwise produce spurious zero-length pairs.
+    let line_len = line_len_sq.sqrt();
+    let merge_eps_s = tolerance.distance() / line_len.max(1.0);
+    crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crossings.dedup_by(|a, b| (*a - *b).abs() < merge_eps_s);
+
+    if crossings.len() < 2 {
+        return Ok(ClipOutcome::Misses);
+    }
+
+    // Take the outermost crossings. For convex planar faces (all box faces
+    // qualify, which is the full task #55 scope), this is exactly the
+    // interior interval. For non-convex outer loops the result is an
+    // over-approximation of the interior range, which is acceptable: the
+    // downstream DCEL arrangement does the exact face-splitting from the
+    // extended cutting line and the true outer-loop edges.
+    let s_lo = crossings.first().copied().unwrap_or(0.0);
+    let s_hi = crossings.last().copied().unwrap_or(1.0);
+    let clamped_lo = s_lo.max(0.0);
+    let clamped_hi = s_hi.min(1.0);
+    let best = if clamped_hi - clamped_lo > merge_eps_s {
+        Some((clamped_lo, clamped_hi))
+    } else {
+        None
+    };
+
+    match best {
+        Some((t_min, t_max)) => Ok(ClipOutcome::Trimmed(t_min, t_max)),
+        None => Ok(ClipOutcome::Misses),
+    }
+}
+
+/// 2D ray-casting point-in-polygon. The polygon is closed implicitly by
+/// connecting the last vertex back to the first.
+fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        // Standard ray-cast with the classic half-open edge convention.
+        let intersects = ((yi > py) != (yj > py))
+            && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Trim a plane-plane `SurfaceIntersectionCurve` to the overlap of both
+/// faces' trim regions. Returns `Ok(Some(trimmed))` when the line lies in
+/// both faces, `Ok(None)` when it misses either face (drop the pair), or
+/// the original unchanged when clipping is not applicable (non-planar
+/// face or non-line boundary).
+fn clip_surface_intersection_curve_to_faces(
+    curve: SurfaceIntersectionCurve,
+    face_a: FaceId,
+    face_b: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Line;
+
+    // Clipping only applies to straight cutting lines (the plane-plane
+    // pathway produces these). NURBS/arc cutting curves are handled by
+    // the fallback 1e6 extent cap.
+    let line = match curve.curve.as_any().downcast_ref::<Line>() {
+        Some(l) => l.clone(),
+        None => return Ok(Some(curve)),
+    };
+
+    let clip_a = clip_line_to_planar_face(&line, face_a, model, tolerance)?;
+    let clip_b = clip_line_to_planar_face(&line, face_b, model, tolerance)?;
+
+    // Combine clip outcomes.
+    let (t_a_lo, t_a_hi) = match clip_a {
+        ClipOutcome::Trimmed(lo, hi) => (lo, hi),
+        ClipOutcome::Misses => return Ok(None),
+        ClipOutcome::NotApplicable => (0.0, 1.0),
+    };
+    let (t_b_lo, t_b_hi) = match clip_b {
+        ClipOutcome::Trimmed(lo, hi) => (lo, hi),
+        ClipOutcome::Misses => return Ok(None),
+        ClipOutcome::NotApplicable => (0.0, 1.0),
+    };
+
+    // If both faces are NotApplicable, return the curve unchanged.
+    if matches!(clip_a, ClipOutcome::NotApplicable)
+        && matches!(clip_b, ClipOutcome::NotApplicable)
+    {
+        return Ok(Some(curve));
+    }
+
+    let t_min_core = t_a_lo.max(t_b_lo);
+    let t_max_core = t_a_hi.min(t_b_hi);
+    // Use a tiny relative epsilon to reject zero-width intervals produced
+    // by lines that only graze one face.
+    if t_max_core - t_min_core <= tolerance.distance() / line.length().max(1.0) {
+        return Ok(None);
+    }
+
+    // Use the tight interior interval. Endpoints falling on shared
+    // face-boundary vertices are handled downstream by
+    // `model.vertices.add_or_find(..., tolerance)` which merges them into
+    // shared vertices; `compute_edge_intersections` then skips same-vertex
+    // pairs correctly.
+    let t_min = t_min_core.max(0.0);
+    let t_max = t_max_core.min(1.0);
+
+    // Build the trimmed line. Since `Line::evaluate(t)` maps t ∈ [0,1]
+    // linearly from `start` to `end`, `point_at(t) = start + t * (end - start)`.
+    let new_start = line.start + (line.end - line.start) * t_min;
+    let new_end = line.start + (line.end - line.start) * t_max;
+    let trimmed_line = Line::new(new_start, new_end);
+
+    // Rewrap parametric curves. For plane-plane the on-surface uv maps
+    // linearly along the 3D line, so the endpoint uv samples fully
+    // characterize the trimmed segment.
+    let (ua0, va0) = ((curve.on_surface_a.u_of_t)(t_min), (curve.on_surface_a.v_of_t)(t_min));
+    let (ua1, va1) = ((curve.on_surface_a.u_of_t)(t_max), (curve.on_surface_a.v_of_t)(t_max));
+    let (ub0, vb0) = ((curve.on_surface_b.u_of_t)(t_min), (curve.on_surface_b.v_of_t)(t_min));
+    let (ub1, vb1) = ((curve.on_surface_b.u_of_t)(t_max), (curve.on_surface_b.v_of_t)(t_max));
+
+    let on_surface_a = create_parametric_curve(&[(ua0, va0), (ua1, va1)]);
+    let on_surface_b = create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]);
+
+    Ok(Some(SurfaceIntersectionCurve {
+        curve: Box::new(trimmed_line),
+        on_surface_a,
+        on_surface_b,
+    }))
 }
 
 /// Create edge from curve
@@ -2453,7 +3060,7 @@ fn compute_edge_intersections(
                     .edges
                     .get(first_id)
                     .map(|e| e.start_vertex)
-                    .unwrap_or(0),
+                    .unwrap_or(u32::MAX),
                 end_vertex: *split_vid,
                 intersections: Vec::new(),
             };
@@ -2546,11 +3153,20 @@ fn find_curve_curve_closest_point(
         }
     }
 
-    // Newton refinement (bisection-like approach for robustness)
+    // Newton-style refinement with unconditional step halving.
+    //
+    // When no direction improves at the current step, we still halve the
+    // step and retry — overshooting the optimum by a fraction of `step`
+    // is the common cause of "no improvement" near convergence, and a
+    // finer step then resolves sub-`step` offsets. We bail only once the
+    // step is numerically negligible or the distance is already below
+    // tolerance. This is essential for boolean face-face intersection
+    // where a cutting-line endpoint coincides with a boundary-edge
+    // crossing: the `t_b=0` wall prevents Newton from moving in `t_b`,
+    // forcing it to converge in `t_a` alone across many step halvings.
     let mut step = 0.5 / SAMPLES as f64;
-    for _ in 0..10 {
-        let mut improved = false;
-
+    let min_step = 1e-14_f64;
+    for _ in 0..60 {
         for &(dt_a, dt_b) in &[
             (step, 0.0),
             (-step, 0.0),
@@ -2570,11 +3186,10 @@ fn find_curve_curve_closest_point(
                 best_dist = dist;
                 best_t_a = t_a;
                 best_t_b = t_b;
-                improved = true;
             }
         }
 
-        if !improved || best_dist < tolerance.distance() * 0.1 {
+        if best_dist < tolerance.distance() * 0.1 || step < min_step {
             break;
         }
         step *= 0.5;
@@ -2611,136 +3226,6 @@ fn find_or_create_intersection_vertex(
         .add_or_find(point.x, point.y, point.z, tolerance.distance())
 }
 
-/// Extract face loops from intersection graph.
-///
-/// Finds closed cycles of edges in the graph. Each cycle represents a face boundary.
-/// Uses a planar graph traversal: at each vertex, follow edges in angular order
-/// to find minimal enclosed regions.
-fn extract_face_loops(
-    graph: &IntersectionGraph,
-    model: &BRepModel,
-) -> OperationResult<Vec<Vec<EdgeId>>> {
-    let mut loops: Vec<Vec<EdgeId>> = Vec::new();
-    let mut used_edge_directions: HashSet<(EdgeId, bool)> = HashSet::new();
-
-    // Collect all edges that have both vertices resolved
-    let valid_edges: Vec<EdgeId> = graph
-        .edges
-        .iter()
-        .filter(|(_, ge)| ge.start_vertex != 0 && ge.end_vertex != 0)
-        .map(|(&eid, _)| eid)
-        .collect();
-
-    // For each directed edge, try to trace a loop
-    for &edge_id in &valid_edges {
-        for forward in [true, false] {
-            if used_edge_directions.contains(&(edge_id, forward)) {
-                continue;
-            }
-
-            // Try to trace a loop starting from this directed edge
-            let mut loop_edges = Vec::new();
-            let mut current_edge = edge_id;
-            let mut current_forward = forward;
-
-            let ge = &graph.edges[&current_edge];
-            let start_vertex = if current_forward {
-                ge.start_vertex
-            } else {
-                ge.end_vertex
-            };
-            let mut current_vertex = if current_forward {
-                ge.end_vertex
-            } else {
-                ge.start_vertex
-            };
-
-            loop_edges.push(current_edge);
-            used_edge_directions.insert((current_edge, current_forward));
-
-            let mut found_loop = false;
-
-            // Walk edges until we return to start or get stuck.
-            // Limit is proportional to edge count to handle large faces.
-            let walk_limit = valid_edges.len() * 2 + 10;
-            for _ in 0..walk_limit {
-                if current_vertex == start_vertex && !loop_edges.is_empty() {
-                    found_loop = true;
-                    break;
-                }
-
-                // Find next edge from current_vertex
-                let node = match graph.nodes.get(&current_vertex) {
-                    Some(n) => n,
-                    None => break,
-                };
-
-                let mut next_edge = None;
-                for &candidate_eid in &node.incident_edges {
-                    if candidate_eid == current_edge {
-                        continue;
-                    }
-
-                    let cge = &graph.edges[&candidate_eid];
-
-                    // Determine direction through this edge from current_vertex
-                    let (cand_forward, next_v) = if cge.start_vertex == current_vertex {
-                        (true, cge.end_vertex)
-                    } else if cge.end_vertex == current_vertex {
-                        (false, cge.start_vertex)
-                    } else {
-                        continue;
-                    };
-
-                    if used_edge_directions.contains(&(candidate_eid, cand_forward)) {
-                        continue;
-                    }
-
-                    next_edge = Some((candidate_eid, cand_forward, next_v));
-                    break;
-                }
-
-                match next_edge {
-                    Some((eid, fwd, next_v)) => {
-                        loop_edges.push(eid);
-                        used_edge_directions.insert((eid, fwd));
-                        current_edge = eid;
-                        current_forward = fwd;
-                        current_vertex = next_v;
-                    }
-                    None => break,
-                }
-            }
-
-            if found_loop && loop_edges.len() >= 3 {
-                loops.push(loop_edges);
-            } else {
-                // Undo used markers if we didn't find a loop
-                for &eid in &loop_edges {
-                    // We can't easily undo the specific directions, but this is acceptable
-                    // as failed traces won't produce duplicate loops
-                }
-            }
-        }
-    }
-
-    // If no loops found from the graph, fall back to returning all boundary edges as one loop
-    if loops.is_empty() {
-        let boundary_edges: Vec<EdgeId> = graph
-            .edges
-            .iter()
-            .filter(|(_, ge)| ge.edge_type == EdgeType::Boundary)
-            .map(|(&eid, _)| eid)
-            .collect();
-
-        if boundary_edges.len() >= 3 {
-            loops.push(boundary_edges);
-        }
-    }
-
-    Ok(loops)
-}
-
 /// Create split face from edges. `origin_solid` is stamped directly on the
 /// result; classification fills in `classification` later.
 fn create_split_face(
@@ -2755,6 +3240,7 @@ fn create_split_face(
         boundary_edges: edges,
         classification: FaceClassification::OnBoundary,
         from_solid: origin_solid,
+        interior_point: None,
     })
 }
 
@@ -2885,6 +3371,14 @@ fn classify_face_relative_to_solid(
 /// parameter center, which can lie outside the actual face boundary for
 /// trimmed or partial faces (e.g., a small sector of a cylinder).
 fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResult<Point3> {
+    // Prefer the pre-computed interior point when available. It is set by
+    // `split_face_by_curves` in situations where naive boundary-centroid
+    // would land inside an enclosed sibling cycle (face-with-hole case),
+    // causing ray-cast classification to misattribute Inside/Outside.
+    if let Some(p) = face.interior_point {
+        return Ok(p);
+    }
+
     // Collect midpoints of boundary edges
     let mut sum = Point3::new(0.0, 0.0, 0.0);
     let mut count = 0u32;
@@ -2965,7 +3459,8 @@ fn ray_cast_classification(
         for t in t_values {
             if t > tolerance.distance() {
                 let intersection_point = point + direction * t;
-                if is_point_in_face(model, face_id, &intersection_point, tolerance)? {
+                let in_face = is_point_in_face(model, face_id, &intersection_point, tolerance)?;
+                if in_face {
                     intersection_count += 1;
                 }
             }
@@ -3319,27 +3814,23 @@ fn is_point_in_face(
         return Ok(true);
     }
 
-    // Build UV polygon from loop edges
+    // Build UV polygon from loop's ordered corner vertices.
+    //
+    // We cannot rely on `outer_loop.orientations[i]` alone because some
+    // callers (e.g., `create_box_faces` in topology_builder) populate it
+    // inconsistently with the actual edge ordering — producing zig-zag
+    // polygons when curves are sampled in their intrinsic direction.
+    //
+    // Instead, walk consecutive edges and use the *shared endpoint* as the
+    // next polygon vertex. This matches `extract_cycle_vertices_3d` and is
+    // robust to arbitrary `orientations` storage. For boxes with straight
+    // line edges, this yields exactly the rectangle's four corners — all
+    // that's needed for the planar point-in-polygon test below.
     let mut uv_polygon: Vec<(f64, f64)> = Vec::new();
-    let num_samples_per_edge = 5;
-
-    for &edge_id in &outer_loop.edges {
-        let edge = match model.edges.get(edge_id) {
-            Some(e) => e,
-            None => continue,
-        };
-        let curve = match model.curves.get(edge.curve_id) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        for k in 0..num_samples_per_edge {
-            let t = k as f64 / num_samples_per_edge as f64;
-            if let Ok(pt3d) = curve.point_at(t) {
-                if let Ok((eu, ev)) = surface.closest_point(&pt3d, *tolerance) {
-                    uv_polygon.push((eu, ev));
-                }
-            }
+    let cycle_vertices = extract_cycle_vertices_3d(&outer_loop.edges, model);
+    for pt3d in &cycle_vertices {
+        if let Ok((eu, ev)) = surface.closest_point(pt3d, *tolerance) {
+            uv_polygon.push((eu, ev));
         }
     }
 
@@ -3675,6 +4166,7 @@ mod tests {
                 boundary_edges: vec![1, 2, 3],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 1,
@@ -3682,6 +4174,7 @@ mod tests {
                 boundary_edges: vec![4, 5, 6],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
         ];
 
@@ -3700,6 +4193,7 @@ mod tests {
                 boundary_edges: vec![1, 2, 3],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 1,
@@ -3707,6 +4201,7 @@ mod tests {
                 boundary_edges: vec![3, 4, 5],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 2,
@@ -3714,6 +4209,7 @@ mod tests {
                 boundary_edges: vec![10, 11, 12],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
         ];
 
@@ -3784,6 +4280,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 1,
@@ -3791,6 +4288,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
                 from_solid: 1,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 2,
@@ -3798,6 +4296,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::OnBoundary,
                 from_solid: 0,
+                interior_point: None,
             },
         ];
 
@@ -3817,6 +4316,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 1,
@@ -3824,6 +4324,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
                 from_solid: 1,
+                interior_point: None,
             },
             SplitFace {
                 original_face: 2,
@@ -3831,6 +4332,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::OnBoundary,
                 from_solid: 0,
+                interior_point: None,
             },
         ];
 
@@ -3850,6 +4352,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
                 from_solid: 0, // A outside B → keep
+                interior_point: None,
             },
             SplitFace {
                 original_face: 1,
@@ -3857,6 +4360,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
                 from_solid: 0, // A inside B → discard
+                interior_point: None,
             },
             SplitFace {
                 original_face: 2,
@@ -3864,6 +4368,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Inside,
                 from_solid: 1, // B inside A → keep (cavity wall)
+                interior_point: None,
             },
             SplitFace {
                 original_face: 3,
@@ -3871,6 +4376,7 @@ mod tests {
                 boundary_edges: vec![],
                 classification: FaceClassification::Outside,
                 from_solid: 1, // B outside A → discard
+                interior_point: None,
             },
         ];
 
@@ -4572,20 +5078,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME: bbox(A ∩ B) can exceed bbox(A) when B extends beyond A. Reproducible \
-        failure: bbox(A∩B).z=[-5.31,5.31] vs bbox(A).z=[-3.56,3.56] (seed BOOLEAN_HARNESS_SEED^0x51, \
-        iter 0). Task #48 established that origin-attribution is correct (SplitFace::from_solid \
-        stamped at split time). Task #48 also added add_non_intersecting_faces so wholly-contained \
-        or wholly-separated caps flow into classification. The REMAINING defect is in face-region \
-        subdivision: split_face_by_curves→extract_face_loops walks edges by HashMap iteration \
-        order and picks the first unused incident edge (boolean.rs:2678-2700), with NO angular \
-        sort. A planar face split by a straight line should yield TWO planar regions (arrangement \
-        subdivision), but the current walk can emerge with the original loop unchanged and the \
-        cutting curve dangling. Result: classify_face_relative_to_solid samples the ORIGINAL \
-        face's interior point, so pieces that should be Outside the test solid get grouped with \
-        pieces that are Inside. Fixing this requires DCEL half-edge construction with angular \
-        sort per vertex to correctly subdivide each face into connected regions (Vida-Martin-Varady \
-        1994; Piegl-Tiller §17). Out of scope for task #48."]
     fn prop_tier3_intersection_bbox_within_both_inputs() {
         // `bbox(A ∩ B) ⊆ bbox(A)` and `⊆ bbox(B)` always — the intersection
         // cannot exceed either operand in any axis.
@@ -4630,12 +5122,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FIXME: bbox(A - B) can exceed bbox(A). Reproducible failure: \
-        bbox(A-B).x=[-8.68,8.68] vs bbox(A).x=[-3.17,3.17] (seed BOOLEAN_HARNESS_SEED^0x52, iter \
-        0). Same root cause as prop_tier3_intersection_bbox_within_both_inputs: \
-        extract_face_loops (boolean.rs:2619) does not correctly subdivide a planar face along \
-        intersection curves because it walks the intersection graph without angular sort at \
-        each vertex. Requires DCEL-based face arrangement. See that test's FIXME for details."]
     fn prop_tier3_difference_bbox_within_minuend() {
         // `bbox(A - B) ⊆ bbox(A)` — subtracting cannot grow the operand.
         let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x52);
