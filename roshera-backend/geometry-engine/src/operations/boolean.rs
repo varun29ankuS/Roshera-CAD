@@ -93,12 +93,12 @@ struct FaceIntersection {
     curves: Vec<IntersectionCurve>,
 }
 
-/// Intersection curve between two faces
+/// Intersection curve between two faces. Only `curve_id` is consumed by
+/// downstream classification — the producer's (u,v)←t mappings are dropped
+/// at this boundary because face-trim recovery operates purely in 3D.
 #[derive(Debug)]
 struct IntersectionCurve {
     curve_id: CurveId,
-    on_face_a: ParametricCurve,
-    on_face_b: ParametricCurve,
 }
 
 /// Parametric curve on a face
@@ -341,11 +341,9 @@ fn intersect_faces(
     let mut intersection_curves = Vec::new();
     for curve in clipped_curves {
         let curve_id = model.curves.add(curve.curve);
-        intersection_curves.push(IntersectionCurve {
-            curve_id,
-            on_face_a: curve.on_surface_a,
-            on_face_b: curve.on_surface_b,
-        });
+        // curve.on_surface_a / curve.on_surface_b are intentionally dropped:
+        // downstream classification reads only the 3D curve via curve_id.
+        intersection_curves.push(IntersectionCurve { curve_id });
     }
 
     Ok(Some(FaceIntersection {
@@ -1348,45 +1346,16 @@ fn create_parallel_cylinder_intersection_lines(
     Ok(curves)
 }
 
-/// Solve general cylinder intersection (non-parallel axes)
+/// Solve general cylinder intersection (non-parallel axes).
+///
+/// The marching solver operates in world coordinates directly, so no
+/// pre-alignment transform is required.
 fn solve_general_cylinder_intersection(
     cyl_a: &crate::primitives::surface::Cylinder,
     cyl_b: &crate::primitives::surface::Cylinder,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    // For general cylinder intersection, we solve the quartic equation
-    // This is complex analytical geometry - using numerical marching as fallback
-    // In production, this would implement the full analytical solution
-
-    // Set up coordinate system with cylinder A at origin
-    let transform = create_cylinder_intersection_transform(cyl_a, cyl_b)?;
-
-    // Solve intersection using parametric marching along key curves
-    let curves = march_cylinder_intersection_curves(cyl_a, cyl_b, tolerance)?;
-
-    Ok(curves)
-}
-
-/// Create coordinate transform for cylinder intersection
-fn create_cylinder_intersection_transform(
-    cyl_a: &crate::primitives::surface::Cylinder,
-    cyl_b: &crate::primitives::surface::Cylinder,
-) -> OperationResult<Matrix4> {
-    // Create transform that places cylinder A at origin with Z-axis alignment
-    let translation = Matrix4::from_translation(&(-cyl_a.origin));
-
-    // Create rotation to align cylinder A axis with Z-axis
-    let rotation = if (cyl_a.axis - Vector3::Z).magnitude() < 1e-10 {
-        Matrix4::IDENTITY
-    } else if (cyl_a.axis + Vector3::Z).magnitude() < 1e-10 {
-        Matrix4::rotation_x(std::f64::consts::PI)
-    } else {
-        let rotation_axis = cyl_a.axis.cross(&Vector3::Z).normalize()?;
-        let rotation_angle = cyl_a.axis.dot(&Vector3::Z).acos();
-        Matrix4::from_axis_angle(&rotation_axis, rotation_angle)?
-    };
-
-    Ok(rotation * translation)
+    march_cylinder_intersection_curves(cyl_a, cyl_b, tolerance)
 }
 
 /// March along intersection curves for general cylinder case
@@ -1660,6 +1629,10 @@ fn find_initial_intersection_points(
     let (u_min_b, u_max_b) = u_bounds_b;
     let (v_min_b, v_max_b) = v_bounds_b;
 
+    // closest_point() does not enforce parameter bounds, so we reject hits
+    // that fall outside surface B's actual domain (within a small slack).
+    let bound_slack = tolerance.distance().max(1e-9);
+
     // Sample surface A
     for i in 0..=GRID_SIZE {
         for j in 0..=GRID_SIZE {
@@ -1670,6 +1643,13 @@ fn find_initial_intersection_points(
 
             // Find closest point on surface B
             if let Ok((u_b, v_b)) = surface_b.closest_point(&point_a.position, *tolerance) {
+                if u_b < u_min_b - bound_slack
+                    || u_b > u_max_b + bound_slack
+                    || v_b < v_min_b - bound_slack
+                    || v_b > v_max_b + bound_slack
+                {
+                    continue;
+                }
                 let point_b = surface_b.evaluate_full(u_b, v_b)?;
 
                 let distance = (point_a.position - point_b.position).magnitude();
@@ -2448,7 +2428,8 @@ pub(super) struct IntersectionGraph {
 
 #[derive(Debug, Clone)]
 pub(super) struct GraphNode {
-    pub(super) vertex_id: VertexId,
+    // The owning HashMap key is the vertex id; storing it again would
+    // duplicate state with no consumer.
     pub(super) incident_edges: HashSet<EdgeId>,
 }
 
@@ -2458,20 +2439,12 @@ pub(super) struct GraphEdge {
     pub(super) edge_type: EdgeType,
     pub(super) start_vertex: VertexId,
     pub(super) end_vertex: VertexId,
-    pub(super) intersections: Vec<EdgeIntersection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum EdgeType {
     Boundary,
     Splitting,
-}
-
-#[derive(Debug, Clone)]
-struct EdgeIntersection {
-    other_edge: EdgeId,
-    parameter: f64,
-    vertex_id: VertexId,
 }
 
 impl IntersectionGraph {
@@ -2493,7 +2466,6 @@ impl IntersectionGraph {
             edge_type,
             start_vertex: u32::MAX, // Will be resolved during compute_edge_intersections
             end_vertex: u32::MAX,
-            intersections: Vec::new(),
         };
         self.edges.insert(edge_id, graph_edge);
     }
@@ -2512,7 +2484,6 @@ impl IntersectionGraph {
         for (&edge_id, graph_edge) in &self.edges {
             for &vid in &[graph_edge.start_vertex, graph_edge.end_vertex] {
                 let node = self.nodes.entry(vid).or_insert_with(|| GraphNode {
-                    vertex_id: vid,
                     incident_edges: HashSet::new(),
                 });
                 node.incident_edges.insert(edge_id);
@@ -2983,7 +2954,6 @@ fn compute_edge_intersections(
     // Collect split operations to apply after annotation
     struct SplitOp {
         edge_id: EdgeId,
-        edge_type: EdgeType,
         parameter: f64,
         vertex_id: VertexId,
     }
@@ -2993,39 +2963,29 @@ fn compute_edge_intersections(
         // Create a real vertex in the model
         let vid = find_or_create_intersection_vertex(model, graph, *point, tolerance);
 
-        // Record intersection on both edges
-        if let Some(ge_a) = graph.edges.get_mut(eid_a) {
-            ge_a.intersections.push(EdgeIntersection {
-                other_edge: *eid_b,
-                parameter: *t_a,
-                vertex_id: vid,
-            });
+        // Record intersection points as split ops on each edge.
+        if graph.edges.contains_key(eid_a) {
             split_ops.push(SplitOp {
                 edge_id: *eid_a,
-                edge_type: ge_a.edge_type,
                 parameter: *t_a,
                 vertex_id: vid,
             });
         }
-        if let Some(ge_b) = graph.edges.get_mut(eid_b) {
-            ge_b.intersections.push(EdgeIntersection {
-                other_edge: *eid_a,
-                parameter: *t_b,
-                vertex_id: vid,
-            });
+        if graph.edges.contains_key(eid_b) {
             split_ops.push(SplitOp {
                 edge_id: *eid_b,
-                edge_type: ge_b.edge_type,
                 parameter: *t_b,
                 vertex_id: vid,
             });
         }
 
         // Register vertex in node map
-        let node = graph.nodes.entry(vid).or_insert_with(|| GraphNode {
-            vertex_id: vid,
-            incident_edges: HashSet::new(),
-        });
+        let node = graph
+            .nodes
+            .entry(vid)
+            .or_insert_with(|| GraphNode {
+                incident_edges: HashSet::new(),
+            });
         node.incident_edges.insert(*eid_a);
         node.incident_edges.insert(*eid_b);
     }
@@ -3092,8 +3052,7 @@ fn compute_edge_intersections(
                     .map(|e| e.start_vertex)
                     .unwrap_or(u32::MAX),
                 end_vertex: *split_vid,
-                intersections: Vec::new(),
-            };
+                };
             graph.edges.insert(first_id, first_ge);
 
             // Update node incidence
@@ -3102,7 +3061,6 @@ fn compute_edge_intersections(
                     .nodes
                     .entry(sv)
                     .or_insert_with(|| GraphNode {
-                        vertex_id: sv,
                         incident_edges: HashSet::new(),
                     })
                     .incident_edges
@@ -3112,7 +3070,6 @@ fn compute_edge_intersections(
                 .nodes
                 .entry(*split_vid)
                 .or_insert_with(|| GraphNode {
-                    vertex_id: *split_vid,
                     incident_edges: HashSet::new(),
                 })
                 .incident_edges
@@ -3131,7 +3088,6 @@ fn compute_edge_intersections(
             edge_type,
             start_vertex: remaining_edge.start_vertex,
             end_vertex: remaining_edge.end_vertex,
-            intersections: Vec::new(),
         };
         graph.edges.insert(final_id, final_ge);
 
@@ -3142,7 +3098,6 @@ fn compute_edge_intersections(
                     .nodes
                     .entry(vid)
                     .or_insert_with(|| GraphNode {
-                        vertex_id: vid,
                         incident_edges: HashSet::new(),
                     })
                     .incident_edges
