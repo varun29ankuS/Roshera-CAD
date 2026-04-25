@@ -234,23 +234,34 @@ fn create_helical_sweep(
         let xform = translate * rot;
         let next_xform = next_translate * next_rot;
 
-        // Create faces for each edge in the profile loop
+        // Create faces for each edge in the profile loop. The loop index
+        // `i` is folded into error messages so revolve failures point to a
+        // specific profile edge rather than the abstract "edge not found".
         for (i, &edge_id) in outer_loop.edges.iter().enumerate() {
             let edge = model
                 .edges
                 .get(edge_id)
-                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".into()))?
+                .ok_or_else(|| OperationError::InvalidGeometry(format!(
+                    "revolve: edge {} (profile slot {}) not found",
+                    edge_id, i
+                )))?
                 .clone();
 
             // Get edge endpoints and transform them
             let ps_arr = model
                 .vertices
                 .get_position(edge.start_vertex)
-                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".into()))?;
+                .ok_or_else(|| OperationError::InvalidGeometry(format!(
+                    "revolve: start vertex {} of edge {} (profile slot {}) not found",
+                    edge.start_vertex, edge_id, i
+                )))?;
             let pe_arr = model
                 .vertices
                 .get_position(edge.end_vertex)
-                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".into()))?;
+                .ok_or_else(|| OperationError::InvalidGeometry(format!(
+                    "revolve: end vertex {} of edge {} (profile slot {}) not found",
+                    edge.end_vertex, edge_id, i
+                )))?;
             let p_start = Vector3::new(ps_arr[0], ps_arr[1], ps_arr[2]);
             let p_end = Vector3::new(pe_arr[0], pe_arr[1], pe_arr[2]);
 
