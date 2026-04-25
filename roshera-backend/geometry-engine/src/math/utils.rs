@@ -1091,6 +1091,16 @@ impl RemezApproximation {
         let coefficients = fit_polynomial(&nodes, &f, degree)?;
         let max_error = estimate_max_error(&coefficients, &f, range, 1000);
 
+        // Surface to the caller when the requested degree is too low to
+        // hit their tolerance budget; without this check the
+        // approximation silently violates its precision contract.
+        if max_error > tolerance.distance() {
+            return Err(MathError::ConvergenceFailure {
+                iterations: 1,
+                error: max_error,
+            });
+        }
+
         Ok(RemezApproximation {
             coefficients,
             max_error,

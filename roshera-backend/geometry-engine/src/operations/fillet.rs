@@ -1640,21 +1640,91 @@ fn validate_vertex_fillet_inputs(
     Ok(())
 }
 
-/// Validate filleted solid
+/// Validate filleted solid via the kernel's parallel B-Rep validator.
+///
+/// Runs `Standard`-level validation (topology connectivity + basic geometry
+/// checks) on the solid that just received fillet faces. Returns
+/// `OperationError::TopologyError` when validation fails so callers can
+/// surface the issue rather than silently produce a malformed solid.
 fn validate_filleted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
-    // Would perform full B-Rep validation
+    // Solid existence is a precondition here; if the caller passed an
+    // unknown id, treat that as an internal logic error.
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "validate_filleted_solid: solid {} not found",
+            solid_id
+        )));
+    }
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::TopologyError(format!(
+            "filleted solid failed validation ({} error(s)): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 
-/// Adaptive sampling for rolling ball
+/// Curvature-adaptive sampling for rolling-ball fillet sweeps.
+///
+/// Refines parameter samples where the curve bends fastest so the swept
+/// fillet surface stays within `tolerance.distance()` of the analytic
+/// rolling-ball envelope. Implementation: start with a coarse 8-sample
+/// uniform partition, then bisect any interval whose midpoint curvature
+/// exceeds `curvature_threshold = 1 / tolerance.distance()` (chord
+/// deviation ~ k * Δs² / 8 ≤ tolerance for that bound). Caps total
+/// samples at 256 to keep fillet construction bounded.
 fn adaptive_rolling_ball_sampling(curve: &dyn Curve, tolerance: &Tolerance) -> Vec<f64> {
-    // Simple uniform sampling for now
-    // TODO: Implement curvature-based adaptive sampling
-    let num_samples = 20;
-    let mut params = Vec::with_capacity(num_samples);
-    for i in 0..=num_samples {
-        params.push(i as f64 / num_samples as f64);
+    const MIN_SAMPLES: usize = 8;
+    const MAX_SAMPLES: usize = 256;
+    let tol = tolerance.distance().max(1e-9);
+    // Curvature above this triggers refinement; chord-deviation bound
+    // becomes tight when k * (Δs)² ≈ 8 * tol.
+    let curvature_threshold = 1.0 / tol;
+
+    let mut params: Vec<f64> = (0..=MIN_SAMPLES)
+        .map(|i| i as f64 / MIN_SAMPLES as f64)
+        .collect();
+
+    // Iterative bisection passes; each pass inserts midpoints where
+    // curvature is high, until either all intervals are smooth enough
+    // or we hit MAX_SAMPLES.
+    for _pass in 0..6 {
+        if params.len() >= MAX_SAMPLES {
+            break;
+        }
+        let mut inserted = Vec::new();
+        for w in params.windows(2) {
+            let mid = 0.5 * (w[0] + w[1]);
+            // If we can't evaluate curvature at the midpoint (e.g.,
+            // straight segment yielding NumericalInstability), skip
+            // refinement for that interval — uniform spacing suffices.
+            if let Ok(k) = curve.curvature_at(mid) {
+                if k > curvature_threshold {
+                    inserted.push(mid);
+                }
+            }
+        }
+        if inserted.is_empty() {
+            break;
+        }
+        params.extend(inserted);
+        params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     }
+
     params
 }
 
@@ -1675,8 +1745,12 @@ fn validate_fillet_parameters(
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
-    // Check that radius is not too large for the edge length
-    let edge_length = edge.compute_arc_length(&model.curves, Tolerance::default())?;
+    // Check that radius is not too large for the edge length. Use the
+    // caller-supplied tolerance so arc-length integration matches the
+    // precision the fillet operation will run at downstream — running
+    // it at a different (default) tolerance can let a borderline-too-
+    // large radius slip past validation.
+    let edge_length = edge.compute_arc_length(&model.curves, *tolerance)?;
     if radius > edge_length * 0.5 {
         return Err(OperationError::InvalidRadius(radius));
     }

@@ -1386,9 +1386,38 @@ fn create_blend_loop(
     Ok(blend_loop)
 }
 
-/// Validate drafted solid
+/// Validate drafted solid via the kernel's parallel B-Rep validator.
+///
+/// Drafting modifies face surfaces and can leave non-manifold seams or
+/// flipped normals; running `Standard`-level validation surfaces those
+/// issues immediately rather than letting the malformed solid leak into
+/// downstream operations.
 fn validate_drafted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
-    // Would perform full validation
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "validate_drafted_solid: solid {} not found",
+            solid_id
+        )));
+    }
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        crate::math::Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::TopologyError(format!(
+            "drafted solid failed validation ({} error(s)): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 
