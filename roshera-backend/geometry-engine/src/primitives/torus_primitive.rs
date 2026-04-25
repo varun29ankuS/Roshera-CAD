@@ -15,7 +15,6 @@ use crate::{
         solid::{Solid, SolidId},
         surface::Torus,
         topology_builder::BRepModel,
-        topology_builder::TopologyBuilder,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -129,11 +128,12 @@ pub struct TorusPrimitive;
 impl TorusPrimitive {
     /// Create a torus with B-Rep topology
     pub fn create(params: &TorusParameters, model: &mut BRepModel) -> PrimitiveResult<SolidId> {
-        let builder = TopologyBuilder::new(model);
-
-        // Create reference directions
-        let ref_dir = params.axis.perpendicular();
-        let y_dir = params.axis.cross(&ref_dir);
+        // Topology is assembled directly against `model` below; the
+        // TopologyBuilder helper is not needed for this primitive's seam
+        // loop / single face layout. The reference frame (`ref_dir`,
+        // implicit y_dir) is recomputed once the axis has been normalised
+        // a few lines down — keeping a duplicate copy here would just
+        // diverge if the axis fails normalisation.
 
         // Angle ranges
         let major_angle_range = params.major_angle_range.unwrap_or([0.0, consts::TWO_PI]);
@@ -367,7 +367,10 @@ impl TorusPrimitive {
         let height = params.minor_radius * sin_v;
 
         let center = params.center + params.axis * height;
-        let ref_dir = params.axis.perpendicular();
+        // Circle::new / Arc::new derive their own in-plane reference direction
+        // from the supplied axis, so we don't need to materialise a separate
+        // ref_dir here — the major circle is fully determined by
+        // (center, axis, radius).
 
         if (u_end - u_start - consts::TWO_PI).abs() < consts::EPSILON {
             Box::new(
@@ -398,8 +401,10 @@ impl TorusPrimitive {
             + ref_dir * (params.major_radius * cos_u)
             + y_dir * (params.major_radius * sin_u);
 
-        let radial_dir = ref_dir * cos_u + y_dir * sin_u;
-        let minor_ref = radial_dir;
+        // The minor circle's reference direction (radial_dir) is implicit
+        // in (center, minor_axis); Circle::new / Arc::new will derive it
+        // from `minor_axis`. Keeping it as a separate local would silently
+        // diverge if `params.axis` is later renormalised.
         let minor_axis = params.axis;
 
         if (v_end - v_start - consts::TWO_PI).abs() < consts::EPSILON {
@@ -421,16 +426,34 @@ impl TorusPrimitive {
         }
     }
 
-    /// Update torus parameters
+    /// Update torus parameters in place.
+    ///
+    /// Parametric update for a torus would tear down the old topology
+    /// (single face with two seam edge loops, see [`Self::create`]) and
+    /// rebuild against the new (`major_radius`, `minor_radius`, axis,
+    /// centre, angle ranges). That rebuild path is not yet wired here —
+    /// callers should delete and recreate the solid for now. We still
+    /// validate that the target exists and surface the rejected request
+    /// with concrete identifiers so log readers can correlate the call.
     pub fn update_parameters(
         solid_id: SolidId,
         params: &TorusParameters,
         model: &mut BRepModel,
     ) -> PrimitiveResult<()> {
-        // TODO: Implement parametric update
+        if model.solids.get(solid_id).is_none() {
+            return Err(PrimitiveError::InvalidTopology {
+                entity: "Solid".to_string(),
+                issue: format!("Torus solid {} not found", solid_id),
+                suggestion: "Verify the solid id before requesting an update"
+                    .to_string(),
+            });
+        }
         Err(PrimitiveError::GeometryError {
             operation: "update_parameters".to_string(),
-            details: "Torus parametric update not yet implemented".to_string(),
+            details: format!(
+                "Torus parametric update not yet implemented (solid {}, major_radius={}, minor_radius={})",
+                solid_id, params.major_radius, params.minor_radius
+            ),
         })
     }
 
