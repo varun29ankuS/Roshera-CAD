@@ -46,6 +46,45 @@ impl Tolerance {
         self.angle
     }
 
+    /// Threshold for `|sin θ|` comparisons against `self.angle()`.
+    ///
+    /// For unit vectors `a, b`, `|a × b| = sin θ` where θ is the angle
+    /// between them. Use this for "are these vectors parallel/anti-parallel
+    /// or perpendicular to within tolerance" checks:
+    ///
+    /// ```ignore
+    /// // parallel: a × b ≈ 0
+    /// if cross.magnitude() < tol.parallel_threshold() { /* parallel */ }
+    /// // perpendicular: a · b ≈ 0
+    /// if dot.abs() < tol.parallel_threshold() { /* perpendicular */ }
+    /// ```
+    ///
+    /// Returns `sin(self.angle())`; for the small angles typical in CAD
+    /// (`≤ 1°`) this is numerically indistinguishable from `self.angle()`
+    /// itself, but the semantic is unambiguous.
+    #[inline]
+    pub fn parallel_threshold(&self) -> f64 {
+        self.angle.sin()
+    }
+
+    /// Threshold for `1 − cos θ` comparisons against `self.angle()`.
+    ///
+    /// For unit vectors `a, b`, `a · b = cos θ`. Use this when detecting
+    /// near-identical orientation (`a · b ≈ 1`):
+    ///
+    /// ```ignore
+    /// if (1.0 - dot).abs() < tol.aligned_threshold() { /* aligned */ }
+    /// ```
+    ///
+    /// Returns `1 - cos(self.angle())`. For small angles this is
+    /// `≈ θ²/2`, much smaller than `self.angle()` itself — comparing
+    /// `(1 - cos)` directly against `self.angle()` would be far too
+    /// permissive.
+    #[inline]
+    pub fn aligned_threshold(&self) -> f64 {
+        1.0 - self.angle.cos()
+    }
+
     /// Get squared distance tolerance (for optimization)
     #[inline]
     pub fn distance_squared(&self) -> f64 {
