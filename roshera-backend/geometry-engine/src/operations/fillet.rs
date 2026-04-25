@@ -286,7 +286,7 @@ fn create_constant_radius_fillet(
         compute_rolling_ball_positions(model, &edge, face1_id, face2_id, radius)?;
 
     // Create fillet surface (cylindrical or toroidal patch)
-    let fillet_surface = create_rolling_ball_surface(model, &rolling_ball_data)?;
+    let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
     let surface_id = model.surfaces.add(fillet_surface);
 
     // Create trimming curves on adjacent faces
@@ -327,7 +327,7 @@ fn create_variable_radius_fillet(
     )?;
 
     // Create variable radius fillet surface
-    let fillet_surface = create_rolling_ball_surface(model, &rolling_ball_data)?;
+    let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
     let surface_id = model.surfaces.add(fillet_surface);
 
     // Create trimming curves
@@ -386,9 +386,10 @@ fn compute_variable_rolling_ball_positions(
         let radius = start_radius + t * (end_radius - start_radius);
         data.radii.push(radius);
 
-        // Get point and tangent on edge
+        // Validate edge differentiability at this sample (tangent value
+        // is unused — we only fail if the edge is non-differentiable).
         let edge_point = edge.evaluate(t, &model.curves)?;
-        let edge_tangent = edge.tangent_at(t, &model.curves)?;
+        edge.tangent_at(t, &model.curves)?;
 
         // Get surface normals
         let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
@@ -622,9 +623,10 @@ fn compute_rolling_ball_positions(
         data.parameters.push(t);
         data.radii.push(radius);
 
-        // Get point and tangent on edge
+        // Validate edge differentiability at this sample (tangent value
+        // is unused — we only fail if the edge is non-differentiable).
         let edge_point = edge.evaluate(t, &model.curves)?;
-        let edge_tangent = edge.tangent_at(t, &model.curves)?;
+        edge.tangent_at(t, &model.curves)?;
 
         // Get surface normals at edge point (projected)
         let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
@@ -675,10 +677,7 @@ fn get_surface_normal_at_point(surface: &dyn Surface, point: &Point3) -> Operati
 }
 
 /// Create surface from rolling ball data
-fn create_rolling_ball_surface(
-    model: &mut BRepModel,
-    data: &RollingBallData,
-) -> OperationResult<Box<dyn Surface>> {
+fn create_rolling_ball_surface(data: &RollingBallData) -> OperationResult<Box<dyn Surface>> {
     // Analyze the rolling ball data to determine surface type
     let is_straight_edge = is_edge_straight(data);
     let is_constant_radius = is_radius_constant(data);
@@ -842,11 +841,14 @@ fn compute_fillet_trim_curves(
         .get(face2_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
 
-    let surface1 = model
+    // Validate both surfaces exist; the trim curves come straight from
+    // the rolling-ball data so the surface bodies themselves are not
+    // needed here.
+    model
         .surfaces
         .get(face1.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
-    let surface2 = model
+    model
         .surfaces
         .get(face2.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;

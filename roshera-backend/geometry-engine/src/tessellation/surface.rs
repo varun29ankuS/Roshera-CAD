@@ -1749,7 +1749,6 @@ fn tessellate_nurbs_adaptive(
 /// Quadtree structure for adaptive subdivision
 struct QuadTree {
     nodes: Vec<QuadNode>,
-    root: usize,
 }
 
 struct QuadNode {
@@ -1758,7 +1757,6 @@ struct QuadNode {
     v_min: f64,
     v_max: f64,
     children: Option<[usize; 4]>,
-    vertex_indices: Option<[u32; 4]>,
 }
 
 impl QuadTree {
@@ -1769,12 +1767,8 @@ impl QuadTree {
             v_min,
             v_max,
             children: None,
-            vertex_indices: None,
         };
-        Self {
-            nodes: vec![root],
-            root: 0,
-        }
+        Self { nodes: vec![root] }
     }
 
     fn subdivide(&mut self, node_idx: usize) -> [usize; 4] {
@@ -1807,7 +1801,6 @@ impl QuadTree {
             v_min,
             v_max,
             children: None,
-            vertex_indices: None,
         });
         idx
     }

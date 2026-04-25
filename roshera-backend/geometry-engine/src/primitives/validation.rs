@@ -45,8 +45,6 @@ pub struct ValidationContext {
     phase_times: DashMap<String, Duration>,
     /// Memory usage
     memory_usage: usize,
-    /// Parallel thread count
-    thread_count: usize,
 }
 
 impl Default for ValidationContext {
@@ -55,9 +53,6 @@ impl Default for ValidationContext {
             start_time: Instant::now(),
             phase_times: DashMap::new(),
             memory_usage: 0,
-            thread_count: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
         }
     }
 }
@@ -320,13 +315,10 @@ struct EdgeUsage {
     pub loops: Vec<LoopId>,
     /// Orientations in each use
     pub orientations: Vec<bool>,
-    /// Dihedral angle at edge
-    pub dihedral_angle: Option<f64>,
 }
 
 /// Multi-threaded validator
 pub struct ParallelValidator {
-    thread_pool: Option<rayon::ThreadPool>,
     progress: Arc<Mutex<ValidationProgress>>,
 }
 
@@ -336,21 +328,11 @@ struct ValidationProgress {
     pub current_phase: String,
     pub items_processed: usize,
     pub total_items: usize,
-    pub errors_found: usize,
-    pub warnings_found: usize,
 }
 
 impl ParallelValidator {
-    pub fn new(num_threads: Option<usize>) -> Self {
-        let pool = num_threads.and_then(|n| {
-            // Thread-pool construction can fail on invalid `n` (e.g. 0) or
-            // Rayon-internal errors. Fall back to the default (global) pool
-            // rather than panicking the validator at construction time.
-            rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
-        });
-
+    pub fn new() -> Self {
         Self {
-            thread_pool: pool,
             progress: Arc::new(Mutex::new(ValidationProgress::default())),
         }
     }
@@ -483,8 +465,6 @@ impl ParallelValidator {
 
         TopologyValidationResults {
             solid_results,
-            edge_usage,
-            orphaned_entities: self.find_orphaned_entities_parallel(model),
             gap_errors,
         }
     }
@@ -540,7 +520,6 @@ impl ParallelValidator {
                                     faces: vec![face_id],
                                     loops: vec![loop_id],
                                     orientations: vec![orientation],
-                                    dihedral_angle: None,
                                 });
                         }
                     }
@@ -549,11 +528,6 @@ impl ParallelValidator {
         });
 
         edge_usage
-    }
-
-    fn find_orphaned_entities_parallel(&self, _model: &BRepModel) -> Vec<EntityLocation> {
-        // Find orphaned entities in parallel
-        Vec::new()
     }
 
     fn combine_results(
@@ -806,24 +780,14 @@ impl ParallelValidator {
 #[derive(Default)]
 struct TopologyValidationResults {
     solid_results: Vec<(SolidId, ValidationResult)>,
-    edge_usage: DashMap<EdgeId, EdgeUsage>,
-    orphaned_entities: Vec<EntityLocation>,
     gap_errors: Vec<ValidationError>,
 }
 
 #[derive(Default)]
-struct GeometryValidationResults {
-    face_results: Vec<(FaceId, ValidationResult)>,
-    edge_results: Vec<(EdgeId, ValidationResult)>,
-    sharp_features: Vec<(EntityLocation, f64)>,
-}
+struct GeometryValidationResults;
 
 #[derive(Default)]
-struct DeepValidationResults {
-    tolerance_accumulation: DashMap<EntityLocation, f64>,
-    numerical_issues: Vec<(EntityLocation, String)>,
-    performance_hints: Vec<(String, String)>,
-}
+struct DeepValidationResults;
 
 /// Validate entire B-Rep model (enhanced entry point)
 pub fn validate_model_enhanced(
@@ -831,14 +795,13 @@ pub fn validate_model_enhanced(
     tolerance: Tolerance,
     level: ValidationLevel,
 ) -> ValidationResult {
-    let validator = ParallelValidator::new(None); // Use default thread count
+    let validator = ParallelValidator::new();
     validator.validate_model(model, tolerance, level)
 }
 
 /// Automatic repair functionality
 pub struct ModelRepairer {
     tolerance: Tolerance,
-    options: RepairOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -865,8 +828,8 @@ impl Default for RepairOptions {
 }
 
 impl ModelRepairer {
-    pub fn new(tolerance: Tolerance, options: RepairOptions) -> Self {
-        Self { tolerance, options }
+    pub fn new(tolerance: Tolerance) -> Self {
+        Self { tolerance }
     }
 
     /// Attempt automatic repair based on validation results
