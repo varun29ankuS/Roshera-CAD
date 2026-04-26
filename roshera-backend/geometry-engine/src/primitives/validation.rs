@@ -10,7 +10,7 @@
 //! - Assembly-constraint checking
 //! - Performance profiling and optimization hints
 
-use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{MathError, MathResult, Point3, Tolerance};
 use crate::primitives::{
     edge::EdgeId,
     face::{FaceId, FaceOrientation},
@@ -36,25 +36,16 @@ pub enum ValidationLevel {
     Deep,
 }
 
-/// Validation context for performance tracking
-#[derive(Debug)]
+/// Validation context for per-phase timing capture during validation runs.
+///
+/// Phase durations are populated by [`ValidationContext::record_phase`] from
+/// inside [`validate_model_enhanced`]; consumers may read `phase_times` to
+/// surface per-phase timings to operators. Held by reference inside
+/// [`ValidationResult::context`].
+#[derive(Debug, Default)]
 pub struct ValidationContext {
-    /// Start time
-    start_time: Instant,
-    /// Time spent in each phase
-    phase_times: DashMap<String, Duration>,
-    /// Memory usage
-    memory_usage: usize,
-}
-
-impl Default for ValidationContext {
-    fn default() -> Self {
-        Self {
-            start_time: Instant::now(),
-            phase_times: DashMap::new(),
-            memory_usage: 0,
-        }
-    }
+    /// Time spent in each phase, keyed by phase name.
+    pub phase_times: DashMap<String, Duration>,
 }
 
 impl ValidationContext {
@@ -195,12 +186,6 @@ pub enum ValidationWarning {
         id: u32,
         measure: f64,
     },
-    /// Small feature
-    SmallFeature {
-        entity_type: String,
-        id: u32,
-        size: f64,
-    },
     /// Sharp angle
     SharpAngle {
         location: EntityLocation,
@@ -223,8 +208,6 @@ pub enum ValidationWarning {
         location: EntityLocation,
         accumulated: f64,
     },
-    /// Performance hint
-    PerformanceHint { message: String, suggestion: String },
 }
 
 /// Enhanced model statistics
@@ -883,110 +866,6 @@ pub struct RepairResult {
     pub model_valid: bool,
 }
 
-/// Manufacturing validation
-pub fn validate_for_manufacturing(
-    model: &BRepModel,
-    constraints: &ManufacturingConstraints,
-    tolerance: Tolerance,
-) -> ValidationResult {
-    let mut validation = validate_model_enhanced(model, tolerance, ValidationLevel::Deep);
-
-    // Check manufacturing constraints
-    check_wall_thickness(model, constraints.min_wall_thickness, &mut validation);
-    check_feature_sizes(model, constraints.min_feature_size, &mut validation);
-    check_draft_angles(model, constraints.min_draft_angle, &mut validation);
-    check_tool_accessibility(model, &constraints.tool_constraints, &mut validation);
-
-    validation.manufacturing_valid = validation
-        .errors
-        .iter()
-        .filter(|e| matches!(e, ValidationError::ManufacturingError { .. }))
-        .count()
-        == 0;
-
-    validation
-}
-
-#[derive(Debug, Clone)]
-pub struct ManufacturingConstraints {
-    pub min_wall_thickness: f64,
-    pub min_feature_size: f64,
-    pub min_draft_angle: f64,
-    pub max_aspect_ratio: f64,
-    pub tool_constraints: ToolConstraints,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolConstraints {
-    pub min_tool_radius: f64,
-    pub max_tool_length: f64,
-    pub access_directions: Vec<Vector3>,
-}
-
-// Manufacturing validation helpers
-fn check_wall_thickness(
-    _model: &BRepModel,
-    _min_thickness: f64,
-    validation: &mut ValidationResult,
-) {
-    // Implementation would check minimum distances between faces
-    // For now, add a placeholder warning
-    validation
-        .warnings
-        .push(ValidationWarning::PerformanceHint {
-            message: "Wall thickness validation not yet implemented".to_string(),
-            suggestion: "Manual inspection recommended".to_string(),
-        });
-}
-
-fn check_feature_sizes(model: &BRepModel, min_size: f64, validation: &mut ValidationResult) {
-    // Check all features meet minimum size requirements
-    // EdgeStore doesn't have iter, so iterate by ID
-    for edge_id in 0..model.edges.len() as u32 {
-        if let Some(edge) = model.edges.get(edge_id) {
-            if let (Some(v1), Some(v2)) = (
-                model.vertices.get(edge.start_vertex),
-                model.vertices.get(edge.end_vertex),
-            ) {
-                let p1 = Vector3::new(v1.position[0], v1.position[1], v1.position[2]);
-                let p2 = Vector3::new(v2.position[0], v2.position[1], v2.position[2]);
-                let length = (p1 - p2).magnitude();
-                if length < min_size && length > 0.0 {
-                    validation.warnings.push(ValidationWarning::SmallFeature {
-                        entity_type: "Edge".to_string(),
-                        id: edge_id,
-                        size: length,
-                    });
-                }
-            }
-        }
-    }
-}
-
-fn check_draft_angles(_model: &BRepModel, _min_angle: f64, validation: &mut ValidationResult) {
-    // Check draft angles for moldability
-    validation
-        .warnings
-        .push(ValidationWarning::PerformanceHint {
-            message: "Draft angle validation not yet implemented".to_string(),
-            suggestion: "Check vertical faces manually".to_string(),
-        });
-}
-
-fn check_tool_accessibility(
-    _model: &BRepModel,
-    _constraints: &ToolConstraints,
-    validation: &mut ValidationResult,
-) {
-    // Check if all features are accessible by tools
-    validation
-        .warnings
-        .push(ValidationWarning::PerformanceHint {
-            message: "Tool accessibility validation not yet implemented".to_string(),
-            suggestion: "Verify tool paths manually".to_string(),
-        });
-}
-
 /// Check face orientation consistency in a shell
 pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -1123,53 +1002,6 @@ fn generate_signature(model: &BRepModel, validation: &ValidationResult) -> Vec<u
     signature
 }
 
-/// Performance analysis for validation
-pub fn analyze_validation_performance(result: &ValidationResult) -> PerformanceReport {
-    let total_time = result.context.start_time.elapsed();
-    let phase_breakdown: Vec<_> = result
-        .context
-        .phase_times
-        .iter()
-        .map(|entry| {
-            let phase = entry.key().clone();
-            let duration = entry.value();
-            (
-                phase,
-                duration.as_millis() as f64 / total_time.as_millis() as f64 * 100.0,
-            )
-        })
-        .collect();
-
-    PerformanceReport {
-        total_time,
-        phase_breakdown,
-        items_per_second: result.statistics.num_faces as f64 / total_time.as_secs_f64(),
-        memory_usage_mb: result.context.memory_usage as f64 / 1024.0 / 1024.0,
-        thread_efficiency: calculate_thread_efficiency(&result.context),
-        bottlenecks: identify_bottlenecks(&result.context),
-    }
-}
-
-#[derive(Debug)]
-pub struct PerformanceReport {
-    pub total_time: Duration,
-    pub phase_breakdown: Vec<(String, f64)>, // Phase name and percentage
-    pub items_per_second: f64,
-    pub memory_usage_mb: f64,
-    pub thread_efficiency: f64,
-    pub bottlenecks: Vec<String>,
-}
-
-fn calculate_thread_efficiency(_context: &ValidationContext) -> f64 {
-    // Calculate parallel efficiency
-    1.0 // Placeholder
-}
-
-fn identify_bottlenecks(_context: &ValidationContext) -> Vec<String> {
-    // Identify performance bottlenecks
-    Vec::new()
-}
-
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1243,17 +1075,6 @@ impl std::fmt::Display for ValidationWarning {
                     entity_type, id, measure
                 )
             }
-            ValidationWarning::SmallFeature {
-                entity_type,
-                id,
-                size,
-            } => {
-                write!(
-                    f,
-                    "{} {} is very small (size: {:.6})",
-                    entity_type, id, size
-                )
-            }
             ValidationWarning::SharpAngle { location, angle } => {
                 write!(f, "Sharp angle at {:?}: {:.1}°", location, angle)
             }
@@ -1288,12 +1109,6 @@ impl std::fmt::Display for ValidationWarning {
                     "Tolerance accumulation risk at {:?}: {:.6}",
                     location, accumulated
                 )
-            }
-            ValidationWarning::PerformanceHint {
-                message,
-                suggestion,
-            } => {
-                write!(f, "Performance: {} (suggestion: {})", message, suggestion)
             }
         }
     }
