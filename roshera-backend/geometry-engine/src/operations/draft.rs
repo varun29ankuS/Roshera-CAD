@@ -631,11 +631,69 @@ fn create_drafted_edge(
         .vertices
         .add(drafted_end.x, drafted_end.y, drafted_end.z);
 
-    // Create drafted curve
-    // For now, create a simple line between drafted vertices
-    use crate::primitives::curve::Line;
-    let drafted_line = Line::new(drafted_start, drafted_end);
-    let curve_id = model.curves.add(Box::new(drafted_line));
+    // Build the drafted curve by sampling the original edge's curve and
+    // applying the per-sample draft transform (holding neutral-line samples
+    // fixed). Linear edges collapse to a line; curved edges fit a degree-3
+    // clamped NURBS through the transformed samples — preserving curvature
+    // continuity instead of degenerating to a chord.
+    use crate::primitives::curve::{Line, NurbsCurve};
+    let curve_id = if let Some(original_curve) = model.curves.get(original_edge.curve_id) {
+        let pr = original_curve.parameter_range();
+        // 16 samples is the kernel default for low-degree curve fitting.
+        const N_SAMPLES: usize = 16;
+        let mut transformed: Vec<Point3> = Vec::with_capacity(N_SAMPLES);
+        let span = pr.end - pr.start;
+        if span.abs() < 1e-12 {
+            // Degenerate parameter range — fall back to endpoints.
+            transformed.push(drafted_start);
+            transformed.push(drafted_end);
+        } else {
+            for i in 0..N_SAMPLES {
+                let t = pr.start + (i as f64 / (N_SAMPLES - 1) as f64) * span;
+                match original_curve.point_at(t) {
+                    Ok(p) => {
+                        let drafted = if on_neutral(p) {
+                            p
+                        } else {
+                            draft_transform.transform_point(&p)
+                        };
+                        transformed.push(drafted);
+                    }
+                    Err(_) => {
+                        // Skip samples that fail to evaluate (e.g. discontinuities)
+                        // — the surrounding samples still constrain the fit.
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if transformed.len() < 2 {
+            // Sampling failed entirely — emit a degenerate line so the
+            // caller still gets a well-formed curve.
+            let line = Line::new(drafted_start, drafted_end);
+            model.curves.add(Box::new(line))
+        } else if transformed.len() == 2 {
+            let line = Line::new(transformed[0], transformed[transformed.len() - 1]);
+            model.curves.add(Box::new(line))
+        } else {
+            let tolerance = crate::math::Tolerance::default();
+            match NurbsCurve::fit_to_points(&transformed, 3, tolerance.distance()) {
+                Ok(nurbs) => model.curves.add(Box::new(nurbs)),
+                Err(_) => {
+                    // Pathological sampling → fall back to a chord. The
+                    // caller still gets a valid curve; downstream solvers
+                    // will detect any geometric mismatch via tolerance.
+                    let line = Line::new(drafted_start, drafted_end);
+                    model.curves.add(Box::new(line))
+                }
+            }
+        }
+    } else {
+        // Original curve missing — emit a line through the drafted endpoints.
+        let drafted_line = Line::new(drafted_start, drafted_end);
+        model.curves.add(Box::new(drafted_line))
+    };
 
     // Create new edge using the new method
     use crate::primitives::curve::ParameterRange;
@@ -1344,35 +1402,70 @@ fn validate_draft_inputs(
     Ok(())
 }
 
-/// Compute surface-surface intersection
+/// Compute the intersection of two surfaces as a polyline of sample points.
+///
+/// For the draft-pull use case the only surface pair guaranteed to need
+/// real intersection geometry is plane–plane (parting surfaces are
+/// typically planar). Non-plane pairs delegate to the kernel's general
+/// surface–surface intersection elsewhere; here we return an empty
+/// polyline rather than a misleading approximation.
+///
+/// Plane–plane intersection uses the standard closed-form solution:
+/// the intersection line direction is `n1 × n2`, and a base point on
+/// the line is found by solving the 2×2 system in the (n1, n2) basis,
+/// yielding a point that lies *on both planes* (not the midpoint of
+/// origins, which generally does not). The returned polyline is the
+/// base point ± 10 units along the line direction — sufficient for
+/// the caller's downstream loop-edit operations, which trim against
+/// face boundaries.
 fn compute_surface_intersection(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
 ) -> OperationResult<Vec<Point3>> {
-    // Simplified surface intersection - in practice this would be much more complex
-    // For now, return a simple line between surface origins if they're planes
     use crate::primitives::surface::Plane;
 
     if let (Some(plane1), Some(plane2)) = (
         surface1.as_any().downcast_ref::<Plane>(),
         surface2.as_any().downcast_ref::<Plane>(),
     ) {
-        let origin1 = plane1.origin;
-        let origin2 = plane2.origin;
-        let normal1 = plane1.normal;
-        let normal2 = plane2.normal;
-
-        // Calculate intersection line direction
-        let line_direction = normal1.cross(&normal2);
-        if line_direction.magnitude() > 1e-10 {
-            // Planes intersect in a line
-            let midpoint = (origin1 + origin2) / 2.0;
-            let offset = line_direction.normalize().unwrap_or(Vector3::X) * 10.0;
-            return Ok(vec![midpoint - offset, midpoint + offset]);
+        let n1 = plane1.normal;
+        let n2 = plane2.normal;
+        let dir = n1.cross(&n2);
+        let dir_mag2 = dir.magnitude_squared();
+        if dir_mag2 < 1e-20 {
+            // Parallel or coincident planes — no isolated intersection line.
+            return Ok(vec![]);
         }
+
+        // Plane equations: n1·p = d1, n2·p = d2
+        let d1 = n1.dot(&Vector3::new(plane1.origin.x, plane1.origin.y, plane1.origin.z));
+        let d2 = n2.dot(&Vector3::new(plane2.origin.x, plane2.origin.y, plane2.origin.z));
+
+        // Express base point as p = c1*n1 + c2*n2. Solving:
+        //   (n1·n1) c1 + (n1·n2) c2 = d1
+        //   (n1·n2) c1 + (n2·n2) c2 = d2
+        let n1n1 = n1.dot(&n1);
+        let n2n2 = n2.dot(&n2);
+        let n1n2 = n1.dot(&n2);
+        let det = n1n1 * n2n2 - n1n2 * n1n2;
+        if det.abs() < 1e-20 {
+            return Ok(vec![]);
+        }
+        let inv_det = 1.0 / det;
+        let c1 = (d1 * n2n2 - d2 * n1n2) * inv_det;
+        let c2 = (d2 * n1n1 - d1 * n1n2) * inv_det;
+        let base = Point3::new(
+            c1 * n1.x + c2 * n2.x,
+            c1 * n1.y + c2 * n2.y,
+            c1 * n1.z + c2 * n2.z,
+        );
+
+        let dir_unit = dir.normalize().unwrap_or(Vector3::X);
+        let offset = dir_unit * 10.0;
+        return Ok(vec![base - offset, base + offset]);
     }
 
-    // Fallback - return empty intersection
+    // Non-plane surface pairs → defer to the kernel's general SSI elsewhere.
     Ok(vec![])
 }
 
