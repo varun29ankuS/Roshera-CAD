@@ -1696,6 +1696,7 @@ fn deduplicate_points(points: &mut Vec<IntersectionPoint>, tolerance: &Tolerance
 }
 
 /// March along intersection curve from a starting point
+#[allow(clippy::expect_used)] // tangent magnitude verified > tolerance before normalize().expect()
 fn march_from_point(
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,

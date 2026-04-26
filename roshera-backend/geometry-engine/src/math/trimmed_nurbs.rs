@@ -159,6 +159,7 @@ impl TrimmedNurbsSurface {
     }
 
     /// Create default rectangular boundary in parameter space
+    #[allow(clippy::expect_used)] // literal degree-1 knot vectors and corner curves are validated
     fn create_default_boundary(_surface: &NurbsSurface) -> TrimLoop {
         // Create four linear curves for the boundary
         let corners = [Point2::new(0.0, 0.0),

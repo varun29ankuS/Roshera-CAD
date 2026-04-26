@@ -156,6 +156,7 @@ impl Rectangle2d {
     /// enforces `width > STRICT_TOLERANCE.distance()` and
     /// `height > STRICT_TOLERANCE.distance()`, so adjacent corners are never
     /// coincident and `LineSegment2d::new` cannot fail here.
+    #[allow(clippy::expect_used)] // rectangle width/height > tolerance: corners non-coincident
     pub fn edges(&self) -> [LineSegment2d; 4] {
         let corners = self.corners();
         const EDGE_INVARIANT: &str =

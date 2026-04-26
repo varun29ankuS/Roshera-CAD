@@ -5,7 +5,8 @@
 use super::{surface, TessellationParams, ThreeJsMesh, TriangleMesh};
 use crate::primitives::{face::Face, shell::Shell, solid::Solid, topology_builder::BRepModel};
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Parallel tessellation of a solid
 pub fn tessellate_solid_parallel(
@@ -96,6 +97,7 @@ impl ParallelTessellator {
     /// Panics if the rayon thread pool fails to build. This can occur if
     /// `num_threads` is invalid for the host (e.g. zero on some platforms)
     /// or if the underlying OS refuses to spawn the requested threads.
+    #[allow(clippy::expect_used)] // rayon thread pool failure is unrecoverable; surface loudly
     pub fn new(params: TessellationParams, num_threads: usize) -> Self {
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
@@ -139,9 +141,7 @@ impl ParallelTessellator {
                         let mut face_mesh = TriangleMesh::new();
                         surface::tessellate_face(face, model, &self.params, &mut face_mesh);
 
-                        let mut meshes_guard = meshes
-                            .lock()
-                            .expect("parallel tessellator meshes Mutex poisoned");
+                        let mut meshes_guard = meshes.lock();
                         meshes_guard.push(face_mesh.to_threejs());
                     }
                 }
@@ -150,9 +150,7 @@ impl ParallelTessellator {
 
         // Merge results
         let mut final_mesh = ThreeJsMesh::new();
-        let meshes_guard = meshes
-            .lock()
-            .expect("parallel tessellator meshes Mutex poisoned");
+        let meshes_guard = meshes.lock();
         for mesh in meshes_guard.iter() {
             final_mesh.merge(mesh);
         }
@@ -226,9 +224,7 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
 
             if is_unique {
                 let new_idx = next_index.fetch_add(1, Ordering::SeqCst);
-                let mut remap = vertex_remap
-                    .lock()
-                    .expect("parallel mesh optimizer vertex_remap Mutex poisoned");
+                let mut remap = vertex_remap.lock();
                 remap[i] = new_idx;
             }
         }
@@ -244,9 +240,7 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
     let remapped_indices: Vec<Vec<u32>> = indices_chunks
         .par_iter()
         .map(|chunk| {
-            let remap = vertex_remap
-                .lock()
-                .expect("parallel mesh optimizer vertex_remap Mutex poisoned");
+            let remap = vertex_remap.lock();
             chunk.iter().map(|&idx| remap[idx as usize]).collect()
         })
         .collect();

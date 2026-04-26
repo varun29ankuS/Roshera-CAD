@@ -1369,6 +1369,7 @@ impl Plane {
     }
 
     /// Fit a NURBS curve to intersection points
+    #[allow(clippy::expect_used)] // degree, knots, weights all derived from validated point set above
     fn fit_nurbs_to_points(
         &self,
         points: &[IntersectionPoint],
@@ -2117,6 +2118,7 @@ impl Cylinder {
     }
 
     /// Create ellipse approximation as NURBS curve
+    #[allow(clippy::expect_used)] // literal degree-2 quadratic ellipse NURBS inputs are validated
     fn create_ellipse_approximation(
         &self,
         center: Point3,
@@ -4439,6 +4441,7 @@ impl Surface for GeneralNurbsSurface {
         }
     }
 
+    #[allow(clippy::expect_used)] // reconstruction inputs come from already-validated self.nurbs
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
         // Transform all control points
         let mut transformed_points = Vec::with_capacity(self.nurbs.control_points.len());

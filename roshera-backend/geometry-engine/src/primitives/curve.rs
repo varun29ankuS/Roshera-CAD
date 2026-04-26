@@ -3912,6 +3912,7 @@ impl Curve for Ellipse {
         }
     }
 
+    #[allow(clippy::expect_used)] // fallback uses literal-validated linear NURBS inputs
     fn to_nurbs(&self) -> NurbsCurve {
         // Convert ellipse to NURBS representation
         // This is a complex conversion - for now return a simple approximation

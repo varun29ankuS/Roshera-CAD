@@ -355,6 +355,7 @@ impl TorusPrimitive {
     }
 
     /// Create arc along major circle
+    #[allow(clippy::expect_used)] // Circle/Arc inputs derived from validated TorusParameters
     fn create_major_circle_arc(
         params: &TorusParameters,
         v: f64,
@@ -386,6 +387,7 @@ impl TorusPrimitive {
     }
 
     /// Create arc along minor circle
+    #[allow(clippy::expect_used)] // Circle/Arc inputs derived from validated TorusParameters
     fn create_minor_circle_arc(
         params: &TorusParameters,
         u: f64,

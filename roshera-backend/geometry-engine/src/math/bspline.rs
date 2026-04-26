@@ -675,6 +675,7 @@ impl BSplineCurve {
 
     /// Quadratic B-spline (degree 2)
     #[inline(always)]
+    #[allow(clippy::expect_used)] // invariant-guarded: see body doc
     fn evaluate_quadratic(&self, u: f64) -> Point3 {
         // `evaluate_quadratic` is only dispatched when `self.degree == 2`,
         // which is well below `MAX_DEGREE`. All remaining failure modes in

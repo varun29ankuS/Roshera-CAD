@@ -242,6 +242,7 @@ impl Ray2d {
     }
 
     /// Find the closest point on the ray to a given point
+    #[allow(clippy::expect_used)] // closest_parameter clamps t into the ray's valid range
     pub fn closest_point(&self, point: &Point2d) -> Point2d {
         let t = self.closest_parameter(point);
         // `point_at(t)` only errors on invalid `t`; `closest_parameter`
@@ -349,6 +350,7 @@ impl LineSegment2d {
     }
 
     /// Find the closest point on the segment to a given point
+    #[allow(clippy::expect_used)] // closest_parameter clamps t into [0, 1] for segment
     pub fn closest_point(&self, point: &Point2d) -> Point2d {
         let t = self.closest_parameter(point);
         // `closest_parameter` clamps t into [0, 1], which is always a
@@ -379,6 +381,7 @@ impl LineSegment2d {
     }
 
     /// Check if two segments intersect
+    #[allow(clippy::expect_used)] // t1 explicitly clamped to [0, 1] before point_at
     pub fn intersect(&self, other: &LineSegment2d) -> Option<Point2d> {
         // Convert to parametric form and solve
         let d1 = self.direction();

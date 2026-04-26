@@ -22,8 +22,9 @@ use crate::primitives::{
 use serde::{Deserialize, Serialize};
 // HashMap removed - using DashMap globally
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
 
 /// Global operations registry with DashMap for high-performance concurrent access
 static OPERATIONS_REGISTRY: LazyLock<Arc<Mutex<OperationsRegistry>>> =
@@ -209,8 +210,7 @@ impl OperationsRegistry {
     ) -> OperationResult<AIOperationResult> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("AIOperationsRegistry global Mutex poisoned");
+            .lock();
 
         let command = registry.parse_operation_command(text)?;
         registry.execute_operation(command, model)
@@ -1416,8 +1416,7 @@ impl OperationsRegistry {
     pub fn get_operations_catalog() -> serde_json::Value {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("AIOperationsRegistry global Mutex poisoned");
+            .lock();
 
         // Build operations JSON manually without requiring Serialize trait
         let mut operations_json = serde_json::Map::new();
@@ -1495,8 +1494,7 @@ impl OperationsRegistry {
     ) -> Vec<OperationResult<AIOperationResult>> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("AIOperationsRegistry global Mutex poisoned");
+            .lock();
 
         commands
             .into_iter()
@@ -1511,8 +1509,7 @@ impl OperationsRegistry {
     pub fn get_performance_hints() -> Vec<String> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("AIOperationsRegistry global Mutex poisoned");
+            .lock();
 
         let mut hints = vec![];
 

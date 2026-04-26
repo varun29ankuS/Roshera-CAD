@@ -23,8 +23,9 @@ use crate::primitives::{
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
 
 /// Global registry of all available CAD primitives with AI metadata
 static PRIMITIVE_REGISTRY: LazyLock<Arc<Mutex<PrimitiveRegistry>>> =
@@ -485,8 +486,7 @@ impl PrimitiveRegistry {
     ) -> Result<AIResponse, PrimitiveError> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
 
         // Parse the natural language command
         let command = registry.parse_natural_language(description)?;
@@ -1362,8 +1362,7 @@ impl PrimitiveRegistry {
     pub fn get_full_catalog() -> serde_json::Value {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
 
         // Serialize DashMap entries into a JSON object
         let mut json_obj = serde_json::Map::new();
@@ -1380,8 +1379,7 @@ impl PrimitiveRegistry {
     pub fn list_all_primitives() -> Vec<String> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
         registry
             .primitives
             .iter()
@@ -1393,8 +1391,7 @@ impl PrimitiveRegistry {
     pub fn get_examples(primitive_type: &str) -> Vec<serde_json::Value> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
 
         registry
             .primitives
@@ -1572,7 +1569,7 @@ impl PrimitiveRegistry {
     /// AI learning endpoint - submit successful commands for optimization (production DashMap implementation)
     pub fn learn_from_success(command: &str, response: &AIResponse) {
         let registry = Self::global();
-        if let Ok(registry) = registry.try_lock() {
+        if let Some(registry) = registry.try_lock() {
             // Parse the command first
             let parsed_result = registry.parse_natural_language(command);
 
@@ -1628,8 +1625,7 @@ impl PrimitiveRegistry {
     pub fn get_optimization_hints() -> Vec<String> {
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
         let mut hints = Vec::new();
 
         // Analyze usage patterns using DashMap
@@ -1677,8 +1673,7 @@ impl PrimitiveRegistry {
         // Parse command with time tracking
         let registry = Self::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
         let parsed = registry.parse_natural_language(command)?;
 
         // Check if we're approaching timeout
@@ -1721,8 +1716,7 @@ pub mod gpu {
         // For now, fall back to CPU batch processing
         let registry = PrimitiveRegistry::global();
         let registry = registry
-            .lock()
-            .expect("PrimitiveRegistry global Mutex poisoned");
+            .lock();
         registry.execute_batch(commands.to_vec(), model)
     }
 }
