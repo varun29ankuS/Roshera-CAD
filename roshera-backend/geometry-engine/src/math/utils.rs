@@ -249,11 +249,9 @@ pub fn solve_quartic(a: f64, b: f64, c: f64, d: f64, e: f64, tolerance: Toleranc
     // If 2m - p > 0, take √(2m - p) and rewrite as (√(2m-p)·y - q/(2·√(2m-p)))².
     let two_m_minus_p = 2.0 * m - p;
     let s = two_m_minus_p.sqrt();
-    let t_sq = m * p + m * m / 4.0 + m * m * m / 2.0 - r; // placeholder; recomputed below
-    // Recompute t_sq correctly: perfect-square condition gives
-    //   t = q / (2s)  with sign chosen so that the pair below matches.
+    // Perfect-square condition gives t = q / (2s); sign is chosen so the
+    // factored quadratic pair below matches Ferrari's resolvent.
     let t = q / (2.0 * s);
-    let _ = t_sq;
 
     // (y² + p/2 + m/2)² = (s·y - t)² ⇒ y² + p/2 + m/2 = ±(s·y - t)
     // Case +: y² - s·y + (p/2 + m/2 + t) = 0
@@ -1110,26 +1108,49 @@ impl RemezApproximation {
     }
 }
 
-/// Fit polynomial through points
+/// Fit a polynomial of the requested `degree` through the first
+/// `degree + 1` nodes by solving the Vandermonde system V·c = y, where
+/// `V[i][j] = nodes[i]^j` and `y[i] = f(nodes[i])`. Returns monomial
+/// coefficients [c0, c1, …, c_degree] (so p(x) = c0 + c1·x + … + c_d·x^d).
+///
+/// Uses pivoted Gaussian elimination via `linear_solver::gaussian_elimination`
+/// for numerical stability; raises `SingularMatrix` if the nodes are not
+/// distinct enough to support the requested degree (i.e. Vandermonde is
+/// near-singular at the supplied tolerance).
 fn fit_polynomial<F>(nodes: &[f64], f: &F, degree: usize) -> MathResult<Vec<f64>>
 where
     F: Fn(f64) -> f64,
 {
-    // Simplified - would use proper linear algebra in production
-    let mut coeffs = vec![0.0; degree + 1];
+    use crate::math::linear_solver::gaussian_elimination;
 
-    // Use Lagrange interpolation as placeholder
-    for i in 0..=degree {
-        let mut basis = 1.0;
-        for j in 0..=degree {
-            if i != j {
-                basis *= (nodes[degree + 1] - nodes[j]) / (nodes[i] - nodes[j]);
-            }
-        }
-        coeffs[i] = f(nodes[i]) * basis;
+    let n = degree + 1;
+    if nodes.len() < n {
+        return Err(MathError::InvalidParameter(format!(
+            "fit_polynomial: need at least {} nodes for degree {}, got {}",
+            n,
+            degree,
+            nodes.len()
+        )));
     }
 
-    Ok(coeffs)
+    // Build Vandermonde matrix and RHS over the first n nodes.
+    let mut matrix: Vec<Vec<f64>> = Vec::with_capacity(n);
+    let mut rhs: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = nodes[i];
+        let mut row = Vec::with_capacity(n);
+        let mut p = 1.0;
+        for _ in 0..n {
+            row.push(p);
+            p *= x;
+        }
+        matrix.push(row);
+        rhs.push(f(x));
+    }
+
+    // STRICT_TOLERANCE inside gaussian_elimination guards against ill
+    // conditioning; fall through any error from there.
+    gaussian_elimination(matrix, rhs, Tolerance::default())
 }
 
 /// Estimate maximum error of polynomial approximation
