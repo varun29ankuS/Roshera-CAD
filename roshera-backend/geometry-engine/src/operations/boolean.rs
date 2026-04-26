@@ -2736,6 +2736,287 @@ fn clip_line_to_planar_face(
     }
 }
 
+/// Outcome of clipping a closed cutting circle to a planar face.
+///
+/// Unlike a straight line (one interval), a circle can yield no overlap,
+/// the full circle, or an angular sub-arc. Multi-arc results (a circle
+/// crossing the polygon boundary 4+ times) are not represented here —
+/// they fall through `NotApplicable` and the caller passes the original
+/// curve unchanged for downstream DCEL face splitting.
+#[derive(Debug)]
+enum CircleClipOutcome {
+    /// Cutting circle does not enter the face's trim region.
+    Misses,
+    /// Full circle lies inside the face — no trimming required.
+    Full,
+    /// Trimmed to an arc of `sweep_angle` radians starting at `start_angle`.
+    /// Angles measured in the circle's intrinsic frame
+    /// (`x_axis_3d = (P(0) - C)/r`, `y_axis_3d = (P(0.25) - C)/r`).
+    Arc {
+        start_angle: f64,
+        sweep_angle: f64,
+    },
+    /// Face is non-planar, has non-line boundaries, the circle is not
+    /// coplanar, or the intersection is too complex (4+ boundary crossings).
+    /// Caller should pass the cutting curve through unchanged.
+    NotApplicable,
+}
+
+/// Clip a closed cutting circle to a planar face's outer trim loop.
+///
+/// The cutting circles produced by perpendicular plane-cylinder and
+/// plane-sphere intersections lie *in* the planar face's plane by
+/// construction — the circle's normal equals the plane's normal and
+/// the circle's center lies on the plane. Under that hypothesis we can
+/// project the circle and the face's polygon edges into the plane's
+/// `(u_dir, v_dir)` frame and solve circle-segment quadratics in 2D.
+///
+/// Returns the angular sub-arc of `[0, 2π)` (in the circle's intrinsic
+/// frame) that lies inside the face's outer loop. See
+/// `CircleClipOutcome` for the variants.
+///
+/// References:
+/// - Patrikalakis & Maekawa (2002), §11 "Boolean operations on B-Rep solids"
+/// - Hoffmann (1989), Geometric and Solid Modeling, Ch. 8
+fn clip_circle_to_planar_face(
+    circle: &crate::primitives::curve::Circle,
+    face_id: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<CircleClipOutcome> {
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::Plane;
+
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_id".to_string(),
+            expected: "valid face ID".to_string(),
+            received: format!("{:?}", face_id),
+        })?;
+
+    let surface =
+        model
+            .surfaces
+            .get(face.surface_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "surface_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{:?}", face.surface_id),
+            })?;
+
+    if surface.surface_type() != SurfaceType::Plane {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+    let plane = match surface.as_any().downcast_ref::<Plane>() {
+        Some(p) => p,
+        None => return Ok(CircleClipOutcome::NotApplicable),
+    };
+
+    // Coplanarity check: the circle's center must lie on the plane and
+    // the circle's normal must align (parallel/antiparallel) with the
+    // plane's normal. If not, the 2D-projection trick is not exact and
+    // we fall through to the unclipped pass-through path.
+    let center3 = circle.center();
+    let center_distance_to_plane = (center3 - plane.origin).dot(&plane.normal);
+    if center_distance_to_plane.abs() > tolerance.distance() {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+    let normal_alignment = circle.normal().dot(&plane.normal).abs();
+    if (1.0 - normal_alignment) > 1e-9 {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+
+    let radius = circle.radius();
+    if radius <= tolerance.distance() {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+
+    let boundary_edges = get_face_boundary_edges(model, face_id)?;
+    if boundary_edges.is_empty() {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+
+    // Recover circle's intrinsic frame `(x_axis_3d, y_axis_3d)` via curve
+    // sampling. Circle::evaluate(t) maps t ∈ [0, 1] to angle = 2π·t in
+    // the (x_axis, y_axis) frame, so:
+    //   x_axis_3d = (P(0)    - C) / r   (angle = 0)
+    //   y_axis_3d = (P(0.25) - C) / r   (angle = π/2)
+    // Sampling avoids exposing the wrapped Arc's private x_axis field.
+    let p_at_zero = circle
+        .evaluate(0.0)
+        .map_err(|e| OperationError::NumericalError(format!("{:?}", e)))?
+        .position;
+    let p_at_quarter = circle
+        .evaluate(0.25)
+        .map_err(|e| OperationError::NumericalError(format!("{:?}", e)))?
+        .position;
+    let inv_r = 1.0 / radius;
+    let x_axis_3d = (p_at_zero - center3) * inv_r;
+    let y_axis_3d = (p_at_quarter - center3) * inv_r;
+
+    let origin = plane.origin;
+    let u_dir = plane.u_dir;
+    let v_dir = plane.v_dir;
+    let project = |p: Point3| -> (f64, f64) {
+        let d = p - origin;
+        (d.dot(&u_dir), d.dot(&v_dir))
+    };
+
+    let (cu, cv) = project(center3);
+
+    let mut poly_uv: Vec<(f64, f64)> = Vec::with_capacity(boundary_edges.len());
+    let mut hits_theta: Vec<f64> = Vec::new();
+
+    let r2 = radius * radius;
+    let edge_param_slack = 1e-9_f64;
+
+    for &edge_id in &boundary_edges {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "edge_id".to_string(),
+                expected: "valid edge ID".to_string(),
+                received: format!("{:?}", edge_id),
+            })?;
+        let curve_obj =
+            model
+                .curves
+                .get(edge.curve_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "curve_id".to_string(),
+                    expected: "valid curve ID".to_string(),
+                    received: format!("{:?}", edge.curve_id),
+                })?;
+
+        // Require straight-line boundary edges. CAD planar faces in the
+        // Tier-1 box-cylinder/box-sphere scenario are line-bounded by
+        // construction; non-line edges would invalidate the analytical
+        // quadratic and we fall through.
+        let edge_line = match curve_obj.as_any().downcast_ref::<Line>() {
+            Some(l) => l,
+            None => return Ok(CircleClipOutcome::NotApplicable),
+        };
+
+        let (eu0, ev0) = project(edge_line.start);
+        let (eu1, ev1) = project(edge_line.end);
+        poly_uv.push((eu0, ev0));
+
+        // Solve `|(E0 + s·dE) - C|² = r²` for `s ∈ [0, 1]` in the plane's
+        // 2D frame. With `dE = (edu, edv)`, `q = (eu0-cu, ev0-cv)`:
+        //   |dE|² s² + 2·(q · dE) s + (|q|² - r²) = 0
+        let edu = eu1 - eu0;
+        let edv = ev1 - ev0;
+        let qu = eu0 - cu;
+        let qv = ev0 - cv;
+        let aa = edu * edu + edv * edv;
+        if aa < 1e-24 {
+            // Degenerate edge: skip; adjacent edges will pick up the
+            // shared vertex if relevant.
+            continue;
+        }
+        let bb = 2.0 * (qu * edu + qv * edv);
+        let cc = qu * qu + qv * qv - r2;
+        let disc = bb * bb - 4.0 * aa * cc;
+        if disc < 0.0 {
+            continue;
+        }
+        let sqrt_disc = disc.sqrt();
+        let two_aa = 2.0 * aa;
+        // Tangent-root detection: when disc is below tolerance, emit a
+        // single hit `s = -b / (2a)` to avoid duplicate angular
+        // crossings that would corrupt the parity of the inside test.
+        let tangent = sqrt_disc < tolerance.distance();
+        let roots: &[f64] = if tangent { &[0.0] } else { &[1.0, -1.0] };
+        for &sign in roots {
+            let s = if tangent {
+                -bb / two_aa
+            } else {
+                (-bb + sign * sqrt_disc) / two_aa
+            };
+            if !(s >= -edge_param_slack && s <= 1.0 + edge_param_slack) {
+                continue;
+            }
+            let s_clamped = s.clamp(0.0, 1.0);
+            // Recover the 3D hit point and compute its angle in the
+            // circle's intrinsic frame.
+            let hu = eu0 + s_clamped * edu;
+            let hv = ev0 + s_clamped * edv;
+            let hit_3d = origin + u_dir * hu + v_dir * hv;
+            let local = hit_3d - center3;
+            let cos_theta = local.dot(&x_axis_3d);
+            let sin_theta = local.dot(&y_axis_3d);
+            let mut theta = sin_theta.atan2(cos_theta);
+            if theta < 0.0 {
+                theta += std::f64::consts::TAU;
+            }
+            hits_theta.push(theta);
+        }
+    }
+
+    // Merge hits within an arc-length tolerance ε = tol / r (radians).
+    // Without this, a circle crossing exactly through a polygon vertex
+    // produces two hits within numerical noise, which would corrupt the
+    // inside/outside parity test.
+    let merge_eps = (tolerance.distance() / radius).max(1e-12);
+    hits_theta.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    hits_theta.dedup_by(|a, b| (*a - *b).abs() < merge_eps);
+
+    let center_inside = point_in_polygon_2d(cu, cv, &poly_uv);
+
+    match hits_theta.len() {
+        0 => {
+            // Circle lies entirely on one side of every boundary edge.
+            // Use the center to disambiguate (entirely inside vs. outside).
+            Ok(if center_inside {
+                CircleClipOutcome::Full
+            } else {
+                CircleClipOutcome::Misses
+            })
+        }
+        1 => {
+            // Tangent grazing: keep the full circle when the center is
+            // interior; otherwise the circle externally touches the
+            // boundary at a single point and contributes nothing.
+            Ok(if center_inside {
+                CircleClipOutcome::Full
+            } else {
+                CircleClipOutcome::Misses
+            })
+        }
+        2 => {
+            let t1 = hits_theta[0];
+            let t2 = hits_theta[1];
+            // Test the midpoint of the (t1 → t2) sub-arc. If it lies
+            // inside the polygon, that arc is the keep interval;
+            // otherwise the wrap-around (t2 → 2π → t1) arc is.
+            let mid = 0.5 * (t1 + t2);
+            let mid_local = x_axis_3d * (radius * mid.cos()) + y_axis_3d * (radius * mid.sin());
+            let mid_3d = center3 + mid_local;
+            let (mu, mv) = project(mid_3d);
+            let mid_inside = point_in_polygon_2d(mu, mv, &poly_uv);
+            let (start, sweep) = if mid_inside {
+                (t1, t2 - t1)
+            } else {
+                (t2, std::f64::consts::TAU - (t2 - t1))
+            };
+            Ok(CircleClipOutcome::Arc {
+                start_angle: start,
+                sweep_angle: sweep,
+            })
+        }
+        _ => {
+            // 4+ crossings — circle weaves through a non-convex face or
+            // grazes multiple shared vertices. The single-arc result
+            // shape can't represent multi-arc retention; downstream
+            // DCEL-based splitting handles this exactly.
+            Ok(CircleClipOutcome::NotApplicable)
+        }
+    }
+}
+
 /// 2D ray-casting point-in-polygon. The polygon is closed implicitly by
 /// connecting the last vertex back to the first.
 fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
@@ -2770,11 +3051,21 @@ fn clip_surface_intersection_curve_to_faces(
     model: &BRepModel,
     tolerance: &Tolerance,
 ) -> OperationResult<Option<SurfaceIntersectionCurve>> {
-    use crate::primitives::curve::Line;
+    use crate::primitives::curve::{Circle, Line};
+
+    // Circle cutting curves arise from perpendicular plane-cylinder and
+    // plane-sphere intersections. They lie in one of the two faces'
+    // planes by construction, so we trim them analytically before
+    // handing them to the DCEL face-splitting code.
+    if let Some(circle_ref) = curve.curve.as_any().downcast_ref::<Circle>() {
+        let circle = circle_ref.clone();
+        return apply_circle_clip_to_faces(curve, &circle, face_a, face_b, model, tolerance);
+    }
 
     // Clipping only applies to straight cutting lines (the plane-plane
-    // pathway produces these). NURBS/arc cutting curves are handled by
-    // the fallback 1e6 extent cap.
+    // pathway produces these). Ellipse / NURBS / marching cutting curves
+    // pass through unchanged; downstream DCEL-based splitting handles
+    // them via the existing arrangement code.
     let line = match curve.curve.as_any().downcast_ref::<Line>() {
         Some(l) => l.clone(),
         None => return Ok(Some(curve)),
@@ -2839,6 +3130,130 @@ fn clip_surface_intersection_curve_to_faces(
         curve: Box::new(trimmed_line),
         on_surface_a,
         on_surface_b,
+    }))
+}
+
+/// Combine clip outcomes from both faces and rebuild a trimmed
+/// `SurfaceIntersectionCurve` for a circular cutting curve.
+///
+/// In Tier-1 box-cylinder and box-sphere booleans exactly one of the
+/// two faces is planar (the other is the cylinder/sphere) so one side
+/// always returns `NotApplicable` and we use the other side's clip.
+/// The both-applicable case (which would require true angular interval
+/// intersection on the unit circle) is rare enough — and conservative
+/// pass-through is safe — that we punt to `NotApplicable` there.
+fn apply_circle_clip_to_faces(
+    curve: SurfaceIntersectionCurve,
+    circle: &crate::primitives::curve::Circle,
+    face_a: FaceId,
+    face_b: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Arc;
+
+    let clip_a = clip_circle_to_planar_face(circle, face_a, model, tolerance)?;
+    let clip_b = clip_circle_to_planar_face(circle, face_b, model, tolerance)?;
+
+    // Reduce the (clip_a, clip_b) pair to a single resulting outcome
+    // for the cutting curve.
+    let combined = match (&clip_a, &clip_b) {
+        (CircleClipOutcome::Misses, _) | (_, CircleClipOutcome::Misses) => {
+            return Ok(None);
+        }
+        (CircleClipOutcome::NotApplicable, CircleClipOutcome::NotApplicable) => {
+            // Neither face is a planar trimmer — pass through unchanged.
+            return Ok(Some(curve));
+        }
+        (CircleClipOutcome::Full, CircleClipOutcome::Full)
+        | (CircleClipOutcome::Full, CircleClipOutcome::NotApplicable)
+        | (CircleClipOutcome::NotApplicable, CircleClipOutcome::Full) => {
+            // Full circle is preserved.
+            return Ok(Some(curve));
+        }
+        (CircleClipOutcome::Arc { .. }, CircleClipOutcome::NotApplicable)
+        | (CircleClipOutcome::Arc { .. }, CircleClipOutcome::Full) => &clip_a,
+        (CircleClipOutcome::NotApplicable, CircleClipOutcome::Arc { .. })
+        | (CircleClipOutcome::Full, CircleClipOutcome::Arc { .. }) => &clip_b,
+        (CircleClipOutcome::Arc { .. }, CircleClipOutcome::Arc { .. }) => {
+            // Both faces planar and both produce arcs — exact angular
+            // interval intersection on the unit circle is the only
+            // correct answer. Pass through and let downstream face
+            // splitting handle it.
+            return Ok(Some(curve));
+        }
+    };
+
+    let (start_angle, sweep_angle) = match combined {
+        CircleClipOutcome::Arc {
+            start_angle,
+            sweep_angle,
+        } => (*start_angle, *sweep_angle),
+        _ => unreachable!("reduction above narrows to Arc"),
+    };
+
+    if sweep_angle.abs() <= (tolerance.distance() / circle.radius()).max(1e-12) {
+        return Ok(None);
+    }
+
+    // Construct the trimmed cutting curve as an `Arc`. Arc's
+    // `evaluate(t')` for t' ∈ [0,1] yields position at angle
+    // `start_angle + sweep_angle·t'` in the same intrinsic frame as
+    // the original Circle (since Arc::new derives the canonical
+    // x_axis from the normal direction the same way Circle::new does).
+    let trimmed_arc =
+        Arc::new(circle.center(), circle.normal(), circle.radius(), start_angle, sweep_angle)
+            .map_err(|e| OperationError::NumericalError(format!("{:?}", e)))?;
+
+    // Remap parametric curves: the original on_surface_{a,b} accept the
+    // full-circle parameter `t ∈ [0,1]` mapping to angle `2π·t`. The
+    // trimmed arc's parameter `t' ∈ [0,1]` maps to angle
+    // `start_angle + sweep_angle·t'`, so the corresponding original t
+    // is `((start + sweep·t') mod 2π) / 2π`.
+    let two_pi = std::f64::consts::TAU;
+    let SurfaceIntersectionCurve {
+        curve: _orig_curve,
+        on_surface_a,
+        on_surface_b,
+    } = curve;
+    let ParametricCurve {
+        u_of_t: u_a,
+        v_of_t: v_a,
+        t_range: _,
+    } = on_surface_a;
+    let ParametricCurve {
+        u_of_t: u_b,
+        v_of_t: v_b,
+        t_range: _,
+    } = on_surface_b;
+
+    let new_on_a = ParametricCurve {
+        u_of_t: Box::new(move |t_prime: f64| {
+            let t_orig = (start_angle + sweep_angle * t_prime).rem_euclid(two_pi) / two_pi;
+            u_a(t_orig)
+        }),
+        v_of_t: Box::new(move |t_prime: f64| {
+            let t_orig = (start_angle + sweep_angle * t_prime).rem_euclid(two_pi) / two_pi;
+            v_a(t_orig)
+        }),
+        t_range: (0.0, 1.0),
+    };
+    let new_on_b = ParametricCurve {
+        u_of_t: Box::new(move |t_prime: f64| {
+            let t_orig = (start_angle + sweep_angle * t_prime).rem_euclid(two_pi) / two_pi;
+            u_b(t_orig)
+        }),
+        v_of_t: Box::new(move |t_prime: f64| {
+            let t_orig = (start_angle + sweep_angle * t_prime).rem_euclid(two_pi) / two_pi;
+            v_b(t_orig)
+        }),
+        t_range: (0.0, 1.0),
+    };
+
+    Ok(Some(SurfaceIntersectionCurve {
+        curve: Box::new(trimmed_arc),
+        on_surface_a: new_on_a,
+        on_surface_b: new_on_b,
     }))
 }
 
@@ -4776,6 +5191,115 @@ mod tests {
         }
         // Any other `Err(..)` is an accepted Tier-1 outcome — numerical
         // robustness ceiling is tracked by the deferred invariants above.
+    }
+
+    // -----------------------------------------------------------------
+    // Circle / planar-face clipping unit tests.
+    // -----------------------------------------------------------------
+
+    /// Pick the face of `solid` whose surface plane normal matches
+    /// `target_normal` exactly (signed). Used to grab the +Z (top) face
+    /// of an axis-aligned box, which is rectangular and line-bounded.
+    fn pick_face_with_normal(
+        model: &BRepModel,
+        solid_id: SolidId,
+        target_normal: Vector3,
+    ) -> FaceId {
+        let faces = get_solid_faces(model, solid_id).expect("box has faces");
+        for fid in faces {
+            let face = model.faces.get(fid).expect("valid face");
+            let surf = model.surfaces.get(face.surface_id).expect("valid surface");
+            if surf.surface_type() == SurfaceType::Plane {
+                if let Some(plane) = surf.as_any().downcast_ref::<Plane>() {
+                    let dot = plane.normal.dot(&target_normal);
+                    if (dot - 1.0).abs() < 1e-9 {
+                        return fid;
+                    }
+                }
+            }
+        }
+        panic!("no face with normal {target_normal:?} found on solid");
+    }
+
+    #[test]
+    fn clip_circle_inside_planar_face_returns_full() {
+        // Box of side 10, centered at origin → top face is the
+        // 10×10 square at z = 5.
+        let mut model = BRepModel::new();
+        let solid = expect_solid(
+            TopologyBuilder::new(&mut model)
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("valid dimensions"),
+        );
+        let top_face = pick_face_with_normal(&model, solid, Vector3::Z);
+
+        // Circle of radius 2 at the centroid of the top face — entirely
+        // inside the 10×10 polygon.
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, 2.0).unwrap();
+
+        let outcome =
+            clip_circle_to_planar_face(&circle, top_face, &model, &Tolerance::default()).unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::Full),
+            "circle inside face should be Full, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn clip_circle_outside_planar_face_misses() {
+        let mut model = BRepModel::new();
+        let solid = expect_solid(
+            TopologyBuilder::new(&mut model)
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("valid dimensions"),
+        );
+        let top_face = pick_face_with_normal(&model, solid, Vector3::Z);
+
+        // Circle far outside the 10×10 polygon, still in the same plane.
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(50.0, 50.0, 5.0), Vector3::Z, 1.0).unwrap();
+
+        let outcome =
+            clip_circle_to_planar_face(&circle, top_face, &model, &Tolerance::default()).unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::Misses),
+            "circle outside face should be Misses, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn clip_circle_crossing_two_edges_returns_arc() {
+        let mut model = BRepModel::new();
+        let solid = expect_solid(
+            TopologyBuilder::new(&mut model)
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("valid dimensions"),
+        );
+        let top_face = pick_face_with_normal(&model, solid, Vector3::Z);
+
+        // Circle centered on the +X face mid-edge, radius reaching back
+        // into the polygon. Box face spans (-5..5, -5..5) at z=5.
+        // Center at (5, 0, 5), radius 3 → the circle protrudes outside
+        // the polygon and enters across the +X edge twice.
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(5.0, 0.0, 5.0), Vector3::Z, 3.0).unwrap();
+
+        let outcome =
+            clip_circle_to_planar_face(&circle, top_face, &model, &Tolerance::default()).unwrap();
+        match outcome {
+            CircleClipOutcome::Arc { sweep_angle, .. } => {
+                // The interior arc is the half-circle on the inside
+                // (negative-x) hemisphere of the cutting circle. Sweep
+                // should be near π.
+                let pi = std::f64::consts::PI;
+                assert!(
+                    (sweep_angle - pi).abs() < 1e-3,
+                    "expected sweep ≈ π, got {sweep_angle}"
+                );
+            }
+            other => panic!("expected Arc, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------
