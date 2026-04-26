@@ -770,7 +770,7 @@ impl LoopStore {
         for &edge_id in &loop_.edges {
             self.edge_to_loops
                 .entry(edge_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(loop_.id);
         }
 

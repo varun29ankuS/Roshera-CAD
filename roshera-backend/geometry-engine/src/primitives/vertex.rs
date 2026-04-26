@@ -487,7 +487,7 @@ impl VertexStore {
                 );
                 self.spatial_hash
                     .entry(key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(i as VertexId);
             }
         }

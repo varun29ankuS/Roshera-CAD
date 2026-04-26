@@ -1905,7 +1905,7 @@ fn quad_tree_to_mesh(
     let mut vertex_map = HashMap::new();
 
     // Process all leaf nodes
-    for (_idx, node) in quad_tree.nodes.iter().enumerate() {
+    for node in quad_tree.nodes.iter() {
         if node.children.is_none() {
             // This is a leaf node - tessellate it
             let vertices = [

@@ -238,7 +238,7 @@ impl Clone for BSplineSurface {
             control_points: self.control_points.clone(),
             knots_u: self.knots_u.clone(),
             knots_v: self.knots_v.clone(),
-            domain: self.domain.clone(),
+            domain: self.domain,
         }
     }
 }

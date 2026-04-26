@@ -371,7 +371,7 @@ fn create_complex_unified_extrusion(
                 let to_vertex = pos - face_centroid;
                 let radial = to_vertex - direction * to_vertex.dot(&direction);
                 let radial_dir = radial.normalize().unwrap_or(Vector3::X);
-                pos = pos + radial_dir * current_draft_offset;
+                pos += radial_dir * current_draft_offset;
             }
 
             let transformed_pos = transform.transform_point(&pos);
@@ -452,13 +452,11 @@ fn create_extruded_edge_face(
     let start_vertex = model
         .vertices
         .get(edge.start_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
-        .clone();
+        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
     let end_vertex = model
         .vertices
         .get(edge.end_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?
-        .clone();
+        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
 
     // Create translated vertices
     let start_pos_top = Point3::from(start_vertex.position) + direction * distance;
@@ -675,8 +673,8 @@ fn create_ruled_surface(
     })?;
 
     // Create a plane from three points (bottom_start, bottom_end, top_start)
-    let v1 = Vector3::from(bottom_end - bottom_start);
-    let v2 = Vector3::from(top_start - bottom_start);
+    let v1 = bottom_end - bottom_start;
+    let v2 = top_start - bottom_start;
     let normal = v1.cross(&v2).normalize().map_err(|e| {
         OperationError::NumericalError(format!("Normal calculation failed: {:?}", e))
     })?;
@@ -814,8 +812,8 @@ fn create_planar_surface_from_edges(
         let mut is_collinear = false;
 
         if plane_points.len() >= 2 {
-            let v1 = Vector3::from(plane_points[1] - plane_points[0]);
-            let v2 = Vector3::from(point - plane_points[0]);
+            let v1 = plane_points[1] - plane_points[0];
+            let v2 = point - plane_points[0];
             if v1.cross(&v2).magnitude() < 1e-10 {
                 is_collinear = true;
             }
@@ -834,8 +832,8 @@ fn create_planar_surface_from_edges(
 
     // Create plane from three points
     let origin = plane_points[0];
-    let v1 = Vector3::from(plane_points[1] - plane_points[0]);
-    let v2 = Vector3::from(plane_points[2] - plane_points[0]);
+    let v1 = plane_points[1] - plane_points[0];
+    let v2 = plane_points[2] - plane_points[0];
     let normal = v1.cross(&v2).normalize().map_err(|e| {
         OperationError::NumericalError(format!("Normal calculation failed: {:?}", e))
     })?;
@@ -1085,8 +1083,8 @@ fn create_planar_surface_from_vertices(
 
         if points.len() >= 3 {
             // Check if these three points are non-collinear
-            let v1 = Vector3::from(points[1] - points[0]);
-            let v2 = Vector3::from(points[2] - points[0]);
+            let v1 = points[1] - points[0];
+            let v2 = points[2] - points[0];
 
             debug!(?v1, ?v2, "checking collinearity");
 
@@ -1112,8 +1110,8 @@ fn create_planar_surface_from_vertices(
 
     // Create plane from three points
     let origin = points[0];
-    let v1 = Vector3::from(points[1] - points[0]);
-    let v2 = Vector3::from(points[2] - points[0]);
+    let v1 = points[1] - points[0];
+    let v2 = points[2] - points[0];
 
     // Calculate cross product and check if it's non-zero
     let cross = v1.cross(&v2);
@@ -1125,8 +1123,8 @@ fn create_planar_surface_from_vertices(
     if cross.magnitude() < 1e-10 {
         // Try diagonal vectors for quads
         if points.len() >= 4 {
-            let v3 = Vector3::from(points[3] - points[1]);
-            let v4 = Vector3::from(points[2] - points[0]);
+            let v3 = points[3] - points[1];
+            let v4 = points[2] - points[0];
             let cross_diag = v3.cross(&v4);
 
             debug!(?v3, ?v4, "trying diagonal vectors");
@@ -1154,7 +1152,7 @@ fn create_planar_surface_from_vertices(
                 .get(vertices[i])
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
             let p = Point3::from(vertex.position);
-            let v3 = Vector3::from(p - points[0]);
+            let v3 = p - points[0];
             let cross2 = v1.cross(&v3);
             if cross2.magnitude() > 1e-10 {
                 let normal = cross2.normalize().map_err(|e| {

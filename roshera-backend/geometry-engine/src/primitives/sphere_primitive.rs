@@ -86,14 +86,14 @@ impl SphereParameters {
         v_segments: u32,
     ) -> Result<Self, PrimitiveError> {
         const MAX_SEGMENTS: u32 = 4096;
-        if u_segments < 4 || u_segments > MAX_SEGMENTS {
+        if !(4..=MAX_SEGMENTS).contains(&u_segments) {
             return Err(PrimitiveError::InvalidParameters {
                 parameter: "u_segments".to_string(),
                 value: u_segments.to_string(),
                 constraint: format!("must be between 4 and {MAX_SEGMENTS}"),
             });
         }
-        if v_segments < 3 || v_segments > MAX_SEGMENTS {
+        if !(3..=MAX_SEGMENTS).contains(&v_segments) {
             return Err(PrimitiveError::InvalidParameters {
                 parameter: "v_segments".to_string(),
                 value: v_segments.to_string(),
@@ -233,7 +233,7 @@ impl Primitive for SpherePrimitive {
         let solid = model
             .solids
             .get(solid_id)
-            .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
 
         let shell =
             model
@@ -280,7 +280,7 @@ impl Primitive for SpherePrimitive {
         let solid = model
             .solids
             .get(solid_id)
-            .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
         entities_checked += 1;
 
         // Get topology counts

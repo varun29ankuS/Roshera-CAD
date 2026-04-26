@@ -1041,9 +1041,7 @@ impl BSplineCurve {
                 }
 
                 ders[k][r] = d;
-                let temp = s1;
-                s1 = s2;
-                s2 = temp;
+                std::mem::swap(&mut s1, &mut s2);
             }
         }
 

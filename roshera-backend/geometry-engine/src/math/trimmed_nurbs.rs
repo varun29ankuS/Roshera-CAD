@@ -161,12 +161,10 @@ impl TrimmedNurbsSurface {
     /// Create default rectangular boundary in parameter space
     fn create_default_boundary(_surface: &NurbsSurface) -> TrimLoop {
         // Create four linear curves for the boundary
-        let corners = vec![
-            Point2::new(0.0, 0.0),
+        let corners = [Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
             Point2::new(1.0, 1.0),
-            Point2::new(0.0, 1.0),
-        ];
+            Point2::new(0.0, 1.0)];
 
         let mut curves = Vec::new();
         for i in 0..4 {

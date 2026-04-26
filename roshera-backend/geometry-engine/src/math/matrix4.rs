@@ -416,24 +416,24 @@ impl Matrix4 {
 
     /// Create rotation matrix around arbitrary axis through a point
     pub fn rotation_axis(point: Point3, axis: Vector3, angle: f64) -> MathResult<Self> {
-        let to_origin = Self::from_translation(&-Vector3::from(point));
+        let to_origin = Self::from_translation(&-point);
         let rotation = Self::from_axis_angle(&axis, angle)?;
-        let from_origin = Self::from_translation(&Vector3::from(point));
+        let from_origin = Self::from_translation(&point);
         Ok(from_origin * rotation * to_origin)
     }
 
     /// Create scale matrix about a point
     pub fn scale_about_point(point: Point3, scale: Vector3) -> Self {
-        let to_origin = Self::from_translation(&-Vector3::from(point));
+        let to_origin = Self::from_translation(&-point);
         let scaling = Self::from_scale(&scale);
-        let from_origin = Self::from_translation(&Vector3::from(point));
+        let from_origin = Self::from_translation(&point);
         from_origin * scaling * to_origin
     }
 
     /// Create mirror/reflection matrix about a plane
     pub fn mirror(plane_point: Point3, plane_normal: Vector3) -> MathResult<Self> {
         let n = plane_normal.normalize()?;
-        let d = -n.dot(&Vector3::from(plane_point));
+        let d = -n.dot(&plane_point);
 
         // Reflection matrix: I - 2*n*n^T
         Ok(Self::new(

@@ -18,10 +18,10 @@ pub const EPSILON: f64 = f64::EPSILON;
 pub const SQRT_EPSILON: f64 = 1.4901161193847656e-8;
 
 /// Cube root of machine epsilon
-pub const CBRT_EPSILON: f64 = 6.0554544523933429e-6;
+pub const CBRT_EPSILON: f64 = 6.055_454_452_393_343e-6;
 
 /// Default angular tolerance in radians (~0.1 degrees)
-pub const ANGULAR_TOLERANCE: f64 = 0.001745329251994330;
+pub const ANGULAR_TOLERANCE: f64 = 0.001_745_329_251_994_33;
 
 /// Pi constant (maximum f64 precision)
 pub const PI: f64 = std::f64::consts::PI;

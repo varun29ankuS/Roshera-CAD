@@ -140,7 +140,7 @@ pub fn transform_faces(
     );
 
     Ok(TransformResult {
-        transformed_ids: faces.into_iter().map(|f| f as u32).collect(),
+        transformed_ids: faces.into_iter().map(|f| f).collect(),
         transform,
     })
 }
@@ -191,7 +191,7 @@ pub fn transform_edges(
     );
 
     Ok(TransformResult {
-        transformed_ids: edges.into_iter().map(|e| e as u32).collect(),
+        transformed_ids: edges.into_iter().map(|e| e).collect(),
         transform,
     })
 }

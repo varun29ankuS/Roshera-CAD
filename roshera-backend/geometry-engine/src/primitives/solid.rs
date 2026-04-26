@@ -869,10 +869,10 @@ impl VolumeIntegrals {
 
     fn compute_inertia_tensor(&self, _mass: f64, _center_of_mass: &Point3) -> [[f64; 3]; 3] {
         // Transform inertia to center of mass using parallel axis theorem
-        let inertia = self.second_moments;
+        
 
         // Simplified - real implementation would be more sophisticated
-        inertia
+        self.second_moments
     }
 }
 
@@ -951,7 +951,7 @@ impl SolidStore {
         for &shell_id in &solid.all_shells() {
             self.shell_to_solids
                 .entry(shell_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(solid.id);
         }
 

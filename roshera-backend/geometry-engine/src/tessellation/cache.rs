@@ -236,6 +236,12 @@ pub enum LodLevel {
     Preview = 4, // Lowest quality
 }
 
+impl Default for LodCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LodCache {
     pub fn new() -> Self {
         Self {
@@ -290,6 +296,12 @@ struct PartialTessellation {
     completed_faces: Vec<FaceId>,
     mesh: ThreeJsMesh,
     progress: f32,
+}
+
+impl Default for IncrementalCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IncrementalCache {

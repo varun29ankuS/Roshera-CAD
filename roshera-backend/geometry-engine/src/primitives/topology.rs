@@ -451,20 +451,20 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     for (edge_id, start_v, end_v) in vertex_edge_data {
         info.vertex_edges
             .entry(start_v)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(edge_id);
         info.vertex_edges
             .entry(end_v)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(edge_id);
 
         info.vertex_vertices
             .entry(start_v)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(end_v);
         info.vertex_vertices
             .entry(end_v)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(start_v);
     }
 
@@ -506,14 +506,14 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
         for &edge_id in &edges {
             info.edge_faces
                 .entry(edge_id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(face_id);
         }
 
         for &vertex_id in &vertices {
             info.vertex_faces
                 .entry(vertex_id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(face_id);
         }
 
@@ -534,11 +534,11 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
                 for j in i + 1..face_vec.len() {
                     info.face_faces
                         .entry(face_vec[i])
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(face_vec[j]);
                     info.face_faces
                         .entry(face_vec[j])
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(face_vec[i]);
                 }
             }
@@ -551,7 +551,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
             for &face_id in &shell.faces {
                 info.face_shells
                     .entry(face_id)
-                    .or_insert_with(HashSet::new)
+                    .or_default()
                     .insert(shell_id);
             }
         }

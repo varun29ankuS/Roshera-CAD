@@ -360,7 +360,7 @@ impl Clone for G2BlendingSurface {
             boundary2: self.boundary2.clone_box(),
             surface1: self.surface1.clone_box(),
             surface2: self.surface2.clone_box(),
-            continuity_info: self.continuity_info.clone(),
+            continuity_info: self.continuity_info,
         }
     }
 }

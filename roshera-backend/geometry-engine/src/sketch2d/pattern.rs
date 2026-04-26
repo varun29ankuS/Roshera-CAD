@@ -18,6 +18,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PatternId(pub Uuid);
 
+impl Default for PatternId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PatternId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())

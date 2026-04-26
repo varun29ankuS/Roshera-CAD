@@ -392,7 +392,7 @@ impl Point2dStore {
         // Add to spatial index
         self.spatial_index
             .entry(grid_key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id);
 
         // Add to main storage
@@ -428,7 +428,7 @@ impl Point2dStore {
             // Add to new spatial index
             self.spatial_index
                 .entry(new_key)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(*id);
         }
 

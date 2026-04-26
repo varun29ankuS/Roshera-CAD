@@ -260,7 +260,7 @@ impl Shell {
                     conn.faces.push((face_id, is_forward));
 
                     // Update face adjacency
-                    adj.adjacent_faces.entry(edge_id).or_insert(Vec::new());
+                    adj.adjacent_faces.entry(edge_id).or_default();
                 }
             }
 
@@ -490,7 +490,7 @@ impl Shell {
 
                 // Volume calculation using divergence theorem
                 if self.shell_type == ShellType::Closed {
-                    let contribution = stats.centroid.to_vec().dot(&Vector3::from(stats.centroid))
+                    let contribution = stats.centroid.to_vec().dot(&stats.centroid)
                         * stats.area
                         / 3.0;
                     volume += contribution;
@@ -1030,7 +1030,7 @@ impl ShellStore {
         for &face_id in &shell.faces {
             self.face_to_shells
                 .entry(face_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(shell.id);
         }
 

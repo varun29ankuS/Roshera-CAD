@@ -98,7 +98,7 @@ impl PerformanceHints {
 
         for _ in 0..WARMUP_ITERATIONS {
             // Warmup matrix multiplication
-            std::hint::black_box(&m1 * &m2);
+            std::hint::black_box(m1 * m2);
 
             // Warmup vector transformation
             std::hint::black_box(m1.transform_vector(&v));
@@ -209,6 +209,12 @@ pub struct PerformanceMetrics {
     pub allocation_count: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+}
+
+impl Default for PerformanceMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PerformanceMetrics {

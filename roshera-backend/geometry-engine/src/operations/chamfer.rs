@@ -640,7 +640,7 @@ fn handle_chamfer_vertices(
     // infrastructure that's not yet robust enough.
 
     // For now, verify that vertex connectivity is maintained
-    for (_vertex_id, incident_edges) in &vertex_edges {
+    for incident_edges in vertex_edges.values() {
         if incident_edges.len() >= 3 {
             // Three or more chamfered edges meeting at a vertex — complex case
             // Log but don't fail; the chamfer faces are still valid individually
@@ -806,7 +806,7 @@ fn face_normal_at_point(
 
     // Flip normal if face orientation is backward
     if face.orientation == FaceOrientation::Backward {
-        normal = normal * -1.0;
+        normal *= -1.0;
     }
 
     Ok(normal)

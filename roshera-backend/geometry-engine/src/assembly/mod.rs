@@ -33,6 +33,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentId(pub Uuid);
 
+impl Default for ComponentId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ComponentId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -42,6 +48,12 @@ impl ComponentId {
 /// Unique identifier for mate constraints
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MateId(pub Uuid);
+
+impl Default for MateId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MateId {
     pub fn new() -> Self {
@@ -315,7 +327,7 @@ impl Assembly {
             // Update tree structure
             self.tree
                 .entry(parent_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(sub_id);
         }
 
@@ -369,12 +381,12 @@ impl Assembly {
             let t1 = self
                 .components
                 .get(&component1)
-                .map(|c| c.transform.clone())
+                .map(|c| c.transform)
                 .unwrap_or(Matrix4::IDENTITY);
             let t2 = self
                 .components
                 .get(&component2)
-                .map(|c| c.transform.clone())
+                .map(|c| c.transform)
                 .unwrap_or(Matrix4::IDENTITY);
             self.gear_neutrals.insert(id, (t1, t2));
         }
@@ -410,7 +422,7 @@ impl Assembly {
         for component in self.components.iter() {
             solver
                 .initial_transforms
-                .insert(component.id, component.transform.clone());
+                .insert(component.id, component.transform);
             if component.is_fixed {
                 solver.fixed_components.insert(component.id);
             }
@@ -421,7 +433,7 @@ impl Assembly {
         for entry in self.gear_neutrals.iter() {
             solver
                 .gear_neutrals
-                .insert(*entry.key(), entry.value().clone());
+                .insert(*entry.key(), *entry.value());
         }
 
         // Register active mates with pre-resolved local-frame references.
@@ -560,7 +572,7 @@ impl Assembly {
 
         for component in self.components.iter() {
             let mass = component.properties.mass.unwrap_or(1.0);
-            let transform = component.transform.clone();
+            let transform = component.transform;
             let position = Point3::new(transform[(0, 3)], transform[(1, 3)], transform[(2, 3)]);
             weighted_sum_x += position.x * mass;
             weighted_sum_y += position.y * mass;
@@ -632,7 +644,7 @@ impl Assembly {
             }
 
             // Apply transform
-            let mut new_transform = comp.transform.clone();
+            let mut new_transform = comp.transform;
             // Apply translation
             new_transform[(0, 3)] += delta.x;
             new_transform[(1, 3)] += delta.y;
@@ -642,7 +654,7 @@ impl Assembly {
                 // Post-multiply: rotation applied in the component's local
                 // frame, after the translation column has been updated.
                 // Standard rigid-body convention for incremental motion.
-                new_transform = new_transform * rotation.to_matrix4();
+                new_transform *= rotation.to_matrix4();
             }
             comp.transform = new_transform;
         }
@@ -894,7 +906,7 @@ impl ConstraintSolver {
         };
 
         let t1 = match transforms.get(&c.component1) {
-            Some(t) => t.clone(),
+            Some(t) => *t,
             None => {
                 return ConstraintOutcome::Unresolvable(format!(
                     "component {:?} transform missing from solve state",
@@ -903,7 +915,7 @@ impl ConstraintSolver {
             }
         };
         let t2 = match transforms.get(&c.component2) {
-            Some(t) => t.clone(),
+            Some(t) => *t,
             None => {
                 return ConstraintOutcome::Unresolvable(format!(
                     "component {:?} transform missing from solve state",
@@ -1090,7 +1102,7 @@ fn compute_correction(
             let inv = movable_t_abs.inverse().map_err(|_| {
                 "Lock mate: movable component transform is non-invertible".to_string()
             })?;
-            let delta_matrix = anchor_t_abs.clone() * inv;
+            let delta_matrix = *anchor_t_abs * inv;
             Ok(Some(matrix_to_correction(&delta_matrix)?))
         }
 

@@ -260,7 +260,7 @@ impl NLPRules {
             let canonical = entry.value().clone();
             self.synonym_index
                 .entry(canonical)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(synonym);
         }
     }
@@ -1407,7 +1407,7 @@ impl PrimitiveRegistry {
                     .map(|e| serde_json::to_value(e).unwrap_or_default())
                     .collect()
             })
-            .unwrap_or_else(|| vec![])
+            .unwrap_or_else(std::vec::Vec::new)
     }
 }
 
@@ -1588,7 +1588,7 @@ impl PrimitiveRegistry {
                         stats.last_used = std::time::Instant::now();
 
                         // Track parameter usage with thread-safe updates
-                        for (param_name, _) in &parsed.parameters {
+                        for param_name in parsed.parameters.keys() {
                             let param_freq = stats
                                 .parameter_frequencies
                                 .entry(param_name.clone())
@@ -1614,7 +1614,7 @@ impl PrimitiveRegistry {
                         last_used: std::time::Instant::now(),
                         parameter_frequencies: {
                             let freq_map = DashMap::new();
-                            for (param_name, _) in &parsed.parameters {
+                            for param_name in parsed.parameters.keys() {
                                 let param_freq = DashMap::new();
                                 param_freq.insert(command.to_string(), 1);
                                 freq_map.insert(param_name.clone(), param_freq);

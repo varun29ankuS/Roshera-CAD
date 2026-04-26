@@ -53,7 +53,7 @@ pub enum CircleLocation {
 // (B and C bounds) is not implemented in this kernel.
 const RESULTERRBOUND: f64 = 3.0e-15;
 const CCWERRBOUNDSA: f64 = 3.3306690738754716e-16;
-const O3DERRBOUNDSA: f64 = 7.7715611723760958e-16;
+const O3DERRBOUNDSA: f64 = 7.771_561_172_376_096e-16;
 const ICCERRBOUNDSA: f64 = 1.0e-15;
 const ISPERRBOUNDSA: f64 = 1.6e-15;
 
@@ -116,9 +116,9 @@ fn orient2d_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
 
     // Compute determinant with exact arithmetic
     let (det, det_tail) = two_sum(detleft, -detright);
-    let det_sum = det + (detleft_tail - detright_tail + det_tail);
+    
 
-    det_sum
+    det + (detleft_tail - detright_tail + det_tail)
 }
 
 /// Test whether three points are in counter-clockwise order
