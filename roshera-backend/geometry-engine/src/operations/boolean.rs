@@ -604,10 +604,8 @@ fn create_line_intersection_curve(
         ((bounds_a.0 .1 - bounds_a.0 .0).abs()).max((bounds_a.1 .1 - bounds_a.1 .0).abs());
     let extent_b =
         ((bounds_b.0 .1 - bounds_b.0 .0).abs()).max((bounds_b.1 .1 - bounds_b.1 .0).abs());
-    let line_extent = extent_a
-        .max(extent_b)
-        .max(10.0) // floor at 10.0 for degenerate bounds
-        .min(MAX_LINE_EXTENT); // cap unbounded (infinite plane) surfaces
+    // Floor at 10.0 for degenerate bounds; cap unbounded (infinite plane) surfaces.
+    let line_extent = extent_a.max(extent_b).clamp(10.0, MAX_LINE_EXTENT);
 
     let start_point = line_point - line_direction * line_extent;
     let end_point = line_point + line_direction * line_extent;

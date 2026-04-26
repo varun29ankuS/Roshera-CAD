@@ -800,9 +800,7 @@ impl PrimitiveRegistry {
             0.0
         };
 
-        (completeness_score + name_bonus + ambiguity_penalty)
-            .min(1.0)
-            .max(0.0)
+        (completeness_score + name_bonus + ambiguity_penalty).clamp(0.0, 1.0)
     }
 
     /// Generate helpful suggestions for low-confidence parsing.
