@@ -359,97 +359,92 @@ impl Shell {
         edge_store: &EdgeStore,
         vertex_store: &VertexStore,
     ) -> MathResult<&ShellStats> {
-        if self.cached_stats.is_some() {
-            return Ok(self
-                .cached_stats
-                .as_ref()
-                .expect("cached_stats.is_some() verified above"));
-        }
+        if self.cached_stats.is_none() {
+            let mut vertices = HashSet::new();
+            let mut edges = HashSet::new();
+            let mut boundary_edges = 0;
+            let mut non_manifold_edges = 0;
 
-        let mut vertices = HashSet::new();
-        let mut edges = HashSet::new();
-        let mut boundary_edges = 0;
-        let mut non_manifold_edges = 0;
+            let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut max_pt = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
 
-        let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-        let mut max_pt = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            // Count unique vertices and edges
+            for &face_id in &self.faces {
+                let face = face_store
+                    .get(face_id)
+                    .ok_or(MathError::InvalidParameter("Face not found".to_string()))?;
 
-        // Count unique vertices and edges
-        for &face_id in &self.faces {
-            let face = face_store
-                .get(face_id)
-                .ok_or(MathError::InvalidParameter("Face not found".to_string()))?;
+                for &loop_id in &face.all_loops() {
+                    let loop_ = loop_store
+                        .get(loop_id)
+                        .ok_or(MathError::InvalidParameter("Loop not found".to_string()))?;
 
-            for &loop_id in &face.all_loops() {
-                let loop_ = loop_store
-                    .get(loop_id)
-                    .ok_or(MathError::InvalidParameter("Loop not found".to_string()))?;
+                    for &edge_id in &loop_.edges {
+                        edges.insert(edge_id);
 
-                for &edge_id in &loop_.edges {
-                    edges.insert(edge_id);
+                        if let Some(edge) = edge_store.get(edge_id) {
+                            vertices.insert(edge.start_vertex);
+                            vertices.insert(edge.end_vertex);
 
-                    if let Some(edge) = edge_store.get(edge_id) {
-                        vertices.insert(edge.start_vertex);
-                        vertices.insert(edge.end_vertex);
-
-                        // Update bounding box
-                        if let Some(v) = vertex_store.get(edge.start_vertex) {
-                            let p = Point3::from_array(v.position);
-                            min_pt = min_pt.min(&p);
-                            max_pt = max_pt.max(&p);
-                        }
-                        if let Some(v) = vertex_store.get(edge.end_vertex) {
-                            let p = Point3::from_array(v.position);
-                            min_pt = min_pt.min(&p);
-                            max_pt = max_pt.max(&p);
+                            // Update bounding box
+                            if let Some(v) = vertex_store.get(edge.start_vertex) {
+                                let p = Point3::from_array(v.position);
+                                min_pt = min_pt.min(&p);
+                                max_pt = max_pt.max(&p);
+                            }
+                            if let Some(v) = vertex_store.get(edge.end_vertex) {
+                                let p = Point3::from_array(v.position);
+                                min_pt = min_pt.min(&p);
+                                max_pt = max_pt.max(&p);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Count boundary and non-manifold edges
-        let edge_conn = self
-            .edge_connectivity
-            .read()
-            .expect("shell edge_connectivity RwLock poisoned");
-        for conn in edge_conn.values() {
-            if conn.is_boundary {
-                boundary_edges += 1;
+            // Count boundary and non-manifold edges
+            let edge_conn = self
+                .edge_connectivity
+                .read()
+                .expect("shell edge_connectivity RwLock poisoned");
+            for conn in edge_conn.values() {
+                if conn.is_boundary {
+                    boundary_edges += 1;
+                }
+                if conn.is_non_manifold {
+                    non_manifold_edges += 1;
+                }
             }
-            if conn.is_non_manifold {
-                non_manifold_edges += 1;
-            }
+
+            let v = vertices.len() as i32;
+            let e = edges.len() as i32;
+            let f = self.faces.len() as i32;
+            let euler = v - e + f;
+
+            // Calculate genus for closed shells: 2 - χ = 2g
+            let genus = if self.shell_type == ShellType::Closed && boundary_edges == 0 {
+                Some((2 - euler) / 2)
+            } else {
+                None
+            };
+
+            self.cached_stats = Some(ShellStats {
+                face_count: self.faces.len(),
+                edge_count: edges.len(),
+                vertex_count: vertices.len(),
+                boundary_edge_count: boundary_edges,
+                non_manifold_edge_count: non_manifold_edges,
+                euler_characteristic: euler,
+                genus,
+                bbox_min: min_pt,
+                bbox_max: max_pt,
+            });
         }
-
-        let v = vertices.len() as i32;
-        let e = edges.len() as i32;
-        let f = self.faces.len() as i32;
-        let euler = v - e + f;
-
-        // Calculate genus for closed shells: 2 - χ = 2g
-        let genus = if self.shell_type == ShellType::Closed && boundary_edges == 0 {
-            Some((2 - euler) / 2)
-        } else {
-            None
-        };
-
-        self.cached_stats = Some(ShellStats {
-            face_count: self.faces.len(),
-            edge_count: edges.len(),
-            vertex_count: vertices.len(),
-            boundary_edge_count: boundary_edges,
-            non_manifold_edge_count: non_manifold_edges,
-            euler_characteristic: euler,
-            genus,
-            bbox_min: min_pt,
-            bbox_max: max_pt,
-        });
 
         Ok(self
             .cached_stats
             .as_ref()
-            .expect("cached_stats was assigned to Some(..) immediately above"))
+            .expect("cached_stats populated above when None"))
     }
 
     /// Calculate mass properties (cached)
@@ -463,87 +458,81 @@ impl Shell {
         surface_store: &SurfaceStore,
         density: f64,
     ) -> MathResult<&MassProperties> {
-        if self.cached_mass_props.is_some() {
-            return Ok(self
-                .cached_mass_props
-                .as_ref()
-                .expect("cached_mass_props.is_some() verified above"));
-        }
+        if self.cached_mass_props.is_none() {
+            let mut total_area = 0.0;
+            let mut volume = 0.0;
+            let mut center = Vector3::ZERO;
+            let mut inertia = [[0.0; 3]; 3];
 
-        let mut total_area = 0.0;
-        let mut volume = 0.0;
-        let mut center = Vector3::ZERO;
-        let mut inertia = [[0.0; 3]; 3];
+            // Calculate surface area and volume (if closed)
+            for &face_id in &self.faces {
+                if let Some(face) = face_store.get_mut(face_id) {
+                    let stats = face.compute_stats(
+                        loop_store,
+                        vertex_store,
+                        edge_store,
+                        curve_store,
+                        surface_store,
+                    )?;
 
-        // Calculate surface area and volume (if closed)
-        for &face_id in &self.faces {
-            if let Some(face) = face_store.get_mut(face_id) {
-                let stats = face.compute_stats(
-                    loop_store,
-                    vertex_store,
-                    edge_store,
-                    curve_store,
-                    surface_store,
-                )?;
+                    total_area += stats.area;
 
-                total_area += stats.area;
-
-                // Volume calculation using divergence theorem
-                if self.shell_type == ShellType::Closed {
-                    let contribution = stats.centroid.to_vec().dot(&stats.centroid)
-                        * stats.area
-                        / 3.0;
-                    volume += contribution;
-                    center += stats.centroid.to_vec() * stats.area;
+                    // Volume calculation using divergence theorem
+                    if self.shell_type == ShellType::Closed {
+                        let contribution =
+                            stats.centroid.to_vec().dot(&stats.centroid) * stats.area / 3.0;
+                        volume += contribution;
+                        center += stats.centroid.to_vec() * stats.area;
+                    }
                 }
             }
+
+            // Center of mass
+            if total_area > consts::EPSILON {
+                center /= total_area;
+            }
+            let center_of_mass = Point3::from(center);
+
+            // Inertia tensor calculation (simplified)
+            // Real implementation would integrate over volume
+            if volume.abs() > consts::EPSILON {
+                let mass = volume * density;
+
+                // Approximate as uniform density
+                let size = self
+                    .cached_stats
+                    .as_ref()
+                    .map(|s| s.bbox_max - s.bbox_min)
+                    .unwrap_or(Vector3::ONE);
+
+                // Box approximation for inertia
+                inertia[0][0] = mass * (size.y * size.y + size.z * size.z) / 12.0;
+                inertia[1][1] = mass * (size.x * size.x + size.z * size.z) / 12.0;
+                inertia[2][2] = mass * (size.x * size.x + size.y * size.y) / 12.0;
+            }
+
+            // Principal moments and axes (eigenvalues/eigenvectors of inertia)
+            let principal_moments = Vector3::new(inertia[0][0], inertia[1][1], inertia[2][2]);
+            let principal_axes = [Vector3::X, Vector3::Y, Vector3::Z];
+
+            self.cached_mass_props = Some(MassProperties {
+                volume: if self.shell_type == ShellType::Closed {
+                    Some(volume.abs())
+                } else {
+                    None
+                },
+                surface_area: total_area,
+                center_of_mass,
+                inertia,
+                principal_moments,
+                principal_axes,
+            });
         }
-
-        // Center of mass
-        if total_area > consts::EPSILON {
-            center /= total_area;
-        }
-        let center_of_mass = Point3::from(center);
-
-        // Inertia tensor calculation (simplified)
-        // Real implementation would integrate over volume
-        if volume.abs() > consts::EPSILON {
-            let mass = volume * density;
-
-            // Approximate as uniform density
-            let size = self
-                .cached_stats
-                .as_ref()
-                .map(|s| s.bbox_max - s.bbox_min)
-                .unwrap_or(Vector3::ONE);
-
-            // Box approximation for inertia
-            inertia[0][0] = mass * (size.y * size.y + size.z * size.z) / 12.0;
-            inertia[1][1] = mass * (size.x * size.x + size.z * size.z) / 12.0;
-            inertia[2][2] = mass * (size.x * size.x + size.y * size.y) / 12.0;
-        }
-
-        // Principal moments and axes (eigenvalues/eigenvectors of inertia)
-        let principal_moments = Vector3::new(inertia[0][0], inertia[1][1], inertia[2][2]);
-        let principal_axes = [Vector3::X, Vector3::Y, Vector3::Z];
-
-        self.cached_mass_props = Some(MassProperties {
-            volume: if self.shell_type == ShellType::Closed {
-                Some(volume.abs())
-            } else {
-                None
-            },
-            surface_area: total_area,
-            center_of_mass,
-            inertia,
-            principal_moments,
-            principal_axes,
-        });
 
         Ok(self
             .cached_mass_props
             .as_ref()
-            .expect("cached_mass_props was assigned to Some(..) immediately above"))
+            .expect("cached_mass_props populated above when None"))
     }
 
     /// Advanced point-in-shell test using winding number

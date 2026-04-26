@@ -182,61 +182,57 @@ impl Loop {
         curve_store: &CurveStore,
         normal: &Vector3,
     ) -> MathResult<&LoopStats> {
-        if self.cached_stats.is_some() {
-            return Ok(self
-                .cached_stats
-                .as_ref()
-                .expect("cached_stats presence verified by is_some() guard above"));
+        if self.cached_stats.is_none() {
+            let vertices = self.vertices_cached(edge_store)?;
+            if vertices.len() < 3 {
+                return Err(MathError::InvalidParameter(
+                    "Loop has fewer than 3 vertices".to_string(),
+                ));
+            }
+
+            // Calculate perimeter
+            let mut perimeter = 0.0;
+            for i in 0..self.edges.len() {
+                let edge = edge_store
+                    .get(self.edges[i])
+                    .ok_or(MathError::InvalidParameter("Edge not found".to_string()))?;
+
+                // Compute accurate arc length (non-caching since we have immutable reference)
+                perimeter += edge.compute_arc_length(curve_store, Tolerance::default())?;
+            }
+
+            // Calculate area and centroid using shoelace formula
+            let (area, centroid) =
+                self.compute_area_and_centroid(&vertices, vertex_store, normal)?;
+
+            // Calculate bounding box
+            let (bbox_min, bbox_max) = self.compute_bbox(&vertices, vertex_store)?;
+
+            // Analyze convexity
+            let convexity = self.analyze_convexity(&vertices, vertex_store, normal)?;
+
+            // Count self-intersections
+            let self_intersections = self.count_self_intersections(edge_store, curve_store)?;
+
+            // Find maximum curvature
+            let max_curvature = self.find_max_curvature(edge_store, curve_store)?;
+
+            self.cached_stats = Some(LoopStats {
+                perimeter,
+                area,
+                centroid,
+                bbox_min,
+                bbox_max,
+                convexity,
+                self_intersections,
+                max_curvature,
+            });
         }
-
-        let vertices = self.vertices_cached(edge_store)?;
-        if vertices.len() < 3 {
-            return Err(MathError::InvalidParameter(
-                "Loop has fewer than 3 vertices".to_string(),
-            ));
-        }
-
-        // Calculate perimeter
-        let mut perimeter = 0.0;
-        for i in 0..self.edges.len() {
-            let edge = edge_store
-                .get(self.edges[i])
-                .ok_or(MathError::InvalidParameter("Edge not found".to_string()))?;
-
-            // Compute accurate arc length (non-caching since we have immutable reference)
-            perimeter += edge.compute_arc_length(curve_store, Tolerance::default())?;
-        }
-
-        // Calculate area and centroid using shoelace formula
-        let (area, centroid) = self.compute_area_and_centroid(&vertices, vertex_store, normal)?;
-
-        // Calculate bounding box
-        let (bbox_min, bbox_max) = self.compute_bbox(&vertices, vertex_store)?;
-
-        // Analyze convexity
-        let convexity = self.analyze_convexity(&vertices, vertex_store, normal)?;
-
-        // Count self-intersections
-        let self_intersections = self.count_self_intersections(edge_store, curve_store)?;
-
-        // Find maximum curvature
-        let max_curvature = self.find_max_curvature(edge_store, curve_store)?;
-
-        self.cached_stats = Some(LoopStats {
-            perimeter,
-            area,
-            centroid,
-            bbox_min,
-            bbox_max,
-            convexity,
-            self_intersections,
-            max_curvature,
-        });
 
         Ok(self
             .cached_stats
             .as_ref()
-            .expect("cached_stats just assigned via `Some(...)` above"))
+            .expect("cached_stats populated above when None"))
     }
 
     /// Compute area and centroid efficiently
