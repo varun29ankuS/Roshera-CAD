@@ -3329,18 +3329,14 @@ impl NurbsCurve {
         // Create uniform knot vector
         let mut knots = Vec::new();
         // Clamp at start
-        for _ in 0..=actual_degree {
-            knots.push(0.0);
-        }
+        knots.resize(actual_degree + 1, 0.0);
         // Internal knots
         let num_internal = n - actual_degree - 1;
         for i in 1..num_internal {
             knots.push(i as f64 / num_internal as f64);
         }
         // Clamp at end
-        for _ in 0..=actual_degree {
-            knots.push(1.0);
-        }
+        knots.resize(knots.len() + actual_degree + 1, 1.0);
 
         // Equal weights for rational curve
         let weights = vec![1.0; n];

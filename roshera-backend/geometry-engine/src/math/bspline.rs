@@ -94,9 +94,7 @@ impl KnotVector {
         let mut knots = Vec::with_capacity(num_knots);
 
         // First degree+1 knots at 0
-        for _ in 0..=degree {
-            knots.push(0.0);
-        }
+        knots.resize(degree + 1, 0.0);
 
         // Interior knots
         for i in 1..=(n - degree) {
@@ -104,9 +102,7 @@ impl KnotVector {
         }
 
         // Last degree+1 knots at n-degree
-        for _ in 0..=degree {
-            knots.push((n - degree + 1) as f64);
-        }
+        knots.resize(num_knots, (n - degree + 1) as f64);
 
         Self {
             knots,
@@ -123,9 +119,7 @@ impl KnotVector {
         let mut knots = Vec::with_capacity(num_knots);
 
         // First degree+1 knots at 0
-        for _ in 0..=degree {
-            knots.push(0.0);
-        }
+        knots.resize(degree + 1, 0.0);
 
         // Interior knots uniformly distributed in (0, 1)
         let num_interior = n - degree;
@@ -134,9 +128,7 @@ impl KnotVector {
         }
 
         // Last degree+1 knots at 1
-        for _ in 0..=degree {
-            knots.push(1.0);
-        }
+        knots.resize(num_knots, 1.0);
 
         Self {
             knots,
@@ -508,17 +500,13 @@ impl BSplineCurve {
         let num_interior = n - degree;
 
         // Clamped knot vector
-        for _ in 0..=degree {
-            knots.push(0.0);
-        }
+        knots.resize(degree + 1, 0.0);
 
         for i in 1..num_interior {
             knots.push(i as f64 / num_interior as f64);
         }
 
-        for _ in 0..=degree {
-            knots.push(1.0);
-        }
+        knots.resize(num_knots, 1.0);
 
         Self::new(degree, control_points, knots)
     }
