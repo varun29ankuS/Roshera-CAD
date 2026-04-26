@@ -413,68 +413,63 @@ impl Face {
         curve_store: &CurveStore,
         surface_store: &SurfaceStore,
     ) -> MathResult<&FaceStats> {
-        if self.cached_stats.is_some() {
-            return Ok(self
-                .cached_stats
-                .as_ref()
-                .expect("cached_stats presence verified by is_some() guard above"));
-        }
+        if self.cached_stats.is_none() {
+            // Get surface
+            let _surface = surface_store
+                .get(self.surface_id)
+                .ok_or(MathError::InvalidParameter("Surface not found".to_string()))?;
 
-        // Get surface
-        let _surface = surface_store
-            .get(self.surface_id)
-            .ok_or(MathError::InvalidParameter("Surface not found".to_string()))?;
+            // Compute area (using parametric integration for accuracy)
+            let area = self.compute_surface_area(
+                loop_store,
+                vertex_store,
+                edge_store,
+                curve_store,
+                surface_store,
+            )?;
 
-        // Compute area (using parametric integration for accuracy)
-        let area = self.compute_surface_area(
-            loop_store,
-            vertex_store,
-            edge_store,
-            curve_store,
-            surface_store,
-        )?;
-
-        // Compute perimeter
-        let mut perimeter = 0.0;
-        for &loop_id in &self.all_loops() {
-            if let Some(loop_) = loop_store.get_mut(loop_id) {
-                let stats = loop_.compute_stats(
-                    vertex_store,
-                    edge_store,
-                    curve_store,
-                    &Vector3::Z, // Dummy normal for perimeter
-                )?;
-                perimeter += stats.perimeter;
+            // Compute perimeter
+            let mut perimeter = 0.0;
+            for &loop_id in &self.all_loops() {
+                if let Some(loop_) = loop_store.get_mut(loop_id) {
+                    let stats = loop_.compute_stats(
+                        vertex_store,
+                        edge_store,
+                        curve_store,
+                        &Vector3::Z, // Dummy normal for perimeter
+                    )?;
+                    perimeter += stats.perimeter;
+                }
             }
+
+            // Compute bounding box and centroid
+            let (bbox_min, bbox_max, centroid) = self.compute_bbox_and_centroid(
+                surface_store,
+                100, // Sample points
+            )?;
+
+            // Compute planarity and curvature
+            let (planarity, max_curvature) = self.compute_shape_metrics(
+                surface_store,
+                50, // Sample points
+            )?;
+
+            self.cached_stats = Some(FaceStats {
+                area,
+                perimeter,
+                bbox_min,
+                bbox_max,
+                centroid,
+                trim_count: self.trim_curves.len(),
+                planarity,
+                max_curvature,
+            });
         }
-
-        // Compute bounding box and centroid
-        let (bbox_min, bbox_max, centroid) = self.compute_bbox_and_centroid(
-            surface_store,
-            100, // Sample points
-        )?;
-
-        // Compute planarity and curvature
-        let (planarity, max_curvature) = self.compute_shape_metrics(
-            surface_store,
-            50, // Sample points
-        )?;
-
-        self.cached_stats = Some(FaceStats {
-            area,
-            perimeter,
-            bbox_min,
-            bbox_max,
-            centroid,
-            trim_count: self.trim_curves.len(),
-            planarity,
-            max_curvature,
-        });
 
         Ok(self
             .cached_stats
             .as_ref()
-            .expect("cached_stats just assigned via `Some(...)` above"))
+            .expect("cached_stats populated above when None"))
     }
 
     /// Compute accurate surface area using parametric integration

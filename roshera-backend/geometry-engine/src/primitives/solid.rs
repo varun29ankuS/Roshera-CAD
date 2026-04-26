@@ -357,44 +357,39 @@ impl Solid {
         edge_store: &EdgeStore,
         vertex_store: &VertexStore,
     ) -> MathResult<&SolidStats> {
-        if self.cached_stats.is_some() {
-            return Ok(self
-                .cached_stats
-                .as_ref()
-                .expect("cached_stats.is_some() verified above"));
-        }
+        if self.cached_stats.is_none() {
+            let mut total_faces = 0;
+            let mut total_edges = HashSet::new();
+            let mut total_vertices = HashSet::new();
+            let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut max_pt = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
 
-        let mut total_faces = 0;
-        let mut total_edges = HashSet::new();
-        let mut total_vertices = HashSet::new();
-        let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-        let mut max_pt = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for &shell_id in &self.all_shells() {
+                if let Some(shell) = shell_store.get(shell_id) {
+                    total_faces += shell.faces.len();
 
-        for &shell_id in &self.all_shells() {
-            if let Some(shell) = shell_store.get(shell_id) {
-                total_faces += shell.faces.len();
+                    for &face_id in &shell.faces {
+                        if let Some(face) = face_store.get(face_id) {
+                            for &loop_id in &face.all_loops() {
+                                if let Some(loop_) = loop_store.get(loop_id) {
+                                    for &edge_id in &loop_.edges {
+                                        total_edges.insert(edge_id);
 
-                for &face_id in &shell.faces {
-                    if let Some(face) = face_store.get(face_id) {
-                        for &loop_id in &face.all_loops() {
-                            if let Some(loop_) = loop_store.get(loop_id) {
-                                for &edge_id in &loop_.edges {
-                                    total_edges.insert(edge_id);
+                                        if let Some(edge) = edge_store.get(edge_id) {
+                                            total_vertices.insert(edge.start_vertex);
+                                            total_vertices.insert(edge.end_vertex);
 
-                                    if let Some(edge) = edge_store.get(edge_id) {
-                                        total_vertices.insert(edge.start_vertex);
-                                        total_vertices.insert(edge.end_vertex);
-
-                                        // Update bounding box
-                                        if let Some(v) = vertex_store.get(edge.start_vertex) {
-                                            let p = Point3::from(v.position);
-                                            min_pt = min_pt.min(&p);
-                                            max_pt = max_pt.max(&p);
-                                        }
-                                        if let Some(v) = vertex_store.get(edge.end_vertex) {
-                                            let p = Point3::from(v.position);
-                                            min_pt = min_pt.min(&p);
-                                            max_pt = max_pt.max(&p);
+                                            // Update bounding box
+                                            if let Some(v) = vertex_store.get(edge.start_vertex) {
+                                                let p = Point3::from(v.position);
+                                                min_pt = min_pt.min(&p);
+                                                max_pt = max_pt.max(&p);
+                                            }
+                                            if let Some(v) = vertex_store.get(edge.end_vertex) {
+                                                let p = Point3::from(v.position);
+                                                min_pt = min_pt.min(&p);
+                                                max_pt = max_pt.max(&p);
+                                            }
                                         }
                                     }
                                 }
@@ -403,38 +398,38 @@ impl Solid {
                     }
                 }
             }
+
+            let v = total_vertices.len() as i32;
+            let e = total_edges.len() as i32;
+            let f = total_faces as i32;
+            let euler = v - e + f;
+
+            // For a solid with g handles and c cavities: χ = 2 - 2g - c
+            // For simple solid: χ = 2, so g = 0
+            let genus = (2 - euler) / 2;
+
+            let features = self
+                .features
+                .read()
+                .expect("solid features RwLock poisoned");
+
+            self.cached_stats = Some(SolidStats {
+                shell_count: 1 + self.inner_shells.len(),
+                face_count: total_faces,
+                edge_count: total_edges.len(),
+                vertex_count: total_vertices.len(),
+                feature_count: features.len(),
+                euler_characteristic: euler,
+                genus,
+                bbox_min: min_pt,
+                bbox_max: max_pt,
+            });
         }
-
-        let v = total_vertices.len() as i32;
-        let e = total_edges.len() as i32;
-        let f = total_faces as i32;
-        let euler = v - e + f;
-
-        // For a solid with g handles and c cavities: χ = 2 - 2g - c
-        // For simple solid: χ = 2, so g = 0
-        let genus = (2 - euler) / 2;
-
-        let features = self
-            .features
-            .read()
-            .expect("solid features RwLock poisoned");
-
-        self.cached_stats = Some(SolidStats {
-            shell_count: 1 + self.inner_shells.len(),
-            face_count: total_faces,
-            edge_count: total_edges.len(),
-            vertex_count: total_vertices.len(),
-            feature_count: features.len(),
-            euler_characteristic: euler,
-            genus,
-            bbox_min: min_pt,
-            bbox_max: max_pt,
-        });
 
         Ok(self
             .cached_stats
             .as_ref()
-            .expect("cached_stats was assigned to Some(..) immediately above"))
+            .expect("cached_stats populated above when None"))
     }
 
     /// Calculate mass properties (cached)
@@ -448,42 +443,14 @@ impl Solid {
         curve_store: &CurveStore,
         surface_store: &SurfaceStore,
     ) -> MathResult<&SolidMassProperties> {
-        if self.cached_mass_props.is_some() {
-            return Ok(self
-                .cached_mass_props
-                .as_ref()
-                .expect("cached_mass_props.is_some() verified above"));
-        }
+        if self.cached_mass_props.is_none() {
+            // Calculate volume using divergence theorem
+            let mut volume = 0.0;
+            let mut center = Vector3::ZERO;
+            let mut volume_integrals = VolumeIntegrals::default();
 
-        // Calculate volume using divergence theorem
-        let mut volume = 0.0;
-        let mut center = Vector3::ZERO;
-        let mut volume_integrals = VolumeIntegrals::default();
-
-        // Process outer shell
-        if let Some(shell) = shell_store.get_mut(self.outer_shell) {
-            let shell_props = shell.compute_mass_properties(
-                face_store,
-                loop_store,
-                vertex_store,
-                edge_store,
-                curve_store,
-                surface_store,
-                1.0, // Unit density for now
-            )?;
-
-            if let Some(v) = shell_props.volume {
-                volume += v;
-                center += shell_props.center_of_mass.to_vec() * v;
-
-                // Add to volume integrals
-                volume_integrals.add_shell_contribution(shell_props, 1.0);
-            }
-        }
-
-        // Subtract inner shells
-        for &inner_id in &self.inner_shells {
-            if let Some(shell) = shell_store.get_mut(inner_id) {
+            // Process outer shell
+            if let Some(shell) = shell_store.get_mut(self.outer_shell) {
                 let shell_props = shell.compute_mass_properties(
                     face_store,
                     loop_store,
@@ -491,61 +458,84 @@ impl Solid {
                     edge_store,
                     curve_store,
                     surface_store,
-                    1.0,
+                    1.0, // Unit density for now
                 )?;
 
                 if let Some(v) = shell_props.volume {
-                    volume -= v;
-                    center -= shell_props.center_of_mass.to_vec() * v;
+                    volume += v;
+                    center += shell_props.center_of_mass.to_vec() * v;
 
-                    // Subtract from volume integrals
-                    volume_integrals.add_shell_contribution(shell_props, -1.0);
+                    // Add to volume integrals
+                    volume_integrals.add_shell_contribution(shell_props, 1.0);
                 }
             }
-        }
 
-        // Calculate mass
-        let mass = volume * self.attributes.material.density;
+            // Subtract inner shells
+            for &inner_id in &self.inner_shells {
+                if let Some(shell) = shell_store.get_mut(inner_id) {
+                    let shell_props = shell.compute_mass_properties(
+                        face_store,
+                        loop_store,
+                        vertex_store,
+                        edge_store,
+                        curve_store,
+                        surface_store,
+                        1.0,
+                    )?;
 
-        // Center of mass
-        let center_of_mass = if volume > consts::EPSILON {
-            Point3::from(center / volume)
-        } else {
-            // Use bounding box center for degenerate case
-            if let Some(stats) = &self.cached_stats {
-                Point3::from((stats.bbox_min.to_vec() + stats.bbox_max.to_vec()) * 0.5)
-            } else {
-                Point3::ZERO
+                    if let Some(v) = shell_props.volume {
+                        volume -= v;
+                        center -= shell_props.center_of_mass.to_vec() * v;
+
+                        // Subtract from volume integrals
+                        volume_integrals.add_shell_contribution(shell_props, -1.0);
+                    }
+                }
             }
-        };
 
-        // Calculate inertia tensor
-        let inertia_tensor = volume_integrals.compute_inertia_tensor(mass, &center_of_mass);
+            // Calculate mass
+            let mass = volume * self.attributes.material.density;
 
-        // Compute principal moments and axes (eigenvalues/eigenvectors)
-        let (principal_moments, principal_axes) = compute_principal_inertia(&inertia_tensor);
+            // Center of mass
+            let center_of_mass = if volume > consts::EPSILON {
+                Point3::from(center / volume)
+            } else {
+                // Use bounding box center for degenerate case
+                if let Some(stats) = &self.cached_stats {
+                    Point3::from((stats.bbox_min.to_vec() + stats.bbox_max.to_vec()) * 0.5)
+                } else {
+                    Point3::ZERO
+                }
+            };
 
-        // Radius of gyration
-        let radius_of_gyration = Vector3::new(
-            (principal_moments.x / mass).sqrt(),
-            (principal_moments.y / mass).sqrt(),
-            (principal_moments.z / mass).sqrt(),
-        );
+            // Calculate inertia tensor
+            let inertia_tensor = volume_integrals.compute_inertia_tensor(mass, &center_of_mass);
 
-        self.cached_mass_props = Some(SolidMassProperties {
-            volume,
-            mass,
-            center_of_mass,
-            inertia_tensor,
-            principal_moments,
-            principal_axes,
-            radius_of_gyration,
-        });
+            // Compute principal moments and axes (eigenvalues/eigenvectors)
+            let (principal_moments, principal_axes) = compute_principal_inertia(&inertia_tensor);
+
+            // Radius of gyration
+            let radius_of_gyration = Vector3::new(
+                (principal_moments.x / mass).sqrt(),
+                (principal_moments.y / mass).sqrt(),
+                (principal_moments.z / mass).sqrt(),
+            );
+
+            self.cached_mass_props = Some(SolidMassProperties {
+                volume,
+                mass,
+                center_of_mass,
+                inertia_tensor,
+                principal_moments,
+                principal_axes,
+                radius_of_gyration,
+            });
+        }
 
         Ok(self
             .cached_mass_props
             .as_ref()
-            .expect("cached_mass_props was assigned to Some(..) immediately above"))
+            .expect("cached_mass_props populated above when None"))
     }
 
     /// Transform solid
