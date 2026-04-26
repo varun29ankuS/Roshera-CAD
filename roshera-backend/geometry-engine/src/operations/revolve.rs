@@ -732,15 +732,16 @@ fn create_degenerate_edge(
     vertex: VertexId,
     _end_vertex: VertexId,
 ) -> OperationResult<EdgeId> {
-    // use crate::primitives::curve::Point as PointCurve; // TODO: Implement Point curve type
-
     let vertex_data = model
         .vertices
         .get(vertex)
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
 
-    // let point_curve = PointCurve::new(Point3::from(vertex_data.position));
-    // For now, use a line with same start and end point as a degenerate curve
+    // Represent a point-edge with a zero-length Line (start == end). The kernel
+    // does not maintain a dedicated Point curve type because every consumer of
+    // a degenerate edge must also handle the zero-arc-length case on regular
+    // curves; collapsing both paths to a single Line implementation keeps
+    // intersection / projection / parameter-mapping logic uniform.
     use crate::primitives::curve::Line;
     let point = Vector3::from(vertex_data.position);
     let point_curve = Line::new(point, point);
@@ -846,26 +847,6 @@ fn validate_revolved_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
     }
 
     Ok(())
-}
-
-/// Placeholder for surface of revolution
-#[derive(Debug, Clone)]
-pub struct RevolutionSurface {
-    pub profile_curve: u32,
-    pub axis_origin: Point3,
-    pub axis_direction: Vector3,
-}
-
-/// Placeholder for point curve
-#[derive(Debug, Clone)]
-pub struct Point {
-    pub position: Point3,
-}
-
-impl Point {
-    pub fn new(position: Point3) -> Self {
-        Self { position }
-    }
 }
 
 // #[cfg(test)]

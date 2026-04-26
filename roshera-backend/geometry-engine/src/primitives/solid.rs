@@ -13,7 +13,7 @@
 use crate::math::{consts, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
-    edge::{EdgeId, EdgeStore},
+    edge::EdgeStore,
     face::{FaceId, FaceStore},
     r#loop::LoopStore,
     shell::{MassProperties, ShellId, ShellStore},
@@ -593,101 +593,12 @@ impl Solid {
         Ok(())
     }
 
-    /// Create fillet on edges
-    pub fn fillet_edges(&mut self, _edge_ids: &[EdgeId], radius: f64) -> MathResult<Vec<FaceId>> {
-        // Placeholder for fillet operation
-        let new_faces = Vec::new();
-
-        // Create feature
-        let feature = Feature {
-            id: self
-                .features
-                .read()
-                .expect("solid features RwLock poisoned")
-                .len() as u32,
-            feature_type: FeatureType::Fillet,
-            faces: new_faces.clone(),
-            parent: None,
-            parameters: {
-                let mut params = HashMap::new();
-                params.insert("radius".to_string(), radius);
-                params
-            },
-            suppressed: false,
-        };
-
-        self.add_feature(feature);
-        self.invalidate_cache();
-
-        Ok(new_faces)
-    }
-
-    /// Create chamfer on edges
-    pub fn chamfer_edges(
-        &mut self,
-        _edge_ids: &[EdgeId],
-        distance: f64,
-        angle: f64,
-    ) -> MathResult<Vec<FaceId>> {
-        // Placeholder for chamfer operation
-        let new_faces = Vec::new();
-
-        // Create feature
-        let feature = Feature {
-            id: self
-                .features
-                .read()
-                .expect("solid features RwLock poisoned")
-                .len() as u32,
-            feature_type: FeatureType::Chamfer,
-            faces: new_faces.clone(),
-            parent: None,
-            parameters: {
-                let mut params = HashMap::new();
-                params.insert("distance".to_string(), distance);
-                params.insert("angle".to_string(), angle);
-                params
-            },
-            suppressed: false,
-        };
-
-        self.add_feature(feature);
-        self.invalidate_cache();
-
-        Ok(new_faces)
-    }
-
-    /// Shell operation (hollow out solid)
-    pub fn shell_operation(
-        &mut self,
-        thickness: f64,
-        _faces_to_remove: &[FaceId],
-    ) -> MathResult<()> {
-        // Placeholder for shell operation
-        self.invalidate_cache();
-
-        // Create feature
-        let feature = Feature {
-            id: self
-                .features
-                .read()
-                .expect("solid features RwLock poisoned")
-                .len() as u32,
-            feature_type: FeatureType::Shell,
-            faces: Vec::new(),
-            parent: None,
-            parameters: {
-                let mut params = HashMap::new();
-                params.insert("thickness".to_string(), thickness);
-                params
-            },
-            suppressed: false,
-        };
-
-        self.add_feature(feature);
-
-        Ok(())
-    }
+    // Note: fillet, chamfer, and shell are not exposed as Solid methods.
+    // The kernel routes those through `crate::operations::{fillet,chamfer,shell}`
+    // which operate on a `BRepModel` (the only place that owns the topology
+    // stores needed to mutate edges/faces/loops). A method on `Solid` would
+    // duplicate the entry point and could only ever record a Feature without
+    // updating the actual geometry — see commit history.
 
     /// Build collision tree for fast intersection tests
     pub fn build_collision_tree(&mut self) -> MathResult<()> {
