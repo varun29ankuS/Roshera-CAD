@@ -341,11 +341,10 @@ impl PatternOperations {
         // Transform entities
         let mirrored_entities = self.transform_entities(&entities, &transform)?;
 
-        let pattern_entities = if keep_original {
-            vec![mirrored_entities]
-        } else {
-            vec![mirrored_entities] // Original will be replaced
-        };
+        // Caller controls original retention via the source vec separately;
+        // this pattern result always contains the mirrored copy.
+        let pattern_entities = vec![mirrored_entities];
+        let _ = keep_original;
 
         let total_created = pattern_entities.iter().map(|v| v.len()).sum();
 

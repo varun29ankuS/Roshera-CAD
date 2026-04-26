@@ -1081,14 +1081,10 @@ impl Curve for Arc {
 
         // Higher derivatives follow the pattern
         for n in 4..=order {
-            let sign = if n % 4 == 0 {
-                1.0
-            } else if n % 4 == 1 {
-                -1.0
-            } else if n % 4 == 2 {
-                -1.0
-            } else {
-                1.0
+            // Sign cycles {+, -, -, +} every 4 derivatives (d^n/dx^n cos/sin pattern)
+            let sign = match n % 4 {
+                0 | 3 => 1.0,
+                _ => -1.0,
             };
             let (sin_part, cos_part) = if n % 2 == 0 {
                 (cos_a, sin_a)
@@ -3724,14 +3720,10 @@ impl Curve for Ellipse {
 
         // Higher order derivatives for ellipse follow pattern (3rd and beyond)
         for i in 3..=order {
-            let factor = if i % 4 == 0 {
-                1.0
-            } else if i % 4 == 1 {
-                -1.0
-            } else if i % 4 == 2 {
-                -1.0
-            } else {
-                1.0
+            // Sign cycles {+, -, -, +} every 4 derivatives
+            let factor = match i % 4 {
+                0 | 3 => 1.0,
+                _ => -1.0,
             };
             let trig_factor = if i % 2 == 0 { cos_t } else { sin_t };
 

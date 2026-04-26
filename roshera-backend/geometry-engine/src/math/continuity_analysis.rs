@@ -233,9 +233,11 @@ pub fn analyze_nurbs_curve_continuity(
         });
     }
 
-    // Adjust second derivatives for direction
-    let accel1 = if at_end1 { deriv2_1 } else { deriv2_1 };
-    let accel2 = if at_start2 { deriv2_2 } else { deriv2_2 };
+    // Second derivatives are direction-independent (curvature vector
+    // depends on |C'|^3, sign cancels). The at_end1 / at_start2 flags
+    // are unused here — kept for future tangent-direction work.
+    let accel1 = deriv2_1;
+    let accel2 = deriv2_2;
 
     // Compute curvature vectors
     let kappa1 = tangent1.cross(&accel1) / speed1.powi(3);
