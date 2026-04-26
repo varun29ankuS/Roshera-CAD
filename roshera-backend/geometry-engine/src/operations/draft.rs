@@ -560,13 +560,11 @@ fn create_drafted_edge(
     let start_vertex = model
         .vertices
         .get(original_edge.start_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
-        .clone();
+        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
     let end_vertex = model
         .vertices
         .get(original_edge.end_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?
-        .clone();
+        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
 
     // Calculate draft transformation
     let draft_transform = create_draft_transform_matrix(draft_direction, draft_angle);
@@ -963,7 +961,7 @@ fn draft_single_face_tangent(
             for w in curve.points.windows(2) {
                 let seg = w[1].position - w[0].position;
                 if let Ok(unit) = seg.normalize() {
-                    avg_tangent = avg_tangent + unit;
+                    avg_tangent += unit;
                 }
             }
             let avg_tangent = avg_tangent.normalize().unwrap_or(Vector3::X);

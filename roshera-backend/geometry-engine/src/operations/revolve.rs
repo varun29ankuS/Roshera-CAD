@@ -162,7 +162,7 @@ fn create_revolution(
             edge_id,
             true, // Assuming forward orientation
             options.axis_origin,
-            options.axis_direction.clone(),
+            options.axis_direction,
             options.angle,
             options.segments,
         )?;
@@ -406,13 +406,11 @@ fn create_revolution_segment_face(
     let start_vertex = model
         .vertices
         .get(edge.start_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
-        .clone();
+        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
     let end_vertex = model
         .vertices
         .get(edge.end_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?
-        .clone();
+        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
 
     // Create rotated vertices
     let rotation_start = Matrix4::from_axis_angle(&axis_direction, start_angle)?;
@@ -599,7 +597,7 @@ fn create_rotated_edge(
         new_end,
         new_curve_id,
         edge.orientation,
-        edge.param_range.clone(),
+        edge.param_range,
     );
     let edge_id = model.edges.add(new_edge);
 
@@ -703,7 +701,7 @@ fn create_transformed_face(
             new_end,
             new_curve_id,
             edge.orientation,
-            edge.param_range.clone(),
+            edge.param_range,
         );
         let new_edge_id = model.edges.add(new_edge);
 

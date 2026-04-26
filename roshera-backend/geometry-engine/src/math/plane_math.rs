@@ -236,7 +236,7 @@ impl Plane {
 
         let t = -(self.normal.dot(start) + self.distance) / denom;
 
-        if t >= 0.0 && t <= 1.0 {
+        if (0.0..=1.0).contains(&t) {
             Some(t)
         } else {
             None

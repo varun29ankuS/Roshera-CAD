@@ -312,6 +312,12 @@ struct ValidationProgress {
     pub total_items: usize,
 }
 
+impl Default for ParallelValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParallelValidator {
     pub fn new() -> Self {
         Self {
@@ -341,7 +347,7 @@ impl ParallelValidator {
             context.record_phase("geometry", phase_start.elapsed());
             results
         } else {
-            GeometryValidationResults::default()
+            GeometryValidationResults
         };
 
         // Phase 3: Deep validation (if needed)
@@ -352,7 +358,7 @@ impl ParallelValidator {
             context.record_phase("deep", phase_start.elapsed());
             results
         } else {
-            DeepValidationResults::default()
+            DeepValidationResults
         };
 
         // Combine results
@@ -457,7 +463,7 @@ impl ParallelValidator {
         _tolerance: Tolerance,
     ) -> GeometryValidationResults {
         // Parallel geometry validation
-        GeometryValidationResults::default()
+        GeometryValidationResults
     }
 
     fn validate_deep_parallel(
@@ -466,7 +472,7 @@ impl ParallelValidator {
         _tolerance: Tolerance,
     ) -> DeepValidationResults {
         // Deep validation including numerical checks
-        DeepValidationResults::default()
+        DeepValidationResults
     }
 
     fn analyze_edge_usage_parallel(&self, model: &BRepModel) -> DashMap<EdgeId, EdgeUsage> {
@@ -594,7 +600,7 @@ impl ParallelValidator {
 
             let v = vertex_set.len() as i32;
             let e = edge_set.len() as i32;
-            let f = face_count as i32;
+            let f = face_count;
             let euler = v - e + f;
 
             // For a simple closed solid, Euler characteristic should be 2
@@ -743,8 +749,8 @@ impl ParallelValidator {
                             location: EntityLocation {
                                 solid_id: None,
                                 shell_id: None,
-                                face_id: usage.faces.get(0).copied(),
-                                loop_id: usage.loops.get(0).copied(),
+                                face_id: usage.faces.first().copied(),
+                                loop_id: usage.loops.first().copied(),
                                 edge_id: Some(edge_id),
                                 vertex_id: None,
                             },
@@ -1002,7 +1008,7 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
                                 loop_data.orientations.get(i).copied().unwrap_or(true);
                             face_adjacency
                                 .entry(edge_id)
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push((face_id, orientation));
                         }
                     }
@@ -1056,7 +1062,7 @@ pub fn create_certificate(
         level,
         model_hash: calculate_model_hash(model),
         validator_version: env!("CARGO_PKG_VERSION").to_string(),
-        signature: generate_signature(model, &validation), // SHA256 signature
+        signature: generate_signature(model, validation), // SHA256 signature
     })
 }
 

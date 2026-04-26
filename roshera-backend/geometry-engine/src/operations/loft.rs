@@ -977,9 +977,9 @@ fn compute_planar_surface(
     // Compute centroid
     let mut centroid = Point3::new(0.0, 0.0, 0.0);
     for &p in &pts {
-        centroid = centroid + p;
+        centroid += p;
     }
-    centroid = centroid * (1.0 / n as f64);
+    centroid *= 1.0 / n as f64;
 
     // Newell's method for area-weighted normal
     let mut nx = 0.0f64;

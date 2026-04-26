@@ -31,7 +31,7 @@ impl Tolerance {
     /// Create tolerance from distance only (uses default angle)
     #[inline]
     pub const fn from_distance(distance: f64) -> Self {
-        Self::new(distance, 0.001745329251994330) // ~0.1 degrees
+        Self::new(distance, 0.001_745_329_251_994_33) // ~0.1 degrees
     }
 
     /// Get distance tolerance
@@ -286,37 +286,37 @@ impl From<ToleranceEx> for Tolerance {
 /// Strict tolerance for critical operations (1 nanometer)
 pub const STRICT_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-9,
-    angle: 1.745329251994330e-5, // ~0.001 degrees
+    angle: 1.745_329_251_994_33e-5, // ~0.001 degrees
 };
 
 /// Normal tolerance for general operations (1 micrometer)
 pub const NORMAL_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-6,
-    angle: 1.745329251994330e-3, // ~0.1 degrees
+    angle: 1.745_329_251_994_33e-3, // ~0.1 degrees
 };
 
 /// Loose tolerance for visualization and approximation (1 millimeter)
 pub const LOOSE_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-3,
-    angle: 1.745329251994330e-2, // ~1 degree
+    angle: 1.745_329_251_994_33e-2, // ~1 degree
 };
 
 /// Ultra-precision tolerance for critical aerospace (0.1 nanometer)
 pub const ULTRA_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-10,
-    angle: 1.745329251994330e-6, // ~0.0001 degrees
+    angle: 1.745_329_251_994_33e-6, // ~0.0001 degrees
 };
 
 /// Manufacturing tolerance for aerospace machining (0.1 millimeter)  
 pub const MANUFACTURING_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-4,
-    angle: 1.745329251994330e-3, // ~0.1 degrees
+    angle: 1.745_329_251_994_33e-3, // ~0.1 degrees
 };
 
 /// Special tolerance for boolean operations
 pub const BOOLEAN_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-8,
-    angle: 1.745329251994330e-4, // ~0.01 degrees
+    angle: 1.745_329_251_994_33e-4, // ~0.01 degrees
 };
 
 /// Tolerance context for hierarchical tolerance management

@@ -1037,13 +1037,13 @@ impl FaceStore {
         // Update indices - expensive DashMap operations
         self.surface_to_faces
             .entry(face.surface_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(face.id);
 
         for &loop_id in &face.all_loops() {
             self.loop_to_faces
                 .entry(loop_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(face.id);
         }
 

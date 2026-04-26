@@ -338,10 +338,8 @@ fn intersect_line_line(
             let p_on_2 = p3 + b * t;
 
             if (p_on_1 - p_on_2).magnitude() < tolerance.distance()
-                && s >= -PARAMETRIC_TOLERANCE
-                && s <= 1.0 + PARAMETRIC_TOLERANCE
-                && t >= -PARAMETRIC_TOLERANCE
-                && t <= 1.0 + PARAMETRIC_TOLERANCE
+                && (-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&s)
+                && (-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&t)
             {
                 // Valid intersection
                 let s_clamped = s.clamp(0.0, 1.0);
@@ -377,10 +375,8 @@ fn intersect_line_line(
     let t = (a.x * c.y - a.y * c.x) / denom;
 
     // Check if intersection point is within both line segments
-    if s >= -PARAMETRIC_TOLERANCE
-        && s <= 1.0 + PARAMETRIC_TOLERANCE
-        && t >= -PARAMETRIC_TOLERANCE
-        && t <= 1.0 + PARAMETRIC_TOLERANCE
+    if (-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&s)
+        && (-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&t)
     {
         // Verify in 3D
         let p_on_1 = p1 + a * s;
@@ -568,7 +564,7 @@ fn line_arc_hits(line: &Line, arc: &Arc, tolerance: Tolerance) -> Vec<LineArcHit
             &[-b / (2.0 * a)][..]
         };
         for &s in roots {
-            if s < -PARAMETRIC_TOLERANCE || s > 1.0 + PARAMETRIC_TOLERANCE {
+            if !(-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&s) {
                 continue;
             }
             let s_clamped = s.clamp(0.0, 1.0);
@@ -584,7 +580,7 @@ fn line_arc_hits(line: &Line, arc: &Arc, tolerance: Tolerance) -> Vec<LineArcHit
         }
     } else {
         let s = (arc.center - p0).dot(&n) / denom;
-        if s < -PARAMETRIC_TOLERANCE || s > 1.0 + PARAMETRIC_TOLERANCE {
+        if !(-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&s) {
             return hits;
         }
         let s_clamped = s.clamp(0.0, 1.0);
@@ -1084,7 +1080,7 @@ fn intersect_curve_plane(
         let t = numerator / denominator;
 
         // Check if intersection is within edge bounds
-        if t >= -PARAMETRIC_TOLERANCE && t <= 1.0 + PARAMETRIC_TOLERANCE {
+        if (-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&t) {
             let t_clamped = t.clamp(0.0, 1.0);
             let intersection_point = start_point + (end_point - start_point) * t_clamped;
             let curve_param = edge.param_range.start
@@ -1199,7 +1195,7 @@ fn surface_uv_for_point(
 /// path (allowing a small parametric slop at the endpoints).
 #[inline]
 fn line_local_param_in_bounds(t: f64) -> bool {
-    t >= -PARAMETRIC_TOLERANCE && t <= 1.0 + PARAMETRIC_TOLERANCE
+    (-PARAMETRIC_TOLERANCE..=1.0 + PARAMETRIC_TOLERANCE).contains(&t)
 }
 
 /// Solutions of `a t² + b t + c = 0` returned as a small vector of real
@@ -1696,8 +1692,8 @@ fn intersect_plane_plane(
     // For bounded planes, we need to find where the line intersects the boundaries
     // For now, create a large line segment
     let t_extent = 1000.0; // Large extent
-    let start_point = point_on_line - Vector3::from(line_direction) * t_extent;
-    let end_point = point_on_line + Vector3::from(line_direction) * t_extent;
+    let start_point = point_on_line - line_direction * t_extent;
+    let end_point = point_on_line + line_direction * t_extent;
 
     let intersection_line = Box::new(Line::new(start_point, end_point));
 

@@ -873,7 +873,7 @@ impl Surface for Plane {
     }
 
     fn clone_box(&self) -> Box<dyn Surface> {
-        Box::new(self.clone())
+        Box::new(*self)
     }
 
     fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
@@ -965,7 +965,7 @@ impl Surface for Plane {
         Ok(OffsetSurface {
             surface: Box::new(offset_plane),
             quality: OffsetQuality::Exact,
-            original: Box::new(self.clone()),
+            original: Box::new(*self),
             distance,
         })
     }
@@ -1155,7 +1155,7 @@ impl Plane {
 
             // Mark nearby points as processed
             for (j, point) in initial_points.iter().enumerate() {
-                if !processed[j] && self.points_are_near(&start_point, point, tolerance) {
+                if !processed[j] && self.points_are_near(start_point, point, tolerance) {
                     processed[j] = true;
                 }
             }
@@ -1481,7 +1481,7 @@ impl Surface for Cylinder {
     }
 
     fn clone_box(&self) -> Box<dyn Surface> {
-        Box::new(self.clone())
+        Box::new(*self)
     }
 
     fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
@@ -1676,7 +1676,7 @@ impl Surface for Cylinder {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        let mut offset_cyl = self.clone();
+        let mut offset_cyl = *self;
         offset_cyl.radius += distance;
         Box::new(offset_cyl)
     }
@@ -1701,7 +1701,7 @@ impl Surface for Cylinder {
         Ok(OffsetSurface {
             surface: Box::new(offset_cylinder),
             quality: OffsetQuality::Exact,
-            original: Box::new(self.clone()),
+            original: Box::new(*self),
             distance,
         })
     }
@@ -2248,7 +2248,7 @@ impl Surface for Sphere {
     }
 
     fn clone_box(&self) -> Box<dyn Surface> {
-        Box::new(self.clone())
+        Box::new(*self)
     }
 
     fn is_closed_u(&self) -> bool {
@@ -2393,7 +2393,7 @@ impl Surface for Sphere {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        let mut offset_sphere = self.clone();
+        let mut offset_sphere = *self;
         offset_sphere.radius += distance;
         Box::new(offset_sphere)
     }
@@ -2417,7 +2417,7 @@ impl Surface for Sphere {
         Ok(OffsetSurface {
             surface: Box::new(offset_sphere),
             quality: OffsetQuality::Exact,
-            original: Box::new(self.clone()),
+            original: Box::new(*self),
             distance,
         })
     }
@@ -2782,7 +2782,7 @@ impl Cone {
         Ok(OffsetSurface {
             surface: Box::new(general_nurbs),
             quality: OffsetQuality::Approximate { max_error: 1e-3 },
-            original: Box::new(self.clone()),
+            original: Box::new(*self),
             distance,
         })
     }
@@ -2798,7 +2798,7 @@ impl Surface for Cone {
     }
 
     fn clone_box(&self) -> Box<dyn Surface> {
-        Box::new(self.clone())
+        Box::new(*self)
     }
 
     fn is_closed_u(&self) -> bool {
@@ -2938,7 +2938,7 @@ impl Surface for Cone {
         let offset_angle =
             ((self.half_angle.sin() + distance / self.half_angle.cos()).asin()).abs();
 
-        let mut offset_cone = self.clone();
+        let mut offset_cone = *self;
         offset_cone.half_angle = offset_angle;
         Box::new(offset_cone)
     }
@@ -2980,7 +2980,7 @@ impl Surface for Cone {
         Ok(OffsetSurface {
             surface: Box::new(offset_cone),
             quality: OffsetQuality::Exact,
-            original: Box::new(self.clone()),
+            original: Box::new(*self),
             distance,
         })
     }
@@ -3458,7 +3458,7 @@ impl Surface for Torus {
     }
 
     fn clone_box(&self) -> Box<dyn Surface> {
-        Box::new(self.clone())
+        Box::new(*self)
     }
 
     fn is_closed_u(&self) -> bool {
@@ -3623,7 +3623,7 @@ impl Surface for Torus {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        let mut offset_torus = self.clone();
+        let mut offset_torus = *self;
         offset_torus.minor_radius += distance;
         Box::new(offset_torus)
     }
@@ -3648,7 +3648,7 @@ impl Surface for Torus {
         Ok(OffsetSurface {
             surface: Box::new(offset_torus),
             quality: OffsetQuality::Exact,
-            original: Box::new(self.clone()),
+            original: Box::new(*self),
             distance,
         })
     }
@@ -4091,10 +4091,7 @@ impl SurfaceContinuity {
             // Check G1 continuity (tangent/normal)
             let normal1 = surface1.normal_at(u1, v1)?;
             let normal2 = surface2.normal_at(u2, v2)?;
-            let angle = match normal1.angle(&normal2) {
-                Ok(a) => a,
-                Err(_) => 0.0, // Use 0 angle if vectors are degenerate
-            };
+            let angle = normal1.angle(&normal2).unwrap_or(0.0);
             max_angle = f64::max(max_angle, angle);
             if angle > tolerance.angle() {
                 g1_valid = false;
@@ -4147,10 +4144,7 @@ impl SurfaceContinuity {
         let g0_valid = position_error <= tolerance.distance();
 
         // G1 analysis (tangent/normal continuity)
-        let normal_angle = match normal1.angle(&normal2) {
-            Ok(a) => a,
-            Err(_) => 0.0, // Default to 0 angle if vectors are degenerate
-        };
+        let normal_angle = normal1.angle(&normal2).unwrap_or(0.0);
         let g1_valid = normal_angle <= tolerance.angle();
 
         // G2 analysis (curvature continuity)

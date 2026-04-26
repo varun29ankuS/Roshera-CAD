@@ -675,11 +675,7 @@ impl NurbsCurve {
                             0
                         }
                     } else {
-                        if self.degree >= r {
-                            self.degree - r
-                        } else {
-                            0
-                        }
+                        self.degree.saturating_sub(r)
                     };
 
                     for j in j1..=j2 {
@@ -708,9 +704,7 @@ impl NurbsCurve {
                     ders[k][r] = d;
 
                     // Swap s1 and s2
-                    let temp = s1;
-                    s1 = s2;
-                    s2 = temp;
+                    std::mem::swap(&mut s1, &mut s2);
                 }
             }
 
@@ -1029,11 +1023,7 @@ impl NurbsCurve {
                         0
                     }
                 } else {
-                    if self.degree >= r {
-                        self.degree - r
-                    } else {
-                        0
-                    }
+                    self.degree.saturating_sub(r)
                 };
 
                 for j in j1..=j2 {
@@ -2547,7 +2537,7 @@ pub fn interpolate_nurbs_curve(
     // In practice, would solve N * P = Q for control points P
     let weights = vec![1.0; points.len()];
 
-    Ok(NurbsCurve::new(points.to_vec(), weights, knots, degree)?)
+    NurbsCurve::new(points.to_vec(), weights, knots, degree)
 }
 
 /// Parameterization types for interpolation

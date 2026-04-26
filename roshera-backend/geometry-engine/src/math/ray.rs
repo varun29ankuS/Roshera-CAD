@@ -256,7 +256,7 @@ impl Ray {
         let u = f * s.dot(&h);
 
         // Check if intersection is outside triangle (u coordinate)
-        if u < 0.0 || u > 1.0 {
+        if !(0.0..=1.0).contains(&u) {
             return None;
         }
 

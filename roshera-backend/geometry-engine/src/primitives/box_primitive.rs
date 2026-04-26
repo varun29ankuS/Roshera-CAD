@@ -60,7 +60,7 @@ impl BoxBuilder {
 
     /// Set box center position
     pub fn center(mut self, center: Point3) -> Self {
-        let translation = Matrix4::from_translation(&Vector3::from(center));
+        let translation = Matrix4::from_translation(&center);
         if let Some(transform) = self.params.transform.as_mut() {
             // Combine with existing transform preserving rotation/scale
             *transform = translation * *transform;
@@ -558,7 +558,7 @@ impl Primitive for BoxPrimitive {
         let solid = model
             .solids
             .get(solid_id)
-            .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
 
         // Collect all vertices from the solid's shell faces
         let shell =
@@ -626,7 +626,7 @@ impl Primitive for BoxPrimitive {
         let solid = model
             .solids
             .get(solid_id)
-            .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
         entities_checked += 1;
 
         // Skip primitive type check since we don't have that method

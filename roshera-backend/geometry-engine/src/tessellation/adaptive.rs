@@ -351,9 +351,9 @@ pub fn delaunay_triangulate(points: &[Point3], normal: &Vector3) -> Vec<[u32; 3]
         .collect();
 
     // Perform Bowyer-Watson algorithm for Delaunay triangulation
-    let triangles = bowyer_watson_2d(&points_2d);
+    
 
-    triangles
+    bowyer_watson_2d(&points_2d)
 }
 
 /// Compute orthonormal axes for a plane given its normal
@@ -562,7 +562,7 @@ pub fn optimize_mesh(mesh: &mut TriangleMesh) {
             let edge = if v1 < v2 { (v1, v2) } else { (v2, v1) };
             edge_triangles
                 .entry(edge)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(tri_idx);
         }
     }
@@ -603,7 +603,7 @@ pub fn optimize_mesh(mesh: &mut TriangleMesh) {
                 let edge = if v1 < v2 { (v1, v2) } else { (v2, v1) };
                 edge_triangles
                     .entry(edge)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(tri_idx);
             }
         }

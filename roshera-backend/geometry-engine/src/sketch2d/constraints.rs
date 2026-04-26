@@ -345,7 +345,7 @@ impl ConstraintStore {
         for entity in &constraint.entities {
             self.entity_constraints
                 .entry(*entity)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(id);
         }
 

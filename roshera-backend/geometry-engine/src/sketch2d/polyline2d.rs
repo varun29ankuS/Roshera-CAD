@@ -617,7 +617,7 @@ impl Polyline2dStore {
             for y in min_grid_y..=max_grid_y {
                 self.spatial_index
                     .entry((x, y))
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(id);
             }
         }

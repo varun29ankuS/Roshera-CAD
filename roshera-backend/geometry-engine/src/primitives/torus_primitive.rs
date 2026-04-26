@@ -347,11 +347,11 @@ impl TorusPrimitive {
             + y_dir * (params.major_radius * sin_u);
 
         let radial_dir = ref_dir * cos_u + y_dir * sin_u;
-        let position = major_point
-            + radial_dir * (params.minor_radius * cos_v)
-            + params.axis * (params.minor_radius * sin_v);
+        
 
-        position
+        major_point
+            + radial_dir * (params.minor_radius * cos_v)
+            + params.axis * (params.minor_radius * sin_v)
     }
 
     /// Create arc along major circle

@@ -3447,7 +3447,7 @@ fn compute_edge_intersections(
                 continue;
             }
             let local_t = (*param - remaining_edge.param_range.start) / range_len;
-            if local_t < 0.01 || local_t > 0.99 {
+            if !(0.01..=0.99).contains(&local_t) {
                 // Too close to endpoint, snap to existing vertex
                 continue;
             }
@@ -3607,7 +3607,7 @@ fn find_or_create_intersection_vertex(
 ) -> VertexId {
     // Check existing graph nodes for a nearby vertex already in the model
     let tol_sq = tolerance.distance() * tolerance.distance();
-    for (&vid, _node) in &graph.nodes {
+    for &vid in graph.nodes.keys() {
         if vid == 0 || vid == u32::MAX {
             continue;
         }
@@ -3788,7 +3788,7 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
             if let Some(curve) = model.curves.get(edge.curve_id) {
                 let t_mid = (edge.param_range.start + edge.param_range.end) * 0.5;
                 if let Ok(pt) = curve.point_at(t_mid) {
-                    sum = sum + Vector3::new(pt.x, pt.y, pt.z);
+                    sum += Vector3::new(pt.x, pt.y, pt.z);
                     count += 1;
                 }
             }

@@ -782,7 +782,7 @@ impl Curve for Line {
             let t1 = d3.cross(&d2).dot(&cross_d1_d2) / denom;
             let t2 = d3.cross(&d1).dot(&cross_d1_d2) / denom;
 
-            if t1 >= 0.0 && t1 <= 1.0 && t2 >= 0.0 && t2 <= 1.0 {
+            if (0.0..=1.0).contains(&t1) && (0.0..=1.0).contains(&t2) {
                 let point = *p1 + d1 * t1;
                 return vec![CurveIntersection {
                     t1,
@@ -824,7 +824,7 @@ impl Curve for Line {
             let t2 = (-b + sqrt_disc) / (2.0 * a);
 
             for t in [t1, t2] {
-                if t >= 0.0 && t <= 1.0 {
+                if (0.0..=1.0).contains(&t) {
                     let point = self.start + line_dir * t;
                     // Check if point is on arc
                     let to_point = point - arc.center;
@@ -898,7 +898,7 @@ impl Curve for Line {
         let d = -plane_normal.dot(&plane.origin);
         let t = (-d - self.start.dot(&plane_normal)) / denom;
 
-        if t >= 0.0 && t <= 1.0 {
+        if (0.0..=1.0).contains(&t) {
             vec![t]
         } else {
             vec![]
@@ -1605,7 +1605,7 @@ impl Arc {
         let t_values = [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)];
 
         for t_line in t_values {
-            if t_line >= 0.0 && t_line <= 1.0 {
+            if (0.0..=1.0).contains(&t_line) {
                 let point_on_circle = start_in_plane + dir_in_plane * t_line;
 
                 // Check if point is within arc's angle range
@@ -1798,7 +1798,7 @@ impl Arc {
                 let t1 = (angle - angle1_start) / self.sweep_angle;
                 let t2 = (angle - angle2_start) / other.sweep_angle;
 
-                if t1 >= 0.0 && t1 <= 1.0 && t2 >= 0.0 && t2 <= 1.0 {
+                if (0.0..=1.0).contains(&t1) && (0.0..=1.0).contains(&t2) {
                     let point = match self.evaluate(t1) {
                         Ok(p) => p.position,
                         Err(_) => continue,
@@ -2673,7 +2673,7 @@ impl NurbsCurve {
         // Filter roots in [0,1] interval
         let valid_roots: Vec<f64> = roots
             .into_iter()
-            .filter(|&t| t >= 0.0 && t <= 1.0)
+            .filter(|&t| (0.0..=1.0).contains(&t))
             .collect();
 
         Some(valid_roots)
@@ -3345,12 +3345,12 @@ impl NurbsCurve {
         // Equal weights for rational curve
         let weights = vec![1.0; n];
 
-        Ok(NurbsCurve::new(
+        NurbsCurve::new(
             actual_degree,
             points.to_vec(),
             weights,
             knots,
-        )?)
+        )
     }
 }
 

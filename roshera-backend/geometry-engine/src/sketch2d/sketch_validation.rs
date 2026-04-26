@@ -473,12 +473,12 @@ impl SketchValidator {
         // Add all entity types
         for entry in sketch.lines().iter() {
             let (min, max) = entry.value().bounding_box();
-            entities.push((EntityRef::Line(entry.key().clone()), min, max));
+            entities.push((EntityRef::Line(*entry.key()), min, max));
         }
 
         for entry in sketch.arcs().iter() {
             let (min, max) = entry.value().bounding_box();
-            entities.push((EntityRef::Arc(entry.key().clone()), min, max));
+            entities.push((EntityRef::Arc(*entry.key()), min, max));
         }
 
         // Add other entity types...
@@ -538,7 +538,7 @@ impl SketchValidator {
             for entity in &constraint.entities {
                 entity_constraints
                     .entry(*entity)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(constraint.id);
             }
         }
@@ -625,7 +625,7 @@ impl SketchValidator {
                 }
 
                 // Check loop nesting
-                for (_i, region) in topology.regions().iter().enumerate() {
+                for region in topology.regions().iter() {
                     for &inner_loop in &region.inner_loops {
                         // Verify proper nesting
                         if !self.is_loop_inside_loop(
@@ -746,7 +746,7 @@ impl SketchValidator {
         let t1 = d3.cross(&d2) / cross;
         let t2 = d3.cross(&d1) / cross;
 
-        if t1 >= 0.0 && t1 <= 1.0 && t2 >= 0.0 && t2 <= 1.0 {
+        if (0.0..=1.0).contains(&t1) && (0.0..=1.0).contains(&t2) {
             Some(Point2d::new(p1.x + t1 * d1.x, p1.y + t1 * d1.y))
         } else {
             None
@@ -1013,7 +1013,7 @@ pub mod analysis_tools {
                     .push("Resolve conflicting constraints for better stability".to_string());
             }
 
-            if constraint_analysis.under_constrained_entities.len() > 0 {
+            if !constraint_analysis.under_constrained_entities.is_empty() {
                 recommendations.push("Some entities need additional constraints".to_string());
             }
 
@@ -1120,7 +1120,7 @@ pub mod analysis_tools {
         // Helper methods for constraint analysis
         fn analyze_points_constraints(&self, sketch: &Sketch, analysis: &mut ConstraintAnalysis) {
             for point_entry in sketch.points().iter() {
-                let entity_ref = EntityRef::Point(point_entry.key().clone());
+                let entity_ref = EntityRef::Point(*point_entry.key());
                 let status = self.get_entity_constraint_status(sketch, &entity_ref);
 
                 match status {
@@ -1137,7 +1137,7 @@ pub mod analysis_tools {
 
         fn analyze_lines_constraints(&self, sketch: &Sketch, analysis: &mut ConstraintAnalysis) {
             for line_entry in sketch.lines().iter() {
-                let entity_ref = EntityRef::Line(line_entry.key().clone());
+                let entity_ref = EntityRef::Line(*line_entry.key());
                 let status = self.get_entity_constraint_status(sketch, &entity_ref);
 
                 match status {
@@ -1154,7 +1154,7 @@ pub mod analysis_tools {
 
         fn analyze_arcs_constraints(&self, sketch: &Sketch, analysis: &mut ConstraintAnalysis) {
             for arc_entry in sketch.arcs().iter() {
-                let entity_ref = EntityRef::Arc(arc_entry.key().clone());
+                let entity_ref = EntityRef::Arc(*arc_entry.key());
                 let status = self.get_entity_constraint_status(sketch, &entity_ref);
 
                 match status {
@@ -1171,7 +1171,7 @@ pub mod analysis_tools {
 
         fn analyze_circles_constraints(&self, sketch: &Sketch, analysis: &mut ConstraintAnalysis) {
             for circle_entry in sketch.circles().iter() {
-                let entity_ref = EntityRef::Circle(circle_entry.key().clone());
+                let entity_ref = EntityRef::Circle(*circle_entry.key());
                 let status = self.get_entity_constraint_status(sketch, &entity_ref);
 
                 match status {
@@ -1207,7 +1207,7 @@ pub mod analysis_tools {
 
         // Check all entity types
         for point_entry in sketch.points().iter() {
-            let entity_ref = EntityRef::Point(point_entry.key().clone());
+            let entity_ref = EntityRef::Point(*point_entry.key());
             let status = analyzer.get_entity_constraint_status(sketch, &entity_ref);
 
             match status {

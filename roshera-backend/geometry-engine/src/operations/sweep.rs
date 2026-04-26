@@ -550,7 +550,7 @@ fn compute_twist_at_parameter(t: f64, twist_control: &TwistControl) -> Operation
 
 /// Build sweep transformation matrix
 fn build_sweep_transform(position: Point3, frame: Matrix4, scale: f64, twist: f64) -> Matrix4 {
-    let translation = Matrix4::from_translation(&Vector3::from(position));
+    let translation = Matrix4::from_translation(&position);
     let scaling = Matrix4::from_scale(&Vector3::new(scale, scale, scale));
     let rotation = Matrix4::from_axis_angle(&Vector3::Z, twist).unwrap_or(Matrix4::identity());
 

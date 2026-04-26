@@ -610,15 +610,15 @@ impl EdgeStore {
         // Update indices - expensive DashMap operations
         self.vertex_to_edges
             .entry(edge.start_vertex)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id);
         self.vertex_to_edges
             .entry(edge.end_vertex)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id);
         self.curve_to_edges
             .entry(edge.curve_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id);
 
         // Add to edge cache with consistent vertex ordering

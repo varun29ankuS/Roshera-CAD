@@ -33,11 +33,11 @@ pub struct TessellatedMesh {
 
 /// Global timeline operations cache for high-performance parametric updates
 static TIMELINE_CACHE: LazyLock<DashMap<u64, Vec<TimelineOperation>>> =
-    LazyLock::new(|| DashMap::new());
+    LazyLock::new(DashMap::new);
 
 /// Global geometry parameter cache for fast parameter updates
 static GEOMETRY_PARAMETERS: LazyLock<DashMap<GeometryId, DashMap<String, f64>>> =
-    LazyLock::new(|| DashMap::new());
+    LazyLock::new(DashMap::new);
 
 /// Cache performance statistics for monitoring
 #[derive(Debug, Clone)]
@@ -419,25 +419,25 @@ impl BRepModel {
                 let edge = self.edges.get(edge_id)?;
 
                 // Process start vertex
-                if !vertex_index_map.contains_key(&edge.start_vertex) {
+                if let std::collections::hash_map::Entry::Vacant(e) = vertex_index_map.entry(edge.start_vertex) {
                     if let Some(vertex) = self.vertices.get(edge.start_vertex) {
                         let point = vertex.point();
                         let idx = vertices.len() as u32;
                         vertices.push([point.x as f32, point.y as f32, point.z as f32]);
                         // Initialize with zero normal, will accumulate later
                         normals.push([0.0, 0.0, 0.0]);
-                        vertex_index_map.insert(edge.start_vertex, idx);
+                        e.insert(idx);
                     }
                 }
 
                 // Process end vertex
-                if !vertex_index_map.contains_key(&edge.end_vertex) {
+                if let std::collections::hash_map::Entry::Vacant(e) = vertex_index_map.entry(edge.end_vertex) {
                     if let Some(vertex) = self.vertices.get(edge.end_vertex) {
                         let point = vertex.point();
                         let idx = vertices.len() as u32;
                         vertices.push([point.x as f32, point.y as f32, point.z as f32]);
                         normals.push([0.0, 0.0, 0.0]);
-                        vertex_index_map.insert(edge.end_vertex, idx);
+                        e.insert(idx);
                     }
                 }
             }
@@ -1782,7 +1782,7 @@ impl<'a> TopologyBuilder<'a> {
 
         // Use the full cone implementation
         use crate::primitives::cone_primitive::ConePrimitive;
-        ConePrimitive::create(&params, &mut self.model)
+        ConePrimitive::create(&params, self.model)
     }
 
     // =====================================
@@ -1820,7 +1820,7 @@ impl<'a> TopologyBuilder<'a> {
         let session_id = self.compute_session_id(geometry_id);
         TIMELINE_CACHE
             .entry(session_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(operation);
 
         // Implement actual parameter update logic with dependency tracking

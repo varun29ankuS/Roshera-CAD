@@ -399,7 +399,7 @@ impl Primitive for CylinderPrimitive {
         let solid = model
             .solids
             .get(solid_id)
-            .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
 
         let shell =
             model
@@ -487,7 +487,7 @@ impl Primitive for CylinderPrimitive {
         let solid = model
             .solids
             .get(solid_id)
-            .ok_or_else(|| PrimitiveError::NotFound { solid_id })?;
+            .ok_or(PrimitiveError::NotFound { solid_id })?;
         entities_checked += 1;
 
         // Get topology counts

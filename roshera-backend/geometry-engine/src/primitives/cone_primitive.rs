@@ -163,8 +163,8 @@ impl ConePrimitive {
         let bottom_center = params.apex + params.axis * (bottom_radius / params.half_angle.tan());
         let mut bottom_vertices = Vec::new();
 
-        if !is_full_cone || !has_apex {
-            if !is_full_cone {
+        if (!is_full_cone || !has_apex)
+            && !is_full_cone {
                 // Start and end vertices for sector
                 let start_point = bottom_center
                     + ref_dir * (bottom_radius * start_angle.cos())
@@ -180,7 +180,6 @@ impl ConePrimitive {
                 ));
                 bottom_vertices.push(model.vertices.add(end_point.x, end_point.y, end_point.z));
             }
-        }
 
         // Top circle vertices
         let top_center = params.apex + params.axis * params.height;
