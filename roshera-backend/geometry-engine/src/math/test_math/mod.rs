@@ -24,3 +24,6 @@ mod stress_tests;
 
 #[cfg(test)]
 mod performance_validation;
+
+#[cfg(test)]
+mod harness;
