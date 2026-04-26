@@ -91,8 +91,6 @@ pub enum ScaleControl {
     Linear(f64, f64),
     /// Scale function along path parameter
     Function(Box<dyn Fn(f64) -> f64>),
-    /// Scale to match rail curves
-    Rails,
 }
 
 /// How to control twist along path
@@ -123,7 +121,6 @@ impl std::fmt::Debug for ScaleControl {
             ScaleControl::Constant => write!(f, "Constant"),
             ScaleControl::Linear(s, e) => write!(f, "Linear({}, {})", s, e),
             ScaleControl::Function(_) => write!(f, "Function(<function>)"),
-            ScaleControl::Rails => write!(f, "Rails"),
         }
     }
 }
@@ -539,9 +536,6 @@ fn compute_scale_at_parameter(t: f64, scale_control: &ScaleControl) -> Operation
         ScaleControl::Constant => Ok(1.0),
         ScaleControl::Linear(start, end) => Ok(start + (end - start) * t),
         ScaleControl::Function(func) => Ok(func(t)),
-        ScaleControl::Rails => Err(OperationError::NotImplemented(
-            "Rail-based scaling not yet implemented".to_string(),
-        )),
     }
 }
 

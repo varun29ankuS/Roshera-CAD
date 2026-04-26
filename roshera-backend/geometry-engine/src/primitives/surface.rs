@@ -220,19 +220,12 @@ pub enum SurfaceType {
     Torus,
     // Swept surfaces
     SurfaceOfRevolution,
-    SurfaceOfExtrusion,
-    SweptSurface,
     // Parametric surfaces
     BSpline,
     NURBS,
     // Composite surfaces
     Offset,
-    Blended,
     Ruled,
-    // Special surfaces
-    Helicoid,
-    Paraboloid,
-    Hyperboloid,
 }
 
 /// Surface evaluation result with full differential geometry

@@ -51,8 +51,6 @@ pub enum BlendType {
     G3,
     /// Conic section blend
     Conic(f64), // shape parameter
-    /// Custom blend function
-    Custom,
 }
 
 /// Continuity requirement
@@ -122,11 +120,6 @@ pub fn blend_faces(
         BlendType::G3 => create_g3_blend(model, &face1, &face2, &curve1, &curve2, &options)?,
         BlendType::Conic(shape) => {
             create_conic_blend(model, &face1, &face2, &curve1, &curve2, shape, &options)?
-        }
-        BlendType::Custom => {
-            return Err(OperationError::NotImplemented(
-                "Custom blend not yet implemented".to_string(),
-            ));
         }
     };
 

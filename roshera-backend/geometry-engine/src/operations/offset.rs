@@ -55,8 +55,6 @@ impl Default for OffsetOptions {
 pub enum OffsetType {
     /// Constant distance offset
     Distance(f64),
-    /// Variable distance (function of position)
-    Variable(Box<dyn Fn(Point3) -> f64>),
     /// Different distances per face
     PerFace(std::collections::HashMap<FaceId, f64>),
 }
@@ -65,7 +63,6 @@ impl std::fmt::Debug for OffsetType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OffsetType::Distance(d) => write!(f, "Distance({})", d),
-            OffsetType::Variable(_) => write!(f, "Variable(<function>)"),
             OffsetType::PerFace(map) => write!(f, "PerFace({:?})", map),
         }
     }
@@ -112,11 +109,6 @@ pub fn offset_face(
     // Get offset distance
     let distance = match &options.offset_type {
         OffsetType::Distance(d) => *d,
-        OffsetType::Variable(_) => {
-            return Err(OperationError::NotImplemented(
-                "Variable offset not yet implemented".to_string(),
-            ));
-        }
         OffsetType::PerFace(map) => *map.get(&face_id).unwrap_or(&0.0),
     };
 
