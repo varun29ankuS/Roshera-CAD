@@ -2097,15 +2097,11 @@ impl Cylinder {
 
                     // Simple uniform knot vector
                     let mut knots = Vec::new();
-                    for _ in 0..=degree {
-                        knots.push(0.0);
-                    }
+                    knots.resize(degree + 1, 0.0);
                     for i in 1..n - degree {
                         knots.push(i as f64 / (n - degree) as f64);
                     }
-                    for _ in 0..=degree {
-                        knots.push(1.0);
-                    }
+                    knots.resize(knots.len() + degree + 1, 1.0);
 
                     // Equal weights for now
                     let weights = vec![1.0; n];

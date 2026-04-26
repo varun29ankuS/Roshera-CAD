@@ -597,18 +597,14 @@ fn clamped_uniform_knot_vector(n: usize, degree: usize) -> Vec<f64> {
     let m = n + degree + 1;
     let mut knots = Vec::with_capacity(m);
 
-    for _ in 0..=degree {
-        knots.push(0.0);
-    }
+    knots.resize(degree + 1, 0.0);
 
     let interior_count = m - 2 * (degree + 1);
     for i in 1..=interior_count {
         knots.push(i as f64 / (interior_count + 1) as f64);
     }
 
-    for _ in 0..=degree {
-        knots.push(1.0);
-    }
+    knots.resize(m, 1.0);
 
     knots
 }
