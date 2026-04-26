@@ -649,6 +649,7 @@ fn should_flip_edge(
 }
 
 /// In-circle test for 3D points (project to best-fit plane)
+#[allow(clippy::expect_used)] // non-degenerate normal verified by magnitude_squared guard above
 fn in_circle_test_3d(p1: &Point3, p2: &Point3, p3: &Point3, p4: &Point3) -> bool {
     // Project to best-fit plane
     let v1 = *p2 - *p1;

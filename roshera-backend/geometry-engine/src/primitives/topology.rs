@@ -24,7 +24,8 @@ use crate::primitives::{
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
 
 /// Enhanced topological query context with caching
 pub struct TopologyContext<'a> {
@@ -71,10 +72,7 @@ impl<'a> TopologyContext<'a> {
     pub fn adjacency(&self) -> MathResult<Arc<AdjacencyInfo>> {
         // Check cache first
         {
-            let cache = self
-                .adjacency_cache
-                .read()
-                .expect("adjacency_cache RwLock poisoned");
+            let cache = self.adjacency_cache.read();
             if let Some(ref adjacency) = *cache {
                 return Ok(Arc::new(adjacency.clone()));
             }
@@ -85,10 +83,7 @@ impl<'a> TopologyContext<'a> {
 
         // Cache it
         {
-            let mut cache = self
-                .adjacency_cache
-                .write()
-                .expect("adjacency_cache RwLock poisoned");
+            let mut cache = self.adjacency_cache.write();
             *cache = Some(adjacency.clone());
         }
 
@@ -561,7 +556,8 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     calculate_dihedral_angles(&mut info, ctx)?;
 
     // Update stats
-    if let Ok(mut stats) = ctx.stats.lock() {
+    {
+        let mut stats = ctx.stats.lock();
         stats.adjacency_build_time_ms = start.elapsed().as_millis() as f64;
     }
 

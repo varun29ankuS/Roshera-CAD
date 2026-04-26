@@ -20,7 +20,8 @@ use crate::primitives::{
     vertex::VertexStore,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Shell ID type
 pub type ShellId = u32;
@@ -211,14 +212,8 @@ impl Shell {
         face_store: &FaceStore,
         loop_store: &LoopStore,
     ) -> MathResult<()> {
-        let mut edge_conn = self
-            .edge_connectivity
-            .write()
-            .expect("shell edge_connectivity RwLock poisoned");
-        let mut face_adj = self
-            .face_adjacency
-            .write()
-            .expect("shell face_adjacency RwLock poisoned");
+        let mut edge_conn = self.edge_connectivity.write();
+        let mut face_adj = self.face_adjacency.write();
 
         edge_conn.clear();
         face_adj.clear();
@@ -310,10 +305,7 @@ impl Shell {
 
     /// Get face adjacency information
     pub fn get_adjacent_faces(&self, face_id: FaceId) -> Vec<FaceId> {
-        let face_adj = self
-            .face_adjacency
-            .read()
-            .expect("shell face_adjacency RwLock poisoned");
+        let face_adj = self.face_adjacency.read();
         if let Some(adj) = face_adj.get(&face_id) {
             let mut adjacent = HashSet::new();
             for faces in adj.adjacent_faces.values() {
@@ -327,10 +319,7 @@ impl Shell {
 
     /// Get boundary edges
     pub fn get_boundary_edges(&self) -> Vec<EdgeId> {
-        let edge_conn = self
-            .edge_connectivity
-            .read()
-            .expect("shell edge_connectivity RwLock poisoned");
+        let edge_conn = self.edge_connectivity.read();
         edge_conn
             .iter()
             .filter(|(_, conn)| conn.is_boundary)
@@ -340,10 +329,7 @@ impl Shell {
 
     /// Get non-manifold edges
     pub fn get_non_manifold_edges(&self) -> Vec<EdgeId> {
-        let edge_conn = self
-            .edge_connectivity
-            .read()
-            .expect("shell edge_connectivity RwLock poisoned");
+        let edge_conn = self.edge_connectivity.read();
         edge_conn
             .iter()
             .filter(|(_, conn)| conn.is_non_manifold)
@@ -403,10 +389,7 @@ impl Shell {
             }
 
             // Count boundary and non-manifold edges
-            let edge_conn = self
-                .edge_connectivity
-                .read()
-                .expect("shell edge_connectivity RwLock poisoned");
+            let edge_conn = self.edge_connectivity.read();
             for conn in edge_conn.values() {
                 if conn.is_boundary {
                     boundary_edges += 1;
@@ -827,10 +810,7 @@ impl Shell {
         face_store: &FaceStore,
         loop_store: &LoopStore,
     ) -> MathResult<HashSet<EdgeId>> {
-        let edge_conn = self
-            .edge_connectivity
-            .read()
-            .expect("shell edge_connectivity RwLock poisoned");
+        let edge_conn = self.edge_connectivity.read();
 
         // Hot path: the cache was populated by build_edge_connectivity and
         // mirrors the union of edges across every face's loops.
