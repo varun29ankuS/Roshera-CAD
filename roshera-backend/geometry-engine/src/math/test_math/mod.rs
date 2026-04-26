@@ -27,3 +27,6 @@ mod performance_validation;
 
 #[cfg(test)]
 mod harness;
+
+#[cfg(test)]
+mod properties;
