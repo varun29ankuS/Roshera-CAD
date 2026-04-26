@@ -89,8 +89,6 @@ pub enum NeutralElement {
     Plane(Point3, Vector3),
     /// Neutral edge/curve
     Edge(EdgeId),
-    /// Neutral face
-    Face(FaceId),
     /// Custom curve
     Curve(Box<dyn Curve>),
 }
@@ -102,7 +100,6 @@ impl std::fmt::Debug for NeutralElement {
                 f.debug_tuple("Plane").field(point).field(vector).finish()
             }
             NeutralElement::Edge(edge_id) => f.debug_tuple("Edge").field(edge_id).finish(),
-            NeutralElement::Face(face_id) => f.debug_tuple("Face").field(face_id).finish(),
             NeutralElement::Curve(_) => f.debug_tuple("Curve").field(&"<curve>").finish(),
         }
     }
@@ -113,7 +110,6 @@ impl Clone for NeutralElement {
         match self {
             NeutralElement::Plane(point, vector) => NeutralElement::Plane(*point, *vector),
             NeutralElement::Edge(edge_id) => NeutralElement::Edge(*edge_id),
-            NeutralElement::Face(face_id) => NeutralElement::Face(*face_id),
             NeutralElement::Curve(_) => NeutralElement::Plane(Point3::ZERO, Vector3::Z), // Fallback to plane
         }
     }
@@ -190,9 +186,6 @@ fn group_faces_by_neutral(
         NeutralElement::Edge(edge_id) => {
             group_faces_by_edge(model, faces, *edge_id, pull_direction)
         }
-        NeutralElement::Face(face_id) => {
-            group_faces_by_face(model, faces, *face_id, pull_direction)
-        }
         NeutralElement::Curve(curve) => group_faces_by_curve(model, faces, curve, pull_direction),
     }
 }
@@ -253,23 +246,6 @@ fn group_faces_by_edge(
         neutral_curve,
         draft_direction: pull_direction,
     }])
-}
-
-/// Group faces by neutral face
-fn group_faces_by_face(
-    _model: &BRepModel,
-    _faces: &[FaceId],
-    _neutral_face_id: FaceId,
-    _pull_direction: Vector3,
-) -> OperationResult<Vec<FaceGroup>> {
-    // Neutral face boundary would define neutral curves; not yet wired.
-    // Callers should use NeutralReference::Edge or NeutralReference::Curve
-    // (both supported via group_faces_by_edge / group_faces_by_curve).
-    Err(OperationError::NotImplemented(
-        "Draft with NeutralReference::Face is not supported in v1; \
-         use NeutralReference::Edge or NeutralReference::Curve instead"
-            .to_string(),
-    ))
 }
 
 /// Group faces by custom curve.

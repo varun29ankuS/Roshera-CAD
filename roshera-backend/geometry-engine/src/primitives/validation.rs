@@ -182,26 +182,8 @@ pub enum RepairAction {
         v2: VertexId,
         distance: f64,
     },
-    /// Heal edge gap
-    HealEdgeGap { edge_id: EdgeId, gap_size: f64 },
     /// Fix face orientation
     FlipFaceOrientation { face_id: FaceId },
-    /// Remove degenerate entity
-    RemoveDegenerateEntity { entity_type: String, id: u32 },
-    /// Simplify over-tessellated region
-    SimplifyRegion {
-        face_ids: Vec<FaceId>,
-        target_count: usize,
-    },
-    /// Split non-manifold edge
-    SplitNonManifoldEdge { edge_id: EdgeId },
-    /// Fill hole in shell
-    FillHole { loop_id: LoopId },
-    /// Smooth sharp feature
-    SmoothFeature {
-        location: EntityLocation,
-        radius: f64,
-    },
 }
 
 /// Validation warning types (enhanced)
@@ -879,10 +861,6 @@ impl ModelRepairer {
                 }
                 Ok(())
             }
-            // Other repair actions...
-            _ => Err(MathError::NotImplemented(
-                "Repair action not implemented".to_string(),
-            )),
         }
     }
 
