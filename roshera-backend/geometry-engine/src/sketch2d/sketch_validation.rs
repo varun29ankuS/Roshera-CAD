@@ -10,6 +10,11 @@
 //! - **Intermediate**: Constraint satisfaction, no self-intersections
 //! - **Advanced**: Topology validity, ready for extrusion/revolution
 //! - **Strict**: Production-ready with all checks passed
+//!
+//! Indexed access into entity/constraint enumeration arrays is the canonical
+//! idiom — all `arr[i]` sites use indices bounded by collection length.
+//! Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::constraints::{ConstraintId, ConstraintStatus, EntityRef};
 use super::line2d::LineGeometry;

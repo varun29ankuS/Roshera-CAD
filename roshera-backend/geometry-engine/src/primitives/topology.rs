@@ -9,6 +9,12 @@
 //! - Queries: geodesic paths, curvature flow
 //! - Topology fingerprinting and comparison
 //! - Multi-resolution topology representations
+//!
+//! Indexed access into adjacency arrays and graph-traversal queues is the
+//! canonical idiom for topology analysis — all `arr[i]` sites use indices
+//! bounded by graph node count. Matches the numerical-kernel pattern used
+//! in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance};
 use crate::primitives::{

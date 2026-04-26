@@ -1,4 +1,11 @@
 //! Surface tessellation algorithms
+//!
+//! Indexed access into UV-grid sample arrays and triangle-strip vertex
+//! indices is the canonical idiom for parametric tessellation — all `arr[i]`
+//! and `grid[u][v]` sites are bounds-guaranteed by the (samples_u × samples_v)
+//! grid dimensions established at the top of each tessellator. Matches the
+//! numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::adaptive::compute_plane_axes;
 use super::{AdaptiveTessellator, MeshVertex, TessellationParams, TriangleMesh};

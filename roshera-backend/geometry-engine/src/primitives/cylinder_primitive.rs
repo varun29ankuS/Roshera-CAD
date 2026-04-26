@@ -2,6 +2,11 @@
 //!
 //! This module implements a world-class parametric cylinder primitive that meets
 //! all requirements for exact geometry, complete topology, and parametric updates.
+//!
+//! Indexed access into the (2N+2) vertex / (3N) edge / (N+2) face buffers is
+//! the canonical idiom — indices are bounded by the segment count `n` chosen
+//! at construction. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{consts, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{

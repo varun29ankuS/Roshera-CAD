@@ -15,6 +15,11 @@
 //!
 //! - Golub, G.H. & Van Loan, C.F. (2013). *Matrix Computations* (4th ed.).
 //!   Johns Hopkins University Press. §3.4 (partial pivoting).
+//!
+//! Indexed access is the canonical idiom for matrix elimination — all
+//! `a[i][j]` here are bounds-guaranteed by `n = a.len()` validation at entry.
+//! Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{MathError, MathResult, Tolerance, STRICT_TOLERANCE};
 

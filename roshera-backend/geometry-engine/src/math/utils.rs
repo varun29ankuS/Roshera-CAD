@@ -4,6 +4,11 @@
 //! - Avoid heap allocations on hot paths
 //! - SIMD-ready data layouts where applicable
 //! - Adaptive algorithms that switch method by input size/conditioning
+//!
+//! Indexed access is the canonical idiom for these numerical utilities —
+//! all `arr[i]` sites use indices bounded by buffer length. Matches the
+//! numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{consts, MathError, MathResult, Tolerance};
 use std::ops::Range;

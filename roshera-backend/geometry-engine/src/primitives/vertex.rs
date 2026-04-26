@@ -6,6 +6,12 @@
 //! - Vertex-attributes system for custom data
 //! - Merge/split operations
 //! - Thread-safe concurrent access
+//!
+//! Indexed access into the SoA xs/ys/zs vertex buffers is the canonical
+//! idiom — all `arr[i]` sites use indices bounded by `xs.len()` (the three
+//! arrays maintain identical length by construction). Matches the
+//! numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{Point3, Vector3};
 // Note: Using DashMap globally for timeline architecture compatibility

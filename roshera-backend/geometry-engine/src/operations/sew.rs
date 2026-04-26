@@ -2,6 +2,11 @@
 //!
 //! Stitches faces together to create watertight shells and solids
 //! by matching and merging coincident edges and vertices.
+//!
+//! Indexed access into edge/vertex enumeration arrays is the canonical
+//! idiom — all `arr[i]` sites use indices bounded by topology length.
+//! Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::Point3;

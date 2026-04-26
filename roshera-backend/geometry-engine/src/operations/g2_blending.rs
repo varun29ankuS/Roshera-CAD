@@ -29,6 +29,12 @@
 //! to the boundary tangent. This produces an honest smooth blend whose
 //! residual G1/G2 mismatch against the parent surfaces is measured and
 //! reported in `BlendingQuality`.
+//!
+//! Indexed access into Bernstein control nets and Bézier control grids is
+//! the canonical idiom for tensor-product patch construction — all
+//! `net[i][j]` sites are bounds-guaranteed by the (degree+1)×(degree+1)
+//! patch dimensions. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::bezier_patch::bernstein;
 use crate::math::linear_solver::gaussian_elimination;

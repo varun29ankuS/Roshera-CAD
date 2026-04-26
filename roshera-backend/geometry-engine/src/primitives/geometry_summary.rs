@@ -2,6 +2,12 @@
 //!
 //! Converts B-Rep solids into structured summaries that LLMs can consume
 //! in their context window. Produces both human-readable text and JSON.
+//!
+//! Indexed access into vertex/face/edge enumeration arrays is the canonical
+//! idiom for B-Rep summary generation — all `arr[i]` sites use indices
+//! bounded by topology length. Matches the numerical-kernel pattern used in
+//! nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use std::collections::HashMap;
 use std::fmt;

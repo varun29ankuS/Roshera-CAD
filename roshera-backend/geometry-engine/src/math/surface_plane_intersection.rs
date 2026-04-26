@@ -31,6 +31,12 @@
 //! - Patrikalakis, N.M. & Maekawa, T. (2002). *Shape Interrogation for Computer
 //!   Aided Design and Manufacturing*. Springer.
 //! - Barnhill, R.E. et al. (1987). "Surface/surface intersection". *CAGD* 4(1-2).
+//!
+//! Indexed access into the (Nu × Nv) signed-distance grid is the canonical
+//! idiom — all `grid[i][j]` sites use indices bounded by the sampling grid
+//! dimensions established at solver entry. Matches the numerical-kernel
+//! pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::surface::Surface;

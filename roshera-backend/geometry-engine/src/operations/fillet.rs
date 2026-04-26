@@ -6,6 +6,12 @@
 //! # References
 //! - Choi, B.K. & Ju, S.Y. (1989). Constant-radius blending in surface modeling. CAD.
 //! - Vida, J. et al. (1994). A survey of blending methods using parametric surfaces. CAD.
+//!
+//! Indexed access into edge-list and surface-sample arrays is the canonical
+//! idiom for fillet construction — all `arr[i]` sites use indices bounded
+//! by edge count or sample density. Matches the numerical-kernel pattern
+//! used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};

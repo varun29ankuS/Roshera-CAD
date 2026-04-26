@@ -2,6 +2,12 @@
 //!
 //! Computes intersections between various geometric entities including
 //! curve-curve, curve-surface, and surface-surface intersections.
+//!
+//! Indexed access into hit arrays and Newton-iteration scratch buffers is
+//! the canonical idiom — all `arr[i]` sites use indices bounded by hit
+//! count or solver dimensions. Matches the numerical-kernel pattern used
+//! in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{OperationError, OperationResult};
 use crate::math::{MathResult, Point3, Tolerance, Vector3};

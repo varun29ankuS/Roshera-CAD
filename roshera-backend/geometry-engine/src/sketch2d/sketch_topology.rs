@@ -10,6 +10,12 @@
 //! - Region identification and nesting
 //! - Profile extraction for 3D operations
 //! - Topological validation
+//!
+//! Indexed access into edge-list and vertex-sample arrays for sketch
+//! connectivity analysis is the canonical idiom — all `arr[i]` sites use
+//! indices bounded by graph node count. Matches the numerical-kernel
+//! pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::constraints::EntityRef;
 use super::line2d::LineGeometry;

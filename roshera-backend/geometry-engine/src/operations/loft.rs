@@ -2,6 +2,12 @@
 //!
 //! Creates smooth transitions between multiple cross-section profiles.
 //! Supports guide curves, vertex correspondence, and tangency constraints.
+//!
+//! Indexed access into profile-vertex arrays and interpolation control nets
+//! is the canonical idiom for loft surface construction — all `arr[i]`
+//! sites use indices bounded by profile vertex count or interpolation
+//! sample density. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Vector3};

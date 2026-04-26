@@ -10,6 +10,12 @@
 //! 3. Error recovery: suggestions, auto-correction, examples
 //! 4. Context aware: learns from usage patterns
 //! 5. Schema-driven: machine-readable parameter descriptions and constraints
+//!
+//! Indexed access into parameter and suggestion arrays is the canonical
+//! idiom — all `arr[i]` sites use indices bounded by array length validated
+//! at registry-entry construction. Matches the numerical-kernel pattern
+//! used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},

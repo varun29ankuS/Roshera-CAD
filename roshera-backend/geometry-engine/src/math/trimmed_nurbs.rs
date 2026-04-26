@@ -2,6 +2,11 @@
 //!
 //! Essential for B-Rep modeling where surfaces are bounded by trim curves.
 //! Implements proper inside/outside classification and intersection algorithms.
+//!
+//! Indexed access into knot vectors and control-point grids is the canonical
+//! idiom — all `arr[i]` sites are bounds-guaranteed by knot-span ranges or
+//! grid dimensions. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::bspline::KnotVector;
 use crate::math::nurbs::NurbsSurface;

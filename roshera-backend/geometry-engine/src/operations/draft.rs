@@ -2,6 +2,12 @@
 //!
 //! Applies draft angles to faces for mold design and manufacturing.
 //! Essential for injection molding, casting, and other manufacturing processes.
+//!
+//! Indexed access into face/edge buffers and surface-sample arrays is the
+//! canonical idiom for draft construction — all `arr[i]` sites use indices
+//! bounded by topology enumeration. Matches the numerical-kernel pattern
+//! used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::surface_plane_intersection::{
