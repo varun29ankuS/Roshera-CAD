@@ -16,6 +16,15 @@
 //! - Piegl & Tiller: "The NURBS Book" (1997)
 //! - de Boor: "A Practical Guide to Splines" (1978)
 //! - Prautzsch et al.: "Bézier and B-Spline Techniques" (2002)
+//!
+//! Indexed access is the canonical idiom in numerical linear algebra and
+//! polynomial-basis evaluation. All `arr[i]` here are bounds-guaranteed by the
+//! enclosing loop structure (`for i in 0..arr.len()`, knot-span-derived
+//! ranges, or de Boor recurrences over (degree+1)-sized buffers). Replacing
+//! with `.get(i).ok_or(...)?` would obscure the math without adding safety —
+//! this matches the pattern used by nalgebra, ndarray, and other Rust
+//! numerical kernels.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use std::fmt;

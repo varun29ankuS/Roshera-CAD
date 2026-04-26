@@ -11,6 +11,15 @@
 //! - Piegl & Tiller, "The NURBS Book", 2nd Ed., Chapters 5-8
 //! - ISO 10303-42:2022 STEP geometric representation
 //! - Rogers, "An Introduction to NURBS", Morgan Kaufmann
+//!
+//! Indexed access is the canonical idiom in numerical linear algebra and
+//! tensor-product surface evaluation. All `arr[i]` and `grid[i][j]` here are
+//! bounds-guaranteed by the enclosing loop structure, knot-span-derived
+//! ranges, or de Boor recurrences over (degree+1)×(degree+1) buffers.
+//! Replacing with `.get(i).ok_or(...)?` would obscure the math without adding
+//! safety — this matches the pattern used by nalgebra, ndarray, and other
+//! Rust numerical kernels.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::nurbs::NurbsCurve;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
