@@ -128,14 +128,6 @@ pub trait Transform {
     fn transform_mut(&mut self, matrix: &Matrix4);
 }
 
-/// Trait for types with a bounding box
-/*
-pub trait Bounded {
-    /// Get axis-aligned bounding box
-    fn bounds(&self) -> BBox;
-}
-*/
-
 /// Result type for mathematical operations that can fail
 pub type MathResult<T> = Result<T, MathError>;
 

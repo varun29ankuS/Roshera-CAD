@@ -186,7 +186,9 @@ fn group_faces_by_neutral(
         NeutralElement::Edge(edge_id) => {
             group_faces_by_edge(model, faces, *edge_id, pull_direction)
         }
-        NeutralElement::Curve(curve) => group_faces_by_curve(model, faces, curve, pull_direction),
+        NeutralElement::Curve(curve) => {
+            group_faces_by_curve(model, faces, curve.as_ref(), pull_direction)
+        }
     }
 }
 
@@ -256,7 +258,7 @@ fn group_faces_by_edge(
 fn group_faces_by_curve(
     model: &BRepModel,
     faces: &[FaceId],
-    curve: &Box<dyn Curve>,
+    curve: &dyn Curve,
     pull_direction: Vector3,
 ) -> OperationResult<Vec<FaceGroup>> {
     for &face_id in faces {
@@ -1278,7 +1280,7 @@ fn sample_edge_points(model: &BRepModel, edge: &Edge) -> OperationResult<Vec<Poi
 }
 
 /// Sample points along a curve
-fn sample_curve_points(curve: &Box<dyn Curve>) -> OperationResult<Vec<Point3>> {
+fn sample_curve_points(curve: &dyn Curve) -> OperationResult<Vec<Point3>> {
     let num_samples = 10;
     let mut points = Vec::new();
 
