@@ -335,6 +335,7 @@ fn compute_chamfer_offsets(
 
 /// Create a RuledSurface for the chamfer face, interpolating between the two offset curves.
 /// Each offset curve is approximated as a Line between its endpoints.
+#[allow(clippy::expect_used)] // offset_points{1,2} non-empty: is_empty() guard above expect sites
 fn create_ruled_chamfer_surface(
     _model: &mut BRepModel,
     data: &ChamferData,
@@ -371,6 +372,7 @@ fn create_ruled_chamfer_surface(
 }
 
 /// Create chamfer face with boundaries
+#[allow(clippy::expect_used)] // offset_points{1,2} non-empty: is_empty() guard at fn entry
 fn create_chamfer_face(
     model: &mut BRepModel,
     surface_id: u32,

@@ -405,6 +405,7 @@ impl Face {
     }
 
     /// Compute face statistics (cached)
+    #[allow(clippy::expect_used)] // cached_stats populated immediately above when None
     pub fn compute_stats(
         &mut self,
         loop_store: &mut LoopStore,

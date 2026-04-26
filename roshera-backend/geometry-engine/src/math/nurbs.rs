@@ -421,6 +421,7 @@ impl NurbsCurve {
 
     /// SIMD-optimized evaluation with derivatives
     /// Target: <1000ns for 1st derivative, <1500ns for 2nd derivative
+    #[allow(clippy::expect_used)] // num_derivatives>=2 implies num_derivatives>=1, derivative1=Some
     pub fn evaluate_derivatives_simd(&self, u: f64, num_derivatives: usize) -> NurbsPoint {
         let u = u.clamp(
             self.knots.values()[self.degree],

@@ -826,11 +826,14 @@ impl DivAssign<f64> for Vector3 {
     }
 }
 
-// Indexing support
+// Indexing support — matches Vec/[T] semantics: out-of-bounds panics.
+// The Index/IndexMut trait contract requires returning a reference, so
+// fallible access must use `.get(i)` / `.get_mut(i)` (added below).
 impl Index<usize> for Vector3 {
     type Output = f64;
 
     #[inline]
+    #[allow(clippy::panic)] // matches Vec/[T] Index trait contract
     fn index(&self, index: usize) -> &f64 {
         match index {
             0 => &self.x,
@@ -843,6 +846,7 @@ impl Index<usize> for Vector3 {
 
 impl IndexMut<usize> for Vector3 {
     #[inline]
+    #[allow(clippy::panic)] // matches Vec/[T] IndexMut trait contract
     fn index_mut(&mut self, index: usize) -> &mut f64 {
         match index {
             0 => &mut self.x,

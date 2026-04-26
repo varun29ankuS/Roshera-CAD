@@ -207,6 +207,7 @@ impl Shell {
     }
 
     /// Build connectivity information
+    #[allow(clippy::expect_used)] // adjacent_faces[edge_id] inserted in same loop iteration above
     pub fn build_connectivity(
         &mut self,
         face_store: &FaceStore,
@@ -338,6 +339,7 @@ impl Shell {
     }
 
     /// Compute shell statistics (cached)
+    #[allow(clippy::expect_used)] // cached_stats populated immediately above when None
     pub fn compute_stats(
         &mut self,
         face_store: &FaceStore,
@@ -431,6 +433,7 @@ impl Shell {
     }
 
     /// Calculate mass properties (cached)
+    #[allow(clippy::expect_used)] // cached_mass_props populated immediately above when None
     pub fn compute_mass_properties(
         &mut self,
         face_store: &mut FaceStore,

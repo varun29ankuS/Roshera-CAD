@@ -962,6 +962,7 @@ fn compute_entity_differences(counts1: &[usize; 7], counts2: &[usize; 7]) -> Has
 /// # Performance
 /// O((V + E) · max_length) worst case; effectively linear on sparse
 /// topology that dominates B-Rep meshes.
+#[allow(clippy::expect_used)] // cycle_vertices non-empty: pushed at cycle entry; ok-branch only
 pub fn find_edge_cycles(adjacency: &AdjacencyInfo, max_length: Option<usize>) -> Vec<Vec<EdgeId>> {
     let cap = max_length.unwrap_or(usize::MAX);
     let mut cycles: Vec<Vec<EdgeId>> = Vec::new();

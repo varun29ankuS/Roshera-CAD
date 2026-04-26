@@ -220,6 +220,7 @@ fn create_g3_blend(
 
 /// Create conic section blend — shape parameter rho controls cross-section shape
 /// rho < 0.5 → ellipse, rho = 0.5 → parabola, rho > 0.5 → hyperbola
+#[allow(clippy::expect_used)] // curve1/curve2 non-empty proven by .is_empty() guard above expect sites
 fn create_conic_blend(
     model: &mut BRepModel,
     face1: &Face,
@@ -282,6 +283,7 @@ fn create_conic_blend(
 }
 
 /// Build a Hermite blend surface with given derivative order matching at boundaries
+#[allow(clippy::expect_used)] // curve1/curve2 non-empty: validated at blend_faces entry point
 fn create_hermite_blend_surface(
     model: &BRepModel,
     face1: &Face,
@@ -362,6 +364,7 @@ fn create_hermite_blend_surface(
 }
 
 /// Build a conic blend surface with the given shape parameter
+#[allow(clippy::expect_used)] // curve1/curve2 non-empty: validated at blend_faces entry point
 fn create_conic_blend_surface(
     curve1: &[Point3],
     curve2: &[Point3],
@@ -441,6 +444,7 @@ fn compute_blend_curves(
 }
 
 /// Create ruled blend surface (linear interpolation between two boundary curves)
+#[allow(clippy::expect_used)] // curve1/curve2 non-empty: validated at blend_faces entry point
 fn create_ruled_blend_surface(
     _model: &BRepModel,
     _face1: &Face,
@@ -468,6 +472,7 @@ fn create_ruled_blend_surface(
 }
 
 /// Create blend face with proper boundaries
+#[allow(clippy::expect_used)] // curve1/curve2 non-empty: validated at blend_faces entry point
 fn create_blend_face(
     model: &mut BRepModel,
     surface_id: u32,

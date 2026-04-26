@@ -346,6 +346,7 @@ impl ToleranceContext {
 
     /// Get current tolerance
     #[inline]
+    #[allow(clippy::expect_used)] // stack invariant: ToleranceContext::new pushes 1 entry; pop refuses below 1
     pub fn current(&self) -> Tolerance {
         *self
             .stack
@@ -419,6 +420,7 @@ impl ToleranceContextEx {
 
     /// Get current extended tolerance
     #[inline]
+    #[allow(clippy::expect_used)] // stack invariant: from_basic/for_model push 1 entry; pop refuses below 1
     pub fn current(&self) -> &ToleranceEx {
         self.stack
             .last()

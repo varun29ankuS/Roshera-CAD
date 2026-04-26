@@ -2,6 +2,7 @@
 use crate::math::nurbs::NurbsCurve;
 use crate::math::Point3;
 
+#[allow(clippy::unwrap_used)] // diagnostic helper: literal degree-2 NurbsCurve inputs are valid
 pub fn test_oslo_simple() {
     println!("Testing Oslo knot insertion algorithm");
 

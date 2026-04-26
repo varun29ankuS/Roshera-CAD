@@ -49,6 +49,7 @@ pub struct Polyline2d {
 
 impl Polyline2d {
     /// Create a new polyline from vertices
+    #[allow(clippy::expect_used)] // vertices.len() >= 2: verified by early return at fn entry
     pub fn new(vertices: Vec<Point2d>, is_closed: bool) -> Sketch2dResult<Self> {
         if vertices.len() < 2 {
             return Err(Sketch2dError::InvalidParameter {
@@ -198,6 +199,7 @@ impl Polyline2d {
     }
 
     /// Get all segments as LineSegment2d
+    #[allow(clippy::expect_used)] // is_closed branch guarded by vertices.len() >= 2
     pub fn segments(&self) -> Vec<LineSegment2d> {
         let mut segments = Vec::with_capacity(self.segment_count());
 
@@ -224,6 +226,7 @@ impl Polyline2d {
     }
 
     /// Get a specific segment by index
+    #[allow(clippy::expect_used)] // closed branch guarded by index < segment_count + is_closed
     pub fn segment(&self, index: usize) -> Option<LineSegment2d> {
         if index >= self.segment_count() {
             return None;
@@ -441,6 +444,7 @@ impl Polyline2d {
     }
 
     /// Douglas-Peucker algorithm implementation
+    #[allow(clippy::expect_used)] // points.len() > 2: verified by early return above
     fn douglas_peucker(&self, points: &[Point2d], tolerance: f64) -> Vec<Point2d> {
         if points.len() <= 2 {
             return points.to_vec();
