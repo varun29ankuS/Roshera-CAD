@@ -143,6 +143,7 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
         }
     }
 
+    #[allow(clippy::expect_used)] // contains_key verified above that key is present
     fn get(&mut self, key: &K) -> Option<&V> {
         if self.map.contains_key(key) {
             self.counter += 1;

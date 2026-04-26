@@ -774,6 +774,7 @@ fn tessellate_spherical_face(
 }
 
 /// Tessellate spherical surface with pole handling
+#[allow(clippy::expect_used)] // pole vertex presence verified by is_some() guard above expect
 fn tessellate_spherical_with_poles(
     face: &Face,
     model: &BRepModel,

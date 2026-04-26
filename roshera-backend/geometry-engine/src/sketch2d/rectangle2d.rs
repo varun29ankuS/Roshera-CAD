@@ -210,6 +210,7 @@ impl Rectangle2d {
     }
 
     /// Find the closest point on the rectangle boundary to a given point
+    #[allow(clippy::expect_used)] // rectangle always has 4 edges: min_by cannot be empty
     pub fn closest_point_on_boundary(&self, point: &Point2d) -> Point2d {
         let edges = self.edges();
 
@@ -227,6 +228,7 @@ impl Rectangle2d {
 
     /// Distance from a point to the rectangle boundary
     /// Negative if point is inside
+    #[allow(clippy::expect_used)] // rectangle always has 4 edges: min_by cannot be empty
     pub fn distance_to_point(&self, point: &Point2d) -> f64 {
         if self.contains_point(point) {
             // Point is inside, find distance to nearest edge

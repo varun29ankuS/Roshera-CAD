@@ -250,6 +250,7 @@ pub fn delete_solid(
 }
 
 /// Delete a single face
+#[allow(clippy::expect_used)] // face_id validated non-None at fn entry; not removed since
 pub fn delete_face(model: &mut BRepModel, face_id: FaceId, heal: bool) -> OperationResult<()> {
     // Validate face exists
     if model.faces.get(face_id).is_none() {

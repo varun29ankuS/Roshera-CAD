@@ -396,6 +396,7 @@ impl BoxParameters {
 impl Primitive for BoxPrimitive {
     type Parameters = BoxParameters;
 
+    #[allow(clippy::expect_used)] // box vertices added to model.vertices earlier in same fn
     fn create(params: Self::Parameters, model: &mut BRepModel) -> Result<SolidId, PrimitiveError> {
         // Validate parameters
         BoxParameters::validate_dimensions(params.width, params.height, params.depth)?;

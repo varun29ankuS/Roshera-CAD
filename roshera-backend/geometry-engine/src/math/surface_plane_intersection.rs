@@ -118,6 +118,7 @@ pub struct ParametricIntersectionCurve {
 /// * `MathError::InvalidParameter` -- if `plane_normal` is zero-length.
 /// * `MathError::ConvergenceFailure` -- if Newton iteration diverges on every
 ///   seed (extremely unlikely with reasonable inputs).
+#[allow(clippy::expect_used)] // pts.len() >= 2: continue-guard above; curve was pushed in this loop
 pub fn intersect_surface_plane(
     surface: &dyn Surface,
     plane_origin: Point3,

@@ -203,6 +203,7 @@ pub fn sweep_profile(
 }
 
 /// Create a path sweep
+#[allow(clippy::expect_used)] // sections non-empty: generate_sweep_sections returns ≥1 section
 fn create_path_sweep(
     model: &mut BRepModel,
     profile_face: FaceId,
@@ -266,6 +267,7 @@ fn create_path_sweep(
 /// The frame solver computes the full set of stations up-front, including
 /// position, orientation, and optional scale. This function converts those
 /// frames into sweep sections and assembles the solid.
+#[allow(clippy::expect_used)] // sections non-empty: generate_sweep_sections returns ≥1 section
 fn create_frame_driven_sweep(
     model: &mut BRepModel,
     profile_face: FaceId,

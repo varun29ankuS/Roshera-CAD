@@ -417,6 +417,7 @@ impl Edge {
     }
 
     /// Adaptive tessellation based on curvature
+    #[allow(clippy::expect_used)] // points non-empty: short-circuit guard !is_empty branch
     pub fn tessellate(
         &self,
         curves: &CurveStore,

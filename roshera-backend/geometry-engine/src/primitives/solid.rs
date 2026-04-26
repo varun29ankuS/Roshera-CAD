@@ -338,6 +338,7 @@ impl Solid {
     }
 
     /// Compute solid statistics (cached)
+    #[allow(clippy::expect_used)] // cached_stats populated immediately above when None
     pub fn compute_stats(
         &mut self,
         shell_store: &ShellStore,
@@ -419,6 +420,7 @@ impl Solid {
     }
 
     /// Calculate mass properties (cached)
+    #[allow(clippy::expect_used)] // cached_mass_props populated immediately above when None
     pub fn compute_mass_properties(
         &mut self,
         shell_store: &mut ShellStore,

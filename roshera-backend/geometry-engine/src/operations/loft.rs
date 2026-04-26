@@ -75,6 +75,7 @@ pub enum LoftType {
 }
 
 /// Loft between multiple profile curves to create a solid or surface
+#[allow(clippy::expect_used)] // profiles non-empty (≥2): validate_loft_inputs at fn entry
 pub fn loft_profiles(
     model: &mut BRepModel,
     profiles: Vec<Vec<EdgeId>>,
@@ -129,6 +130,7 @@ pub fn loft_profiles(
 }
 
 /// Create a linear loft (ruled surfaces between profiles)
+#[allow(clippy::expect_used)] // profiles non-empty (≥2): validated at loft_profiles entry
 fn create_linear_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,
@@ -209,6 +211,7 @@ fn create_linear_loft(
 ///      and cap the solid if requested.
 ///
 /// Reference: Piegl & Tiller, "The NURBS Book" (1997), Algorithm A9.1.
+#[allow(clippy::expect_used)] // profiles non-empty (≥2): validated at loft_profiles entry
 fn create_cubic_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,
@@ -534,6 +537,7 @@ fn create_minimal_twist_loft(
 /// Because guide curves are typically sparse compared to the full profile
 /// topology, the algorithm falls back to unguided ruled faces for any vertex
 /// columns that no guide covers.
+#[allow(clippy::expect_used)] // profiles non-empty (≥2): validated at loft_profiles entry
 fn create_guided_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,

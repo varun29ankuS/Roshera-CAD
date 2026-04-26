@@ -220,6 +220,7 @@ fn project_point_closest(point: Point3, surface: &dyn Surface) -> OperationResul
 }
 
 /// Project point using directional method
+#[allow(clippy::expect_used)] // intersections non-empty: is_empty() early-return above
 fn project_point_directional(
     point: Point3,
     surface: &dyn Surface,

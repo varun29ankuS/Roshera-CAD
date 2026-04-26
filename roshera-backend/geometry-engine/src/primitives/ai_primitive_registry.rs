@@ -770,6 +770,7 @@ impl PrimitiveRegistry {
     /// `primitive_type` must be a key present in `self.primitives`; this
     /// helper is only reachable after `parse_natural_language` has
     /// matched the input against a registered primitive name.
+    #[allow(clippy::expect_used)] // primitive_type was looked up in self.primitives by caller
     fn calculate_confidence(
         &self,
         text: &str,
@@ -807,6 +808,7 @@ impl PrimitiveRegistry {
     ///
     /// `primitive_type` must be a key present in `self.primitives`
     /// (same invariant as `calculate_confidence`).
+    #[allow(clippy::expect_used)] // primitive_type was looked up in self.primitives by caller
     fn generate_suggestions(&self, primitive_type: &str) -> Vec<String> {
         let primitive_info = self
             .primitives
