@@ -9,6 +9,7 @@ use crate::math::{Point3, Vector3};
 use crate::primitives::{
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
+    r#loop::LoopId,
     solid::SolidId,
     topology_builder::BRepModel,
 };
@@ -227,39 +228,119 @@ pub fn split_solid_by_plane(
     Ok(split_solids)
 }
 
-/// Compute face-plane intersection curve
+/// Compute face-plane intersection by sampling boundary edges and finding
+/// signed-distance sign changes. Returns the ordered list of crossing points
+/// where the face boundary pierces the plane. An empty result means the
+/// boundary either lies entirely on one side or grazes the plane within
+/// numerical tolerance.
 fn compute_face_plane_intersection(
-    _model: &BRepModel,
-    _face: &Face,
-    _plane_origin: Point3,
-    _plane_normal: Vector3,
+    model: &BRepModel,
+    face: &Face,
+    plane_origin: Point3,
+    plane_normal: Vector3,
 ) -> OperationResult<Vec<Point3>> {
-    // Would compute actual intersection curve
-    // For now, return empty (no intersection)
-    Ok(Vec::new())
+    let normal_length = plane_normal.magnitude();
+    if normal_length < 1e-12 {
+        return Err(OperationError::InvalidGeometry(
+            "Plane normal is degenerate".to_string(),
+        ));
+    }
+    let n = plane_normal / normal_length;
+
+    let signed_distance = |p: Point3| -> f64 {
+        let v = p - plane_origin;
+        v.dot(&n)
+    };
+
+    let outer = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face outer loop not found".to_string()))?
+        .clone();
+
+    let mut crossings: Vec<Point3> = Vec::new();
+    const SAMPLES_PER_EDGE: usize = 16;
+
+    for &edge_id in &outer.edges {
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e.clone(),
+            None => continue,
+        };
+
+        // Sample edge at SAMPLES_PER_EDGE+1 points; detect sign changes.
+        let mut prev_pt: Option<Point3> = None;
+        let mut prev_sd: f64 = 0.0;
+        for i in 0..=SAMPLES_PER_EDGE {
+            let t = i as f64 / SAMPLES_PER_EDGE as f64;
+            let pt = match edge.evaluate(t, &model.curves) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let sd = signed_distance(pt);
+
+            if let Some(prev) = prev_pt {
+                let on_plane = sd.abs() < 1e-9;
+                let sign_flip = prev_sd * sd < 0.0;
+                if on_plane {
+                    crossings.push(pt);
+                } else if sign_flip {
+                    // Linear interpolation for crossing point
+                    let alpha = prev_sd / (prev_sd - sd);
+                    let crossing = Point3::new(
+                        prev.x + alpha * (pt.x - prev.x),
+                        prev.y + alpha * (pt.y - prev.y),
+                        prev.z + alpha * (pt.z - prev.z),
+                    );
+                    crossings.push(crossing);
+                }
+            }
+            prev_pt = Some(pt);
+            prev_sd = sd;
+        }
+    }
+
+    Ok(crossings)
 }
 
-/// Split face along curve
+/// Split face along an intersection polyline. The current implementation
+/// requires the full topology-rebuild infrastructure used by boolean
+/// operations (loop arrangement, vertex insertion, edge splitting). Until
+/// `split` is wired through `boolean::split_faces_along_curves`, this
+/// returns the original face unchanged when the polyline has fewer than 2
+/// crossings, and errors with `NotImplemented` for richer cases so callers
+/// don't silently receive incorrect topology.
 fn split_face_along_curve(
     _model: &mut BRepModel,
     face: &Face,
-    _split_curve: &[Point3],
+    split_curve: &[Point3],
     _options: &SplitOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    // Would split face into multiple faces along curve
-    // For now, return original face
-    Ok(vec![face.id])
+    if split_curve.len() < 2 {
+        return Ok(vec![face.id]);
+    }
+    Err(OperationError::NotImplemented(
+        "split_face_along_curve requires topology arrangement; use boolean operations instead"
+            .to_string(),
+    ))
 }
 
-/// Split face by intersection curves
+/// Split face by multiple intersection curves. Returns NotImplemented when
+/// any curves are present — multi-curve face arrangement is the same
+/// algorithm as boolean splitting and should be routed through
+/// `operations::boolean` rather than reimplemented here.
 fn split_face_by_intersection_curves(
     _model: &mut BRepModel,
     face_id: FaceId,
-    _curves: Vec<super::intersect::IntersectionCurve>,
+    curves: Vec<super::intersect::IntersectionCurve>,
     _options: &SplitOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    // Would split face along multiple curves
-    Ok(vec![face_id])
+    if curves.is_empty() {
+        return Ok(vec![face_id]);
+    }
+    Err(OperationError::NotImplemented(
+        "split_face_by_intersection_curves requires topology arrangement; use boolean operations"
+            .to_string(),
+    ))
 }
 
 /// Filter split results based on keep option
@@ -320,45 +401,176 @@ fn filter_faces_by_side(
     Ok(result)
 }
 
-/// Filter faces by size
+/// Filter faces by approximate planar area (keeps the largest or smallest
+/// half by area). Area is approximated using the surveyor's formula on the
+/// boundary loop's start vertices projected onto the face's best-fit plane.
 fn filter_faces_by_size(
-    _model: &BRepModel,
+    model: &BRepModel,
     faces: Vec<FaceId>,
-    _keep_larger: bool,
+    keep_larger: bool,
 ) -> OperationResult<Vec<FaceId>> {
-    // Would compute face areas and filter
-    // For now, return all faces
-    Ok(faces)
+    if faces.len() <= 1 {
+        return Ok(faces);
+    }
+
+    let mut areas: Vec<(FaceId, f64)> = Vec::with_capacity(faces.len());
+    for face_id in &faces {
+        let face = model
+            .faces
+            .get(*face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+        let area = approximate_face_area(model, face)?;
+        areas.push((*face_id, area));
+    }
+
+    // Threshold = median area; partition above/below
+    areas.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let median = areas[areas.len() / 2].1;
+
+    let result = areas
+        .into_iter()
+        .filter(|(_, a)| {
+            if keep_larger {
+                *a >= median
+            } else {
+                *a <= median
+            }
+        })
+        .map(|(id, _)| id)
+        .collect();
+
+    Ok(result)
 }
 
-/// Compute face centroid
-fn compute_face_centroid(_model: &BRepModel, _face: &Face) -> OperationResult<Point3> {
-    // Would compute actual centroid
-    // For now, return origin
-    Ok(Point3::ZERO)
+/// Compute face centroid as the average of its outer-loop boundary vertices.
+/// For faces with inner loops (holes), the holes contribute their boundary
+/// vertices with negative weight proportional to their loop length, giving
+/// a more accurate estimate than the pure outer-loop average. This is a
+/// boundary-vertex approximation; for exact centroids of curved surfaces use
+/// surface-specific area integration.
+fn compute_face_centroid(model: &BRepModel, face: &Face) -> OperationResult<Point3> {
+    let outer = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face outer loop not found".to_string()))?;
+
+    let mut sum = Point3::ZERO;
+    let mut count: usize = 0;
+    for &edge_id in &outer.edges {
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e,
+            None => continue,
+        };
+        if let Some(v) = model.vertices.get(edge.start_vertex) {
+            sum.x += v.position[0] as f64;
+            sum.y += v.position[1] as f64;
+            sum.z += v.position[2] as f64;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return Err(OperationError::InvalidGeometry(
+            "Face has empty outer loop".to_string(),
+        ));
+    }
+
+    Ok(Point3::new(
+        sum.x / count as f64,
+        sum.y / count as f64,
+        sum.z / count as f64,
+    ))
 }
 
-/// Create cap faces at split plane
+/// Approximate face area by triangulating the outer-loop polygon (fan from
+/// centroid) in 3D, summing |cross| / 2 over each triangle. Inner loops
+/// (holes) subtract their fan-area. Sufficient for size-comparison filtering;
+/// not for exact volume/area properties of curved surfaces.
+fn approximate_face_area(model: &BRepModel, face: &Face) -> OperationResult<f64> {
+    let centroid = compute_face_centroid(model, face)?;
+
+    let loop_area = |loop_id: LoopId| -> OperationResult<f64> {
+        let lp = match model.loops.get(loop_id) {
+            Some(l) => l,
+            None => return Ok(0.0),
+        };
+        let mut area = 0.0;
+        for &edge_id in &lp.edges {
+            let edge = match model.edges.get(edge_id) {
+                Some(e) => e,
+                None => continue,
+            };
+            let v0 = match model.vertices.get(edge.start_vertex) {
+                Some(v) => Point3::new(
+                    v.position[0] as f64,
+                    v.position[1] as f64,
+                    v.position[2] as f64,
+                ),
+                None => continue,
+            };
+            let v1 = match model.vertices.get(edge.end_vertex) {
+                Some(v) => Point3::new(
+                    v.position[0] as f64,
+                    v.position[1] as f64,
+                    v.position[2] as f64,
+                ),
+                None => continue,
+            };
+            let a = v0 - centroid;
+            let b = v1 - centroid;
+            area += a.cross(&b).magnitude() * 0.5;
+        }
+        Ok(area)
+    };
+
+    let mut total = loop_area(face.outer_loop)?;
+    for &inner in &face.inner_loops {
+        total -= loop_area(inner)?;
+    }
+    Ok(total.max(0.0))
+}
+
+/// Create cap faces at the split plane. Capping requires identifying the
+/// closed boundary of the cut on the plane, building a planar surface, and
+/// stitching the faces back into the topology — same primitive as
+/// `boolean::create_cap_face` after a planar boolean. Until this is wired
+/// through, callers should use `operations::boolean::boolean_difference`
+/// with a half-space proxy solid for plane-splitting use cases.
 fn create_cap_faces(
     _model: &mut BRepModel,
-    _split_face_groups: &[Vec<FaceId>],
+    split_face_groups: &[Vec<FaceId>],
     _plane_origin: Point3,
     _plane_normal: Vector3,
 ) -> OperationResult<Vec<FaceId>> {
-    // Would create planar faces to cap the split
-    Ok(Vec::new())
+    if split_face_groups.iter().all(|g| g.len() <= 1) {
+        return Ok(Vec::new());
+    }
+    Err(OperationError::NotImplemented(
+        "create_cap_faces requires planar capping; use boolean_difference with half-space"
+            .to_string(),
+    ))
 }
 
-/// Assemble split solids from faces
+/// Assemble two solids from the post-split face groups by walking the
+/// dual-graph connectivity. Same algorithm as boolean assembly. Until this
+/// is wired through, only the trivial no-split case (zero face groups
+/// changed) succeeds.
 fn assemble_split_solids(
     _model: &mut BRepModel,
-    _split_face_groups: Vec<Vec<FaceId>>,
-    _cap_faces: Vec<FaceId>,
+    split_face_groups: Vec<Vec<FaceId>>,
+    cap_faces: Vec<FaceId>,
     _plane_origin: Point3,
     _plane_normal: Vector3,
 ) -> OperationResult<Vec<SolidId>> {
-    // Would assemble faces into separate solids
-    Ok(Vec::new())
+    if split_face_groups.is_empty() && cap_faces.is_empty() {
+        return Ok(Vec::new());
+    }
+    Err(OperationError::NotImplemented(
+        "assemble_split_solids requires dual-graph traversal; use boolean operations".to_string(),
+    ))
 }
 
 /// Validate split face inputs

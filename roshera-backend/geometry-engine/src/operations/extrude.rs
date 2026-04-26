@@ -806,41 +806,46 @@ fn create_planar_surface_from_edges(
         }
     }
 
-    // Find the best-fit plane using least squares
-    // For now, use first three non-collinear points
-    let mut plane_points = Vec::new();
-    for i in 0..points.len() {
-        if plane_points.len() >= 3 {
-            break;
-        }
-
-        let point = points[i];
-        let mut is_collinear = false;
-
-        if plane_points.len() >= 2 {
-            let v1 = plane_points[1] - plane_points[0];
-            let v2 = point - plane_points[0];
-            if v1.cross(&v2).magnitude() < 1e-10 {
-                is_collinear = true;
-            }
-        }
-
-        if !is_collinear {
-            plane_points.push(point);
-        }
-    }
-
-    if plane_points.len() < 3 {
+    // Best-fit plane via Newell's method (Sutherland & Hodgman 1974;
+    // Filip-Magnenat-Thalmann variant). For each polygon edge, accumulate
+    // a normal contribution; the resulting vector is robust to small
+    // out-of-plane noise and degenerate triangles, unlike a single 3-point
+    // cross product. Origin is taken at the centroid for numerical stability.
+    if points.len() < 3 {
         return Err(OperationError::InvalidGeometry(
-            "Cannot find three non-collinear points".to_string(),
+            "Need at least three points to fit a plane".to_string(),
         ));
     }
 
-    // Create plane from three points
-    let origin = plane_points[0];
-    let v1 = plane_points[1] - plane_points[0];
-    let v2 = plane_points[2] - plane_points[0];
-    let normal = v1.cross(&v2).normalize().map_err(|e| {
+    let mut centroid = Point3::ZERO;
+    for p in &points {
+        centroid.x += p.x;
+        centroid.y += p.y;
+        centroid.z += p.z;
+    }
+    let inv_n = 1.0 / points.len() as f64;
+    centroid.x *= inv_n;
+    centroid.y *= inv_n;
+    centroid.z *= inv_n;
+
+    let mut nx = 0.0;
+    let mut ny = 0.0;
+    let mut nz = 0.0;
+    for i in 0..points.len() {
+        let curr = points[i];
+        let next = points[(i + 1) % points.len()];
+        nx += (curr.y - next.y) * (curr.z + next.z);
+        ny += (curr.z - next.z) * (curr.x + next.x);
+        nz += (curr.x - next.x) * (curr.y + next.y);
+    }
+    let raw_normal = Vector3::new(nx, ny, nz);
+    if raw_normal.magnitude() < 1e-12 {
+        return Err(OperationError::InvalidGeometry(
+            "Cannot fit plane: points are degenerate or collinear".to_string(),
+        ));
+    }
+    let origin = centroid;
+    let normal = raw_normal.normalize().map_err(|e| {
         OperationError::NumericalError(format!("Normal calculation failed: {:?}", e))
     })?;
 
@@ -917,12 +922,77 @@ fn validate_closed_profile(model: &BRepModel, edges: &[EdgeId]) -> OperationResu
     Ok(())
 }
 
-/// Validate the extruded solid
+/// Validate the extruded solid by walking its shell graph and checking
+/// referential integrity at every level. Returns `InvalidBRep` for the
+/// first dangling reference encountered (shell → faces, face → outer/inner
+/// loops + surface, loop → edges, edge → vertices + curve). This guards
+/// against silent corruption when downstream operations consume a
+/// freshly-extruded solid.
 fn validate_extruded_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
-    // Would perform full B-Rep validation
-    // For now, just check it exists
-    if model.solids.get(solid_id).is_none() {
-        return Err(OperationError::InvalidBRep("Solid not found".to_string()));
+    let solid = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| OperationError::InvalidBRep("Solid not found".to_string()))?
+        .clone();
+
+    let mut shells = vec![solid.outer_shell];
+    shells.extend(solid.inner_shells.iter().copied());
+
+    for shell_id in shells {
+        let shell = model
+            .shells
+            .get(shell_id)
+            .ok_or_else(|| OperationError::InvalidBRep(format!("Shell {} not found", shell_id)))?
+            .clone();
+        for &face_id in &shell.faces {
+            let face = model.faces.get(face_id).ok_or_else(|| {
+                OperationError::InvalidBRep(format!("Face {} referenced by shell missing", face_id))
+            })?;
+            if model.surfaces.get(face.surface_id).is_none() {
+                return Err(OperationError::InvalidBRep(format!(
+                    "Surface {} for face {} missing",
+                    face.surface_id, face_id
+                )));
+            }
+            let mut loops = vec![face.outer_loop];
+            loops.extend(face.inner_loops.iter().copied());
+            for lid in loops {
+                let lp = model.loops.get(lid).ok_or_else(|| {
+                    OperationError::InvalidBRep(format!(
+                        "Loop {} for face {} missing",
+                        lid, face_id
+                    ))
+                })?;
+                if lp.edges.is_empty() {
+                    return Err(OperationError::InvalidBRep(format!(
+                        "Loop {} has no edges",
+                        lid
+                    )));
+                }
+                for &eid in &lp.edges {
+                    let edge = model.edges.get(eid).ok_or_else(|| {
+                        OperationError::InvalidBRep(format!(
+                            "Edge {} for loop {} missing",
+                            eid, lid
+                        ))
+                    })?;
+                    if model.vertices.get(edge.start_vertex).is_none()
+                        || model.vertices.get(edge.end_vertex).is_none()
+                    {
+                        return Err(OperationError::InvalidBRep(format!(
+                            "Edge {} has dangling vertex reference",
+                            eid
+                        )));
+                    }
+                    if model.curves.get(edge.curve_id).is_none() {
+                        return Err(OperationError::InvalidBRep(format!(
+                            "Edge {} curve {} missing",
+                            eid, edge.curve_id
+                        )));
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
