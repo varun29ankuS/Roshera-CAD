@@ -280,21 +280,29 @@ fn project_point_onto_surface(
     Ok(surface.point_at(best_u, best_v)?)
 }
 
-/// Create interpolated curve through points
+/// Create an interpolated curve through projected sample points.
+///
+/// Used by imprinting to lay a curve along a face. Two points → exact
+/// `Line`. Three or more points → degree-min(3, n-1) clamped NURBS curve
+/// fit through the points so the imprinted edge follows the curvature
+/// of the face, not the straight chord between endpoints.
 fn create_interpolated_curve(model: &mut BRepModel, points: &[Point3]) -> OperationResult<u32> {
-    // use crate::primitives::curve::BSplineCurve; // TODO: Implement BSplineCurve in curves module
+    use crate::primitives::curve::{Line, NurbsCurve};
 
-    // Would create B-spline through points
-    // For now, create polyline
-    use crate::primitives::curve::Line;
-    if points.len() >= 2 {
-        let line = Line::new(points[0], points[points.len() - 1]);
-        Ok(model.curves.add(Box::new(line)))
-    } else {
-        Err(OperationError::InvalidGeometry(
+    if points.len() < 2 {
+        return Err(OperationError::InvalidGeometry(
             "Not enough points for curve".to_string(),
-        ))
+        ));
     }
+    if points.len() == 2 {
+        let line = Line::new(points[0], points[points.len() - 1]);
+        return Ok(model.curves.add(Box::new(line)));
+    }
+    let tolerance = crate::math::Tolerance::default();
+    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
+        OperationError::NumericalError(format!("imprint curve fit failed: {:?}", e))
+    })?;
+    Ok(model.curves.add(Box::new(nurbs)))
 }
 
 /// Create edge on face

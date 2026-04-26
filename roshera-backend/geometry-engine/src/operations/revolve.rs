@@ -760,41 +760,172 @@ fn create_degenerate_edge(
     Ok(edge_id)
 }
 
-/// Check if a face intersects the revolution axis
+/// Check whether the revolution axis passes through the face.
+///
+/// Three conditions detect intersection:
+///
+///  1. **Vertex on axis** — any boundary vertex within `tolerance` radial
+///     distance of the axis. Cheap, catches sketches drawn touching the
+///     pivot.
+///  2. **Edge crossing axis** — sampled radial distance falls below
+///     `tolerance` along an edge, *or* the radial offset vector flips
+///     sense between samples (sign change in a fixed orthogonal frame).
+///     Catches edges that pass through the axis without endpointing on it.
+///  3. **Axis pierces face interior** — for a planar face the revolution
+///     axis line is intersected with the face plane; the resulting point
+///     is then tested against the face's outer loop using a 2D
+///     point-in-polygon parity test on the axis-projected polygon. Catches
+///     the "axis goes straight through the middle of a flat face" case.
+///
+/// Non-planar surfaces fall back to (1) and (2) only — sufficient in
+/// practice because revolution profiles are typically sketched on
+/// planar sketch planes.
 fn face_intersects_axis(
     model: &BRepModel,
     face: &Face,
     axis_origin: Point3,
     axis_direction: Vector3,
 ) -> OperationResult<bool> {
-    // Simplified check - would need proper face-line intersection
-    // For now, just check if any vertex is too close to axis
+    use crate::primitives::surface::Plane;
+
     let tolerance = 1e-6;
+    let axis_dir = axis_direction
+        .normalize()
+        .unwrap_or(axis_direction);
 
     let loop_data = model
         .loops
         .get(face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
 
+    // Helper: radial offset of a point from the infinite axis line.
+    let radial_offset = |p: Point3| -> Vector3 {
+        let to_p = Vector3::new(p.x, p.y, p.z) - Vector3::new(axis_origin.x, axis_origin.y, axis_origin.z);
+        to_p - axis_dir * to_p.dot(&axis_dir)
+    };
+
+    // (1) + (2): walk the boundary loop, checking endpoints and edge interior.
+    let mut radial_samples: Vec<Vector3> = Vec::new();
     for &edge_id in &loop_data.edges {
         let edge = model
             .edges
             .get(edge_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
+        // Endpoint check — fast path catches sketches touching the axis.
         for &vertex_id in &[edge.start_vertex, edge.end_vertex] {
             let vertex = model
                 .vertices
                 .get(vertex_id)
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
-
-            let point = Vector3::from(vertex.position);
-            let to_point = point - axis_origin;
-            let axis_component = to_point.dot(&axis_direction) * axis_direction;
-            let radial_component = to_point - axis_component;
-
-            if radial_component.magnitude() < tolerance {
+            let point = Point3::new(
+                vertex.position[0] as f64,
+                vertex.position[1] as f64,
+                vertex.position[2] as f64,
+            );
+            let r = radial_offset(point);
+            if r.magnitude() < tolerance {
                 return Ok(true);
+            }
+            radial_samples.push(r);
+        }
+
+        // Edge-interior check: sample the curve and look for sub-tolerance
+        // radial magnitude or sign-flip in the radial offset direction.
+        if let Some(curve) = model.curves.get(edge.curve_id) {
+            let pr = curve.parameter_range();
+            let span = pr.end - pr.start;
+            if span.abs() > 1e-12 {
+                const N: usize = 8;
+                let mut prev: Option<Vector3> = None;
+                for i in 0..=N {
+                    let t = pr.start + span * (i as f64 / N as f64);
+                    if let Ok(p) = curve.point_at(t) {
+                        let r = radial_offset(p);
+                        if r.magnitude() < tolerance {
+                            return Ok(true);
+                        }
+                        if let Some(prev_r) = prev {
+                            // If the offset vectors point in opposite
+                            // half-spaces, the edge crossed the axis line.
+                            if prev_r.dot(&r) < 0.0 {
+                                return Ok(true);
+                            }
+                        }
+                        prev = Some(r);
+                    }
+                }
+            }
+        }
+    }
+
+    // (3) Planar-face interior pierce test.
+    if let Some(surface) = model.surfaces.get(face.surface_id) {
+        if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+            let n = plane.normal;
+            let denom = n.dot(&axis_dir);
+            if denom.abs() > 1e-12 {
+                // Axis is not parallel to plane → unique intersection point.
+                let plane_origin_v =
+                    Vector3::new(plane.origin.x, plane.origin.y, plane.origin.z);
+                let axis_origin_v =
+                    Vector3::new(axis_origin.x, axis_origin.y, axis_origin.z);
+                let t = n.dot(&(plane_origin_v - axis_origin_v)) / denom;
+                let pierce = Point3::new(
+                    axis_origin.x + axis_dir.x * t,
+                    axis_origin.y + axis_dir.y * t,
+                    axis_origin.z + axis_dir.z * t,
+                );
+
+                // Build a 2D frame on the plane to run point-in-polygon.
+                let u_dir = if n.x.abs() < 0.9 {
+                    n.cross(&Vector3::new(1.0, 0.0, 0.0))
+                } else {
+                    n.cross(&Vector3::new(0.0, 1.0, 0.0))
+                }
+                .normalize()
+                .unwrap_or(Vector3::X);
+                let v_dir = n.cross(&u_dir).normalize().unwrap_or(Vector3::Y);
+
+                let project_2d = |p: Point3| -> (f64, f64) {
+                    let d = Vector3::new(p.x, p.y, p.z) - plane_origin_v;
+                    (d.dot(&u_dir), d.dot(&v_dir))
+                };
+
+                // Collect ordered boundary vertices.
+                let mut polygon: Vec<(f64, f64)> = Vec::new();
+                for &edge_id in &loop_data.edges {
+                    if let Some(edge) = model.edges.get(edge_id) {
+                        if let Some(vertex) = model.vertices.get(edge.start_vertex) {
+                            let p = Point3::new(
+                                vertex.position[0] as f64,
+                                vertex.position[1] as f64,
+                                vertex.position[2] as f64,
+                            );
+                            polygon.push(project_2d(p));
+                        }
+                    }
+                }
+
+                if polygon.len() >= 3 {
+                    let (px, py) = project_2d(pierce);
+                    let mut inside = false;
+                    let n_pts = polygon.len();
+                    let mut j = n_pts - 1;
+                    for i in 0..n_pts {
+                        let (xi, yi) = polygon[i];
+                        let (xj, yj) = polygon[j];
+                        let crosses = (yi > py) != (yj > py)
+                            && px < (xj - xi) * (py - yi) / (yj - yi) + xi;
+                        if crosses {
+                            inside = !inside;
+                        }
+                        j = i;
+                    }
+                    if inside {
+                        return Ok(true);
+                    }
+                }
             }
         }
     }

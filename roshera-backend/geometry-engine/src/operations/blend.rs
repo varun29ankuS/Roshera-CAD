@@ -522,21 +522,44 @@ fn create_blend_face(
     Ok(face_id)
 }
 
-/// Create edge from curve points
+/// Create an edge whose underlying curve is a NURBS fit through `points`.
+///
+/// Two points → exact `Line`. Three or more points → degree-min(3, n-1)
+/// clamped NURBS curve fit through all sample points. The endpoint
+/// vertices are created from `points.first()` and `points.last()` so
+/// the edge's parameter range matches the fitted curve.
 fn create_curve_edge(model: &mut BRepModel, points: &[Point3]) -> OperationResult<EdgeId> {
-    // use crate::primitives::curve::BSplineCurve; // TODO: Implement BSplineCurve in curves module
+    use crate::primitives::curve::{Line, NurbsCurve};
 
-    // Would create B-spline curve through points
-    // For now, create line between endpoints
-    use crate::primitives::curve::Line;
+    if points.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "Edge curve points must be non-empty".to_string(),
+        ));
+    }
+    let first_point = points[0];
     let last_point = *points.last().ok_or_else(|| {
         OperationError::InvalidGeometry("Edge curve points must be non-empty".to_string())
     })?;
-    let line = Line::new(points[0], last_point);
-    let curve_id = model.curves.add(Box::new(line));
 
-    // Create vertices
-    let v_start = model.vertices.add(points[0].x, points[0].y, points[0].z);
+    let curve_id = if points.len() < 2 {
+        // Single-point degenerate input — emit a zero-length line so the
+        // caller gets a well-formed edge instead of a panic. This matches
+        // the edge-degeneracy contract used elsewhere in operations.
+        let line = Line::new(first_point, first_point);
+        model.curves.add(Box::new(line))
+    } else if points.len() == 2 {
+        let line = Line::new(first_point, last_point);
+        model.curves.add(Box::new(line))
+    } else {
+        let tolerance = crate::math::Tolerance::default();
+        let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
+            OperationError::NumericalError(format!("blend curve fit failed: {:?}", e))
+        })?;
+        model.curves.add(Box::new(nurbs))
+    };
+
+    // Create endpoint vertices
+    let v_start = model.vertices.add(first_point.x, first_point.y, first_point.z);
     let v_end = model.vertices.add(last_point.x, last_point.y, last_point.z);
 
     // Create edge

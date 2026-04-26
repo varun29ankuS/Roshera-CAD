@@ -409,20 +409,28 @@ fn point_in_face_bounds(
     })
 }
 
-/// Create interpolated 3D curve through points
+/// Create an interpolated 3D curve through projected sample points.
+///
+/// Two points → exact `Line`. Three or more points → degree-min(3, n-1)
+/// clamped NURBS curve fit through the points so the projected curve
+/// preserves the curvature of the source curve on the target surface,
+/// not just the endpoints.
 fn create_interpolated_curve_3d(points: &[Point3]) -> OperationResult<Box<dyn Curve>> {
-    use crate::primitives::curve::Line;
+    use crate::primitives::curve::{Line, NurbsCurve};
 
     if points.len() < 2 {
         return Err(OperationError::InvalidGeometry(
             "Not enough points for curve interpolation".to_string(),
         ));
     }
-
-    // For now, create polyline
-    // In full implementation, would create B-spline
-    let line = Line::new(points[0], points[points.len() - 1]);
-    Ok(Box::new(line))
+    if points.len() == 2 {
+        return Ok(Box::new(Line::new(points[0], points[points.len() - 1])));
+    }
+    let tolerance = crate::math::Tolerance::default();
+    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
+        OperationError::NumericalError(format!("projected curve fit failed: {:?}", e))
+    })?;
+    Ok(Box::new(nurbs))
 }
 
 /// Project a vertex onto a surface

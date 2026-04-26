@@ -808,17 +808,32 @@ fn create_nurbs_fillet_surface(
     Ok(Box::new(fillet))
 }
 
-/// Create curve from points (simplified - would use curve fitting)
+/// Fit a curve through the given sample points.
+///
+/// Two points → exact `Line`. Three or more points → degree-min(3, n-1)
+/// clamped NURBS curve fit through the points, preserving curvature along
+/// the rolling-ball spine and contact trails for non-circular fillets.
+/// A straight line through the endpoints would discard intermediate
+/// curvature and silently misplace the fillet surface for any non-planar
+/// edge.
 fn create_curve_from_points(points: &[Point3]) -> OperationResult<Box<dyn Curve>> {
+    use crate::primitives::curve::NurbsCurve;
+
     if points.len() < 2 {
         return Err(OperationError::InvalidGeometry(
             "Need at least 2 points for curve".to_string(),
         ));
     }
 
-    // For now, create line between first and last point
-    // In production, would fit NURBS curve through all points
-    Ok(Box::new(Line::new(points[0], points[points.len() - 1])))
+    if points.len() == 2 {
+        return Ok(Box::new(Line::new(points[0], points[points.len() - 1])));
+    }
+
+    let tolerance = Tolerance::default();
+    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
+        OperationError::NumericalError(format!("fillet curve fit failed: {:?}", e))
+    })?;
+    Ok(Box::new(nurbs))
 }
 
 /// Create spine curve from edge center points

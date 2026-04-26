@@ -474,19 +474,41 @@ fn create_chamfer_face(
     Ok(face_id)
 }
 
-/// Create offset curve from points
+/// Create an offset curve through a sequence of sample points.
+///
+/// Two points → exact `Line`. Three or more points → degree-min(3, n-1)
+/// NURBS curve fit through the points (clamped uniform parameterisation).
+/// This preserves the curvature of the offset trail along non-planar
+/// chamfered edges, instead of collapsing to a straight chord that
+/// silently disconnects from the actual chamfer surface.
 fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationResult<u32> {
-    // Would create proper B-spline curve through points
-    // For now, create line between endpoints
-    use crate::primitives::curve::Line;
+    use crate::primitives::curve::{Line, NurbsCurve};
+
     let first = points.first().ok_or_else(|| {
         OperationError::InvalidGeometry("Offset curve requires at least one point".to_string())
     })?;
-    let last = points.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Offset curve requires at least one point".to_string())
+
+    if points.len() < 2 {
+        return Err(OperationError::InvalidGeometry(
+            "Offset curve requires at least two points".to_string(),
+        ));
+    }
+
+    if points.len() == 2 {
+        let last = points.last().ok_or_else(|| {
+            OperationError::InvalidGeometry("Offset curve requires at least two points".to_string())
+        })?;
+        let line = Line::new(*first, *last);
+        return Ok(model.curves.add(Box::new(line)));
+    }
+
+    // 3+ points: fit a clamped NURBS curve. Tolerance is informational for
+    // `fit_to_points`; we pass the kernel default.
+    let tolerance = crate::math::Tolerance::default();
+    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
+        OperationError::NumericalError(format!("offset curve fit failed: {:?}", e))
     })?;
-    let line = Line::new(*first, *last);
-    Ok(model.curves.add(Box::new(line)))
+    Ok(model.curves.add(Box::new(nurbs)))
 }
 
 /// Create straight edge between vertices

@@ -568,15 +568,43 @@ fn delete_shell_cascade(
     Ok(())
 }
 
-fn heal_deletion_gaps(_model: &mut BRepModel) -> OperationResult<Vec<(EntityType, u32)>> {
-    // This would implement gap healing algorithms
-    // For now, return empty
-    Ok(Vec::new())
+/// Iteratively remove orphaned topology entities until a fixed point is reached.
+///
+/// After primary deletion + cascade + single-pass orphan cleanup, removing one
+/// orphan can create new orphans (e.g. deleting an orphan face frees its loops;
+/// freeing the loops frees their edges; freeing the edges frees their vertices).
+/// A single pass therefore leaves a stratum of dangling entities. We iterate
+/// `find_orphaned_entities` to a fixed point — at most O(depth) passes, where
+/// depth ≤ 5 (vertex→edge→loop→face→shell), so worst case is 5 sweeps.
+///
+/// Returns the cumulative list of entities healed away.
+fn heal_deletion_gaps(model: &mut BRepModel) -> OperationResult<Vec<(EntityType, u32)>> {
+    let mut healed = Vec::new();
+    // Cap iterations defensively at the topology depth (5 levels). In practice
+    // the loop terminates after 1-2 iterations once orphans run out.
+    for _ in 0..6 {
+        let orphans = find_orphaned_entities(model);
+        if orphans.is_empty() {
+            break;
+        }
+        for (entity_type, entity_id) in orphans {
+            delete_entity(model, entity_type, entity_id)?;
+            healed.push((entity_type, entity_id));
+        }
+    }
+    Ok(healed)
 }
 
-fn heal_face_deletion(_model: &mut BRepModel, _face_id: FaceId) -> OperationResult<()> {
-    // This would implement face deletion healing
-    // Could involve extending adjacent faces, etc.
+/// Heal topology after a single face deletion.
+///
+/// At call time, the face and its loops have already been removed by the caller
+/// (`delete_face`). Any edges that were used only by this face's loops are now
+/// dangling, and the vertices at their endpoints may also have become orphans.
+/// We delegate to `heal_deletion_gaps`, which performs transitive cleanup.
+fn heal_face_deletion(model: &mut BRepModel, _face_id: FaceId) -> OperationResult<()> {
+    // Transitive orphan cleanup handles edges and vertices freed by the
+    // face's removed loops in arbitrary depth.
+    let _ = heal_deletion_gaps(model)?;
     Ok(())
 }
 
@@ -671,10 +699,91 @@ fn is_shell_used(model: &BRepModel, shell_id: ShellId) -> bool {
     false
 }
 
-fn validate_model_after_deletion(_model: &BRepModel) -> OperationResult<()> {
-    // Validate topology integrity
-    // Check for dangling references
-    // Validate Euler characteristics
+/// Validate B-Rep referential integrity after a deletion.
+///
+/// A delete must leave the topology referentially consistent: every ID
+/// referenced by a surviving entity must resolve to an existing entity in the
+/// corresponding store. Dangling references are silent corruption — they
+/// cause downstream operations (tessellation, boolean, export) to fail in
+/// confusing places far from the original delete site.
+///
+/// This pass walks every survivor and asserts:
+///   - Edge.start_vertex / end_vertex exist in `model.vertices`
+///   - Edge.curve_id exists in `model.curves`
+///   - Loop.edges all exist in `model.edges`
+///   - Face.outer_loop and inner_loops all exist in `model.loops`
+///   - Face.surface_id exists in `model.surfaces`
+///   - Shell.faces all exist in `model.faces`
+///   - Solid.outer_shell and inner_shells all exist in `model.shells`
+///
+/// Returns `OperationError::TopologyError` with the first dangling reference
+/// found. The caller can then choose to roll back, repair, or surface to the
+/// user.
+fn validate_model_after_deletion(model: &BRepModel) -> OperationResult<()> {
+    fn dangling(kind: &str, id: u32, ref_kind: &str) -> OperationError {
+        OperationError::TopologyError(format!(
+            "{kind} {id} references missing {ref_kind}"
+        ))
+    }
+
+    // Edges → vertices, curves
+    for (edge_id, edge) in model.edges.iter() {
+        if model.vertices.get(edge.start_vertex).is_none() {
+            return Err(dangling("Edge", edge_id, "start vertex"));
+        }
+        if model.vertices.get(edge.end_vertex).is_none() {
+            return Err(dangling("Edge", edge_id, "end vertex"));
+        }
+        if model.curves.get(edge.curve_id).is_none() {
+            return Err(dangling("Edge", edge_id, "curve"));
+        }
+    }
+
+    // Loops → edges
+    for (loop_id, lp) in model.loops.iter() {
+        for &eid in &lp.edges {
+            if model.edges.get(eid).is_none() {
+                return Err(dangling("Loop", loop_id, "edge"));
+            }
+        }
+    }
+
+    // Faces → loops, surfaces
+    for (face_id, face) in model.faces.iter() {
+        if model.loops.get(face.outer_loop).is_none() {
+            return Err(dangling("Face", face_id, "outer loop"));
+        }
+        for &lid in &face.inner_loops {
+            if model.loops.get(lid).is_none() {
+                return Err(dangling("Face", face_id, "inner loop"));
+            }
+        }
+        if model.surfaces.get(face.surface_id).is_none() {
+            return Err(dangling("Face", face_id, "surface"));
+        }
+    }
+
+    // Shells → faces
+    for (shell_id, shell) in model.shells.iter() {
+        for &fid in &shell.faces {
+            if model.faces.get(fid).is_none() {
+                return Err(dangling("Shell", shell_id, "face"));
+            }
+        }
+    }
+
+    // Solids → shells
+    for (solid_id, solid) in model.solids.iter() {
+        if model.shells.get(solid.outer_shell).is_none() {
+            return Err(dangling("Solid", solid_id, "outer shell"));
+        }
+        for &sid in &solid.inner_shells {
+            if model.shells.get(sid).is_none() {
+                return Err(dangling("Solid", solid_id, "inner shell"));
+            }
+        }
+    }
+
     Ok(())
 }
 
