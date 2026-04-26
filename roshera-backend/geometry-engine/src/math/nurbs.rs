@@ -13,6 +13,15 @@
 //! References:
 //! - Piegl & Tiller, "The NURBS Book", 2nd Edition
 //! - Rogers, "An Introduction to NURBS"
+//!
+//! Indexed access is the canonical idiom in numerical linear algebra and
+//! polynomial-basis evaluation. All `arr[i]` here are bounds-guaranteed by the
+//! enclosing loop structure (`for i in 0..arr.len()`, knot-span-derived
+//! ranges, or de Boor recurrences over (degree+1)-sized buffers). Replacing
+//! with `.get(i).ok_or(...)?` would obscure the math without adding safety —
+//! this matches the pattern used by nalgebra, ndarray, and other Rust
+//! numerical kernels.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::bspline::KnotVector;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Vector3};
