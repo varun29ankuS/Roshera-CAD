@@ -241,7 +241,6 @@ impl OperationImpl for PatternOp {
                                         merge_entities: false,
                                         track_history: false,
                                     },
-                                    copy: false,
                                     update_parameterization: false,
                                 };
                                 let _ = transform_solid(
@@ -317,7 +316,6 @@ impl OperationImpl for PatternOp {
                                         merge_entities: false,
                                         track_history: false,
                                     },
-                                    copy: false,
                                     update_parameterization: false,
                                 };
                                 let _ = transform_solid(
@@ -406,7 +404,6 @@ impl OperationImpl for PatternOp {
                                             merge_entities: false,
                                             track_history: false,
                                         },
-                                        copy: false,
                                         update_parameterization: false,
                                     };
                                     let _ = transform_solid(

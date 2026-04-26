@@ -16,9 +16,6 @@ pub struct TransformOptions {
     /// Common operation options
     pub common: CommonOptions,
 
-    /// Whether to copy or move
-    pub copy: bool,
-
     /// Whether to update surface parameterization
     pub update_parameterization: bool,
 }
@@ -27,7 +24,6 @@ impl Default for TransformOptions {
     fn default() -> Self {
         Self {
             common: CommonOptions::default(),
-            copy: false,
             update_parameterization: true,
         }
     }
@@ -36,7 +32,8 @@ impl Default for TransformOptions {
 /// Transform result
 #[derive(Debug)]
 pub struct TransformResult {
-    /// Transformed entities (or copies if copy=true)
+    /// Transformed entities (transforms apply in place; callers wanting a
+    /// duplicate must clone the underlying solid prior to invocation).
     pub transformed_ids: Vec<u32>,
     /// Transform matrix applied
     pub transform: Matrix4,
@@ -52,11 +49,7 @@ pub fn transform_solid(
     // Validate inputs
     validate_transform_inputs(model, &transform)?;
 
-    let solid = if options.copy {
-        copy_solid(model, solid_id)?
-    } else {
-        solid_id
-    };
+    let solid = solid_id;
 
     // Get all entities in solid
     let entities = get_solid_entities(model, solid)?;
@@ -83,7 +76,6 @@ pub fn transform_solid(
             .with_parameters(serde_json::json!({
                 "solid_id": solid_id,
                 "transform": transform,
-                "copy": options.copy,
                 "update_parameterization": options.update_parameterization,
             }))
             .with_inputs(vec![solid_id as u64])
@@ -107,11 +99,7 @@ pub fn transform_faces(
 
     let input_face_ids: Vec<u64> = face_ids.iter().map(|&f| f as u64).collect();
 
-    let faces = if options.copy {
-        copy_faces(model, &face_ids)?
-    } else {
-        face_ids.clone()
-    };
+    let faces = face_ids.clone();
 
     // Get all entities used by faces
     let entities = get_faces_entities(model, &faces)?;
@@ -132,7 +120,6 @@ pub fn transform_faces(
         crate::operations::recorder::RecordedOperation::new("transform_faces")
             .with_parameters(serde_json::json!({
                 "transform": transform,
-                "copy": options.copy,
                 "update_parameterization": options.update_parameterization,
             }))
             .with_inputs(input_face_ids)
@@ -156,11 +143,7 @@ pub fn transform_edges(
 
     let input_edge_ids: Vec<u64> = edge_ids.iter().map(|&e| e as u64).collect();
 
-    let edges = if options.copy {
-        copy_edges(model, &edge_ids)?
-    } else {
-        edge_ids.clone()
-    };
+    let edges = edge_ids.clone();
 
     // Get vertices used by edges
     let mut vertices = HashSet::new();
@@ -183,7 +166,6 @@ pub fn transform_edges(
         crate::operations::recorder::RecordedOperation::new("transform_edges")
             .with_parameters(serde_json::json!({
                 "transform": transform,
-                "copy": options.copy,
                 "update_parameterization": options.update_parameterization,
             }))
             .with_inputs(input_edge_ids)
@@ -352,24 +334,6 @@ fn transform_surfaces(
     }
 
     Ok(())
-}
-
-/// Copy a solid
-fn copy_solid(_model: &mut BRepModel, solid_id: SolidId) -> OperationResult<SolidId> {
-    // Would implement deep copy of solid and all its entities
-    Ok(solid_id) // Placeholder
-}
-
-/// Copy faces
-fn copy_faces(_model: &mut BRepModel, face_ids: &[FaceId]) -> OperationResult<Vec<FaceId>> {
-    // Would implement deep copy of faces
-    Ok(face_ids.to_vec()) // Placeholder
-}
-
-/// Copy edges
-fn copy_edges(_model: &mut BRepModel, edge_ids: &[EdgeId]) -> OperationResult<Vec<EdgeId>> {
-    // Would implement deep copy of edges
-    Ok(edge_ids.to_vec()) // Placeholder
 }
 
 /// Get all entities in a solid
