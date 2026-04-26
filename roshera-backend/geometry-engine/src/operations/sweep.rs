@@ -531,11 +531,39 @@ fn compute_fixed_frame(
     Ok(Matrix4::from_cols(side, up, tangent, Vector3::ZERO))
 }
 
-/// Compute normal-based frame
+/// Compute a world-up oriented frame: tangent from the path, "up" derived
+/// from the global +Z axis (or +Y if the tangent is near-parallel to +Z),
+/// "side" = tangent × up, then re-orthonormalize. This avoids the
+/// curvature-flip artifacts of Frenet on planar paths and gives a
+/// predictable orientation aligned with the world reference frame, which
+/// is what `OrientationControl::Normal` denotes when no guide surface is
+/// supplied.
 fn compute_normal_frame(model: &BRepModel, edge: &Edge, t: f64) -> OperationResult<Matrix4> {
-    // Would compute frame based on surface normal
-    // For now, use Frenet
-    compute_frenet_frame(model, edge, t)
+    let curve = model
+        .curves
+        .get(edge.curve_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+
+    let curve_t = edge.edge_to_curve_parameter(t);
+    let derivatives = curve.evaluate_derivatives(curve_t, 1)?;
+    let tangent = derivatives
+        .get(1)
+        .ok_or(MathError::InvalidParameter("No tangent".to_string()))?
+        .normalize()?;
+
+    // Pick reference up; switch to Y if tangent is near-parallel to Z
+    let z = Vector3::new(0.0, 0.0, 1.0);
+    let reference = if tangent.dot(&z).abs() > 0.95 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        z
+    };
+
+    // Project reference onto plane perpendicular to tangent
+    let up = (reference - tangent * tangent.dot(&reference)).normalize()?;
+    let side = tangent.cross(&up).normalize()?;
+
+    Ok(Matrix4::from_cols(side, up, tangent, Vector3::ZERO))
 }
 
 /// Compute scale at parameter
