@@ -5,6 +5,10 @@
 //! - Plane-plane intersections
 //! - Projection operations
 //! - Half-space queries
+//!
+//! Indexed access into 3D coefficient / normal arrays is the canonical idiom —
+//! bounded by axis dimension constants. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{
     consts, ray::Ray, vector2::Vector2, ApproxEq, MathError, MathResult, Point3, Tolerance, Vector3,

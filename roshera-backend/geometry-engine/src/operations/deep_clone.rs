@@ -2,6 +2,10 @@
 //!
 //! Provides functionality to create complete copies of geometric entities
 //! with proper ID remapping for all references.
+//!
+//! Indexed access into ID-remap tables is the canonical idiom — bounded by
+//! source-topology length. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{OperationError, OperationResult};
 use crate::math::{Point3, Vector3};

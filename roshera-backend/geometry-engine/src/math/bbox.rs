@@ -6,6 +6,10 @@
 //! - Efficient union and intersection operations
 //! - Support for spatial indexing and culling
 //! - Cache-friendly 48-byte representation
+//!
+//! Indexed access into 3D coordinate arrays is the canonical idiom —
+//! bounded by axis dimension constants. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{consts, ApproxEq, Matrix4, Point3, Tolerance, Vector3};
 use std::fmt;

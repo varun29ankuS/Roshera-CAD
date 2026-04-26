@@ -1,6 +1,10 @@
 //! Projection Operations for B-Rep Models
 //!
 //! Projects points, curves, and other entities onto surfaces and faces.
+//!
+//! Indexed access into projection sample arrays is the canonical idiom —
+//! bounded by sample count. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Vector3};

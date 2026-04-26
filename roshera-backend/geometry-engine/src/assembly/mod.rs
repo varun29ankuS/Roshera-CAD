@@ -7,6 +7,11 @@
 //! - Motion simulation
 //! - Exploded views
 //!
+//! Indexed access into part / instance arrays is the canonical idiom for
+//! assembly tree traversal — bounded by enumeration length. Matches the
+//! pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
+//!
 //! # Example
 //! ```
 //! let mut assembly = Assembly::new("Engine Assembly");

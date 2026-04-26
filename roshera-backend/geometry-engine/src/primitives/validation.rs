@@ -9,6 +9,11 @@
 //! - Feature-recognition validation
 //! - Assembly-constraint checking
 //! - Performance profiling and optimization hints
+//!
+//! Indexed access into topology enumeration arrays is the canonical idiom —
+//! bounded by topology length and validation buffer sizes. Matches the pattern
+//! used in nurbs.rs and other Rust numerical kernels.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{MathError, MathResult, Point3, Tolerance};
 use crate::primitives::{

@@ -9,6 +9,10 @@
 //! - Mass properties with material support
 //! - Collision-detection acceleration structures
 //! - Feature-based modeling operations
+//!
+//! Indexed access into shell/face enumeration arrays is the canonical idiom
+//! — bounded by topology length. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{consts, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
