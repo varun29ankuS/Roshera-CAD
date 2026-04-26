@@ -345,12 +345,8 @@ fn transform_surfaces(
         };
         let transformed = current.transform(transform);
         if model.surfaces.replace(surface_id, transformed).is_none() {
-            // Out-of-range id from the fast-path storage — surface was probably
-            // inserted via the type-dispatch path, which we cannot address here.
-            return Err(OperationError::NotImplemented(format!(
-                "transform_surfaces: surface {surface_id} lives in the \
-                 type-dispatched storage path, which does not yet support \
-                 in-place replacement"
+            return Err(OperationError::InvalidGeometry(format!(
+                "transform_surfaces: surface {surface_id} not found in store"
             )));
         }
     }

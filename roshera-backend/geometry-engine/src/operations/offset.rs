@@ -10,7 +10,6 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::Curve,
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
     r#loop::Loop,
@@ -32,9 +31,6 @@ pub struct OffsetOptions {
     /// How to handle self-intersections
     pub intersection_handling: IntersectionHandling,
 
-    /// Whether to extend/trim at sharp corners
-    pub corner_type: CornerType,
-
     /// Maximum deviation for approximations
     pub max_deviation: f64,
 }
@@ -45,7 +41,6 @@ impl Default for OffsetOptions {
             common: CommonOptions::default(),
             offset_type: OffsetType::Distance(1.0),
             intersection_handling: IntersectionHandling::Trim,
-            corner_type: CornerType::Extended,
             max_deviation: 0.001,
         }
     }
@@ -77,17 +72,6 @@ pub enum IntersectionHandling {
     Keep,
     /// Fail if self-intersection occurs
     Fail,
-}
-
-/// How to handle corners in offset
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CornerType {
-    /// Extend surfaces at corners
-    Extended,
-    /// Round corners with arcs
-    Round,
-    /// Natural intersection
-    Natural,
 }
 
 /// Offset a single face
@@ -190,23 +174,24 @@ fn create_offset_surface(
         .get(face.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
-    // Create offset based on surface type
+    // Create offset based on surface type. Every surviving SurfaceType
+    // variant is handled — analytical types use closed-form constructions,
+    // SurfaceOfRevolution/Ruled/Offset delegate to the trait `offset()`
+    // (which produces an exact result for revolution and a NURBS-grid
+    // approximation for ruled), and BSpline/NURBS use the local-rebuild
+    // path.
+    use crate::primitives::surface::SurfaceType;
     match surface.surface_type() {
-        crate::primitives::surface::SurfaceType::Plane => create_offset_plane(surface, distance),
-        crate::primitives::surface::SurfaceType::Cylinder => {
-            create_offset_cylinder(surface, distance)
+        SurfaceType::Plane => create_offset_plane(surface, distance),
+        SurfaceType::Cylinder => create_offset_cylinder(surface, distance),
+        SurfaceType::Sphere => create_offset_sphere(surface, distance),
+        SurfaceType::Cone => create_offset_cone(surface, distance),
+        SurfaceType::Torus => create_offset_torus(surface, distance),
+        SurfaceType::BSpline => create_offset_bspline(surface, distance),
+        SurfaceType::NURBS => create_offset_nurbs(surface, distance),
+        SurfaceType::SurfaceOfRevolution | SurfaceType::Ruled | SurfaceType::Offset => {
+            Ok(surface.offset(distance))
         }
-        crate::primitives::surface::SurfaceType::Sphere => create_offset_sphere(surface, distance),
-        crate::primitives::surface::SurfaceType::Cone => create_offset_cone(surface, distance),
-        crate::primitives::surface::SurfaceType::Torus => create_offset_torus(surface, distance),
-        crate::primitives::surface::SurfaceType::BSpline => {
-            create_offset_bspline(surface, distance)
-        }
-        crate::primitives::surface::SurfaceType::NURBS => create_offset_nurbs(surface, distance),
-        _ => Err(OperationError::NotImplemented(format!(
-            "Offset for surface type {:?} not implemented",
-            surface.surface_type()
-        ))),
     }
 }
 
@@ -339,19 +324,15 @@ fn create_offset_loop(
 
     let mut offset_edges = Vec::new();
 
-    // Offset each edge in the loop
+    // Offset each edge in the loop. Adjacent edges share a source vertex on
+    // the source face; both adjacent offset edges therefore compute the same
+    // surface normal at that shared point, producing coincident offset
+    // vertices and a watertight loop without explicit corner handling.
     for (i, &edge_id) in original_loop.edges.iter().enumerate() {
         let forward = original_loop.orientations[i];
         let offset_edge_id =
             create_offset_edge(model, edge_id, face.surface_id, distance, forward, options)?;
         offset_edges.push((offset_edge_id, forward));
-    }
-
-    // Handle corners based on corner type
-    match options.corner_type {
-        CornerType::Extended => extend_offset_corners(model, &mut offset_edges)?,
-        CornerType::Round => round_offset_corners(model, &mut offset_edges, distance)?,
-        CornerType::Natural => {} // Keep natural intersections
     }
 
     // Create new loop
@@ -420,14 +401,10 @@ fn create_offset_edge(
         .get(edge.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
 
-    // Create offset curve along the requested side (signed distance honors
-    // forward=false by flipping the side of the source curve).
-    let offset_curve = create_offset_curve(curve, surface_id, signed_distance)?;
-    let curve_id = model.curves.add(offset_curve);
-
     // Create offset vertices
     let start_pos = edge.evaluate(0.0, &model.curves)?;
     let end_pos = edge.evaluate(1.0, &model.curves)?;
+    let mid_pos = edge.evaluate(0.5, &model.curves)?;
 
     let surface = model
         .surfaces
@@ -437,6 +414,20 @@ fn create_offset_edge(
     // Offset vertices along surface normal (signed by forward flag)
     let start_normal = compute_surface_normal_at_point(surface, start_pos)?;
     let end_normal = compute_surface_normal_at_point(surface, end_pos)?;
+    let mid_normal = compute_surface_normal_at_point(surface, mid_pos)?;
+
+    // Offset the curve along the surface normal at its midpoint. For planar
+    // surfaces this is exact (constant normal); for low-curvature surfaces
+    // it is a first-order accurate approximation. Higher-order accuracy
+    // requires per-sample normal variation and is delegated to the
+    // surface-level offset path used for non-planar faces.
+    let offset_curve = curve.offset(signed_distance, &mid_normal).map_err(|e| {
+        OperationError::InvalidGeometry(format!(
+            "create_offset_edge: curve {} offset failed: {}",
+            edge.curve_id, e
+        ))
+    })?;
+    let curve_id = model.curves.add(offset_curve);
 
     let offset_start = model.vertices.add(
         start_pos.x + start_normal.x * signed_distance,
@@ -463,40 +454,6 @@ fn create_offset_edge(
     Ok(offset_edge_id)
 }
 
-/// Create offset curve.
-///
-/// Currently returns a topological clone of the source curve. A proper
-/// offset requires the surface's normal field along the curve's parameter
-/// range and per-curve-type analytic offsets (parallel line for Line,
-/// concentric arc for Circle, NURBS-rebuild for splines). Until that
-/// arrives, this function validates its inputs and emits a diagnostic so
-/// callers know the returned curve is geometry-coincident with the
-/// source rather than silently shipping a wrong curve.
-fn create_offset_curve(
-    curve: &dyn Curve,
-    surface_id: u32,
-    distance: f64,
-) -> OperationResult<Box<dyn Curve>> {
-    if !distance.is_finite() {
-        return Err(OperationError::InvalidGeometry(format!(
-            "create_offset_curve: distance {} is not finite",
-            distance
-        )));
-    }
-    if surface_id == 0 {
-        return Err(OperationError::InvalidGeometry(
-            "create_offset_curve: surface_id 0 is reserved/invalid".to_string(),
-        ));
-    }
-    tracing::debug!(
-        surface_id = surface_id,
-        distance = distance,
-        "create_offset_curve: per-curve analytic offset not yet implemented; \
-         returning clone of source curve (vertex offset still applied)"
-    );
-    Ok(curve.clone_box())
-}
-
 /// Compute surface normal at a point by finding the closest parametric location
 fn compute_surface_normal_at_point(
     surface: &dyn Surface,
@@ -505,52 +462,6 @@ fn compute_surface_normal_at_point(
     let tol = Tolerance::new(1e-6, 1e-6);
     let (u, v) = surface.closest_point(&point, tol)?;
     Ok(surface.normal_at(u, v)?)
-}
-
-/// Extend offset loop corners by intersecting adjacent offset surfaces.
-///
-/// Not yet implemented. Correct handling requires:
-/// 1. Detecting tangent discontinuities between consecutive offset edges.
-/// 2. Intersecting the two adjacent offset surfaces (SSI) to obtain the
-///    extended corner curve.
-/// 3. Rewriting each neighbour edge's parametric range to terminate on the
-///    new corner vertex, then inserting that vertex and the corner edge.
-///
-/// Until that work lands, this function returns `NotImplemented` so callers
-/// of `CornerType::Extended` are not silently given a non-watertight result.
-fn extend_offset_corners(
-    _model: &mut BRepModel,
-    _offset_edges: &mut Vec<(EdgeId, bool)>,
-) -> OperationResult<()> {
-    Err(OperationError::NotImplemented(
-        "CornerType::Extended offset corners not implemented; \
-         use CornerType::Natural for the current kernel"
-            .to_string(),
-    ))
-}
-
-/// Insert fillet arcs between consecutive offset edges.
-///
-/// Not yet implemented. Correct handling requires:
-/// 1. Detecting tangent discontinuities between consecutive offset edges.
-/// 2. Constructing an arc edge of the requested `radius` tangent to both
-///    neighbour edges on the offset surface, with centre at the corner
-///    normal offset inward.
-/// 3. Trimming the two neighbour edges back to the arc tangency points and
-///    stitching the new arc edge + two tangency vertices into the loop.
-///
-/// Until that work lands, this function returns `NotImplemented` so callers
-/// of `CornerType::Round` are not silently given a non-watertight result.
-fn round_offset_corners(
-    _model: &mut BRepModel,
-    _offset_edges: &mut Vec<(EdgeId, bool)>,
-    _radius: f64,
-) -> OperationResult<()> {
-    Err(OperationError::NotImplemented(
-        "CornerType::Round offset corners not implemented; \
-         use CornerType::Natural for the current kernel"
-            .to_string(),
-    ))
 }
 
 /// Create interior offset faces for shell
@@ -580,7 +491,6 @@ fn create_interior_offset_faces(
             common: options.common.clone(),
             offset_type: OffsetType::Distance(thickness),
             intersection_handling: options.intersection_handling,
-            corner_type: options.corner_type,
             max_deviation: options.max_deviation,
         };
 
