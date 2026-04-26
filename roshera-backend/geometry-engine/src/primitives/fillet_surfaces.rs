@@ -2,6 +2,11 @@
 //!
 //! Implements cylindrical, toroidal, and spherical fillet surfaces with
 //! proper trimming support and numerical robustness.
+//!
+//! Indexed access into control-point grids and tangent arrays is the canonical
+//! idiom for fillet-surface evaluation — bounded by NURBS degree and grid
+//! dimensions. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::bspline::KnotVector;
 use crate::math::nurbs::NurbsSurface;

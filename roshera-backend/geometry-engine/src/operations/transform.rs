@@ -2,6 +2,11 @@
 //!
 //! Applies transformations (translate, rotate, scale, mirror) to B-Rep entities
 //! while maintaining topological integrity and analytical precision.
+//!
+//! Indexed access into matrix rows / point coordinate arrays is the canonical
+//! idiom for affine transformation — bounded by 4x4 matrix and 3D vector
+//! constants. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};

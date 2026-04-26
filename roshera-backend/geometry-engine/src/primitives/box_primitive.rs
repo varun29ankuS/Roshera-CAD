@@ -2,6 +2,10 @@
 //!
 //! This module implements a world-class parametric box primitive that meets
 //! all requirements for exact geometry, complete topology, and parametric updates.
+//!
+//! Indexed access into the 8-vertex / 12-edge / 6-face buffers is the canonical
+//! idiom — bounded by box topology constants. Matches nurbs.rs pattern.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{

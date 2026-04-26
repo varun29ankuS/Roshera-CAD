@@ -8,6 +8,11 @@
 //! - Warmup is critical: 10,000 iterations minimum for stable measurements
 //! - Pre-allocation prevents measurement noise
 //! - Inline hints are essential for hot paths
+//!
+//! Indexed access into preallocated vector / matrix buffers is the canonical
+//! idiom for hot-path benchmark code — bounded by buffer size constants.
+//! Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 //! - mul_add provides better CPU pipelining than separate multiply+add
 
 use crate::math::{Matrix4, Point3, Vector3};

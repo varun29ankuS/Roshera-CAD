@@ -6,6 +6,10 @@
 //! # References
 //! - Maekawa, T. (1999). An overview of offset curves and surfaces. CAD.
 //! - Pham, B. (1992). Offset curves and surfaces: a brief survey. CAD.
+//!
+//! Indexed access into offset sample arrays is the canonical idiom —
+//! bounded by sample / face count. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};

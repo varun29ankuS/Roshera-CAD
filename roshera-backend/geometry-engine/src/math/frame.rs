@@ -13,6 +13,11 @@
 //!   a guide rail at each station.
 //! - **Multi-guide**: Fits the profile to multiple guide curves using a Kabsch-style
 //!   rotation with optional scaling.
+//!
+//! Indexed access into station / sample arrays is the canonical idiom for
+//! frame propagation — bounded by sample count. Matches the pattern used in
+//! nurbs.rs and other Rust numerical kernels.
+#![allow(clippy::indexing_slicing)]
 //! - **Bi-rail**: Interpolates orientation and width between two rail curves.
 //!
 //! # References

@@ -2,6 +2,11 @@
 //!
 //! Imprints edges and wires onto faces, creating new edges on the face
 //! without splitting it into separate faces.
+//!
+//! Indexed access into edge / vertex enumeration arrays is the canonical idiom
+//! for imprint topology walks — bounded by topology length. Matches the
+//! pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Vector3};

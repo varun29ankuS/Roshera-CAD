@@ -6,6 +6,10 @@
 //! 2. No `unsafe` blocks — safety through design
 //! 3. Cache-friendly layouts (SoA where hot paths demand it)
 //! 4. Minimize heap allocations on hot paths
+//!
+//! Indexed access in inline math helpers is the canonical idiom — bounded by
+//! fixed array sizes. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 // Core modules (existing)
 pub mod matrix4;

@@ -2,6 +2,11 @@
 //!
 //! Provides tools for analyzing G0, G1, and G2 continuity between
 //! curves and surfaces at their boundaries.
+//!
+//! Indexed access into control-point and knot arrays is the canonical idiom
+//! for continuity-difference computation — bounded by polynomial degree.
+//! Matches the pattern used in nurbs.rs and other Rust numerical kernels.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::bspline::BSplineCurve;
 use crate::math::nurbs::{NurbsCurve, NurbsSurface};

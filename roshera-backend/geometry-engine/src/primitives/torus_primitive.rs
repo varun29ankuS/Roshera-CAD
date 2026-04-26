@@ -2,6 +2,10 @@
 //!
 //! This module provides a production-grade torus primitive with full B-Rep topology generation.
 //! Handles self-intersection cases, partial tori, and proper UV parameterization.
+//!
+//! Indexed access into torus seam-edge / vertex arrays is the canonical idiom —
+//! bounded by topology constants. Matches the pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::{
     math::{consts, Point3, Vector3},
