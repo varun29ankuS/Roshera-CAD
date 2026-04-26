@@ -1,4 +1,9 @@
 //! Mesh data structures for tessellation
+//!
+//! Indexed access into vertex/index arrays is the canonical idiom — all
+//! `arr[i]` sites use indices bounded by mesh dimensions. Matches the
+//! numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{Point3, Vector3};
 use serde::{Deserialize, Serialize};

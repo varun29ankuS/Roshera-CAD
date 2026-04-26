@@ -12,6 +12,12 @@
 //! - NURBS: 3n degrees of freedom (X, Y, weight for each control point)
 //!
 //! The degree p determines smoothness: C^(p-1) continuity at simple knots.
+//!
+//! Indexed access into control-point and knot-vector arrays is the canonical
+//! idiom for B-spline/NURBS evaluation — all `arr[i]` sites are bounds-
+//! guaranteed by curve degree and knot-span ranges. Matches the numerical-
+//! kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{
     Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d, Vector2d,

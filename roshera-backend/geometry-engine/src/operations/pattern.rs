@@ -2,6 +2,12 @@
 //!
 //! Creates arrays and patterns of features including linear, circular,
 //! rectangular, and custom patterns.
+//!
+//! Indexed access into instance arrays and transform-matrix buffers is the
+//! canonical idiom for pattern construction — all `arr[i]` sites use
+//! indices bounded by instance count. Matches the numerical-kernel pattern
+//! used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};

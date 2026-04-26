@@ -30,6 +30,12 @@
 //!   at non-manifold vertices.
 //! - Piegl & Tiller (1997). *The NURBS Book*, §17 (trimmed-surface face
 //!   construction).
+//!
+//! Indexed access into half-edge arrays and vertex incidence lists is the
+//! canonical idiom for DCEL traversal — all `arr[i]` sites use indices
+//! bounded by `half_edges.len()` (twin-pair construction). Matches the
+//! numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::boolean::{GraphEdge, IntersectionGraph};
 use super::{OperationError, OperationResult};

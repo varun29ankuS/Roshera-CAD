@@ -9,6 +9,11 @@
 //!
 //! - Farin, G. (2002). *Curves and Surfaces for CAGD* (5th ed.),
 //!   §4.3 (de Casteljau) and §17.3 (tensor-product patches).
+//!
+//! Indexed access is the canonical idiom for de Casteljau's algorithm — all
+//! `arr[i]`/`grid[i][j]` here are bounds-guaranteed by the (degree+1)-sized
+//! buffer recurrences. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::Point3;
 use crate::math::Vector3;

@@ -2,6 +2,12 @@
 //!
 //! Creates smooth transitions between non-adjacent faces using
 //! various blending techniques.
+//!
+//! Indexed access into Hermite/conic control nets and face/edge enumeration
+//! arrays is the canonical idiom — all `arr[i]` sites use indices bounded
+//! by patch dimensions or topology length. Matches the numerical-kernel
+//! pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance};

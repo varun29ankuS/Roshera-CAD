@@ -32,6 +32,12 @@
 //! - Requicha, A.A.G. & Voelcker, H.B. (1985). Boolean operations in solid modeling. CAD.
 //! - Mäntylä, M. (1988). An Introduction to Solid Modeling. Chapter 12.
 //! - Patrikalakis & Maekawa (2002). Shape Interrogation for Computer Aided Design.
+//!
+//! Indexed access into face/edge/vertex buffers and intersection-curve
+//! sample arrays is the canonical idiom for B-Rep boolean operations — all
+//! `arr[i]` sites use indices bounded by buffer length or topology
+//! enumeration. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};

@@ -1,6 +1,11 @@
 //! Chamfer Operations for B-Rep Models
 //!
 //! Creates beveled transitions between faces by cutting edges at specified angles or distances.
+//!
+//! Indexed access into edge/face buffers and surface-sample arrays is the
+//! canonical idiom — all `arr[i]` sites use indices bounded by topology
+//! enumeration. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};

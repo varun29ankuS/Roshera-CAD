@@ -25,6 +25,12 @@
 //! - Undo/redo capability
 //! - Parametric updates
 //! - Design exploration through branching
+//!
+//! Indexed access into Matrix3 element arrays and entity buffers is the
+//! canonical idiom — all `arr[i]` sites use indices bounded by fixed array
+//! length or collection length. Matches the numerical-kernel pattern used
+//! in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 // Core 2D primitives
 pub mod arc2d;

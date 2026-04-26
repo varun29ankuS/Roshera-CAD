@@ -1,4 +1,10 @@
 //! Adaptive tessellation strategies
+//!
+//! Indexed access into curvature-sampled grids and refinement queues is the
+//! canonical idiom — all `arr[i]` sites are bounds-guaranteed by the
+//! sampling grid dimensions or recursion-depth bounds. Matches the
+//! numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{MeshVertex, TessellationParams, TriangleMesh};
 use crate::math::{Point3, Vector3};

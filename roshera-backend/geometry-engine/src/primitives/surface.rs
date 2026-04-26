@@ -9,6 +9,12 @@
 //! - Curvature analysis (Gaussian, mean, principal)
 //! - Surface fitting and approximation
 //! - G2 continuity analysis
+//!
+//! Indexed access into surface control nets, knot vectors, and parameter-
+//! grid arrays is the canonical idiom for surface evaluation — all
+//! `arr[i]`/`grid[i][j]` sites are bounds-guaranteed by surface degree and
+//! knot-span ranges. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::nurbs::NurbsSurface;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};

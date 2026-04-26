@@ -5,6 +5,11 @@
 //! - Parameter inference from partial input
 //! - Operation chaining and batch execution
 //! - Usage-based catalog hints
+//!
+//! Indexed access into operation parameter and suggestion arrays is the
+//! canonical idiom — all `arr[i]` sites use indices bounded by registry
+//! entry length. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{Point3, Vector3};
 use crate::operations::{

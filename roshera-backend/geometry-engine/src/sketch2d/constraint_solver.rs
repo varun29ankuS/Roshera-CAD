@@ -10,6 +10,13 @@
 //! 3. Order constraints by priority
 //! 4. Solve using Newton-Raphson iteration
 //! 5. Handle over/under-constrained cases
+//!
+//! Indexed access into Jacobian rows, residual vectors, and parameter arrays
+//! is the canonical idiom for Newton-Raphson — all `arr[i]` sites are
+//! bounds-guaranteed by the (n_params × n_constraints) system dimensions
+//! established at solver entry. Matches the numerical-kernel pattern used in
+//! nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::constraints::EntityRef;
 use super::{

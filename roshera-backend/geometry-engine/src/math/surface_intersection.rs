@@ -30,6 +30,12 @@
 //!   Computer Aided Design and Manufacturing*. Springer, Ch. 5.
 //! - Barnhill, R.E., Farin, G., Jordan, M. & Piper, B.R. (1987). "Surface/
 //!   surface intersection". *Computer Aided Geometric Design*, 4(1-2).
+//!
+//! Indexed access into seed-grid sample arrays and Newton-iteration scratch
+//! buffers is the canonical idiom for SSI tracing — all `arr[i]` sites use
+//! indices bounded by sampling grid dimensions or solver state vectors.
+//! Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::bspline::KnotVector;
 use crate::math::nurbs::NurbsCurve;

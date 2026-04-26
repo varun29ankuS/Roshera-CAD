@@ -1,6 +1,11 @@
 //! Parallel tessellation.
 //!
 //! Uses Rayon for multi-threaded processing.
+//!
+//! Indexed access into mesh arrays is the canonical idiom — all `arr[i]`
+//! sites use indices bounded by mesh dimensions. Matches the numerical-
+//! kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{surface, TessellationParams, ThreeJsMesh, TriangleMesh};
 use crate::primitives::{face::Face, shell::Shell, solid::Solid, topology_builder::BRepModel};

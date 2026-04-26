@@ -6,6 +6,12 @@
 //! # References
 //! - Stroud, I. (2006). Boundary Representation Modelling Techniques. Springer.
 //! - Mäntylä, M. (1988). An Introduction to Solid Modeling. Computer Science Press.
+//!
+//! Indexed access into profile-vertex arrays and side-face vertex pairings
+//! is the canonical idiom for extrusion — all `arr[i]` sites use indices
+//! bounded by profile vertex count established at extrusion entry.
+//! Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::deep_clone::deep_clone_faces;
 use super::{CommonOptions, OperationError, OperationResult};

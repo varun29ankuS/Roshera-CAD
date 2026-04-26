@@ -3,6 +3,12 @@
 //! This module provides robust implementations for edge cases in fillet
 //! operations including degenerate surfaces, near-tangent cases, and
 //! numerical instabilities.
+//!
+//! Indexed access into NURBS control nets and arc-construction sample
+//! arrays is the canonical idiom — all `arr[i]` sites use indices bounded
+//! by curve degree or sample density. Matches the numerical-kernel pattern
+//! used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::curve::NurbsCurve;

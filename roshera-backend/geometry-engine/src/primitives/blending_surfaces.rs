@@ -16,6 +16,12 @@
 //! - Piegl, L. & Tiller, W. (1997). "The NURBS Book" (2nd ed.). Springer.
 //! - DeRose, T., Kass, M., Truong, T. (1993). "Functional composition algorithms via blossoming"
 //! - Vida, J., Martin, R., Varady, T. (1994). "A survey of blending methods that use parametric surfaces"
+//!
+//! Indexed access into control nets, knot vectors, and Bézier coefficient
+//! arrays is the canonical idiom for blend-surface evaluation — all
+//! `arr[i]`/`grid[i][j]` sites are bounds-guaranteed by patch dimensions and
+//! degree. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::surface::{

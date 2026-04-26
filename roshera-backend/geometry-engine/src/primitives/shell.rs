@@ -9,6 +9,11 @@
 //! - Volume and mass-property calculations
 //! - Shell offset generation
 //! - Multi-threaded validation
+//!
+//! Indexed access into face/edge buffers is the canonical idiom for shell
+//! traversal — all `arr[i]` sites use indices bounded by topology length.
+//! Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{

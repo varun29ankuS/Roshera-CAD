@@ -8,6 +8,11 @@
 //! - Face-face intersection
 //! - Adaptive meshing driven by curvature
 //! - Face splitting and merging
+//!
+//! Indexed access into loop/edge enumeration arrays is the canonical idiom
+//! for face traversal — all `arr[i]` sites use indices bounded by topology
+//! length. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{

@@ -2,6 +2,12 @@
 //!
 //! This module provides the core infrastructure for building watertight B-Rep
 //! topology for all primitive types, both 2D and 3D, with timeline support.
+//!
+//! Indexed access into vertex/edge/face buffers built during primitive
+//! construction is bounds-guaranteed by the known topology of each primitive
+//! (box=8v/12e/6f, cylinder=2N+2v, etc). All `arr[i]` sites use indices
+//! derived from the construction loop counters.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{

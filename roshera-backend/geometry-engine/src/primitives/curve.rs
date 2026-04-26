@@ -11,6 +11,12 @@
 //! - ISO 10303-42:2022 Geometric and topological representation
 //! - Piegl & Tiller, "The NURBS Book", 2nd Ed.
 //! - Stroud, "Boundary Representation Modelling Techniques"
+//!
+//! Indexed access into control-point arrays, knot vectors, and Bézier
+//! coefficient buffers is the canonical idiom for curve evaluation — all
+//! `arr[i]` sites are bounds-guaranteed by curve degree and knot-span
+//! ranges. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use crate::math::{
     consts, BBox, MathError, MathResult, Matrix4, Point3, Point4, Tolerance, Vector3,

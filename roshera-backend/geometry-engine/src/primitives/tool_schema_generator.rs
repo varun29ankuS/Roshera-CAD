@@ -8,6 +8,11 @@
 //! Tool schemas are generated statically from the geometry engine's type system.
 //! Tiered disclosure prevents context window bloat: Tier1 covers the most common
 //! primitives and operations, Tier2 adds modeling operations, Tier3 includes all.
+//!
+//! Indexed access into schema parameter arrays is the canonical idiom — all
+//! `arr[i]` sites use indices bounded by parameter list length validated at
+//! schema construction. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

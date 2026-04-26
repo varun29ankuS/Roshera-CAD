@@ -2,6 +2,12 @@
 //!
 //! Creates solids by sweeping profiles along arbitrary paths with
 //! orientation control and scaling.
+//!
+//! Indexed access into profile-vertex / path-frame arrays is the canonical
+//! idiom — all `arr[i]` sites use indices bounded by profile vertex count
+//! and path-frame count established at sweep entry. Matches the numerical-
+//! kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::frame::parallel_transport_frames;

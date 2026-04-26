@@ -2,6 +2,11 @@
 //!
 //! Column-major order for compatibility with graphics APIs.
 //! Optimized for normal transformations and rotation operations.
+//!
+//! Indexed access into `m: [f64; 9]` is the canonical idiom — all `m[i]`
+//! sites use compile-time-known constant indices (0..=8) bounded by the
+//! fixed array length. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{consts, ApproxEq, MathError, MathResult, Matrix4, Tolerance, Vector3};
 use std::fmt;

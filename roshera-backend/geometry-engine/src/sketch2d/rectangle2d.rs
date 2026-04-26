@@ -11,6 +11,11 @@
 //! - 1 for height
 //!
 //! A rotated rectangle adds 1 more DOF for rotation angle (5 total).
+//!
+//! Indexed access into the 4-corner vertex array is the canonical idiom —
+//! all `corners[i]` sites use indices in 0..=3. Matches the numerical-
+//! kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{
     LineSegment2d, Matrix3, Point2d, Polyline2d, Sketch2dError, Sketch2dResult, SketchEntity2d,

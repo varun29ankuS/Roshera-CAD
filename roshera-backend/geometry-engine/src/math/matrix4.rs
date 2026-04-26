@@ -15,6 +15,11 @@
 //! [ m20 m21 m22 m23 ]              m02, m12, m22, m32,  // Column 2
 //! [ m30 m31 m32 m33 ]              m03, m13, m23, m33]  // Column 3
 //! ```
+//!
+//! Indexed access into `m: [f64; 16]` is the canonical idiom — all `m[i]`
+//! sites use compile-time-known constant indices (0..=15) bounded by the
+//! fixed array length. Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{consts, ApproxEq, MathError, MathResult, Point3, Tolerance, Vector3};
 use serde::{Deserialize, Serialize};

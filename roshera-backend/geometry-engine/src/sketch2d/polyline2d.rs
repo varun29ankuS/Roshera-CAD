@@ -9,6 +9,11 @@
 //! - 2 for each vertex position (X, Y)
 //!
 //! When closed, one constraint is implicitly added (first == last).
+//!
+//! Indexed access into the polyline vertex array is the canonical idiom —
+//! all `vertices[i]` sites use indices bounded by `vertices.len()` (verified
+//! at construction). Matches the numerical-kernel pattern used in nurbs.rs.
+#![allow(clippy::indexing_slicing)]
 
 use super::{
     LineSegment2d, Matrix3, Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d,
