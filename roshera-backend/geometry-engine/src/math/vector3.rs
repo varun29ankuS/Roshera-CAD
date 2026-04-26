@@ -1171,6 +1171,7 @@ mod tests {
         let small = Vector3::splat(1e-100);
 
         assert!(large.is_finite());
+        assert!(small.is_finite());
         assert!(!Vector3::splat(f64::INFINITY).is_finite());
         assert!(!Vector3::splat(f64::NAN).is_finite());
 

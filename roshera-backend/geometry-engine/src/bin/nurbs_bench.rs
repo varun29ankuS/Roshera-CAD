@@ -10,8 +10,6 @@ const BENCHMARK_ITERATIONS: usize = 100_000;
 #[derive(Debug)]
 struct BenchmarkResult {
     operation: String,
-    total_time: Duration,
-    iterations: usize,
     ns_per_op: f64,
     ops_per_sec: f64,
 }
@@ -23,8 +21,6 @@ impl BenchmarkResult {
 
         Self {
             operation: operation.to_string(),
-            total_time,
-            iterations,
             ns_per_op,
             ops_per_sec,
         }

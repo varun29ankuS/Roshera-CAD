@@ -93,7 +93,7 @@ fn benchmark_vector3() -> Vec<BenchmarkResult> {
     // Normalization
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(v1.normalize());
+        let _ = std::hint::black_box(v1.normalize());
     }
     let duration = start.elapsed();
     let ns_per_op = duration.as_nanos() as f64 / iterations as f64;

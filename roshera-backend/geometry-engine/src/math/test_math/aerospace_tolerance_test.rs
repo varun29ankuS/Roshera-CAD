@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod aerospace_tolerance_tests {
-    use crate::math::{bspline::BSplineCurve, Point3, Tolerance};
+    use crate::math::{bspline::BSplineCurve, Point3};
 
     /// Aerospace industry standard geometric tolerance
     const AEROSPACE_TOLERANCE: f64 = 1e-10;

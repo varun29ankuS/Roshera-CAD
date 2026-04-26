@@ -80,7 +80,7 @@ fn main() {
         || {
             let mut model = BRepModel::new();
             let mut builder = TopologyBuilder::new(&mut model);
-            std::hint::black_box(builder.create_box_3d(5.0, 3.0, 2.0));
+            let _ = std::hint::black_box(builder.create_box_3d(5.0, 3.0, 2.0));
         },
         1000,
     );
@@ -95,7 +95,7 @@ fn main() {
         || {
             let mut model = BRepModel::new();
             let mut builder = TopologyBuilder::new(&mut model);
-            std::hint::black_box(builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), 5.0));
+            let _ = std::hint::black_box(builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), 5.0));
         },
         1000,
     );

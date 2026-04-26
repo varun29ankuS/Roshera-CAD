@@ -17,14 +17,12 @@ struct BenchmarkResult {
 
 #[derive(Debug, Clone)]
 struct TimingResult {
-    op_count: usize,
-    total_ns: f64,
     ns_per_op: f64,
     ops_per_sec: f64,
 }
 
 // Helper function to prevent compiler optimization
-fn black_box_return<T>(mut val: T) -> T {
+fn black_box_return<T>(val: T) -> T {
     let ret = unsafe { std::ptr::read_volatile(&val) };
     std::mem::forget(val);
     ret
@@ -62,8 +60,6 @@ where
         let ops_per_sec = 1e9 / ns_per_op;
 
         measurements.push(TimingResult {
-            op_count,
-            total_ns,
             ns_per_op,
             ops_per_sec,
         });
@@ -248,7 +244,6 @@ fn bench_vector_ops() {
 
     let v1 = Vector3::new(1.234, 5.678, 9.012);
     let v2 = Vector3::new(3.456, 7.890, 1.234);
-    let v3 = Vector3::new(-2.345, 6.789, -3.456);
 
     // Basic arithmetic
     results.push(benchmark_scaled("Vector3::add", || {
@@ -532,9 +527,6 @@ fn bench_real_world_scenarios() {
 
     // Scenario 1: Transform chain
     {
-        let transform = Matrix4::translation(5.0, 0.0, 0.0)
-            * Matrix4::rotation_y(std::f64::consts::PI / 4.0)
-            * Matrix4::scale(2.0, 2.0, 2.0);
         let point = Point3::new(1.0, 2.0, 3.0);
 
         results.push(benchmark_scaled("Transform chain (3 matrices)", || {

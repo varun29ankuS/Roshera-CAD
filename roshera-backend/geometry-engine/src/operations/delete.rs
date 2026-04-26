@@ -677,31 +677,3 @@ fn validate_model_after_deletion(_model: &BRepModel) -> OperationResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_delete_solid() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-
-    #[test]
-    fn test_delete_face() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-
-    #[test]
-    fn test_cascade_deletion() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-
-    #[test]
-    fn test_orphan_cleanup() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-}

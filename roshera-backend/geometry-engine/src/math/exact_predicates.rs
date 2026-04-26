@@ -501,7 +501,6 @@ pub fn cospherical(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Poin
 mod tests {
     use super::*;
     use crate::math::consts;
-    use crate::math::tolerance::NORMAL_TOLERANCE;
 
     #[test]
     fn test_orient2d_basic() {
@@ -597,10 +596,9 @@ mod tests {
         assert_eq!(hi, 21.0);
         assert!(lo.abs() < consts::EPSILON);
 
-        // Test two_sum
-        let (hi, lo) = two_sum(1e16, 1.0);
+        // Test two_sum: lo captures roundoff error
+        let (hi, _lo) = two_sum(1e16, 1.0);
         assert_eq!(hi, 1e16 + 1.0);
-        // lo captures the roundoff error
     }
 
     #[test]

@@ -24,7 +24,7 @@ mod tests {
         box_primitive::{BoxParameters, BoxPrimitive},
         cone_primitive::{ConeParameters, ConePrimitive},
         cylinder_primitive::{CylinderParameters, CylinderPrimitive},
-        primitive_traits::{Primitive, PrimitiveError},
+        primitive_traits::Primitive,
         shell::ShellType,
         solid,
         sphere_primitive::{SphereParameters, SpherePrimitive},
@@ -1000,7 +1000,7 @@ mod tests {
         };
 
         let initial_vertices = model.vertices.len();
-        let solid_id = SpherePrimitive::create(sphere_params, &mut model).unwrap();
+        SpherePrimitive::create(sphere_params, &mut model).unwrap();
         let vertices_added = model.vertices.len() - initial_vertices;
 
         // Calculate memory usage
