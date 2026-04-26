@@ -655,9 +655,13 @@ fn compute_line_surface_parameters(
     Ok(params)
 }
 
-/// Stub implementations for other specialized intersections
-/// These would be implemented with similar analytical precision
-
+/// Analytical plane-cylinder intersection.
+///
+/// Returns a Vec of intersection curves classified by the relative angle
+/// between the plane normal and the cylinder axis:
+/// - parallel (|n · a| ≈ 0): two parallel lines (or zero if plane misses)
+/// - perpendicular (|n · a| ≈ 1): a circle
+/// - oblique: an ellipse bounded to the cylinder's extents
 fn plane_cylinder_intersection(
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,
@@ -936,7 +940,7 @@ fn create_line_intersection_curve_bounded(
     })
 }
 
-/// Helper functions for parametric computations
+// Helper functions for parametric computations.
 
 /// Project a 3D point onto a plane's local UV coordinate system.
 /// Uses the plane normal to build an orthonormal basis (U, V, N) and returns
