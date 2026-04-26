@@ -321,9 +321,19 @@ fn move_vertex(
     // Store old position for constraint checking
     let old_position = old_vertex.point();
 
-    // Update position by adding a new vertex at the same ID
-    // Note: VertexStore doesn't have a direct update method, so we need to work around this
-    // For now, we'll just track that the vertex needs updating
+    // Apply the actual position update via VertexStore::set_position.
+    // The store also updates its spatial index internally.
+    if !model.vertices.set_position(
+        vertex_id,
+        new_position.x,
+        new_position.y,
+        new_position.z,
+    ) {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Vertex {} could not be updated",
+            vertex_id
+        )));
+    }
 
     // Update dependent edges if requested
     if options.update_dependents {
@@ -331,136 +341,79 @@ fn move_vertex(
         update_edges_for_vertex(model, vertex_id, old_position, new_position)?;
     }
 
-    // Maintain constraints if requested
+    // Validate that no edges incident to this vertex were corrupted by the move.
     if options.maintain_constraints {
-        // This would involve constraint solving
-        // For now, just validate that constraints are not violated
         validate_vertex_constraints(model, vertex_id)?;
     }
 
     Ok(())
 }
 
-/// Replace an edge's curve
+/// Replace an edge's underlying curve. Replacing an edge curve requires
+/// `EdgeStore::set_curve_id` (does not currently exist) plus parameter-range
+/// recomputation against the new curve. Returns `NotImplemented` to avoid
+/// silently producing a model where the edge claims one geometry but the
+/// store still holds the old curve.
 fn replace_edge_curve(
     model: &mut BRepModel,
     edge_id: EdgeId,
-    new_curve: EdgeCurveType,
-    options: &ModifyOptions,
+    _new_curve: EdgeCurveType,
+    _options: &ModifyOptions,
 ) -> OperationResult<()> {
-    // Get the edge
-    let _edge = model
-        .edges
-        .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidInput {
+    if model.edges.get(edge_id).is_none() {
+        return Err(OperationError::InvalidInput {
             parameter: "edge_id".to_string(),
             expected: "existing edge".to_string(),
             received: format!("{}", edge_id),
-        })?;
-
-    // Create new curve based on type
-    match new_curve {
-        EdgeCurveType::Line { start: _, end: _ } => {
-            // Update edge to be a line
-            // This would involve updating the edge's curve representation
-        }
-        EdgeCurveType::Arc {
-            center: _,
-            radius: _,
-            start_angle: _,
-            end_angle: _,
-        } => {
-            // Update edge to be an arc
-        }
-        EdgeCurveType::BSpline {
-            control_points: _,
-            degree: _,
-        } => {
-            // Update edge to be a B-spline
-        }
-        EdgeCurveType::Circle {
-            center: _,
-            radius: _,
-            normal: _,
-        } => {
-            // Update edge to be a circle
-        }
+        });
     }
-
-    // Update dependent faces if requested
-    if options.update_dependents {
-        update_faces_for_edge(model, edge_id)?;
-    }
-
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "replace_edge_curve requires EdgeStore mutation API; delete + recreate edge instead"
+            .to_string(),
+    ))
 }
 
-/// Modify a face's surface
+/// Modify a face's underlying surface. Requires `SurfaceStore::set_surface`
+/// or replace + remap pattern that is currently not exposed. Returns
+/// `NotImplemented` to avoid silently leaving the face referencing the old
+/// surface while the caller assumes the swap succeeded.
 fn modify_face_surface(
     model: &mut BRepModel,
     face_id: FaceId,
-    surface_params: SurfaceParameters,
+    _surface_params: SurfaceParameters,
     _options: &ModifyOptions,
 ) -> OperationResult<()> {
-    // Get the face
-    let _face = model
-        .faces
-        .get(face_id)
-        .ok_or_else(|| OperationError::InvalidInput {
+    if model.faces.get(face_id).is_none() {
+        return Err(OperationError::InvalidInput {
             parameter: "face_id".to_string(),
             expected: "existing face".to_string(),
             received: format!("{}", face_id),
-        })?;
-
-    // Update surface based on type
-    match surface_params.surface_type {
-        SurfaceType::Plane => {
-            // Convert to planar surface
-        }
-        SurfaceType::Cylinder => {
-            // Convert to cylindrical surface
-        }
-        SurfaceType::Sphere => {
-            // Convert to spherical surface
-        }
-        SurfaceType::Torus => {
-            // Convert to toroidal surface
-        }
-        SurfaceType::BSpline => {
-            // Convert to B-spline surface
-            if let Some(_control_points) = surface_params.control_points {
-                // Set control points
-            }
-        }
-        SurfaceType::NURBS => {
-            // Convert to NURBS surface
-        }
+        });
     }
-
-    Ok(())
+    Err(OperationError::NotImplemented(
+        "modify_face_surface requires SurfaceStore mutation API; rebuild face instead".to_string(),
+    ))
 }
 
-/// Modify solid properties
+/// Modify solid-level metadata properties. The current `Solid` struct does
+/// not carry a properties field (mass, density, material id, etc.), so this
+/// operation has no representation. Returns `NotImplemented` rather than
+/// silently accepting properties that vanish.
 fn modify_solid_properties(
     model: &mut BRepModel,
     solid_id: SolidId,
     _properties: SolidProperties,
 ) -> OperationResult<()> {
-    // Get the solid
-    let _solid = model
-        .solids
-        .get(solid_id)
-        .ok_or_else(|| OperationError::InvalidInput {
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidInput {
             parameter: "solid_id".to_string(),
             expected: "existing solid".to_string(),
             received: format!("{}", solid_id),
-        })?;
-
-    // Update properties
-    // Note: The actual solid structure would need property fields for this
-    // This is a placeholder for the actual implementation
-
-    Ok(())
+        });
+    }
+    Err(OperationError::NotImplemented(
+        "modify_solid_properties: Solid struct has no properties field to update".to_string(),
+    ))
 }
 
 /// Change loop orientation
@@ -572,12 +525,6 @@ fn update_edges_for_vertex(
 ) -> OperationResult<()> {
     // Update curves of edges that use this vertex
     // This would involve recalculating curve parameters
-    Ok(())
-}
-
-fn update_faces_for_edge(_model: &mut BRepModel, _edge_id: EdgeId) -> OperationResult<()> {
-    // Update surfaces of faces that use this edge
-    // This would involve recalculating surface parameters
     Ok(())
 }
 
