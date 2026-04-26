@@ -19,8 +19,6 @@ pub enum ContinuityType {
     G1 = 2,
     /// G2: Position, tangent, and curvature continuity
     G2 = 3,
-    /// G3: Position, tangent, curvature, and torsion continuity
-    G3 = 4,
 }
 
 impl fmt::Display for ContinuityType {
@@ -30,7 +28,6 @@ impl fmt::Display for ContinuityType {
             ContinuityType::G0 => write!(f, "G0 (Position)"),
             ContinuityType::G1 => write!(f, "G1 (Tangent)"),
             ContinuityType::G2 => write!(f, "G2 (Curvature)"),
-            ContinuityType::G3 => write!(f, "G3 (Torsion)"),
         }
     }
 }
@@ -415,138 +412,6 @@ fn estimate_surface_curvature_difference(
     let d2_2 = (p2_1 - 2.0 * p2_0 + p2_2) / (h * h);
 
     Ok((d2_2 - d2_1).magnitude())
-}
-
-/// Modify curve to achieve desired continuity
-pub fn enforce_continuity(
-    curve1: &mut BSplineCurve,
-    at_end1: bool,
-    curve2: &mut BSplineCurve,
-    at_start2: bool,
-    continuity: ContinuityType,
-) -> MathResult<()> {
-    match continuity {
-        ContinuityType::G0 => enforce_g0_continuity(curve1, at_end1, curve2, at_start2),
-        ContinuityType::G1 => enforce_g1_continuity(curve1, at_end1, curve2, at_start2),
-        ContinuityType::G2 => enforce_g2_continuity(curve1, at_end1, curve2, at_start2),
-        _ => Err(MathError::NotImplemented(
-            "G3 continuity enforcement".into(),
-        )),
-    }
-}
-
-/// Enforce position continuity
-fn enforce_g0_continuity(
-    curve1: &mut BSplineCurve,
-    at_end1: bool,
-    curve2: &mut BSplineCurve,
-    at_start2: bool,
-) -> MathResult<()> {
-    // Get junction parameters
-    let t1 = if at_end1 {
-        curve1.param_range.1
-    } else {
-        curve1.param_range.0
-    };
-    let t2 = if at_start2 {
-        curve2.param_range.0
-    } else {
-        curve2.param_range.1
-    };
-
-    // Evaluate positions
-    let pos1 = curve1.evaluate(t1)?;
-    let pos2 = curve2.evaluate(t2)?;
-
-    // Average position
-    let avg_pos = (pos1 + pos2) * 0.5;
-
-    // Modify control points
-    if at_end1 {
-        let n = curve1.control_points.len() - 1;
-        curve1.control_points[n] = avg_pos;
-    } else {
-        curve1.control_points[0] = avg_pos;
-    }
-
-    if at_start2 {
-        curve2.control_points[0] = avg_pos;
-    } else {
-        let n = curve2.control_points.len() - 1;
-        curve2.control_points[n] = avg_pos;
-    }
-
-    Ok(())
-}
-
-/// Enforce tangent continuity
-fn enforce_g1_continuity(
-    curve1: &mut BSplineCurve,
-    at_end1: bool,
-    curve2: &mut BSplineCurve,
-    at_start2: bool,
-) -> MathResult<()> {
-    // First enforce G0
-    enforce_g0_continuity(curve1, at_end1, curve2, at_start2)?;
-
-    // Get tangent vectors
-    let t1 = if at_end1 {
-        curve1.param_range.1
-    } else {
-        curve1.param_range.0
-    };
-    let t2 = if at_start2 {
-        curve2.param_range.0
-    } else {
-        curve2.param_range.1
-    };
-
-    let derivs1 = curve1.evaluate_derivatives(t1, 1)?;
-    let derivs2 = curve2.evaluate_derivatives(t2, 1)?;
-
-    let tangent1 = if at_end1 { derivs1[1] } else { -derivs1[1] };
-    let tangent2 = if at_start2 { derivs2[1] } else { -derivs2[1] };
-
-    // Average tangent direction
-    let avg_tangent = (tangent1.normalize()? + tangent2.normalize()?) * 0.5;
-    let avg_magnitude = (tangent1.magnitude() + tangent2.magnitude()) * 0.5;
-    let target_tangent = avg_tangent.normalize()? * avg_magnitude;
-
-    // Modify control points to match tangent
-    // This is simplified - proper implementation would consider knot multiplicity
-    if at_end1 {
-        let n = curve1.control_points.len() - 1;
-        if n > 0 {
-            let dt = curve1.knots[n] - curve1.knots[n - 1];
-            curve1.control_points[n - 1] = curve1.control_points[n] - target_tangent * dt;
-        }
-    } else {
-        if curve1.control_points.len() > 1 {
-            let dt = curve1.knots[1] - curve1.knots[0];
-            curve1.control_points[1] = curve1.control_points[0] + target_tangent * dt;
-        }
-    }
-
-    Ok(())
-}
-
-/// Enforce curvature continuity
-fn enforce_g2_continuity(
-    curve1: &mut BSplineCurve,
-    at_end1: bool,
-    curve2: &mut BSplineCurve,
-    at_start2: bool,
-) -> MathResult<()> {
-    // First enforce G1
-    enforce_g1_continuity(curve1, at_end1, curve2, at_start2)?;
-
-    // G2 enforcement requires modifying at least 3 control points
-    // This is a complex operation that depends on knot multiplicity
-    // Simplified implementation here
-
-    Err(MathError::NotImplemented(
-        "Full G2 enforcement not yet implemented".into(),
-    ))
 }
 
 #[cfg(test)]

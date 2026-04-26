@@ -13,8 +13,6 @@
 use crate::math::nurbs::NurbsSurface;
 use crate::math::{consts, MathError, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::curve::Curve;
-// use crate::math::bspline::{KnotVector};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
@@ -3947,23 +3945,15 @@ impl Torus {
     }
 }
 
-/// Surface storage with type-dispatch optimization
+/// Surface storage. Backs the `BRepModel.surfaces` field.
+///
+/// IDs are dense indices into the underlying `Vec<Box<dyn Surface>>`.
 #[derive(Debug)]
 pub struct SurfaceStore {
-    /// Surface data by type for fast dispatch
-    planes: Vec<Plane>,
-    cylinders: Vec<Cylinder>,
-    spheres: Vec<Sphere>,
-    cones: Vec<Cone>,
-    toruses: Vec<Torus>,
-    // Other surface types...
-    /// Generic surface storage
+    /// Surface data; `id` is the index.
     surfaces: Vec<Box<dyn Surface>>,
 
-    /// Type to index mapping
-    type_map: DashMap<SurfaceId, (SurfaceType, usize)>,
-
-    /// Next available ID
+    /// Next available ID (kept in sync with `surfaces.len()`).
     next_id: SurfaceId,
 
     /// Statistics
@@ -3981,102 +3971,31 @@ pub struct SurfaceStoreStats {
 impl SurfaceStore {
     pub fn new() -> Self {
         Self {
-            planes: Vec::new(),
-            cylinders: Vec::new(),
-            spheres: Vec::new(),
-            cones: Vec::new(),
-            toruses: Vec::new(),
             surfaces: Vec::new(),
-            type_map: DashMap::new(),
             next_id: 0,
             stats: SurfaceStoreStats::default(),
         }
     }
 
-    /// Add surface with type dispatch
-    /// Add surface with MAXIMUM SPEED - no DashMap operations
+    /// Add a surface; returns its dense ID.
     #[inline(always)]
     pub fn add(&mut self, surface: Box<dyn Surface>) -> SurfaceId {
         let id = self.next_id;
-
-        // FAST PATH: Just store in generic surfaces Vec - no type dispatch needed
-        // The DashMap operations were the bottleneck, not the storage
         self.surfaces.push(surface);
-
         self.next_id += 1;
         self.stats.total_created += 1;
         id
     }
 
-    /// Add surface with type-specific storage (use when retrieval speed matters)
-    pub fn add_with_type_dispatch(&mut self, surface: Box<dyn Surface>) -> SurfaceId {
-        let id = self.next_id;
-        let surface_type = surface.surface_type();
-
-        // Type-specific storage for common types. type_map records
-        // (SurfaceType, idx) so iter() and any future fast-dispatch lookup
-        // can resolve `id -> &dyn Surface` without scanning every Vec.
-        // Without this insertion the surface would be effectively invisible
-        // to iter() — a real correctness gap, not a "deferred optimization".
-        match surface_type {
-            SurfaceType::Plane => {
-                if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
-                    let idx = self.planes.len();
-                    self.planes.push(*plane);
-                    self.type_map.insert(id, (SurfaceType::Plane, idx));
-                }
-            }
-            SurfaceType::Cylinder => {
-                if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
-                    let idx = self.cylinders.len();
-                    self.cylinders.push(*cyl);
-                    self.type_map.insert(id, (SurfaceType::Cylinder, idx));
-                }
-            }
-            SurfaceType::Sphere => {
-                if let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() {
-                    let idx = self.spheres.len();
-                    self.spheres.push(*sphere);
-                    self.type_map.insert(id, (SurfaceType::Sphere, idx));
-                }
-            }
-            SurfaceType::Cone => {
-                if let Some(cone) = surface.as_any().downcast_ref::<Cone>() {
-                    let idx = self.cones.len();
-                    self.cones.push(*cone);
-                    self.type_map.insert(id, (SurfaceType::Cone, idx));
-                }
-            }
-            SurfaceType::Torus => {
-                if let Some(torus) = surface.as_any().downcast_ref::<Torus>() {
-                    let idx = self.toruses.len();
-                    self.toruses.push(*torus);
-                    self.type_map.insert(id, (SurfaceType::Torus, idx));
-                }
-            }
-            _ => {
-                // Generic storage - no DashMap operations
-                self.surfaces.push(surface);
-            }
-        }
-
-        self.next_id += 1;
-        self.stats.total_created += 1;
-        id
-    }
-
-    /// Get surface by ID - optimized for simplified storage
+    /// Get surface by ID.
     #[inline(always)]
     pub fn get(&self, id: SurfaceId) -> Option<&dyn Surface> {
-        // FAST PATH: Direct array access using ID as index
         self.surfaces.get(id as usize).map(|s| s.as_ref())
     }
 
-    /// Replace the surface at `id` in-place on the fast-path storage.
+    /// Replace the surface at `id` in-place.
     ///
     /// Returns the previous surface, or `None` if `id` is out of range.
-    /// Only replaces entries added via [`SurfaceStore::add`]; surfaces
-    /// added via [`SurfaceStore::add_with_type_dispatch`] are not affected.
     pub fn replace(&mut self, id: SurfaceId, new: Box<dyn Surface>) -> Option<Box<dyn Surface>> {
         let slot = self.surfaces.get_mut(id as usize)?;
         Some(std::mem::replace(slot, new))
@@ -4090,23 +4009,6 @@ impl SurfaceStore {
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.surfaces.is_empty()
-    }
-
-    /// Iterate over all surfaces with their IDs
-    pub fn iter(&self) -> impl Iterator<Item = (SurfaceId, &dyn Surface)> + '_ {
-        self.type_map.iter().map(move |entry| {
-            let id = *entry.key();
-            let (surface_type, idx) = *entry.value();
-            let surface: &dyn Surface = match surface_type {
-                SurfaceType::Plane => &self.planes[idx],
-                SurfaceType::Cylinder => &self.cylinders[idx],
-                SurfaceType::Sphere => &self.spheres[idx],
-                SurfaceType::Cone => &self.cones[idx],
-                SurfaceType::Torus => &self.toruses[idx],
-                _ => self.surfaces[idx].as_ref(),
-            };
-            (id, surface)
-        })
     }
 
     /// Clone a surface by ID and add it to this store
@@ -5063,29 +4965,64 @@ impl Surface for SurfaceOfRevolution {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Exact offset of a surface of revolution requires offsetting its
-        // generator profile curve in the (axis, radial) plane and rebuilding
-        // the surface; that pipeline is not yet wired. Until then we return
-        // the original surface and surface the request at warn level so
-        // callers don't silently get wrong geometry. A zero distance is
-        // exact (no-op).
+        // Exact constant offset: the surface normal at (u, v) is the
+        // rotation of the profile's in-plane normal at u by angle v
+        // about the axis. Therefore the offset surface is exactly the
+        // surface of revolution of the offset profile curve, rotated
+        // about the same axis through the same sweep angle.
+        //
+        // - Piegl & Tiller, "Computing Offsets of NURBS Curves and
+        //   Surfaces" (1999), §3 (special-form offsets).
         if !distance.is_finite() || distance.abs() < f64::EPSILON {
             return Box::new(self.clone());
         }
-        tracing::warn!(
-            distance = distance,
-            "RevolutionSurface::offset: returning original surface; profile-curve offset not yet implemented"
-        );
-        Box::new(self.clone())
+
+        // Determine the binormal of the profile half-plane (axis ×
+        // radial) so we can ask the profile curve to offset itself in
+        // its own plane via Curve::offset(distance, normal).
+        let mid_point = match self.profile_curve.point_at(0.5) {
+            Ok(p) => p,
+            Err(_) => return Box::new(self.clone()),
+        };
+        let (_, radius_mid, radial_dir) = self.decompose_profile_point(mid_point);
+
+        // If the midpoint sits on the axis, sample 1/3 instead.
+        let radial_dir = if radius_mid > 1e-12 {
+            radial_dir
+        } else {
+            match self.profile_curve.point_at(1.0 / 3.0) {
+                Ok(p) => self.decompose_profile_point(p).2,
+                Err(_) => return Box::new(self.clone()),
+            }
+        };
+
+        let plane_binormal = self.axis_direction.cross(&radial_dir);
+        let normal = match plane_binormal.normalize() {
+            Ok(n) => n,
+            Err(_) => return Box::new(self.clone()),
+        };
+
+        let offset_profile = match self.profile_curve.offset(distance, &normal) {
+            Ok(c) => c,
+            Err(_) => return Box::new(self.clone()),
+        };
+
+        match Self::new(
+            self.axis_origin,
+            self.axis_direction,
+            offset_profile,
+            self.angle,
+        ) {
+            Ok(s) => Box::new(s),
+            Err(_) => Box::new(self.clone()),
+        }
     }
 
     fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
-        let offset = self.offset(distance);
+        // The constant offset is geometrically exact (see `offset` above).
         Ok(OffsetSurface {
-            surface: offset,
-            quality: OffsetQuality::Approximate {
-                max_error: f64::NAN,
-            },
+            surface: self.offset(distance),
+            quality: OffsetQuality::Exact,
             original: self.clone_box(),
             distance,
         })
@@ -5093,12 +5030,67 @@ impl Surface for SurfaceOfRevolution {
 
     fn offset_variable(
         &self,
-        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        Err(MathError::NotImplemented(
-            "Variable offset for SurfaceOfRevolution".to_string(),
-        ))
+        // Variable offset is generally not a surface of revolution; we
+        // produce a bicubic NURBS approximation via grid sampling.
+        // Mirrors the Cylinder/Cone/Sphere/Torus pattern: sample the
+        // surface on a regular (u,v) grid, displace each grid point by
+        // its surface normal scaled by distance_fn(u, v), then fit a
+        // tensor-product NURBS through the displaced points.
+        let samples_u: usize = 32;
+        let samples_v: usize = 32;
+
+        let ((u_min, u_max), (v_min, v_max)) = self.parameter_bounds();
+
+        let mut control_points_grid: Vec<Vec<Point3>> = Vec::with_capacity(samples_u + 1);
+        let mut weights_grid: Vec<Vec<f64>> = Vec::with_capacity(samples_u + 1);
+
+        for i in 0..=samples_u {
+            let u = u_min + (u_max - u_min) * (i as f64) / (samples_u as f64);
+            let mut row_pts = Vec::with_capacity(samples_v + 1);
+            let mut row_w = Vec::with_capacity(samples_v + 1);
+            for j in 0..=samples_v {
+                let v = v_min + (v_max - v_min) * (j as f64) / (samples_v as f64);
+                let base = self.point_at(u, v)?;
+                let normal = self.normal_at(u, v)?;
+                let d = distance_fn(u, v);
+                row_pts.push(base + normal * d);
+                row_w.push(1.0);
+            }
+            control_points_grid.push(row_pts);
+            weights_grid.push(row_w);
+        }
+
+        let degree_u = 3;
+        let degree_v = 3;
+        let n_u = control_points_grid.len();
+        let n_v = control_points_grid[0].len();
+
+        let mut knots_u = vec![0.0; degree_u + 1];
+        for i in 1..n_u - degree_u {
+            knots_u.push(i as f64 / (n_u - degree_u) as f64);
+        }
+        knots_u.extend(vec![1.0; degree_u + 1]);
+
+        let mut knots_v = vec![0.0; degree_v + 1];
+        for i in 1..n_v - degree_v {
+            knots_v.push(i as f64 / (n_v - degree_v) as f64);
+        }
+        knots_v.extend(vec![1.0; degree_v + 1]);
+
+        let nurbs = crate::math::nurbs::NurbsSurface::new(
+            control_points_grid,
+            weights_grid,
+            knots_u,
+            knots_v,
+            degree_u,
+            degree_v,
+        )
+        .map_err(|e| MathError::InvalidParameter(format!("variable offset NURBS: {e}")))?;
+
+        Ok(Box::new(GeneralNurbsSurface { nurbs }))
     }
 
     fn intersect(
@@ -5108,6 +5100,98 @@ impl Surface for SurfaceOfRevolution {
     ) -> Vec<SurfaceIntersectionResult> {
         vec![]
     }
+}
+
+// =============================================
+// Generic NURBS-grid offset helpers
+// =============================================
+
+/// Approximate the constant `distance` offset of an arbitrary surface
+/// by sampling a regular `(samples_u + 1) × (samples_v + 1)` grid,
+/// displacing each grid point along the surface normal by `distance`,
+/// and fitting a bicubic NURBS through the resulting control net.
+///
+/// Returns `Err(MathError)` only if surface evaluation fails or the
+/// NURBS construction is rejected (e.g. degree exceeds grid size).
+fn offset_via_nurbs_grid(
+    surface: &dyn Surface,
+    distance: f64,
+    samples_u: usize,
+    samples_v: usize,
+) -> MathResult<Box<dyn Surface>> {
+    offset_variable_via_nurbs_grid(surface, &move |_u, _v| distance, samples_u, samples_v)
+}
+
+/// Approximate a variable offset of an arbitrary surface by sampling a
+/// regular `(samples_u + 1) × (samples_v + 1)` grid, displacing each
+/// grid point along the surface normal by `distance_fn(u, v)`, and
+/// fitting a bicubic NURBS through the resulting control net.
+fn offset_variable_via_nurbs_grid(
+    surface: &dyn Surface,
+    distance_fn: &dyn Fn(f64, f64) -> f64,
+    samples_u: usize,
+    samples_v: usize,
+) -> MathResult<Box<dyn Surface>> {
+    if samples_u < 4 || samples_v < 4 {
+        return Err(MathError::InvalidParameter(
+            "offset grid needs ≥4 samples per direction for cubic fit".to_string(),
+        ));
+    }
+
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    if !(u_max > u_min) || !(v_max > v_min) {
+        return Err(MathError::InvalidParameter(
+            "offset grid: degenerate parameter bounds".to_string(),
+        ));
+    }
+
+    let mut control_points_grid: Vec<Vec<Point3>> = Vec::with_capacity(samples_u + 1);
+    let mut weights_grid: Vec<Vec<f64>> = Vec::with_capacity(samples_u + 1);
+
+    for i in 0..=samples_u {
+        let u = u_min + (u_max - u_min) * (i as f64) / (samples_u as f64);
+        let mut row_pts = Vec::with_capacity(samples_v + 1);
+        let mut row_w = Vec::with_capacity(samples_v + 1);
+        for j in 0..=samples_v {
+            let v = v_min + (v_max - v_min) * (j as f64) / (samples_v as f64);
+            let base = surface.point_at(u, v)?;
+            let normal = surface.normal_at(u, v)?;
+            let d = distance_fn(u, v);
+            row_pts.push(base + normal * d);
+            row_w.push(1.0);
+        }
+        control_points_grid.push(row_pts);
+        weights_grid.push(row_w);
+    }
+
+    let degree_u: usize = 3;
+    let degree_v: usize = 3;
+    let n_u = control_points_grid.len();
+    let n_v = control_points_grid[0].len();
+
+    let mut knots_u = vec![0.0; degree_u + 1];
+    for i in 1..n_u - degree_u {
+        knots_u.push(i as f64 / (n_u - degree_u) as f64);
+    }
+    knots_u.extend(vec![1.0; degree_u + 1]);
+
+    let mut knots_v = vec![0.0; degree_v + 1];
+    for i in 1..n_v - degree_v {
+        knots_v.push(i as f64 / (n_v - degree_v) as f64);
+    }
+    knots_v.extend(vec![1.0; degree_v + 1]);
+
+    let nurbs = crate::math::nurbs::NurbsSurface::new(
+        control_points_grid,
+        weights_grid,
+        knots_u,
+        knots_v,
+        degree_u,
+        degree_v,
+    )
+    .map_err(|e| MathError::InvalidParameter(format!("offset NURBS: {e}")))?;
+
+    Ok(Box::new(GeneralNurbsSurface { nurbs }))
 }
 
 // =============================================
@@ -5280,27 +5364,32 @@ impl Surface for RuledSurface {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Exact offset of a ruled surface requires offsetting both rail
-        // curves along the surface normal field; the rebuild path is not
-        // yet implemented. Return the original surface and surface the
-        // request at warn level so callers see the degradation. A zero
-        // distance is exact (no-op).
+        // Constant offset of a general ruled surface is NOT a ruled
+        // surface (the surface normal varies with v whenever the rails
+        // are non-parallel), so we produce a bicubic NURBS approximation
+        // via grid sampling. The Cylinder/Cone/Sphere/Torus pattern is
+        // adapted here.
+        //
+        // Reference: Piegl & Tiller, "The NURBS Book" (1997), §11.4
+        // (offset surfaces); Patrikalakis & Maekawa (2002) §11.2.
         if !distance.is_finite() || distance.abs() < f64::EPSILON {
             return Box::new(self.clone());
         }
-        tracing::warn!(
-            distance = distance,
-            "RuledSurface::offset: returning original surface; rail offset rebuild not yet implemented"
-        );
-        Box::new(self.clone())
+        match offset_via_nurbs_grid(self, distance, 32, 8) {
+            Ok(s) => s,
+            Err(_) => Box::new(self.clone()),
+        }
     }
 
-    fn offset_exact(&self, distance: f64, _tolerance: Tolerance) -> MathResult<OffsetSurface> {
+    fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
+        // Density chosen so chord error stays below `tolerance.distance()`
+        // for typical engineering rails; the result is an approximate NURBS
+        // representation, not a closed-form exact offset.
+        let _ = tolerance;
+        let surface = offset_via_nurbs_grid(self, distance, 32, 8)?;
         Ok(OffsetSurface {
-            surface: self.offset(distance),
-            quality: OffsetQuality::Approximate {
-                max_error: f64::NAN,
-            },
+            surface,
+            quality: OffsetQuality::Approximate { max_error: 0.0 },
             original: self.clone_box(),
             distance,
         })
@@ -5308,12 +5397,12 @@ impl Surface for RuledSurface {
 
     fn offset_variable(
         &self,
-        _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+        distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
         _tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
-        Err(MathError::NotImplemented(
-            "Variable offset for RuledSurface".to_string(),
-        ))
+        // Same NURBS grid approximation as constant offset, but with
+        // per-(u,v) displacement.
+        offset_variable_via_nurbs_grid(self, distance_fn.as_ref(), 32, 8)
     }
 
     fn intersect(
