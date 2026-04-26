@@ -88,7 +88,7 @@ mod vector_edge_cases {
         let v1 = Vector3::X;
         let v2 = -Vector3::X;
         // This is undefined - any perpendicular vector is valid at t=0.5
-        let result = v1.slerp(&v2, 0.5);
+        let _ = v1.slerp(&v2, 0.5);
         // Should fall back to lerp or return error
 
         // Slerp with zero vector
@@ -99,7 +99,7 @@ mod vector_edge_cases {
         let v3 = Vector3::new(1.0, 1e-15, 0.0)
             .normalize()
             .expect("should normalize");
-        let result2 = v1.slerp(&v3, 0.5).expect("slerp should succeed");
+        let _ = v1.slerp(&v3, 0.5).expect("slerp should succeed");
         // Should be close to linear interpolation
     }
 }
@@ -116,12 +116,6 @@ mod matrix_edge_cases {
         );
         assert!(singular.inverse().is_err());
 
-        // Near-singular matrix
-        let near_singular = Matrix4::new(
-            1.0, 2.0, 3.0, 4.0, 2.0, 4.0000001, 6.0, 8.0, 3.0, 6.0, 9.0, 12.0, 4.0, 8.0, 12.0, 16.0,
-        );
-        // Should either fail or produce large condition number
-
         // Identity matrix (trivial inverse)
         let identity = Matrix4::IDENTITY;
         let inv = identity.inverse().expect("identity should have inverse");
@@ -132,7 +126,7 @@ mod matrix_edge_cases {
     fn test_matrix_decomposition_edge_cases() {
         // Matrix with zero scale
         let zero_scale = Matrix4::scale(0.0, 1.0, 1.0);
-        let (translation, rotation, scale) = zero_scale.decompose();
+        let (_, _, scale) = zero_scale.decompose();
         assert_eq!(scale.x, 0.0);
 
         // Matrix with negative scale (reflection)
@@ -171,17 +165,19 @@ mod numerical_stability_tests {
     #[test]
     fn test_catastrophic_cancellation() {
         // Test cases where subtraction can lose precision
-        let a = 1.0 + 1e-15;
-        let b = 1.0;
+        let a: f64 = 1.0 + 1e-15;
+        let b: f64 = 1.0;
         let diff = a - b;
         // In exact arithmetic, diff should be 1e-15
-        // But due to floating point, it might be 0 or slightly different
+        // But due to floating point, it falls within an order of magnitude
+        assert!(diff.abs() < 1e-13);
 
         // Vector case
         let v1 = Vector3::new(1e10, 1e-5, 0.0);
         let v2 = Vector3::new(1e10, 0.0, 0.0);
         let diff_v = v1 - v2;
-        // y-component might lose precision
+        // y-component must remain finite even under catastrophic cancellation
+        assert!(diff_v.y.is_finite());
     }
 
     #[test]
@@ -248,9 +244,10 @@ mod overflow_underflow_tests {
         let huge_scale = Matrix4::scale(1e100, 1e100, 1e100);
         let point = Point3::new(1e200, 1e200, 1e200);
 
-        // Transform might overflow
+        // Transform must not panic; result may overflow but must not corrupt state
         let transformed = huge_scale.transform_point(&point);
-        // Should handle gracefully
+        // 1e100 * 1e200 = 1e300 — well-defined IEEE 754 result, may be finite or Inf
+        assert!(transformed.x.abs() >= 1e200);
     }
 
     #[test]
@@ -259,9 +256,9 @@ mod overflow_underflow_tests {
         let tiny = 1e-300;
         let v = Vector3::new(tiny, tiny, tiny);
 
-        // Squared operations might underflow
+        // Squared operations underflow to zero at this magnitude
         let mag_sq = v.magnitude_squared();
-        // Might be 0 due to underflow
+        assert_eq!(mag_sq, 0.0);
 
         // Normalization should fail
         assert!(v.normalize().is_err());
@@ -294,9 +291,10 @@ mod special_values_tests {
         let sum = inf_vec + normal_vec;
         assert!(sum.x.is_infinite());
 
-        // Normalize infinity vector
-        let norm_result = inf_vec.normalize();
-        // Should handle gracefully
+        // Normalize infinity vector must not panic. Either errors or yields NaN
+        // (since inf/inf = NaN under IEEE 754 division).
+        let result = inf_vec.normalize();
+        assert!(result.is_err() || result.unwrap().x.is_nan());
     }
 
     #[test]

@@ -255,17 +255,3 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
     mesh.indices = remapped_indices.into_iter().flatten().collect();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parallel_tessellation() {
-        // TODO: Add comprehensive tests
-    }
-
-    #[test]
-    fn test_complexity_estimation() {
-        // TODO: Test complexity estimation
-    }
-}

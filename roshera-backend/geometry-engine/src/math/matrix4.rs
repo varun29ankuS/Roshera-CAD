@@ -1225,6 +1225,8 @@ mod tests {
         // In NDC space
         assert!(near_corner.x.abs() - 1.0 < 1e-6);
         assert!(near_corner.y.abs() - 1.0 < 1e-6);
+        assert!(far_corner.x.abs() - 1.0 < 1e-6);
+        assert!(far_corner.y.abs() - 1.0 < 1e-6);
     }
 
     #[test]

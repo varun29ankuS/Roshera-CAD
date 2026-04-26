@@ -21,18 +21,15 @@
 //! See `backend/CLAUDE.md` ("Internal Regression Targets") for the single
 //! source of truth these numbers are synchronized against.
 
-use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::math::Point3;
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
-    cone_primitive::{ConeParameters, ConePrimitive},
     cylinder_primitive::{CylinderParameters, CylinderPrimitive},
     primitive_traits::Primitive,
     sphere_primitive::{SphereParameters, SpherePrimitive},
     topology_builder::BRepModel,
-    torus_primitive::{TorusParameters, TorusPrimitive},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// External system benchmark results for comparison
@@ -648,7 +645,7 @@ impl PerformanceBenchmarks {
     pub fn quick_check() -> BenchmarkResults {
         println!("⚡ Running Quick Performance Check...");
 
-        let mut roshera_metrics = ExternalMetrics {
+        let roshera_metrics = ExternalMetrics {
             boolean_union_1k: 0.0,
             boolean_intersect_1k: 0.0,
             nurbs_eval_1m: 0.0,
@@ -692,8 +689,8 @@ impl PerformanceBenchmarks {
             let box1_params = BoxParameters::new(10.0, 10.0, 10.0).unwrap();
             let box2_params = BoxParameters::new(10.0, 10.0, 10.0).unwrap();
 
-            let solid1 = BoxPrimitive::create(box1_params, &mut model).unwrap();
-            let solid2 = BoxPrimitive::create(box2_params, &mut model).unwrap();
+            BoxPrimitive::create(box1_params, &mut model).unwrap();
+            BoxPrimitive::create(box2_params, &mut model).unwrap();
 
             let start = Instant::now();
 
@@ -725,8 +722,8 @@ impl PerformanceBenchmarks {
             let sphere1_params = SphereParameters::new(5.0, Point3::ORIGIN).unwrap();
             let sphere2_params = SphereParameters::new(5.0, Point3::new(3.0, 0.0, 0.0)).unwrap();
 
-            let solid1 = SpherePrimitive::create(sphere1_params, &mut model).unwrap();
-            let solid2 = SpherePrimitive::create(sphere2_params, &mut model).unwrap();
+            SpherePrimitive::create(sphere1_params, &mut model).unwrap();
+            SpherePrimitive::create(sphere2_params, &mut model).unwrap();
 
             let start = Instant::now();
 
@@ -758,7 +755,7 @@ impl PerformanceBenchmarks {
                 .with_segments(32, 16) // Higher detail for tessellation test
                 .unwrap();
 
-            let solid = SpherePrimitive::create(params, &mut model).unwrap();
+            SpherePrimitive::create(params, &mut model).unwrap();
 
             let start = Instant::now();
 

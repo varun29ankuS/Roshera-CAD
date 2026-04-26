@@ -1,4 +1,4 @@
-use crate::math::{Matrix3, Matrix4, Point3, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use std::time::Instant;
 
 #[cfg(test)]
@@ -211,9 +211,6 @@ mod math_benchmarks_tests {
         println!("\n--- {} operations ---", format_number(count));
 
         // Scenario 1: Transform chain (common in CAD)
-        let transform = Matrix4::translation(5.0, 0.0, 0.0)
-            * Matrix4::rotation_y(std::f64::consts::PI / 4.0)
-            * Matrix4::scale(2.0, 2.0, 2.0);
         let point = Point3::new(1.0, 2.0, 3.0);
 
         let start = Instant::now();

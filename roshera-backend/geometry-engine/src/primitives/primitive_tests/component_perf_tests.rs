@@ -9,8 +9,6 @@ use crate::primitives::{
     edge::{Edge, EdgeOrientation},
     face::{Face, FaceOrientation},
     r#loop::{Loop, LoopType},
-    shell::{Shell, ShellType},
-    solid::Solid,
     surface::Plane,
     topology_builder::BRepModel,
 };

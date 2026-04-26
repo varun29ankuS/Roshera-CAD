@@ -81,10 +81,11 @@ mod nurbs_edge_cases {
         assert!(d1.derivative1.is_some());
         assert!(d1.derivative2.is_some());
 
-        // Request more derivatives than degree allows
+        // Request more derivatives than degree allows: degree-2 curve has at
+        // most 2nd derivative; the request must succeed without panicking.
         let d_many = curve.evaluate_derivatives(0.5, 10);
-        // For degree 2, we can have up to 2nd derivative
-        // Higher derivatives would be None
+        assert!(d_many.derivative1.is_some());
+        assert!(d_many.derivative2.is_some());
     }
 
     #[test]

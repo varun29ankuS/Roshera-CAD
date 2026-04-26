@@ -592,26 +592,3 @@ fn validate_model_topology(_model: &BRepModel) -> OperationResult<()> {
     // This would involve checking Euler characteristics, etc.
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_move_vertex() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-
-    #[test]
-    fn test_replace_edge() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-
-    #[test]
-    fn test_modify_face_surface() {
-        let mut model = BRepModel::new();
-        // Add test implementation
-    }
-}

@@ -276,7 +276,6 @@ fn estimate_face_extent(face_id: u32, axis: &[f64; 3], model: &BRepModel) -> f64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::{Point3, Vector3};
     use crate::primitives::primitive_traits::Primitive;
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
 

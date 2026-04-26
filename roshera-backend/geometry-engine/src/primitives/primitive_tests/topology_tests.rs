@@ -8,12 +8,8 @@
 mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::{
-        curve::{Line, ParameterRange},
-        edge::{Edge, EdgeOrientation},
         face::{Face, FaceOrientation},
-        r#loop::Loop,
-        shell::{Shell, ShellType},
-        solid::{Feature, FeatureType, Material, Solid, SolidId},
+        solid::{Feature, FeatureType, Material, Solid},
         surface::Plane,
         topology_builder::BRepModel,
         vertex::VertexStore,
@@ -99,7 +95,7 @@ mod tests {
         // NORMAL_TOLERANCE.distance() = 1e-6, so use 5e-7 (distance = sqrt(3)*5e-7 ≈ 8.7e-7 < 1e-6)
         println!("  Tolerance distance: {}", tolerance.distance());
         let distance_calc =
-            ((0.0000005_f64.powi(2) + 0.0000005_f64.powi(2) + 0.0000005_f64.powi(2)).sqrt());
+            (0.0000005_f64.powi(2) + 0.0000005_f64.powi(2) + 0.0000005_f64.powi(2)).sqrt();
         println!("  Expected distance: {}", distance_calc);
         let v2 = store.add_or_find(0.0000005, 0.0000005, 0.0000005, tolerance.distance());
         println!("  Attempted duplicate v2: {} at (5e-7,5e-7,5e-7)", v2);
@@ -497,7 +493,7 @@ mod tests {
                 EdgeOrientation::Forward,
                 ParameterRange::unit(),
             );
-            let edge_id = model.edges.add_or_find(edge);
+            model.edges.add_or_find(edge);
             let edge_time = edge_creation_start.elapsed();
 
             let total_time = start.elapsed();
@@ -563,7 +559,7 @@ mod tests {
         use crate::primitives::{
             curve::{Line, ParameterRange},
             edge::{Edge, EdgeOrientation},
-            r#loop::{Loop, LoopId, LoopType},
+            r#loop::{Loop, LoopType},
         };
 
         let tolerance = Tolerance::default();
@@ -690,7 +686,7 @@ mod tests {
         use crate::primitives::{
             curve::{Line, ParameterRange},
             edge::{Edge, EdgeOrientation},
-            r#loop::{Loop, LoopId, LoopType},
+            r#loop::{Loop, LoopType},
         };
 
         let tolerance = Tolerance::default();
@@ -759,7 +755,7 @@ mod tests {
         let edge_count = loop_.edge_count();
         let vertices_result = loop_.vertices(&model.edges);
 
-        let loop_id = model.loops.add(loop_);
+        model.loops.add(loop_);
         let validation_time = start.elapsed();
 
         println!("  Loop validation results:");
@@ -790,7 +786,7 @@ mod tests {
         use crate::primitives::{
             curve::{Line, ParameterRange},
             edge::{Edge, EdgeOrientation},
-            r#loop::{Loop, LoopId, LoopType},
+            r#loop::{Loop, LoopType},
         };
 
         let tolerance = Tolerance::default();
@@ -1442,7 +1438,7 @@ mod tests {
         .expect("Plane creation should succeed");
         let surface_id = model.surfaces.add(Box::new(plane));
 
-        let mut face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
         let face_id = model.faces.add(face);
 
         // Test area computation
@@ -1654,9 +1650,6 @@ mod tests {
         for (u, v, contains, test_time) in containment_results {
             total_test_time += test_time;
 
-            // Check expected results based on square bounds [0,2] x [0,2]
-            let expected_inside = u >= 0.0 && u <= 2.0 && v >= 0.0 && v <= 2.0;
-
             if contains {
                 inside_count += 1;
             } else {
@@ -1664,10 +1657,10 @@ mod tests {
             }
 
             // Note: Exact boundary handling may vary, so we just check obviously inside/outside points
-            if (u > 0.1 && u < 1.9 && v > 0.1 && v < 1.9) {
+            if u > 0.1 && u < 1.9 && v > 0.1 && v < 1.9 {
                 assert!(contains, "Point ({}, {}) should definitely be inside", u, v);
             }
-            if (u < -0.1 || u > 2.1 || v < -0.1 || v > 2.1) {
+            if u < -0.1 || u > 2.1 || v < -0.1 || v > 2.1 {
                 assert!(
                     !contains,
                     "Point ({}, {}) should definitely be outside",
@@ -1709,8 +1702,7 @@ mod tests {
 
     #[test]
     fn test_shell_creation_box() {
-        use crate::primitives::face::FaceId;
-        use crate::primitives::shell::{Shell, ShellStore, ShellType};
+        use crate::primitives::shell::{Shell, ShellType};
         use crate::primitives::vertex::VertexId;
         use std::time::Instant;
 
@@ -1862,8 +1854,7 @@ mod tests {
 
     #[test]
     fn test_shell_validation_manifold() {
-        use crate::primitives::face::FaceId;
-        use crate::primitives::shell::{Shell, ShellStore, ShellType};
+        use crate::primitives::shell::{Shell, ShellType};
         use crate::primitives::vertex::VertexId;
         use std::time::Instant;
 
@@ -1873,7 +1864,6 @@ mod tests {
         println!("  Creating tetrahedron shell and validating manifold properties...");
 
         let tolerance = Tolerance::default();
-        let mut vertex_store = VertexStore::with_capacity_and_tolerance(10, tolerance.distance());
         let mut model = BRepModel::new();
 
         let start = Instant::now();
@@ -1995,8 +1985,7 @@ mod tests {
 
     #[test]
     fn test_shell_complex_topology() {
-        use crate::primitives::face::FaceId;
-        use crate::primitives::shell::{Shell, ShellStore, ShellType};
+        use crate::primitives::shell::{Shell, ShellType};
         use crate::primitives::vertex::VertexId;
         use std::time::Instant;
 
@@ -2006,7 +1995,6 @@ mod tests {
         println!("  Creating complex shell with mixed face types...");
 
         let tolerance = Tolerance::default();
-        let mut vertex_store = VertexStore::with_capacity_and_tolerance(20, tolerance.distance());
         let mut model = BRepModel::new();
 
         let start = Instant::now();
@@ -2123,8 +2111,6 @@ mod tests {
         println!("║                    SOLID VALIDATION TEST (CUBE)                   ║");
         println!("╚══════════════════════════════════════════════════════════════════╝");
         println!("  Creating solid cube and validating 3D topology...");
-
-        use crate::primitives::shell::{Shell, ShellType};
 
         let tolerance = Tolerance::new(1e-6, 1e-6);
         let mut model = BRepModel::new();
@@ -2443,8 +2429,6 @@ mod tests {
         // Create tetrahedron faces manually for precise Euler validation
         let mut vertex_ids = Vec::new();
         for vertex_pos in &tetrahedron_vertices {
-            let vertex =
-                crate::primitives::vertex::Vertex::new(0, vertex_pos.x, vertex_pos.y, vertex_pos.z);
             let vertex_id = model.vertices.add_or_find(
                 vertex_pos.x,
                 vertex_pos.y,
@@ -2568,12 +2552,10 @@ mod tests {
     ) -> crate::primitives::shell::ShellId {
         use crate::math::Vector3;
         use crate::primitives::shell::{Shell, ShellType};
-        use crate::primitives::vertex::Vertex;
 
         // Add vertices to model
         let mut vertex_ids = Vec::new();
         for vertex_pos in vertices {
-            let vertex = Vertex::new(0, vertex_pos.x, vertex_pos.y, vertex_pos.z);
             let vertex_id = model.vertices.add_or_find(
                 vertex_pos.x,
                 vertex_pos.y,
@@ -2703,10 +2685,8 @@ mod tests {
 
         let p0 = positions[0];
         let p1 = positions[1];
-        let p2 = positions[2];
 
         let u_dir = (p1 - p0).normalize().unwrap();
-        let v_dir = (p2 - p0).normalize().unwrap();
 
         // Create edges for the triangle (3 edges)
         let mut edge_ids = Vec::new();
@@ -2762,7 +2742,7 @@ mod tests {
         model: &mut BRepModel,
         positions: &[Point3; 4],
         vertex_ids: &[VertexId; 4],
-        normal: Vector3,
+        _normal: Vector3,
     ) -> FaceId {
         use crate::primitives::curve::Line;
         use crate::primitives::curve::ParameterRange;
@@ -2833,14 +2813,10 @@ mod tests {
         // Get vertex positions for plane creation
         let p0_arr = vertex_store.get(vertices[0]).unwrap().position;
         let p1_arr = vertex_store.get(vertices[1]).unwrap().position;
-        let p3_arr = vertex_store.get(vertices[3]).unwrap().position;
-
         let p0 = Point3::new(p0_arr[0], p0_arr[1], p0_arr[2]);
         let p1 = Point3::new(p1_arr[0], p1_arr[1], p1_arr[2]);
-        let p3 = Point3::new(p3_arr[0], p3_arr[1], p3_arr[2]);
 
         let u_dir = (p1 - p0).normalize().unwrap();
-        let v_dir = (p3 - p0).normalize().unwrap();
 
         // Create edges for the rectangle
         let mut edge_ids = Vec::new();
@@ -2892,11 +2868,9 @@ mod tests {
         use crate::primitives::curve::Line;
         use crate::primitives::curve::ParameterRange;
         use crate::primitives::edge::{Edge, EdgeOrientation};
-        use crate::primitives::face::FaceId;
         use crate::primitives::face::{Face, FaceOrientation};
         use crate::primitives::r#loop::{Loop, LoopType};
         use crate::primitives::surface::Plane;
-        use crate::primitives::vertex::VertexId;
 
         assert_eq!(vertices.len(), 5, "Pentagon requires exactly 5 vertices");
 
@@ -3030,7 +3004,7 @@ mod tests {
         // Create shell
         let mut shell = Shell::new(0, ShellType::Open);
         shell.add_face(face_id);
-        let shell_id = model.shells.add(shell);
+        model.shells.add(shell);
 
         // Now delete a vertex - this should cascade through the topology
         // In a real implementation, this would need to handle:
@@ -3509,7 +3483,7 @@ mod tests {
         // Add to shell - this creates non-manifold vertex at center
         let mut shell = Shell::new(0, ShellType::NonManifold);
         shell.add_faces(&[face1_id, face2_id]);
-        let shell_id = model.shells.add(shell);
+        model.shells.add(shell);
 
         // The center vertex is non-manifold (bowtie configuration)
         println!("⚠️ Non-manifold vertex created - validation should detect this!");
@@ -3535,8 +3509,6 @@ mod tests {
     /// Compute and assert that every face on `solid_id` has its outer-loop
     /// vertex winding aligned with the surface's outward normal.
     fn assert_box_face_normals_match_loop_winding(model: &BRepModel, solid_id: u32) {
-        use crate::primitives::surface::Surface;
-
         let solid = model
             .solids
             .get(solid_id)

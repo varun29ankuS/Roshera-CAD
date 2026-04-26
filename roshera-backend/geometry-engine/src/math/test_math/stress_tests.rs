@@ -7,7 +7,6 @@ mod stress_tests {
     use crate::math::bspline::BSplineCurve;
     use crate::math::quaternion::Quaternion;
     use crate::math::*;
-    use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
 
