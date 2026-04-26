@@ -1266,7 +1266,7 @@ impl Plane {
         let curvature =
             (surf1.k1.abs().max(surf1.k2.abs())).max(surf2.k1.abs().max(surf2.k2.abs()));
         let step_size = if curvature > consts::EPSILON {
-            (0.1 / curvature).min(1.0).max(0.01)
+            (0.1 / curvature).clamp(0.01, 1.0)
         } else {
             0.1
         };

@@ -3801,7 +3801,7 @@ impl Curve for Ellipse {
     fn arc_length_between(&self, t1: f64, t2: f64, tolerance: Tolerance) -> MathResult<f64> {
         // Ellipse arc length requires numerical integration (no closed form)
         let num_segments = ((t2 - t1).abs() / tolerance.distance()).ceil() as usize;
-        let num_segments = num_segments.max(10).min(1000);
+        let num_segments = num_segments.clamp(10, 1000);
 
         let dt = (t2 - t1) / (num_segments as f64);
         let mut length = 0.0;
@@ -3837,7 +3837,7 @@ impl Curve for Ellipse {
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, Point3)> {
         // Numerical solution - sample points around ellipse
         let num_samples = (1.0 / tolerance.distance()).ceil() as usize;
-        let num_samples = num_samples.max(100).min(1000);
+        let num_samples = num_samples.clamp(100, 1000);
 
         let mut best_t = 0.0;
         let mut best_dist_sq = f64::INFINITY;

@@ -1343,8 +1343,8 @@ fn tessellate_generic_face(
     let u_steps = ((u_max - u_min) / params.max_edge_length * 10.0).ceil() as usize + 1;
     let v_steps = ((v_max - v_min) / params.max_edge_length * 10.0).ceil() as usize + 1;
 
-    let u_steps = u_steps.min(50).max(3);
-    let v_steps = v_steps.min(50).max(3);
+    let u_steps = u_steps.clamp(3, 50);
+    let v_steps = v_steps.clamp(3, 50);
 
     // Generate vertices
     let mut vertex_grid = Vec::new();
