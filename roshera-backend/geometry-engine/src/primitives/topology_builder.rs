@@ -11,14 +11,14 @@
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Circle, CurveStore, Line},
+    curve::{Circle, CurveStore, Line, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation, EdgeStore},
     face::{Face, FaceId, FaceOrientation, FaceStore},
     primitive_traits::PrimitiveError,
     r#loop::{Loop, LoopStore, LoopType},
     shell::{Shell, ShellId, ShellStore, ShellType},
     solid::{Solid, SolidId, SolidStore},
-    surface::{Plane, Sphere, SurfaceStore},
+    surface::{Cylinder, Plane, Sphere, SurfaceStore},
     vertex::{VertexId, VertexStore},
 };
 use dashmap::DashMap;
@@ -1716,25 +1716,173 @@ impl<'a> TopologyBuilder<'a> {
         Ok(self.model.solids.add(solid))
     }
 
-    /// Create cylinder topology (simplified implementation)
+    /// Create a watertight B-Rep cylinder solid.
+    ///
+    /// Topology produced:
+    /// - 2 vertices on the seam (one on each circular cap, at the
+    ///   `ref_dir = axis.perpendicular()` reference direction).
+    /// - 3 edges: a closed circle on the bottom cap, a closed circle on
+    ///   the top cap, and a linear seam connecting the two seam vertices.
+    /// - 3 faces:
+    ///   - Bottom cap: planar surface with normal `-axis`. Outer loop
+    ///     traverses the bottom circle in the orientation that yields
+    ///     a CCW boundary when viewed from outside (along `-axis`),
+    ///     i.e. `Backward` relative to the underlying parametric circle.
+    ///   - Top cap: planar surface with normal `+axis`. Outer loop
+    ///     traverses the top circle `Forward`.
+    ///   - Lateral cylindrical face: outer loop is the canonical
+    ///     seamed rectangle in (u, v) parameter space — bottom-circle
+    ///     forward, seam forward, top-circle backward, seam backward.
+    /// - 1 closed shell containing all three faces.
+    ///
+    /// References: Mäntylä §4 (B-Rep solid modelling), Stroud §3
+    /// (seamed surfaces), Hoffmann §5 (analytical primitives).
     fn create_cylinder_topology(
         &mut self,
-        _base_center: Point3,
-        _axis: Vector3,
-        _radius: f64,
-        _height: f64,
+        base_center: Point3,
+        axis: Vector3,
+        radius: f64,
+        height: f64,
     ) -> Result<SolidId, PrimitiveError> {
-        // This is a simplified implementation
-        // In a full implementation, we would create:
-        // - Circular edges for top and bottom
-        // - Cylindrical surface for sides
-        // - Two planar faces for caps
-        // - One cylindrical face for sides
-        // - Proper edge-face adjacency
+        let topology_err = |msg: String| PrimitiveError::TopologyError {
+            message: msg,
+            euler_characteristic: None,
+        };
 
-        // For now, create a minimal valid solid
-        let shell = Shell::new(0, ShellType::Closed);
+        // Reference direction must match the one Cylinder::new uses so
+        // the seam vertex lands at u=0 in the lateral face's parametric
+        // frame. `axis.perpendicular()` returns a unit-length vector.
+        let ref_dir = axis.perpendicular();
+        let top_center = base_center + axis * height;
+
+        // ---- vertices: one seam vertex per cap. ----
+        let v_bottom = self.model.vertices.add_or_find(
+            base_center.x + ref_dir.x * radius,
+            base_center.y + ref_dir.y * radius,
+            base_center.z + ref_dir.z * radius,
+            self.tolerance.distance(),
+        );
+        let v_top = self.model.vertices.add_or_find(
+            top_center.x + ref_dir.x * radius,
+            top_center.y + ref_dir.y * radius,
+            top_center.z + ref_dir.z * radius,
+            self.tolerance.distance(),
+        );
+
+        // ---- curves: two circles + one line. ----
+        let bottom_circle = Circle::new(base_center, axis, radius)
+            .map_err(|e| topology_err(format!("bottom circle: {e}")))?;
+        let top_circle = Circle::new(top_center, axis, radius)
+            .map_err(|e| topology_err(format!("top circle: {e}")))?;
+        let seam_line = Line::new(
+            base_center + ref_dir * radius,
+            top_center + ref_dir * radius,
+        );
+        let bottom_circle_id = self.model.curves.add(Box::new(bottom_circle));
+        let top_circle_id = self.model.curves.add(Box::new(top_circle));
+        let seam_line_id = self.model.curves.add(Box::new(seam_line));
+
+        // ---- edges: closed circles + linear seam. ----
+        // Closed circle edges: start_vertex == end_vertex (the seam vertex).
+        // Parameter range is the full angular sweep [0, 2π).
+        let two_pi = std::f64::consts::TAU;
+        let bottom_edge = self.model.edges.add(Edge::new(
+            0,
+            v_bottom,
+            v_bottom,
+            bottom_circle_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, two_pi),
+        ));
+        let top_edge = self.model.edges.add(Edge::new(
+            0,
+            v_top,
+            v_top,
+            top_circle_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, two_pi),
+        ));
+        let seam_edge = self.model.edges.add(Edge::new(
+            0,
+            v_bottom,
+            v_top,
+            seam_line_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+
+        // ---- surfaces: 2 planes + 1 finite cylinder. ----
+        let bottom_plane = Plane::from_point_normal(base_center, -axis)
+            .map_err(|e| topology_err(format!("bottom plane: {e}")))?;
+        let top_plane = Plane::from_point_normal(top_center, axis)
+            .map_err(|e| topology_err(format!("top plane: {e}")))?;
+        let lateral_cyl = Cylinder::new_finite(base_center, axis, radius, height)
+            .map_err(|e| topology_err(format!("lateral cylinder: {e}")))?;
+        let bottom_surface_id = self.model.surfaces.add(Box::new(bottom_plane));
+        let top_surface_id = self.model.surfaces.add(Box::new(top_plane));
+        let lateral_surface_id = self.model.surfaces.add(Box::new(lateral_cyl));
+
+        // ---- loops. ----
+        // Bottom cap: outward normal is `-axis`. The Circle is
+        // parameterized CCW when viewed from `+axis`. Looking from
+        // `-axis` (outside the bottom cap), that traversal appears CW,
+        // so we walk the edge `Backward` to get an outward-CCW loop.
+        let mut bottom_loop = Loop::new(0, LoopType::Outer);
+        bottom_loop.add_edge(bottom_edge, false);
+        let bottom_loop_id = self.model.loops.add(bottom_loop);
+
+        // Top cap: outward normal is `+axis`, same orientation as the
+        // Circle's parametric CCW direction → walk `Forward`.
+        let mut top_loop = Loop::new(0, LoopType::Outer);
+        top_loop.add_edge(top_edge, true);
+        let top_loop_id = self.model.loops.add(top_loop);
+
+        // Lateral seamed face: in (u, v) parameter space the outer loop
+        // is a CCW rectangle with corners at (0, 0), (2π, 0), (2π, h),
+        // (0, h). The seam is the degenerate segment u=0 ≡ u=2π
+        // traversed twice (once forward, once backward) to close the
+        // rectangle. Edge sequence:
+        //   (0,0)→(2π,0): bottom_circle forward
+        //   (2π,0)→(2π,h): seam forward
+        //   (2π,h)→(0,h): top_circle backward
+        //   (0,h)→(0,0): seam backward
+        let mut lateral_loop = Loop::new(0, LoopType::Outer);
+        lateral_loop.add_edge(bottom_edge, true);
+        lateral_loop.add_edge(seam_edge, true);
+        lateral_loop.add_edge(top_edge, false);
+        lateral_loop.add_edge(seam_edge, false);
+        let lateral_loop_id = self.model.loops.add(lateral_loop);
+
+        // ---- faces. ----
+        let mut bottom_face = Face::new(
+            0,
+            bottom_surface_id,
+            bottom_loop_id,
+            FaceOrientation::Forward,
+        );
+        bottom_face.outer_loop = bottom_loop_id;
+        let bottom_face_id = self.model.faces.add(bottom_face);
+
+        let mut top_face = Face::new(0, top_surface_id, top_loop_id, FaceOrientation::Forward);
+        top_face.outer_loop = top_loop_id;
+        let top_face_id = self.model.faces.add(top_face);
+
+        let mut lateral_face = Face::new(
+            0,
+            lateral_surface_id,
+            lateral_loop_id,
+            FaceOrientation::Forward,
+        );
+        lateral_face.outer_loop = lateral_loop_id;
+        let lateral_face_id = self.model.faces.add(lateral_face);
+
+        // ---- shell + solid. ----
+        let mut shell = Shell::new(0, ShellType::Closed);
+        shell.add_face(bottom_face_id);
+        shell.add_face(top_face_id);
+        shell.add_face(lateral_face_id);
         let shell_id = self.model.shells.add(shell);
+
         let solid = Solid::new(0, shell_id);
         Ok(self.model.solids.add(solid))
     }

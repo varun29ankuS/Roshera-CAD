@@ -3026,6 +3026,160 @@ fn clip_circle_to_planar_face(
     }
 }
 
+/// Clip a Circle cutting curve against a Cylinder face's parametric extent.
+///
+/// The cutting circles produced by perpendicular plane-cylinder
+/// intersections wrap the cylinder once. Their geometric configuration
+/// (center on axis, normal aligned with axis, radius = cylinder.radius)
+/// makes the clip reduce to two scalar tests:
+///
+///   1. Axial position of the circle's center must lie within the
+///      cylinder's `height_limits` (else `Misses` — the cutting plane
+///      missed the finite cylinder vertically).
+///   2. For full-revolution cylinder faces (`angle_limits = None`),
+///      the entire circle is preserved (`Full`). For partial-revolution
+///      faces we return `NotApplicable` — angular interval intersection
+///      between the circle's intrinsic frame and the cylinder's
+///      `angle_limits` requires aligning the two frames, which the
+///      DCEL splitter handles correctly downstream.
+///
+/// Tier-3 booleans (box minus tall cylinder where the box plane sits
+/// above the cylinder cap) previously fell through here and produced a
+/// dangling cutting curve; this clipper drops it as `Misses`.
+fn clip_circle_to_cylindrical_face(
+    circle: &crate::primitives::curve::Circle,
+    face_id: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<CircleClipOutcome> {
+    use crate::primitives::surface::Cylinder;
+
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_id".to_string(),
+            expected: "valid face ID".to_string(),
+            received: format!("{:?}", face_id),
+        })?;
+    let surface =
+        model
+            .surfaces
+            .get(face.surface_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "surface_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{:?}", face.surface_id),
+            })?;
+
+    if surface.surface_type() != SurfaceType::Cylinder {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+    let cyl = match surface.as_any().downcast_ref::<Cylinder>() {
+        Some(c) => c,
+        None => return Ok(CircleClipOutcome::NotApplicable),
+    };
+
+    // Geometric coherence checks — the cutting circle must be the
+    // canonical perpendicular plane-cylinder intersection, else the
+    // analytical test is not valid.
+    let normal_alignment = circle.normal().dot(&cyl.axis).abs();
+    if (1.0 - normal_alignment) > 1e-9 {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+    let center_offset = circle.center() - cyl.origin;
+    let axial_pos = center_offset.dot(&cyl.axis);
+    let radial = center_offset - cyl.axis * axial_pos;
+    if radial.magnitude() > tolerance.distance() {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+    if (circle.radius() - cyl.radius).abs() > tolerance.distance() {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+
+    // Axial-extent test — the dominant Tier-3 win.
+    if let Some([h_lo, h_hi]) = cyl.height_limits {
+        let tol = tolerance.distance();
+        if axial_pos < h_lo - tol || axial_pos > h_hi + tol {
+            return Ok(CircleClipOutcome::Misses);
+        }
+    }
+
+    // Angular extent. Full-revolution lateral surfaces preserve the
+    // circle entirely; partial-revolution faces defer to the DCEL.
+    if cyl.angle_limits.is_none() {
+        Ok(CircleClipOutcome::Full)
+    } else {
+        Ok(CircleClipOutcome::NotApplicable)
+    }
+}
+
+/// Clip a Circle cutting curve against a Sphere face's parametric extent.
+///
+/// Cutting circles from plane-sphere intersections lie in a plane
+/// perpendicular to `(plane_origin - sphere.center)` and have radius
+/// `sqrt(R² - d²)` where `d` is the plane-to-center distance. For a
+/// full sphere face (`u_range = [0, 2π]`, `v_range = [-π/2, π/2]`),
+/// the entire circle lies on the surface — `Full`. Partial spherical
+/// patches defer to the DCEL.
+///
+/// Validity test: the circle's center must lie *inside* the sphere
+/// (it does, by construction — the center is the perpendicular foot
+/// of the cutting plane onto the sphere center) and the circle's
+/// radius must satisfy `r² + d² = R²` to within tolerance.
+fn clip_circle_to_spherical_face(
+    circle: &crate::primitives::curve::Circle,
+    face_id: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<CircleClipOutcome> {
+    use crate::primitives::surface::Sphere;
+
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_id".to_string(),
+            expected: "valid face ID".to_string(),
+            received: format!("{:?}", face_id),
+        })?;
+    let surface =
+        model
+            .surfaces
+            .get(face.surface_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "surface_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{:?}", face.surface_id),
+            })?;
+
+    if surface.surface_type() != SurfaceType::Sphere {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+    let sphere = match surface.as_any().downcast_ref::<Sphere>() {
+        Some(s) => s,
+        None => return Ok(CircleClipOutcome::NotApplicable),
+    };
+
+    // Coherence: r² + d² = R²  where d = |center - sphere.center|.
+    let d_vec = circle.center() - sphere.center;
+    let d_sq = d_vec.magnitude_squared();
+    let r = circle.radius();
+    let r_sq = r * r;
+    let big_r_sq = sphere.radius * sphere.radius;
+    let tol = tolerance.distance().max(1e-9) * sphere.radius.max(1.0);
+    if (r_sq + d_sq - big_r_sq).abs() > tol {
+        return Ok(CircleClipOutcome::NotApplicable);
+    }
+
+    // Full sphere — preserve circle. Partial spherical patches defer.
+    if sphere.param_limits.is_none() {
+        Ok(CircleClipOutcome::Full)
+    } else {
+        Ok(CircleClipOutcome::NotApplicable)
+    }
+}
+
 /// 2D ray-casting point-in-polygon. The polygon is closed implicitly by
 /// connecting the last vertex back to the first.
 fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
@@ -3161,8 +3315,37 @@ fn apply_circle_clip_to_faces(
 ) -> OperationResult<Option<SurfaceIntersectionCurve>> {
     use crate::primitives::curve::Arc;
 
-    let clip_a = clip_circle_to_planar_face(circle, face_a, model, tolerance)?;
-    let clip_b = clip_circle_to_planar_face(circle, face_b, model, tolerance)?;
+    // Planar clip first — analytic for box/prismatic faces.
+    let mut clip_a = clip_circle_to_planar_face(circle, face_a, model, tolerance)?;
+    let mut clip_b = clip_circle_to_planar_face(circle, face_b, model, tolerance)?;
+
+    // For non-planar faces (Cylinder / Sphere), the planar clipper
+    // returns NotApplicable. Try the analytical clippers for those
+    // surface types — Tier-3 booleans rely on these to drop cutting
+    // curves that fall outside finite cylindrical/spherical face
+    // extents (the prior 1e6-fallback code path).
+    if matches!(clip_a, CircleClipOutcome::NotApplicable) {
+        let cyl = clip_circle_to_cylindrical_face(circle, face_a, model, tolerance)?;
+        if !matches!(cyl, CircleClipOutcome::NotApplicable) {
+            clip_a = cyl;
+        } else {
+            let sph = clip_circle_to_spherical_face(circle, face_a, model, tolerance)?;
+            if !matches!(sph, CircleClipOutcome::NotApplicable) {
+                clip_a = sph;
+            }
+        }
+    }
+    if matches!(clip_b, CircleClipOutcome::NotApplicable) {
+        let cyl = clip_circle_to_cylindrical_face(circle, face_b, model, tolerance)?;
+        if !matches!(cyl, CircleClipOutcome::NotApplicable) {
+            clip_b = cyl;
+        } else {
+            let sph = clip_circle_to_spherical_face(circle, face_b, model, tolerance)?;
+            if !matches!(sph, CircleClipOutcome::NotApplicable) {
+                clip_b = sph;
+            }
+        }
+    }
 
     // Reduce the (clip_a, clip_b) pair to a single resulting outcome
     // for the cutting curve.
@@ -5309,6 +5492,222 @@ mod tests {
             }
             other => panic!("expected Arc, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Circle / cylindrical-face and Circle / spherical-face clipping.
+    // These cover the Tier-3 paths added in Task #76 — the cutting
+    // circles produced by plane-cylinder and plane-sphere intersection
+    // must be clipped against the actual face extents instead of the
+    // 1e6-fallback envelope used previously.
+    // -----------------------------------------------------------------
+
+    /// Pick the spherical face of a sphere solid.
+    fn pick_spherical_face(model: &BRepModel, solid_id: SolidId) -> FaceId {
+        let faces = get_solid_faces(model, solid_id).expect("sphere has faces");
+        for fid in faces {
+            let face = model.faces.get(fid).expect("valid face");
+            let surf = model.surfaces.get(face.surface_id).expect("valid surface");
+            if surf.surface_type() == SurfaceType::Sphere {
+                return fid;
+            }
+        }
+        panic!("no spherical face found on solid");
+    }
+
+    /// Pick the lateral cylindrical face of a cylinder solid (the one
+    /// whose surface is of type `Cylinder`, not the planar end caps).
+    fn pick_cylindrical_face(model: &BRepModel, solid_id: SolidId) -> FaceId {
+        let faces = get_solid_faces(model, solid_id).expect("cylinder has faces");
+        for fid in faces {
+            let face = model.faces.get(fid).expect("valid face");
+            let surf = model.surfaces.get(face.surface_id).expect("valid surface");
+            if surf.surface_type() == SurfaceType::Cylinder {
+                return fid;
+            }
+        }
+        panic!("no cylindrical face found on solid");
+    }
+
+    /// Build a finite cylinder via the real `TopologyBuilder` API and
+    /// return the lateral face.
+    fn cylinder_lateral_face(
+        model: &mut BRepModel,
+        origin: Point3,
+        axis: Vector3,
+        radius: f64,
+        height: f64,
+    ) -> FaceId {
+        let geom = {
+            let mut b = TopologyBuilder::new(model);
+            b.create_cylinder_3d(origin, axis, radius, height)
+                .expect("valid finite cylinder parameters")
+        };
+        let solid = expect_solid(geom);
+        pick_cylindrical_face(model, solid)
+    }
+
+    #[test]
+    fn clip_circle_inside_finite_cylinder_returns_full() {
+        // Cylinder of radius 5, height 10, axis +Z, base at origin →
+        // height_limits = [0, 10].
+        let mut model = BRepModel::new();
+        let cyl_face =
+            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+
+        // Cutting circle at z = 5 (mid-cylinder), perpendicular to axis,
+        // radius matching the cylinder. This is the canonical
+        // plane-cylinder intersection.
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, 5.0).unwrap();
+
+        let outcome =
+            clip_circle_to_cylindrical_face(&circle, cyl_face, &model, &Tolerance::default())
+                .unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::Full),
+            "circle inside finite cylinder should be Full, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn clip_circle_above_finite_cylinder_misses() {
+        // Same cylinder, cutting circle at z = 50 — well above
+        // height_limits = [0, 10].
+        let mut model = BRepModel::new();
+        let cyl_face =
+            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(0.0, 0.0, 50.0), Vector3::Z, 5.0).unwrap();
+
+        let outcome =
+            clip_circle_to_cylindrical_face(&circle, cyl_face, &model, &Tolerance::default())
+                .unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::Misses),
+            "circle above finite cylinder should be Misses, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn clip_circle_below_finite_cylinder_misses() {
+        let mut model = BRepModel::new();
+        let cyl_face =
+            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+
+        // z = -50 — below height_limits = [0, 10].
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(0.0, 0.0, -50.0), Vector3::Z, 5.0).unwrap();
+
+        let outcome =
+            clip_circle_to_cylindrical_face(&circle, cyl_face, &model, &Tolerance::default())
+                .unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::Misses),
+            "circle below finite cylinder should be Misses, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn clip_circle_offset_axis_not_applicable() {
+        // Center off the cylinder axis — the geometric coherence
+        // check should reject and return NotApplicable, deferring
+        // to the DCEL splitter.
+        let mut model = BRepModel::new();
+        let cyl_face =
+            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(2.0, 0.0, 5.0), Vector3::Z, 5.0).unwrap();
+
+        let outcome =
+            clip_circle_to_cylindrical_face(&circle, cyl_face, &model, &Tolerance::default())
+                .unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::NotApplicable),
+            "offset-axis circle should be NotApplicable, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn create_cylinder_3d_produces_real_topology() {
+        // Regression test for Task #81 — proves create_cylinder_3d
+        // builds the documented 2v / 3e / 3f / 1s structure rather
+        // than the empty-shell stub it used to be.
+        let mut model = BRepModel::new();
+        let geom = {
+            let mut b = TopologyBuilder::new(&mut model);
+            b.create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 5.0, 10.0)
+                .unwrap()
+        };
+        let solid = expect_solid(geom);
+        let faces = get_solid_faces(&model, solid).expect("solid has faces");
+        assert_eq!(faces.len(), 3, "cylinder must have 3 faces (2 caps + lateral)");
+
+        // Exactly one cylindrical face, exactly two planar caps.
+        let mut planar = 0usize;
+        let mut cylindrical = 0usize;
+        for fid in &faces {
+            let face = model.faces.get(*fid).expect("valid face");
+            let surf = model.surfaces.get(face.surface_id).expect("valid surface");
+            match surf.surface_type() {
+                SurfaceType::Plane => planar += 1,
+                SurfaceType::Cylinder => cylindrical += 1,
+                other => panic!("unexpected surface type {other:?}"),
+            }
+        }
+        assert_eq!(planar, 2, "expected 2 planar caps");
+        assert_eq!(cylindrical, 1, "expected 1 cylindrical lateral face");
+    }
+
+    #[test]
+    fn clip_circle_on_full_sphere_returns_full() {
+        // Full sphere of radius 10. A cutting circle at z = 6 with
+        // radius sqrt(10² - 6²) = 8 satisfies r² + d² = R².
+        let mut model = BRepModel::new();
+        let geom = {
+            let mut b = TopologyBuilder::new(&mut model);
+            b.create_sphere_3d(Point3::ORIGIN, 10.0).unwrap()
+        };
+        let solid = expect_solid(geom);
+        let sphere_face = pick_spherical_face(&model, solid);
+
+        use crate::primitives::curve::Circle;
+        let circle = Circle::new(Point3::new(0.0, 0.0, 6.0), Vector3::Z, 8.0).unwrap();
+
+        let outcome =
+            clip_circle_to_spherical_face(&circle, sphere_face, &model, &Tolerance::default())
+                .unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::Full),
+            "coherent circle on full sphere should be Full, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn clip_circle_incoherent_with_sphere_not_applicable() {
+        // Same sphere, but the circle radius/center violates
+        // r² + d² = R² — defer to DCEL.
+        let mut model = BRepModel::new();
+        let geom = {
+            let mut b = TopologyBuilder::new(&mut model);
+            b.create_sphere_3d(Point3::ORIGIN, 10.0).unwrap()
+        };
+        let solid = expect_solid(geom);
+        let sphere_face = pick_spherical_face(&model, solid);
+
+        use crate::primitives::curve::Circle;
+        // r² + d² = 4 + 9 = 13, but R² = 100.
+        let circle = Circle::new(Point3::new(0.0, 0.0, 3.0), Vector3::Z, 2.0).unwrap();
+
+        let outcome =
+            clip_circle_to_spherical_face(&circle, sphere_face, &model, &Tolerance::default())
+                .unwrap();
+        assert!(
+            matches!(outcome, CircleClipOutcome::NotApplicable),
+            "incoherent circle on sphere should be NotApplicable, got {outcome:?}"
+        );
     }
 
     // -----------------------------------------------------------------
