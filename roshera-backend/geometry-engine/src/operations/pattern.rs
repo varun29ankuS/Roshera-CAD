@@ -201,7 +201,11 @@ pub fn create_pattern(
 
     // Merge geometry if requested
     if options.merge_geometry {
-        merge_pattern_geometry(model, &mut pattern_instances)?;
+        merge_pattern_geometry(
+            model,
+            &mut pattern_instances,
+            options.common.tolerance.distance(),
+        )?;
     }
 
     // Validate result if requested
@@ -681,38 +685,129 @@ fn aabbs_overlap(a: &[f64; 6], b: &[f64; 6]) -> bool {
     a[0] <= b[3] && a[3] >= b[0] && a[1] <= b[4] && a[4] >= b[1] && a[2] <= b[5] && a[5] >= b[2]
 }
 
-/// Merge coincident geometry in pattern.
+/// Merge coincident vertices created by pattern instancing.
 ///
-/// Currently a no-op placeholder for the planned vertex/edge/face merge
-/// pass. We still validate the inputs so misuse surfaces immediately:
-/// every face referenced by every instance must exist in the model. An
-/// empty instance list is treated as a successful no-op.
+/// `transform_edge` always pushes a fresh vertex for every endpoint, so
+/// pattern instances that meet at shared positions (e.g. circular patterns
+/// closing back on the seed) end up with duplicate vertices. This pass
+/// detects vertex pairs that lie within `options.common.tolerance.distance()`
+/// of each other in 3-space and rewrites edge endpoints to point at the
+/// canonical (lowest-id) vertex of each cluster.
+///
+/// Edges and faces themselves are not deduplicated here — that requires
+/// curve/surface geometric equality, which the boolean pass handles when
+/// the pattern is later combined with adjacent solids. Vertex merge is
+/// the prerequisite for downstream booleans and the only step necessary
+/// for a watertight intermediate B-Rep.
 fn merge_pattern_geometry(
     model: &mut BRepModel,
     instances: &mut Vec<Vec<FaceId>>,
+    tolerance: f64,
 ) -> OperationResult<()> {
     if instances.is_empty() {
-        tracing::debug!("merge_pattern_geometry: no instances; skipping merge");
         return Ok(());
     }
 
-    let mut total_faces: usize = 0;
+    // Collect every edge referenced by every face in every instance,
+    // walking outer + inner loops.
+    let mut edge_ids: Vec<EdgeId> = Vec::new();
     for (i, instance) in instances.iter().enumerate() {
         for &face_id in instance {
-            if model.faces.get(face_id).is_none() {
-                return Err(OperationError::InvalidGeometry(format!(
+            let face = model.faces.get(face_id).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
                     "merge_pattern_geometry: instance {} references non-existent face {}",
                     i, face_id
-                )));
+                ))
+            })?;
+            let outer = face.outer_loop;
+            let inners = face.inner_loops.clone();
+            for loop_id in std::iter::once(outer).chain(inners.into_iter()) {
+                if let Some(lp) = model.loops.get(loop_id) {
+                    edge_ids.extend_from_slice(&lp.edges);
+                }
             }
-            total_faces += 1;
+        }
+    }
+    edge_ids.sort_unstable();
+    edge_ids.dedup();
+
+    if edge_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Collect unique vertex ids touched by these edges, with their positions.
+    let mut vertex_ids: Vec<u32> = Vec::with_capacity(edge_ids.len() * 2);
+    for &eid in &edge_ids {
+        if let Some(e) = model.edges.get(eid) {
+            vertex_ids.push(e.start_vertex);
+            vertex_ids.push(e.end_vertex);
+        }
+    }
+    vertex_ids.sort_unstable();
+    vertex_ids.dedup();
+
+    let mut positions: Vec<(u32, [f64; 3])> = Vec::with_capacity(vertex_ids.len());
+    for &vid in &vertex_ids {
+        if let Some(v) = model.vertices.get(vid) {
+            positions.push((vid, v.position));
+        }
+    }
+
+    // Build coincidence remap: for each vertex, find the lowest-id vertex
+    // already accepted that lies within tolerance. O(V²) — acceptable for
+    // pattern instance counts (typically < 1000 vertices); switch to a
+    // spatial hash if profiling shows this dominating.
+    let tolerance_sq = tolerance * tolerance;
+
+    use std::collections::HashMap;
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut canonicals: Vec<(u32, [f64; 3])> = Vec::new();
+    for &(vid, pos) in &positions {
+        let mut found_canonical: Option<u32> = None;
+        for &(canon_vid, canon_pos) in &canonicals {
+            let dx = pos[0] - canon_pos[0];
+            let dy = pos[1] - canon_pos[1];
+            let dz = pos[2] - canon_pos[2];
+            if dx * dx + dy * dy + dz * dz <= tolerance_sq {
+                found_canonical = Some(canon_vid);
+                break;
+            }
+        }
+        match found_canonical {
+            Some(cid) => {
+                remap.insert(vid, cid);
+            }
+            None => {
+                canonicals.push((vid, pos));
+                remap.insert(vid, vid);
+            }
+        }
+    }
+
+    // Apply remap to all edges; only mutate when the canonical differs.
+    let mut rewritten = 0_usize;
+    for &eid in &edge_ids {
+        if let Some(edge) = model.edges.get_mut(eid) {
+            let new_start = *remap.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+            let new_end = *remap.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
+            if new_start != edge.start_vertex {
+                edge.start_vertex = new_start;
+                rewritten += 1;
+            }
+            if new_end != edge.end_vertex {
+                edge.end_vertex = new_end;
+                rewritten += 1;
+            }
         }
     }
 
     tracing::debug!(
         instances = instances.len(),
-        total_faces = total_faces,
-        "merge_pattern_geometry: coincidence merge not yet implemented; faces left untouched"
+        unique_edges = edge_ids.len(),
+        unique_vertices = positions.len(),
+        canonical_vertices = canonicals.len(),
+        endpoints_rewritten = rewritten,
+        "merge_pattern_geometry: vertex coincidence merge complete"
     );
 
     Ok(())

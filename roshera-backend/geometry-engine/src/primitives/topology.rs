@@ -876,8 +876,40 @@ pub fn compute_fingerprint(ctx: &TopologyContext) -> MathResult<TopologyFingerpr
     }
     genus_signature.sort();
 
-    // Feature hash (placeholder)
-    let feature_hash = 0;
+    // Feature hash: signature over face structure (loop counts per face,
+    // orientation, and edge counts per loop). Complements connectivity_hash
+    // by capturing higher-order topology — two solids with identical
+    // vertex-edge degree sequences but different face/hole structure
+    // produce different feature hashes. Sorted before hashing to make the
+    // signature insensitive to insertion order.
+    let mut face_signatures: Vec<(usize, u32, u8)> = Vec::with_capacity(ctx.faces.len());
+    for (_id, face) in ctx.faces.iter() {
+        let outer_edges = ctx
+            .loops
+            .get(face.outer_loop)
+            .map(|l| l.edges.len())
+            .unwrap_or(0);
+        let inner_edges_total: usize = face
+            .inner_loops
+            .iter()
+            .filter_map(|lid| ctx.loops.get(*lid))
+            .map(|l| l.edges.len())
+            .sum();
+        face_signatures.push((
+            outer_edges,
+            face.inner_loops.len() as u32,
+            face.orientation as u8,
+        ));
+        // Fold inner-edge totals into the same vector so they participate
+        // in the hash without an extra collection.
+        face_signatures.push((inner_edges_total, 0, 0));
+    }
+    face_signatures.sort_unstable();
+    let mut feature_hasher = DefaultHasher::new();
+    for sig in &face_signatures {
+        sig.hash(&mut feature_hasher);
+    }
+    let feature_hash = feature_hasher.finish();
 
     Ok(TopologyFingerprint {
         entity_counts,
@@ -1309,8 +1341,10 @@ struct TopologyLevel {
     /// Normalized resolution for this level: 1.0 at level 0 (full
     /// detail) and approaching 0.0 as more edges are collapsed.
     resolution: f64,
-    /// Collapsed edges at this level. Each key is a removed edge; the
-    /// value is currently empty (a placeholder for future remap targets).
+    /// Collapsed edges at this level. Each key is an edge removed at this
+    /// LOD tier; the value is the (possibly empty) list of surviving edges
+    /// that absorb its endpoints. An empty value means the edge was simply
+    /// removed without remapping.
     simplified_edges: HashMap<EdgeId, Vec<EdgeId>>,
     /// Faces affected by collapsed edges, mapped to their surviving
     /// neighbour faces at this LOD tier.

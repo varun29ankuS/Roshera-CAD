@@ -46,10 +46,6 @@ pub mod recorder;
 // AI integration
 pub mod ai_operations_registry;
 
-// Test modules
-//#[cfg(test)]
-//mod tests;
-
 // Re-export commonly used types
 pub use blend::{blend_faces, BlendOptions};
 pub use boolean::{boolean_operation, BooleanOp, BooleanOptions};
