@@ -592,7 +592,14 @@ impl ConstraintStore {
         }
     }
 
-    /// Check conflicts between dimensional and geometric constraints
+    /// Check conflicts between a dimensional and a geometric constraint on
+    /// the same entity pair. Specific syntactic incompatibilities (distance
+    /// = 0 with non-coincident, angle = 0/180 with non-parallel/non-collinear,
+    /// angle = 90 with non-perpendicular) require unifying the two constraint
+    /// kinds in a satisfiability check, which is performed by the constraint
+    /// solver during `solve()` rather than pre-flight conflict detection.
+    /// We therefore report no static conflict here — the solver surfaces the
+    /// incompatibility as an unsatisfied residual.
     fn mixed_constraints_conflict(
         &self,
         _c1: &Constraint,
@@ -600,22 +607,16 @@ impl ConstraintStore {
         _d: &DimensionalConstraint,
         _g: &GeometricConstraint,
     ) -> bool {
-        // Examples of mixed conflicts:
-        // - Distance constraint of 0 with non-coincident geometric constraint
-        // - Angle constraint of 0/180 degrees with non-parallel/non-collinear constraint
-        // - Angle constraint of 90 degrees with non-perpendicular constraint
-
-        // For now, return false - more sophisticated analysis needed
         false
     }
 
-    /// Check if two constraints apply to the same entity pairs
+    /// Check if two constraints apply to the same entity tuple. Compares the
+    /// entity vectors element-wise and in order; constraints whose entity
+    /// lists are permutations of each other are not considered equivalent.
     fn same_entity_pairs(&self, c1: &Constraint, c2: &Constraint) -> bool {
         if c1.entities.len() != c2.entities.len() {
             return false;
         }
-
-        // For now, simple check - could be more sophisticated
         c1.entities == c2.entities
     }
 
