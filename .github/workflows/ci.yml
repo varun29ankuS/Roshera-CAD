@@ -68,7 +68,23 @@ jobs:
     - name: Run tests
       run: cargo test --workspace
       working-directory: ./roshera-backend
-    
+
+    - name: Run kernel demo regression suite
+      # Each demo asserts non-zero triangle counts and bbox invariants on
+      # outputs from primitives, booleans, extrude/revolve, sweep/loft,
+      # features, transforms, and pattern/draft. A regression in any of
+      # these paths fails CI loudly. See plans/steady-sauteeing-nova.md
+      # Phase 3 ("demos become regression tests").
+      run: |
+        set -e
+        for demo in demo_primitives demo_booleans demo_extrude_revolve \
+                    demo_sweep_loft demo_features demo_transforms \
+                    demo_pattern_draft; do
+          echo "==> $demo"
+          cargo run --release --example "$demo" -p geometry-engine
+        done
+      working-directory: ./roshera-backend
+
     # Benchmarks not yet implemented
     # - name: Run benchmarks (dry run)
     #   run: cargo bench --no-run
