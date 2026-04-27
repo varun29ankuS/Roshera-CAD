@@ -344,9 +344,11 @@ fn ray_plane_intersection(
     }
 
     let position = origin + direction * t;
-    // For a plane, we can use simple parameter calculation
-    // In production, would compute actual UV from plane basis
-    let (u, v) = (0.5, 0.5); // Placeholder
+    // Recover the plane's (u,v) coordinates of the hit point via the
+    // surface's exact closest-point query. For an unbounded plane this
+    // is the orthogonal projection and is exact in a single Newton step.
+    let tolerance = crate::math::Tolerance::default();
+    let (u, v) = plane.closest_point(&position, tolerance).unwrap_or((0.0, 0.0));
 
     Ok(Some(ProjectedPoint {
         position,
@@ -358,13 +360,86 @@ fn ray_plane_intersection(
 
 /// Ray-cylinder intersection
 fn ray_cylinder_intersection(
-    _origin: Point3,
-    _direction: Vector3,
-    _cylinder: &dyn Surface,
-    _max_distance: Option<f64>,
+    origin: Point3,
+    direction: Vector3,
+    cylinder: &dyn Surface,
+    max_distance: Option<f64>,
 ) -> OperationResult<Option<ProjectedPoint>> {
-    // Would implement analytical ray-cylinder intersection
-    Ok(None)
+    use crate::primitives::surface::Cylinder;
+
+    // Downcast to the analytic Cylinder; non-cylindrical Surface impls
+    // that report SurfaceType::Cylinder are not expected, but if one
+    // arrives we fall back to the general iterative path.
+    let cyl = match cylinder.as_any().downcast_ref::<Cylinder>() {
+        Some(c) => c,
+        None => {
+            return ray_general_surface_intersection(origin, direction, cylinder, max_distance);
+        }
+    };
+
+    // Project ray and origin into the cylinder's axis-perpendicular plane.
+    let q = origin - cyl.origin;
+    let d_axis = direction.dot(&cyl.axis);
+    let q_axis = q.dot(&cyl.axis);
+    let d_perp = direction - cyl.axis * d_axis;
+    let q_perp = q - cyl.axis * q_axis;
+
+    // Solve |q_perp + t·d_perp|² = r²
+    let a = d_perp.dot(&d_perp);
+    if a < 1e-20 {
+        // Ray is parallel to the cylinder axis — never crosses the surface.
+        return Ok(None);
+    }
+    let b = 2.0 * q_perp.dot(&d_perp);
+    let c = q_perp.dot(&q_perp) - cyl.radius * cyl.radius;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return Ok(None);
+    }
+    let sqrt_disc = disc.sqrt();
+    let t0 = (-b - sqrt_disc) / (2.0 * a);
+    let t1 = (-b + sqrt_disc) / (2.0 * a);
+
+    // Pick the closest non-negative root, honouring max_distance.
+    let mut best_t = f64::INFINITY;
+    for &t in &[t0, t1] {
+        if t < 0.0 {
+            continue;
+        }
+        if let Some(max_dist) = max_distance {
+            if t > max_dist {
+                continue;
+            }
+        }
+        // Check axial limits if the cylinder is finite.
+        if let Some([h_min, h_max]) = cyl.height_limits {
+            let h = q_axis + t * d_axis;
+            if h < h_min || h > h_max {
+                continue;
+            }
+        }
+        if t < best_t {
+            best_t = t;
+        }
+    }
+    if !best_t.is_finite() {
+        return Ok(None);
+    }
+
+    let position = origin + direction * best_t;
+    let normal = cylinder.normal_at(0.0, 0.0).ok().unwrap_or(cyl.axis);
+    let tolerance = crate::math::Tolerance::default();
+    let (u, v) = cylinder
+        .closest_point(&position, tolerance)
+        .unwrap_or((0.0, 0.0));
+    let actual_normal = cylinder.normal_at(u, v).unwrap_or(normal);
+
+    Ok(Some(ProjectedPoint {
+        position,
+        uv: (u, v),
+        distance: best_t,
+        normal: actual_normal,
+    }))
 }
 
 /// Ray-sphere intersection
@@ -513,24 +588,30 @@ fn is_silhouette_edge(
         .get(face.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
 
-    // Sample along edge
+    // Sample along the edge and test the surface normal at each sample.
+    // The normal is taken at the (u,v) parameters that project the 3D
+    // edge point onto the surface, not at a fixed mid-bound point — using
+    // the centre would make every edge of every face look like a
+    // silhouette, since the normal would be evaluated in the same place
+    // for every sample.
+    let tolerance = crate::math::Tolerance::default();
     for i in 0..=10 {
         let t = i as f64 / 10.0;
-        let _point = edge.evaluate(t, &model.curves)?;
+        let point = edge.evaluate(t, &model.curves)?;
 
-        // Get surface normal at this point
-        // Use simple parameter finding for now
-        let bounds = surface.parameter_bounds();
-        let (u, v) = (
-            (bounds.0 .0 + bounds.0 .1) * 0.5,
-            (bounds.1 .0 + bounds.1 .1) * 0.5,
-        ); // Placeholder - in production would find actual UV
+        let (u, v) = surface
+            .closest_point(&point, tolerance)
+            .unwrap_or_else(|_| {
+                let bounds = surface.parameter_bounds();
+                (
+                    (bounds.0 .0 + bounds.0 .1) * 0.5,
+                    (bounds.1 .0 + bounds.1 .1) * 0.5,
+                )
+            });
         let normal = surface.normal_at(u, v)?;
 
-        // Check if normal is perpendicular to view direction
         let dot = normal.dot(&view_direction).abs();
         if dot < 0.1 {
-            // Nearly perpendicular
             return Ok(true);
         }
     }
