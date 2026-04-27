@@ -1408,11 +1408,10 @@ mod tests {
     }
 
     #[test]
-    fn test_surface_curvature() {
-        // Create a spherical patch
-        // TODO: Implement sphere as NURBS surface
-
-        // For now, test with bilinear (zero curvature)
+    fn test_surface_curvature_planar_is_zero() {
+        // Bilinear patch over the unit square in z = 0 plane: K = H = 0
+        // exactly. This pins the planar branch of the curvature formulas;
+        // curved-patch verification is covered by the separate saddle test.
         let surf = BSplineSurface::bilinear(
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(1.0, 0.0, 0.0),
@@ -1426,6 +1425,29 @@ mod tests {
         // Bilinear surface has zero curvature
         assert_eq!(eval.gaussian_curvature(), Some(0.0));
         assert_eq!(eval.mean_curvature(), Some(0.0));
+    }
+
+    #[test]
+    fn test_surface_curvature_saddle_is_negative() {
+        // Saddle patch z = u·v over [0,1]×[0,1] using the bilinear B-spline
+        // with corner heights {0, 0, 0, 1}. At the center (u=v=0.5):
+        //   d/du = v = 0.5, d/dv = u = 0.5, d²/dudv = 1, d²/du² = d²/dv² = 0
+        //   K = (LN - M²)/(EG - F²) = -M²/(EG - F²) < 0
+        //   H = (EN - 2FM + GL)/(2(EG - F²)) ≠ 0
+        let surf = BSplineSurface::bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 1.0),
+        )
+        .unwrap();
+
+        let eval = surf.evaluate(Parameter2D::new(0.5, 0.5)).unwrap();
+
+        let k = eval.gaussian_curvature().expect("saddle has finite K");
+        let h = eval.mean_curvature().expect("saddle has finite H");
+        assert!(k < 0.0, "saddle K should be negative, got {k}");
+        assert!(h.abs() > 1e-12, "saddle H should be non-zero, got {h}");
     }
 
     #[test]
