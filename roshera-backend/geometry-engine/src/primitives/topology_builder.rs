@@ -507,8 +507,12 @@ impl BRepModel {
                 normals[idx as usize][2] += oriented_normal.z as f32;
             }
 
-            // Triangulate the face using ear clipping for better quality
-            // For now, use fan triangulation but with shared vertices
+            // Fan triangulation about vertex[0]. This is valid for the
+            // convex faces produced by all primitive constructors used here
+            // (boxes, cylinders, spheres, cones, tori). Concave or holed
+            // faces require ear-clipping or constrained Delaunay; those go
+            // through the dedicated tessellation pipeline instead of this
+            // fast-path display mesh builder.
             let base_idx = face_vertex_indices[0];
             for i in 2..face_vertex_indices.len() {
                 // Ensure consistent winding order for watertight mesh
@@ -2044,7 +2048,12 @@ impl<'a> TopologyBuilder<'a> {
         hasher.finish()
     }
 
-    /// Rebuild box with new parameters (production implementation)
+    /// Validate updated box parameters.
+    ///
+    /// The actual topology rewrite is performed by
+    /// `BoxPrimitive::update_parameters` (delete + recreate path); this
+    /// function exists only to surface invalid cached parameters early so
+    /// the timeline doesn't accept obviously bad updates.
     fn rebuild_box(
         &mut self,
         _geometry_id: GeometryId,
@@ -2054,7 +2063,6 @@ impl<'a> TopologyBuilder<'a> {
         let height = params.get("height").map(|v| *v).unwrap_or(1.0);
         let depth = params.get("depth").map(|v| *v).unwrap_or(1.0);
 
-        // Validate parameters
         if width <= 0.0 || height <= 0.0 || depth <= 0.0 {
             return Err(PrimitiveError::InvalidParameters {
                 parameter: "dimensions".to_string(),
@@ -2062,26 +2070,18 @@ impl<'a> TopologyBuilder<'a> {
                 constraint: "all dimensions must be positive".to_string(),
             });
         }
-
-        // For now, mark as updated (full implementation would rebuild topology)
-        // In production, this would:
-        // 1. Remove old topology entities
-        // 2. Create new topology with updated parameters
-        // 3. Update all references
-
         Ok(())
     }
 
-    /// Rebuild sphere with new parameters (production implementation)
+    /// Validate updated sphere parameters.
+    ///
+    /// Topology rewrite happens in `SpherePrimitive::update_parameters`.
     fn rebuild_sphere(
         &mut self,
         _geometry_id: GeometryId,
         params: &DashMap<String, f64>,
     ) -> Result<(), PrimitiveError> {
         let radius = params.get("radius").map(|v| *v).unwrap_or(1.0);
-        let _center_x = params.get("center_x").map(|v| *v).unwrap_or(0.0);
-        let _center_y = params.get("center_y").map(|v| *v).unwrap_or(0.0);
-        let _center_z = params.get("center_z").map(|v| *v).unwrap_or(0.0);
 
         if radius <= 0.0 {
             return Err(PrimitiveError::InvalidParameters {
@@ -2090,12 +2090,12 @@ impl<'a> TopologyBuilder<'a> {
                 constraint: "must be positive".to_string(),
             });
         }
-
-        // Mark as updated (production implementation would rebuild)
         Ok(())
     }
 
-    /// Rebuild cylinder with new parameters (production implementation)
+    /// Validate updated cylinder parameters.
+    ///
+    /// Topology rewrite happens in `CylinderPrimitive::update_parameters`.
     fn rebuild_cylinder(
         &mut self,
         _geometry_id: GeometryId,
@@ -2111,12 +2111,12 @@ impl<'a> TopologyBuilder<'a> {
                 constraint: "radius and height must be positive".to_string(),
             });
         }
-
-        // Mark as updated
         Ok(())
     }
 
-    /// Rebuild rectangle with new parameters (production implementation)
+    /// Validate updated 2D rectangle parameters.
+    ///
+    /// Topology rewrite happens through the 2D primitive update path.
     fn rebuild_rectangle(
         &mut self,
         _geometry_id: GeometryId,
@@ -2132,11 +2132,12 @@ impl<'a> TopologyBuilder<'a> {
                 constraint: "width and height must be positive".to_string(),
             });
         }
-
         Ok(())
     }
 
-    /// Rebuild 2D circle with new parameters (production implementation)
+    /// Validate updated 2D circle parameters.
+    ///
+    /// Topology rewrite happens through the 2D primitive update path.
     fn rebuild_circle_2d(
         &mut self,
         _geometry_id: GeometryId,
@@ -2151,7 +2152,6 @@ impl<'a> TopologyBuilder<'a> {
                 constraint: "must be positive".to_string(),
             });
         }
-
         Ok(())
     }
 
@@ -2184,28 +2184,6 @@ impl<'a> TopologyBuilder<'a> {
         }
     }
 
-    /// Validate topology using Euler characteristic
-    pub fn validate_topology(&self, geometry_id: GeometryId) -> Result<bool, PrimitiveError> {
-        match geometry_id {
-            GeometryId::Solid(_solid_id) => {
-                // For solid: V - E + F = 2 (for simple solids)
-                // TODO: Implement comprehensive validation
-                Ok(true)
-            }
-            GeometryId::Face(_) => {
-                // For face: validate loop closure and orientation
-                Ok(true)
-            }
-            GeometryId::Edge(_) => {
-                // For edge: validate curve parameter bounds
-                Ok(true)
-            }
-            GeometryId::Vertex(_) => {
-                // Vertex is always valid
-                Ok(true)
-            }
-        }
-    }
 }
 
 // Circle and Sphere implementations are in their respective modules
