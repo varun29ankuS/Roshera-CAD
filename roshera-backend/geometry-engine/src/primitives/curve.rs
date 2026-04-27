@@ -3328,16 +3328,22 @@ impl NurbsCurve {
         let n = points.len();
         let actual_degree = degree.min(n - 1);
 
-        // Create uniform knot vector
-        let mut knots = Vec::new();
-        // Clamp at start
+        // Create clamped uniform knot vector of length `n + actual_degree + 1`.
+        //
+        // Layout (Piegl-Tiller, eq. 9.8):
+        //   [0]^(p+1)  ++  [i/(num_internal+1) for i=1..=num_internal]  ++  [1]^(p+1)
+        //
+        // The earlier implementation used `for i in 1..num_internal` and
+        // divided by `num_internal`, producing only `num_internal - 1`
+        // interior knots and leaving the vector short by one entry — this
+        // tripped `Invalid knot vector length` for any fit with ≥ 5
+        // points at degree 3 (e.g. fillet rolling-ball spines).
+        let mut knots = Vec::with_capacity(n + actual_degree + 1);
         knots.resize(actual_degree + 1, 0.0);
-        // Internal knots
         let num_internal = n - actual_degree - 1;
-        for i in 1..num_internal {
-            knots.push(i as f64 / num_internal as f64);
+        for i in 1..=num_internal {
+            knots.push(i as f64 / (num_internal + 1) as f64);
         }
-        // Clamp at end
         knots.resize(knots.len() + actual_degree + 1, 1.0);
 
         // Equal weights for rational curve

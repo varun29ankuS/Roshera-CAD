@@ -256,29 +256,42 @@ pub fn mirror(
     Ok(result)
 }
 
-/// Transform vertices
+/// Transform vertices in place.
+///
+/// Earlier this routine called `model.vertices.add(...)` for each vertex,
+/// which appended a *new* vertex with the transformed position while
+/// leaving every edge / loop / face still pointing at the original
+/// (untransformed) vertices. Net effect: callers like `translate` /
+/// `rotate` / `scale` returned `Ok(...)` while the model was visually
+/// unchanged. Mutating in place via `VertexStore::set_position` keeps
+/// every existing topology reference valid and actually moves the solid.
 fn transform_vertices(
     model: &mut BRepModel,
     vertex_ids: &[VertexId],
     transform: &Matrix4,
 ) -> OperationResult<Vec<VertexId>> {
-    let mut new_vertices = Vec::new();
-
     for &vertex_id in vertex_ids {
-        if let Some(vertex) = model.vertices.get(vertex_id) {
-            let pos = Point3::from(vertex.position);
-            let transformed = transform.transform_point(&pos);
-            let new_id = model
-                .vertices
-                .add(transformed.x, transformed.y, transformed.z);
-            new_vertices.push(new_id);
-        } else {
-            return Err(OperationError::InvalidGeometry(
-                "Vertex not found".to_string(),
-            ));
+        let pos = match model.vertices.get(vertex_id) {
+            Some(v) => Point3::from(v.position),
+            None => {
+                return Err(OperationError::InvalidGeometry(
+                    "Vertex not found".to_string(),
+                ));
+            }
+        };
+        let transformed = transform.transform_point(&pos);
+        if !model.vertices.set_position(
+            vertex_id,
+            transformed.x,
+            transformed.y,
+            transformed.z,
+        ) {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Failed to update vertex {vertex_id}"
+            )));
         }
     }
-    Ok(new_vertices)
+    Ok(vertex_ids.to_vec())
 }
 
 /// Transform curves

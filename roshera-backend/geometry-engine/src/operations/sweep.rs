@@ -602,8 +602,11 @@ fn create_sweep_section(
     // Transform the profile face
     let transformed_face = transform_face_full(model, profile_face, &transform)?;
 
-    // Get ordered vertices from face
-    let vertices = get_face_vertices_ordered(model, transformed_face)?;
+    // Get an ordered ring of vertices for lateral-face construction.
+    // Closed-curve edges (e.g. a circle expressed as a single self-closing
+    // edge) are densified here so consecutive sections produce non-degenerate
+    // quads. The transformed face itself stays analytical for caps.
+    let vertices = get_section_vertex_ring(model, transformed_face, 32)?;
 
     Ok(SweepSection {
         face_id: transformed_face,
@@ -621,43 +624,110 @@ fn transform_face_full(
     super::pattern::transform_face(model, face_id, transform)
 }
 
-/// Get ordered vertices from face
-fn get_face_vertices_ordered(model: &BRepModel, face_id: FaceId) -> OperationResult<Vec<VertexId>> {
+/// Build a polygonal vertex ring around the outer loop of a section face.
+///
+/// For each edge in the loop, samples the underlying curve at evenly-spaced
+/// parameters and creates real vertices in the model. Straight edges
+/// contribute exactly their start vertex; closed-curve edges (start == end,
+/// e.g. a circular profile expressed as a single self-closing edge) are
+/// subdivided into `samples_per_closed_edge` distinct points so that
+/// consecutive sweep sections can be stitched with non-degenerate quads.
+///
+/// The returned ring is in CCW order for a forward-oriented loop and
+/// excludes the seam-duplicate so successive entries are distinct.
+fn get_section_vertex_ring(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    samples_per_closed_edge: usize,
+) -> OperationResult<Vec<VertexId>> {
     let face = model
         .faces
         .get(face_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+    let outer_loop_id = face.outer_loop;
 
     let loop_data = model
         .loops
-        .get(face.outer_loop)
-        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
+        .get(outer_loop_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
+        .clone();
 
-    let mut vertices = Vec::new();
+    let mut ring: Vec<VertexId> = Vec::new();
+
     for (i, &edge_id) in loop_data.edges.iter().enumerate() {
         let forward = loop_data.orientations[i];
         let edge = model
             .edges
             .get(edge_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+            .clone();
 
-        let vertex = if forward {
-            edge.start_vertex
+        // Detect closed-curve edges by either coincident vertex IDs or
+        // coincident endpoint positions (transform_edge re-emits distinct
+        // VertexIds for a self-closing source edge, so the ID check alone
+        // misses transformed circles/ellipses).
+        let curve = model
+            .curves
+            .get(edge.curve_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+        let lo = edge.param_range.start;
+        let hi = edge.param_range.end;
+        let endpoints_coincide = if edge.start_vertex == edge.end_vertex {
+            true
         } else {
-            edge.end_vertex
+            match (curve.evaluate(lo), curve.evaluate(hi)) {
+                (Ok(a), Ok(b)) => (a.position - b.position).magnitude_squared() < 1e-12,
+                _ => false,
+            }
         };
 
-        if vertices.is_empty() || vertices.last() != Some(&vertex) {
-            vertices.push(vertex);
+        if endpoints_coincide {
+            // Closed-curve edge: discretize the curve into N sample vertices.
+            let n = samples_per_closed_edge.max(3);
+            let mut sample_positions: Vec<Point3> = Vec::with_capacity(n);
+            for k in 0..n {
+                let frac = k as f64 / n as f64;
+                let u = lo + (hi - lo) * frac;
+                let cp = curve.evaluate(u).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "Curve evaluation failed during section ring discretization: {:?}",
+                        e
+                    ))
+                })?;
+                sample_positions.push(cp.position);
+            }
+            let mut samples: Vec<VertexId> = sample_positions
+                .into_iter()
+                .map(|p| model.vertices.add(p.x, p.y, p.z))
+                .collect();
+            if !forward {
+                samples.reverse();
+            }
+            for v in samples {
+                if ring.last() != Some(&v) {
+                    ring.push(v);
+                }
+            }
+        } else {
+            let v = if forward { edge.start_vertex } else { edge.end_vertex };
+            if ring.last() != Some(&v) {
+                ring.push(v);
+            }
         }
     }
 
-    // Remove duplicate last vertex if closed
-    if vertices.len() > 1 && vertices[0] == vertices[vertices.len() - 1] {
-        vertices.pop();
+    // Drop a trailing seam duplicate if the ring closed onto itself.
+    if ring.len() > 1 && ring.first() == ring.last() {
+        ring.pop();
     }
 
-    Ok(vertices)
+    if ring.len() < 3 {
+        return Err(OperationError::InvalidGeometry(
+            "Section vertex ring needs at least 3 distinct points".to_string(),
+        ));
+    }
+
+    Ok(ring)
 }
 
 /// Create lateral faces between sections
@@ -762,21 +832,144 @@ fn create_or_find_edge(
     Ok(model.edges.add(edge))
 }
 
-/// Create bilinear surface
+/// Create a bilinear (ruled) surface through four corner vertices.
+///
+/// Models the lateral panel between two consecutive sweep sections as a
+/// ruled surface S(u, v) = (1 - v) · L_bottom(u) + v · L_top(u), where
+/// L_bottom is the line v1→v2 and L_top is the line v4→v3. This matches the
+/// loop traversal v1 → v2 → v3 → v4 used in `create_quad_face`, so the
+/// surface's parametric domain coincides with the face's outer loop.
 fn create_bilinear_surface(
-    _model: &BRepModel,
-    _v1: VertexId,
-    _v2: VertexId,
-    _v3: VertexId,
-    _v4: VertexId,
+    model: &BRepModel,
+    v1: VertexId,
+    v2: VertexId,
+    v3: VertexId,
+    v4: VertexId,
 ) -> OperationResult<Box<dyn Surface>> {
-    // Would create proper bilinear surface
-    use crate::primitives::surface::Plane;
-    Ok(Box::new(Plane::xy(0.0)))
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::RuledSurface;
+
+    let p1 = Point3::from(
+        model
+            .vertices
+            .get(v1)
+            .ok_or_else(|| OperationError::InvalidGeometry("v1 not found".to_string()))?
+            .position,
+    );
+    let p2 = Point3::from(
+        model
+            .vertices
+            .get(v2)
+            .ok_or_else(|| OperationError::InvalidGeometry("v2 not found".to_string()))?
+            .position,
+    );
+    let p3 = Point3::from(
+        model
+            .vertices
+            .get(v3)
+            .ok_or_else(|| OperationError::InvalidGeometry("v3 not found".to_string()))?
+            .position,
+    );
+    let p4 = Point3::from(
+        model
+            .vertices
+            .get(v4)
+            .ok_or_else(|| OperationError::InvalidGeometry("v4 not found".to_string()))?
+            .position,
+    );
+
+    let bottom = Box::new(Line::new(p1, p2));
+    let top = Box::new(Line::new(p4, p3));
+    Ok(Box::new(RuledSurface::new(bottom, top)))
 }
 
-/// Create profile face from edges
+/// Create profile face from edges.
+///
+/// Constructs a planar surface fitted to the profile's actual vertex
+/// positions rather than defaulting to the XY plane — sweeping a circle
+/// in the YZ plane (e.g. profile normal = +X) would otherwise collapse to
+/// a degenerate strip when projected onto Z = 0.
 fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationResult<FaceId> {
+    use crate::primitives::surface::Plane;
+
+    // Collect sample points from each edge in loop order. For straight-edge
+    // profiles the edge endpoints suffice; closed-curve profiles (e.g. a
+    // circle expressed as a single self-closing edge) provide too few
+    // distinct vertices, so we additionally sample the underlying curve at
+    // its quarter parameters. Three non-collinear samples define the plane.
+    let mut points: Vec<Point3> = Vec::with_capacity(edges.len() * 3);
+    for &edge_id in &edges {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+
+        let v_start = model.vertices.get(edge.start_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Start vertex not found".to_string())
+        })?;
+        points.push(Point3::from(v_start.position));
+
+        // Sample mid-curve and quarter points to capture closed/curved edges
+        // whose start and end vertices coincide.
+        if edge.start_vertex == edge.end_vertex {
+            let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Curve not found".to_string())
+            })?;
+            let lo = edge.param_range.start;
+            let hi = edge.param_range.end;
+            for frac in [0.25, 0.5, 0.75] {
+                let u = lo + (hi - lo) * frac;
+                if let Ok(cp) = curve.evaluate(u) {
+                    points.push(cp.position);
+                }
+            }
+        }
+    }
+
+    if points.len() < 3 {
+        return Err(OperationError::InvalidGeometry(
+            "Profile needs at least three sample points to define a plane".to_string(),
+        ));
+    }
+
+    // Pick three non-collinear points: p0 fixed, scan for first p_i with a
+    // sufficiently long edge p0→p_i, then for first p_j with a non-trivial
+    // cross product against (p_i - p0).
+    let p0 = points[0];
+    let tol_sq = 1e-20;
+    let mut p_i = None;
+    let mut idx_i = 0;
+    for (k, p) in points.iter().enumerate().skip(1) {
+        if (*p - p0).magnitude_squared() > tol_sq {
+            p_i = Some(*p);
+            idx_i = k;
+            break;
+        }
+    }
+    let p_i = p_i.ok_or_else(|| {
+        OperationError::InvalidGeometry("Profile vertices are coincident".to_string())
+    })?;
+
+    let v_i = p_i - p0;
+    let mut p_j = None;
+    for (k, p) in points.iter().enumerate().skip(idx_i + 1) {
+        if (*p - p0).magnitude_squared() < tol_sq {
+            continue;
+        }
+        let v_k = *p - p0;
+        if v_i.cross(&v_k).magnitude_squared() > tol_sq {
+            p_j = Some(points[k]);
+            break;
+        }
+    }
+    let p_j = p_j.ok_or_else(|| {
+        OperationError::InvalidGeometry("Profile vertices are collinear".to_string())
+    })?;
+
+    let plane = Plane::from_three_points(p0, p_i, p_j).map_err(|e| {
+        OperationError::NumericalError(format!("Profile plane fit failed: {:?}", e))
+    })?;
+
     // Create loop from edges
     let mut profile_loop = Loop::new(
         0, // ID will be assigned by store
@@ -787,9 +980,7 @@ fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationRe
     }
     let loop_id = model.loops.add(profile_loop);
 
-    // Create planar surface (assuming planar profile)
-    use crate::primitives::surface::Plane;
-    let surface = Box::new(Plane::xy(0.0));
+    let surface: Box<dyn Surface> = Box::new(plane);
     let surface_id = model.surfaces.add(surface);
 
     // Create face

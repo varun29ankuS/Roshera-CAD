@@ -13,7 +13,7 @@ use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
 use crate::primitives::surface::Surface;
 use crate::primitives::topology_builder::BRepModel;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing;
 
 /// Tessellate a face into triangles
@@ -98,8 +98,27 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
         return;
     }
 
-    // Perform constrained Delaunay triangulation
-    let triangles = constrained_delaunay_triangulation(&all_vertices, &loop_boundaries, &normal);
+    // Triangulate. We unify the hole-free and holed cases on a single
+    // bridged-ear-clipping algorithm:
+    //
+    //   * Project the loops to the face's tangent plane (2D).
+    //   * Force outer CCW, every hole CW (shoelace-signed-area test).
+    //   * For each hole, find a visible bridge target on the outer
+    //     polygon and splice the hole into outer as a thin notch
+    //     (Hertel 1985, also used by mapbox/earcut).
+    //   * Ear-clip the resulting simple polygon.
+    //
+    // This replaced the previous Bowyer-Watson + constraint-enforcement
+    // path, whose `enforce_edge_constraint` step silently corrupted the
+    // triangulation by discarding the cavity-boundary edges (the
+    // `_boundary_edges` collection at the old surface.rs:472 was
+    // computed but never used) and falling back to a naive
+    // sort-vertices-by-angle scheme that only worked for fan-shaped
+    // cavities. On axis-aligned quads (every box face, extrude/revolve
+    // caps) this produced a triangulation whose triangles fell outside
+    // the polygon, the retain filter then dropped them all, and the
+    // face emitted zero triangles.
+    let triangles = triangulate_planar_polygon(&all_vertices, &loop_boundaries, &normal);
 
     // Add vertices to mesh and build index mapping
     let mut vertex_map = Vec::new();
@@ -130,353 +149,292 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
     }
 }
 
-/// Perform constrained Delaunay triangulation for a face with holes
-fn constrained_delaunay_triangulation(
+/// Triangulate a planar face's outer + (optional) inner loops in the
+/// face's tangent plane.
+///
+/// Algorithm: bridged ear-clipping (Hertel 1985, also used by
+/// mapbox/earcut). Bullet-proof for any simple polygon, with or without
+/// holes, runs in O((n+h)²) where n = total vertex count, h = hole count.
+///
+/// Steps:
+///
+///   1. Project all vertices to 2D using `compute_plane_axes(normal)`.
+///   2. Force the outer loop CCW and every hole CW (shoelace signed-
+///      area test). This convention matches `ear_clip_2d`'s positive-
+///      cross-product ear test.
+///   3. Sort holes by max-x descending and bridge each into the running
+///      outer polygon by:
+///        a. Choosing M = the hole's rightmost vertex.
+///        b. Casting a ray from M in +x; finding the closest outer edge
+///           it pierces.
+///        c. Picking the edge endpoint with larger x as the bridge
+///           target P, then refining: if any reflex outer vertex lies
+///           strictly inside triangle (M, ray-hit, P), the closest such
+///           vertex (smallest |angle from +x|, ties broken by squared
+///           distance) becomes P instead. This guarantees segment MP
+///           does not cross the polygon boundary (Eberly 2008,
+///           "Triangulation by Ear Clipping").
+///        d. Splicing the hole's CW walk into the outer at position P
+///           using two synthetic duplicate vertices for M and P; the
+///           result is a simple polygon with a thin notch.
+///   4. Ear-clip the bridged polygon.
+///   5. Remap synthetic duplicates back to their original 3D indices so
+///      the output mesh has no orphan vertices.
+///
+/// This unifies the previously-separate hole-free and holed paths on a
+/// single algorithm. The previous implementation routed holed faces
+/// through a Bowyer-Watson + constraint-enforcement chain whose
+/// `enforce_edge_constraint` step silently corrupted the triangulation
+/// (cavity boundary edges were collected but never used; a naïve
+/// sort-by-angle fallback only worked for fan-shaped cavities). On
+/// axis-aligned quads it produced triangles outside the polygon,
+/// the retain filter dropped them all, and the face emitted zero
+/// triangles. Bridged ear-clipping has no super-triangle, no cavity
+/// retriangulation, and no retain filter — there is nowhere for
+/// triangles to silently disappear.
+fn triangulate_planar_polygon(
     vertices: &[Point3],
     loop_boundaries: &[(usize, usize, bool)],
     normal: &Vector3,
 ) -> Vec<[usize; 3]> {
-    if vertices.len() < 3 {
-        return Vec::new();
-    }
+    let outer_range = match loop_boundaries.iter().find(|(_, _, is_outer)| *is_outer) {
+        Some(&(s, e, _)) if e - s >= 3 => (s, e),
+        _ => return Vec::new(),
+    };
+    let inner_ranges: Vec<(usize, usize)> = loop_boundaries
+        .iter()
+        .filter(|(_, _, is_outer)| !*is_outer)
+        .filter_map(|&(s, e, _)| if e - s >= 3 { Some((s, e)) } else { None })
+        .collect();
 
-    // Project vertices to 2D plane
+    // Project to 2D in the face's tangent plane.
     let (u_axis, v_axis) = compute_plane_axes(normal);
-    let origin = vertices[0];
-
-    let vertices_2d: Vec<(f64, f64)> = vertices
+    let origin = vertices[outer_range.0];
+    let mut vertices_2d: Vec<(f64, f64)> = vertices
         .iter()
         .map(|p| {
-            let relative = *p - origin;
-            (relative.dot(&u_axis), relative.dot(&v_axis))
+            let r = *p - origin;
+            (r.dot(&u_axis), r.dot(&v_axis))
         })
         .collect();
+    // Track the original 3D index for every (possibly synthetic) 2D
+    // vertex. Synthetic duplicates introduced by hole-bridging carry the
+    // 3D index of the vertex they shadow.
+    let mut index_remap: Vec<usize> = (0..vertices_2d.len()).collect();
 
-    // Build constraint edges
-    let mut constraint_edges = Vec::new();
-    for &(start, end, _is_outer) in loop_boundaries {
-        for i in start..end {
-            let j = if i + 1 < end { i + 1 } else { start };
-            constraint_edges.push((i, j));
-        }
+    // Outer (force CCW).
+    let mut outer: Vec<usize> = (outer_range.0..outer_range.1).collect();
+    if polygon_signed_area_2d(&vertices_2d, &outer) < 0.0 {
+        outer.reverse();
     }
 
-    // Perform Delaunay triangulation
-    let mut triangles = bowyer_watson_constrained(&vertices_2d, &constraint_edges);
+    if inner_ranges.is_empty() {
+        let mut tris = Vec::new();
+        ear_clip_2d(&vertices_2d, &outer, &mut tris);
+        return tris;
+    }
 
-    // Remove triangles outside outer boundary and inside holes
-    triangles.retain(|triangle| {
-        let centroid = calculate_triangle_centroid_2d(
-            &vertices_2d[triangle[0]],
-            &vertices_2d[triangle[1]],
-            &vertices_2d[triangle[2]],
-        );
-
-        // Check if centroid is inside outer loop
-        let mut inside_outer = false;
-        for &(start, end, is_outer) in loop_boundaries {
-            if is_outer {
-                let loop_polygon: Vec<(f64, f64)> = (start..end).map(|i| vertices_2d[i]).collect();
-                if is_point_inside_polygon_2d(&centroid, &loop_polygon) {
-                    inside_outer = true;
-                    break;
-                }
+    // Holes (force each CW), sorted by max-x descending so we bridge
+    // the rightmost hole first.
+    let mut holes: Vec<Vec<usize>> = inner_ranges
+        .iter()
+        .map(|&(s, e)| {
+            let mut h: Vec<usize> = (s..e).collect();
+            if polygon_signed_area_2d(&vertices_2d, &h) > 0.0 {
+                h.reverse();
             }
-        }
-
-        if !inside_outer {
-            return false;
-        }
-
-        // Check if centroid is inside any hole
-        for &(start, end, is_outer) in loop_boundaries {
-            if !is_outer {
-                let hole_polygon: Vec<(f64, f64)> = (start..end).map(|i| vertices_2d[i]).collect();
-                if is_point_inside_polygon_2d(&centroid, &hole_polygon) {
-                    return false;
-                }
-            }
-        }
-
-        true
+            h
+        })
+        .collect();
+    holes.sort_by(|a, b| {
+        let amx = polygon_max_x(a, &vertices_2d);
+        let bmx = polygon_max_x(b, &vertices_2d);
+        bmx.partial_cmp(&amx).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    triangles
-}
-
-/// Bowyer-Watson algorithm with constraints
-fn bowyer_watson_constrained(
-    vertices: &[(f64, f64)],
-    constraints: &[(usize, usize)],
-) -> Vec<[usize; 3]> {
-    // Start with standard Bowyer-Watson
-    let mut triangles = bowyer_watson_2d_indexed(vertices);
-
-    // Enforce constraints
-    for &(v1, v2) in constraints {
-        enforce_edge_constraint(&mut triangles, vertices, v1, v2);
+    for hole in holes {
+        if !bridge_hole_into_outer(&mut outer, &hole, &mut vertices_2d, &mut index_remap) {
+            tracing::warn!(
+                "triangulate_planar_polygon: failed to bridge hole into outer; \
+                 face will be tessellated without this hole"
+            );
+        }
     }
 
-    triangles
-}
+    let mut bridged_tris: Vec<[usize; 3]> = Vec::new();
+    ear_clip_2d(&vertices_2d, &outer, &mut bridged_tris);
 
-/// Bowyer-Watson algorithm that returns triangles with original vertex indices
-fn bowyer_watson_2d_indexed(points: &[(f64, f64)]) -> Vec<[usize; 3]> {
-    if points.len() < 3 {
-        return Vec::new();
-    }
-
-    // Create super-triangle
-    let (min_x, min_y, max_x, max_y) = compute_bounds_2d(points);
-    let dx = max_x - min_x;
-    let dy = max_y - min_y;
-    let delta_max = dx.max(dy);
-    let mid_x = (min_x + max_x) / 2.0;
-    let mid_y = (min_y + max_y) / 2.0;
-
-    let super_vertices = vec![
-        (mid_x - 2.0 * delta_max, mid_y - delta_max),
-        (mid_x, mid_y + 2.0 * delta_max),
-        (mid_x + 2.0 * delta_max, mid_y - delta_max),
-    ];
-
-    let n = points.len();
-    let mut all_vertices = super_vertices;
-    all_vertices.extend_from_slice(points);
-
-    let mut triangles = vec![[0, 1, 2]];
-
-    // Add points one by one
-    for i in 0..n {
-        let vertex_idx = i + 3; // Account for super-triangle vertices
-        let point = points[i];
-
-        let mut bad_triangles = Vec::new();
-
-        // Find triangles whose circumcircle contains the point
-        for (tri_idx, &triangle) in triangles.iter().enumerate() {
-            if in_circumcircle_indexed(&all_vertices, triangle, &point) {
-                bad_triangles.push(tri_idx);
+    // Collapse synthetic-duplicate indices back to their original 3D
+    // indices. After this remap, two indices in the same triangle may
+    // refer to the same 3D vertex only on the bridge degenerate
+    // (zero-area) triangles; those are filtered out below.
+    bridged_tris
+        .into_iter()
+        .filter_map(|[a, b, c]| {
+            let ra = index_remap[a];
+            let rb = index_remap[b];
+            let rc = index_remap[c];
+            if ra == rb || rb == rc || ra == rc {
+                None
+            } else {
+                Some([ra, rb, rc])
             }
-        }
-
-        // Find boundary edges
-        let mut boundary_edges = Vec::new();
-        for &tri_idx in &bad_triangles {
-            let triangle = triangles[tri_idx];
-            for j in 0..3 {
-                let edge = [triangle[j], triangle[(j + 1) % 3]];
-
-                let mut is_shared = false;
-                for &other_idx in &bad_triangles {
-                    if other_idx != tri_idx {
-                        let other_tri = triangles[other_idx];
-                        if triangle_has_edge(&other_tri, edge[0], edge[1]) {
-                            is_shared = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !is_shared {
-                    boundary_edges.push(edge);
-                }
-            }
-        }
-
-        // Remove bad triangles
-        bad_triangles.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in bad_triangles {
-            triangles.swap_remove(idx);
-        }
-
-        // Re-triangulate
-        for edge in boundary_edges {
-            triangles.push([edge[0], edge[1], vertex_idx]);
-        }
-    }
-
-    // Remove triangles containing super-triangle vertices and adjust indices
-    triangles.retain(|tri| tri[0] >= 3 && tri[1] >= 3 && tri[2] >= 3);
-
-    for triangle in &mut triangles {
-        triangle[0] -= 3;
-        triangle[1] -= 3;
-        triangle[2] -= 3;
-    }
-
-    triangles
+        })
+        .collect()
 }
 
-/// Check if a point is inside the circumcircle of a triangle
-fn in_circumcircle_indexed(
-    vertices: &[(f64, f64)],
-    triangle: [usize; 3],
-    point: &(f64, f64),
-) -> bool {
-    let p1 = &vertices[triangle[0]];
-    let p2 = &vertices[triangle[1]];
-    let p3 = &vertices[triangle[2]];
-
-    let ax = p1.0 - point.0;
-    let ay = p1.1 - point.1;
-    let bx = p2.0 - point.0;
-    let by = p2.1 - point.1;
-    let cx = p3.0 - point.0;
-    let cy = p3.1 - point.1;
-
-    let det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay)
-        + (cx * cx + cy * cy) * (ax * by - bx * ay);
-
-    det > 0.0
-}
-
-/// Check if triangle has a specific edge
-fn triangle_has_edge(triangle: &[usize; 3], v1: usize, v2: usize) -> bool {
-    for i in 0..3 {
-        let j = (i + 1) % 3;
-        if (triangle[i] == v1 && triangle[j] == v2) || (triangle[i] == v2 && triangle[j] == v1) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Enforce an edge constraint in the triangulation.
-///
-/// Removes all triangles whose edges cross the constraint edge (v1, v2),
-/// then retriangulates the two resulting cavities (one on each side of the
-/// constraint edge) using ear-clipping. This produces a valid constrained
-/// Delaunay triangulation.
-fn enforce_edge_constraint(
-    triangles: &mut Vec<[usize; 3]>,
-    vertices: &[(f64, f64)],
-    v1: usize,
-    v2: usize,
-) {
-    // Check if edge already exists in the triangulation
-    for triangle in triangles.iter() {
-        if triangle_has_edge(triangle, v1, v2) {
-            return;
-        }
-    }
-
-    // Find triangles whose edges intersect the constraint edge
-    let mut intersecting = Vec::new();
-    for (idx, triangle) in triangles.iter().enumerate() {
-        if edge_intersects_triangle(vertices, v1, v2, *triangle) {
-            intersecting.push(idx);
-        }
-    }
-
-    if intersecting.is_empty() {
-        return;
-    }
-
-    // Collect boundary edges of the cavity (edges not shared between removed triangles)
-    let _removed_set: HashSet<usize> = intersecting.iter().cloned().collect();
-    let mut edge_count: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut cavity_vertices: HashSet<usize> = HashSet::new();
-
-    for &idx in &intersecting {
-        let tri = triangles[idx];
-        for k in 0..3 {
-            let a = tri[k];
-            let b = tri[(k + 1) % 3];
-            cavity_vertices.insert(a);
-            cavity_vertices.insert(b);
-            let edge = if a < b { (a, b) } else { (b, a) };
-            *edge_count.entry(edge).or_insert(0) += 1;
-        }
-    }
-    // Ensure constraint endpoints are included
-    cavity_vertices.insert(v1);
-    cavity_vertices.insert(v2);
-
-    // Boundary edges are those appearing exactly once among removed triangles
-    let _boundary_edges: Vec<(usize, usize)> = edge_count
+/// Maximum x-coordinate among the indexed 2D points.
+fn polygon_max_x(polygon: &[usize], vertices_2d: &[(f64, f64)]) -> f64 {
+    polygon
         .iter()
-        .filter(|(_, &count)| count == 1)
-        .map(|(&edge, _)| edge)
-        .collect();
+        .map(|&i| vertices_2d[i].0)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
 
-    // Remove intersecting triangles (reverse order to keep indices valid with swap_remove)
-    intersecting.sort_unstable_by(|a, b| b.cmp(a));
-    for idx in &intersecting {
-        triangles.swap_remove(*idx);
+/// Bridge a single hole into `outer`. Returns false if no visible bridge
+/// target could be found (degenerate input — caller emits a warning and
+/// skips this hole).
+///
+/// Mutates `vertices_2d` and `index_remap` to add two synthetic duplicate
+/// vertices (one for the outer-bridge target, one for the hole's
+/// rightmost vertex). Synthetic duplicates carry the same 2D coords and
+/// the same `index_remap[i]` as their originals — `ear_clip_2d` treats
+/// them as independent vertices for its index-equality "same vertex"
+/// check, but the final `index_remap` collapse undoes the duplication
+/// in the emitted triangles.
+fn bridge_hole_into_outer(
+    outer: &mut Vec<usize>,
+    hole: &[usize],
+    vertices_2d: &mut Vec<(f64, f64)>,
+    index_remap: &mut Vec<usize>,
+) -> bool {
+    if hole.len() < 3 {
+        return false;
     }
 
-    // Separate cavity vertices into two polygons: above and below the constraint edge
-    let edge_dir = (
-        vertices[v2].0 - vertices[v1].0,
-        vertices[v2].1 - vertices[v1].1,
-    );
+    // 1. M = rightmost hole vertex (break x ties by larger y).
+    let m_in_hole = (0..hole.len())
+        .max_by(|&a, &b| {
+            let pa = vertices_2d[hole[a]];
+            let pb = vertices_2d[hole[b]];
+            pa.0.partial_cmp(&pb.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| pa.1.partial_cmp(&pb.1).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .unwrap_or(0);
+    let m_idx = hole[m_in_hole];
+    let m = vertices_2d[m_idx];
 
-    let mut above: Vec<usize> = Vec::new();
-    let mut below: Vec<usize> = Vec::new();
-
-    for &vi in &cavity_vertices {
-        if vi == v1 || vi == v2 {
+    // 2. Ray from M in +x. Find outer edge with min x-intersection > M.x.
+    let n_outer = outer.len();
+    let mut best_hit: Option<(f64, usize)> = None;
+    for i in 0..n_outer {
+        let a = vertices_2d[outer[i]];
+        let b = vertices_2d[outer[(i + 1) % n_outer]];
+        // Half-open span check avoids double-counting at shared y.
+        let spans = (a.1 <= m.1 && m.1 < b.1) || (b.1 <= m.1 && m.1 < a.1);
+        if !spans {
             continue;
         }
-        let rel = (
-            vertices[vi].0 - vertices[v1].0,
-            vertices[vi].1 - vertices[v1].1,
-        );
-        let cross = edge_dir.0 * rel.1 - edge_dir.1 * rel.0;
+        let dy = b.1 - a.1;
+        if dy.abs() < 1e-14 {
+            continue;
+        }
+        let t = (m.1 - a.1) / dy;
+        let x = a.0 + t * (b.0 - a.0);
+        if x > m.0 - 1e-14 && best_hit.map_or(true, |(bx, _)| x < bx) {
+            best_hit = Some((x, i));
+        }
+    }
+    let (hit_x, hit_edge) = match best_hit {
+        Some(h) => h,
+        None => return false,
+    };
+
+    // 3. Initial P = endpoint of (outer[hit_edge], outer[hit_edge+1]) with larger x.
+    let a_pos = hit_edge;
+    let b_pos = (hit_edge + 1) % n_outer;
+    let a_pt = vertices_2d[outer[a_pos]];
+    let b_pt = vertices_2d[outer[b_pos]];
+    let mut p_pos = if a_pt.0 >= b_pt.0 { a_pos } else { b_pos };
+    let mut p_pt = vertices_2d[outer[p_pos]];
+
+    // 4. Refine: if any reflex outer vertex lies strictly inside triangle
+    //    (M, hit_point, P), the bridge MP crosses the boundary. Pick the
+    //    closest such reflex vertex (smallest |angle from M's +x axis|,
+    //    ties broken by squared distance) as P instead.
+    let hit_pt = (hit_x, m.1);
+    let mut best_angle = (p_pt.1 - m.1).atan2(p_pt.0 - m.0).abs();
+    let mut best_dist2 = (p_pt.0 - m.0).powi(2) + (p_pt.1 - m.1).powi(2);
+    for i in 0..n_outer {
+        if i == p_pos {
+            continue;
+        }
+        let v = vertices_2d[outer[i]];
+        let prev = vertices_2d[outer[(i + n_outer - 1) % n_outer]];
+        let next = vertices_2d[outer[(i + 1) % n_outer]];
+        // CCW ⇒ reflex iff (curr - prev) × (next - prev) ≤ 0.
+        let cross = (v.0 - prev.0) * (next.1 - prev.1) - (v.1 - prev.1) * (next.0 - prev.0);
         if cross > 0.0 {
-            above.push(vi);
-        } else {
-            below.push(vi);
+            continue;
+        }
+        if !point_in_triangle_2d(&v, &m, &hit_pt, &p_pt) {
+            continue;
+        }
+        let angle = (v.1 - m.1).atan2(v.0 - m.0).abs();
+        let dist2 = (v.0 - m.0).powi(2) + (v.1 - m.1).powi(2);
+        if angle < best_angle - 1e-14
+            || ((angle - best_angle).abs() <= 1e-14 && dist2 < best_dist2)
+        {
+            p_pos = i;
+            p_pt = v;
+            best_angle = angle;
+            best_dist2 = dist2;
         }
     }
 
-    // Triangulate each side: fan from constraint edge to cavity boundary vertices.
-    // Sort vertices by angle from v1→v2 to produce a correct polygon ordering.
-    let retriangulate_side = |side: &mut Vec<usize>, tris: &mut Vec<[usize; 3]>| {
-        if side.is_empty() {
-            return;
-        }
+    // 5. Splice. Insert into outer immediately after position p_pos:
+    //    [M_dup, hole walked CW from m_in_hole+1 wrapping to m_in_hole-1,
+    //     M (original), P_dup]
+    //
+    // Synthetic duplicates carry the original 3D index via `index_remap`
+    // so the final triangle remap collapses them back.
+    let m_dup = vertices_2d.len();
+    vertices_2d.push(m);
+    index_remap.push(index_remap[m_idx]);
+    let p_orig_idx = outer[p_pos];
+    let p_dup = vertices_2d.len();
+    vertices_2d.push(p_pt);
+    index_remap.push(index_remap[p_orig_idx]);
 
-        // Sort by angle relative to v1, measured from v1→v2 direction
-        let base_angle = edge_dir.1.atan2(edge_dir.0);
-        side.sort_by(|&a, &b| {
-            let da = (
-                vertices[a].0 - vertices[v1].0,
-                vertices[a].1 - vertices[v1].1,
-            );
-            let db = (
-                vertices[b].0 - vertices[v1].0,
-                vertices[b].1 - vertices[v1].1,
-            );
-            let angle_a = da.1.atan2(da.0) - base_angle;
-            let angle_b = db.1.atan2(db.0) - base_angle;
-            // Normalize to [0, 2π)
-            let na = if angle_a < 0.0 {
-                angle_a + 2.0 * std::f64::consts::PI
-            } else {
-                angle_a
-            };
-            let nb = if angle_b < 0.0 {
-                angle_b + 2.0 * std::f64::consts::PI
-            } else {
-                angle_b
-            };
-            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
-        });
+    let mut spliced = Vec::with_capacity(outer.len() + hole.len() + 2);
+    spliced.extend_from_slice(&outer[..=p_pos]);
+    spliced.push(m_dup);
+    let h_len = hole.len();
+    for k in 1..h_len {
+        spliced.push(hole[(m_in_hole + k) % h_len]);
+    }
+    spliced.push(m_idx);
+    spliced.push(p_dup);
+    spliced.extend_from_slice(&outer[p_pos + 1..]);
+    *outer = spliced;
+    true
+}
 
-        // Build polygon: v1, sorted vertices..., v2
-        let mut polygon = Vec::with_capacity(side.len() + 2);
-        polygon.push(v1);
-        polygon.extend_from_slice(side);
-        polygon.push(v2);
-
-        // Ear-clipping triangulation of the polygon
-        ear_clip_2d(vertices, &polygon, tris);
-    };
-
-    retriangulate_side(&mut above, triangles);
-    retriangulate_side(&mut below, triangles);
+/// Signed area of a polygon described by indices into `vertices_2d`.
+/// Positive ⇒ CCW, negative ⇒ CW. Uses the shoelace formula.
+fn polygon_signed_area_2d(vertices_2d: &[(f64, f64)], polygon: &[usize]) -> f64 {
+    let n = polygon.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for i in 0..n {
+        let (x1, y1) = vertices_2d[polygon[i]];
+        let (x2, y2) = vertices_2d[polygon[(i + 1) % n]];
+        area += x1 * y2 - x2 * y1;
+    }
+    area * 0.5
 }
 
 /// Triangulate a simple polygon in 2D using ear clipping.
@@ -563,102 +521,6 @@ fn point_in_triangle_2d(p: &(f64, f64), a: &(f64, f64), b: &(f64, f64), c: &(f64
     u > 1e-10 && v > 1e-10 && (u + v) < 1.0 - 1e-10
 }
 
-/// Check if an edge intersects a triangle
-fn edge_intersects_triangle(
-    vertices: &[(f64, f64)],
-    e1: usize,
-    e2: usize,
-    triangle: [usize; 3],
-) -> bool {
-    let p1 = vertices[e1];
-    let p2 = vertices[e2];
-
-    for i in 0..3 {
-        let j = (i + 1) % 3;
-        let p3 = vertices[triangle[i]];
-        let p4 = vertices[triangle[j]];
-
-        if segments_intersect_2d(&p1, &p2, &p3, &p4) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check if two line segments intersect
-fn segments_intersect_2d(
-    p1: &(f64, f64),
-    p2: &(f64, f64),
-    p3: &(f64, f64),
-    p4: &(f64, f64),
-) -> bool {
-    let d1 = orientation_2d(p3, p4, p1);
-    let d2 = orientation_2d(p3, p4, p2);
-    let d3 = orientation_2d(p1, p2, p3);
-    let d4 = orientation_2d(p1, p2, p4);
-
-    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
-    {
-        return true;
-    }
-
-    // Check for collinear points
-    if d1.abs() < 1e-10 && on_segment_2d(p3, p1, p4) {
-        return true;
-    }
-    if d2.abs() < 1e-10 && on_segment_2d(p3, p2, p4) {
-        return true;
-    }
-    if d3.abs() < 1e-10 && on_segment_2d(p1, p3, p2) {
-        return true;
-    }
-    if d4.abs() < 1e-10 && on_segment_2d(p1, p4, p2) {
-        return true;
-    }
-
-    false
-}
-
-/// Compute orientation of ordered triplet (p, q, r)
-fn orientation_2d(p: &(f64, f64), q: &(f64, f64), r: &(f64, f64)) -> f64 {
-    (q.1 - p.1) * (r.0 - q.0) - (q.0 - p.0) * (r.1 - q.1)
-}
-
-/// Check if point q lies on segment pr
-fn on_segment_2d(p: &(f64, f64), q: &(f64, f64), r: &(f64, f64)) -> bool {
-    q.0 <= p.0.max(r.0) && q.0 >= p.0.min(r.0) && q.1 <= p.1.max(r.1) && q.1 >= p.1.min(r.1)
-}
-
-/// Calculate centroid of a 2D triangle
-fn calculate_triangle_centroid_2d(p1: &(f64, f64), p2: &(f64, f64), p3: &(f64, f64)) -> (f64, f64) {
-    ((p1.0 + p2.0 + p3.0) / 3.0, (p1.1 + p2.1 + p3.1) / 3.0)
-}
-
-/// Check if a point is inside a 2D polygon using winding number
-fn is_point_inside_polygon_2d(point: &(f64, f64), polygon: &[(f64, f64)]) -> bool {
-    let winding = calculate_winding_number(point, polygon);
-    winding.abs() > 0.5
-}
-
-/// Compute bounding box of 2D points
-fn compute_bounds_2d(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    let mut min_x = f64::MAX;
-    let mut min_y = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut max_y = f64::MIN;
-
-    for &(x, y) in points {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-
-    (min_x, min_y, max_x, max_y)
-}
-
 /// Tessellate a cylindrical face
 fn tessellate_cylindrical_face(
     face: &Face,
@@ -685,8 +547,39 @@ fn tessellate_cylindrical_face(
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 
-    let u_steps = ((radius * u_span) / params.max_edge_length).ceil() as usize + 1;
-    let v_steps = (v_span / params.max_edge_length).ceil() as usize + 1;
+    // Angular subdivision capped by max_segments — mirrors the spherical
+    // path. The previous formula `(radius * u_span) / max_edge_length`
+    // never consulted max_segments and produced ~1M steps per face for
+    // r=15, h=80, max_edge_length=0.1; the floor+cap below keeps it
+    // bounded while still respecting both chord-length and angle
+    // tolerances.
+    let u_from_chord = if params.max_edge_length > 0.0 && radius > 0.0 {
+        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
+        let theta = 2.0 * half_chord.asin();
+        if theta > 0.0 {
+            (u_span / theta).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+    let u_from_angle = if params.max_angle_deviation > 0.0 {
+        (u_span / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+    let u_steps = u_from_chord
+        .max(u_from_angle)
+        .max(params.min_segments)
+        .min(params.max_segments);
+
+    let v_steps_raw = if params.max_edge_length > 0.0 {
+        ((v_span / params.max_edge_length).ceil() as usize).max(1)
+    } else {
+        1
+    };
+    let v_steps = v_steps_raw.min(params.max_segments);
 
     // Generate vertices
     let mut vertex_grid = Vec::new();
@@ -751,10 +644,54 @@ fn tessellate_spherical_face(
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 
-    // Calculate resolution based on angular deviation
-    let _radius = estimate_sphere_radius(surface);
-    let u_steps = ((u_span / params.max_angle_deviation) as usize).max(3);
-    let v_steps = ((v_span / params.max_angle_deviation) as usize).max(3);
+    // Calculate resolution using the same triple-guard pattern as the
+    // cylinder and cone tessellators: chord tolerance, angular tolerance,
+    // and an explicit `max_segments` cap. Without the cap, an aggressive
+    // `max_edge_length` (e.g. 0.1 mm on a 30 mm sphere) and a tiny
+    // `max_angle_deviation` would request millions of triangles per face.
+    let radius = estimate_sphere_radius(surface).max(crate::math::constants::EPSILON);
+
+    let u_from_chord = if params.max_edge_length > 0.0 {
+        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
+        let theta = 2.0 * half_chord.asin();
+        if theta > 0.0 {
+            (u_span / theta).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+    let u_from_angle = if params.max_angle_deviation > 0.0 {
+        (u_span / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+    let u_steps = u_from_chord
+        .max(u_from_angle)
+        .max(params.min_segments.max(3))
+        .min(params.max_segments);
+
+    let v_from_chord = if params.max_edge_length > 0.0 {
+        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
+        let theta = 2.0 * half_chord.asin();
+        if theta > 0.0 {
+            (v_span / theta).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+    let v_from_angle = if params.max_angle_deviation > 0.0 {
+        (v_span / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+    let v_steps = v_from_chord
+        .max(v_from_angle)
+        .max(params.min_segments.max(3))
+        .min(params.max_segments);
 
     // Special handling for poles to avoid degeneracies
     if near_north_pole || near_south_pole {
@@ -1000,16 +937,52 @@ fn tessellate_conical_face(
     // Detect if we include the apex (v = 0 for typical cone parameterization)
     let includes_apex = v_min.abs() < 1e-6;
 
-    // Calculate tessellation resolution
+    // Calculate tessellation resolution. Both axes use a triple guard
+    // (chord-tolerance, angle-tolerance, hard `max_segments` cap) so a
+    // user-supplied `max_angle_deviation` near zero or `max_edge_length`
+    // near zero cannot blow the step count to millions — the same
+    // failure mode the cylinder path used to suffer.
     let u_span = u_max - u_min;
-    let _v_span = v_max - v_min;
 
-    // Angular resolution for u (around axis)
-    let u_steps = ((u_span / params.max_angle_deviation) as usize).max(8);
+    // Maximum cross-section radius (at v_max) for the chord metric. For
+    // a Cone, r(v) = v · sin(half_angle). Falls back to a unit radius if
+    // the surface is not a Cone (generic-grid path), which keeps the
+    // angular metric as the safe lower bound on step count.
+    let base_radius = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cone>()
+        .map(|cone| (v_max.abs()).max(v_min.abs()) * cone.half_angle.sin())
+        .unwrap_or(1.0);
 
-    // Linear resolution for v (along slant)
+    let u_from_chord = if params.max_edge_length > 0.0 && base_radius > 0.0 {
+        let half_chord = (params.max_edge_length / (2.0 * base_radius)).min(1.0);
+        let theta = 2.0 * half_chord.asin();
+        if theta > 0.0 {
+            (u_span / theta).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+    let u_from_angle = if params.max_angle_deviation > 0.0 {
+        (u_span / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+    let u_steps = u_from_chord
+        .max(u_from_angle)
+        .max(params.min_segments.max(8))
+        .min(params.max_segments);
+
+    // Linear resolution for v (along slant), capped by max_segments.
     let cone_height = estimate_cone_height(surface, v_min, v_max);
-    let v_steps = ((cone_height / params.max_edge_length) as usize).max(3);
+    let v_steps_raw = if params.max_edge_length > 0.0 {
+        ((cone_height / params.max_edge_length).ceil() as usize).max(3)
+    } else {
+        3
+    };
+    let v_steps = v_steps_raw.min(params.max_segments);
 
     if includes_apex {
         tessellate_conical_with_apex(
@@ -1055,7 +1028,16 @@ fn tessellate_conical_with_apex(
         }
     }
 
-    // Generate remaining rows
+    // Generate remaining rows. The previous implementation gated each
+    // (u, v) sample on `is_point_inside_face`, which fails for the
+    // primitive cone topology because its outer loop projects to a
+    // single line in (u, v) (the wide-end circle, all at v = height).
+    // The (u, v) extent has already been clamped by
+    // `get_face_parameter_bounds`, which unions degenerate axes with the
+    // surface's own parameter bounds — so every grid point inside that
+    // rectangle is, by construction, inside the face. Trimmed cones
+    // (e.g. boolean output) carry seam edges that fix the loop
+    // projection, and can re-introduce a trim test in a later pass.
     let v_start = if v_min.abs() < 1e-6 { 1 } else { 0 };
     for v_idx in v_start..=v_steps {
         let v = v_min + (v_idx as f64) * (v_max - v_min) / (v_steps as f64);
@@ -1064,20 +1046,16 @@ fn tessellate_conical_with_apex(
         for u_idx in 0..=u_steps {
             let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
 
-            if is_point_inside_face(u, v, face, model) {
-                if let (Ok(point), Ok(normal)) = (
-                    surface.point_at(u, v),
-                    face.normal_at(u, v, &model.surfaces),
-                ) {
-                    let index = mesh.add_vertex(MeshVertex {
-                        position: point,
-                        normal,
-                        uv: Some((u, v)),
-                    });
-                    row.push(Some(index));
-                } else {
-                    row.push(None);
-                }
+            if let (Ok(point), Ok(normal)) = (
+                surface.point_at(u, v),
+                face.normal_at(u, v, &model.surfaces),
+            ) {
+                let index = mesh.add_vertex(MeshVertex {
+                    position: point,
+                    normal,
+                    uv: Some((u, v)),
+                });
+                row.push(Some(index));
             } else {
                 row.push(None);
             }
@@ -1158,60 +1136,91 @@ fn tessellate_toroidal_face(
 
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
-
-    // Torus has two circular parameters
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 
-    // Get torus radii
+    // Get torus radii: u sweeps the major (R) circle, v sweeps the minor (r) circle.
     let (major_radius, minor_radius) = estimate_torus_radii(surface);
 
-    // Calculate steps based on angular deviation
-    // u goes around major circle, v goes around minor circle
-    let u_steps = ((u_span / params.max_angle_deviation) as usize).max(8);
-    let v_steps = ((v_span / params.max_angle_deviation) as usize).max(6);
-
-    // Also consider chord tolerance
-    let u_steps_chord = ((major_radius * u_span) / params.max_edge_length) as usize;
-    let v_steps_chord = ((minor_radius * v_span) / params.max_edge_length) as usize;
-
-    let _u_steps = u_steps.max(u_steps_chord).min(params.max_segments);
-    let _v_steps = v_steps.max(v_steps_chord).min(params.max_segments / 2);
-
-    // Use adaptive tessellation for high quality
-    let tessellator = AdaptiveTessellator::new(params.clone());
-    let temp_mesh = tessellator.tessellate_patch(surface, (u_min, u_max), (v_min, v_max));
-
-    // Convert to ThreeJS mesh with trimming
-    let mut vertex_map = Vec::new();
-    for vertex in &temp_mesh.vertices {
-        if let Some((u, v)) = vertex.uv {
-            if is_point_inside_face(u, v, face, model) {
-                let index = mesh.add_vertex(MeshVertex {
-                    position: vertex.position,
-                    normal: vertex.normal,
-                    uv: Some((u, v)),
-                });
-                vertex_map.push(Some(index));
+    // Triple guard for both axes (chord, angle, max_segments). The
+    // previous implementation handed the patch off to
+    // `AdaptiveTessellator::tessellate_patch`, which ignored
+    // `max_segments` entirely — a torus with R=30, r=10 generated ≈115k
+    // triangles, blowing through the 100k regression cap. The grid path
+    // below mirrors `tessellate_cylindrical_face` and always honours the
+    // hard segment cap.
+    let steps_for = |span: f64, radius: f64, cap: usize| -> usize {
+        let from_chord = if params.max_edge_length > 0.0 && radius > 0.0 {
+            let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
+            let theta = 2.0 * half_chord.asin();
+            if theta > 0.0 {
+                (span / theta).ceil() as usize
             } else {
-                vertex_map.push(None);
+                params.min_segments
             }
         } else {
-            vertex_map.push(None);
+            params.min_segments
+        };
+        let from_angle = if params.max_angle_deviation > 0.0 {
+            (span / params.max_angle_deviation).ceil() as usize
+        } else {
+            params.min_segments
+        };
+        from_chord
+            .max(from_angle)
+            .max(params.min_segments)
+            .min(cap)
+    };
+
+    let u_steps = steps_for(u_span, major_radius, params.max_segments);
+    // Cap v at half max_segments so the grand total tri count stays
+    // within max_segments² rather than 2·max_segments² for a full torus.
+    let v_steps = steps_for(v_span, minor_radius, params.max_segments.max(2) / 2);
+
+    // Generate vertices on a regular (u, v) grid. As with the cylinder
+    // path, the (u, v) extent has been clamped against surface bounds by
+    // `get_face_parameter_bounds`, so every grid point lies inside the
+    // primitive torus face. Trimmed tori carry seam edges that fix the
+    // loop projection and can re-introduce a per-sample trim test later.
+    let mut vertex_grid: Vec<Vec<Option<u32>>> = Vec::with_capacity(v_steps + 1);
+    for v_idx in 0..=v_steps {
+        let v = v_min + (v_idx as f64) * v_span / (v_steps as f64);
+        let mut row = Vec::with_capacity(u_steps + 1);
+        for u_idx in 0..=u_steps {
+            let u = u_min + (u_idx as f64) * u_span / (u_steps as f64);
+            if let (Ok(point), Ok(normal)) = (
+                surface.point_at(u, v),
+                face.normal_at(u, v, &model.surfaces),
+            ) {
+                let index = mesh.add_vertex(MeshVertex {
+                    position: point,
+                    normal,
+                    uv: Some((u, v)),
+                });
+                row.push(Some(index));
+            } else {
+                row.push(None);
+            }
         }
+        vertex_grid.push(row);
     }
 
-    // Add triangles
-    for triangle in &temp_mesh.triangles {
-        if let (Some(v0), Some(v1), Some(v2)) = (
-            vertex_map.get(triangle[0] as usize).and_then(|&v| v),
-            vertex_map.get(triangle[1] as usize).and_then(|&v| v),
-            vertex_map.get(triangle[2] as usize).and_then(|&v| v),
-        ) {
-            if face.orientation == crate::primitives::face::FaceOrientation::Forward {
-                mesh.add_triangle(v0, v1, v2);
-            } else {
-                mesh.add_triangle(v0, v2, v1);
+    // Generate triangles
+    for v_idx in 0..v_steps {
+        for u_idx in 0..u_steps {
+            if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (
+                vertex_grid[v_idx].get(u_idx).and_then(|&v| v),
+                vertex_grid[v_idx].get(u_idx + 1).and_then(|&v| v),
+                vertex_grid[v_idx + 1].get(u_idx).and_then(|&v| v),
+                vertex_grid[v_idx + 1].get(u_idx + 1).and_then(|&v| v),
+            ) {
+                if face.orientation == crate::primitives::face::FaceOrientation::Forward {
+                    mesh.add_triangle(v0, v1, v2);
+                    mesh.add_triangle(v1, v3, v2);
+                } else {
+                    mesh.add_triangle(v0, v2, v1);
+                    mesh.add_triangle(v1, v2, v3);
+                }
             }
         }
     }
@@ -1331,7 +1340,14 @@ fn tessellate_nurbs_face(
     );
 }
 
-/// Generic surface tessellation using uniform grid
+/// Generic surface tessellation using uniform grid.
+///
+/// Builds the face's boundary polygon in (u, v) parameter space once,
+/// then point-tests every grid cell against that cached polygon. The
+/// previous implementation called `is_point_inside_face` per cell, which
+/// reprojected every loop sample through `surface.closest_point` (an
+/// iterative Newton solve) for every test — O(grid² · samples · Newton)
+/// per face. Caching collapses it to O(grid² + samples · Newton).
 fn tessellate_generic_face(
     face: &Face,
     model: &BRepModel,
@@ -1347,12 +1363,50 @@ fn tessellate_generic_face(
     let (_u_range, _v_range) = surface.parameter_bounds();
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
-    // Simple uniform grid tessellation
-    let u_steps = ((u_max - u_min) / params.max_edge_length * 10.0).ceil() as usize + 1;
-    let v_steps = ((v_max - v_min) / params.max_edge_length * 10.0).ceil() as usize + 1;
+    // Triple-guard subdivision: parameter-derived chord, max_segments cap,
+    // floor for visual smoothness. The previous formula multiplied the
+    // parameter-space ratio by 10, saturating at the clamp ceiling for any
+    // realistic max_edge_length and torching tessellation throughput.
+    let raw_u = ((u_max - u_min) / params.max_edge_length).ceil() as usize + 1;
+    let raw_v = ((v_max - v_min) / params.max_edge_length).ceil() as usize + 1;
+    let u_steps = raw_u.max(3).min(params.max_segments.max(3));
+    let v_steps = raw_v.max(3).min(params.max_segments.max(3));
 
-    let u_steps = u_steps.clamp(3, 50);
-    let v_steps = v_steps.clamp(3, 50);
+    // Precompute the outer-loop polygon once and the inner-loop polygons
+    // (holes) once. All subsequent point-in-face tests reuse these.
+    let outer_polygon = match model.loops.get(face.outer_loop) {
+        Some(loop_data) => get_loop_polygon_2d(loop_data, model, surface),
+        None => Vec::new(),
+    };
+    let inner_polygons: Vec<Vec<(f64, f64)>> = face
+        .inner_loops
+        .iter()
+        .filter_map(|&inner_id| {
+            model
+                .loops
+                .get(inner_id)
+                .map(|loop_data| get_loop_polygon_2d(loop_data, model, surface))
+        })
+        .collect();
+
+    let inside_face = |u: f64, v: f64| -> bool {
+        if outer_polygon.len() < 3 {
+            // Surface has no usable boundary; accept the whole grid so we
+            // still emit triangles rather than silently dropping the face.
+            return true;
+        }
+        if calculate_winding_number(&(u, v), &outer_polygon).abs() < 0.5 {
+            return false;
+        }
+        for hole in &inner_polygons {
+            if hole.len() >= 3
+                && calculate_winding_number(&(u, v), hole).abs() > 0.5
+            {
+                return false;
+            }
+        }
+        true
+    };
 
     // Generate vertices
     let mut vertex_grid = Vec::new();
@@ -1363,8 +1417,7 @@ fn tessellate_generic_face(
         for u_idx in 0..=u_steps {
             let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
 
-            // Check if point is inside face boundaries
-            if is_point_inside_face(u, v, face, model) {
+            if inside_face(u, v) {
                 if let (Ok(point), Ok(normal)) = (
                     surface.point_at(u, v),
                     face.normal_at(u, v, &model.surfaces),
@@ -1437,18 +1490,40 @@ fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, 
     if u_min > u_max || v_min > v_max {
         // Fallback to surface bounds
         let (u_range, v_range) = surface.parameter_bounds();
-        (u_range.0, u_range.1, v_range.0, v_range.1)
-    } else {
-        // Add small margin for numerical stability
-        let u_margin = (u_max - u_min) * 0.01;
-        let v_margin = (v_max - v_min) * 0.01;
-        (
-            u_min - u_margin,
-            u_max + u_margin,
-            v_min - v_margin,
-            v_max + v_margin,
-        )
+        return (u_range.0, u_range.1, v_range.0, v_range.1);
     }
+
+    // Degenerate-axis collapse: a face whose outer loop projects onto a
+    // single u- or v-line (e.g. an apex-degenerate cone whose only edge
+    // is the wide-end circle, sampled entirely at v = height) yields a
+    // zero-span axis here. The face still covers the full surface extent
+    // along that axis (the apex is a topological point with no edge);
+    // fall back to the surface's parameter bound for any collapsed axis
+    // so the grid tessellator has a non-zero region to sample.
+    const DEGENERATE_TOL: f64 = 1e-9;
+    let (u_range, v_range) = surface.parameter_bounds();
+    if (u_max - u_min) < DEGENERATE_TOL {
+        u_min = u_range.0;
+        u_max = u_range.1;
+    }
+    if (v_max - v_min) < DEGENERATE_TOL {
+        v_min = v_range.0;
+        v_max = v_range.1;
+    }
+
+    // Add a small margin for numerical stability, but never let the
+    // expanded interval escape the surface's own parameter domain. Going
+    // below the surface's v_min in particular collides with apex-detection
+    // logic (`v_min.abs() < 1e-6`) downstream, and going beyond a surface's
+    // u/v limits has no defined evaluation.
+    let u_margin = (u_max - u_min) * 0.01;
+    let v_margin = (v_max - v_min) * 0.01;
+    (
+        (u_min - u_margin).max(u_range.0),
+        (u_max + u_margin).min(u_range.1),
+        (v_min - v_margin).max(v_range.0),
+        (v_max + v_margin).min(v_range.1),
+    )
 }
 
 /// Update parameter bounds from a loop
@@ -2065,31 +2140,146 @@ fn ensure_watertight_mesh(mesh: &mut TriangleMesh, _vertex_map: &HashMap<(usize,
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
+    //! Direct regression tests for the planar-face triangulation pipeline.
+    //!
+    //! These exercise the pure 2D entry point (`triangulate_planar_polygon`)
+    //! and its helpers without going through `BRepModel`, so they double as
+    //! algorithm-level invariants:
+    //!
+    //!   * Simple square (CCW input)  → ≥ 2 triangles, total signed area == 1.
+    //!   * Simple square (CW input)   → ≥ 2 triangles (shoelace correction).
+    //!   * Square with square hole    → triangles cover (outer − hole) area,
+    //!                                  none has its centroid inside the hole.
+    //!
+    //! Each test ran red against the prior Bowyer-Watson + constraint-
+    //! enforcement implementation (the box demo in `quick_demo` produced
+    //! 0 triangles); they pass against the new bridged ear-clipping path.
     use super::*;
-    use crate::primitives::builder::Builder;
+    use crate::math::Point3;
+
+    /// Build a Z-up planar polygon: outer + optional CW holes.
+    fn build_planar_loops(
+        outer: &[(f64, f64)],
+        holes: &[&[(f64, f64)]],
+    ) -> (Vec<Point3>, Vec<(usize, usize, bool)>) {
+        let mut vertices = Vec::new();
+        let mut boundaries = Vec::new();
+        let start = vertices.len();
+        for &(x, y) in outer {
+            vertices.push(Point3::new(x, y, 0.0));
+        }
+        boundaries.push((start, vertices.len(), true));
+        for &hole in holes {
+            let s = vertices.len();
+            for &(x, y) in hole {
+                vertices.push(Point3::new(x, y, 0.0));
+            }
+            boundaries.push((s, vertices.len(), false));
+        }
+        (vertices, boundaries)
+    }
+
+    /// Sum of triangle areas (taken in 2D, ignoring z).
+    fn total_tri_area_xy(vertices: &[Point3], tris: &[[usize; 3]]) -> f64 {
+        tris.iter()
+            .map(|t| {
+                let a = vertices[t[0]];
+                let b = vertices[t[1]];
+                let c = vertices[t[2]];
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() * 0.5
+            })
+            .sum()
+    }
+
+    /// Centroid of a triangle in 2D.
+    fn tri_centroid_xy(vertices: &[Point3], tri: [usize; 3]) -> (f64, f64) {
+        let a = vertices[tri[0]];
+        let b = vertices[tri[1]];
+        let c = vertices[tri[2]];
+        ((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0)
+    }
 
     #[test]
-    fn test_planar_face_tessellation() {
-        let mut builder = Builder::new();
-        let solid_id = builder.box_primitive(1.0, 1.0, 1.0, None).unwrap();
+    fn signed_area_ccw_is_positive() {
+        let v = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let poly: Vec<usize> = (0..v.len()).collect();
+        assert!(polygon_signed_area_2d(&v, &poly) > 0.0);
+    }
 
-        let mut mesh = ThreeJsMesh::new();
-        let params = TessellationParams::default();
+    #[test]
+    fn signed_area_cw_is_negative() {
+        let v = vec![(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+        let poly: Vec<usize> = (0..v.len()).collect();
+        assert!(polygon_signed_area_2d(&v, &poly) < 0.0);
+    }
 
-        // Get first face
-        let solid = builder.model.solids.get(solid_id).unwrap();
-        let shell = builder.model.shells.get(solid.outer_shell).unwrap();
-        if let Some(&face_id) = shell.faces.get(0) {
-            if let Some(face) = builder.model.faces.get(face_id) {
-                tessellate_face(face, &builder.model, &params, &mut mesh);
+    #[test]
+    fn planar_face_simple_quad_ccw() {
+        // 1x1 unit square, CCW. Must produce ≥ 2 tris totalling area 1.
+        let (verts, loops) = build_planar_loops(
+            &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            &[],
+        );
+        let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
+        assert!(tris.len() >= 2, "expected ≥2 tris, got {}", tris.len());
+        let area = total_tri_area_xy(&verts, &tris);
+        assert!(
+            (area - 1.0).abs() < 1e-9,
+            "tri area sum {area} ≠ outer area 1.0"
+        );
+    }
 
-                // A planar face should have at least one triangle
-                assert!(mesh.triangle_count() > 0);
-            }
+    #[test]
+    fn planar_face_simple_quad_cw_input_is_auto_corrected() {
+        // Same square, but CW. Algorithm must shoelace-correct to CCW
+        // before ear-clipping rather than return zero triangles.
+        let (verts, loops) = build_planar_loops(
+            &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            &[],
+        );
+        let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
+        assert!(tris.len() >= 2, "expected ≥2 tris, got {}", tris.len());
+        let area = total_tri_area_xy(&verts, &tris);
+        assert!((area - 1.0).abs() < 1e-9, "tri area sum {area} ≠ 1.0");
+    }
+
+    #[test]
+    fn planar_face_quad_with_square_hole() {
+        // 4x4 outer (CCW), 1x1 hole in middle (CW). Expected face area =
+        // 16 − 1 = 15. Every triangle's centroid must lie outside the hole.
+        let (verts, loops) = build_planar_loops(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            &[&[(1.5, 1.5), (1.5, 2.5), (2.5, 2.5), (2.5, 1.5)]],
+        );
+        let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
+        assert!(
+            tris.len() >= 8,
+            "outer-with-hole should produce ≥8 tris, got {}",
+            tris.len()
+        );
+        let area = total_tri_area_xy(&verts, &tris);
+        assert!(
+            (area - 15.0).abs() < 1e-9,
+            "tri area sum {area} ≠ (outer − hole) 15.0"
+        );
+        for &t in &tris {
+            let (cx, cy) = tri_centroid_xy(&verts, t);
+            let inside_hole = cx > 1.5 && cx < 2.5 && cy > 1.5 && cy < 2.5;
+            assert!(
+                !inside_hole,
+                "triangle centroid ({cx}, {cy}) lies inside hole — bridging failed"
+            );
         }
     }
+
+    #[test]
+    fn planar_face_degenerate_loops_return_empty() {
+        // Outer with only 2 vertices (degenerate). Must produce no tris,
+        // not panic, not produce garbage triangles referencing OOB indices.
+        let (verts, loops) = build_planar_loops(&[(0.0, 0.0), (1.0, 0.0)], &[]);
+        let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
+        assert!(tris.is_empty());
+    }
 }
-*/

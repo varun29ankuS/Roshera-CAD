@@ -602,8 +602,15 @@ fn compute_rolling_ball_positions(
         &edge_tangent,
         &Tolerance::default(),
     )?;
-    if angle < 0.1 {
-        // ~5.7 degrees
+    // `robust_face_angle` returns a signed dihedral in (-π, π]; concave
+    // edges flip its sign. The "near-tangent" condition is when the
+    // surfaces are nearly coplanar, i.e. |angle| close to 0 (or to π for
+    // the antiparallel-normal degeneracy). A 90° convex cube edge yields
+    // ±π/2 and must pass — the previous unsigned-style check rejected
+    // any negative dihedral (e.g. concave fillets) outright.
+    let abs_angle = angle.abs();
+    if abs_angle < 0.1 || (std::f64::consts::PI - abs_angle) < 0.1 {
+        // ~5.7 degrees from coplanar
         return Err(OperationError::InvalidGeometry(
             "Near-tangent surfaces require special handling".to_string(),
         ));

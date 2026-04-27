@@ -103,6 +103,10 @@ pub fn loft_profiles(
         Some(ref corr) => corr.clone(),
         None => establish_correspondence(model, &face_profiles)?,
     };
+    // Densify any profile that returned fewer points than the maximum
+    // (single self-closing edges yield only 1 vertex; mixing those with
+    // polygonal profiles would otherwise fail IncompatibleProfiles).
+    let correspondence = densify_correspondence(model, &face_profiles, correspondence)?;
 
     // Create lofted solid based on type
     let solid_id = match options.loft_type {
@@ -977,7 +981,10 @@ fn compute_planar_surface(
         ));
     }
 
-    // Collect all start-vertex positions in boundary order
+    // Collect all start-vertex positions in boundary order. For self-closing
+    // edges (single edge whose curve closes on itself, e.g. a circle), the
+    // start vertex alone is insufficient — sample interior curve points so
+    // a planar normal can still be derived via Newell's method.
     let mut pts: Vec<Point3> = Vec::with_capacity(edges.len());
     for &eid in edges {
         let edge = model.edges.get(eid).ok_or_else(|| {
@@ -985,12 +992,54 @@ fn compute_planar_surface(
                 "Edge not found in planar surface computation".to_string(),
             )
         })?;
-        let pos = model
+        let start_pos = model
             .vertices
             .get(edge.start_vertex)
             .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
             .position;
-        pts.push(Point3::new(pos[0], pos[1], pos[2]));
+        pts.push(Point3::new(start_pos[0], start_pos[1], start_pos[2]));
+
+        // Detect closed-curve edge: vertex coincidence OR curve start/end
+        // position coincidence (transformed circles get distinct VertexIds
+        // even when the source curve closes on itself).
+        let curve_id = edge.curve_id;
+        let curve = model.curves.get(curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "Edge curve not found in planar surface computation".to_string(),
+            )
+        })?;
+        let (lo, hi) = (edge.param_range.start, edge.param_range.end);
+        let curve_closes = if edge.start_vertex == edge.end_vertex {
+            true
+        } else {
+            match (curve.evaluate(lo), curve.evaluate(hi)) {
+                (Ok(a), Ok(b)) => {
+                    let ax = a.position;
+                    let bx = b.position;
+                    let dx = ax[0] - bx[0];
+                    let dy = ax[1] - bx[1];
+                    let dz = ax[2] - bx[2];
+                    (dx * dx + dy * dy + dz * dz) < 1e-12
+                }
+                _ => false,
+            }
+        };
+
+        if curve_closes {
+            // Sample 3 interior points so Newell's method has a well-defined
+            // polygon. Direction respects edge orientation.
+            let fractions = match edge.orientation {
+                EdgeOrientation::Forward => [0.25_f64, 0.5, 0.75],
+                EdgeOrientation::Backward => [0.75_f64, 0.5, 0.25],
+            };
+            for &f in &fractions {
+                let t = lo + (hi - lo) * f;
+                if let Ok(cp) = curve.evaluate(t) {
+                    let p = cp.position;
+                    pts.push(Point3::new(p[0], p[1], p[2]));
+                }
+            }
+        }
     }
 
     let n = pts.len();
@@ -1100,6 +1149,104 @@ fn create_reversed_face(model: &mut BRepModel, face_id: &FaceId) -> OperationRes
 }
 
 /// Establish vertex correspondence between profiles
+/// Resample profiles so all share a common vertex count. Required when the
+/// input profiles include both polygonal faces (n vertices) and self-closing
+/// curve faces (1 vertex per edge — typical for circles/ellipses).
+///
+/// Algorithm: target = max(profile counts, 8). For each profile that already
+/// matches the target, keep it. Otherwise walk its outer loop, distribute
+/// `target` parameter-uniform samples across the edges (rounding up so the
+/// per-edge counts cover the target), evaluate the curves at those params,
+/// and emit fresh vertices into the model.
+fn densify_correspondence(
+    model: &mut BRepModel,
+    profiles: &[FaceId],
+    correspondence: Vec<Vec<VertexId>>,
+) -> OperationResult<Vec<Vec<VertexId>>> {
+    let target = correspondence
+        .iter()
+        .map(|v| v.len())
+        .max()
+        .unwrap_or(1)
+        .max(8);
+
+    if correspondence.iter().all(|v| v.len() == target) {
+        return Ok(correspondence);
+    }
+
+    let mut out: Vec<Vec<VertexId>> = Vec::with_capacity(profiles.len());
+    for (i, &face_id) in profiles.iter().enumerate() {
+        if correspondence[i].len() == target {
+            out.push(correspondence[i].clone());
+            continue;
+        }
+
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
+            .clone();
+        let loop_data = model
+            .loops
+            .get(face.outer_loop)
+            .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
+            .clone();
+
+        let n_edges = loop_data.edges.len();
+        if n_edges == 0 {
+            return Err(OperationError::InvalidGeometry(
+                "Profile loop has no edges".to_string(),
+            ));
+        }
+
+        // Distribute target samples across edges; first `extra` edges get +1
+        // so total exactly equals target.
+        let per_edge = target / n_edges;
+        let extra = target - per_edge * n_edges;
+
+        let mut samples: Vec<(crate::primitives::curve::CurveId, f64)> =
+            Vec::with_capacity(target);
+        for (j, &edge_id) in loop_data.edges.iter().enumerate() {
+            let edge = model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+            let forward = loop_data.orientations[j];
+            let lo = edge.param_range.start;
+            let hi = edge.param_range.end;
+            let count = per_edge + if j < extra { 1 } else { 0 };
+            for k in 0..count {
+                let frac = k as f64 / count as f64;
+                let t = if forward {
+                    lo + (hi - lo) * frac
+                } else {
+                    hi - (hi - lo) * frac
+                };
+                samples.push((edge.curve_id, t));
+            }
+        }
+
+        // Evaluate curves and create vertices.
+        let mut new_verts: Vec<VertexId> = Vec::with_capacity(samples.len());
+        for (curve_id, t) in samples {
+            let curve = model.curves.get(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Curve not found".to_string())
+            })?;
+            let cp = curve.evaluate(t).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "Curve evaluation failed during loft densification: {:?}",
+                    e
+                ))
+            })?;
+            let p = cp.position;
+            let new_id = model.vertices.add(p.x, p.y, p.z);
+            new_verts.push(new_id);
+        }
+        out.push(new_verts);
+    }
+    Ok(out)
+}
+
 fn establish_correspondence(
     model: &BRepModel,
     profiles: &[FaceId],
@@ -1116,14 +1263,9 @@ fn establish_correspondence(
         correspondence.push(vertices);
     }
 
-    // Verify all profiles have same number of vertices
-    let vertex_count = correspondence[0].len();
-    for vertices in &correspondence {
-        if vertices.len() != vertex_count {
-            return Err(OperationError::IncompatibleProfiles);
-        }
-    }
-
+    // Mismatched profile counts are tolerated here: callers run
+    // `densify_correspondence` to resample every profile to a uniform
+    // target count before consuming the correspondence.
     Ok(correspondence)
 }
 

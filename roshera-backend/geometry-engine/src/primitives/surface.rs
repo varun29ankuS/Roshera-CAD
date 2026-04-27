@@ -4043,6 +4043,18 @@ impl SurfaceStore {
         self.surfaces.is_empty()
     }
 
+    /// Iterate over `(id, &dyn Surface)` pairs in insertion order.
+    ///
+    /// Mirrors `CurveStore::iter` and is used by serialization/timeline
+    /// crates that need to walk every surface in a model.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (SurfaceId, &dyn Surface)> {
+        self.surfaces
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as SurfaceId, s.as_ref()))
+    }
+
     /// Clone a surface by ID and add it to this store
     pub fn clone_surface(&mut self, id: SurfaceId) -> Option<SurfaceId> {
         if let Some(surface) = self.get(id) {

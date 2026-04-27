@@ -34,7 +34,6 @@ pub mod imprint;
 pub mod intersect;
 pub mod project;
 pub mod sew;
-pub mod split;
 
 // Internal helpers for boolean face splitting (DCEL-based planar arrangement).
 // Not part of the public API — used by `boolean::split_face_by_curves` only.
