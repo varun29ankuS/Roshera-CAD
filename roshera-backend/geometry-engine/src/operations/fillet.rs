@@ -1823,19 +1823,3 @@ fn validate_fillet_parameters(
     Ok(())
 }
 
-/// Placeholder for fillet surface type
-#[derive(Debug, Clone)]
-pub struct FilletSurface {
-    pub edge: EdgeId,
-    pub radius: f64,
-}
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_fillet_validation() {
-//         // Test validation of fillet parameters
-//     }
-// }
