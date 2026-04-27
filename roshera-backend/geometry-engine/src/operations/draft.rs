@@ -17,7 +17,7 @@ use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
     edge::{Edge, EdgeId, EdgeOrientation},
-    face::{Face, FaceId, FaceOrientation},
+    face::{Face, FaceId},
     r#loop::Loop,
     solid::SolidId,
     surface::Surface,
@@ -128,8 +128,6 @@ pub enum DraftIntersectionHandling {
     Extend,
     /// Trim at intersection
     Trim,
-    /// Blend intersections
-    Blend,
 }
 
 /// Apply draft to faces
@@ -723,7 +721,6 @@ fn handle_draft_intersections(
     match options.intersection_handling {
         DraftIntersectionHandling::Extend => extend_drafted_faces(model, drafted_faces),
         DraftIntersectionHandling::Trim => trim_drafted_faces(model, drafted_faces),
-        DraftIntersectionHandling::Blend => blend_drafted_faces(model, drafted_faces),
     }
 }
 
@@ -793,45 +790,6 @@ fn trim_drafted_faces(model: &mut BRepModel, faces: &[FaceId]) -> OperationResul
             // Trim both faces at the intersection curve
             trim_face_at_curve(model, faces[i], &intersection_curve)?;
             trim_face_at_curve(model, faces[j], &intersection_curve)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Blend drafted face intersections
-fn blend_drafted_faces(model: &mut BRepModel, faces: &[FaceId]) -> OperationResult<()> {
-    // Create blend surfaces at face intersections
-    for i in 0..faces.len() {
-        for j in i + 1..faces.len() {
-            let face1 = model
-                .faces
-                .get(faces[i])
-                .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
-            let face2 = model
-                .faces
-                .get(faces[j])
-                .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
-
-            // Check if faces are adjacent
-            if are_faces_adjacent(model, faces[i], faces[j])? {
-                // Create blend surface between the faces
-                let blend_surface = create_blend_surface_between_faces(model, face1, face2)?;
-                let blend_surface_id = model.surfaces.add(blend_surface);
-
-                // Create blend face with appropriate loop
-                let blend_loop = create_blend_loop(model, faces[i], faces[j])?;
-                let blend_loop_id = model.loops.add(blend_loop);
-
-                let blend_face = Face::new(
-                    0, // Temporary ID
-                    blend_surface_id,
-                    blend_loop_id,
-                    FaceOrientation::Forward,
-                );
-
-                model.faces.add(blend_face);
-            }
         }
     }
 
@@ -1536,113 +1494,6 @@ fn trim_face_at_curve(
          face boundary left untrimmed"
     );
     Ok(())
-}
-
-/// Check if two faces are adjacent
-fn are_faces_adjacent(
-    model: &BRepModel,
-    face_id1: FaceId,
-    face_id2: FaceId,
-) -> OperationResult<bool> {
-    let face1 = model
-        .faces
-        .get(face_id1)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
-    let face2 = model
-        .faces
-        .get(face_id2)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
-
-    // Get loops
-    let loop1 = model
-        .loops
-        .get(face1.outer_loop)
-        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
-    let loop2 = model
-        .loops
-        .get(face2.outer_loop)
-        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
-
-    // Check if loops share any edges
-    for &edge1 in &loop1.edges {
-        for &edge2 in &loop2.edges {
-            if edge1 == edge2 {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-/// Create blend surface between two faces
-fn create_blend_surface_between_faces(
-    model: &BRepModel,
-    face1: &Face,
-    face2: &Face,
-) -> OperationResult<Box<dyn Surface>> {
-    // Create a simple cylindrical blend surface
-    // In practice, this would be much more sophisticated
-    use crate::primitives::surface::Plane;
-
-    let surface1 = model
-        .surfaces
-        .get(face1.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
-    let surface2 = model
-        .surfaces
-        .get(face2.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
-
-    // For simplicity, create a plane between the two surfaces
-    if let (Some(plane1), Some(plane2)) = (
-        surface1.as_any().downcast_ref::<Plane>(),
-        surface2.as_any().downcast_ref::<Plane>(),
-    ) {
-        let origin1 = plane1.origin;
-        let origin2 = plane2.origin;
-        let normal1 = plane1.normal;
-        let normal2 = plane2.normal;
-
-        // Create blend normal as average of the two normals
-        let blend_normal = (normal1 + normal2).normalize().unwrap_or(Vector3::Z);
-        let blend_origin = (origin1 + origin2) / 2.0;
-
-        let blend_plane = Plane::from_point_normal(blend_origin, blend_normal)?;
-        return Ok(Box::new(blend_plane));
-    }
-
-    // Fallback to XY plane
-    Ok(Box::new(Plane::xy(0.0)))
-}
-
-/// Create blend loop between two faces.
-///
-/// Returns an empty outer loop today — the blend topology is generated
-/// elsewhere (see `blend.rs`). This validator-style stub exists so the
-/// draft pipeline has a uniform "ask for a blend loop" hook; we still
-/// confirm both faces exist so callers operating on stale IDs fail
-/// loudly instead of silently receiving an empty loop.
-fn create_blend_loop(
-    model: &BRepModel,
-    face_id1: FaceId,
-    face_id2: FaceId,
-) -> OperationResult<Loop> {
-    use crate::primitives::r#loop::{Loop, LoopType};
-
-    if model.faces.get(face_id1).is_none() {
-        return Err(OperationError::InvalidGeometry(format!(
-            "create_blend_loop: face {} missing",
-            face_id1
-        )));
-    }
-    if model.faces.get(face_id2).is_none() {
-        return Err(OperationError::InvalidGeometry(format!(
-            "create_blend_loop: face {} missing",
-            face_id2
-        )));
-    }
-    Ok(Loop::new(0, LoopType::Outer))
 }
 
 /// Validate drafted solid via the kernel's parallel B-Rep validator.

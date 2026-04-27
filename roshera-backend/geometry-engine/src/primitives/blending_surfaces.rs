@@ -294,7 +294,7 @@ impl std::fmt::Debug for VariableG2Blend {
 }
 
 /// Quality metrics for blending surface assessment
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlendingQuality {
     /// G0 continuity error (maximum position deviation)
     pub g0_error: f64,

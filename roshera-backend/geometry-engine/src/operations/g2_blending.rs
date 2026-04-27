@@ -255,21 +255,14 @@ impl G2BlendingOperations {
             control_points[2][j] = cp_rowm[j] + q_rowm1[j];
         }
 
-        let placeholder_quality = BlendingQuality {
-            g0_error: 0.0,
-            g1_error: 0.0,
-            g2_error: 0.0,
-            quality_score: 0.0,
-            optimization_iterations: 0,
-            converged: true,
-        };
+        // Initial quality is overwritten below by measure_blend_continuity.
         let mut blend = CubicG2Blend {
             control_points,
             weights: [[1.0; 4]; 4],
             param_bounds: [0.0, 1.0, 0.0, 1.0],
             boundary1_params: [0.0, 1.0],
             boundary2_params: [0.0, 1.0],
-            quality_metrics: placeholder_quality,
+            quality_metrics: BlendingQuality::default(),
         };
 
         // Measure continuity honestly against the parent surfaces.
@@ -327,27 +320,19 @@ impl G2BlendingOperations {
             control_points[2][j] = (p2_side1 + p2_side2) * 0.5;
         }
 
-        let placeholder_quality = BlendingQuality {
-            g0_error: 0.0,
-            g1_error: 0.0,
-            g2_error: 0.0,
-            quality_score: 0.0,
-            optimization_iterations: 0,
-            converged: true,
-        };
-
         // Curvature constraints are expressed as zero-K targets at
         // Bernstein abscissae along both boundaries; store them for
         // introspection rather than re-solve.
         let curvature_constraints = build_curvature_constraints(&samples, degree);
 
+        // Initial quality is overwritten below by measure_blend_continuity.
         let mut blend = QuarticG2Blend {
             control_points,
             weights: [[1.0; 5]; 5],
             param_bounds: [0.0, 1.0, 0.0, 1.0],
             twist_factors: [[0.0; 5]; 5],
             curvature_constraints,
-            quality_metrics: placeholder_quality,
+            quality_metrics: BlendingQuality::default(),
         };
 
         let measured = measure_blend_continuity(
@@ -599,9 +584,10 @@ fn solve_bernstein_vectors(
         .collect())
 }
 
-/// Build placeholder curvature constraints annotating the construction.
-/// These are informational: the actual G2 targets (zero K) are baked into
-/// the row-2 computation.
+/// Build informational curvature-constraint annotations describing the
+/// G2 targets (zero principal curvature) imposed at each Bernstein abscissa.
+/// The actual targets are baked into the row-2 control-point computation
+/// above; these records expose them for introspection and serialization.
 fn build_curvature_constraints(
     samples: &BoundarySamples,
     degree: usize,
