@@ -784,9 +784,25 @@ fn create_or_find_edge(
     start: VertexId,
     end: VertexId,
 ) -> OperationResult<EdgeId> {
-    // In a complete implementation, would check if edge already exists
-    // For now, always create new edge
     use crate::primitives::curve::Line;
+
+    // Reuse an existing straight edge between the same two vertices if one
+    // is already in the store (in either direction). Loft generates many
+    // shared rails and rungs; without this dedup we'd produce parallel
+    // duplicate edges that break face-edge incidence.
+    for (existing_id, existing_edge) in model.edges.iter() {
+        if (existing_edge.start_vertex == start && existing_edge.end_vertex == end)
+            || (existing_edge.start_vertex == end && existing_edge.end_vertex == start)
+        {
+            // Only reuse straight-line edges; lofted rungs are always lines
+            // here, so a stored Line carrying the same endpoints is exact.
+            if let Some(curve) = model.curves.get(existing_edge.curve_id) {
+                if curve.as_any().is::<Line>() {
+                    return Ok(existing_id);
+                }
+            }
+        }
+    }
 
     let start_vertex = model
         .vertices

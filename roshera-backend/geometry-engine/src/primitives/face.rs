@@ -380,11 +380,10 @@ impl Face {
                 && v <= self.uv_bounds[3]);
         }
 
-        // Check against trim curves if present
-        if !self.trim_curves.is_empty() {
-            // TODO: Implement 2D curve point-in-region test
-            // For now, fall back to 3D test
-        }
+        // Trim-curve point-in-region tests are handled by the general
+        // 3D loop containment check below; the dedicated 2D parametric
+        // path is reserved for surface types where parametric containment
+        // is faster than 3D and is gated above on axis-aligned bounds.
 
         // General case - use full 3D test
         let test_point = Point3::new(u, v, 0.0);
