@@ -397,9 +397,19 @@ impl ToroidalFillet {
             ));
         }
 
-        // Compute major radius from center curve
-        // This is simplified - real implementation would compute from edge geometry
-        let major_radius = 10.0; // Placeholder
+        // Estimate the major radius (osculating-circle radius) from three
+        // samples on the spine: u = 0, 0.5, 1. For a true circular spine
+        // this is exact; for a generally curved spine it gives the local
+        // osculating radius near the midpoint, which is the right scale
+        // for the principal-curvature reporting in evaluate_full.
+        let p_range = center_curve.parameter_range();
+        let u0 = p_range.start;
+        let u_mid = (p_range.start + p_range.end) * 0.5;
+        let u1 = p_range.end;
+        let p0 = center_curve.evaluate(u0)?.position;
+        let p1 = center_curve.evaluate(u_mid)?.position;
+        let p2 = center_curve.evaluate(u1)?.position;
+        let major_radius = circumscribed_radius(p0, p1, p2).unwrap_or(f64::INFINITY);
 
         Ok(Self {
             major_radius,
@@ -410,6 +420,20 @@ impl ToroidalFillet {
             contact2,
         })
     }
+}
+
+/// Radius of the unique circle through three points in 3D, or `None` if
+/// the points are colinear (no finite circumscribed circle).
+fn circumscribed_radius(p0: Point3, p1: Point3, p2: Point3) -> Option<f64> {
+    let a = (p1 - p0).magnitude();
+    let b = (p2 - p1).magnitude();
+    let c = (p0 - p2).magnitude();
+    let cross = (p1 - p0).cross(&(p2 - p0));
+    let twice_area = cross.magnitude();
+    if twice_area < 1e-30 {
+        return None;
+    }
+    Some(a * b * c / (2.0 * twice_area))
 }
 
 impl Surface for ToroidalFillet {
@@ -444,10 +468,12 @@ impl Surface for ToroidalFillet {
         // Map v to angle range
         let angle = self.angle_bounds.0 + v * (self.angle_bounds.1 - self.angle_bounds.0);
 
-        // Position on torus
-        let tube_center = center + x_axis * self.major_radius;
+        // The spine IS the tube center: a fillet of constant radius around a
+        // curved edge is a tube swept along the spine, not a torus offset
+        // along x_axis. major_radius is retained only for the principal-
+        // curvature formula (k2) below.
         let radial = x_axis * angle.cos() + y_axis * angle.sin();
-        let position = tube_center + radial * self.minor_radius;
+        let position = center + radial * self.minor_radius;
 
         // Derivatives
         let du = center_tangent;

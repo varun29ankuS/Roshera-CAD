@@ -668,13 +668,16 @@ fn handle_chamfer_vertices(
     // This is deferred to a follow-up since it requires face-splitting
     // infrastructure that's not yet robust enough.
 
-    // For now, verify that vertex connectivity is maintained
-    for incident_edges in vertex_edges.values() {
-        if incident_edges.len() >= 3 {
-            // Three or more chamfered edges meeting at a vertex — complex case
-            // Log but don't fail; the chamfer faces are still valid individually
-            continue;
-        }
+    // Three-or-more chamfered edges meeting at a single vertex (e.g. all
+    // three box-corner edges chamfered simultaneously) are not stitched
+    // here — the chamfer faces remain valid individually and the
+    // surrounding topology is left to the caller's mesh-repair pass. We
+    // do not silently fail or fabricate a corner triangle.
+    if vertex_edges.values().any(|edges| edges.len() >= 3) {
+        tracing::debug!(
+            "chamfer: corner-vertex with 3+ chamfered edges encountered; \
+             corner fill face is not synthesized in this pass"
+        );
     }
 
     Ok(())
