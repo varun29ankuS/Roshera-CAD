@@ -1244,23 +1244,26 @@ impl NurbsSurface {
         Self::new(2, 1, control_points, weights, knots_u, knots_v)
     }
 
-    /// Evaluate NURBS surface at parameter
+    /// Evaluate NURBS surface at parameter using rational quotient rule.
+    ///
+    /// Implements Piegl & Tiller, *The NURBS Book* §4.5, Algorithm A4.4:
+    /// build weighted-control-point sums Aw[k][l] (in 3D) and weight sums
+    /// W[k][l] (scalar) for k+l ≤ 2, then apply the quotient rule to recover
+    /// position and first/second partial derivatives of the rational surface.
     pub fn evaluate(&self, param: Parameter2D) -> MathResult<SurfacePoint> {
         let param = self.bspline.domain.clamp(param);
 
-        // Find spans
         let span_u = self.bspline.find_span_u(param.u);
         let span_v = self.bspline.find_span_v(param.v);
 
-        // Get basis functions with derivatives
-        let _ders_u = self.bspline.basis_derivatives(
+        let ders_u = self.bspline.basis_derivatives(
             &self.bspline.knots_u,
             self.bspline.degree_u,
             span_u,
             param.u,
             2,
         );
-        let _ders_v = self.bspline.basis_derivatives(
+        let ders_v = self.bspline.basis_derivatives(
             &self.bspline.knots_v,
             self.bspline.degree_v,
             span_v,
@@ -1268,13 +1271,95 @@ impl NurbsSurface {
             2,
         );
 
-        // Compute weighted sums (rational surface evaluation)
-        // This follows the same pattern as NURBS curves but in 2D
+        // Aw[k][l] = Σ_{i,j} N_u^(k)(i) · N_v^(l)(j) · w_ij · P_ij  (Vector3)
+        // W [k][l] = Σ_{i,j} N_u^(k)(i) · N_v^(l)(j) · w_ij           (scalar)
+        let mut aw = [[Vector3::ZERO; 3]; 3];
+        let mut w = [[0.0f64; 3]; 3];
 
-        // ... (implementation details for rational surface evaluation)
+        let max_du = ders_u.len().min(3);
+        let max_dv = ders_v.len().min(3);
 
-        // For now, return non-rational result
-        self.bspline.evaluate(param)
+        for l in 0..=self.bspline.degree_v {
+            // Per-row partial sums in u, weighted by w_ij·P_ij and w_ij.
+            let mut row_aw = [Vector3::ZERO; 3];
+            let mut row_w = [0.0f64; 3];
+
+            for k_u in 0..=self.bspline.degree_u {
+                let idx_u = span_u - self.bspline.degree_u + k_u;
+                let idx_v = span_v - self.bspline.degree_v + l;
+                let p = self.bspline.control_points[idx_v][idx_u];
+                let wij = self.weights[idx_v][idx_u];
+                let pw = Vector3::new(p.x * wij, p.y * wij, p.z * wij);
+
+                for du_order in 0..max_du {
+                    let n = ders_u[du_order][k_u];
+                    row_aw[du_order] += pw * n;
+                    row_w[du_order] += wij * n;
+                }
+            }
+
+            // Combine with v-basis derivatives.
+            for dv_order in 0..max_dv {
+                let m = ders_v[dv_order][l];
+                for du_order in 0..max_du {
+                    aw[du_order][dv_order] += row_aw[du_order] * m;
+                    w[du_order][dv_order] += row_w[du_order] * m;
+                }
+            }
+        }
+
+        let w00 = w[0][0];
+        if w00.abs() < 1e-30 {
+            return Err(MathError::DegenerateGeometry(
+                "NURBS surface weight sum is zero — degenerate weights".to_string(),
+            ));
+        }
+        let inv_w = 1.0 / w00;
+
+        // Position: S = Aw[0][0] / W[0][0]
+        let s_vec = aw[0][0] * inv_w;
+        let position = Point3::new(s_vec.x, s_vec.y, s_vec.z);
+
+        // First derivatives: S_u = (Aw_u - W_u·S) / W
+        let s_u = if max_du > 1 {
+            (aw[1][0] - s_vec * w[1][0]) * inv_w
+        } else {
+            Vector3::ZERO
+        };
+        let s_v = if max_dv > 1 {
+            (aw[0][1] - s_vec * w[0][1]) * inv_w
+        } else {
+            Vector3::ZERO
+        };
+
+        // Second derivatives:
+        //   S_uu = (Aw_uu - 2·W_u·S_u - W_uu·S) / W
+        //   S_uv = (Aw_uv -   W_u·S_v - W_v·S_u - W_uv·S) / W
+        //   S_vv = (Aw_vv - 2·W_v·S_v - W_vv·S) / W
+        let s_uu = if max_du > 2 {
+            Some((aw[2][0] - s_u * (2.0 * w[1][0]) - s_vec * w[2][0]) * inv_w)
+        } else {
+            None
+        };
+        let s_uv = if max_du > 1 && max_dv > 1 {
+            Some((aw[1][1] - s_v * w[1][0] - s_u * w[0][1] - s_vec * w[1][1]) * inv_w)
+        } else {
+            None
+        };
+        let s_vv = if max_dv > 2 {
+            Some((aw[0][2] - s_v * (2.0 * w[0][1]) - s_vec * w[0][2]) * inv_w)
+        } else {
+            None
+        };
+
+        Ok(SurfacePoint {
+            position,
+            du: s_u,
+            dv: s_v,
+            duu: s_uu,
+            duv: s_uv,
+            dvv: s_vv,
+        })
     }
 }
 

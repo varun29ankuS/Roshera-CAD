@@ -291,21 +291,17 @@ impl Plane {
         Some(point)
     }
 
-    /// Create a transformed plane
+    /// Create a transformed plane.
     ///
-    /// Note: The transformation matrix should have uniform scale for correct results.
+    /// Normals transform by the inverse-transpose of the upper-left 3×3 of
+    /// the transformation matrix; this preserves perpendicularity under
+    /// non-uniform scale and shear. `Matrix4::transform_normal` performs
+    /// this calculation via the cofactor matrix, which keeps the operation
+    /// numerically stable for ill-conditioned but non-singular transforms.
     pub fn transform(&self, matrix: &super::Matrix4) -> MathResult<Self> {
-        // Transform a point on the plane
         let point = self.point_on_plane();
         let transformed_point = matrix.transform_point(&point);
-
-        // Transform the normal using the inverse transpose
-        // For now, we'll use the transpose of the upper-left 3x3
-        // This is correct for orthogonal transformations
-        let normal_transform = super::Matrix3::from_matrix4(matrix).transpose();
-        let transformed_normal = normal_transform
-            .transform_vector(&self.normal)
-            .normalize()?;
+        let transformed_normal = matrix.transform_normal(&self.normal)?.normalize()?;
 
         Self::from_normal_and_point(&transformed_normal, &transformed_point)
     }
