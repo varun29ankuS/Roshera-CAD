@@ -488,18 +488,6 @@ impl Polyline2d {
         }
     }
 
-    /// Offset the polyline by a given distance
-    pub fn offset(&self, distance: f64) -> Sketch2dResult<Vec<Self>> {
-        if distance.abs() < STRICT_TOLERANCE.distance() {
-            return Ok(vec![self.clone()]);
-        }
-
-        // Complex offset algorithm would go here
-        // For now, return error indicating not implemented
-        Err(Sketch2dError::NumericalError {
-            description: "Polyline offset requires complex algorithm implementation".to_string(),
-        })
-    }
 }
 
 /// A parametric polyline entity with constraint tracking

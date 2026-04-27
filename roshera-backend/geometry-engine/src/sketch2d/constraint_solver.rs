@@ -69,6 +69,14 @@ pub enum EntityUpdate {
     Circle(Point2d, f64),
     /// Updated rectangle parameters (center, width, height, rotation)
     Rectangle(Point2d, f64, f64, f64),
+    /// Updated ellipse parameters (center, semi_major, semi_minor, rotation)
+    Ellipse(Point2d, f64, f64, f64),
+    /// Raw parameter vector for entities with variable degree of freedom
+    /// (splines, polylines). Layout is entity-specific and matches the
+    /// solver's internal `EntityState::parameters` order: for a spline,
+    /// pairs of (x, y) per control point; for a polyline, pairs of (x, y)
+    /// per vertex.
+    Parameters(Vec<f64>),
 }
 
 /// Constraint solver
@@ -769,17 +777,14 @@ impl ConstraintSolver {
                     state.parameters[3],
                     state.parameters[4],
                 ),
-                EntityRef::Ellipse(_) => {
-                    // For now, return point update as placeholder
-                    EntityUpdate::Point(Point2d::new(state.parameters[0], state.parameters[1]))
-                }
-                EntityRef::Spline(_) => {
-                    // For now, return point update as placeholder
-                    EntityUpdate::Point(Point2d::new(state.parameters[0], state.parameters[1]))
-                }
-                EntityRef::Polyline(_) => {
-                    // For now, return point update as placeholder
-                    EntityUpdate::Point(Point2d::new(state.parameters[0], state.parameters[1]))
+                EntityRef::Ellipse(_) => EntityUpdate::Ellipse(
+                    Point2d::new(state.parameters[0], state.parameters[1]),
+                    state.parameters[2],
+                    state.parameters[3],
+                    state.parameters[4],
+                ),
+                EntityRef::Spline(_) | EntityRef::Polyline(_) => {
+                    EntityUpdate::Parameters(state.parameters.clone())
                 }
             };
 
@@ -998,17 +1003,18 @@ impl ConstraintSolver {
         }
     }
 
-    /// Evaluate G2 continuity (curvature continuity)
+    /// Evaluate G2 continuity (curvature continuity).
+    /// Returns the scalar curvature mismatch κ₁ − κ₂ at the join. G2 holds
+    /// when this residual is zero. Higher-order terms (G3, G4...) are out
+    /// of scope for the 2D constraint solver.
     fn evaluate_g2_continuity(&self, curve1: &EntityRef, curve2: &EntityRef) -> Vec<f64> {
-        // Get curvature at connection point
         if let (Some(k1), Some(k2)) = (
             self.get_curve_curvature_at_end(curve1),
             self.get_curve_curvature_at_start(curve2),
         ) {
-            // Curvatures should match
-            vec![k1 - k2, 0.0, 0.0] // Placeholder for higher order terms
+            vec![k1 - k2]
         } else {
-            vec![0.0, 0.0, 0.0]
+            vec![0.0]
         }
     }
 
@@ -1032,7 +1038,8 @@ impl ConstraintSolver {
     }
 
     fn get_line_start(&self, entity: &EntityRef) -> Option<Point2d> {
-        // For now, use line point as start
+        // Lines in this solver are parameterized as (point, direction); the
+        // anchored point is the start.
         self.get_line_point(entity)
     }
 

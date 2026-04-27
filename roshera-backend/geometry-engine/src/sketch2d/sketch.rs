@@ -17,10 +17,10 @@ use super::polyline2d::ParametricPolyline2d;
 use super::rectangle2d::ParametricRectangle2d;
 use super::spline2d::{BSpline2d, ParametricSpline2d};
 use super::{
-    Arc2d, Arc2dId, Circle2d, Circle2dId, Constraint, ConstraintId, ConstraintSolver, Ellipse2d,
-    Ellipse2dId, Line2d, Line2dId, LineSegment2d, Point2d, Point2dId, Polyline2d, Polyline2dId,
-    Rectangle2d, Rectangle2dId, Sketch2dError, Sketch2dResult, SketchPlane, SolverResult,
-    SolverStatus, Spline2d, Spline2dId, Tolerance2d, Vector2d,
+    Arc2d, Arc2dId, Circle2d, Circle2dId, Constraint, ConstraintId, Ellipse2d, Ellipse2dId,
+    Line2d, Line2dId, LineSegment2d, Point2d, Point2dId, Polyline2d, Polyline2dId, Rectangle2d,
+    Rectangle2dId, Sketch2dError, Sketch2dResult, SketchPlane, Spline2d, Spline2dId, Tolerance2d,
+    Vector2d,
 };
 use crate::sketch2d::SketchEntity2d;
 use dashmap::DashMap;
@@ -545,28 +545,6 @@ impl Sketch {
     /// Get constraints by entity
     pub fn get_constraints_by_entity(&self, entity: &EntityRef) -> Vec<Constraint> {
         self.constraints.get_entity_constraints(entity)
-    }
-
-    /// Solve all constraints in the sketch
-    pub fn solve_constraints(&self) -> SolverResult {
-        let mut solver = ConstraintSolver::new();
-
-        // Add all entities to the solver
-        // This would involve converting sketch entities to solver format
-
-        // Set constraints
-        solver.set_constraints(self.all_constraints());
-
-        // Solve
-        let result = solver.solve();
-
-        // Apply results back to sketch entities
-        if matches!(result.status, SolverStatus::Converged { .. }) {
-            // Update entity positions based on solver results
-            // This would involve applying entity_updates from result
-        }
-
-        result
     }
 
     // Delete operations

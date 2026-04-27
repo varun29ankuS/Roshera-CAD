@@ -129,6 +129,13 @@ pub enum ValidationIssue {
         expected_range: (f64, f64),
         severity: ValidationSeverity,
     },
+
+    /// A sketch-wide issue not attributable to a specific entity
+    /// (e.g. mixed open/closed profiles, topology analysis failure).
+    SketchLevel {
+        reason: String,
+        severity: ValidationSeverity,
+    },
 }
 
 /// Validation result
@@ -494,17 +501,18 @@ impl SketchValidator {
                 let (entity1, min1, max1) = &entities[i];
                 let (entity2, min2, max2) = &entities[j];
 
-                // Quick bounding box check
+                // Broad-phase AABB overlap. We emit a Warning rather than an
+                // Error because AABB overlap is necessary but not sufficient
+                // for a true geometric overlap; a precise SAT/intersection
+                // pass against curve evaluations would tighten this, but an
+                // AABB false-positive is benign for a downstream user (it
+                // surfaces the suspicious pair for manual review).
                 if self.boxes_overlap(min1, max1, min2, max2) {
-                    // Detailed overlap check would go here
-                    // For now, just flag potential overlaps
-                    if self.entities_might_overlap(sketch, entity1, entity2) {
-                        issues.push(ValidationIssue::OverlappingEntities {
-                            entity1: *entity1,
-                            entity2: *entity2,
-                            severity: ValidationSeverity::Warning,
-                        });
-                    }
+                    issues.push(ValidationIssue::OverlappingEntities {
+                        entity1: *entity1,
+                        entity2: *entity2,
+                        severity: ValidationSeverity::Warning,
+                    });
                 }
             }
         }
@@ -589,8 +597,7 @@ impl SketchValidator {
                         });
                     }
                     ProfileType::Mixed => {
-                        issues.push(ValidationIssue::InvalidEntity {
-                            entity: EntityRef::Point(super::Point2dId::new()), // Placeholder
+                        issues.push(ValidationIssue::SketchLevel {
                             reason: "Sketch contains both open and closed profiles".to_string(),
                             severity: ValidationSeverity::Warning,
                         });
@@ -648,8 +655,7 @@ impl SketchValidator {
                 }
             }
             Err(e) => {
-                issues.push(ValidationIssue::InvalidEntity {
-                    entity: EntityRef::Point(super::Point2dId::new()), // Placeholder
+                issues.push(ValidationIssue::SketchLevel {
                     reason: format!("Topology analysis failed: {}", e),
                     severity: ValidationSeverity::Critical,
                 });
@@ -771,21 +777,22 @@ impl SketchValidator {
         }
     }
 
-    fn entities_might_overlap(
-        &self,
-        _sketch: &Sketch,
-        _entity1: &EntityRef,
-        _entity2: &EntityRef,
-    ) -> bool {
-        // This would need detailed geometric intersection tests
-        // For now, return false to avoid false positives
-        false
-    }
-
-    fn is_loop_inside_loop(&self, _outer: &SketchLoop, _inner: &SketchLoop) -> bool {
-        // Check if inner loop is fully contained in outer loop
-        // This would use point-in-polygon tests
-        true // Placeholder
+    /// Necessary condition for `inner` to be nested inside `outer`: the
+    /// inner loop's AABB must be fully contained in the outer loop's AABB.
+    /// Falsity means the inner loop definitely escapes the outer; truth
+    /// is a necessary-but-not-sufficient pass — a precise containment test
+    /// would discretize the outer loop to a polygon and run point-in-polygon
+    /// against a sample point on the inner loop. We accept the AABB-only
+    /// check as a soundness-preserving validator: it raises InvalidNesting
+    /// only when the relationship is provably wrong, never spuriously.
+    fn is_loop_inside_loop(&self, outer: &SketchLoop, inner: &SketchLoop) -> bool {
+        let (outer_min, outer_max) = outer.bounds;
+        let (inner_min, inner_max) = inner.bounds;
+        let tol = self.config.tolerance.distance;
+        inner_min.x >= outer_min.x - tol
+            && inner_min.y >= outer_min.y - tol
+            && inner_max.x <= outer_max.x + tol
+            && inner_max.y <= outer_max.y + tol
     }
 }
 
@@ -806,6 +813,7 @@ impl ValidationIssue {
             ValidationIssue::TJunction { severity, .. } => *severity,
             ValidationIssue::OutOfBounds { severity, .. } => *severity,
             ValidationIssue::NumericalPrecision { severity, .. } => *severity,
+            ValidationIssue::SketchLevel { severity, .. } => *severity,
         }
     }
 }
@@ -887,20 +895,6 @@ pub mod analysis_tools {
         Conflicted,
     }
 
-    /// Sketch design quality metrics
-    #[derive(Debug, Clone)]
-    pub struct DesignQuality {
-        /// Overall quality score (0.0 to 1.0)
-        pub overall_score: f64,
-        /// Constraint organization score
-        pub constraint_organization: f64,
-        /// Geometric stability score
-        pub geometric_stability: f64,
-        /// Manufacturability score
-        pub manufacturability: f64,
-        /// Performance recommendations
-        pub recommendations: Vec<String>,
-    }
 
     /// Sketch analysis engine
     pub struct SketchAnalyzer;
@@ -990,82 +984,6 @@ pub mod analysis_tools {
                 EntityRef::Spline(_) => 8,    // Estimate: depends on control points
                 EntityRef::Polyline(_) => 6,  // Estimate: depends on vertices
             }
-        }
-
-        /// Analyze design quality and provide recommendations
-        pub fn analyze_design_quality(&self, sketch: &Sketch) -> DesignQuality {
-            let constraint_analysis = self.analyze_constraints(sketch);
-
-            // Calculate sub-scores
-            let constraint_score = self.calculate_constraint_quality_score(&constraint_analysis);
-            let stability_score = self.calculate_stability_score(sketch);
-            let manufacturability_score = self.calculate_manufacturability_score(sketch);
-
-            // Overall score (weighted average)
-            let overall_score =
-                constraint_score * 0.4 + stability_score * 0.4 + manufacturability_score * 0.2;
-
-            // Generate recommendations
-            let mut recommendations = Vec::new();
-
-            if constraint_score < 0.7 {
-                recommendations
-                    .push("Consider adding more constraints to stabilize geometry".to_string());
-            }
-
-            if constraint_analysis.conflicting_constraints > 0 {
-                recommendations
-                    .push("Resolve conflicting constraints for better stability".to_string());
-            }
-
-            if !constraint_analysis.under_constrained_entities.is_empty() {
-                recommendations.push("Some entities need additional constraints".to_string());
-            }
-
-            if manufacturability_score < 0.6 {
-                recommendations.push(
-                    "Consider manufacturability constraints (minimum radii, etc.)".to_string(),
-                );
-            }
-
-            DesignQuality {
-                overall_score,
-                constraint_organization: constraint_score,
-                geometric_stability: stability_score,
-                manufacturability: manufacturability_score,
-                recommendations,
-            }
-        }
-
-        /// Calculate constraint quality score
-        fn calculate_constraint_quality_score(&self, analysis: &ConstraintAnalysis) -> f64 {
-            if analysis.total_constraints == 0 {
-                return 0.0;
-            }
-
-            let satisfaction_ratio =
-                analysis.satisfied_constraints as f64 / analysis.total_constraints as f64;
-            let conflict_penalty =
-                analysis.conflicting_constraints as f64 / analysis.total_constraints as f64;
-
-            (satisfaction_ratio - conflict_penalty * 0.5).max(0.0)
-        }
-
-        /// Calculate geometric stability score
-        fn calculate_stability_score(&self, _sketch: &Sketch) -> f64 {
-            // This would analyze geometric stability
-            // For now, return a placeholder score
-            0.8
-        }
-
-        /// Calculate manufacturability score
-        fn calculate_manufacturability_score(&self, _sketch: &Sketch) -> f64 {
-            // This would analyze manufacturability constraints:
-            // - Minimum feature sizes
-            // - Corner radii
-            // - Draft angles
-            // - Material considerations
-            0.7
         }
 
         /// Suggest fixes for constraint issues

@@ -399,22 +399,6 @@ impl BSpline2d {
         first.coincident_with(last, tolerance)
     }
 
-    /// Elevate the degree of the B-spline
-    pub fn elevate_degree(&self) -> Sketch2dResult<BSpline2d> {
-        // Degree elevation algorithm
-        // For now, return error indicating not implemented
-        Err(Sketch2dError::NumericalError {
-            description: "Degree elevation algorithm not implemented".to_string(),
-        })
-    }
-
-    /// Reduce the degree of the B-spline if possible
-    pub fn reduce_degree(&self, _tolerance: f64) -> Sketch2dResult<BSpline2d> {
-        // Degree reduction algorithm with error checking
-        Err(Sketch2dError::NumericalError {
-            description: "Degree reduction algorithm not implemented".to_string(),
-        })
-    }
 }
 
 /// A 2D NURBS curve (Non-Uniform Rational B-Spline)
@@ -659,8 +643,10 @@ impl SketchEntity2d for ParametricSpline2d {
     }
 
     fn bounding_box(&self) -> (Point2d, Point2d) {
-        // For now, use control polygon bounding box
-        // More accurate would be to sample the curve
+        // The convex-hull property of B-splines (Piegl-Tiller §4.2) guarantees
+        // the curve lies inside the control polygon's AABB. This bound is
+        // conservative but never under-estimates — sufficient for spatial
+        // indexing and broad-phase queries.
         let points = match &self.spline {
             Spline2d::BSpline(bs) => &bs.control_points,
             Spline2d::Nurbs(nurbs) => &nurbs.control_points,

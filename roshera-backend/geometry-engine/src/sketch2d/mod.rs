@@ -51,7 +51,6 @@ pub mod sketch;
 pub mod sketch_plane;
 
 // Utilities
-pub mod pattern;
 pub mod sketch_topology;
 pub mod sketch_validation;
 
@@ -73,8 +72,6 @@ pub use constraints::{
 
 pub use sketch::{Sketch, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
-
-pub use pattern::{PatternId, PatternOperations, PatternParams, PatternResult, PatternType};
 
 // Error types for 2D operations
 use thiserror::Error;

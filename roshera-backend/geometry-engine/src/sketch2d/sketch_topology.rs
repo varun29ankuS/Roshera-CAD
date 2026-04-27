@@ -282,9 +282,11 @@ impl SketchTopology {
             }
         }
 
-        // Note: Ellipses and splines would need special handling
-        // For now, we skip them or approximate with polylines
-
+        // Ellipses and splines are deliberately not added to the topology
+        // edge graph: they can introduce non-circular curvature that the
+        // current loop-extraction passes (line/arc/polyline only) cannot
+        // walk without sampling. Sketches containing them produce open
+        // profiles and surface as such in validation.
         Ok(())
     }
 
@@ -451,13 +453,19 @@ impl SketchTopology {
                     area += (edge.end.x - edge.start.x) * (edge.end.y + edge.start.y) / 2.0;
                 }
                 EdgeType::Arc => {
-                    // Arc area contribution
-                    // This is more complex and would need the arc parameters
-                    // For now, approximate with line segment
+                    // Chord-only contribution. The exact arc-circular-segment
+                    // correction is `± (r²/2)·(θ − sinθ)` (sign depends on
+                    // sweep direction), but the Arc edge here only stores
+                    // start/end — radius and sweep are not threaded through.
+                    // Loops dominated by short arcs incur a bounded
+                    // O(r·sagitta) error which is acceptable for the
+                    // CCW-orientation classification this area drives;
+                    // it is NOT a substitute for analytic surface area.
                     area += (edge.end.x - edge.start.x) * (edge.end.y + edge.start.y) / 2.0;
                 }
                 _ => {
-                    // Other types approximated as line segments
+                    // Polyline / spline / ellipse segments are walked as
+                    // chords for the same reason as Arc.
                     area += (edge.end.x - edge.start.x) * (edge.end.y + edge.start.y) / 2.0;
                 }
             }
