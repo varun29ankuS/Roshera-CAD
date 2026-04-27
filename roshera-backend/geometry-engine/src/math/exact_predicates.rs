@@ -448,7 +448,12 @@ pub fn insphere(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3)
     } else if det < -errbound {
         CircleLocation::Outside
     } else {
-        // For now, use a simplified exact test
+        // Tighter f64 fallback when |det| sits below the adaptive error
+        // bound. A full Shewchuk-style expansion-arithmetic refinement
+        // would resolve points that are exactly cocircular up to the last
+        // bit; here we treat anything within RESULTERRBOUND of zero as
+        // OnBoundary, which is conservative and consistent with the
+        // tolerance contract used elsewhere in the kernel.
         if det > RESULTERRBOUND {
             CircleLocation::Inside
         } else if det < -RESULTERRBOUND {

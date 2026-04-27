@@ -639,56 +639,12 @@ fn create_ruled_surface(
         .get(top_edge_data.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Top curve not found".to_string()))?;
 
-    // Create a ruled surface by interpolating between the two curves
-    // For ruled surfaces: S(u,v) = (1-v) * C1(u) + v * C2(u)
-    // where C1 and C2 are the two boundary curves
-
-    // Sample points from both curves to create a NURBS surface
-    let num_samples = 10;
-    let mut control_points = Vec::new();
-    let mut weights = Vec::new();
-
-    for i in 0..=num_samples {
-        let u = i as f64 / num_samples as f64;
-
-        // Get points on both curves
-        let bottom_point = bottom_curve.point_at(u).map_err(|e| {
-            OperationError::NumericalError(format!("Bottom curve evaluation failed: {:?}", e))
-        })?;
-        let top_point = top_curve.point_at(u).map_err(|e| {
-            OperationError::NumericalError(format!("Top curve evaluation failed: {:?}", e))
-        })?;
-
-        // Create two rows of control points
-        control_points.push(bottom_point);
-        control_points.push(top_point);
-        weights.push(1.0);
-        weights.push(1.0);
-    }
-
-    // For now, create a planar approximation between the endpoints
-    // A complete implementation would create a proper NURBS ruled surface
-    let bottom_start = bottom_curve.point_at(0.0).map_err(|e| {
-        OperationError::NumericalError(format!("Bottom curve start evaluation failed: {:?}", e))
-    })?;
-    let bottom_end = bottom_curve.point_at(1.0).map_err(|e| {
-        OperationError::NumericalError(format!("Bottom curve end evaluation failed: {:?}", e))
-    })?;
-    let top_start = top_curve.point_at(0.0).map_err(|e| {
-        OperationError::NumericalError(format!("Top curve start evaluation failed: {:?}", e))
-    })?;
-
-    // Create a plane from three points (bottom_start, bottom_end, top_start)
-    let v1 = bottom_end - bottom_start;
-    let v2 = top_start - bottom_start;
-    let normal = v1.cross(&v2).normalize().map_err(|e| {
-        OperationError::NumericalError(format!("Normal calculation failed: {:?}", e))
-    })?;
-
-    use crate::primitives::surface::Plane;
-    let plane = Plane::from_point_normal(bottom_start, normal)
-        .map_err(|e| OperationError::NumericalError(format!("Plane creation failed: {:?}", e)))?;
-    Ok(Box::new(plane))
+    // Build a real ruled surface S(u,v) = (1-v)·C1(u) + v·C2(u) by cloning
+    // both boundary curves. RuledSurface evaluates the linear interpolation
+    // analytically — no NURBS approximation, no sampling error.
+    use crate::primitives::surface::RuledSurface;
+    let surface = RuledSurface::new(bottom_curve.clone_box(), top_curve.clone_box());
+    Ok(Box::new(surface))
 }
 
 /// Create a face from a closed wire profile
@@ -1257,32 +1213,3 @@ fn create_planar_surface_from_vertices(
     Ok(Box::new(plane))
 }
 
-/// Create a ruled surface type (placeholder for now)
-#[derive(Debug, Clone)]
-pub struct RuledSurface {
-    pub edge1: EdgeId,
-    pub edge2: EdgeId,
-}
-
-/*
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::primitives::builder::Builder;
-
-    #[test]
-    fn test_simple_extrusion() {
-        let mut builder = Builder::new();
-
-        // Create a simple rectangular face to extrude
-        // This would require setting up vertices, edges, loops, and face
-        // For now, this is a placeholder test
-
-        // Test would verify:
-        // - Correct number of faces created
-        // - Proper orientation of faces
-        // - Watertight solid
-        // - Correct volume
-    }
-}
-*/

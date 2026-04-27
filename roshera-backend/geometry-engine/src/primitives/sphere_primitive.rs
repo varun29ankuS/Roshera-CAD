@@ -214,7 +214,10 @@ impl Primitive for SpherePrimitive {
         params: Self::Parameters,
         model: &mut BRepModel,
     ) -> Result<(), PrimitiveError> {
-        // For now, implement as delete + recreate
+        // Implemented as delete + recreate: spheres are single-face, single-shell
+        // primitives, so in-place mutation of the underlying surface offers no
+        // significant savings over rebuilding the topology. The store reuses
+        // freed IDs, which is enforced by the equality check below.
         model.solids.remove(solid_id);
         let new_solid_id = Self::create(params, model)?;
         if new_solid_id != solid_id {

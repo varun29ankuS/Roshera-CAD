@@ -385,7 +385,10 @@ impl Primitive for CylinderPrimitive {
         params: Self::Parameters,
         model: &mut BRepModel,
     ) -> Result<(), PrimitiveError> {
-        // For now, implement as delete + recreate
+        // Implemented as delete + recreate: cylinder topology (1 lateral + 2 caps)
+        // depends on the radius/height/segment parameters; rebuilding the shell
+        // is simpler and equally correct compared to mutating individual faces.
+        // ID preservation is enforced by the equality check below.
         model.solids.remove(solid_id);
         let new_solid_id = Self::create(params, model)?;
         if new_solid_id != solid_id {
