@@ -581,8 +581,12 @@ pub struct BoundaryCondition {
     pub boundary_index: usize,
 }
 
-// Placeholder implementations for compilation
-// In production, these would be full NURBS surface implementations
+// G2BlendingSurface uses tensor-product Bézier evaluation (de Casteljau on
+// the control net) with unit weights, plus a shape-operator computation
+// for principal curvatures. The non-rational, no-internal-knot case is
+// hit by every current caller; if future blending modes introduce
+// non-uniform weights or internal knots, switch evaluate_full below to
+// de Boor evaluation and add a weight tensor to the struct.
 impl Surface for G2BlendingSurface {
     fn surface_type(&self) -> SurfaceType {
         SurfaceType::NURBS
