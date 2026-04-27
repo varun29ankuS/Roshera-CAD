@@ -277,11 +277,17 @@ impl ConePrimitive {
                 model.faces.add(face)
             }
         } else {
-            // Sector cone - more complex edge loops
-            // TODO: Implement sector cone face creation
+            // Sector cones (partial-sweep cones with start_angle/sweep_angle <
+            // TWO_PI) require radial-cap face stitching that the rolling-ball
+            // kernel does not yet generate. Until that path lands we surface
+            // an explicit error rather than silently emitting a malformed
+            // shell. Callers wanting a partial cone should construct it from
+            // a revolved profile via operations::revolve.
             return Err(PrimitiveError::GeometryError {
                 operation: "Create sector cone".to_string(),
-                details: "Sector cone not yet implemented".to_string(),
+                details: "sector cones are not supported by this primitive — \
+                          use operations::revolve with a triangular profile"
+                    .to_string(),
             });
         };
 
@@ -366,17 +372,31 @@ impl ConePrimitive {
         Ok(solid_id)
     }
 
-    /// Update cone parameters
+    /// Update cone parameters by replacing the underlying topology.
+    ///
+    /// A cone has 3 faces (lateral + bottom cap + top cap or apex), one
+    /// shell, and one solid; in-place mutation of the surfaces would have
+    /// to walk the same shell to reach them and rebuild the cap edges
+    /// anyway, so a delete + recreate is equivalent in cost and simpler
+    /// to keep correct. The ID-equality check below detects the (rare)
+    /// case where the underlying store could not reuse the freed slot.
     pub fn update_parameters(
-        _solid_id: SolidId,
-        _params: &ConeParameters,
-        _model: &mut BRepModel,
+        solid_id: SolidId,
+        params: &ConeParameters,
+        model: &mut BRepModel,
     ) -> PrimitiveResult<()> {
-        // TODO: Implement parametric update
-        Err(PrimitiveError::GeometryError {
-            operation: "update_parameters".to_string(),
-            details: "Cone parametric update not yet implemented".to_string(),
-        })
+        model.solids.remove(solid_id);
+        let new_solid_id = Self::create(params, model)?;
+        if new_solid_id != solid_id {
+            return Err(PrimitiveError::InvalidTopology {
+                entity: "Solid".to_string(),
+                issue: "Cone update did not preserve solid ID".to_string(),
+                suggestion: "Verify solid store reuses freed IDs; this is \
+                             a kernel-store invariant, not a user error"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Validate cone topology
