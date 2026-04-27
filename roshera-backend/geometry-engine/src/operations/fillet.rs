@@ -1213,8 +1213,11 @@ fn get_adjacent_faces_safe(
     model: &BRepModel,
     edge_id: EdgeId,
 ) -> OperationResult<(FaceId, FaceId)> {
-    // This is a simplified version - would use proper topology
-    // For now, just search through faces
+    // Linear face scan: O(F) per call, but the caller invokes this once
+    // per filleted edge and the model rarely exceeds a few thousand
+    // faces. A face-edge incidence index would shave this to O(1) but
+    // adds maintenance overhead on every topology mutation; the trade
+    // is not worthwhile until profiling proves otherwise.
     let mut adjacent_faces = Vec::new();
 
     // Iterate through all faces by index

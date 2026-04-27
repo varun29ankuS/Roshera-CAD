@@ -507,12 +507,28 @@ fn find_edges_using_vertex(model: &BRepModel, vertex_id: VertexId) -> Vec<EdgeId
     edges
 }
 
-fn find_faces_using_edge(model: &BRepModel, _edge_id: EdgeId) -> Vec<FaceId> {
-    let faces = Vec::new();
-    for (_face_id, _face) in model.faces.iter() {
-        // Check if face uses this edge in any of its loops
-        // This would require iterating through loops
-        // Placeholder for actual implementation
+fn find_faces_using_edge(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
+    let mut faces = Vec::new();
+    for (face_id, face) in model.faces.iter() {
+        let mut used = false;
+        if let Some(outer) = model.loops.get(face.outer_loop) {
+            if outer.edges.iter().any(|e| *e == edge_id) {
+                used = true;
+            }
+        }
+        if !used {
+            for inner_id in &face.inner_loops {
+                if let Some(inner) = model.loops.get(*inner_id) {
+                    if inner.edges.iter().any(|e| *e == edge_id) {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if used {
+            faces.push(face_id);
+        }
     }
     faces
 }
