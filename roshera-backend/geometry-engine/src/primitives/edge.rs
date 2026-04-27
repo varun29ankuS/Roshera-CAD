@@ -299,22 +299,50 @@ impl Edge {
     }
 
     /// Compute arc length using adaptive integration (non-caching)
+    ///
+    /// Integrates `|dC/du|` over the curve parameter range
+    /// `[param_range.start, param_range.end]`. The previous implementation
+    /// used `Edge::tangent_at` which returns a *normalized* tangent (unit
+    /// magnitude), so the integral collapsed to the length of the unit
+    /// interval (≈ 1.0) regardless of edge geometry — every box edge then
+    /// validated as 1 mm long, which broke fillet-radius validation
+    /// (`radius > edge_length * 0.5`) for any non-trivial radius.
     pub fn compute_arc_length(&self, curves: &CurveStore, tolerance: Tolerance) -> MathResult<f64> {
-        let _curve = curves
+        let curve = curves
             .get(self.curve_id)
             .ok_or(MathError::InvalidParameter("Invalid curve ID".to_string()))?;
 
-        // Adaptive Simpson's rule
-        let mut stack = vec![(0.0, 1.0)];
+        // Speed function s(u) = |dC/du| evaluated on the underlying curve's
+        // parameter axis.
+        let speed = |u: f64| -> MathResult<f64> {
+            let cp = curve.evaluate(u)?;
+            Ok(cp.derivative1.magnitude())
+        };
+
+        // Adaptive Simpson's rule over the curve parameter range. The
+        // edge `param_range` is honoured directly so trimmed edges
+        // integrate over the correct subinterval.
+        let u_start = self.param_range.start;
+        let u_end = self.param_range.end;
+        if (u_end - u_start).abs() <= f64::EPSILON {
+            return Ok(0.0);
+        }
+        let (lo, hi) = if u_start <= u_end {
+            (u_start, u_end)
+        } else {
+            (u_end, u_start)
+        };
+
+        let mut stack = vec![(lo, hi)];
         let mut total_length = 0.0;
 
         while let Some((a, b)) = stack.pop() {
             let mid = 0.5 * (a + b);
 
             // Evaluate at 5 points for Simpson's rule
-            let fa = self.tangent_at(a, curves)?.magnitude();
-            let fmid = self.tangent_at(mid, curves)?.magnitude();
-            let fb = self.tangent_at(b, curves)?.magnitude();
+            let fa = speed(a)?;
+            let fmid = speed(mid)?;
+            let fb = speed(b)?;
 
             let h = b - a;
             let s1 = h * (fa + 4.0 * fmid + fb) / 6.0;
@@ -322,12 +350,16 @@ impl Edge {
             // Subdivide for error estimation
             let mid1 = 0.5 * (a + mid);
             let mid2 = 0.5 * (mid + b);
-            let f1 = self.tangent_at(mid1, curves)?.magnitude();
-            let f2 = self.tangent_at(mid2, curves)?.magnitude();
+            let f1 = speed(mid1)?;
+            let f2 = speed(mid2)?;
 
             let s2 = h * (fa + 4.0 * f1 + 2.0 * fmid + 4.0 * f2 + fb) / 12.0;
 
-            if (s2 - s1).abs() < tolerance.distance() * h {
+            // Guard against pathological refinement on tiny intervals: stop
+            // once the subinterval is at the tolerance scale.
+            if (s2 - s1).abs() < tolerance.distance() * h.max(1.0)
+                || h < tolerance.distance() * 1e-3
+            {
                 total_length += s2;
             } else {
                 stack.push((a, mid));

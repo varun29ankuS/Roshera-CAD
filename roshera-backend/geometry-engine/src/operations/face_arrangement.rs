@@ -268,7 +268,14 @@ pub(super) fn build_arrangement(
 }
 
 /// Walk minimal-face cycles in the arrangement and return each as a list
-/// of underlying edge IDs.
+/// of `(underlying edge id, forward)` pairs.
+///
+/// `forward` is the half-edge's `forward` bit: `true` if the cycle walks
+/// the underlying edge in its native start→end direction, `false` if it
+/// walks end→start. Downstream consumers (loop construction in
+/// `build_shells_from_faces`, classification, offset, sweep) use this bit
+/// to assemble loops with correct edge orientation; without it the kernel
+/// silently corrupts loop topology by hard-coding `forward=true`.
 ///
 /// Faces with non-positive signed area (outer face, CW under the surface
 /// normal) are discarded. Dangling-edge detours — half-edges whose twin is
@@ -278,10 +285,10 @@ pub(super) fn extract_regions(
     arr: &Arrangement,
     model: &BRepModel,
     surface: &dyn Surface,
-) -> Vec<Vec<EdgeId>> {
+) -> Vec<Vec<(EdgeId, bool)>> {
     let tol = Tolerance::default();
     let mut visited = vec![false; arr.len()];
-    let mut regions: Vec<Vec<EdgeId>> = Vec::new();
+    let mut regions: Vec<Vec<(EdgeId, bool)>> = Vec::new();
 
     for start in 0..arr.len() {
         if visited[start] {
@@ -342,16 +349,22 @@ pub(super) fn extract_regions(
             continue;
         }
 
-        // Collect underlying edge ids in walk order, deduping consecutive
-        // duplicates that may remain after trimming.
-        let mut edges: Vec<EdgeId> = Vec::with_capacity(trimmed.len());
+        // Collect underlying edge ids + half-edge forward bits in walk
+        // order, deduping consecutive duplicates that may remain after
+        // trimming. Two consecutive entries with the same edge_id can
+        // arise from arrangement-vertex stitching where the same edge
+        // appears twice; in that case the second occurrence's forward
+        // bit is the meaningful one for the cycle and we keep the first
+        // occurrence (matching the previous, edge-id-only behavior).
+        let mut edges: Vec<(EdgeId, bool)> = Vec::with_capacity(trimmed.len());
         for &h in &trimmed {
-            let eid = arr.get(h).edge_id;
-            if edges.last().copied() != Some(eid) {
-                edges.push(eid);
+            let he = arr.get(h);
+            let eid = he.edge_id;
+            if edges.last().map(|(e, _)| *e) != Some(eid) {
+                edges.push((eid, he.forward));
             }
         }
-        if edges.first().copied() == edges.last().copied() && edges.len() > 1 {
+        if edges.first().map(|(e, _)| *e) == edges.last().map(|(e, _)| *e) && edges.len() > 1 {
             edges.pop();
         }
         if edges.len() < 3 {

@@ -109,8 +109,11 @@ pub struct SolidAttributes {
     pub layer: Option<u32>,
     /// Visibility
     pub visible: bool,
-    /// Selection state
+    /// Selection state (currently selected by user)
     pub selected: bool,
+    /// Selectable (whether user input may select this solid; locked solids
+    /// stay visible but cannot be picked)
+    pub selectable: bool,
     /// User-defined attributes
     pub user_data: HashMap<String, String>,
 }
@@ -123,6 +126,7 @@ impl Default for SolidAttributes {
             layer: None,
             visible: true,
             selected: false,
+            selectable: true,
             user_data: HashMap::new(),
         }
     }

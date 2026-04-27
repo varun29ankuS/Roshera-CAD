@@ -6,7 +6,13 @@
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
-    edge::EdgeId, face::FaceId, r#loop::LoopId, solid::SolidId, topology_builder::BRepModel,
+    curve::{Curve as CurveTrait, Line, NurbsCurve as PrimNurbsCurve, ParameterRange},
+    edge::EdgeId,
+    face::FaceId,
+    r#loop::LoopId,
+    solid::SolidId,
+    surface::GeneralNurbsSurface,
+    topology_builder::BRepModel,
     vertex::VertexId,
 };
 
@@ -349,71 +355,356 @@ fn move_vertex(
     Ok(())
 }
 
-/// Replace an edge's underlying curve. Replacing an edge curve requires
-/// `EdgeStore::set_curve_id` (does not currently exist) plus parameter-range
-/// recomputation against the new curve. Returns `NotImplemented` to avoid
-/// silently producing a model where the edge claims one geometry but the
-/// store still holds the old curve.
+/// Replace an edge's underlying curve.
+///
+/// Constructs a new analytical or B-spline curve from the supplied
+/// `EdgeCurveType`, inserts it into the model's `CurveStore`, and rewires the
+/// edge's `curve_id` and `param_range` to reference the new curve over its
+/// natural parameter domain. The edge's start/end vertices are then snapped
+/// to the new curve's endpoints so that vertex positions and curve geometry
+/// remain consistent — a Boundary Representation invariant.
+///
+/// The previous curve remains in the store (curves may be shared across
+/// multiple edges). Removal of orphaned curves is the caller's responsibility
+/// or a separate sweep pass.
 fn replace_edge_curve(
     model: &mut BRepModel,
     edge_id: EdgeId,
-    _new_curve: EdgeCurveType,
+    new_curve: EdgeCurveType,
     _options: &ModifyOptions,
 ) -> OperationResult<()> {
-    if model.edges.get(edge_id).is_none() {
-        return Err(OperationError::InvalidInput {
-            parameter: "edge_id".to_string(),
-            expected: "existing edge".to_string(),
-            received: format!("{}", edge_id),
-        });
-    }
-    Err(OperationError::NotImplemented(
-        "replace_edge_curve requires EdgeStore mutation API; delete + recreate edge instead"
-            .to_string(),
-    ))
+    // Build the boxed curve from the user-facing variant.
+    let boxed: Box<dyn CurveTrait> = match new_curve {
+        EdgeCurveType::Line { start, end } => Box::new(Line::new(start, end)),
+
+        EdgeCurveType::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+        } => {
+            if !(radius > 0.0 && radius.is_finite()) {
+                return Err(OperationError::InvalidInput {
+                    parameter: "radius".to_string(),
+                    expected: "positive finite value".to_string(),
+                    received: format!("{}", radius),
+                });
+            }
+            let sweep = end_angle - start_angle;
+            // EdgeCurveType::Arc carries no normal; default to +Z (XY-plane
+            // arc), matching CAD convention for 2-D sketches embedded in a
+            // 3-D model. Callers needing an arbitrary plane should use the
+            // Circle variant which carries an explicit normal.
+            let arc =
+                crate::primitives::curve::Arc::new(center, Vector3::Z, radius, start_angle, sweep)
+                    .map_err(|e| {
+                        OperationError::InvalidGeometry(format!("Arc construction failed: {:?}", e))
+                    })?;
+            Box::new(arc)
+        }
+
+        EdgeCurveType::Circle {
+            center,
+            radius,
+            normal,
+        } => {
+            if !(radius > 0.0 && radius.is_finite()) {
+                return Err(OperationError::InvalidInput {
+                    parameter: "radius".to_string(),
+                    expected: "positive finite value".to_string(),
+                    received: format!("{}", radius),
+                });
+            }
+            let circle =
+                crate::primitives::curve::Circle::new(center, normal, radius).map_err(|e| {
+                    OperationError::InvalidGeometry(format!(
+                        "Circle construction failed: {:?}",
+                        e
+                    ))
+                })?;
+            Box::new(circle)
+        }
+
+        EdgeCurveType::BSpline {
+            control_points,
+            degree,
+        } => {
+            let p = degree as usize;
+            let n = control_points.len();
+            if n < p + 1 {
+                return Err(OperationError::InvalidInput {
+                    parameter: "control_points".to_string(),
+                    expected: format!("at least degree+1 = {} control points", p + 1),
+                    received: format!("{} control points", n),
+                });
+            }
+            // Clamped uniform knot vector: [0;p+1] ++ interior ++ [1;p+1].
+            let mut knots: Vec<f64> = Vec::with_capacity(n + p + 1);
+            knots.extend(std::iter::repeat(0.0).take(p + 1));
+            let interior_count = n.saturating_sub(p + 1);
+            for i in 1..=interior_count {
+                knots.push(i as f64 / (interior_count + 1) as f64);
+            }
+            knots.extend(std::iter::repeat(1.0).take(p + 1));
+
+            let curve = PrimNurbsCurve::from_bspline(p, control_points, knots).map_err(|e| {
+                OperationError::InvalidGeometry(format!("B-spline construction failed: {:?}", e))
+            })?;
+            Box::new(curve)
+        }
+    };
+
+    // Capture the new curve's natural parameter range before transferring
+    // ownership into the store.
+    let new_range = boxed.parameter_range();
+    let new_curve_id = model.curves.add(boxed);
+
+    // Sample endpoints from the new curve so we can snap the edge's vertices
+    // and stay topologically consistent.
+    let (start_vertex_id, end_vertex_id) = {
+        let edge =
+            model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "edge_id".to_string(),
+                    expected: "existing edge".to_string(),
+                    received: format!("{}", edge_id),
+                })?;
+        (edge.start_vertex, edge.end_vertex)
+    };
+
+    let curve_ref = model
+        .curves
+        .get(new_curve_id)
+        .ok_or_else(|| OperationError::InternalError("Curve insert lost id".to_string()))?;
+    let p_start = curve_ref.point_at(new_range.start).map_err(|e| {
+        OperationError::NumericalError(format!("evaluate new curve at start: {:?}", e))
+    })?;
+    let p_end = curve_ref.point_at(new_range.end).map_err(|e| {
+        OperationError::NumericalError(format!("evaluate new curve at end: {:?}", e))
+    })?;
+
+    // Now rewrite the edge.
+    let edge_mut =
+        model
+            .edges
+            .get_mut(edge_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "edge_id".to_string(),
+                expected: "existing edge".to_string(),
+                received: format!("{}", edge_id),
+            })?;
+    edge_mut.curve_id = new_curve_id;
+    edge_mut.param_range = ParameterRange::new(new_range.start, new_range.end);
+
+    // Snap vertex positions to the new curve endpoints so face loops stay
+    // watertight after the replacement.
+    let _ = model
+        .vertices
+        .set_position(start_vertex_id, p_start.x, p_start.y, p_start.z);
+    let _ = model
+        .vertices
+        .set_position(end_vertex_id, p_end.x, p_end.y, p_end.z);
+
+    Ok(())
 }
 
-/// Modify a face's underlying surface. Requires `SurfaceStore::set_surface`
-/// or replace + remap pattern that is currently not exposed. Returns
-/// `NotImplemented` to avoid silently leaving the face referencing the old
-/// surface while the caller assumes the swap succeeded.
+/// Modify a face's underlying surface.
+///
+/// Constructs a new B-spline / NURBS surface from the supplied
+/// `SurfaceParameters`, swaps it into the `SurfaceStore` at the face's
+/// existing `surface_id` slot via `SurfaceStore::replace`, and updates the
+/// face's `uv_bounds` to match the new surface's natural parameter domain.
+///
+/// Only the parametric `BSpline` and `NURBS` types are constructible from
+/// `SurfaceParameters` as currently designed, since the struct only carries
+/// degrees + control points. Analytical types (`Plane`, `Cylinder`, `Sphere`,
+/// `Torus`) require origin / axis / radius data that isn't present here, so
+/// this function returns `InvalidInput` for those rather than silently
+/// fabricating a default.
 fn modify_face_surface(
     model: &mut BRepModel,
     face_id: FaceId,
-    _surface_params: SurfaceParameters,
+    surface_params: SurfaceParameters,
     _options: &ModifyOptions,
 ) -> OperationResult<()> {
-    if model.faces.get(face_id).is_none() {
-        return Err(OperationError::InvalidInput {
+    let surface_id = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
             parameter: "face_id".to_string(),
             expected: "existing face".to_string(),
             received: format!("{}", face_id),
-        });
+        })?
+        .surface_id;
+
+    let new_surface: Box<dyn crate::primitives::surface::Surface> = match surface_params
+        .surface_type
+    {
+        SurfaceType::BSpline | SurfaceType::NURBS => {
+            let degree_u = surface_params.u_degree.ok_or_else(|| OperationError::InvalidInput {
+                parameter: "u_degree".to_string(),
+                expected: "Some(degree)".to_string(),
+                received: "None".to_string(),
+            })? as usize;
+            let degree_v = surface_params.v_degree.ok_or_else(|| OperationError::InvalidInput {
+                parameter: "v_degree".to_string(),
+                expected: "Some(degree)".to_string(),
+                received: "None".to_string(),
+            })? as usize;
+            let control_points = surface_params.control_points.ok_or_else(|| {
+                OperationError::InvalidInput {
+                    parameter: "control_points".to_string(),
+                    expected: "Some(grid)".to_string(),
+                    received: "None".to_string(),
+                }
+            })?;
+
+            let n_u = control_points.len();
+            if n_u < degree_u + 1 {
+                return Err(OperationError::InvalidInput {
+                    parameter: "control_points.len()".to_string(),
+                    expected: format!("at least u_degree+1 = {}", degree_u + 1),
+                    received: format!("{}", n_u),
+                });
+            }
+            let n_v = control_points.first().map(|r| r.len()).unwrap_or(0);
+            if n_v < degree_v + 1 {
+                return Err(OperationError::InvalidInput {
+                    parameter: "control_points[0].len()".to_string(),
+                    expected: format!("at least v_degree+1 = {}", degree_v + 1),
+                    received: format!("{}", n_v),
+                });
+            }
+            // Reject non-rectangular grids up front; the underlying NurbsSurface
+            // constructor checks this too, but a clear error here is more useful
+            // than the generic "must be rectangular".
+            for (row_idx, row) in control_points.iter().enumerate() {
+                if row.len() != n_v {
+                    return Err(OperationError::InvalidInput {
+                        parameter: format!("control_points[{}].len()", row_idx),
+                        expected: format!("{} (rectangular grid)", n_v),
+                        received: format!("{}", row.len()),
+                    });
+                }
+            }
+
+            // Clamped uniform knot vectors in each direction.
+            let make_knots = |n: usize, p: usize| -> Vec<f64> {
+                let mut knots: Vec<f64> = Vec::with_capacity(n + p + 1);
+                knots.extend(std::iter::repeat(0.0).take(p + 1));
+                let interior = n.saturating_sub(p + 1);
+                for i in 1..=interior {
+                    knots.push(i as f64 / (interior + 1) as f64);
+                }
+                knots.extend(std::iter::repeat(1.0).take(p + 1));
+                knots
+            };
+            let knots_u = make_knots(n_u, degree_u);
+            let knots_v = make_knots(n_v, degree_v);
+
+            // SurfaceParameters has no weights field; treat as a B-spline by
+            // setting all weights to 1.0 (rational-equivalent unit-weight NURBS).
+            let weights: Vec<Vec<f64>> = (0..n_u).map(|_| vec![1.0; n_v]).collect();
+
+            let nurbs = crate::math::nurbs::NurbsSurface::new(
+                control_points,
+                weights,
+                knots_u,
+                knots_v,
+                degree_u,
+                degree_v,
+            )
+            .map_err(|msg| {
+                OperationError::InvalidGeometry(format!("NURBS surface construction: {}", msg))
+            })?;
+            Box::new(GeneralNurbsSurface { nurbs })
+        }
+
+        SurfaceType::Plane
+        | SurfaceType::Cylinder
+        | SurfaceType::Sphere
+        | SurfaceType::Torus => {
+            return Err(OperationError::InvalidInput {
+                parameter: "surface_params".to_string(),
+                expected: "BSpline or NURBS (control-point-driven surface)".to_string(),
+                received: format!("{:?}", surface_params.surface_type),
+            });
+        }
+    };
+
+    let bounds = new_surface.parameter_bounds();
+
+    // Swap the new surface in at the face's existing slot. `replace` returns
+    // None only if the slot is missing — that would indicate corruption, so
+    // surface this as InternalError.
+    if model.surfaces.replace(surface_id, new_surface).is_none() {
+        return Err(OperationError::InternalError(format!(
+            "SurfaceStore slot {} missing during replace",
+            surface_id
+        )));
     }
-    Err(OperationError::NotImplemented(
-        "modify_face_surface requires SurfaceStore mutation API; rebuild face instead".to_string(),
-    ))
+
+    // Update face uv_bounds to the new surface's natural domain.
+    let face_mut = model
+        .faces
+        .get_mut(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_id".to_string(),
+            expected: "existing face".to_string(),
+            received: format!("{}", face_id),
+        })?;
+    face_mut.uv_bounds = [bounds.0 .0, bounds.0 .1, bounds.1 .0, bounds.1 .1];
+
+    Ok(())
 }
 
-/// Modify solid-level metadata properties. The current `Solid` struct does
-/// not carry a properties field (mass, density, material id, etc.), so this
-/// operation has no representation. Returns `NotImplemented` rather than
-/// silently accepting properties that vanish.
+/// Modify solid-level metadata properties.
+///
+/// Maps the user-facing `SolidProperties` onto the on-disk
+/// `Solid { name, attributes }` shape. Each `Option<T>` field that is `Some`
+/// overwrites the corresponding solid field; `None` leaves it untouched (so
+/// callers can perform partial updates).
+///
+/// - `name`        → `solid.name`
+/// - `material`    → `solid.attributes.material.name` (does not change the
+///   physical density / Young's modulus values; use `Material` directly for
+///   those)
+/// - `color`       → `solid.attributes.color`
+/// - `visible`     → `solid.attributes.visible`
+/// - `selectable`  → `solid.attributes.selectable`
 fn modify_solid_properties(
     model: &mut BRepModel,
     solid_id: SolidId,
-    _properties: SolidProperties,
+    properties: SolidProperties,
 ) -> OperationResult<()> {
-    if model.solids.get(solid_id).is_none() {
-        return Err(OperationError::InvalidInput {
+    let solid = model
+        .solids
+        .get_mut(solid_id)
+        .ok_or_else(|| OperationError::InvalidInput {
             parameter: "solid_id".to_string(),
             expected: "existing solid".to_string(),
             received: format!("{}", solid_id),
-        });
+        })?;
+
+    if let Some(name) = properties.name {
+        solid.name = Some(name);
     }
-    Err(OperationError::NotImplemented(
-        "modify_solid_properties: Solid struct has no properties field to update".to_string(),
-    ))
+    if let Some(material) = properties.material {
+        solid.attributes.material.name = material;
+    }
+    if let Some(color) = properties.color {
+        solid.attributes.color = color;
+    }
+    if let Some(visible) = properties.visible {
+        solid.attributes.visible = visible;
+    }
+    if let Some(selectable) = properties.selectable {
+        solid.attributes.selectable = selectable;
+    }
+
+    Ok(())
 }
 
 /// Change loop orientation
@@ -512,14 +803,14 @@ fn find_faces_using_edge(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
     for (face_id, face) in model.faces.iter() {
         let mut used = false;
         if let Some(outer) = model.loops.get(face.outer_loop) {
-            if outer.edges.iter().any(|e| *e == edge_id) {
+            if outer.edges.contains(&edge_id) {
                 used = true;
             }
         }
         if !used {
             for inner_id in &face.inner_loops {
                 if let Some(inner) = model.loops.get(*inner_id) {
-                    if inner.edges.iter().any(|e| *e == edge_id) {
+                    if inner.edges.contains(&edge_id) {
                         used = true;
                         break;
                     }

@@ -8,9 +8,9 @@
 //! at construction. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use crate::math::{consts, Matrix4, Point3, Tolerance, Vector3};
+use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Arc, Line, ParameterRange},
+    curve::{Circle, Line, ParameterRange},
     edge::{Edge, EdgeOrientation},
     face::FaceOrientation,
     primitive_traits::{
@@ -24,7 +24,6 @@ use crate::primitives::{
     solid::SolidId,
     surface::{Cylinder as CylinderSurface, Plane},
     topology_builder::BRepModel,
-    vertex::VertexId,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -139,245 +138,159 @@ impl Primitive for CylinderPrimitive {
 
         let tolerance = params.tolerance.unwrap_or_default();
 
-        // Create coordinate system aligned with axis
+        // Build seamed-cylinder topology: a parametric cylinder is a single
+        // closed lateral face (seamed at u=0≡u=2π) plus two planar caps —
+        // 3 faces total, regardless of segment count. The previous
+        // implementation faceted the lateral surface into N separate
+        // sub-arc faces (one per `segments`), which (a) violated the B-Rep
+        // contract that analytic surfaces remain analytic at topology
+        // level, and (b) caused the tessellator to emit
+        // segments × max_segments² triangles per cylinder (e.g. 16 ×
+        // 100² = 160k extra tris on a r=15 h=80 cylinder).
+        //
+        // `segments` is now a documented tessellation hint; topology is
+        // always seamed. Mirror of `topology_builder::create_cylinder_topology`.
         let z_axis = params.axis;
-        let x_axis = z_axis.perpendicular();
-        let y_axis = z_axis.cross(&x_axis);
-
-        // Create vertices for top and bottom circles
-        let mut bottom_vertices = Vec::new();
-        let mut top_vertices = Vec::new();
-
-        for i in 0..params.segments {
-            let angle = 2.0 * consts::PI * (i as f64) / (params.segments as f64);
-            let x = params.radius * angle.cos();
-            let y = params.radius * angle.sin();
-
-            // Bottom vertex
-            let bottom_pt = params.base_center + x_axis * x + y_axis * y;
-            bottom_vertices.push(model.vertices.add_or_find(
-                bottom_pt.x,
-                bottom_pt.y,
-                bottom_pt.z,
-                tolerance.distance(),
-            ));
-
-            // Top vertex
-            let top_pt = bottom_pt + z_axis * params.height;
-            top_vertices.push(model.vertices.add_or_find(
-                top_pt.x,
-                top_pt.y,
-                top_pt.z,
-                tolerance.distance(),
-            ));
-        }
-
-        // Create center vertices for caps
-        let _bottom_center = model.vertices.add_or_find(
-            params.base_center.x,
-            params.base_center.y,
-            params.base_center.z,
-            tolerance.distance(),
-        );
+        let ref_dir = z_axis.perpendicular();
         let top_center_pt = params.base_center + z_axis * params.height;
-        let _top_center = model.vertices.add_or_find(
-            top_center_pt.x,
-            top_center_pt.y,
-            top_center_pt.z,
+
+        let topology_err = |op: &str, msg: String| PrimitiveError::GeometryError {
+            operation: op.to_string(),
+            details: msg,
+        };
+
+        // ---- vertices: one seam vertex per cap. ----
+        let v_bottom = model.vertices.add_or_find(
+            params.base_center.x + ref_dir.x * params.radius,
+            params.base_center.y + ref_dir.y * params.radius,
+            params.base_center.z + ref_dir.z * params.radius,
+            tolerance.distance(),
+        );
+        let v_top = model.vertices.add_or_find(
+            top_center_pt.x + ref_dir.x * params.radius,
+            top_center_pt.y + ref_dir.y * params.radius,
+            top_center_pt.z + ref_dir.z * params.radius,
             tolerance.distance(),
         );
 
-        // Create surfaces
-        // Cylindrical surface
-        let cylinder_surface = CylinderSurface::new(params.base_center, z_axis, params.radius)
-            .map_err(|_| PrimitiveError::GeometryError {
-                operation: "create_cylinder_surface".to_string(),
-                details: "Failed to create cylinder surface".to_string(),
-            })?;
-        let cylinder_surface_id = model.surfaces.add(Box::new(cylinder_surface));
+        // ---- curves: two closed circles + one seam line. ----
+        let bottom_circle = Circle::new(params.base_center, z_axis, params.radius)
+            .map_err(|e| topology_err("bottom_circle", format!("{e}")))?;
+        let top_circle = Circle::new(top_center_pt, z_axis, params.radius)
+            .map_err(|e| topology_err("top_circle", format!("{e}")))?;
+        let seam_line = Line::new(
+            params.base_center + ref_dir * params.radius,
+            top_center_pt + ref_dir * params.radius,
+        );
+        let bottom_circle_id = model.curves.add(Box::new(bottom_circle));
+        let top_circle_id = model.curves.add(Box::new(top_circle));
+        let seam_line_id = model.curves.add(Box::new(seam_line));
 
-        // Bottom plane
-        let bottom_plane = Plane::from_point_normal(params.base_center, -z_axis).map_err(|_| {
-            PrimitiveError::GeometryError {
-                operation: "create_bottom_plane".to_string(),
-                details: "Failed to create bottom plane".to_string(),
-            }
-        })?;
-        let bottom_plane_id = model.surfaces.add(Box::new(bottom_plane));
+        // ---- edges: closed circles + linear seam. ----
+        let two_pi = std::f64::consts::TAU;
+        let bottom_edge = model.edges.add(Edge::new(
+            0,
+            v_bottom,
+            v_bottom,
+            bottom_circle_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, two_pi),
+        ));
+        let top_edge = model.edges.add(Edge::new(
+            0,
+            v_top,
+            v_top,
+            top_circle_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, two_pi),
+        ));
+        let seam_edge = model.edges.add(Edge::new(
+            0,
+            v_bottom,
+            v_top,
+            seam_line_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
 
-        // Top plane
-        let top_plane = Plane::from_point_normal(top_center_pt, z_axis).map_err(|_| {
-            PrimitiveError::GeometryError {
-                operation: "create_top_plane".to_string(),
-                details: "Failed to create top plane".to_string(),
-            }
-        })?;
-        let top_plane_id = model.surfaces.add(Box::new(top_plane));
+        // ---- surfaces: 2 planes + 1 finite cylinder. ----
+        let bottom_plane = Plane::from_point_normal(params.base_center, -z_axis)
+            .map_err(|e| topology_err("bottom_plane", format!("{e}")))?;
+        let top_plane = Plane::from_point_normal(top_center_pt, z_axis)
+            .map_err(|e| topology_err("top_plane", format!("{e}")))?;
+        let lateral_cyl =
+            CylinderSurface::new_finite(params.base_center, z_axis, params.radius, params.height)
+                .map_err(|e| topology_err("lateral_cylinder", format!("{e}")))?;
+        let bottom_surface_id = model.surfaces.add(Box::new(bottom_plane));
+        let top_surface_id = model.surfaces.add(Box::new(top_plane));
+        let lateral_surface_id = model.surfaces.add(Box::new(lateral_cyl));
 
-        let mut faces = Vec::new();
-
-        // Create side faces
-        for i in 0..params.segments {
-            let next_i = (i + 1) % params.segments;
-
-            // Create edges
-            let mut edges = Vec::new();
-
-            // Bottom edge
-            let bottom_arc = create_cylinder_arc(
-                params.base_center,
-                z_axis,
-                params.radius,
-                i,
-                params.segments,
-            )?;
-            let bottom_curve = model.curves.add(Box::new(bottom_arc));
-            let bottom_edge = Edge::new(
-                0,
-                bottom_vertices[i as usize],
-                bottom_vertices[next_i as usize],
-                bottom_curve,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            edges.push(model.edges.add_or_find(bottom_edge));
-
-            // Right vertical edge
-            let right_line = create_vertical_line(
-                model,
-                bottom_vertices[next_i as usize],
-                top_vertices[next_i as usize],
-            )?;
-            let right_curve = model.curves.add(Box::new(right_line));
-            let right_edge = Edge::new(
-                0,
-                bottom_vertices[next_i as usize],
-                top_vertices[next_i as usize],
-                right_curve,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            edges.push(model.edges.add_or_find(right_edge));
-
-            // Top edge (reversed)
-            let top_arc = create_cylinder_arc(
-                top_center_pt,
-                z_axis,
-                params.radius,
-                next_i,
-                params.segments,
-            )?;
-            let top_curve = model.curves.add(Box::new(top_arc));
-            let top_edge = Edge::new(
-                0,
-                top_vertices[next_i as usize],
-                top_vertices[i as usize],
-                top_curve,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            edges.push(model.edges.add_or_find(top_edge));
-
-            // Left vertical edge (reversed)
-            let left_line =
-                create_vertical_line(model, top_vertices[i as usize], bottom_vertices[i as usize])?;
-            let left_curve = model.curves.add(Box::new(left_line));
-            let left_edge = Edge::new(
-                0,
-                top_vertices[i as usize],
-                bottom_vertices[i as usize],
-                left_curve,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            edges.push(model.edges.add_or_find(left_edge));
-
-            // Create face
-            let mut face_loop = Loop::new(0, LoopType::Outer);
-            for edge_id in edges {
-                face_loop.add_edge(edge_id, true);
-            }
-            let loop_id = model.loops.add(face_loop);
-
-            let face = crate::primitives::face::Face::new(
-                0,
-                cylinder_surface_id,
-                loop_id,
-                FaceOrientation::Forward,
-            );
-            faces.push(model.faces.add(face));
-        }
-
-        // Create bottom cap
+        // ---- loops. ----
+        // Bottom cap: outward normal is `-z_axis`. The Circle is
+        // parameterized CCW when viewed from `+z_axis`. Looking from
+        // `-z_axis` (outside the bottom cap), that traversal appears CW,
+        // so we walk the edge `Backward` to get an outward-CCW loop.
         let mut bottom_loop = Loop::new(0, LoopType::Outer);
-        for i in 0..params.segments {
-            let next_i = (i + 1) % params.segments;
-            let arc = create_cylinder_arc(
-                params.base_center,
-                z_axis,
-                params.radius,
-                next_i,
-                params.segments, // Reversed for outward normal
-            )?;
-            let curve = model.curves.add(Box::new(arc));
-            let edge = Edge::new(
-                0,
-                bottom_vertices[next_i as usize],
-                bottom_vertices[i as usize],
-                curve,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            bottom_loop.add_edge(model.edges.add_or_find(edge), true);
-        }
+        bottom_loop.add_edge(bottom_edge, false);
         let bottom_loop_id = model.loops.add(bottom_loop);
 
-        let bottom_face = crate::primitives::face::Face::new(
+        // Top cap: outward normal is `+z_axis`, same orientation as the
+        // Circle's parametric CCW direction → walk `Forward`.
+        let mut top_loop = Loop::new(0, LoopType::Outer);
+        top_loop.add_edge(top_edge, true);
+        let top_loop_id = model.loops.add(top_loop);
+
+        // Lateral seamed face: in (u, v) parameter space the outer loop
+        // is a CCW rectangle with corners at (0, 0), (2π, 0), (2π, h),
+        // (0, h). Edge sequence:
+        //   (0,0)→(2π,0): bottom_circle forward
+        //   (2π,0)→(2π,h): seam forward
+        //   (2π,h)→(0,h): top_circle backward
+        //   (0,h)→(0,0): seam backward
+        let mut lateral_loop = Loop::new(0, LoopType::Outer);
+        lateral_loop.add_edge(bottom_edge, true);
+        lateral_loop.add_edge(seam_edge, true);
+        lateral_loop.add_edge(top_edge, false);
+        lateral_loop.add_edge(seam_edge, false);
+        let lateral_loop_id = model.loops.add(lateral_loop);
+
+        // ---- faces. ----
+        let mut bottom_face = crate::primitives::face::Face::new(
             0,
-            bottom_plane_id,
+            bottom_surface_id,
             bottom_loop_id,
             FaceOrientation::Forward,
         );
-        faces.push(model.faces.add(bottom_face));
+        bottom_face.outer_loop = bottom_loop_id;
+        let bottom_face_id = model.faces.add(bottom_face);
 
-        // Create top cap
-        let mut top_loop = Loop::new(0, LoopType::Outer);
-        for i in 0..params.segments {
-            let next_i = (i + 1) % params.segments;
-            let arc =
-                create_cylinder_arc(top_center_pt, z_axis, params.radius, i, params.segments)?;
-            let curve = model.curves.add(Box::new(arc));
-            let edge = Edge::new(
-                0,
-                top_vertices[i as usize],
-                top_vertices[next_i as usize],
-                curve,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            top_loop.add_edge(model.edges.add_or_find(edge), true);
-        }
-        let top_loop_id = model.loops.add(top_loop);
-
-        let top_face = crate::primitives::face::Face::new(
+        let mut top_face = crate::primitives::face::Face::new(
             0,
-            top_plane_id,
+            top_surface_id,
             top_loop_id,
             FaceOrientation::Forward,
         );
-        faces.push(model.faces.add(top_face));
+        top_face.outer_loop = top_loop_id;
+        let top_face_id = model.faces.add(top_face);
 
-        // Create shell and solid
+        let mut lateral_face = crate::primitives::face::Face::new(
+            0,
+            lateral_surface_id,
+            lateral_loop_id,
+            FaceOrientation::Forward,
+        );
+        lateral_face.outer_loop = lateral_loop_id;
+        let lateral_face_id = model.faces.add(lateral_face);
+
+        // ---- shell + solid. ----
         let mut shell = Shell::new(0, ShellType::Closed);
-        for face_id in faces {
-            shell.add_face(face_id);
-        }
+        shell.add_face(bottom_face_id);
+        shell.add_face(top_face_id);
+        shell.add_face(lateral_face_id);
         let shell_id = model.shells.add(shell);
 
         let solid = Solid::new(0, shell_id);
-        let solid_id = model.solids.add(solid);
-
-        Ok(solid_id)
+        Ok(model.solids.add(solid))
     }
 
     fn update_parameters(
@@ -577,51 +490,6 @@ impl Primitive for CylinderPrimitive {
             constraints: vec![],
         }
     }
-}
-
-// Helper functions
-fn create_cylinder_arc(
-    center: Point3,
-    axis: Vector3,
-    radius: f64,
-    segment: u32,
-    total_segments: u32,
-) -> Result<Arc, PrimitiveError> {
-    let start_angle = 2.0 * consts::PI * (segment as f64) / (total_segments as f64);
-    let sweep_angle = 2.0 * consts::PI / (total_segments as f64);
-
-    Arc::new(center, axis, radius, start_angle, sweep_angle).map_err(|_| {
-        PrimitiveError::GeometryError {
-            operation: "create_arc".to_string(),
-            details: "Failed to create cylinder arc".to_string(),
-        }
-    })
-}
-
-fn create_vertical_line(
-    model: &BRepModel,
-    bottom_vertex: VertexId,
-    top_vertex: VertexId,
-) -> Result<Line, PrimitiveError> {
-    let bottom_pos = model.vertices.get_position(bottom_vertex).ok_or_else(|| {
-        PrimitiveError::TopologyError {
-            message: format!("Bottom vertex {:?} not found", bottom_vertex),
-            euler_characteristic: None,
-        }
-    })?;
-    let top_pos =
-        model
-            .vertices
-            .get_position(top_vertex)
-            .ok_or_else(|| PrimitiveError::TopologyError {
-                message: format!("Top vertex {:?} not found", top_vertex),
-                euler_characteristic: None,
-            })?;
-
-    Ok(Line::new(
-        Point3::new(bottom_pos[0], bottom_pos[1], bottom_pos[2]),
-        Point3::new(top_pos[0], top_pos[1], top_pos[2]),
-    ))
 }
 
 #[cfg(test)]

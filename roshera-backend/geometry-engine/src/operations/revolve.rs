@@ -819,9 +819,9 @@ fn face_intersects_axis(
                 .get(vertex_id)
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
             let point = Point3::new(
-                vertex.position[0] as f64,
-                vertex.position[1] as f64,
-                vertex.position[2] as f64,
+                vertex.position[0],
+                vertex.position[1],
+                vertex.position[2],
             );
             let r = radial_offset(point);
             if r.magnitude() < tolerance {
@@ -898,32 +898,33 @@ fn face_intersects_axis(
                     if let Some(edge) = model.edges.get(edge_id) {
                         if let Some(vertex) = model.vertices.get(edge.start_vertex) {
                             let p = Point3::new(
-                                vertex.position[0] as f64,
-                                vertex.position[1] as f64,
-                                vertex.position[2] as f64,
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
                             );
                             polygon.push(project_2d(p));
                         }
                     }
                 }
 
-                if polygon.len() >= 3 {
-                    let (px, py) = project_2d(pierce);
-                    let mut inside = false;
-                    let n_pts = polygon.len();
-                    let mut j = n_pts - 1;
-                    for i in 0..n_pts {
-                        let (xi, yi) = polygon[i];
-                        let (xj, yj) = polygon[j];
-                        let crosses = (yi > py) != (yj > py)
-                            && px < (xj - xi) * (py - yi) / (yj - yi) + xi;
-                        if crosses {
-                            inside = !inside;
+                if let Some(&last) = polygon.last() {
+                    if polygon.len() >= 3 {
+                        let (px, py) = project_2d(pierce);
+                        let mut inside = false;
+                        let mut prev = last;
+                        for &curr in &polygon {
+                            let (xi, yi) = curr;
+                            let (xj, yj) = prev;
+                            let crosses = (yi > py) != (yj > py)
+                                && px < (xj - xi) * (py - yi) / (yj - yi) + xi;
+                            if crosses {
+                                inside = !inside;
+                            }
+                            prev = curr;
                         }
-                        j = i;
-                    }
-                    if inside {
-                        return Ok(true);
+                        if inside {
+                            return Ok(true);
+                        }
                     }
                 }
             }

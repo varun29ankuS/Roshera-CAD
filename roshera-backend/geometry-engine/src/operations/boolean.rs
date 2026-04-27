@@ -127,7 +127,20 @@ impl std::fmt::Debug for ParametricCurve {
 struct SplitFace {
     original_face: FaceId,
     surface: SurfaceId,
-    boundary_edges: Vec<EdgeId>,
+    /// Boundary edges in walk order, paired with each edge's
+    /// orientation in this face's loop:
+    ///
+    ///   * `true`  — the edge is traversed in its native start→end
+    ///               direction (vertex `start_vertex` first).
+    ///   * `false` — the edge is traversed end→start (the loop walks
+    ///               against the edge's stored direction).
+    ///
+    /// Originally a flat `Vec<EdgeId>` that hard-coded `forward=true` at
+    /// loop reconstruction (`build_shells_from_faces`), silently
+    /// corrupting topology for any cycle whose DCEL walk crossed an
+    /// edge end→start. Carrying the half-edge `forward` bit through the
+    /// pipeline preserves orientation end-to-end.
+    boundary_edges: Vec<(EdgeId, bool)>,
     classification: FaceClassification,
     /// Which solid this face originally came from.
     ///
@@ -2161,9 +2174,10 @@ fn split_face_by_curves(
     // Create intersection graph
     let mut graph = IntersectionGraph::new();
 
-    // Add existing boundary edges to graph
-    for edge_id in &boundary_edges {
-        graph.add_edge(*edge_id, EdgeType::Boundary);
+    // Add existing boundary edges to graph (orientation is irrelevant
+    // here — the graph is undirected and only needs edge identity).
+    for &(edge_id, _) in &boundary_edges {
+        graph.add_edge(edge_id, EdgeType::Boundary);
     }
 
     // Add splitting curves to graph
@@ -2248,7 +2262,7 @@ fn split_face_by_curves(
 /// evaluation fails, the slot is left `None` so callers fall back to the
 /// default boundary-midpoint centroid.
 fn compute_split_face_interior_points(
-    loops: &[Vec<EdgeId>],
+    loops: &[Vec<(EdgeId, bool)>],
     model: &BRepModel,
     surface_id: SurfaceId,
 ) -> Vec<Option<Point3>> {
@@ -2262,11 +2276,16 @@ fn compute_split_face_interior_points(
         None => return result,
     };
 
-    // Extract ordered 3D vertices per cycle. If any cycle is malformed we
-    // abandon the whole correction pass — falling back is always safe.
+    // Extract ordered 3D vertices per cycle. Orientations are not needed
+    // for interior-point sampling (it's purely geometric — find shared
+    // vertices between consecutive edges and project to a tangent plane),
+    // so strip them before calling `extract_cycle_vertices_3d`. If any
+    // cycle is malformed we abandon the whole correction pass — falling
+    // back is always safe.
     let mut loop_vertices_3d: Vec<Vec<Point3>> = Vec::with_capacity(loops.len());
     for cycle in loops {
-        let verts = extract_cycle_vertices_3d(cycle, model);
+        let edge_only: Vec<EdgeId> = cycle.iter().map(|(e, _)| *e).collect();
+        let verts = extract_cycle_vertices_3d(&edge_only, model);
         if verts.len() < 3 {
             return result;
         }
@@ -2501,8 +2520,18 @@ impl IntersectionGraph {
     }
 }
 
-/// Get boundary edges of a face
-fn get_face_boundary_edges(model: &BRepModel, face_id: FaceId) -> OperationResult<Vec<EdgeId>> {
+/// Get boundary edges of a face, paired with the per-edge orientation
+/// recorded in each loop.
+///
+/// Each entry is `(edge_id, forward)` where `forward` is taken from the
+/// loop's `orientations` vector. When a loop's `orientations` vector is
+/// shorter than its `edges` vector (legacy data), missing entries default
+/// to `true` to match the historical behavior of the code that hard-coded
+/// `forward=true` at loop reconstruction.
+fn get_face_boundary_edges(
+    model: &BRepModel,
+    face_id: FaceId,
+) -> OperationResult<Vec<(EdgeId, bool)>> {
     let face = model
         .faces
         .get(face_id)
@@ -2512,9 +2541,9 @@ fn get_face_boundary_edges(model: &BRepModel, face_id: FaceId) -> OperationResul
             received: format!("{:?}", face_id),
         })?;
 
-    let mut edges = Vec::new();
+    let mut edges: Vec<(EdgeId, bool)> = Vec::new();
 
-    // Get outer loop edges
+    // Get outer loop edges, zipped with their per-edge orientations.
     let outer_loop =
         model
             .loops
@@ -2524,9 +2553,12 @@ fn get_face_boundary_edges(model: &BRepModel, face_id: FaceId) -> OperationResul
                 expected: "valid loop ID".to_string(),
                 received: format!("{:?}", face.outer_loop),
             })?;
-    edges.extend(outer_loop.edges.clone());
+    for (i, &eid) in outer_loop.edges.iter().enumerate() {
+        let fwd = outer_loop.orientations.get(i).copied().unwrap_or(true);
+        edges.push((eid, fwd));
+    }
 
-    // Get inner loop edges
+    // Get inner loop edges, also with their orientations.
     for loop_id in &face.inner_loops {
         let inner_loop = model
             .loops
@@ -2536,7 +2568,10 @@ fn get_face_boundary_edges(model: &BRepModel, face_id: FaceId) -> OperationResul
                 expected: "valid loop ID".to_string(),
                 received: format!("{:?}", loop_id),
             })?;
-        edges.extend(inner_loop.edges.clone());
+        for (i, &eid) in inner_loop.edges.iter().enumerate() {
+            let fwd = inner_loop.orientations.get(i).copied().unwrap_or(true);
+            edges.push((eid, fwd));
+        }
     }
 
     Ok(edges)
@@ -2644,7 +2679,7 @@ fn clip_line_to_planar_face(
     // the test independent of world scale.
     let edge_param_slack = 1e-9_f64;
 
-    for &edge_id in &boundary_edges {
+    for &(edge_id, _) in &boundary_edges {
         let edge = model
             .edges
             .get(edge_id)
@@ -2881,7 +2916,7 @@ fn clip_circle_to_planar_face(
     let r2 = radius * radius;
     let edge_param_slack = 1e-9_f64;
 
-    for &edge_id in &boundary_edges {
+    for &(edge_id, _) in &boundary_edges {
         let edge = model
             .edges
             .get(edge_id)
@@ -3819,10 +3854,12 @@ fn find_or_create_intersection_vertex(
 }
 
 /// Create split face from edges. `origin_solid` is stamped directly on the
-/// result; classification fills in `classification` later.
+/// result; classification fills in `classification` later. Each
+/// `(edge_id, forward)` pair carries the per-edge orientation derived
+/// from the DCEL cycle walk that produced this face.
 fn create_split_face(
     surface_id: SurfaceId,
-    edges: Vec<EdgeId>,
+    edges: Vec<(EdgeId, bool)>,
     original_face: FaceId,
     origin_solid: SolidId,
 ) -> OperationResult<SplitFace> {
@@ -3971,11 +4008,12 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
         return Ok(p);
     }
 
-    // Collect midpoints of boundary edges
+    // Collect midpoints of boundary edges (orientation does not affect
+    // edge midpoint position, so the forward bit is ignored here).
     let mut sum = Point3::new(0.0, 0.0, 0.0);
     let mut count = 0u32;
 
-    for &edge_id in &face.boundary_edges {
+    for &(edge_id, _) in &face.boundary_edges {
         if let Some(edge) = model.edges.get(edge_id) {
             if let Some(curve) = model.curves.get(edge.curve_id) {
                 let t_mid = (edge.param_range.start + edge.param_range.end) * 0.5;
@@ -4575,11 +4613,20 @@ fn build_shells_from_faces(
         for face_idx in component {
             let split_face = &faces[face_idx];
 
-            // Create a loop from the boundary edges
+            // Create a loop from the boundary edges, preserving each
+            // edge's orientation as recorded by the DCEL cycle walk in
+            // `extract_regions` (or the original loop's orientations
+            // for unsplit faces in `add_non_intersecting_faces`).
+            //
+            // The previous implementation hard-coded `forward=true` for
+            // every edge, which silently corrupted topology any time the
+            // cycle traversed an edge end→start: downstream loop
+            // walkers (`Loop::vertices`, classification, sweep, offset)
+            // then read vertices in the wrong order.
             let mut face_loop =
                 crate::primitives::r#loop::Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
-            for &edge_id in &split_face.boundary_edges {
-                face_loop.add_edge(edge_id, true);
+            for &(edge_id, fwd) in &split_face.boundary_edges {
+                face_loop.add_edge(edge_id, fwd);
             }
 
             // If the split face has no boundary edges, copy from original face
@@ -4622,10 +4669,11 @@ fn group_faces_by_adjacency(faces: &[SplitFace]) -> Vec<Vec<usize>> {
         return vec![];
     }
 
-    // Build edge-to-face-index adjacency
+    // Build edge-to-face-index adjacency. Adjacency is by edge identity
+    // only — orientation does not change which faces share an edge.
     let mut edge_to_faces: HashMap<EdgeId, Vec<usize>> = HashMap::new();
     for (idx, face) in faces.iter().enumerate() {
-        for &eid in &face.boundary_edges {
+        for &(eid, _) in &face.boundary_edges {
             edge_to_faces.entry(eid).or_default().push(idx);
         }
     }
@@ -4780,7 +4828,7 @@ mod tests {
             SplitFace {
                 original_face: 0,
                 surface: 0,
-                boundary_edges: vec![1, 2, 3],
+                boundary_edges: vec![(1, true), (2, true), (3, true)],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
@@ -4788,7 +4836,7 @@ mod tests {
             SplitFace {
                 original_face: 1,
                 surface: 1,
-                boundary_edges: vec![4, 5, 6],
+                boundary_edges: vec![(4, true), (5, true), (6, true)],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
@@ -4807,7 +4855,7 @@ mod tests {
             SplitFace {
                 original_face: 0,
                 surface: 0,
-                boundary_edges: vec![1, 2, 3],
+                boundary_edges: vec![(1, true), (2, true), (3, true)],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
@@ -4815,7 +4863,7 @@ mod tests {
             SplitFace {
                 original_face: 1,
                 surface: 1,
-                boundary_edges: vec![3, 4, 5],
+                boundary_edges: vec![(3, true), (4, true), (5, true)],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
@@ -4823,7 +4871,7 @@ mod tests {
             SplitFace {
                 original_face: 2,
                 surface: 2,
-                boundary_edges: vec![10, 11, 12],
+                boundary_edges: vec![(10, true), (11, true), (12, true)],
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,

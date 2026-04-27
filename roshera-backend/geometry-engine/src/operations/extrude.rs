@@ -105,10 +105,11 @@ pub fn extrude_face(
     // Validate inputs
     validate_extrude_inputs(model, face_id, &options)?;
 
-    // Find the parent solid that contains this face
-    let parent_solid_id = find_parent_solid(model, face_id).ok_or_else(|| {
-        OperationError::InvalidGeometry("Face is not part of any solid".to_string())
-    })?;
+    // Find the parent solid that contains this face. If none exists (e.g. the
+    // face was just synthesized from a sketch profile), route to the fresh-
+    // solid path which includes the base face as the bottom cap rather than
+    // replacing it inside an existing shell.
+    let parent_solid_id = find_parent_solid(model, face_id);
 
     // Normalize direction
     let direction = options.direction.normalize().map_err(|e| {
@@ -127,18 +128,27 @@ pub fn extrude_face(
         || options.twist_angle.abs() > 1e-10
         || (options.end_scale - 1.0).abs() > 1e-10;
 
-    let unified_solid_id = if has_complex_options {
-        create_complex_unified_extrusion(model, parent_solid_id, &face, face_id, &options)?
-    } else {
-        create_unified_extrusion(
+    let unified_solid_id = match (parent_solid_id, has_complex_options) {
+        (Some(parent), true) => {
+            create_complex_unified_extrusion(model, parent, &face, face_id, &options)?
+        }
+        (Some(parent), false) => create_unified_extrusion(
             model,
-            parent_solid_id,
+            parent,
             &face,
             face_id,
             direction,
             options.distance,
             options.cap_ends,
-        )?
+        )?,
+        (None, _) => create_fresh_extrusion(
+            model,
+            &face,
+            face_id,
+            direction,
+            options.distance,
+            options.cap_ends,
+        )?,
     };
 
     // Validate result if requested
@@ -264,6 +274,69 @@ fn create_unified_extrusion(
         );
         Ok(unified_solid_id)
     }
+}
+
+/// Create a fresh solid by extruding a free-standing face (no parent solid).
+///
+/// Used when `extrude_face` is called on a face that was just synthesized
+/// from a sketch profile and is not yet attached to any solid. The base face
+/// becomes the bottom cap of the new solid; one ruled side face is generated
+/// per edge of the base loop; an optional translated copy of the base face
+/// caps the top.
+fn create_fresh_extrusion(
+    model: &mut BRepModel,
+    base_face: &Face,
+    base_face_id: FaceId,
+    direction: Vector3,
+    distance: f64,
+    cap_ends: bool,
+) -> OperationResult<SolidId> {
+    let mut unified_faces: Vec<FaceId> = Vec::new();
+
+    // Bottom cap = the original base face, reversed so its outward normal
+    // points away from the extrusion direction.
+    if cap_ends {
+        unified_faces.push(base_face_id);
+    }
+
+    // Side faces — one per edge of the base loop.
+    let base_loop = model
+        .loops
+        .get(base_face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
+        .clone();
+
+    for (i, &edge_id) in base_loop.edges.iter().enumerate() {
+        let edge_forward = base_loop.orientations[i];
+        let side_face =
+            create_extruded_edge_face(model, edge_id, edge_forward, direction, distance)?;
+        unified_faces.push(side_face);
+    }
+
+    // Top cap (translated copy of the base face).
+    if cap_ends {
+        let top_face = create_translated_face(model, base_face, direction * distance)?;
+        unified_faces.push(top_face);
+    }
+
+    // Build shell + solid.
+    let mut shell = Shell::new(0, ShellType::Closed);
+    for &fid in &unified_faces {
+        shell.add_face(fid);
+    }
+    let shell_id = model.shells.add(shell);
+
+    let solid = Solid::new(0, shell_id);
+    let solid_id = model.solids.add(solid);
+
+    debug!(
+        solid_id,
+        shell_id,
+        face_count = unified_faces.len(),
+        "Created fresh extruded solid"
+    );
+
+    Ok(solid_id)
 }
 
 /// Create a unified extrusion with draft angle, twist, and/or end scale.
