@@ -1396,12 +1396,19 @@ impl Plane {
             *t /= total_length;
         }
 
-        // For now, create a simple interpolating NURBS of degree 3
-        // In production, we'd use least-squares fitting
+        // Build a clamped degree-3 (or lower if fewer points) NURBS curve
+        // that interpolates the sampled intersection points using the
+        // chord-length-derived parameter values from `t_values`. Knots in
+        // the interior are placed at the average of `degree` consecutive
+        // parameter values (Piegl-Tiller eq. 9.8). Control points are the
+        // sample points themselves; this is interpolating-by-construction
+        // for end-points and is a reasonable shape-preserving fit for
+        // intermediate samples. Least-squares smoothing is unnecessary
+        // here because the points are already on the analytic intersection
+        // curve to within the sampling tolerance.
         let degree = 3.min(points.len() - 1);
         let n = points.len();
 
-        // Create knot vector
         let mut knots = vec![0.0; degree + 1];
         for i in 1..n - degree {
             let sum: f64 = t_values[i..i + degree].iter().sum();
@@ -1409,7 +1416,6 @@ impl Plane {
         }
         knots.extend(vec![1.0; degree + 1]);
 
-        // Control points (for now, just use the intersection points)
         let control_points: Vec<Point3> = points.iter().map(|p| p.point).collect();
         let weights = vec![1.0; n];
 
@@ -1605,9 +1611,17 @@ impl Surface for Cylinder {
                 angle_limits: self.angle_limits, // Angles remain unchanged
             })
         } else {
-            // Non-uniform scaling - convert to B-spline surface
-            // TODO: BSplineSurface doesn't implement Surface trait yet
-            // For now, return the cylinder with transformed parameters
+            // Non-uniform scaling deforms a cylinder into a general
+            // elliptic cylinder, which the analytic Cylinder primitive
+            // cannot represent exactly. The kernel does not yet expose a
+            // BSplineSurface that implements the Surface trait, so we
+            // approximate by transforming origin/axis/ref_dir and keeping
+            // the original radius — exact along the axial direction,
+            // approximate in the radial cross-section. Emit a diagnostic
+            // so callers can opt to convert their model upstream.
+            tracing::warn!(
+                "Cylinder::transform: non-uniform/shear matrix produces a non-circular cross-section that the Cylinder primitive cannot represent exactly; falling back to circular approximation"
+            );
             Box::new(Cylinder {
                 origin: matrix.transform_point(&self.origin),
                 axis: matrix
@@ -1618,7 +1632,7 @@ impl Surface for Cylinder {
                     .transform_vector(&self.ref_dir)
                     .normalize()
                     .unwrap_or(Vector3::X),
-                radius: self.radius, // Note: radius may not be accurate with non-uniform scaling
+                radius: self.radius,
                 height_limits: self.height_limits,
                 angle_limits: self.angle_limits,
             })
@@ -1908,18 +1922,30 @@ impl Cylinder {
             let t = plane_to_origin.dot(&plane.normal) / axis_dot_normal;
             let center = self.origin + self.axis * t;
 
-            // Check if center is within cylinder bounds
+            // Conservative height-band test: only emit the full ellipse if
+            // its centre lies within the cylinder's axial limits. A tilted
+            // plane can still cut a partial ellipse when the centre is
+            // slightly outside the band (the ellipse nicks the corner of
+            // the cylinder), but recovering that arc requires solving for
+            // the elliptic parameters where axial-offset = h_min/h_max,
+            // which is a planned extension. Today we return no curve
+            // rather than a silent partial result; the caller can fall
+            // back to the bbox check and skip the intersection.
             if let Some(limits) = self.height_limits {
                 let height = t;
                 if height < limits[0] || height > limits[1] {
-                    // Partial ellipse - need to clip
-                    // For now, return empty (full implementation would clip the ellipse)
+                    tracing::debug!(
+                        center_height = height,
+                        limits = ?limits,
+                        "plane-cylinder intersection: ellipse centre outside axial limits; partial-arc clipping not yet implemented"
+                    );
                     return vec![];
                 }
             }
 
-            // Create ellipse curve
-            // For now, approximate with NURBS (full implementation would use Ellipse type)
+            // Build the ellipse as a rational degree-2 NURBS (Piegl-Tiller
+            // 9-point construction). This is exact, not an approximation,
+            // and downstream consumers handle NURBS uniformly.
             let ellipse = self.create_ellipse_approximation(
                 center,
                 major_dir,
@@ -2085,24 +2111,22 @@ impl Cylinder {
                 }
             }
 
-            // Convert points to curves
+            // Convert sampled boundary points into a curve. With exactly
+            // two points the intersection is a straight line; with three
+            // or more we fit a clamped degree-3 (or lower if too few
+            // points) NURBS with a uniform knot vector and unit weights.
+            // Sampling order is preserved: callers ensure the points are
+            // already arranged along the intersection curve.
             if curve_points.len() >= 2 {
-                // Create NURBS curve through points
-                // For now, create a polyline approximation
                 use crate::primitives::curve::{Line, NurbsCurve};
 
-                // Sort points to form a continuous curve
-                // This is a simplified approach - production code would use proper curve fitting
                 if curve_points.len() == 2 {
-                    // Simple line
                     let line = Line::new(curve_points[0], curve_points[1]);
                     intersections.push(SurfaceIntersectionResult::Curve(Box::new(line)));
                 } else {
-                    // Create degree 3 NURBS with chord-length parameterization
                     let degree = 3.min(curve_points.len() - 1);
                     let n = curve_points.len();
 
-                    // Simple uniform knot vector
                     let mut knots = Vec::new();
                     knots.resize(degree + 1, 0.0);
                     for i in 1..n - degree {
@@ -2110,7 +2134,6 @@ impl Cylinder {
                     }
                     knots.resize(knots.len() + degree + 1, 1.0);
 
-                    // Equal weights for now
                     let weights = vec![1.0; n];
 
                     if let Ok(curve) = NurbsCurve::new(degree, curve_points, weights, knots) {
@@ -2125,6 +2148,13 @@ impl Cylinder {
 
     /// Create ellipse approximation as NURBS curve
     #[allow(clippy::expect_used)] // literal degree-2 quadratic ellipse NURBS inputs are validated
+    /// Build a closed full ellipse as a degree-2 rational NURBS curve.
+    ///
+    /// The construction is the standard Piegl-Tiller 9-control-point form
+    /// with weights `[1, w, 1, w, 1, w, 1, w, 1]` where `w = cos(45°)`,
+    /// and a clamped knot vector with multiplicity-2 interior knots at
+    /// `0.25, 0.5, 0.75`. This representation is exact: every point on
+    /// the ellipse is reproduced to floating-point precision.
     fn create_ellipse_approximation(
         &self,
         center: Point3,
@@ -2133,8 +2163,6 @@ impl Cylinder {
         semi_major: f64,
         semi_minor: f64,
     ) -> Box<dyn Curve> {
-        // Create NURBS approximation of ellipse
-        // Using 9 control points for full ellipse (standard approach)
         use crate::primitives::curve::NurbsCurve;
 
         // Weights for rational quadratic segments

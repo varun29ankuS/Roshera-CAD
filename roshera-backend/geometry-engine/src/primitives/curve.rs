@@ -3869,8 +3869,11 @@ impl Curve for Ellipse {
     }
 
     fn split(&self, t: f64) -> MathResult<(Box<dyn Curve>, Box<dyn Curve>)> {
-        // Split ellipse into two arcs (not implemented as simple ellipses)
-        // For now, return NURBS representation
+        // The kernel does not have a dedicated EllipticArc primitive yet,
+        // so the two pieces are returned as NURBS curves. This is exact:
+        // Ellipse::to_nurbs produces a degree-2 rational representation
+        // (4 quarter-arc Bezier patches), and NurbsCurve::split is exact
+        // via Boehm knot insertion.
         let nurbs = self.to_nurbs();
         nurbs.split(t)
     }

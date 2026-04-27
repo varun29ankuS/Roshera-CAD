@@ -244,40 +244,24 @@ fn project_curve_onto_surface(
     Ok(projected_curve)
 }
 
-/// Project point onto surface
+/// Project a point onto a surface using the surface's exact closest-point
+/// query (Newton-refined per implementation in `Surface::closest_point`),
+/// then return the surface point at the resulting parameters.
+///
+/// `_direction` is currently unused: imprinting only requires the foot of
+/// the orthogonal projection. Directional projection (along a given vector
+/// rather than along the surface normal) is a separate operation handled
+/// by the boolean intersector.
 fn project_point_onto_surface(
     point: Point3,
     surface: &dyn Surface,
     _direction: Vector3,
 ) -> OperationResult<Point3> {
-    // Would implement actual projection
-    // For now, return closest point on surface
-    // The Surface trait doesn't have a closest_point method
-    // Use a simple grid search instead
-    let bounds = surface.parameter_bounds();
-    let mut best_distance = f64::MAX;
-    let mut best_u = 0.0;
-    let mut best_v = 0.0;
-
-    // Grid search
-    let samples = 20;
-    for i in 0..=samples {
-        for j in 0..=samples {
-            let u = bounds.0 .0 + (i as f64 / samples as f64) * (bounds.0 .1 - bounds.0 .0);
-            let v = bounds.1 .0 + (j as f64 / samples as f64) * (bounds.1 .1 - bounds.1 .0);
-
-            let surface_point = surface.point_at(u, v)?;
-            let distance = point.distance(&surface_point);
-
-            if distance < best_distance {
-                best_distance = distance;
-                best_u = u;
-                best_v = v;
-            }
-        }
-    }
-
-    Ok(surface.point_at(best_u, best_v)?)
+    let tolerance = crate::math::Tolerance::default();
+    let (u, v) = surface.closest_point(&point, tolerance).map_err(|e| {
+        OperationError::NumericalError(format!("project_point_onto_surface failed: {:?}", e))
+    })?;
+    Ok(surface.point_at(u, v)?)
 }
 
 /// Create an interpolated curve through projected sample points.

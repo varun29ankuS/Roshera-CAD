@@ -215,8 +215,12 @@ pub fn intersect_surfaces(
         .get(face2.surface_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Second surface not found".to_string()))?;
 
-    // For now, check if surfaces are planes by sampling normals
-    // In a full implementation, we would use type IDs or dynamic dispatch
+    // Detect planes by comparing two sampled normals. This works
+    // uniformly across all Surface impls without needing
+    // type-id dispatch and only costs two normal evaluations
+    // per face. The dedicated `surface.surface_type()` enum is used
+    // elsewhere when the kernel must distinguish between specific
+    // analytic primitives (cylinder vs sphere etc.).
     let (u1_range, v1_range) = surface1.parameter_bounds();
     let (u2_range, v2_range) = surface2.parameter_bounds();
 
