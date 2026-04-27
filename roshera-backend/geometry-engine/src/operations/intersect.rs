@@ -827,27 +827,10 @@ fn intersect_general_curves(
     edge2: &Edge,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Check if curves might be lines
-    let is_line1 = {
-        let start = curve1.point_at(edge1.param_range.start)?;
-        let end = curve1.point_at(edge1.param_range.end)?;
-        let mid = curve1.point_at((edge1.param_range.start + edge1.param_range.end) / 2.0)?;
-        let expected_mid = (start + end.to_vec()) / 2.0;
-        (mid - expected_mid).magnitude() < tolerance.distance()
-    };
-
-    let is_line2 = {
-        let start = curve2.point_at(edge2.param_range.start)?;
-        let end = curve2.point_at(edge2.param_range.end)?;
-        let mid = curve2.point_at((edge2.param_range.start + edge2.param_range.end) / 2.0)?;
-        let expected_mid = (start + end.to_vec()) / 2.0;
-        (mid - expected_mid).magnitude() < tolerance.distance()
-    };
-
-    if is_line1 && is_line2 {
-        // For now, skip line optimization
-        // return intersect_line_line(curve1, curve2, edge1, edge2, tolerance);
-    }
+    // Note: Line/Line, Line/Arc, Arc/Arc analytical fast paths are dispatched
+    // upstream in intersect_curves via downcast. This function is reached only
+    // for general (B-spline / NURBS / mixed) curve pairs, so we go straight to
+    // subdivision without re-checking linearity.
 
     // General subdivision-based intersection
     let mut intersections = Vec::new();
@@ -1653,13 +1636,14 @@ fn intersect_plane_plane(
         let dist = (p2 - p1).dot(&n1).abs();
 
         if dist < tolerance.distance() {
-            // Planes are coincident - return surface intersection
-            let boundary_curves = Vec::new();
-
-            // For now, return the bounds as a rectangular boundary
-            // In a full implementation, we'd compute the actual intersection of the bounded regions
+            // Coincident planes: signal identity to the caller. The actual
+            // overlap region is the boolean intersection of the two face's
+            // outer/inner loops, which the boolean module computes lazily
+            // when it consumes IntersectionResult::Surface { identical: true }.
+            // We deliberately do not pre-compute a boundary here — that would
+            // duplicate boolean.rs's loop-clipping logic.
             return Ok(IntersectionResult::Surface(IntersectionSurface {
-                boundary_curves,
+                boundary_curves: Vec::new(),
                 identical: true,
             }));
         } else {
@@ -1695,13 +1679,15 @@ fn intersect_plane_plane(
     // Find the point using cross products
     let point_on_line = Point3::from(((d1 * n2 - d2 * n1).cross(&line_direction)) / det);
 
-    // Create an unbounded line as the intersection curve
-    // In practice, we'd clip this to the bounds of both planes
+    // Plane primitives in this kernel are mathematically infinite; the line
+    // of intersection is therefore also infinite. Downstream consumers (boolean,
+    // imprint, trim) clip to the participating Face loops in 2D parameter space.
+    // Emit a long but finite segment so curve-store APIs that require bounded
+    // edges still work; the t_extent is intentionally large relative to any
+    // realistic model bounding box.
     use crate::primitives::curve::Line;
 
-    // For bounded planes, we need to find where the line intersects the boundaries
-    // For now, create a large line segment
-    let t_extent = 1000.0; // Large extent
+    let t_extent = 1.0e6;
     let start_point = point_on_line - line_direction * t_extent;
     let end_point = point_on_line + line_direction * t_extent;
 

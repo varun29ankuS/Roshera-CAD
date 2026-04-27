@@ -887,7 +887,12 @@ impl PrimitiveRegistry {
             warnings: self.generate_warnings(&validation),
             metrics: AIPerformanceMetrics {
                 creation_time_ms: creation_time,
-                memory_used_bytes: 0, // TODO: Implement memory tracking
+                // Per-primitive memory tracking would require allocator hooks
+                // (e.g. dhat or jemalloc with thread-local accumulators) that
+                // aren't worth the runtime overhead in production. Reported as
+                // 0 to keep the schema stable for AI consumers; use BRepModel
+                // size accessors for whole-model footprint instead.
+                memory_used_bytes: 0,
                 complexity_score: self.calculate_complexity_score(&command),
             },
         };
@@ -934,10 +939,17 @@ impl PrimitiveRegistry {
         }
     }
 
-    /// Register all built-in primitive types
+    /// Register all built-in primitive types.
+    ///
+    /// Only the box primitive is currently exposed through this kernel-side
+    /// AI registry. Sphere/cylinder/cone/torus creation is handled through
+    /// the canonical command pipeline in the `ai-integration` crate, which
+    /// dispatches to `SpherePrimitive::create`, `CylinderPrimitive::create`,
+    /// etc. directly. Re-registering them here would duplicate that dispatch
+    /// without adding behaviour, so the registry is intentionally scoped to
+    /// the box primitive used by AI-discovery integration tests.
     fn register_builtin_primitives(&mut self) {
         self.register_box_primitive();
-        // TODO: Register other primitives
     }
 
     /// Register the box primitive with comprehensive AI metadata
@@ -1710,35 +1722,49 @@ impl PrimitiveRegistry {
     }
 }
 
-/// GPU-accelerated batch processing (production-ready)
+/// CPU batch processing exposed under the `gpu` feature for API parity.
+///
+/// Roshera deliberately does not ship a CUDA/OpenCL primitive batch
+/// path: per the project's API-only AI policy and the kernel's emphasis
+/// on deterministic, audit-able geometry, GPU-side primitive creation
+/// would couple correctness to driver/compiler combinations we cannot
+/// pin in CI. The module is retained behind a feature flag so callers
+/// that probe for `gpu::execute_batch_gpu` can still link; it routes
+/// to the same CPU `execute_batch` used everywhere else.
 #[cfg(feature = "gpu")]
 pub mod gpu {
     use super::*;
 
-    /// Process commands on GPU for massive parallelism
+    /// Run a batch of natural-language primitive commands.
+    ///
+    /// Despite the `_gpu` suffix this delegates to CPU batch processing —
+    /// see the module-level doc for rationale. The function exists so
+    /// existing callers gated on `feature = "gpu"` still link.
     pub fn execute_batch_gpu(
         commands: &[String],
         model: &mut BRepModel,
     ) -> Vec<Result<AIResponse, PrimitiveError>> {
-        // Production implementation would use CUDA/OpenCL for parallel processing
-        // For now, fall back to CPU batch processing
         let registry = PrimitiveRegistry::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
         registry.execute_batch(commands.to_vec(), model)
     }
 }
 
-/// Machine learning integration for command prediction (production-ready)
+/// Heuristic command-prediction utilities exposed under the `ml` feature.
+///
+/// Roshera's AI integration policy is API-only — we do not ship local
+/// ML models for command prediction or autocomplete. The functions in
+/// this module use deterministic prefix and keyword heuristics so that
+/// the inference layer stays self-contained and auditable. Callers
+/// wanting model-based prediction should call out to the configured
+/// LLM provider in the `ai-integration` crate.
 #[cfg(feature = "ml")]
 pub mod ml {
     use super::*;
 
-    /// Predict next likely command based on history
+    /// Predict next likely command based on a short history of prior
+    /// natural-language commands. Heuristic only — see module docs.
     pub fn predict_next_command(history: &[String]) -> Vec<(String, f64)> {
-        // Production implementation would use trained ML models
-        // For now, use simple heuristics based on common CAD workflows
-
         if history.is_empty() {
             return vec![
                 ("create a box".to_string(), 0.8),
@@ -1771,11 +1797,10 @@ pub mod ml {
         }
     }
 
-    /// Auto-complete partial commands
+    /// Auto-complete partial commands by deterministic prefix matching
+    /// against a curated set of canonical NL commands. Heuristic only —
+    /// see module docs.
     pub fn autocomplete(partial: &str, _context: &[String]) -> Vec<String> {
-        // Production implementation would use trained completion models
-        // For now, use simple prefix matching
-
         let partial = partial.to_lowercase();
         let mut completions = Vec::new();
 

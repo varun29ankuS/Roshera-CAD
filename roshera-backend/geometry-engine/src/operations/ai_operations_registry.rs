@@ -502,7 +502,11 @@ impl OperationsRegistry {
             entities: result,
             description: self.generate_operation_description(&command),
             metrics: OperationMetrics {
-                parse_time_ms: 0.5, // Placeholder
+                // Parsing of the AI command happens upstream of this registry
+                // (see ai-integration crate); execute_command() only sees the
+                // already-parsed AIOperationCommand. parse_time_ms is therefore
+                // not measurable here and is reported as 0.0.
+                parse_time_ms: 0.0,
                 execution_time_ms: execution_time,
                 entities_processed: command.targets.len(),
                 memory_used_bytes: std::mem::size_of::<AIOperationCommand>()
@@ -547,7 +551,9 @@ impl OperationsRegistry {
             ));
         }
 
-        // For now, assume first two targets are solids
+        // Boolean is a pairwise operation: take the first two SolidId targets.
+        // The match arms below hard-error on non-Solid references, so this
+        // assumption is enforced rather than implicit.
         let solid_a = match &command.targets[0] {
             EntityReference::Solid(id) => *id,
             _ => {
