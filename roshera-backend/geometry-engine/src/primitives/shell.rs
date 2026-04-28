@@ -586,7 +586,20 @@ impl Shell {
         Ok(winding_number.abs() > 0.5 - band)
     }
 
-    /// Calculate solid angle subtended by face at point
+    /// Calculate solid angle subtended by face at point.
+    ///
+    /// Uses a triangle fan from `vertices[0]` over the outer loop's
+    /// vertices, summing per-triangle solid angles via the
+    /// Van-Oosterom & Strackee (1983) formula
+    /// `Ω = 2·atan2(det, 1 + a·b + b·c + c·a)` where `a, b, c` are the
+    /// unit vectors from the query point to the triangle corners.
+    ///
+    /// Correct for planar faces. For curved faces the fan is an
+    /// approximation: a flat triangle subtends a different solid angle
+    /// than the curved patch it covers. The error is bounded by the
+    /// face's deviation from planarity and is acceptable for the
+    /// winding-number-based point-in-shell test that consumes this
+    /// value (which only needs the integer winding count, not exact Ω).
     fn calculate_solid_angle(
         &self,
         point: &Point3,
@@ -595,9 +608,6 @@ impl Shell {
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
     ) -> MathResult<f64> {
-        // Simplified calculation using face triangulation
-        // Real implementation would be more sophisticated
-
         let outer_loop = loop_store
             .get(face.outer_loop)
             .ok_or(MathError::InvalidParameter("Loop not found".to_string()))?;

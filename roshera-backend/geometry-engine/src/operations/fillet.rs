@@ -19,7 +19,7 @@ use crate::primitives::{
     curve::{Curve, Line, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
-    fillet_surfaces::{CylindricalFillet, SphericalFillet, ToroidalFillet, VariableRadiusFillet},
+    fillet_surfaces::{CylindricalFillet, ToroidalFillet, VariableRadiusFillet},
     solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
@@ -495,57 +495,60 @@ fn create_chord_fillet(
     create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius)
 }
 
-/// Create spherical blend at vertex
+/// Create spherical blend at a vertex.
+///
+/// A complete vertex blend requires intersecting the spherical patch at
+/// the vertex against each adjacent edge-fillet surface (toroidal /
+/// cylindrical) to compute the trimming loop on the sphere, then
+/// re-trimming each adjacent fillet against the sphere. Without those
+/// trimming curves the resulting face has no loop and is topologically
+/// invalid: it cannot be tessellated, cannot be sewn into a shell, and
+/// silently breaks downstream operations (volume, surface area,
+/// boolean) that walk loops.
+///
+/// Rather than emit a broken face we fail loudly with
+/// `OperationError::NotImplemented`. The caller (`fillet_vertices`)
+/// propagates the error so the user sees a precise diagnostic instead
+/// of a silently corrupt B-Rep. The validated input (vertex / edge /
+/// curve existence) is still checked here so the error path is honest.
 fn create_vertex_blend(
     model: &mut BRepModel,
     vertex_id: VertexId,
     edges: &[EdgeId],
     radius: f64,
 ) -> OperationResult<Vec<FaceId>> {
-    let vertex = model
+    // Validate referenced topology is sound before reporting
+    // not-implemented — invalid input should surface as InvalidGeometry,
+    // not be masked behind the NotImplemented branch.
+    let _vertex = model
         .vertices
         .get(vertex_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
 
-    let vertex_point = Vector3::from(vertex.position);
-
-    // Get edge curves at vertex
-    let mut edge_curves = Vec::new();
     for &edge_id in edges {
         let edge = model
             .edges
             .get(edge_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
-
-        // Get the curve and determine if we need to reverse it
-        let curve = model
+        model
             .curves
             .get(edge.curve_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
-
-        // Clone the curve (simplified - would handle orientation properly)
-        edge_curves.push(curve.clone_box());
     }
 
-    // Create spherical fillet surface
-    let sphere_fillet = SphericalFillet::new(vertex_point, radius, edge_curves).map_err(|e| {
-        OperationError::NumericalError(format!("Failed to create spherical fillet: {:?}", e))
-    })?;
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(OperationError::InvalidRadius(radius));
+    }
 
-    let surface_id = model.surfaces.add(Box::new(sphere_fillet));
-
-    // Create face for the spherical patch
-    // In production, this would compute proper trimming curves
-    let face = Face::new(
-        0, // Temporary ID
-        surface_id,
-        0, // Would create proper loop
-        FaceOrientation::Forward,
-    );
-
-    let face_id = model.faces.add(face);
-
-    Ok(vec![face_id])
+    Err(OperationError::NotImplemented(format!(
+        "Vertex blend (spherical corner fillet) at vertex {:?} with {} \
+         incident edges and radius {} requires sphere-fillet trimming \
+         curve computation against adjacent edge-fillet surfaces, which \
+         is not yet implemented. Apply edge fillets only.",
+        vertex_id,
+        edges.len(),
+        radius
+    )))
 }
 
 /// Data for rolling ball fillet computation
