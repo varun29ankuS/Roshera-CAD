@@ -259,19 +259,33 @@ pub async fn get_object_details(
 ) -> Json<SceneResponse> {
     tracing::info!("Object details requested for ID: {}", object_id);
 
-    let model = state.model.read().await;
+    // Write lock is required because Solid::compute_mass_properties mutates
+    // the solid (cached_mass_props) and the shell/face/loop stores during
+    // the divergence-theorem volume integration. The lock window is short:
+    // results are cached on the solid after the first computation.
+    let mut model_guard = state.model.write().await;
     let solids = state.solids.read().await;
 
-    if let Some(solid) = model.solids.get(object_id) {
+    if model_guard.solids.get(object_id).is_some() {
         let shape_type = solids
             .get(&object_id)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         let object_type = parse_object_type(&shape_type, &object_id);
-        let bounding_box = calculate_bounding_box(solid, &model);
 
-        // Calculate mass properties if possible
-        let mass_properties = calculate_mass_properties(solid, &model);
+        // Reborrow immutably for bounding box, then mutably for mass props.
+        let bounding_box = {
+            let solid = model_guard
+                .solids
+                .get(object_id)
+                .expect("solid presence verified above");
+            calculate_bounding_box(solid, &model_guard)
+        };
+
+        // Real kernel mass properties (volume + COG + inertia tensor) via
+        // divergence-theorem integration. Returns None on numerical failure
+        // — we never silently fall back to bbox approximations.
+        let mass_properties = calculate_mass_properties(object_id, &mut model_guard);
 
         let scene_object = SceneObject {
             id: uuid::Uuid::new_v4(),
@@ -433,21 +447,86 @@ fn calculate_bounding_box(
     SceneBoundingBox { min, max }
 }
 
+/// Compute real mass properties (volume, surface area, center of mass) by
+/// invoking the kernel's divergence-theorem integration.
+///
+/// Replaces the previous bbox-volume placeholder. The kernel caches results
+/// on the solid after the first computation, so subsequent calls are O(1).
+///
+/// Returns `None` if either the surface area integration or the mass-property
+/// integration fails — the caller treats the absence of mass properties as a
+/// signal that the topology is degenerate, not as a license to fall back to a
+/// bounding-box approximation.
 fn calculate_mass_properties(
-    solid: &geometry_engine::primitives::solid::Solid,
-    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid_id: u32,
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
 ) -> Option<MassProperties> {
-    // This is a placeholder - real implementation would calculate
-    // actual volume, surface area, and center of mass
-    let bbox = calculate_bounding_box(solid, model);
-    let dims = bbox.dimensions();
-    let volume = dims[0] * dims[1] * dims[2];
-    let surface_area = 2.0 * (dims[0] * dims[1] + dims[1] * dims[2] + dims[0] * dims[2]);
+    use geometry_engine::math::Tolerance;
+
+    // Disjoint-field borrows: the kernel's mass-property API requires a
+    // mutable borrow on the solid plus mutable borrows on the shell, face,
+    // and loop stores, plus immutable borrows on the rest of the model.
+    // Splitting the model reference field-by-field is the only way to
+    // satisfy that signature without restructuring the kernel.
+    //
+    // Compute surface area first (also mutates) so the mass-prop call can
+    // run on top of cached intermediates.
+    let surface_area = {
+        let solid = model.solids.get_mut(solid_id)?;
+        match solid.surface_area(
+            &mut model.shells,
+            &mut model.faces,
+            &mut model.loops,
+            &model.vertices,
+            &model.edges,
+            &model.surfaces,
+            Tolerance::default(),
+        ) {
+            Ok(area) => area,
+            Err(err) => {
+                tracing::warn!(
+                    "surface_area failed for solid {}: {} — omitting mass properties",
+                    solid_id,
+                    err
+                );
+                return None;
+            }
+        }
+    };
+
+    let solid = model.solids.get_mut(solid_id)?;
+    let props = match solid.compute_mass_properties(
+        &mut model.shells,
+        &mut model.faces,
+        &mut model.loops,
+        &model.vertices,
+        &model.edges,
+        &model.curves,
+        &model.surfaces,
+    ) {
+        Ok(p) => p.clone(),
+        Err(err) => {
+            tracing::warn!(
+                "compute_mass_properties failed for solid {}: {} — omitting mass properties",
+                solid_id,
+                err
+            );
+            return None;
+        }
+    };
 
     Some(MassProperties {
-        volume,
-        surface_area,
-        center_of_mass: bbox.center(),
+        volume: props.volume as f32,
+        surface_area: surface_area as f32,
+        center_of_mass: [
+            props.center_of_mass.x as f32,
+            props.center_of_mass.y as f32,
+            props.center_of_mass.z as f32,
+        ],
+        // Mass requires material density which the API does not yet thread
+        // through. The kernel's `props.mass` uses a unit-density placeholder;
+        // returning None here keeps the contract honest until material
+        // assignment is wired end-to-end.
         mass: None,
     })
 }
