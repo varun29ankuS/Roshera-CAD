@@ -764,21 +764,126 @@ impl VolumeIntegrals {
         }
     }
 
-    fn compute_inertia_tensor(&self, _mass: f64, _center_of_mass: &Point3) -> [[f64; 3]; 3] {
-        // Transform inertia to center of mass using parallel axis theorem
-        
+    /// Translate the accumulated origin-frame inertia tensor to the
+    /// center-of-mass frame via the parallel-axis theorem (Goldstein,
+    /// *Classical Mechanics*, §5.3):
+    ///
+    ///     I_C = I_O − m · [(c·c) I₃ − c ⊗ c]
+    ///
+    /// where `I_O` is `self.second_moments` (computed about the origin
+    /// during volume-integral accumulation), `c` is the center of mass,
+    /// `m` is the total mass, `I₃` is the 3×3 identity, and `⊗` denotes
+    /// the outer product. Returns the symmetric tensor about COM.
+    fn compute_inertia_tensor(&self, mass: f64, center_of_mass: &Point3) -> [[f64; 3]; 3] {
+        let c = [center_of_mass.x, center_of_mass.y, center_of_mass.z];
+        let cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
 
-        // Simplified - real implementation would be more sophisticated
-        self.second_moments
+        let mut i_com = self.second_moments;
+        for i in 0..3 {
+            for j in 0..3 {
+                let kron = if i == j { 1.0 } else { 0.0 };
+                // Subtract m·[ (c·c) δ_ij − c_i c_j ]
+                i_com[i][j] -= mass * (cc * kron - c[i] * c[j]);
+            }
+        }
+        i_com
     }
 }
 
-/// Compute principal moments and axes of inertia
+/// Compute principal moments (eigenvalues) and principal axes
+/// (eigenvectors) of a 3×3 symmetric inertia tensor by Jacobi rotations
+/// (Press et al., *Numerical Recipes*, §11.1).
+///
+/// Returns `(principal_moments, principal_axes)` where eigenvalues are
+/// sorted in descending order and `principal_axes[k]` is the unit
+/// eigenvector corresponding to `principal_moments[k]`. The axes form
+/// an orthonormal frame.
+///
+/// Convergence: at most `MAX_SWEEPS` cyclic sweeps; in practice 5–10
+/// sweeps suffice for the off-diagonal sum to drop below `EPS`.
 fn compute_principal_inertia(inertia: &[[f64; 3]; 3]) -> (Vector3, [Vector3; 3]) {
-    // Simplified - real implementation would compute eigenvalues/eigenvectors
-    let principal_moments = Vector3::new(inertia[0][0], inertia[1][1], inertia[2][2]);
+    const MAX_SWEEPS: usize = 50;
+    const EPS: f64 = 1e-14;
 
-    let principal_axes = [Vector3::X, Vector3::Y, Vector3::Z];
+    // Working copy of the symmetric matrix; eigenvalues end up on diag.
+    let mut a = *inertia;
+    // Eigenvector matrix accumulator, starts as identity.
+    let mut v = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+
+    for _ in 0..MAX_SWEEPS {
+        // Off-diagonal Frobenius norm squared.
+        let off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
+        if off < EPS {
+            break;
+        }
+
+        // Rotate every off-diagonal pair (cyclic Jacobi).
+        for &(p, q) in &[(0usize, 1usize), (0, 2), (1, 2)] {
+            let apq = a[p][q];
+            if apq.abs() < EPS {
+                continue;
+            }
+            let app = a[p][p];
+            let aqq = a[q][q];
+
+            // Givens rotation angle that zeroes a[p][q]:
+            //   tan(2θ) = 2 a_pq / (a_pp − a_qq)
+            // Numerically stable form (Press §11.1).
+            let theta = (aqq - app) / (2.0 * apq);
+            let t = if theta >= 0.0 {
+                1.0 / (theta + (1.0 + theta * theta).sqrt())
+            } else {
+                1.0 / (theta - (1.0 + theta * theta).sqrt())
+            };
+            let c = 1.0 / (1.0 + t * t).sqrt();
+            let s = t * c;
+
+            // Update diagonals; off-diagonal a[p][q] becomes 0.
+            a[p][p] = app - t * apq;
+            a[q][q] = aqq + t * apq;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+
+            // Update remaining row/column entries (the third index r).
+            for r in 0..3 {
+                if r != p && r != q {
+                    let arp = a[r][p];
+                    let arq = a[r][q];
+                    a[r][p] = c * arp - s * arq;
+                    a[p][r] = a[r][p];
+                    a[r][q] = s * arp + c * arq;
+                    a[q][r] = a[r][q];
+                }
+            }
+
+            // Accumulate rotation into eigenvector matrix.
+            for r in 0..3 {
+                let vrp = v[r][p];
+                let vrq = v[r][q];
+                v[r][p] = c * vrp - s * vrq;
+                v[r][q] = s * vrp + c * vrq;
+            }
+        }
+    }
+
+    // Sort eigenvalues descending; permute eigenvectors in lockstep.
+    let mut idx = [0usize, 1, 2];
+    idx.sort_by(|&i, &j| {
+        a[j][j]
+            .partial_cmp(&a[i][i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let principal_moments = Vector3::new(a[idx[0]][idx[0]], a[idx[1]][idx[1]], a[idx[2]][idx[2]]);
+    let principal_axes = [
+        Vector3::new(v[0][idx[0]], v[1][idx[0]], v[2][idx[0]]),
+        Vector3::new(v[0][idx[1]], v[1][idx[1]], v[2][idx[1]]),
+        Vector3::new(v[0][idx[2]], v[1][idx[2]], v[2][idx[2]]),
+    ];
 
     (principal_moments, principal_axes)
 }
@@ -1054,4 +1159,128 @@ pub struct SolidValidation {
     pub is_valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod inertia_tests {
+    use super::*;
+
+    /// Diagonal inertia tensor must round-trip through Jacobi unchanged
+    /// (off-diagonals already zero ⇒ no rotations applied).
+    #[test]
+    fn diagonal_tensor_returns_diagonal_eigenvalues_descending() {
+        let inertia = [
+            [3.0, 0.0, 0.0],
+            [0.0, 7.0, 0.0],
+            [0.0, 0.0, 5.0],
+        ];
+        let (moments, axes) = compute_principal_inertia(&inertia);
+
+        // Sorted descending
+        assert!((moments.x - 7.0).abs() < 1e-10);
+        assert!((moments.y - 5.0).abs() < 1e-10);
+        assert!((moments.z - 3.0).abs() < 1e-10);
+
+        // Axes must be permuted unit vectors (up to sign).
+        for axis in &axes {
+            let m = axis.magnitude();
+            assert!((m - 1.0).abs() < 1e-10, "axis not unit length: {}", m);
+        }
+    }
+
+    /// Verify eigendecomposition reconstructs the original tensor:
+    /// I ≈ V · diag(λ) · V^T for a non-trivially coupled symmetric matrix.
+    #[test]
+    fn jacobi_reconstructs_symmetric_matrix() {
+        let inertia = [
+            [4.0, 1.0, -2.0],
+            [1.0, 6.0, 0.5],
+            [-2.0, 0.5, 8.0],
+        ];
+        let (moments, axes) = compute_principal_inertia(&inertia);
+
+        let lambda = [moments.x, moments.y, moments.z];
+        // Reconstruct: A_ij = sum_k λ_k v_ki v_kj
+        let v: [[f64; 3]; 3] = [
+            [axes[0].x, axes[0].y, axes[0].z],
+            [axes[1].x, axes[1].y, axes[1].z],
+            [axes[2].x, axes[2].y, axes[2].z],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut acc = 0.0;
+                for k in 0..3 {
+                    acc += lambda[k] * v[k][i] * v[k][j];
+                }
+                assert!(
+                    (acc - inertia[i][j]).abs() < 1e-9,
+                    "reconstruction failed at ({}, {}): got {}, expected {}",
+                    i,
+                    j,
+                    acc,
+                    inertia[i][j]
+                );
+            }
+        }
+    }
+
+    /// Eigenvectors must be mutually orthogonal (Jacobi guarantees this
+    /// for symmetric input by construction, but the test pins it down).
+    #[test]
+    fn eigenvectors_form_orthonormal_frame() {
+        let inertia = [
+            [10.0, 3.0, 1.0],
+            [3.0, 5.0, -2.0],
+            [1.0, -2.0, 7.0],
+        ];
+        let (_, axes) = compute_principal_inertia(&inertia);
+
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                let dot = axes[i].dot(&axes[j]);
+                assert!(
+                    dot.abs() < 1e-9,
+                    "axes {} and {} not orthogonal: dot = {}",
+                    i,
+                    j,
+                    dot
+                );
+            }
+        }
+    }
+
+    /// Parallel-axis transform: a point mass at distance `r` from the
+    /// origin contributes `m·r²` to the off-COM moment about each
+    /// transverse axis. After translating to COM the inertia drops to
+    /// the body's intrinsic inertia (zero for a point mass).
+    #[test]
+    fn parallel_axis_subtracts_offset_correctly() {
+        // Point mass m at (2, 0, 0): I_origin =
+        //   [[0, 0, 0], [0, m·4, 0], [0, 0, m·4]]
+        let m = 3.0;
+        let integrals = VolumeIntegrals {
+            volume: 1.0,
+            first_moments: Vector3::new(2.0, 0.0, 0.0),
+            second_moments: [
+                [0.0, 0.0, 0.0],
+                [0.0, m * 4.0, 0.0],
+                [0.0, 0.0, m * 4.0],
+            ],
+        };
+        let com = Point3::new(2.0, 0.0, 0.0);
+        let i_com = integrals.compute_inertia_tensor(m, &com);
+
+        // Should be ≈ zero tensor (point mass has no intrinsic inertia).
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    i_com[i][j].abs() < 1e-10,
+                    "expected zero at ({}, {}), got {}",
+                    i,
+                    j,
+                    i_com[i][j]
+                );
+            }
+        }
+    }
 }

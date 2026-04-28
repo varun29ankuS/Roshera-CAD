@@ -11,8 +11,10 @@ mod auth_middleware;
 mod delta_handlers;
 mod handlers;
 mod handlers_impl;
+mod kernel_state;
 mod metrics;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
+mod viewport_bridge;
               // Using core geometry-engine directly
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -107,6 +109,12 @@ pub struct AppState {
     // Performance and command metrics
     command_metrics: Arc<Mutex<metrics::CommandMetrics>>,
     performance_metrics: Arc<Mutex<metrics::PerformanceTracker>>,
+
+    /// Debug viewport bridge — gives Claude/dev tools eyes into the live
+    /// Three.js viewport. Routes are mounted only when
+    /// `ROSHERA_DEV_BRIDGE=1`; the bridge state is always present so the
+    /// `Clone` impl on `AppState` stays cheap.
+    pub viewport_bridge: Arc<viewport_bridge::ViewportBridge>,
 }
 
 impl AppState {
@@ -331,26 +339,401 @@ async fn list_roles_wrapper(
     list_roles(State(state), auth_info).await
 }
 
+/// Create a primitive solid via the live B-Rep kernel and return its
+/// tessellated mesh in a shape the frontend can drop straight into the
+/// scene store.
+///
+/// Request:
+/// ```json
+/// { "shape_type": "box|sphere|cylinder|cone|torus",
+///   "parameters": { ... shape-specific ... },
+///   "position":   [x, y, z]  // optional, default [0,0,0]
+/// }
+/// ```
+///
+/// Response on success:
+/// ```json
+/// { "success": true,
+///   "object": {
+///     "id":         "<uuid>",
+///     "name":       "Box 1",
+///     "objectType": "box",
+///     "mesh":       { "vertices": [...], "indices": [...], "normals": [...] },
+///     "position":   [0, 0, 0],
+///     "rotation":   [0, 0, 0],
+///     "scale":      [1, 1, 1]
+///   },
+///   "stats": { "vertex_count": N, "triangle_count": M, "tessellation_ms": ms },
+///   "solid_id": <u32>
+/// }
+/// ```
 async fn create_geometry(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement geometry creation
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use geometry_engine::primitives::topology_builder::{GeometryId as KernelGeometryId, TopologyBuilder};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let shape_type = payload
+        .get("shape_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "missing 'shape_type'"
+                })),
+            )
+        })?
+        .to_lowercase();
+
+    let parameters = payload
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let position: [f32; 3] = payload
+        .get("position")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            [
+                arr.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                arr.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                arr.get(2).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+            ]
+        })
+        .unwrap_or([0.0, 0.0, 0.0]);
+
+    let param = |k: &str, default: f64| -> f64 {
+        parameters
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default)
+    };
+
+    // Drive the kernel. The model is the single source of truth — every
+    // call funnels through TopologyBuilder so the timeline records the op.
+    let mut model = state.model.write().await;
+    let mut builder = TopologyBuilder::new(&mut model);
+
+    let result = match shape_type.as_str() {
+        "box" | "cube" => {
+            let w = param("width", 10.0);
+            let h = param("height", 10.0);
+            let d = param("depth", 10.0);
+            builder.create_box_3d(w, h, d)
+        }
+        "sphere" => {
+            let r = param("radius", 5.0);
+            builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r)
+        }
+        "cylinder" => {
+            let r = param("radius", 5.0);
+            let h = param("height", 10.0);
+            builder.create_cylinder_3d(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                r,
+                h,
+            )
+        }
+        "cone" => {
+            let r = param("radius", 5.0);
+            let h = param("height", 10.0);
+            builder.create_cone_3d(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                r,
+                h,
+            )
+        }
+        "torus" => {
+            let major = param("major_radius", 8.0);
+            let minor = param("minor_radius", 2.0);
+            builder.create_torus_3d(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                major,
+                minor,
+            )
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("unknown shape_type: {other}")
+                })),
+            ));
+        }
+    };
+
+    let solid_id = match result {
+        Ok(KernelGeometryId::Solid(id)) => id,
+        Ok(other) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("kernel returned non-solid id: {other:?}")
+                })),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("kernel error: {e}")
+                })),
+            ));
+        }
+    };
+
+    // Tessellate the freshly created solid.
+    let solid = model.solids.get(solid_id).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "solid vanished from store immediately after creation"
+            })),
+        )
+    })?;
+    let tess_start = Instant::now();
+    let tri_mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+    let tessellation_ms = tess_start.elapsed().as_millis() as u64;
+
+    if tri_mesh.triangles.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "tessellation produced 0 triangles",
+                "solid_id": solid_id,
+                "vertex_count": tri_mesh.vertices.len(),
+            })),
+        ));
+    }
+
+    // Flatten into the wire-friendly Three.js layout the frontend already
+    // consumes for STL imports.
+    let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
+    let mut normals = Vec::with_capacity(tri_mesh.vertices.len() * 3);
+    for v in &tri_mesh.vertices {
+        vertices.push(v.position.x as f32);
+        vertices.push(v.position.y as f32);
+        vertices.push(v.position.z as f32);
+        normals.push(v.normal.x as f32);
+        normals.push(v.normal.y as f32);
+        normals.push(v.normal.z as f32);
+    }
+    let mut indices = Vec::with_capacity(tri_mesh.triangles.len() * 3);
+    for tri in &tri_mesh.triangles {
+        indices.push(tri[0]);
+        indices.push(tri[1]);
+        indices.push(tri[2]);
+    }
+
+    let object_uuid = Uuid::new_v4();
+    let object_id = object_uuid.to_string();
+    let display_name = format!("{} {}", capitalize(&shape_type), solid_id);
+
+    // Drop the model write lock before mutating the id-mapping DashMap
+    // so we don't hold two locks at once.
+    drop(model);
+    state.register_id_mapping(object_uuid, solid_id);
+
+    let shape_type_copy = shape_type.clone();
     Ok(Json(serde_json::json!({
         "success": true,
-        "id": "temp-id",
-        "message": "Geometry creation not yet implemented"
+        "solid_id": solid_id,
+        "object": {
+            "id":         object_id,
+            "name":       display_name,
+            "objectType": shape_type_copy,
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+            },
+            "analyticalGeometry": {
+                "type":   shape_type,
+                "params": parameters,
+            },
+            "position": position,
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
     })))
 }
 
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Execute a boolean operation on two existing solids, return the
+/// tessellated result + the input UUIDs that should be retired from
+/// the scene.
+///
+/// Request:
+/// ```json
+/// { "operation":  "union|intersection|difference",
+///   "object_a":   "<uuid of operand A>",
+///   "object_b":   "<uuid of operand B>"
+/// }
+/// ```
+///
+/// Response on success matches `create_geometry`, plus a `consumed`
+/// list of the operand UUIDs the frontend should drop from its scene.
 async fn boolean_operation(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement boolean operations
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use geometry_engine::operations::boolean::{
+        boolean_operation as kernel_boolean, BooleanOp, BooleanOptions,
+    };
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let bad_request = |msg: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": msg })),
+        )
+    };
+    let server_error = |msg: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": msg })),
+        )
+    };
+
+    let op_str = payload
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad_request("missing 'operation'"))?
+        .to_lowercase();
+    let operation = match op_str.as_str() {
+        "union" | "add" => BooleanOp::Union,
+        "intersection" | "intersect" => BooleanOp::Intersection,
+        "difference" | "subtract" | "minus" => BooleanOp::Difference,
+        other => {
+            return Err(bad_request(&format!("unknown operation: {other}")));
+        }
+    };
+
+    let parse_uuid_field =
+        |key: &str| -> Result<Uuid, (StatusCode, Json<serde_json::Value>)> {
+            let s = payload
+                .get(key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| bad_request(&format!("missing '{key}'")))?;
+            Uuid::parse_str(s)
+                .map_err(|_| bad_request(&format!("'{key}' is not a valid UUID")))
+        };
+    let uuid_a = parse_uuid_field("object_a")?;
+    let uuid_b = parse_uuid_field("object_b")?;
+
+    let solid_a = state.get_local_id(&uuid_a).ok_or_else(|| {
+        bad_request(&format!(
+            "no kernel solid registered for object_a={uuid_a}"
+        ))
+    })?;
+    let solid_b = state.get_local_id(&uuid_b).ok_or_else(|| {
+        bad_request(&format!(
+            "no kernel solid registered for object_b={uuid_b}"
+        ))
+    })?;
+
+    if solid_a == solid_b {
+        return Err(bad_request("object_a and object_b refer to the same solid"));
+    }
+
+    // Run the kernel boolean and tessellate while still holding the lock.
+    let mut model = state.model.write().await;
+    let result_solid_id =
+        kernel_boolean(&mut model, solid_a, solid_b, operation, BooleanOptions::default())
+            .map_err(|e| server_error(format!("boolean kernel error: {e}")))?;
+
+    let solid = model
+        .solids
+        .get(result_solid_id)
+        .ok_or_else(|| server_error("boolean result solid missing from store".into()))?;
+
+    let tess_start = Instant::now();
+    let tri_mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+    let tessellation_ms = tess_start.elapsed().as_millis() as u64;
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(server_error(format!(
+            "boolean result tessellated to 0 triangles (solid_id={result_solid_id})"
+        )));
+    }
+
+    let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
+    let mut normals = Vec::with_capacity(tri_mesh.vertices.len() * 3);
+    for v in &tri_mesh.vertices {
+        vertices.push(v.position.x as f32);
+        vertices.push(v.position.y as f32);
+        vertices.push(v.position.z as f32);
+        normals.push(v.normal.x as f32);
+        normals.push(v.normal.y as f32);
+        normals.push(v.normal.z as f32);
+    }
+    let mut indices = Vec::with_capacity(tri_mesh.triangles.len() * 3);
+    for tri in &tri_mesh.triangles {
+        indices.push(tri[0]);
+        indices.push(tri[1]);
+        indices.push(tri[2]);
+    }
+
+    drop(model);
+
+    let result_uuid = Uuid::new_v4();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let op_label = match operation {
+        BooleanOp::Union => "union",
+        BooleanOp::Intersection => "intersection",
+        BooleanOp::Difference => "difference",
+    };
+    let display_name = format!("{} {}", capitalize(op_label), result_solid_id);
+
     Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Boolean operation not yet implemented"
+        "success":  true,
+        "solid_id": result_solid_id,
+        "consumed": [uuid_a.to_string(), uuid_b.to_string()],
+        "object": {
+            "id":         result_uuid.to_string(),
+            "name":       display_name,
+            "objectType": op_label,
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":   tri_mesh.vertices.len(),
+            "triangle_count": tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
     })))
 }
 
@@ -2087,10 +2470,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
         performance_metrics: Arc::new(Mutex::new(metrics::PerformanceTracker::default())),
+        viewport_bridge: viewport_bridge::ViewportBridge::new(),
     };
 
     // Build router with all routes
-    let app = Router::new()
+    let mut app = Router::new()
         // Root and health
         .route("/", get(root))
         .route("/health", get(enhanced_health))
@@ -2109,6 +2493,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_geometry).delete(delete_geometry),
         )
         .route("/api/geometry/boolean", post(boolean_operation))
+        // Kernel introspection (proprioception) — read-only model snapshot
+        .route("/api/kernel/state", get(kernel_state::kernel_state))
+        // Real mass properties (volume, COG, inertia tensor) for a single solid
+        .route(
+            "/api/geometry/{id}/properties",
+            get(kernel_state::solid_properties),
+        )
         // Session endpoints
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
@@ -2130,10 +2521,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/admin/roles", get(list_roles))
         // Monitoring endpoints
-        .route("/api/logs/stream", get(stream_logs))
-        // Add state
+        .route("/api/logs/stream", get(stream_logs));
+
+    // Optional viewport debug bridge — gated by ROSHERA_DEV_BRIDGE=1.
+    // Mounted only when explicitly enabled so production builds never expose
+    // an unauthenticated control surface.
+    if viewport_bridge::enabled() {
+        tracing::info!(
+            "viewport bridge: ENABLED (ROSHERA_DEV_BRIDGE=1) — mounting /ws/viewport-bridge + /api/viewport/*"
+        );
+        app = app
+            .route(
+                "/ws/viewport-bridge",
+                get(viewport_bridge::ws_handler),
+            )
+            .route(
+                "/api/viewport/snapshot",
+                post(viewport_bridge::snapshot),
+            )
+            .route("/api/viewport/camera", post(viewport_bridge::set_camera))
+            .route("/api/viewport/load_stl", post(viewport_bridge::load_stl))
+            .route(
+                "/api/viewport/shading",
+                post(viewport_bridge::set_shading),
+            )
+            .route(
+                "/api/viewport/clear",
+                post(viewport_bridge::clear_scene),
+            )
+            .route("/api/viewport/status", get(viewport_bridge::status));
+    }
+
+    // Add state and CORS
+    let app = app
         .with_state(state)
-        // Add CORS
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -2142,7 +2563,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
     // Start server
-    let addr = "0.0.0.0:3000";
+    let addr = "0.0.0.0:8081";
     tracing::info!("Starting Roshera CAD API server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
