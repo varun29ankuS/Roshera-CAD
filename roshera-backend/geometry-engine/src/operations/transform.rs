@@ -428,9 +428,68 @@ fn get_faces_entities(model: &BRepModel, face_ids: &[FaceId]) -> OperationResult
     })
 }
 
-/// Fix orientations after mirroring
-fn fix_mirrored_orientations(_model: &mut BRepModel, _solid_id: SolidId) -> OperationResult<()> {
-    // Would reverse face orientations and edge directions
+/// Fix face / edge orientations after mirroring.
+///
+/// A reflection has determinant −1 and reverses the handedness of every
+/// loop in the solid. Without flipping orientations, every face's
+/// outward normal points inward and the solid is inside-out — booleans,
+/// volume integration, and tessellation all silently produce the wrong
+/// result. This walks every face in every shell of the solid, flips
+/// each face's `FaceOrientation`, and flips every edge orientation
+/// inside the face's outer + inner loops so the loop traversal still
+/// agrees with the reversed face normal.
+fn fix_mirrored_orientations(model: &mut BRepModel, solid_id: SolidId) -> OperationResult<()> {
+    let solid = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?
+        .clone();
+
+    let shell_ids = solid.all_shells();
+
+    // Collect all face IDs first so we can mutate faces without holding
+    // an immutable borrow on shells.
+    let mut face_ids: Vec<FaceId> = Vec::new();
+    for shell_id in &shell_ids {
+        if let Some(shell) = model.shells.get(*shell_id) {
+            face_ids.extend(shell.faces.iter().copied());
+        }
+    }
+
+    // Collect loop IDs per face before mutating.
+    let mut face_loops: Vec<(FaceId, Vec<crate::primitives::r#loop::LoopId>)> = Vec::new();
+    for &fid in &face_ids {
+        if let Some(face) = model.faces.get(fid) {
+            let mut loops = vec![face.outer_loop];
+            loops.extend(face.inner_loops.iter().copied());
+            face_loops.push((fid, loops));
+        }
+    }
+
+    // Flip face orientations.
+    for &fid in &face_ids {
+        if let Some(face) = model.faces.get_mut(fid) {
+            face.orientation = face.orientation.flipped();
+        }
+    }
+
+    // Flip edge orientations inside each loop. Reverse the edge ordering
+    // too so that loop traversal still emits a consistent (head→tail)
+    // walk under the new face normal. Loop stores edges and orientations
+    // as parallel vectors — both must be reversed in lockstep, then each
+    // orientation flag inverted.
+    for (_fid, loops) in face_loops {
+        for lid in loops {
+            if let Some(loop_entity) = model.loops.get_mut(lid) {
+                loop_entity.edges.reverse();
+                loop_entity.orientations.reverse();
+                for o in loop_entity.orientations.iter_mut() {
+                    *o = !*o;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -446,9 +505,30 @@ fn validate_transform_inputs(_model: &BRepModel, transform: &Matrix4) -> Operati
     Ok(())
 }
 
-/// Validate transformed solid
-fn validate_transformed_solid(_model: &BRepModel, _solid_id: SolidId) -> OperationResult<()> {
-    // Would validate B-Rep integrity
+/// Validate transformed solid by running the full B-Rep validation suite.
+fn validate_transformed_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidBRep("Solid not found".to_string()));
+    }
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        crate::math::Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::InvalidBRep(format!(
+            "Transformed solid failed validation ({} errors): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 

@@ -192,65 +192,114 @@ fn estimate_face_complexity(face: &Face, model: &BRepModel) -> f64 {
     complexity
 }
 
-/// Multi-threaded mesh optimization
+/// Multi-threaded mesh optimization (vertex deduplication).
+///
+/// Builds a spatial hash keyed on quantized (position, normal) tuples
+/// so two vertices that round to the same bucket within
+/// `MERGE_TOLERANCE` collapse to one. The previous implementation
+/// stamped every vertex as unique, which made this function a no-op
+/// while still paying the cost of the parallel chunked walk.
 pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::collections::HashMap;
 
-    // Parallel vertex deduplication
     let vertex_count = mesh.vertex_count();
-    let _unique_vertices: Vec<(f32, f32, f32, f32, f32, f32)> = Vec::new();
-    let vertex_remap = Arc::new(Mutex::new(vec![0u32; vertex_count]));
-    let next_index = Arc::new(AtomicU32::new(0));
+    if vertex_count == 0 {
+        return;
+    }
 
-    // Process vertices in chunks
-    const CHUNK_SIZE: usize = 1000;
-    let chunks: Vec<_> = (0..vertex_count)
-        .collect::<Vec<_>>()
-        .chunks(CHUNK_SIZE)
-        .map(|chunk| chunk.to_vec())
-        .collect();
+    // Quantization granularity. Vertices closer than ~1e-5 in any
+    // component or whose normals differ by less than ~1e-4 (about
+    // 0.006°) collapse into the same bucket. These thresholds match
+    // the kernel's default mesh tolerance and produce visually
+    // identical output while removing duplicates introduced by
+    // adjacent face seams.
+    const POS_QUANT: f32 = 1.0e5;
+    const NRM_QUANT: f32 = 1.0e4;
 
-    chunks.par_iter().for_each(|chunk| {
-        for &i in chunk {
-            let idx = i * 3;
-            let _pos = (
-                mesh.positions[idx],
-                mesh.positions[idx + 1],
-                mesh.positions[idx + 2],
-            );
-            let _normal = (
-                mesh.normals[idx],
-                mesh.normals[idx + 1],
-                mesh.normals[idx + 2],
-            );
+    // Single-pass deduplication. The hash map is cheap to build
+    // serially and avoids the lock contention that fooled the
+    // previous parallel attempt into a silent no-op. We retain the
+    // function name so callers stay unchanged.
+    let mut bucket: HashMap<(i32, i32, i32, i32, i32, i32), u32> =
+        HashMap::with_capacity(vertex_count);
+    let mut new_positions: Vec<f32> = Vec::with_capacity(mesh.positions.len());
+    let mut new_normals: Vec<f32> = Vec::with_capacity(mesh.normals.len());
+    let has_uv = mesh
+        .uvs
+        .as_ref()
+        .is_some_and(|u| u.len() == vertex_count * 2);
+    let mut new_uvs: Vec<f32> = Vec::with_capacity(if has_uv { vertex_count * 2 } else { 0 });
+    let has_color = mesh
+        .colors
+        .as_ref()
+        .is_some_and(|c| c.len() == vertex_count * 3);
+    let mut new_colors: Vec<f32> = Vec::with_capacity(if has_color { vertex_count * 3 } else { 0 });
 
-            // Check for duplicate (simplified for performance)
-            let is_unique = true; // Would implement spatial hash lookup
+    let mut remap = vec![0u32; vertex_count];
+    let mut next_index: u32 = 0;
 
-            if is_unique {
-                let new_idx = next_index.fetch_add(1, Ordering::SeqCst);
-                let mut remap = vertex_remap.lock();
-                remap[i] = new_idx;
+    for i in 0..vertex_count {
+        let p_idx = i * 3;
+        let n_idx = i * 3;
+        let key = (
+            (mesh.positions[p_idx] * POS_QUANT).round() as i32,
+            (mesh.positions[p_idx + 1] * POS_QUANT).round() as i32,
+            (mesh.positions[p_idx + 2] * POS_QUANT).round() as i32,
+            (mesh.normals[n_idx] * NRM_QUANT).round() as i32,
+            (mesh.normals[n_idx + 1] * NRM_QUANT).round() as i32,
+            (mesh.normals[n_idx + 2] * NRM_QUANT).round() as i32,
+        );
+        if let Some(&existing) = bucket.get(&key) {
+            remap[i] = existing;
+        } else {
+            bucket.insert(key, next_index);
+            remap[i] = next_index;
+            next_index += 1;
+            new_positions.extend_from_slice(&mesh.positions[p_idx..p_idx + 3]);
+            new_normals.extend_from_slice(&mesh.normals[n_idx..n_idx + 3]);
+            if has_uv {
+                if let Some(uvs) = mesh.uvs.as_ref() {
+                    let uv_idx = i * 2;
+                    new_uvs.extend_from_slice(&uvs[uv_idx..uv_idx + 2]);
+                }
+            }
+            if has_color {
+                if let Some(cs) = mesh.colors.as_ref() {
+                    let c_idx = i * 3;
+                    new_colors.extend_from_slice(&cs[c_idx..c_idx + 3]);
+                }
             }
         }
-    });
+    }
 
-    // Parallel index remapping
+    // Parallel index remapping — this part of the original logic is
+    // sound and benefits from rayon since indices.len() can be large.
+    const CHUNK_SIZE: usize = 1000;
+    let remap = Arc::new(remap);
     let indices_chunks: Vec<_> = mesh
         .indices
         .chunks(CHUNK_SIZE)
         .map(|chunk| chunk.to_vec())
         .collect();
-
     let remapped_indices: Vec<Vec<u32>> = indices_chunks
         .par_iter()
         .map(|chunk| {
-            let remap = vertex_remap.lock();
-            chunk.iter().map(|&idx| remap[idx as usize]).collect()
+            let remap = Arc::clone(&remap);
+            chunk
+                .iter()
+                .map(|&idx| remap[idx as usize])
+                .collect::<Vec<u32>>()
         })
         .collect();
 
-    // Flatten remapped indices
     mesh.indices = remapped_indices.into_iter().flatten().collect();
+    mesh.positions = new_positions;
+    mesh.normals = new_normals;
+    if has_uv {
+        mesh.uvs = Some(new_uvs);
+    }
+    if has_color {
+        mesh.colors = Some(new_colors);
+    }
 }
 
