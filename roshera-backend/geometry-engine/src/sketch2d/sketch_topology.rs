@@ -552,12 +552,23 @@ impl SketchTopology {
         Ok(())
     }
 
-    /// Check if loop i contains loop j
+    /// Check if loop i contains loop j.
+    ///
+    /// Uses an axis-aligned bounds prune followed by an even-odd ray-cast
+    /// point-in-polygon test against loop_i's edge polyline. Since the
+    /// detected loops are non-self-intersecting and pairwise disjoint at
+    /// this stage, testing a single sample point on loop_j (the start of
+    /// its first edge) is sufficient to decide containment.
+    ///
+    /// The ray is cast in the +X direction; horizontal edges (y_a == y_b)
+    /// are skipped because they cannot produce a transverse crossing,
+    /// and the half-open interval `[y_min, y_max)` convention prevents
+    /// double-counting at vertex grazes.
     fn loop_contains_loop(&self, i: usize, j: usize) -> bool {
         let loop_i = &self.loops[i];
         let loop_j = &self.loops[j];
 
-        // Quick bounds check
+        // Axis-aligned bounds prune.
         let (min_i, max_i) = loop_i.bounds;
         let (min_j, max_j) = loop_j.bounds;
 
@@ -565,8 +576,40 @@ impl SketchTopology {
             return false;
         }
 
-        // Would need proper point-in-polygon test here
-        true
+        // Sample point: start vertex of loop_j's first edge.
+        let Some(&first_edge_idx) = loop_j.edges.first() else {
+            return false;
+        };
+        let Some(first_edge) = self.edges.get(first_edge_idx) else {
+            return false;
+        };
+        let test = first_edge.start;
+
+        // Even-odd ray cast in +X against loop_i's edge polyline.
+        let mut crossings = 0usize;
+        for &edge_idx in &loop_i.edges {
+            let Some(edge) = self.edges.get(edge_idx) else {
+                continue;
+            };
+            let (a, b) = (edge.start, edge.end);
+            let (y_min, y_max, x_at_min, x_at_max) = if a.y <= b.y {
+                (a.y, b.y, a.x, b.x)
+            } else {
+                (b.y, a.y, b.x, a.x)
+            };
+            // Skip horizontal segments and edges entirely above or below test.y.
+            if y_min == y_max || test.y < y_min || test.y >= y_max {
+                continue;
+            }
+            // Linear-interpolate x at the ray's y level.
+            let t = (test.y - y_min) / (y_max - y_min);
+            let x_cross = x_at_min + t * (x_at_max - x_at_min);
+            if x_cross > test.x {
+                crossings += 1;
+            }
+        }
+
+        crossings % 2 == 1
     }
 
     /// Classify the profile type
@@ -647,6 +690,27 @@ impl SketchTopology {
     /// Get topology issues
     pub fn issues(&self) -> &[TopologyIssue] {
         &self.issues
+    }
+
+    /// Return the positions of every dangling vertex (degree-1 node).
+    ///
+    /// In an open profile each connected component terminates at a
+    /// vertex incident to exactly one edge. These are the points the
+    /// validator surfaces to the user as "fix the gap here". Vertices
+    /// with degree ≥ 2 either lie on a closed loop or at an interior
+    /// junction and are excluded.
+    pub fn open_endpoints(&self) -> Vec<Point2d> {
+        self.vertices
+            .iter()
+            .filter_map(|entry| {
+                let v = entry.value();
+                if v.edges.len() == 1 {
+                    Some(v.position)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Check if topology forms valid profiles for extrusion

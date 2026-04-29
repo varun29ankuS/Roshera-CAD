@@ -587,9 +587,10 @@ impl SketchValidator {
                 // Check profile type
                 match topology.profile_type() {
                     ProfileType::Open => {
-                        // Find open endpoints
-                        let endpoints = Vec::new();
-                        // Would need to extract endpoints from topology
+                        // Surface every dangling vertex (degree-1 node) so
+                        // the user can see exactly where the profile fails
+                        // to close.
+                        let endpoints = topology.open_endpoints();
 
                         issues.push(ValidationIssue::OpenProfile {
                             endpoints,

@@ -1060,18 +1060,65 @@ impl ConstraintSolver {
         Some(100.0)
     }
 
+    /// Read the angular range stored on an arc's entity state.
+    ///
+    /// Arc parameter layout matches the constructor in `EntityState::arc`:
+    /// `[center.x, center.y, radius, start_angle, end_angle]`. Returns
+    /// `None` if the entity is not an arc or its state is malformed.
+    fn get_arc_angles(&self, entity: &EntityRef) -> Option<(f64, f64)> {
+        match entity {
+            EntityRef::Arc(_) => self.entity_state.get(entity).and_then(|state| {
+                if state.parameters.len() >= 5 {
+                    Some((state.parameters[3], state.parameters[4]))
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        }
+    }
+
+    /// Tangent at the curve's end parameter (CCW orientation).
+    ///
+    /// For a line the tangent is the stored direction. For an arc the
+    /// tangent at angle θ is `(-sin θ, cos θ)`. For a full circle the
+    /// "end" coincides with the "start" at θ = 0 (CCW), giving `(0, 1)`.
     fn get_curve_tangent_at_end(&self, entity: &EntityRef) -> Option<Vector2d> {
-        // Simplified - should compute actual tangent
-        self.get_line_direction(entity)
+        match entity {
+            EntityRef::Line(_) => self.get_line_direction(entity),
+            EntityRef::Arc(_) => {
+                let (_, end_angle) = self.get_arc_angles(entity)?;
+                Some(Vector2d::new(-end_angle.sin(), end_angle.cos()))
+            }
+            EntityRef::Circle(_) => {
+                // Closed curve: end parameter at θ = 2π wraps to θ = 0.
+                Some(Vector2d::new(0.0, 1.0))
+            }
+            _ => None,
+        }
     }
 
+    /// Tangent at the curve's start parameter (CCW orientation).
     fn get_curve_tangent_at_start(&self, entity: &EntityRef) -> Option<Vector2d> {
-        // Simplified - should compute actual tangent
-        self.get_line_direction(entity)
+        match entity {
+            EntityRef::Line(_) => self.get_line_direction(entity),
+            EntityRef::Arc(_) => {
+                let (start_angle, _) = self.get_arc_angles(entity)?;
+                Some(Vector2d::new(-start_angle.sin(), start_angle.cos()))
+            }
+            EntityRef::Circle(_) => Some(Vector2d::new(0.0, 1.0)),
+            _ => None,
+        }
     }
 
+    /// Signed curvature at the curve's end parameter.
+    ///
+    /// Lines have zero curvature. Circles and arcs traversed CCW have
+    /// curvature `+1/r`; the constraint solver does not currently track
+    /// arc orientation, so the unsigned `1/r` value is returned. Other
+    /// curve types fall through with `None` so callers (G2 evaluators)
+    /// can treat them as unsupported rather than silently mis-classifying.
     fn get_curve_curvature_at_end(&self, entity: &EntityRef) -> Option<f64> {
-        // Simplified - should compute actual curvature
         match entity {
             EntityRef::Circle(_) | EntityRef::Arc(_) => {
                 self.get_circle_radius(entity).map(|r| 1.0 / r)
@@ -1081,6 +1128,12 @@ impl ConstraintSolver {
         }
     }
 
+    /// Signed curvature at the curve's start parameter.
+    ///
+    /// Circles and arcs have constant curvature, so this matches
+    /// `get_curve_curvature_at_end` exactly. For non-uniform curves
+    /// (splines, ellipses) this would diverge from the end value; those
+    /// kinds currently return `None` from both methods.
     fn get_curve_curvature_at_start(&self, entity: &EntityRef) -> Option<f64> {
         self.get_curve_curvature_at_end(entity)
     }
