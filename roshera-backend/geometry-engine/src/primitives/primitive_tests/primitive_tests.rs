@@ -288,19 +288,21 @@ mod tests {
         let solid = model.solids.get(solid_id).unwrap();
         let shell = model.shells.get(solid.outer_shell).unwrap();
 
-        // Cylinder has: 2 circular faces (top/bottom) + segments rectangular faces
-        let expected_faces = 2 + segments;
+        // Cylinder is a true B-Rep solid with 3 faces: top cap, bottom cap,
+        // and a single trimmed cylindrical side surface (post-#97). The side
+        // surface is parametric — `segments` controls tessellation density,
+        // not topology face count.
+        let expected_faces: u32 = 3;
         assert_eq!(
             shell.faces.len() as u32,
             expected_faces,
-            "Cylinder should have {} faces",
+            "Cylinder should have {} B-Rep faces (top + bottom + side)",
             expected_faces
         );
 
         println!(
-            "  📊 Topology: {} faces ({} side + 2 caps)",
+            "  📊 Topology: {} faces (1 side + 2 caps); tess segments={segments}",
             shell.faces.len(),
-            segments
         );
         println!("  ⚡ Performance: {:?} (Target: <200μs)", elapsed);
     }
@@ -768,12 +770,15 @@ mod tests {
         let solid_id = CylinderPrimitive::create(triangle_params, &mut model).unwrap();
         let solid = model.solids.get(solid_id).unwrap();
         let shell = model.shells.get(solid.outer_shell).unwrap();
+        // Post-#97: cylinder is a true B-Rep with 3 faces (top + bottom + 1
+        // trimmed cylindrical side surface). `segments` controls tessellation
+        // density of the parametric side, not topology face count.
         assert_eq!(
             shell.faces.len(),
-            5,
-            "Triangular cylinder should have 5 faces"
+            3,
+            "Triangular cylinder should have 3 B-Rep faces (top + bottom + side)"
         );
-        println!("  ✓ Triangular cylinder (3 segments) created with 5 faces");
+        println!("  ✓ Triangular cylinder (3 segments) created with 3 B-Rep faces");
     }
 
     #[test]

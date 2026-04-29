@@ -327,7 +327,7 @@ fn calculate_determinant_4x4(m: &[[f64; 4]; 4]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BranchId, EntityId};
+    use crate::{BranchId, EntityId, EntityReference, EntityType, ValidationRequirement};
     use std::sync::Arc;
 
     #[tokio::test]

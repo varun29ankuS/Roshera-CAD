@@ -570,8 +570,9 @@ pub fn verify_auth_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ros_fs::keys::SoftwareKeyManager;
-    use crate::ros_fs::util::random_16;
+    use crate::ros_fs::keys::{KeyManager, SoftwareKeyManager};
+    use crate::ros_fs::util::{random_16, random_bytes};
+    use std::io::Cursor;
 
     // Helper for fast key generation in tests
     fn test_key_manager() -> SoftwareKeyManager {

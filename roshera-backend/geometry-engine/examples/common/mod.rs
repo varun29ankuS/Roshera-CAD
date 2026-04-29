@@ -6,6 +6,7 @@
 //! binaries, so a `common/` subdirectory without a `main.rs` is safely
 //! ignored by the auto-discovery rules.
 
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::vertex::VertexId;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
+use serde::{Deserialize, Serialize};
 
 /// Stats produced by [`tess_and_write`].
 pub struct MeshStats {
@@ -28,9 +30,68 @@ pub struct MeshStats {
     pub stl_path: PathBuf,
 }
 
+/// One entry in the gallery manifest. Mirrors what the frontend
+/// `roshera-app/src/lib/demo-types.ts::DemoEntry` consumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemoManifestEntry {
+    /// Subdirectory category (e.g. "primitives", "booleans"). Used to
+    /// group cards in the UI.
+    pub category: String,
+    /// STL filename, no directory part.
+    pub filename: String,
+    /// Browser-relative URL, including the category subdir
+    /// (e.g. "primitives/box.stl"). Joined to the gallery base URL.
+    pub stl_path: String,
+    pub verts: usize,
+    pub tris: usize,
+    pub tess_ms: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DemoManifest {
+    pub demos: Vec<DemoManifestEntry>,
+}
+
+/// Resolve the gallery output root.
+///
+/// Defaults to `target/demos/`. Can be overridden by setting
+/// `ROSHERA_DEMO_OUT` (e.g. point straight at
+/// `../roshera-app/public/demos`) so a single `cargo run` populates the
+/// gallery without a separate copy step.
+fn demo_out_root() -> PathBuf {
+    match env::var("ROSHERA_DEMO_OUT") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => PathBuf::from("target").join("demos"),
+    }
+}
+
+/// Append (or replace, on duplicate `category/filename`) one entry to the
+/// gallery manifest. Read-modify-write — fine for short-lived demo runs.
+fn manifest_upsert(root: &Path, entry: DemoManifestEntry) {
+    let path = root.join("manifest.json");
+
+    let mut manifest: DemoManifest = match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => DemoManifest::default(),
+    };
+
+    manifest
+        .demos
+        .retain(|e| !(e.category == entry.category && e.filename == entry.filename));
+    manifest.demos.push(entry);
+    manifest
+        .demos
+        .sort_by(|a, b| a.category.cmp(&b.category).then(a.filename.cmp(&b.filename)));
+
+    if let Ok(s) = serde_json::to_string_pretty(&manifest) {
+        let _ = fs::write(&path, s);
+    }
+}
+
 /// Tessellate a solid and write the resulting mesh to a binary STL file.
 ///
-/// `subdir` is the demo's working directory under `target/demos/`.
+/// `subdir` is the demo's working directory under the gallery output root
+/// (defaults to `target/demos/`, overridable via `ROSHERA_DEMO_OUT`).
 pub fn tess_and_write(
     model: &BRepModel,
     solid_id: SolidId,
@@ -44,7 +105,8 @@ pub fn tess_and_write(
     let mesh = tessellate_solid(solid, model, params);
     let tess_dt = t.elapsed();
 
-    let dir = PathBuf::from("target").join("demos").join(subdir);
+    let root = demo_out_root();
+    let dir = root.join(subdir);
     let _ = fs::create_dir_all(&dir);
     let path = dir.join(filename);
 
@@ -57,19 +119,36 @@ pub fn tess_and_write(
     };
 
     let abs = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let tess_ms = tess_dt.as_secs_f64() * 1e3;
     println!(
         "    -> {} ({} verts / {} tris, tess {:.2} ms, stl {:.2} ms)",
         abs.display(),
         mesh.vertices.len(),
         mesh.triangles.len(),
-        tess_dt.as_secs_f64() * 1e3,
+        tess_ms,
         stl_dt.as_secs_f64() * 1e3,
+    );
+
+    // Update the gallery manifest. Browser-relative path uses forward
+    // slashes regardless of host OS so the same JSON works on Windows
+    // and Linux.
+    let stl_rel = format!("{subdir}/{filename}");
+    manifest_upsert(
+        &root,
+        DemoManifestEntry {
+            category: subdir.to_string(),
+            filename: filename.to_string(),
+            stl_path: stl_rel,
+            verts: mesh.vertices.len(),
+            tris: mesh.triangles.len(),
+            tess_ms,
+        },
     );
 
     MeshStats {
         verts: mesh.vertices.len(),
         tris: mesh.triangles.len(),
-        tess_ms: tess_dt.as_secs_f64() * 1e3,
+        tess_ms,
         stl_path: abs,
     }
 }

@@ -42,7 +42,7 @@ import {
   SquareDashedBottom,
   type LucideIcon,
 } from 'lucide-react'
-import { useSceneStore, type TransformTool } from '@/stores/scene-store'
+import { useSceneStore, type TransformTool, type CADObject } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { cn } from '@/lib/utils'
@@ -77,6 +77,12 @@ const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
  * Send a structured geometry command directly to the REST API.
  * Deterministic operations (create primitive, boolean, export) don't need
  * NLP parsing — this eliminates latency and misinterpretation risk.
+ *
+ * Backend returns `{ success, object, stats, solid_id }` where `object`
+ * matches the `CADObject` shape but with plain JS arrays. This function
+ * promotes the mesh arrays to typed arrays and pushes into the scene
+ * store so the viewport renders immediately.
+ *
  * Falls back to NLP pipeline if the direct endpoint fails.
  */
 async function sendDirectGeometry(
@@ -102,14 +108,126 @@ async function sendDirectGeometry(
     if (!resp.ok) throw new Error(`${resp.status}`)
 
     const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+
+    const obj = hydrateBackendObject(data.object, shapeType)
+    useSceneStore.getState().addObject(obj)
+
+    const stats = data.stats
+      ? ` (${data.stats.vertex_count} verts, ${data.stats.triangle_count} tris, ${data.stats.tessellation_ms} ms)`
+      : ''
     addMessage({
       role: 'assistant',
-      content: data.message || `Created ${shapeType}.`,
-      objectsAffected: data.object?.id ? [data.object.id] : undefined,
+      content: `Created ${shapeType}${stats}.`,
+      objectsAffected: [obj.id],
     })
-  } catch {
+  } catch (err) {
     // Direct API unavailable — fall back to NLP pipeline
+    // eslint-disable-next-line no-console
+    console.warn('[toolbar] direct geometry failed, falling back to NLP', err)
     await processUserMessage(`create a ${shapeType} ${Object.entries(parameters).map(([k, v]) => `${k} ${v}`).join(' ')}`)
+  } finally {
+    useChatStore.getState().setProcessing(false)
+  }
+}
+
+/**
+ * Promote backend `object` payload (plain arrays) to a `CADObject`
+ * (typed arrays + defaults). Backend guarantees: id, name, objectType,
+ * mesh.{vertices,indices,normals}, position, rotation, scale.
+ */
+function hydrateBackendObject(raw: Record<string, unknown>, shapeType: string): CADObject {
+  const mesh = raw.mesh as { vertices: number[]; indices: number[]; normals: number[] }
+  const position = (raw.position as [number, number, number]) ?? [0, 0, 0]
+  const rotation = (raw.rotation as [number, number, number]) ?? [0, 0, 0]
+  const scale = (raw.scale as [number, number, number]) ?? [1, 1, 1]
+
+  return {
+    id: String(raw.id),
+    name: String(raw.name ?? shapeType),
+    objectType: String(raw.objectType ?? shapeType),
+    mesh: {
+      vertices: new Float32Array(mesh.vertices),
+      indices: new Uint32Array(mesh.indices),
+      normals: new Float32Array(mesh.normals),
+    },
+    material: {
+      color: '#9ca8c4',
+      metalness: 0.1,
+      roughness: 0.45,
+      opacity: 1,
+    },
+    position,
+    rotation,
+    scale,
+    visible: true,
+    locked: false,
+    analyticalGeometry: raw.analyticalGeometry as CADObject['analyticalGeometry'],
+  }
+}
+
+/**
+ * Run a boolean operation against the two currently-selected objects
+ * via the REST API. On success, swap the operands out of the scene
+ * for the result so the user sees the boolean immediately.
+ */
+async function sendDirectBoolean(
+  operation: 'union' | 'intersection' | 'difference',
+) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length < 2) {
+    addMessage({
+      role: 'assistant',
+      content: `Select two objects before running ${operation}.`,
+    })
+    return
+  }
+
+  const [a, b] = selectedIds
+  addMessage({ role: 'user', content: `${operation} (${a.slice(0, 6)} ↔ ${b.slice(0, 6)})` })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/boolean`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operation, object_a: a, object_b: b }),
+    })
+
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+
+    const obj = hydrateBackendObject(data.object, operation)
+    const removeObject = useSceneStore.getState().removeObject
+    const consumed: string[] = Array.isArray(data.consumed) ? data.consumed : [a, b]
+    consumed.forEach((id) => removeObject(id))
+    useSceneStore.getState().addObject(obj)
+
+    const stats = data.stats
+      ? ` (${data.stats.vertex_count} verts, ${data.stats.triangle_count} tris, ${data.stats.tessellation_ms} ms)`
+      : ''
+    addMessage({
+      role: 'assistant',
+      content: `${operation}${stats}.`,
+      objectsAffected: [obj.id],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({
+      role: 'assistant',
+      content: `${operation} failed: ${msg}`,
+    })
   } finally {
     useChatStore.getState().setProcessing(false)
   }
@@ -310,9 +428,9 @@ export function ToolBar() {
         {
           label: 'Boolean',
           items: [
-            { icon: Combine, label: 'Union', action: () => sendCommand('union selected objects') },
-            { icon: SquaresIntersect, label: 'Intersect', action: () => sendCommand('intersect selected objects') },
-            { icon: Diff, label: 'Subtract', action: () => sendCommand('subtract selected objects') },
+            { icon: Combine, label: 'Union', action: () => sendDirectBoolean('union') },
+            { icon: SquaresIntersect, label: 'Intersect', action: () => sendDirectBoolean('intersection') },
+            { icon: Diff, label: 'Subtract', action: () => sendDirectBoolean('difference') },
           ],
         },
       ],

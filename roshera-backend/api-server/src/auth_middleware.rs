@@ -43,12 +43,65 @@ pub struct AuthInfo {
     pub is_api_key: bool,
 }
 
-/// Authentication middleware that validates JWT tokens or API keys
+/// Returns true when the api-server is running in local dev mode and
+/// should accept unauthenticated requests with full permissions. Gated
+/// by `ROSHERA_DEV_BRIDGE=1`, the same flag that exposes the viewport
+/// debug bridge — both are dev-only conveniences and the env-gate
+/// makes accidental production exposure impossible.
+fn dev_mode_enabled() -> bool {
+    std::env::var("ROSHERA_DEV_BRIDGE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Build a permissive AuthInfo for dev-mode requests. Every permission
+/// is granted; user_id is a stable sentinel so audit logs are still
+/// distinguishable from real users.
+fn dev_auth_info() -> AuthInfo {
+    AuthInfo {
+        user_id: "dev-bridge".to_string(),
+        session_id: Some("dev-session".to_string()),
+        permissions: vec![
+            Permission::CreateGeometry,
+            Permission::ModifyGeometry,
+            Permission::DeleteGeometry,
+            Permission::ViewGeometry,
+            Permission::ExportGeometry,
+            Permission::RecordSession,
+        ],
+        roles: vec!["dev".to_string()],
+        is_api_key: false,
+    }
+}
+
+/// Tower middleware that injects a permissive `AuthInfo` extension on
+/// every request when `ROSHERA_DEV_BRIDGE=1`. This lets handlers using
+/// the built-in `Extension<AuthInfo>` extractor succeed in local dev
+/// without a real session, mirroring the dev-mode bypass in the
+/// canonical `auth_middleware` (which is not currently layered onto
+/// the router globally).
+pub async fn dev_auth_layer(mut request: Request, next: Next) -> Response {
+    if dev_mode_enabled() && request.extensions().get::<AuthInfo>().is_none() {
+        request.extensions_mut().insert(dev_auth_info());
+    }
+    next.run(request).await
+}
+
+/// Authentication middleware that validates JWT tokens or API keys.
+///
+/// In dev mode (`ROSHERA_DEV_BRIDGE=1`) the middleware injects a
+/// permissive `AuthInfo` and skips header validation so the toolbar /
+/// debug bridge can drive the kernel without a real session.
 pub async fn auth_middleware(
     State(auth_manager): State<Arc<AuthManager>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
+    if dev_mode_enabled() {
+        request.extensions_mut().insert(dev_auth_info());
+        return Ok(next.run(request).await);
+    }
+
     // Extract authorization header
     let auth_header = request
         .headers()
@@ -237,7 +290,13 @@ pub fn get_auth_info(request: &Request) -> Option<&AuthInfo> {
     request.extensions().get::<AuthInfo>()
 }
 
-/// Implement FromRequestParts for AuthInfo to allow it as a handler parameter
+/// Implement FromRequestParts for AuthInfo to allow it as a handler parameter.
+///
+/// When `ROSHERA_DEV_BRIDGE=1` and no extension is present, fall back to a
+/// permissive dev `AuthInfo`. The auth middleware is the canonical injector
+/// when wired as a layer; the dev fallback exists because the router
+/// currently doesn't apply the layer globally and we still want every
+/// AuthInfo-extracting handler to work in local development.
 impl<S> axum::extract::FromRequestParts<S> for AuthInfo
 where
     S: Send + Sync,
@@ -248,15 +307,17 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<AuthInfo>()
-            .cloned()
-            .ok_or_else(|| AuthError {
-                error: "Authentication required".to_string(),
-                code: "AUTH_REQUIRED".to_string(),
-                status: 401,
-            })
+        if let Some(info) = parts.extensions.get::<AuthInfo>().cloned() {
+            return Ok(info);
+        }
+        if dev_mode_enabled() {
+            return Ok(dev_auth_info());
+        }
+        Err(AuthError {
+            error: "Authentication required".to_string(),
+            code: "AUTH_REQUIRED".to_string(),
+            status: 401,
+        })
     }
 }
 

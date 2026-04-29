@@ -1144,10 +1144,11 @@ fn intersect_curve_plane(
             }
 
             let intersection_point = curve.point_at(t_mid)?;
+            let (u_hit, v_hit) = surface_uv_for_point(plane, &intersection_point, tolerance);
             intersections.push(IntersectionPoint {
                 position: intersection_point,
                 param1: IntersectionParameter::Single(t_mid),
-                param2: IntersectionParameter::UV(0.0, 0.0), // Would compute actual UV
+                param2: IntersectionParameter::UV(u_hit, v_hit),
                 intersection_type: PointIntersectionType::Transverse,
             });
         }
@@ -1693,9 +1694,13 @@ fn intersect_plane_plane(
 
     let intersection_line = Box::new(Line::new(start_point, end_point));
 
+    // param_curve1/param_curve2 are an opt-in optimization for downstream
+    // consumers that want the line in each plane's UV space; no caller in
+    // this kernel reads them, so we leave them None (consistent with every
+    // other producer in this file).
     Ok(IntersectionResult::Curves(vec![IntersectionCurve {
         curve_3d: intersection_line,
-        param_curve1: None, // Would compute UV curves on each plane
+        param_curve1: None,
         param_curve2: None,
         t_range: (0.0, 1.0),
     }]))
