@@ -102,7 +102,6 @@ pub struct AppState {
     database: Arc<dyn DatabasePersistence + Send + Sync>,
 
     // Additional fields for handlers
-    geometry_model: Arc<RwLock<geometry_engine::primitives::topology_builder::BRepModel>>,
     export_engine: Arc<export_engine::ExportEngine>,
     request_metrics: Arc<dashmap::DashMap<String, u64>>,
 
@@ -2458,7 +2457,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         branch_manager,
         hierarchy_manager,
         database,
-        geometry_model: model.clone(),
         export_engine,
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
