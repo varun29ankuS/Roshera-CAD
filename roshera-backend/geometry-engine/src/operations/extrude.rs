@@ -922,7 +922,18 @@ fn validate_extrude_inputs(
     Ok(())
 }
 
-/// Validate that edges form a closed profile
+/// Validate that the supplied edges form a closed profile by walking
+/// the chain head→tail and tracking the *traversal direction* through
+/// each edge.
+///
+/// The previous implementation tested
+/// `current.end_vertex ∈ {next.start_vertex, next.end_vertex}` which
+/// passed for any pair of edges that merely shared a vertex —
+/// including chains that backtrack (e.g. `A→B`, `B→A`, `A→C`) and
+/// chains that close on the wrong endpoint. This walk maintains a
+/// running `exit_vertex` that flips correctly when an edge is
+/// traversed in reverse, and verifies the final edge's exit point
+/// returns to the very first edge's entry point.
 fn validate_closed_profile(model: &BRepModel, edges: &[EdgeId]) -> OperationResult<()> {
     if edges.is_empty() {
         return Err(OperationError::InvalidGeometry(
@@ -930,25 +941,54 @@ fn validate_closed_profile(model: &BRepModel, edges: &[EdgeId]) -> OperationResu
         ));
     }
 
-    // Check that edges connect end-to-end
-    // Simplified check - full implementation would handle edge orientations
-    for i in 0..edges.len() {
-        let current = model
-            .edges
-            .get(edges[i])
-            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
-        let next = model
-            .edges
-            .get(edges[(i + 1) % edges.len()])
-            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+    let first = model
+        .edges
+        .get(edges[0])
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
-        // Check connectivity (simplified)
-        if current.end_vertex != next.start_vertex && current.end_vertex != next.end_vertex {
+    // We don't know yet whether the first edge is traversed start→end
+    // or end→start — both are valid as long as the chain stays
+    // consistent. Try start→end first; if the chain fails, retry
+    // end→start before giving up.
+    if walk_profile_chain(model, edges, first.start_vertex, first.end_vertex).is_ok() {
+        return Ok(());
+    }
+    if walk_profile_chain(model, edges, first.end_vertex, first.start_vertex).is_ok() {
+        return Ok(());
+    }
+    Err(OperationError::OpenProfile)
+}
+
+/// Walk the edge chain assuming the first edge was traversed
+/// `entry → exit`. Returns Ok if every subsequent edge shares the
+/// running exit vertex with one of its endpoints (in which case the
+/// other endpoint becomes the new exit) and the final exit matches the
+/// initial entry (i.e. the loop closes).
+fn walk_profile_chain(
+    model: &BRepModel,
+    edges: &[EdgeId],
+    entry_vertex: VertexId,
+    initial_exit: VertexId,
+) -> OperationResult<()> {
+    let mut exit_vertex = initial_exit;
+    for &edge_id in &edges[1..] {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+        if edge.start_vertex == exit_vertex {
+            exit_vertex = edge.end_vertex;
+        } else if edge.end_vertex == exit_vertex {
+            exit_vertex = edge.start_vertex;
+        } else {
             return Err(OperationError::OpenProfile);
         }
     }
-
-    Ok(())
+    if exit_vertex == entry_vertex {
+        Ok(())
+    } else {
+        Err(OperationError::OpenProfile)
+    }
 }
 
 /// Validate the extruded solid by walking its shell graph and checking
