@@ -89,6 +89,15 @@ pub struct AppState {
     command_executor: Arc<Mutex<CommandExecutor>>,
     provider_manager: Arc<Mutex<ProviderManager>>,
 
+    /// True iff a real LLM provider key was found at server start.
+    /// AI handlers (`/api/ai/command`, `/api/ai/command/stream`) refuse
+    /// to serve traffic with `503 ai_not_configured` when this is
+    /// false. There is no mock fallback in production — silent mock
+    /// responses would make the system look like it works while
+    /// quietly returning placeholder text, which is worse than failing
+    /// loudly.
+    ai_configured: bool,
+
     // Vision pipeline (not yet implemented)
     // smart_router: Option<Arc<SmartRouter>>,
 
@@ -235,7 +244,7 @@ async fn process_enhanced_ai_command_wrapper(
     State(state): State<AppState>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     Json(payload): Json<EnhancedAICommandRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     process_enhanced_ai_command(Extension(auth_info), State(state), Json(payload)).await
 }
 
@@ -443,10 +452,14 @@ async fn create_geometry(
         "cone" => {
             let r = require("radius")?;
             let h = require("height")?;
+            // True cone: base radius `r`, apex (top_radius = 0).
+            // `create_cone_3d` accepts a frustum signature; passing 0.0
+            // for the top radius collapses it to a single-apex cone.
             builder.create_cone_3d(
                 Point3::new(0.0, 0.0, 0.0),
                 Vector3::new(0.0, 0.0, 1.0),
                 r,
+                0.0,
                 h,
             )
         }
@@ -1379,10 +1392,19 @@ async fn process_enhanced_ai_command(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
     Json(payload): Json<EnhancedAICommandRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    // Refuse loudly if no LLM key was configured at startup. Returning
+    // a structured 503 (vs. silently invoking a mock) makes the
+    // misconfiguration visible to operators and to agents.
+    if !state.ai_configured {
+        return Err(crate::error_catalog::ApiError::ai_not_configured().into_response());
+    }
+
     // Check permissions
     if !auth_info.permissions.contains(&Permission::CreateGeometry) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into_response());
     }
 
     let start = std::time::Instant::now();
@@ -1414,7 +1436,7 @@ async fn process_enhanced_ai_command(
     } else {
         // Parse the command and execute it properly
         let command = parse_ai_command_to_geometry_command(&payload.command)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
 
         state
             .command_executor
@@ -1505,6 +1527,34 @@ async fn process_ai_command_stream(
     use futures::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
     let (tx, rx) = tokio::sync::mpsc::channel(128);
+
+    // Configuration gate — refuse loudly when no LLM key is set.
+    // SSE doesn't have a clean way to emit an HTTP status alongside
+    // the stream, so we mirror the JSON shape of `ApiError` in a
+    // single terminal `event: error` frame and close. Agents already
+    // pattern-match on `error_code`; the wire shape matches what
+    // POST /api/ai/command would have returned as a 503.
+    if !state.ai_configured {
+        let payload = serde_json::to_value(
+            &crate::error_catalog::ApiError::ai_not_configured(),
+        )
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "success": false,
+                "error_code": "ai_not_configured",
+                "error": "AI provider not configured",
+                "retryable": false,
+            })
+        });
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(axum::response::sse::Event::default()
+                    .event("error")
+                    .data(payload.to_string())))
+                .await;
+        });
+        return Sse::new(ReceiverStream::new(rx));
+    }
 
     // Permission gate — emit a single error frame and close.
     if !auth_info.permissions.contains(&Permission::CreateGeometry) {
@@ -2110,24 +2160,46 @@ async fn enhanced_health(State(state): State<AppState>) -> Json<serde_json::Valu
     Json(health_status)
 }
 
+/// Honest AI subsystem status.
+///
+/// Returns `status: "operational"` only if a real LLM provider key was
+/// configured at server start. When `ai_configured` is false the
+/// endpoint reports `status: "not_configured"` plus the same
+/// remediation hint that `/api/ai/command` returns in its 503 body, so
+/// agents can branch their behaviour off this single GET without
+/// having to first issue a failing POST.
 async fn get_ai_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    if !state.ai_configured {
+        return Json(serde_json::json!({
+            "status": "not_configured",
+            "error_code": "ai_not_configured",
+            "providers": {
+                "llm": "unavailable",
+            },
+            "hint": "Set ANTHROPIC_API_KEY (or another supported provider key) \
+                     in the server environment and restart.",
+            "missing_env": ["ANTHROPIC_API_KEY"],
+        }));
+    }
+
+    let active_llm = {
+        let mgr = state.provider_manager.lock().await;
+        mgr.llm()
+            .map(|p| p.capabilities().name)
+            .unwrap_or_else(|_| "unknown".to_string())
+    };
+
     Json(serde_json::json!({
         "status": "operational",
         "providers": {
-            "llm": "available",
-            "tts": "available",
-            "asr": "available"
+            "llm": active_llm,
         },
         "features": {
-            "voice_commands": true,
             "natural_language": true,
             "context_awareness": true,
-            "session_integration": true
+            "session_integration": true,
+            "streaming": true,
         },
-        "performance": {
-            "avg_response_time_ms": 150,
-            "success_rate": 0.98
-        }
     }))
 }
 
@@ -2342,12 +2414,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hierarchy_manager = Arc::new(HierarchyManager::new());
 
     // Initialize AI components.
+    //
     // Policy: API-only providers (Claude/OpenAI). Local-model runtimes are
-    // not permitted. If no API key is configured, fall back to the mock
-    // provider so the server can still boot for non-AI workflows and tests.
+    // not permitted.
+    //
+    // Failure mode: if no provider key is set at server start the AI
+    // routes refuse to serve traffic — see `AppState.ai_configured`
+    // and the gate at the top of `process_enhanced_ai_command` /
+    // `process_ai_command_stream`. We deliberately DO NOT register
+    // `MockLLMProvider` as the active LLM in production: silent mock
+    // responses would make `/api/ai/command` look like it works while
+    // returning placeholder text, which is worse than failing loudly
+    // with `503 ai_not_configured`. The mock provider stays available
+    // in the codebase for in-process tests that construct their own
+    // `ProviderManager` directly.
     let mut provider_manager = ProviderManager::new();
-
-    if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
+    let ai_configured = if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
         tracing::info!("Anthropic API key detected, registering Claude provider");
         let claude_config = ai_integration::providers::claude::ClaudeConfig {
             api_key: Some(anthropic_key),
@@ -2359,15 +2441,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 claude_config,
             )),
         );
-        provider_manager.set_active("mock".to_string(), "claude".to_string(), None);
+        provider_manager.set_active(String::new(), "claude".to_string(), None);
+        true
     } else {
-        tracing::info!("No LLM API key configured, falling back to mock provider");
-        provider_manager.register_llm(
-            "mock".to_string(),
-            Box::new(ai_integration::providers::MockLLMProvider::new()),
+        tracing::warn!(
+            "No LLM API key configured (ANTHROPIC_API_KEY unset). \
+             AI routes will return 503 ai_not_configured until a key is \
+             set and the server is restarted."
         );
-        provider_manager.set_active("mock".to_string(), "mock".to_string(), None);
-    }
+        false
+    };
 
     // Bind the AI command executor to the same kernel `model` that REST and
     // WebSocket handlers mutate. Previously each `CommandExecutor::new()`
@@ -2442,6 +2525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_integration_executor,
         command_executor,
         provider_manager: provider_manager_arc.clone(),
+        ai_configured,
         // smart_router: not yet implemented,
         session_manager,
         auth_manager,
@@ -2548,8 +2632,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/timeline/init", post(initialize_timeline))
         .route("/api/timeline/record", post(record_operation))
         .route("/api/timeline/history/{branch_id}", get(get_history))
-        .route("/api/timeline/undo", post(undo_operation))
-        .route("/api/timeline/redo", post(redo_operation))
+        // Disambiguate against the session-scoped undo/redo also re-
+        // exported via `handlers::*` (handlers/session.rs). The
+        // timeline-scoped variant takes `Json<Value>` carrying a
+        // `session_id`; the session-scoped one takes `Path<String>`.
+        .route(
+            "/api/timeline/undo",
+            post(crate::handlers::timeline::undo_operation),
+        )
+        .route(
+            "/api/timeline/redo",
+            post(crate::handlers::timeline::redo_operation),
+        )
         .route("/api/timeline/replay", post(replay_events))
         .route("/api/timeline/checkpoint", post(create_checkpoint))
         .route("/api/timeline/branch/create", post(create_branch))
