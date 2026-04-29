@@ -96,6 +96,7 @@ interface SceneState {
   hoveredId: string | null
   selectionMode: SelectionMode
   subElementSelections: SubElementSelection[]
+  hoveredSubElement: SubElementSelection | null
 
   // Mesh ref registry for outline effects
   meshRefs: Map<string, THREE.Mesh>
@@ -137,6 +138,7 @@ interface SceneState {
   addSubElementSelection: (sel: SubElementSelection) => void
   clearSubElementSelections: () => void
   toggleSubElementSelection: (sel: SubElementSelection) => void
+  setHoveredSubElement: (sel: SubElementSelection | null) => void
 
   registerMeshRef: (id: string, mesh: THREE.Mesh) => void
   unregisterMeshRef: (id: string) => void
@@ -165,6 +167,7 @@ export const useSceneStore = create<SceneState>()(
     hoveredId: null,
     selectionMode: 'object',
     subElementSelections: [],
+    hoveredSubElement: null,
     meshRefs: new Map(),
     activeTool: 'select',
     transformSpace: 'world',
@@ -249,7 +252,9 @@ export const useSceneStore = create<SceneState>()(
     setHovered: (id) => set({ hoveredId: id }),
 
     setSelectionMode: (mode) =>
-      set({ selectionMode: mode, subElementSelections: [] }),
+      set({ selectionMode: mode, subElementSelections: [], hoveredSubElement: null }),
+
+    setHoveredSubElement: (sel) => set({ hoveredSubElement: sel }),
 
     addSubElementSelection: (sel) =>
       set((state) => ({

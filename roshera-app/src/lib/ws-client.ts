@@ -92,7 +92,14 @@ class WSClient {
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const start = performance.now()
-        this.ws.send(JSON.stringify({ type: 'Ping' }))
+        // Backend protocol: ClientMessage::Ping { timestamp: u64 }
+        // Uses serde tag="type", content="data" — payload goes under `data`.
+        this.ws.send(
+          JSON.stringify({
+            type: 'Ping',
+            data: { timestamp: Math.floor(Date.now()) },
+          }),
+        )
         useWSStore.getState().setLastPing(Math.round(performance.now() - start))
       }
     }, HEARTBEAT_INTERVAL_MS)
@@ -125,5 +132,5 @@ class WSClient {
   }
 }
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3000/ws'
+const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8081/ws'
 export const wsClient = new WSClient(WS_URL)

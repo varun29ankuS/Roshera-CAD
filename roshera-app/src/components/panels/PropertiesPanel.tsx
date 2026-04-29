@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
@@ -132,21 +133,50 @@ export function PropertiesPanel() {
             <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
               Material
             </p>
-            <div className="flex items-center gap-2">
-              <div
-                className="w-4 h-4 rounded border border-border"
-                style={{ backgroundColor: obj.material.color }}
-              />
-              <span className="text-[10px]">{obj.material.color}</span>
-            </div>
-            <div className="mt-1 space-y-0.5 text-[10px]">
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Metalness</span>
-                <span className="font-mono">{obj.material.metalness.toFixed(2)}</span>
+            <ColorPicker
+              value={obj.material.color}
+              onChange={(c) =>
+                updateObject(id, { material: { ...obj.material, color: c } })
+              }
+            />
+            <div className="mt-1.5 space-y-1">
+              <div>
+                <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+                  <span>Metalness</span>
+                  <span className="font-mono">{obj.material.metalness.toFixed(2)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={obj.material.metalness}
+                  onChange={(e) =>
+                    updateObject(id, {
+                      material: { ...obj.material, metalness: Number(e.target.value) },
+                    })
+                  }
+                  className="w-full h-1 accent-primary"
+                />
               </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Roughness</span>
-                <span className="font-mono">{obj.material.roughness.toFixed(2)}</span>
+              <div>
+                <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+                  <span>Roughness</span>
+                  <span className="font-mono">{obj.material.roughness.toFixed(2)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={obj.material.roughness}
+                  onChange={(e) =>
+                    updateObject(id, {
+                      material: { ...obj.material, roughness: Number(e.target.value) },
+                    })
+                  }
+                  className="w-full h-1 accent-primary"
+                />
               </div>
             </div>
           </div>
@@ -179,6 +209,125 @@ export function PropertiesPanel() {
           <TransformEditor objectId={id} />
         </div>
       </ScrollArea>
+    </div>
+  )
+}
+
+/**
+ * Inline material-color picker. Click the swatch to slide out a grid
+ * of engineering-palette presets directly under the Material header —
+ * no native browser dialog. Hex text input stays editable so any
+ * arbitrary `#rrggbb` value can still be entered by typing.
+ *
+ * Palette is curated for CAD workflows: neutral greys for parts, a
+ * row of metal tones (steel, aluminum, copper, brass, gold, iron),
+ * and saturated primaries for callouts / variants.
+ */
+const COLOR_PRESETS: ReadonlyArray<readonly [string, string]> = [
+  ['#1a1a1a', 'Charcoal'],
+  ['#444444', 'Graphite'],
+  ['#7a7a7a', 'Mid grey'],
+  ['#b0b0b0', 'Light grey'],
+  ['#e8e8e8', 'Off white'],
+  ['#ffffff', 'White'],
+  ['#5b6770', 'Steel'],
+  ['#a8aab0', 'Aluminum'],
+  ['#b87333', 'Copper'],
+  ['#d4af37', 'Brass'],
+  ['#cdb56a', 'Gold'],
+  ['#3a3a3a', 'Iron'],
+  ['#c0392b', 'Red'],
+  ['#e67e22', 'Orange'],
+  ['#f1c40f', 'Yellow'],
+  ['#27ae60', 'Green'],
+  ['#2980b9', 'Blue'],
+  ['#8e44ad', 'Purple'],
+]
+
+function ColorPicker({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (color: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState(value)
+
+  // Keep the hex input in sync if the value updates externally
+  // (e.g. another part of the UI changes the material).
+  if (draft !== value && !open) {
+    // Read during render is fine here — we only want to mirror prop
+    // changes back into local draft when the popover is closed.
+    setDraft(value)
+  }
+
+  function commit(v: string) {
+    if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v)) {
+      onChange(v)
+    }
+  }
+
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="w-5 h-5 rounded border border-border cursor-pointer p-0 transition-transform hover:scale-110"
+          style={{ backgroundColor: value }}
+          title={open ? 'Close picker' : 'Pick color'}
+          aria-label="Toggle material color picker"
+          aria-expanded={open}
+        />
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value)
+            commit(e.target.value.trim())
+          }}
+          className="flex-1 bg-background/50 rounded px-1.5 py-0.5 text-[10px] font-mono outline-none text-foreground"
+          spellCheck={false}
+        />
+      </div>
+
+      {/* Slide-out palette. `grid-rows-[Nfr]` + max-height transition
+          keeps the panel inside the Properties scroll area instead of
+          floating above other UI as a popover would. */}
+      <div
+        className={`grid transition-[grid-template-rows,opacity,margin] duration-150 ease-out ${
+          open
+            ? 'grid-rows-[1fr] opacity-100 mt-1.5'
+            : 'grid-rows-[0fr] opacity-0 mt-0'
+        }`}
+      >
+        <div className="overflow-hidden">
+          <div className="rounded border border-border bg-background/40 p-1.5">
+            <div className="grid grid-cols-6 gap-1">
+              {COLOR_PRESETS.map(([hex, name]) => {
+                const selected = hex.toLowerCase() === value.toLowerCase()
+                return (
+                  <button
+                    key={hex}
+                    type="button"
+                    onClick={() => onChange(hex)}
+                    className={`w-full aspect-square rounded border cursor-pointer transition-transform hover:scale-110 ${
+                      selected
+                        ? 'border-foreground ring-1 ring-foreground'
+                        : 'border-border/60'
+                    }`}
+                    style={{ backgroundColor: hex }}
+                    title={`${name} (${hex})`}
+                    aria-label={name}
+                    aria-pressed={selected}
+                  />
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
