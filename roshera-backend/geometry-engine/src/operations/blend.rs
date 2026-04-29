@@ -37,11 +37,16 @@ pub struct BlendOptions {
 
 impl Default for BlendOptions {
     fn default() -> Self {
+        // Default to `Extended` so callers get a working blend out of the
+        // box. `Natural` and `Clamped` request trimming of the original
+        // faces against the blend surface — that path is currently
+        // unimplemented (`trim_faces_against_blend` returns
+        // `NotImplemented`) and selecting it would surface a hard error.
         Self {
             common: CommonOptions::default(),
             blend_type: BlendType::G1,
             continuity: Continuity::G1,
-            boundary_handling: BoundaryHandling::Natural,
+            boundary_handling: BoundaryHandling::Extended,
         }
     }
 }
@@ -597,15 +602,37 @@ fn create_lateral_edge(model: &mut BRepModel, p1: &Point3, p2: &Point3) -> Opera
     Ok(edge_id)
 }
 
-/// Trim faces against blend
+/// Trim original faces back against the freshly created blend surface.
+///
+/// `BoundaryHandling::Natural` and `BoundaryHandling::Clamped` both
+/// require this path: the blend should mate cleanly with the originals,
+/// which means cutting the originals at the blend's boundary curves.
+/// That requires surface-surface intersection between each original
+/// face's surface and each blend face's surface, splitting the original
+/// loops along the resulting trim curves, and rebuilding the affected
+/// faces — see `boolean::split_face_by_curves` for the analogous
+/// machinery on the boolean side.
+///
+/// The current kernel has no production-grade implementation of that
+/// flow that respects blend curves. Rather than silently emit an
+/// overlapping, non-watertight result (which the previous no-op did),
+/// we surface the gap as `NotImplemented` so callers either pick
+/// `BoundaryHandling::Extended` (the new default) or trim the
+/// originals themselves before invoking `blend_faces`.
 fn trim_faces_against_blend(
     _model: &mut BRepModel,
-    _face1_id: FaceId,
-    _face2_id: FaceId,
-    _blend_faces: &[FaceId],
+    face1_id: FaceId,
+    face2_id: FaceId,
+    blend_faces: &[FaceId],
 ) -> OperationResult<()> {
-    // Would trim original faces to meet blend cleanly
-    Ok(())
+    Err(OperationError::NotImplemented(format!(
+        "trim_faces_against_blend: trimming originals against blend not implemented \
+         (face1={}, face2={}, blend_faces={}). Use BoundaryHandling::Extended or \
+         pre-trim the originals via boolean::split_face_by_curves.",
+        face1_id,
+        face2_id,
+        blend_faces.len()
+    )))
 }
 
 /// Validate blend inputs
@@ -637,15 +664,44 @@ fn validate_blend_inputs(
     Ok(())
 }
 
-/// Validate blend result
+/// Validate the blend result by (1) confirming every emitted blend face
+/// is reachable through the topology and (2) running the kernel's full
+/// B-Rep validation suite over the model so structural defects
+/// introduced by the blend operation surface immediately rather than
+/// being deferred to a downstream tessellation or boolean.
+///
+/// Continuity quality (G1/G2/G3) is enforced upstream by
+/// `create_g1_blend` / `create_g2_blend` / `create_g3_blend` via
+/// boundary-sample preconditions; what this function adds is the
+/// missing topological closure check.
 fn validate_blend_result(model: &BRepModel, blend_faces: &[FaceId]) -> OperationResult<()> {
-    // Would validate blend continuity and quality
     for &face_id in blend_faces {
         if model.faces.get(face_id).is_none() {
-            return Err(OperationError::InvalidBRep(
-                "Blend face not found".to_string(),
-            ));
+            return Err(OperationError::InvalidBRep(format!(
+                "Blend face {} not found in model after blend_faces emitted it",
+                face_id
+            )));
         }
+    }
+
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        crate::math::Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::InvalidBRep(format!(
+            "Blend result failed validation ({} errors): {}",
+            result.errors.len(),
+            summary
+        )));
     }
 
     Ok(())
