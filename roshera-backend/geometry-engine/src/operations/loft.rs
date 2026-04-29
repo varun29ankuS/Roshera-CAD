@@ -1343,13 +1343,30 @@ fn validate_loft_inputs(
     Ok(())
 }
 
-/// Validate the lofted solid
+/// Validate the lofted solid by running the full B-Rep validation suite.
 fn validate_lofted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
-    // Would perform full B-Rep validation
     if model.solids.get(solid_id).is_none() {
         return Err(OperationError::InvalidBRep("Solid not found".to_string()));
     }
-
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        crate::math::Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::InvalidBRep(format!(
+            "Lofted solid failed validation ({} errors): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 

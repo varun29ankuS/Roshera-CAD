@@ -240,22 +240,57 @@ fn create_distance_angle_chamfer(
     create_two_distance_chamfer(model, edge_id, face1_id, face2_id, distance, distance2)
 }
 
-/// Create angle-based chamfer
+/// Create angle-based chamfer.
+///
+/// `angle` is the chamfer plane's angle (in radians) measured from
+/// `face1` toward `face2`. The chamfer width on `face1` defaults to a
+/// fraction of the underlying edge's arc length; the width on `face2`
+/// follows from the law of sines in the chamfer triangle:
+///
+/// `d2 = d1 · sin(angle) / sin(face_angle − angle)`
+///
+/// where `face_angle` is the dihedral angle between the two adjacent
+/// faces.
 fn create_angle_chamfer(
     model: &mut BRepModel,
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
-    _angle: f64,
+    angle: f64,
 ) -> OperationResult<FaceId> {
-    // For symmetric angle chamfer, compute equal distances
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
-    let _half_angle = face_angle / 2.0;
+    if angle <= 0.0 || angle >= face_angle {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Chamfer angle {} rad must be in (0, {}) rad (dihedral)",
+            angle, face_angle
+        )));
+    }
 
-    // Choose a reasonable default distance
-    let distance = 1.0; // Would be computed from edge length
+    // Derive face1 width from the edge's arc length so the chamfer
+    // scales with the feature instead of being a hardcoded constant.
+    // 1/10 of edge length is a conservative default that keeps the
+    // chamfer well within the adjacent faces for typical geometry.
+    let mut edge = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+        .clone();
+    let edge_length = edge
+        .length(&model.curves, Tolerance::default())
+        .map_err(|e| OperationError::NumericalError(format!("Edge length: {:?}", e)))?;
+    if !edge_length.is_finite() || edge_length <= 0.0 {
+        return Err(OperationError::FeatureTooSmall);
+    }
+    let distance1 = (edge_length * 0.1).max(Tolerance::default().distance() * 10.0);
+    let denom = (face_angle - angle).sin();
+    if denom.abs() < 1e-12 {
+        return Err(OperationError::NumericalError(
+            "Degenerate chamfer triangle (face_angle − angle ≈ 0)".to_string(),
+        ));
+    }
+    let distance2 = distance1 * angle.sin() / denom;
 
-    create_equal_distance_chamfer(model, edge_id, face1_id, face2_id, distance)
+    create_two_distance_chamfer(model, edge_id, face1_id, face2_id, distance1, distance2)
 }
 
 /// Data for chamfer computation
@@ -696,22 +731,134 @@ fn propagate_edge_selection(
     }
 }
 
-/// Propagate along tangent edges
+/// Propagate along tangent-continuous edges.
+///
+/// Walks outward from each seed edge, adding any edge that shares a
+/// vertex with an already-selected edge AND whose tangent direction at
+/// the shared vertex is parallel (within `Tolerance::default().angle()`)
+/// to the seed's tangent. Iterates until no new edges are added.
 fn propagate_tangent_edges(
-    _model: &BRepModel,
+    model: &BRepModel,
     initial_edges: Vec<EdgeId>,
 ) -> OperationResult<Vec<EdgeId>> {
-    // Would find all tangent-connected edges
-    Ok(initial_edges)
+    propagate_by_continuity(model, initial_edges, ContinuityKind::Tangent)
 }
 
-/// Propagate along smooth edges
+/// Propagate along smoothly-connected edges.
+///
+/// Smooth = tangent-continuous AND the curvature on either side of the
+/// shared vertex matches within tolerance (G2-like). For the chamfer
+/// selector this is currently equivalent to tangent propagation since
+/// curvature comparisons across edges of different curve families are
+/// not meaningful for chamfer fan-out; the function delegates with the
+/// same predicate but is exposed separately so the API distinction
+/// remains stable.
 fn propagate_smooth_edges(
-    _model: &BRepModel,
+    model: &BRepModel,
     initial_edges: Vec<EdgeId>,
 ) -> OperationResult<Vec<EdgeId>> {
-    // Would find all smoothly-connected edges
-    Ok(initial_edges)
+    propagate_by_continuity(model, initial_edges, ContinuityKind::Smooth)
+}
+
+#[derive(Copy, Clone)]
+enum ContinuityKind {
+    Tangent,
+    Smooth,
+}
+
+fn propagate_by_continuity(
+    model: &BRepModel,
+    initial_edges: Vec<EdgeId>,
+    kind: ContinuityKind,
+) -> OperationResult<Vec<EdgeId>> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Build vertex → incident edges adjacency over the model.
+    let mut vertex_edges: HashMap<VertexId, Vec<EdgeId>> = HashMap::new();
+    for (eid, edge) in model.edges.iter() {
+        vertex_edges.entry(edge.start_vertex).or_default().push(eid);
+        vertex_edges.entry(edge.end_vertex).or_default().push(eid);
+    }
+
+    let angle_tol = Tolerance::default().angle().max(1e-6);
+    let mut selected: HashSet<EdgeId> = initial_edges.iter().copied().collect();
+    let mut queue: VecDeque<EdgeId> = initial_edges.iter().copied().collect();
+
+    while let Some(eid) = queue.pop_front() {
+        let edge = match model.edges.get(eid) {
+            Some(e) => e,
+            None => continue,
+        };
+        for &v in &[edge.start_vertex, edge.end_vertex] {
+            let neighbors = match vertex_edges.get(&v) {
+                Some(ns) => ns,
+                None => continue,
+            };
+            // Tangent of `edge` at vertex v
+            let t_seed = edge_tangent_at_vertex(model, edge, v).unwrap_or(Vector3::ZERO);
+            if t_seed.magnitude() < 1e-12 {
+                continue;
+            }
+            for &nid in neighbors {
+                if nid == eid || selected.contains(&nid) {
+                    continue;
+                }
+                let nedge = match model.edges.get(nid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let t_n = match edge_tangent_at_vertex(model, nedge, v) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if t_n.magnitude() < 1e-12 {
+                    continue;
+                }
+                let cos = t_seed.normalize().unwrap_or(Vector3::X).dot(
+                    &t_n.normalize().unwrap_or(Vector3::X),
+                );
+                // Accept either co-directional or anti-directional
+                // tangent (edges may be oriented oppositely at the
+                // shared vertex).
+                let aligned = cos.abs() >= (angle_tol).cos();
+                if !aligned {
+                    continue;
+                }
+                if matches!(kind, ContinuityKind::Smooth) {
+                    // Reserved for future curvature-match check; tangent
+                    // alignment is sufficient for the chamfer selector
+                    // because chamfered faces inherit the seed edge's
+                    // local frame, not its curvature.
+                }
+                selected.insert(nid);
+                queue.push_back(nid);
+            }
+        }
+    }
+
+    Ok(selected.into_iter().collect())
+}
+
+/// Curve tangent of `edge` evaluated at the curve parameter
+/// corresponding to vertex `v`. Returns `None` if the curve cannot be
+/// evaluated.
+fn edge_tangent_at_vertex(
+    model: &BRepModel,
+    edge: &Edge,
+    v: VertexId,
+) -> Option<Vector3> {
+    let curve = model.curves.get(edge.curve_id)?;
+    let t = if v == edge.start_vertex {
+        edge.param_range.start
+    } else {
+        edge.param_range.end
+    };
+    let tan = curve.tangent_at(t).ok()?;
+    if matches!(edge.orientation, EdgeOrientation::Backward) {
+        Some(tan * -1.0)
+    } else {
+        Some(tan)
+    }
 }
 
 /// Get adjacent faces for an edge by scanning all faces in the solid's shells
@@ -907,9 +1054,33 @@ fn validate_chamfer_inputs(
     Ok(())
 }
 
-/// Validate chamfered solid
-fn validate_chamfered_solid(_model: &BRepModel, _solid_id: SolidId) -> OperationResult<()> {
-    // Would perform full validation
+/// Validate chamfered solid by running the full B-Rep validation suite.
+fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
+    if model.solids.get(solid_id).is_none() {
+        return Err(OperationError::InvalidBRep(format!(
+            "validate_chamfered_solid: solid {} not found",
+            solid_id
+        )));
+    }
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::InvalidBRep(format!(
+            "Chamfered solid failed validation ({} errors): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 
