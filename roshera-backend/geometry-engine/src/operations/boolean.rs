@@ -2600,11 +2600,12 @@ impl IntersectionGraph {
     }
 
     fn add_edge(&mut self, edge_id: EdgeId, edge_type: EdgeType) {
-        // Store edge in graph with placeholder vertices (resolved when model is available).
-        // `u32::MAX` is used as the "unresolved" sentinel because vertex ID 0 is a
-        // legitimate VertexId (VertexStore::next_id starts at 0). Using 0 here would
-        // conflate an unresolved placeholder with a real corner vertex whenever the
-        // first vertex created in the model participates in a boundary edge.
+        // Insert with deferred vertex IDs — they're filled in by
+        // `resolve_vertices` once the BRepModel is available. `u32::MAX`
+        // is the canonical "unresolved" sentinel because vertex ID 0 is
+        // a legitimate VertexId (VertexStore::next_id starts at 0); a
+        // sentinel of 0 would silently merge unresolved edges with the
+        // first real corner vertex.
         let graph_edge = GraphEdge {
             edge_id,
             edge_type,
@@ -4939,7 +4940,8 @@ mod tests {
 
     #[test]
     fn test_face_grouping_all_isolated() {
-        // face-grouping is origin-agnostic; use solid 0 as a placeholder.
+        // face-grouping is origin-agnostic; we set `from_solid = 0` as a
+        // don't-care fixture value (the test exercises only adjacency).
         let faces = vec![
             SplitFace {
                 original_face: 0,
@@ -4966,7 +4968,8 @@ mod tests {
 
     #[test]
     fn test_face_grouping_shared_edges() {
-        // face-grouping is origin-agnostic; use solid 0 as a placeholder.
+        // face-grouping is origin-agnostic; we set `from_solid = 0` as a
+        // don't-care fixture value (the test exercises only adjacency).
         let faces = vec![
             SplitFace {
                 original_face: 0,
