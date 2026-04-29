@@ -996,8 +996,71 @@ fn create_trimmed_fillet_face(
     );
     fillet_edges.push(model.edges.add(edge2));
 
-    // Create side edges if needed (simplified - assumes 3-sided fillet)
-    // In production, would handle 4-sided fillets and complex cases
+    // 3-sided fillet topology assumes the trim curves on the two
+    // adjacent faces both terminate exactly at the original edge's
+    // endpoints (i.e. the rolling-ball radius vanishes at the edge
+    // vertices). This is the canonical case for sharp-edge fillets.
+    //
+    // The 4-sided fillet topology — required when the contact trails
+    // extend past the original edge ends (long fillets, blends spanning
+    // multiple edges, vanishing radii inside the face) — needs two
+    // additional side edges plus two new vertices, and a cap (spherical
+    // arc or N-sided patch) at each end. The kernel does not yet emit
+    // those side edges, so we validate the 3-sided assumption here and
+    // surface the gap loudly when it doesn't hold rather than silently
+    // emitting an open loop.
+    let endpoint_tol = Tolerance::default().distance().max(1e-6);
+    let start_pos = model
+        .vertices
+        .get(start_vertex)
+        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
+        .position;
+    let end_pos = model
+        .vertices
+        .get(end_vertex)
+        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?
+        .position;
+    let dist = |a: [f64; 3], b: Point3| -> f64 {
+        ((a[0] - b.x).powi(2) + (a[1] - b.y).powi(2) + (a[2] - b.z).powi(2)).sqrt()
+    };
+    let trim1_first = trim_curve1
+        .first()
+        .copied()
+        .ok_or_else(|| OperationError::InvalidGeometry("Trim curve 1 is empty".to_string()))?;
+    let trim1_last = trim_curve1
+        .last()
+        .copied()
+        .ok_or_else(|| OperationError::InvalidGeometry("Trim curve 1 is empty".to_string()))?;
+    let trim2_first = trim_curve2
+        .first()
+        .copied()
+        .ok_or_else(|| OperationError::InvalidGeometry("Trim curve 2 is empty".to_string()))?;
+    let trim2_last = trim_curve2
+        .last()
+        .copied()
+        .ok_or_else(|| OperationError::InvalidGeometry("Trim curve 2 is empty".to_string()))?;
+
+    let three_sided_ok = dist(start_pos, trim1_first) < endpoint_tol
+        && dist(end_pos, trim1_last) < endpoint_tol
+        && dist(start_pos, trim2_first) < endpoint_tol
+        && dist(end_pos, trim2_last) < endpoint_tol;
+    if !three_sided_ok {
+        return Err(OperationError::NotImplemented(format!(
+            "create_trimmed_fillet_face: 4-sided fillet topology required \
+             (trim curve endpoints offset from original edge by up to {:.3e}, \
+             tol={:.3e}); side-edge synthesis + cap patches not yet implemented",
+            [
+                dist(start_pos, trim1_first),
+                dist(end_pos, trim1_last),
+                dist(start_pos, trim2_first),
+                dist(end_pos, trim2_last),
+            ]
+            .iter()
+            .cloned()
+            .fold(0.0_f64, f64::max),
+            endpoint_tol
+        )));
+    }
 
     // Create loop for fillet face
     let mut fillet_loop = Loop::new(
