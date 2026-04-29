@@ -307,8 +307,12 @@ pub fn analyze_surface_continuity(
         let normal1 = surface1.normal_at(u1, v1)?;
         let normal2 = surface2.normal_at(u2, v2)?;
 
-        // For G1 continuity, normals should be parallel (same or opposite)
-        let normal_dot = normal1.dot(&normal2).abs();
+        // For G1 continuity, normals should be parallel (same or opposite).
+        // Clamp the dot product to [0, 1] before passing to acos: floating-point
+        // drift on a normalized vector can push |n1·n2| just outside [0, 1] and
+        // produce NaN, which would then poison `max_tangent_error` and the
+        // continuity classification below.
+        let normal_dot = normal1.dot(&normal2).abs().clamp(0.0, 1.0);
         let normal_angle = (1.0 - normal_dot).acos();
         max_tangent_error = f64::max(max_tangent_error, normal_angle);
 

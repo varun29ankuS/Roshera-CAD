@@ -154,11 +154,32 @@ pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64, tolerance: Tolerance) -> Vec<
     roots
 }
 
-/// Trigonometric solution for three real roots
+/// Trigonometric solution for three real roots (Viète's casus irreducibilis).
+///
+/// The argument to `acos` is `3q / (p · m)` where `m = 2·√(-p/3)`. Two
+/// numerical hazards must be neutralised:
+///
+/// 1. When `p` is very close to zero, `m ≈ 0` and the division becomes
+///    ill-conditioned; we fall back to Cardano's formula, which is well-
+///    behaved in that regime.
+/// 2. The argument can drift outside [-1, 1] by floating-point rounding
+///    even when the cubic has three real roots; clamping is the
+///    standard safety net (cited in Press et al., *Numerical Recipes*,
+///    §5.6 "Quadratic and Cubic Equations").
+///
+/// Without these guards `acos` returns `NaN`, contaminating all three
+/// roots — which then survive the `is_finite` filter only if NaN is
+/// converted upstream.
 #[inline]
 fn solve_cubic_trig(p: f64, q: f64, b_shift: f64) -> Vec<f64> {
     let m = 2.0 * (-p / 3.0).sqrt();
-    let theta = (3.0 * q / (p * m)).acos() / 3.0;
+    if m.abs() < 1e-14 || p.abs() < 1e-14 {
+        // Degenerate trigonometric path — Cardano's formula handles
+        // it correctly even when discriminant ≈ 0.
+        return solve_cubic_cardano(p, q, b_shift);
+    }
+    let arg = (3.0 * q / (p * m)).clamp(-1.0, 1.0);
+    let theta = arg.acos() / 3.0;
     let shift = -b_shift / 3.0;
 
     vec![
