@@ -1926,27 +1926,62 @@ impl NurbsSurface {
             v,
         };
 
-        // Compute derivatives if requested
+        // Compute derivatives via central finite differences. We honour
+        // both first- and second-order requests; orders ≥ 3 fall back
+        // to whichever derivatives we *do* fill (du, dv, duu, dvv, duv)
+        // rather than panicking — callers needing C³ should use the
+        // analytic-recursion variant once that lands.
+        //
+        // Step size h chosen as ~sqrt(eps) for first derivatives and
+        // ~eps^(1/3) for second derivatives, balancing truncation error
+        // (∝ h^p) against round-off (∝ eps/h^q). For double precision
+        // these resolve to roughly 1e-6 (1st-order) and 1e-4 (2nd).
         if du_order >= 1 || dv_order >= 1 {
-            // Simplified - full implementation would compute all requested derivatives
-            let delta = 1e-6;
-
+            let h1 = 1e-6;
             if du_order >= 1 {
-                let p1 = self.evaluate(u - delta, v).point;
-                let p2 = self.evaluate(u + delta, v).point;
-                result.du = Some((p2 - p1) / (2.0 * delta));
+                let p1 = self.evaluate(u - h1, v).point;
+                let p2 = self.evaluate(u + h1, v).point;
+                result.du = Some((p2 - p1) / (2.0 * h1));
             }
-
             if dv_order >= 1 {
-                let p1 = self.evaluate(u, v - delta).point;
-                let p2 = self.evaluate(u, v + delta).point;
-                result.dv = Some((p2 - p1) / (2.0 * delta));
+                let p1 = self.evaluate(u, v - h1).point;
+                let p2 = self.evaluate(u, v + h1).point;
+                result.dv = Some((p2 - p1) / (2.0 * h1));
             }
-
-            // Compute normal from first derivatives
-            // Use right-hand rule: normal = dv × du (not du × dv) for standard orientation
+            // Right-hand rule: normal = dv × du keeps the standard
+            // outward orientation for surfaces parametrised
+            // (u increases right, v increases up).
             if let (Some(du), Some(dv)) = (result.du, result.dv) {
                 result.normal = dv.cross(&du).normalize().ok();
+            }
+        }
+        if du_order >= 2 || dv_order >= 2 {
+            let h2 = 1e-4;
+            let p_center = result.point;
+            if du_order >= 2 {
+                let p_minus = self.evaluate(u - h2, v).point;
+                let p_plus = self.evaluate(u + h2, v).point;
+                let acc = (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec())
+                    / (h2 * h2);
+                result.duu = Some(acc);
+            }
+            if dv_order >= 2 {
+                let p_minus = self.evaluate(u, v - h2).point;
+                let p_plus = self.evaluate(u, v + h2).point;
+                let acc = (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec())
+                    / (h2 * h2);
+                result.dvv = Some(acc);
+            }
+            // Mixed partial only meaningful when both directions
+            // requested — uses the standard four-corner stencil.
+            if du_order >= 2 && dv_order >= 2 {
+                let pp = self.evaluate(u + h2, v + h2).point;
+                let pm = self.evaluate(u + h2, v - h2).point;
+                let mp = self.evaluate(u - h2, v + h2).point;
+                let mm = self.evaluate(u - h2, v - h2).point;
+                let mixed = (pp.to_vec() - pm.to_vec() - mp.to_vec() + mm.to_vec())
+                    / (4.0 * h2 * h2);
+                result.duv = Some(mixed);
             }
         }
 
