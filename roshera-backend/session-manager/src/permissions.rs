@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use shared_types::{ObjectId, SessionError};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::warn;
 
 /// User role in a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -647,24 +648,57 @@ impl PermissionManager {
         Ok(())
     }
 
-    /// Evaluate rule condition
+    /// Evaluate rule condition.
+    ///
+    /// Conditions whose evaluation requires data the current schema does
+    /// not carry (group membership, resource counters, custom predicate
+    /// registry) fail closed — they return `false` so the rule does not
+    /// fire. This is the safe default in an authorization context: an
+    /// unevaluable condition must never cause a `Grant` rule to apply.
+    /// Each unevaluable site emits a `warn!` so operators can detect rules
+    /// that depend on unimplemented capabilities.
     fn evaluate_condition(&self, condition: &RuleCondition, user: &UserPermissions) -> bool {
         match condition {
             RuleCondition::UserHasRole(role) => user.role == *role,
-            RuleCondition::UserInGroup(_group) => {
-                // TODO: Implement group membership check
+            RuleCondition::UserInGroup(group) => {
+                // `UserPermissions` has no `groups` field; group membership
+                // is not part of the v1 schema. Fail closed.
+                warn!(
+                    user_id = %user.user_id,
+                    group = %group,
+                    "RuleCondition::UserInGroup evaluated against schema with no group support; \
+                     rule will not fire"
+                );
                 false
             }
             RuleCondition::TimeBased { start, end } => {
                 let now = Utc::now();
                 now >= *start && now <= *end
             }
-            RuleCondition::ResourceLimit { .. } => {
-                // TODO: Implement resource limit check
-                true
+            RuleCondition::ResourceLimit { resource, limit } => {
+                // Per-user resource counters are not yet tracked in the
+                // permission manager. Fail closed (was previously `true`,
+                // which caused `Grant` rules with this condition to apply
+                // unconditionally — a security regression).
+                warn!(
+                    user_id = %user.user_id,
+                    resource = %resource,
+                    limit = limit,
+                    "RuleCondition::ResourceLimit evaluated without counter tracking; \
+                     rule will not fire"
+                );
+                false
             }
-            RuleCondition::Custom(_) => {
-                // TODO: Implement custom conditions
+            RuleCondition::Custom(expr) => {
+                // No custom-predicate registry is plumbed in at this
+                // layer; a future extension would dispatch on `expr`.
+                // Fail closed.
+                warn!(
+                    user_id = %user.user_id,
+                    expression = %expr,
+                    "RuleCondition::Custom evaluated with no registered predicate; \
+                     rule will not fire"
+                );
                 false
             }
         }
@@ -695,8 +729,20 @@ impl PermissionManager {
                 }
                 Ok(())
             }
-            RuleAction::Custom(_) => {
-                // TODO: Implement custom actions
+            RuleAction::Custom(name) => {
+                // No custom-action registry is plumbed in at this layer;
+                // a future extension would look `name` up against a table
+                // of `Box<dyn Fn(&PermissionManager, ...) -> Result>`.
+                // Until then we ignore it (the rule's condition has
+                // already passed evaluation) and emit a warn so operators
+                // see unbound action references.
+                warn!(
+                    session_id = %session_id,
+                    user_id = %user_id,
+                    action = %name,
+                    applied_by = %applied_by,
+                    "RuleAction::Custom referenced with no registered handler; action skipped"
+                );
                 Ok(())
             }
         }

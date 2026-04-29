@@ -13,7 +13,6 @@ use std::sync::Arc;
 use timeline_engine::{Operation, Timeline};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 /// Command processor with timeline integration
 pub struct CommandProcessor {
@@ -203,14 +202,20 @@ impl CommandProcessor {
                         operands: operand_ids,
                     },
                     BooleanOp::Difference => {
-                        // First object is the target; the rest are the tool bodies.
-                        let (target, tools) = operand_ids
-                            .split_first()
-                            .map(|(h, t)| (*h, t.to_vec()))
-                            .unwrap_or_else(|| {
-                                let placeholder = timeline_engine::EntityId(Uuid::nil());
-                                (placeholder, vec![])
-                            });
+                        // First object is the target; the rest are the tool
+                        // bodies. An empty operand list is a malformed
+                        // command — surface it as an InvalidInput error
+                        // rather than fabricating a nil-UUID placeholder
+                        // (which would advance the timeline with an
+                        // operation pointing at a non-existent entity).
+                        let (target, tools) =
+                            operand_ids.split_first().map(|(h, t)| (*h, t.to_vec())).ok_or_else(
+                                || SessionError::InvalidInput {
+                                    field: "BooleanOperation::target_objects (Difference \
+                                            requires at least one operand)"
+                                        .to_string(),
+                                },
+                            )?;
                         Operation::BooleanDifference { target, tools }
                     }
                 }

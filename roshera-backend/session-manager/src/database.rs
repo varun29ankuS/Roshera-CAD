@@ -668,6 +668,23 @@ impl DatabasePersistence for PostgresDatabase {
             reason: format!("Failed to serialize object: {}", e),
         })?;
 
+        // The `CADObject` schema does not carry a dedicated `created_by`
+        // field; producers (command_processor::create_primitive,
+        // AI-driven import paths) record the originating user inside the
+        // object's `metadata` map under the `"created_by"` key when that
+        // identity is available. We honour that convention here so the
+        // SQL column reflects the real creator when known and falls back
+        // to `"system"` for objects produced by internal subsystems
+        // (timeline replay, default-scene seeding) that have no human
+        // attribution. The fallback is structural — adding a typed field
+        // to `CADObject` is tracked separately as a public-API change.
+        let created_by = object
+            .metadata
+            .get("created_by")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "system".to_string());
+
         sqlx::query(
             r#"
             INSERT INTO objects (id, session_id, name, object_type, data, created_at, modified_at, created_by)
@@ -685,7 +702,7 @@ impl DatabasePersistence for PostgresDatabase {
         .bind(data)
         .bind(timestamp_to_datetime(object.created_at as i64))
         .bind(timestamp_to_datetime(object.modified_at as i64))
-        .bind("system") // TODO: Track actual creator
+        .bind(created_by)
         .execute(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {
