@@ -1,14 +1,14 @@
 import * as THREE from 'three'
 
 /**
- * Bridge from CSS custom properties (oklch / rgb / hex) to THREE.Color +
- * alpha. The browser's Canvas2D `fillStyle` setter is the canonical CSS
- * color parser — assigning any valid color and reading it back yields a
- * normalised `#rrggbb` or `rgba(r, g, b, a)` string regardless of input
- * syntax (named colors, oklch, hsl, color() functions, etc.).
+ * Bridge from CSS custom properties (oklch / rgb / hex / named) to
+ * THREE.Color + alpha.
  *
- * This lets the Three.js scene consume the same blueprint tokens as the
- * rest of the UI without duplicating palette literals.
+ * Implementation note: we set the value as the `color` property on a
+ * detached element and read back the computed style. Browsers normalise
+ * `color` to `rgb(r, g, b)` or `rgba(r, g, b, a)` regardless of input
+ * syntax — including modern color spaces like `oklch()` — so this works
+ * across Chrome / Safari / Firefox without per-syntax parsing.
  */
 
 export interface ResolvedColor {
@@ -21,59 +21,61 @@ const FALLBACK: ResolvedColor = {
   alpha: 1,
 }
 
-let canvasProbe: CanvasRenderingContext2D | null = null
+let probeEl: HTMLDivElement | null = null
 
-function getProbe(): CanvasRenderingContext2D | null {
-  if (canvasProbe) return canvasProbe
+function getProbe(): HTMLDivElement | null {
+  if (probeEl) return probeEl
   if (typeof document === 'undefined') return null
-  const canvas = document.createElement('canvas')
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return null
-  canvasProbe = ctx
-  return ctx
+  const el = document.createElement('div')
+  el.style.position = 'absolute'
+  el.style.left = '-9999px'
+  el.style.top = '-9999px'
+  el.style.visibility = 'hidden'
+  el.style.pointerEvents = 'none'
+  document.body.appendChild(el)
+  probeEl = el
+  return el
 }
 
 /**
  * Resolves a CSS variable on `:root` (e.g. `--cad-grid`) to a THREE.Color
- * plus its alpha component. Returns a neutral grey at full opacity if the
- * variable is unset or unparseable so the scene never renders black.
+ * plus its alpha component. Falls back to neutral grey on any failure.
  */
 export function resolveCssVar(varName: string): ResolvedColor {
-  if (typeof document === 'undefined') return FALLBACK
+  const probe = getProbe()
+  if (!probe) return FALLBACK
+  probe.style.color = ''
+  probe.style.color = `var(${varName})`
+  // If the var didn't resolve, color stays as the inherited default
+  // (typically a foreground value); we test for an unset var explicitly.
   const raw = getComputedStyle(document.documentElement)
     .getPropertyValue(varName)
     .trim()
   if (!raw) return FALLBACK
-  return parseCssColor(raw)
+
+  const computed = getComputedStyle(probe).color
+  return parseRgbString(computed)
 }
 
 /**
- * Parses any CSS color string (hex, rgb/rgba, hsl, oklch, named) using a
- * Canvas2D context as the canonical normaliser.
+ * Parses any CSS color string by routing it through the browser's
+ * computed-style normaliser. Always returns rgb()/rgba() regardless of
+ * input format (oklch, hsl, hex, named).
  */
 export function parseCssColor(value: string): ResolvedColor {
-  const ctx = getProbe()
-  if (!ctx) return FALLBACK
+  const probe = getProbe()
+  if (!probe) return FALLBACK
+  probe.style.color = ''
+  probe.style.color = value
+  const computed = getComputedStyle(probe).color
+  if (!computed) return FALLBACK
+  return parseRgbString(computed)
+}
 
-  // Reset to a known sentinel so a rejected fillStyle assignment leaves a
-  // detectable previous value.
-  ctx.fillStyle = '#000000'
-  try {
-    ctx.fillStyle = value
-  } catch {
-    return FALLBACK
-  }
-  const normalised = ctx.fillStyle as string
-
-  // Hex form — no alpha channel.
-  if (normalised.startsWith('#')) {
-    return { color: new THREE.Color(normalised), alpha: 1 }
-  }
-
-  // rgb() / rgba() form.
-  const match = normalised.match(/rgba?\(([^)]+)\)/i)
+function parseRgbString(value: string): ResolvedColor {
+  const match = value.match(/rgba?\(([^)]+)\)/i)
   if (!match) return FALLBACK
-  const parts = match[1].split(',').map((s) => parseFloat(s.trim()))
+  const parts = match[1].split(/[,\s/]+/).filter(Boolean).map((s) => parseFloat(s))
   if (parts.length < 3 || parts.some((p) => Number.isNaN(p))) return FALLBACK
   const [r, g, b, a] = parts
   return {

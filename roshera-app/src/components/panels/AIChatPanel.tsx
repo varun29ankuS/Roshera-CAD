@@ -73,7 +73,7 @@ export function AIChatPanel() {
   }
 
   return (
-    <div className="cad-panel-floating absolute bottom-8 left-3 z-20 w-80 max-h-[55vh] flex flex-col rounded-xl overflow-hidden">
+    <div className="absolute bottom-8 left-3 z-20 w-80 max-h-[55vh] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
         <div className="flex items-center gap-2">
