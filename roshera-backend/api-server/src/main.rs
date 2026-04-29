@@ -1479,6 +1479,22 @@ async fn process_enhanced_ai_command(
     }
 }
 
+/// Stream an LLM response for an AI command via Server-Sent Events.
+///
+/// Wire protocol — emitted in this order, one SSE event per frame:
+///
+/// * `event: start`     `{"command": "<input>", "session_id": "<id>"}`
+/// * `event: token`     `{"text": "<delta>"}` (repeated, one per LLM delta)
+/// * `event: complete`  `{"text": "<full>", "session_id": "...", "user_id": "..."}`
+///
+/// On failure a single `event: error` frame replaces the token stream
+/// and the connection is closed. If the client disconnects mid-stream
+/// the spawned task notices the closed `mpsc::Sender` and drops the
+/// outstanding LLM read so the upstream HTTP request is cancelled
+/// promptly — no orphaned tokens get billed against the API key.
+///
+/// Replaces the previous fake "Analyzing… / Creating… / Finalizing…"
+/// chunk loop, which was a placeholder for real provider streaming.
 async fn process_ai_command_stream(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
@@ -1486,77 +1502,122 @@ async fn process_ai_command_stream(
 ) -> Sse<
     impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
+    use futures::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
 
-    // Check permissions
+    // Permission gate — emit a single error frame and close.
     if !auth_info.permissions.contains(&Permission::CreateGeometry) {
         tokio::spawn(async move {
             let _ = tx
-                .send(Ok(axum::response::sse::Event::default().data(
-                    serde_json::json!({
-                        "error": "Permission denied",
-                        "code": "FORBIDDEN"
-                    })
-                    .to_string(),
-                )))
+                .send(Ok(axum::response::sse::Event::default()
+                    .event("error")
+                    .data(
+                        serde_json::json!({
+                            "error": "Permission denied",
+                            "code": "FORBIDDEN"
+                        })
+                        .to_string(),
+                    )))
                 .await;
         });
         return Sse::new(ReceiverStream::new(rx));
     }
 
-    // Process AI command with streaming
-    let session_id = payload.session_id.clone();
+    let session_id = payload.session_id.clone().unwrap_or_default();
     let command = payload.command.clone();
     let user_id = auth_info.user_id.clone();
+    let provider_manager = state.provider_manager.clone();
 
     tokio::spawn(async move {
-        // Send initial processing message
+        // Frame 1: start event so the client knows the stream is live
+        // before any tokens have arrived (LLM cold-start can be ~500ms).
         let _ = tx
             .send(Ok(axum::response::sse::Event::default()
                 .event("start")
                 .data(
                     serde_json::json!({
-                        "status": "processing",
-                        "command": command
+                        "command": command,
+                        "session_id": session_id,
                     })
                     .to_string(),
                 )))
             .await;
 
-        // Simulate streaming chunks (in production, this would be real AI streaming)
-        let chunks = vec![
-            "Analyzing command...",
-            "Creating geometry...",
-            "Applying transformations...",
-            "Finalizing result...",
-        ];
+        // Open the upstream stream. We hold the provider-manager lock
+        // only across this single network round-trip; once we have the
+        // owned stream object we drop the guard so concurrent AI
+        // commands aren't blocked behind us.
+        let stream_result = {
+            let mgr = provider_manager.lock().await;
+            match mgr.llm() {
+                Ok(provider) => provider.generate_stream(&command, 1024).await,
+                Err(e) => Err(e),
+            }
+        };
 
-        for chunk in chunks {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            let _ = tx
-                .send(Ok(axum::response::sse::Event::default()
-                    .event("chunk")
-                    .data(
-                        serde_json::json!({
-                            "content": chunk,
-                            "session_id": &session_id
-                        })
-                        .to_string(),
-                    )))
-                .await;
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx
+                    .send(Ok(axum::response::sse::Event::default()
+                        .event("error")
+                        .data(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "stage": "open_stream",
+                            })
+                            .to_string(),
+                        )))
+                    .await;
+                return;
+            }
+        };
+
+        // Forward deltas verbatim. We accumulate the full text so the
+        // `complete` frame carries the whole response in one place for
+        // clients that prefer post-hoc consumption (e.g. tests).
+        let mut full = String::new();
+        while let Some(delta) = stream.next().await {
+            match delta {
+                Ok(text) => {
+                    full.push_str(&text);
+                    let send = tx
+                        .send(Ok(axum::response::sse::Event::default()
+                            .event("token")
+                            .data(serde_json::json!({ "text": text }).to_string())))
+                        .await;
+                    if send.is_err() {
+                        // Client hung up — drop the stream so the
+                        // upstream HTTP connection is cancelled.
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Ok(axum::response::sse::Event::default()
+                            .event("error")
+                            .data(
+                                serde_json::json!({
+                                    "error": e.to_string(),
+                                    "stage": "stream",
+                                })
+                                .to_string(),
+                            )))
+                        .await;
+                    return;
+                }
+            }
         }
 
-        // Send completion
         let _ = tx
             .send(Ok(axum::response::sse::Event::default()
                 .event("complete")
                 .data(
                     serde_json::json!({
-                        "status": "completed",
-                        "result": "Geometry created successfully",
+                        "text": full,
                         "session_id": session_id,
-                        "user_id": user_id
+                        "user_id": user_id,
                     })
                     .to_string(),
                 )))

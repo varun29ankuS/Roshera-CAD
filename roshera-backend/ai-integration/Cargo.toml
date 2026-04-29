@@ -34,7 +34,11 @@ tracing = { workspace = true }
 metrics = "0.21"
 
 # HTTP client for hosted LLM APIs (Claude, OpenAI, etc.)
-reqwest = { version = "0.12", features = ["json"] }
+# `stream` enables `bytes_stream()` which we use to parse Anthropic
+# server-sent events token-by-token in `ClaudeProvider::generate_stream`.
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# Naming reqwest's `bytes_stream()` item type directly in our SSE parser.
+bytes = "1"
 
 # For TTS - Native implementations
 base64 = "0.22"  # For encoding audio data in JSON
