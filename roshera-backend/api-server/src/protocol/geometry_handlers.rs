@@ -236,117 +236,55 @@ async fn handle_create_primitive(
     // Get geometry engine
     let mut geometry_model = state.model.write().await;
 
-    // Create shape parameters from JSON
-    // Removed wrapper import - using core geometry engine directly
-    use std::collections::HashMap;
-
-    let mut params = HashMap::new();
-
-    // Convert primitive type string to enum
-    let prim_type = match primitive_type.as_str() {
-        "box" | "cube" => {
-            params.insert(
-                "width".to_string(),
-                parameters["width"].as_f64().unwrap_or(1.0),
-            );
-            params.insert(
-                "height".to_string(),
-                parameters["height"].as_f64().unwrap_or(1.0),
-            );
-            params.insert(
-                "depth".to_string(),
-                parameters["depth"].as_f64().unwrap_or(1.0),
-            );
-            shared_types::PrimitiveType::Box
-        }
-        "sphere" => {
-            params.insert(
-                "radius".to_string(),
-                parameters["radius"].as_f64().unwrap_or(1.0),
-            );
-            shared_types::PrimitiveType::Sphere
-        }
-        "cylinder" => {
-            params.insert(
-                "radius".to_string(),
-                parameters["radius"].as_f64().unwrap_or(1.0),
-            );
-            params.insert(
-                "height".to_string(),
-                parameters["height"].as_f64().unwrap_or(2.0),
-            );
-            shared_types::PrimitiveType::Cylinder
-        }
-        "cone" => {
-            params.insert(
-                "half_angle".to_string(),
-                parameters["half_angle"].as_f64().unwrap_or(0.5),
-            );
-            params.insert(
-                "height".to_string(),
-                parameters["height"].as_f64().unwrap_or(2.0),
-            );
-            shared_types::PrimitiveType::Cone
-        }
-        "torus" => {
-            params.insert(
-                "major_radius".to_string(),
-                parameters["major_radius"].as_f64().unwrap_or(1.0),
-            );
-            params.insert(
-                "minor_radius".to_string(),
-                parameters["minor_radius"].as_f64().unwrap_or(0.3),
-            );
-            shared_types::PrimitiveType::Torus
-        }
-        _ => {
-            let error = GeometryWebSocketResponse::GeometryError {
-                message: format!("Unknown primitive type: {}", primitive_type),
-                request_type: "CreatePrimitive".to_string(),
-            };
-            send_response(sender, &error).await?;
-            return Ok(());
-        }
-    };
-
-    // Create primitive using core geometry engine - NO ShapeParameters needed
+    // Drive the kernel through TopologyBuilder so the timeline records the
+    // op. Default origin + Z axis; per-shape parameters come from the JSON
+    // payload. Defaults intentionally match `main.rs::create_geometry` so
+    // REST and WebSocket clients see identical behaviour.
     let mut builder = TopologyBuilder::new(&mut geometry_model);
+    let param = |k: &str, default: f64| -> f64 {
+        parameters
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default)
+    };
+    let origin = geometry_engine::math::Point3::new(0.0, 0.0, 0.0);
+    let z_axis = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0);
+
     let result = match primitive_type.to_lowercase().as_str() {
         "box" | "cube" => {
-            let width = parameters
-                .get("width")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(10.0);
-            let height = parameters
-                .get("height")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(10.0);
-            let depth = parameters
-                .get("depth")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(10.0);
+            let width = param("width", 10.0);
+            let height = param("height", 10.0);
+            let depth = param("depth", 10.0);
             builder.create_box_3d(width, height, depth)
         }
         "sphere" => {
-            let radius = parameters
-                .get("radius")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(5.0);
-            let center = geometry_engine::math::Point3::new(0.0, 0.0, 0.0);
-            builder.create_sphere_3d(center, radius)
+            let radius = param("radius", 5.0);
+            builder.create_sphere_3d(origin, radius)
         }
         "cylinder" => {
-            let radius = parameters
-                .get("radius")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(5.0);
-            let height = parameters
-                .get("height")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(10.0);
-            let base_center = geometry_engine::math::Point3::new(0.0, 0.0, 0.0);
-            let axis = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0); // Z-axis
-            builder.create_cylinder_3d(base_center, axis, radius, height)
+            let radius = param("radius", 5.0);
+            let height = param("height", 10.0);
+            builder.create_cylinder_3d(origin, z_axis, radius, height)
+        }
+        "cone" => {
+            let radius = param("radius", 5.0);
+            let height = param("height", 10.0);
+            // top_radius = 0.0 → sharp-tipped cone (matches REST handler).
+            builder.create_cone_3d(origin, z_axis, radius, 0.0, height)
+        }
+        "torus" => {
+            let major = param("major_radius", 8.0);
+            let minor = param("minor_radius", 2.0);
+            match geometry_engine::primitives::torus_primitive::TorusParameters::new(
+                origin, z_axis, major, minor,
+            ) {
+                Ok(params) => geometry_engine::primitives::torus_primitive::TorusPrimitive::create(
+                    &params,
+                    &mut *builder.model,
+                )
+                .map(geometry_engine::primitives::topology_builder::GeometryId::Solid),
+                Err(e) => Err(e),
+            }
         }
         _ => {
             let error = GeometryWebSocketResponse::GeometryError {
