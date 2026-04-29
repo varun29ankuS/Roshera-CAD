@@ -2299,6 +2299,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_geometry).delete(delete_geometry),
         )
         .route("/api/geometry/boolean", post(boolean_operation))
+        // Capability discovery — agent-readable surface description.
+        // Agents call this once per session to learn which primitives /
+        // operations exist and the exact parameter contract for each.
+        .route("/api/capabilities", get(handlers::capabilities::capabilities))
         // Kernel introspection (proprioception) — read-only model snapshot
         .route("/api/kernel/state", get(kernel_state::kernel_state))
         // Real mass properties (volume, COG, inertia tensor) for a single solid

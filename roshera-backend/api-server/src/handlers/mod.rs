@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod cache;
+pub mod capabilities;
 pub mod export;
 pub mod geometry;
 pub mod hierarchy;
@@ -15,6 +16,7 @@ pub mod timeline;
 // Re-export commonly used handlers
 pub use auth::*;
 pub use cache::*;
+pub use capabilities::*;
 pub use export::*;
 pub use geometry::*;
 pub use hierarchy::*;
