@@ -3,13 +3,25 @@
 use crate::AppState;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{Json, Result},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use session_manager::{AuthManager, Permission};
 use tracing::{error, info, warn};
+
+/// Response payload for the logout endpoint.
+#[derive(Debug, Serialize)]
+pub struct LogoutResponse {
+    /// Indicates whether the token was successfully revoked.
+    pub success: bool,
+    /// Human-readable status string.
+    pub message: String,
+    /// Populated only on the unhappy path; mirrors the codes used by
+    /// the other auth handlers in this module.
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
@@ -312,6 +324,65 @@ pub async fn refresh_token(
         success: true,
         token: Some(new_token.token),
         expires_in: Some(new_token.expires_at.timestamp() as u64),
+        error: None,
+    }))
+}
+
+/// Handle user logout
+///
+/// Extracts the bearer token from the `Authorization` header, verifies it via
+/// `AuthManager::verify_token` (which rejects tampered, expired, or already
+/// revoked tokens), then revokes its `jti` so subsequent requests using the
+/// same token fail authentication.
+///
+/// Idempotent: revoking an already-revoked token surfaces as a verification
+/// failure and returns success: false with an explanatory error code, but
+/// otherwise has no side effects.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<LogoutResponse>> {
+    let auth_manager = &state.auth_manager;
+
+    // Extract the Bearer token from the Authorization header.
+    let raw_token = match headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+    {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            warn!("Logout rejected — missing or malformed Authorization header");
+            return Ok(Json(LogoutResponse {
+                success: false,
+                message: "Missing bearer token".to_string(),
+                error: Some("MISSING_TOKEN".to_string()),
+            }));
+        }
+    };
+
+    // Verify the token to surface its jti. A revoked or expired token will
+    // fail verification — we treat that as a no-op success from the caller's
+    // perspective (logout is idempotent) but log the rejection for audit.
+    let claims = match auth_manager.verify_token(&raw_token) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Logout: token already invalid or revoked: {:?}", e);
+            return Ok(Json(LogoutResponse {
+                success: false,
+                message: "Token already invalid".to_string(),
+                error: Some("INVALID_TOKEN".to_string()),
+            }));
+        }
+    };
+
+    auth_manager.revoke_token(&claims.jti, "user_logout", &claims.sub);
+    info!("Logout successful — token {} revoked for user {}", claims.jti, claims.sub);
+
+    Ok(Json(LogoutResponse {
+        success: true,
+        message: "Logged out successfully".to_string(),
         error: None,
     }))
 }
