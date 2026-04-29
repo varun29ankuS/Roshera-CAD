@@ -92,21 +92,23 @@ export function DemoGallery({ onExit }: DemoGalleryProps) {
   return (
     <div className="flex flex-col h-screen w-screen bg-background text-foreground">
       {/* Header bar */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-card/50">
+      <div className="cad-panel border-b flex items-center justify-between px-4 py-2">
         <div className="flex items-center gap-3">
-          <Button variant="ghost" size="sm" onClick={onExit} className="gap-1.5">
+          <Button variant="ghost" size="sm" onClick={onExit} className="gap-1.5 font-mono uppercase tracking-wider text-[11px]">
             <ArrowLeft className="w-4 h-4" />
             Workspace
           </Button>
           <div className="h-4 w-px bg-border" />
           <div>
-            <div className="text-sm font-semibold">Kernel Demo Gallery</div>
-            <div className="text-xs text-muted-foreground">
+            <div className="text-[11px] font-mono uppercase tracking-[0.16em] text-foreground">
+              Kernel Demo Gallery
+            </div>
+            <div className="text-[10px] text-muted-foreground mt-0.5">
               Live STL output from each kernel example. Click a card to render it.
             </div>
           </div>
         </div>
-        <Button variant="ghost" size="sm" onClick={() => void loadManifest()} className="gap-1.5">
+        <Button variant="ghost" size="sm" onClick={() => void loadManifest()} className="gap-1.5 font-mono uppercase tracking-wider text-[11px]">
           <RefreshCw className="w-3.5 h-3.5" />
           Refresh
         </Button>
@@ -115,7 +117,7 @@ export function DemoGallery({ onExit }: DemoGalleryProps) {
       {/* Body: split between gallery list (left) and viewport (right) */}
       <div className="flex flex-1 min-h-0">
         {/* Gallery list */}
-        <div className="flex flex-col w-96 border-r border-border bg-card/30">
+        <div className="flex flex-col w-96 cad-panel border-r">
           {manifestError && (
             <div className="m-4 p-3 rounded-md border border-destructive/40 bg-destructive/10 text-xs flex items-start gap-2">
               <AlertTriangle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
@@ -140,10 +142,12 @@ export function DemoGallery({ onExit }: DemoGalleryProps) {
                 const info = categoryInfo(category)
                 return (
                   <div key={category} className="space-y-2">
-                    <div>
-                      <div className="text-sm font-semibold text-foreground">{info.title}</div>
+                    <div className="border-b border-border/60 pb-1.5">
+                      <div className="text-[10px] font-mono uppercase tracking-[0.16em] text-foreground">
+                        {info.title}
+                      </div>
                       {info.description && (
-                        <div className="text-xs text-muted-foreground mt-0.5">
+                        <div className="text-[10px] text-muted-foreground mt-0.5">
                           {info.description}
                         </div>
                       )}

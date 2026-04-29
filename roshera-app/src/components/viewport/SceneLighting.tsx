@@ -1,11 +1,43 @@
+import { useMemo } from 'react'
+import { useThemeStore } from '@/stores/theme-store'
+
+/**
+ * Scene lighting that follows the active blueprint theme.
+ *
+ * Light theme: warm cream sky / paper ground bounce — geometry reads as
+ * if lit on a drafting table.
+ * Dark theme: cool cyan key / saturated navy ground bounce — geometry
+ * reads as if lit under a hooded engineering lamp.
+ */
 export function SceneLighting() {
+  const theme = useThemeStore((s) => s.theme)
+
+  const palette = useMemo(() => {
+    if (theme === 'dark') {
+      return {
+        ambient: '#c8cde8',
+        keyLight: '#ffffff',
+        fillLight: '#b0c4de',
+        hemiSky: '#7090c0',
+        hemiGround: '#1e1e2e',
+      }
+    }
+    return {
+      ambient: '#f0e8d8',
+      keyLight: '#ffffff',
+      fillLight: '#d4c8b0',
+      hemiSky: '#e8e0c8',
+      hemiGround: '#b0a890',
+    }
+  }, [theme])
+
   return (
     <>
-      <ambientLight intensity={0.6} color="#c8cde8" />
+      <ambientLight intensity={0.6} color={palette.ambient} />
       <directionalLight
         position={[15, 25, 10]}
         intensity={1.0}
-        color="#ffffff"
+        color={palette.keyLight}
         castShadow
         shadow-mapSize-width={2048}
         shadow-mapSize-height={2048}
@@ -20,11 +52,9 @@ export function SceneLighting() {
       <directionalLight
         position={[-10, 10, -15]}
         intensity={0.4}
-        color="#b0c4de"
+        color={palette.fillLight}
       />
-      <hemisphereLight
-        args={['#7090c0', '#1e1e2e', 0.4]}
-      />
+      <hemisphereLight args={[palette.hemiSky, palette.hemiGround, 0.4]} />
     </>
   )
 }

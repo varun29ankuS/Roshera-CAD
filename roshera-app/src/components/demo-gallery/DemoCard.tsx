@@ -1,5 +1,4 @@
 import { Loader2 } from 'lucide-react'
-import { Badge } from '@/components/ui/badge'
 import type { DemoEntry } from '@/lib/demo-types'
 
 interface DemoCardProps {
@@ -17,27 +16,39 @@ export function DemoCard({ demo, isActive, isLoading, onLoad }: DemoCardProps) {
       onClick={onLoad}
       disabled={isLoading}
       className={[
-        'flex flex-col items-start gap-2 p-4 rounded-lg border text-left transition-all',
-        'bg-card/60 hover:bg-card hover:border-primary/50',
-        isActive ? 'border-primary ring-1 ring-primary/40' : 'border-border',
+        'flex flex-col items-stretch gap-1.5 px-3 py-2 border text-left transition-colors w-full',
+        'bg-card hover:bg-accent/30',
+        isActive
+          ? 'border-primary'
+          : 'border-border/60 hover:border-border',
         isLoading ? 'opacity-60 cursor-wait' : 'cursor-pointer',
       ].join(' ')}
     >
       <div className="flex items-center justify-between w-full gap-2">
-        <span className="font-mono text-sm text-foreground truncate">{demo.filename}</span>
-        {isLoading && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
+        <span className="font-mono text-[11px] text-foreground truncate uppercase tracking-wider">
+          {demo.filename}
+        </span>
+        {isLoading && (
+          <Loader2 className="w-3 h-3 animate-spin text-muted-foreground shrink-0" />
+        )}
       </div>
 
-      <div className="flex flex-wrap gap-1.5">
-        <Badge variant="secondary" className="text-[10px] font-mono">
-          {numberFmt.format(demo.verts)} verts
-        </Badge>
-        <Badge variant="secondary" className="text-[10px] font-mono">
-          {numberFmt.format(demo.tris)} tris
-        </Badge>
-        <Badge variant="outline" className="text-[10px] font-mono">
-          {demo.tess_ms.toFixed(1)} ms
-        </Badge>
+      <div className="flex flex-col gap-0.5 text-[10px] font-mono text-muted-foreground tabular-nums">
+        <div className="flex items-baseline gap-2">
+          <span className="uppercase tracking-wider min-w-[40px]">Verts</span>
+          <span className="flex-1 border-b border-dotted border-border/60 translate-y-[-2px]" />
+          <span className="text-foreground">{numberFmt.format(demo.verts)}</span>
+        </div>
+        <div className="flex items-baseline gap-2">
+          <span className="uppercase tracking-wider min-w-[40px]">Tris</span>
+          <span className="flex-1 border-b border-dotted border-border/60 translate-y-[-2px]" />
+          <span className="text-foreground">{numberFmt.format(demo.tris)}</span>
+        </div>
+        <div className="flex items-baseline gap-2">
+          <span className="uppercase tracking-wider min-w-[40px]">Tess</span>
+          <span className="flex-1 border-b border-dotted border-border/60 translate-y-[-2px]" />
+          <span className="text-foreground">{demo.tess_ms.toFixed(1)} ms</span>
+        </div>
       </div>
     </button>
   )

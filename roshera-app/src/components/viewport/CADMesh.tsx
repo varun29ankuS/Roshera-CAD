@@ -1,6 +1,8 @@
 import { useRef, useMemo, useCallback, useEffect } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
+import { useThemeStore } from '@/stores/theme-store'
+import { resolveCssVar } from '@/lib/css-color'
 import { wsClient } from '@/lib/ws-client'
 import * as THREE from 'three'
 import type { ThreeEvent } from '@react-three/fiber'
@@ -11,8 +13,6 @@ interface CADMeshProps {
   isHovered: boolean
 }
 
-const DEFAULT_EDGE_COLOR = '#2a2d3a'
-
 export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null!)
   const selectObject = useSceneStore((s) => s.selectObject)
@@ -21,6 +21,17 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   const registerMeshRef = useSceneStore((s) => s.registerMeshRef)
   const unregisterMeshRef = useSceneStore((s) => s.unregisterMeshRef)
   const edgeSettings = useSceneStore((s) => s.edgeSettings)
+  const theme = useThemeStore((s) => s.theme)
+
+  const { defaultEdgeHex, accentEdgeHex } = useMemo(() => {
+    const tick = resolveCssVar('--cad-tick')
+    const accent = resolveCssVar('--cad-selected')
+    return {
+      defaultEdgeHex: `#${tick.color.getHexString()}`,
+      accentEdgeHex: `#${accent.color.getHexString()}`,
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [theme])
 
   // Register mesh ref for outline post-processing
   useEffect(() => {
@@ -144,7 +155,7 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       {edgeSettings.visible && (
         <Edges
           threshold={edgeSettings.threshold}
-          color={isHovered || isSelected ? '#5b9cf5' : (edgeSettings.color || DEFAULT_EDGE_COLOR)}
+          color={isHovered || isSelected ? accentEdgeHex : (edgeSettings.color || defaultEdgeHex)}
           lineWidth={isSelected ? edgeSettings.lineWidth * 1.5 : edgeSettings.lineWidth}
         />
       )}
