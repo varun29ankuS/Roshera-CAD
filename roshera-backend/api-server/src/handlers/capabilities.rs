@@ -59,7 +59,15 @@ fn build_capabilities() -> Value {
             "errors": "Missing or non-numeric required parameters return \
                 400 BAD_REQUEST with `{\"success\": false, \"error\": \
                 \"missing or non-numeric parameter 'X'\"}`. The kernel \
-                never silently substitutes default dimensions."
+                never silently substitutes default dimensions.",
+            "idempotency": "Every mutating endpoint (POST/PUT/PATCH/DELETE) \
+                honours an optional `Idempotency-Key` request header. \
+                Sending the same key + same body twice replays the \
+                cached response with `Idempotency-Replayed: true`; \
+                same key + different body returns 409 CONFLICT. 5xx \
+                responses are never cached so transient kernel errors \
+                stay retryable. Cache window: 24 hours. Use a fresh \
+                UUID per logical command."
         },
         "primitives": primitives(),
         "operations": operations(),
