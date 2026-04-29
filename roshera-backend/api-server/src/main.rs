@@ -16,6 +16,7 @@ mod idempotency;
 mod kernel_state;
 mod metrics;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
+mod transactions;
 mod viewport_bridge;
               // Using core geometry-engine directly
 use axum::{
@@ -116,6 +117,12 @@ pub struct AppState {
     /// `ROSHERA_DEV_BRIDGE=1`; the bridge state is always present so the
     /// `Clone` impl on `AppState` stays cheap.
     pub viewport_bridge: Arc<viewport_bridge::ViewportBridge>,
+
+    /// Atomic transaction registry. Mutating handlers honour the
+    /// `X-Roshera-Tx-Id` header by routing newly-created solids
+    /// through `track_solid`; `POST /api/tx/{id}/rollback` then
+    /// removes them from the kernel store. See `transactions.rs`.
+    pub transactions: Arc<transactions::TransactionManager>,
 }
 
 impl AppState {
@@ -327,11 +334,49 @@ async fn list_roles_wrapper(
 /// ```
 async fn create_geometry(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use geometry_engine::primitives::topology_builder::{GeometryId as KernelGeometryId, TopologyBuilder};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
+
+    // Optional `X-Roshera-Tx-Id` header opts the request into an
+    // active transaction. Validating it up front (before doing any
+    // kernel work) means a bad UUID surfaces as a 400 without
+    // leaving an orphan solid behind.
+    let tx_id: Option<Uuid> = match headers.get(transactions::TX_ID_HEADER) {
+        None => None,
+        Some(v) => {
+            let s = v
+                .to_str()
+                .map_err(|_| error_catalog::ApiError::missing_field(transactions::TX_ID_HEADER))?;
+            Some(Uuid::parse_str(s).map_err(|_| {
+                error_catalog::ApiError::new(
+                    error_catalog::ErrorCode::InvalidParameter,
+                    format!("'{}' header is not a UUID: {s}", transactions::TX_ID_HEADER),
+                )
+            })?)
+        }
+    };
+    // Pre-flight: if a transaction was named, fail fast when it is
+    // missing or terminal so we never create a solid we cannot track.
+    if let Some(id) = tx_id {
+        let view = state
+            .transactions
+            .view(id)
+            .ok_or_else(|| error_catalog::ApiError::new(
+                error_catalog::ErrorCode::TransactionNotFound,
+                format!("transaction {id} is unknown or has been pruned"),
+            ))?;
+        if view.status != transactions::TxStatus::Active {
+            return Err(error_catalog::ApiError::new(
+                error_catalog::ErrorCode::TransactionNotActive,
+                format!("transaction {id} is no longer active"),
+            )
+            .into());
+        }
+    }
 
     let shape_type = payload
         .get("shape_type")
@@ -431,6 +476,14 @@ async fn create_geometry(
         }
     };
 
+    // If the request opted into a transaction, register the new solid
+    // before doing any further work. Tracking *before* tessellation
+    // means a downstream failure (e.g. empty mesh) is still cleaned
+    // up by `POST /api/tx/{id}/rollback`.
+    if let Some(id) = tx_id {
+        state.transactions.track_solid(id, solid_id)?;
+    }
+
     // Tessellate the freshly created solid.
     let solid = model
         .solids
@@ -511,6 +564,107 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
     }
+}
+
+/// `POST /api/tx/begin` — open a fresh atomic transaction.
+///
+/// Response: `{ "tx_id": "<uuid>", "status": "active", "created_solids": [], "age_seconds": 0 }`.
+/// The agent quotes the returned `tx_id` in subsequent mutation
+/// requests via the `X-Roshera-Tx-Id` header.
+async fn tx_begin(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let id = state.transactions.begin();
+    let view = state.transactions.view(id).ok_or_else(|| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::Internal,
+            "freshly-opened transaction vanished",
+        )
+    })?;
+    Ok(Json(serde_json::to_value(view).map_err(|e| {
+        error_catalog::ApiError::new(error_catalog::ErrorCode::Internal, e.to_string())
+    })?))
+}
+
+/// `GET /api/tx/{id}` — inspect a transaction's current state.
+async fn tx_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tx_id = Uuid::parse_str(&id).map_err(|_| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::InvalidParameter,
+            format!("tx id is not a UUID: {id}"),
+        )
+    })?;
+    let view = state.transactions.view(tx_id).ok_or_else(|| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::TransactionNotFound,
+            format!("transaction {tx_id} is unknown or has been pruned"),
+        )
+    })?;
+    Ok(Json(serde_json::to_value(view).map_err(|e| {
+        error_catalog::ApiError::new(error_catalog::ErrorCode::Internal, e.to_string())
+    })?))
+}
+
+/// `POST /api/tx/{id}/commit` — promote every solid created under the
+/// transaction into the permanent kernel state. Idempotent only via
+/// the standard `Idempotency-Key` middleware; calling commit twice on
+/// the same `tx_id` returns `transaction_not_active`.
+async fn tx_commit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tx_id = Uuid::parse_str(&id).map_err(|_| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::InvalidParameter,
+            format!("tx id is not a UUID: {id}"),
+        )
+    })?;
+    let view = state.transactions.commit(tx_id)?;
+    Ok(Json(serde_json::to_value(view).map_err(|e| {
+        error_catalog::ApiError::new(error_catalog::ErrorCode::Internal, e.to_string())
+    })?))
+}
+
+/// `POST /api/tx/{id}/rollback` — flip the transaction to RolledBack
+/// and remove every solid it produced from the kernel store. Lock
+/// order: model write lock first, then transaction inner mutex —
+/// matches the discipline used elsewhere in the server.
+async fn tx_rollback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tx_id = Uuid::parse_str(&id).map_err(|_| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::InvalidParameter,
+            format!("tx id is not a UUID: {id}"),
+        )
+    })?;
+    let solids = state.transactions.begin_rollback(tx_id)?;
+
+    // The transaction inner mutex was already released by
+    // `begin_rollback` before we reach for the model write lock,
+    // preserving the codebase's "model first, tx second" lock order
+    // for any future code path that holds both.
+    {
+        let mut model = state.model.write().await;
+        for sid in &solids {
+            model.solids.remove(*sid);
+        }
+    }
+
+    let view = state.transactions.view(tx_id).ok_or_else(|| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::Internal,
+            "rolled-back transaction vanished from registry",
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "tx": view,
+        "removed_solids": solids,
+    })))
 }
 
 /// Execute a boolean operation on two existing solids, return the
@@ -2239,6 +2393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
         performance_metrics: Arc::new(Mutex::new(metrics::PerformanceTracker::default())),
         viewport_bridge: viewport_bridge::ViewportBridge::new(),
+        transactions: Arc::new(transactions::TransactionManager::new()),
     };
 
     // Build router with all routes
@@ -2265,6 +2420,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.
         .route("/api/capabilities", get(handlers::capabilities::capabilities))
+        // Atomic transactions: agents wrap multi-step plans in a tx so a
+        // mid-plan failure doesn't pollute the model. The tx_id from
+        // /begin is quoted in the X-Roshera-Tx-Id header on subsequent
+        // mutations; commit promotes, rollback removes.
+        .route("/api/tx/begin", post(tx_begin))
+        .route("/api/tx/{id}", get(tx_get))
+        .route("/api/tx/{id}/commit", post(tx_commit))
+        .route("/api/tx/{id}/rollback", post(tx_rollback))
         // Kernel introspection (proprioception) — read-only model snapshot
         .route("/api/kernel/state", get(kernel_state::kernel_state))
         // Real mass properties (volume, COG, inertia tensor) for a single solid

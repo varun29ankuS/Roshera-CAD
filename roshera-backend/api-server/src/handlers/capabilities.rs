@@ -72,7 +72,19 @@ fn build_capabilities() -> Value {
                 same key + different body returns 409 CONFLICT. 5xx \
                 responses are never cached so transient kernel errors \
                 stay retryable. Cache window: 24 hours. Use a fresh \
-                UUID per logical command."
+                UUID per logical command.",
+            "transactions": "Multi-step plans may be wrapped in an atomic \
+                transaction so partial work doesn't leak into the model on \
+                failure. Open one with `POST /api/tx/begin`, then quote the \
+                returned `tx_id` in the `X-Roshera-Tx-Id` header on each \
+                subsequent mutation. `POST /api/tx/{id}/commit` makes the \
+                tracked solids permanent; `POST /api/tx/{id}/rollback` \
+                removes every solid created under the transaction. \
+                Transactions auto-expire after 1 hour of inactivity. \
+                Errors surface as `transaction_not_found` (NOT_FOUND, \
+                non-retryable) or `transaction_not_active` (CONFLICT, \
+                non-retryable). Header is opt-in: omitting it preserves \
+                pre-transaction behaviour."
         },
         "primitives": primitives(),
         "operations": operations(),
@@ -269,6 +281,12 @@ fn endpoints() -> Value {
             "create": "POST /api/sessions",
             "join": "POST /api/sessions/{id}/join",
             "leave": "POST /api/sessions/{id}/leave"
+        },
+        "transactions": {
+            "begin":    "POST /api/tx/begin",
+            "get":      "GET  /api/tx/{id}",
+            "commit":   "POST /api/tx/{id}/commit",
+            "rollback": "POST /api/tx/{id}/rollback"
         },
         "export": "POST /api/export"
     })
