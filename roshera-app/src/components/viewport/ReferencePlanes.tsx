@@ -1,27 +1,16 @@
-import { useMemo } from 'react'
-import { useThemeStore } from '@/stores/theme-store'
-import { resolveCssVar } from '@/lib/css-color'
-
 /**
- * Datum axis lines along the world origin — X, Y, Z all rendered in the
- * blueprint tick color. Orientation is conveyed by the gizmo widget, not
- * by RGB encoding, so the viewport reads as a single-hue technical drawing.
+ * World-origin axis lines on the XZ ground plane plus the Y vertical.
+ * Uses the conventional X=red / Y=green / Z=blue encoding so the
+ * orientation matches the gizmo widget and standard CAD muscle memory.
+ * Drawn slightly above the grid plane to avoid z-fighting.
  */
 export function ReferencePlanes() {
-  const Y = 0.005
+  const Y = 0
   const LEN = 100
-  const theme = useThemeStore((s) => s.theme)
-
-  const tick = useMemo(
-    () => resolveCssVar('--cad-tick'),
-    // theme switches change the resolved CSS var; depend on it explicitly.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [theme],
-  )
 
   return (
     <group name="reference-planes">
-      {/* X axis */}
+      {/* X axis (red) */}
       <line>
         <bufferGeometry>
           <bufferAttribute
@@ -29,10 +18,10 @@ export function ReferencePlanes() {
             args={[new Float32Array([-LEN, Y, 0, LEN, Y, 0]), 3]}
           />
         </bufferGeometry>
-        <lineBasicMaterial color={tick.color} transparent opacity={tick.alpha * 0.45} />
+        <lineBasicMaterial color="#e74c3c" transparent opacity={0.45} />
       </line>
 
-      {/* Y axis (vertical datum — slightly stronger) */}
+      {/* Y axis (green) */}
       <line>
         <bufferGeometry>
           <bufferAttribute
@@ -40,10 +29,10 @@ export function ReferencePlanes() {
             args={[new Float32Array([0, 0, 0, 0, LEN, 0]), 3]}
           />
         </bufferGeometry>
-        <lineBasicMaterial color={tick.color} transparent opacity={tick.alpha * 0.7} />
+        <lineBasicMaterial color="#2ecc71" transparent opacity={0.45} />
       </line>
 
-      {/* Z axis */}
+      {/* Z axis (blue) */}
       <line>
         <bufferGeometry>
           <bufferAttribute
@@ -51,7 +40,7 @@ export function ReferencePlanes() {
             args={[new Float32Array([0, Y, -LEN, 0, Y, LEN]), 3]}
           />
         </bufferGeometry>
-        <lineBasicMaterial color={tick.color} transparent opacity={tick.alpha * 0.45} />
+        <lineBasicMaterial color="#3498db" transparent opacity={0.45} />
       </line>
     </group>
   )
