@@ -100,7 +100,7 @@ function ViewportReadout() {
   const selectedCount = useSceneStore((s) => s.selectedIds.size)
 
   return (
-    <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[140px]">
+    <div className="absolute bottom-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[140px]">
       <div className="flex items-center justify-between gap-3">
         <span className="text-muted-foreground">Tool</span>
         <span className="text-foreground">{activeTool}</span>
@@ -122,12 +122,10 @@ function ViewportReadout() {
  */
 function ViewportHints() {
   return (
-    <div className="absolute bottom-0 left-0 right-0 pointer-events-none">
-      <div className="flex items-center justify-end gap-4 px-3 py-1 text-[10px] uppercase tracking-wider font-mono text-muted-foreground/80">
-        <span>LMB · Orbit</span>
-        <span>MMB · Pan</span>
-        <span>Scroll · Zoom</span>
-      </div>
+    <div className="absolute bottom-3 left-3 pointer-events-none flex items-center gap-4 px-2.5 py-1 text-[10px] uppercase tracking-wider font-mono text-muted-foreground/80">
+      <span>LMB · Orbit</span>
+      <span>MMB · Pan</span>
+      <span>Scroll · Zoom</span>
     </div>
   )
 }
