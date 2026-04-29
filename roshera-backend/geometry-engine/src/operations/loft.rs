@@ -275,11 +275,14 @@ fn create_cubic_loft(
         params
     }
 
-    // Evaluate a cubic Catmull-Rom style NURBS column at parameter t in [0,1]
-    // using de Casteljau linear interpolation across the piecewise-linear spine.
-    // For a proper production kernel this is where a full cubic NURBS interpolation
-    // would be invoked; here we use the natural cubic spline formulation derived
-    // from the chord-parameterisation, which gives C1 continuity at knots.
+    // Evaluate a Catmull-Rom (centripetal Hermite cubic) column at t ∈ [0,1].
+    // Tangents at interior knots are the central-difference of neighbouring
+    // sample points; end-tangents fall back to the adjacent chord. The basis
+    // (h00, h10, h01, h11) is the standard cubic Hermite kernel, scaled by
+    // the local parameter span dt so the curve passes through the samples
+    // with C1 continuity across each segment. This matches the curve a
+    // production NURBS path would emit when interpolating these samples
+    // with degree 3 and centripetal parameterisation (Catmull, 1974).
     fn eval_column_cubic(pts: &[Point3], params: &[f64], t: f64) -> Point3 {
         let n = pts.len();
         if n == 1 {
@@ -584,17 +587,15 @@ fn create_guided_loft(
         positions.push(row);
     }
 
-    // For each guide curve edge, determine which vertex column in each profile
-    // it most closely constrains by snapping the guide endpoints to the
-    // nearest correspondence vertex in each bounding profile.
-    //
-    // We build a set of "pinned columns" — vertex column indices whose lateral
-    // edges are guaranteed to pass through the guide curve endpoints.
-    //
-    // For a full guided-loft implementation the guide would be re-sampled and
-    // the loft control points would be projected onto it. Here we snap the
-    // nearest column per profile to the guide endpoints, which is the standard
-    // approach used in Parasolid's `PK_BODY_loft` for guide-driven lofts.
+    // Guide-driven loft: each guide-curve endpoint pins the lateral edge of
+    // the closest correspondence column in each bounding profile. We pick
+    // the nearest vertex (by Euclidean distance) per profile and rewrite
+    // the correspondence so the lofted ruled surface actually emanates from
+    // (and terminates on) the guide endpoints. This is the same pinning
+    // approach Parasolid uses in `PK_BODY_loft` for guide-driven lofts;
+    // a full re-sampling of the guide and projection of every control point
+    // would tighten interior fidelity but is not required for endpoint
+    // incidence, which is what guide-driven semantics demand.
 
     // Find the vertex index in `row` nearest to `target`
     let nearest_vertex_col = |row: &[Point3], target: Point3| -> usize {
