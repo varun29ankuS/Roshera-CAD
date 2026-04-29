@@ -1611,7 +1611,9 @@ fn intersect_plane_plane(
     surface2: &dyn Surface,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
-    // Get plane parameters - for now we'll evaluate at center to get normal and point
+    // The Surface trait does not expose plane normal/origin directly;
+    // sample at the centre of each parameter domain. For a Plane this
+    // is exact (constant normal, point lies on the plane).
     let (u1_range, v1_range) = surface1.parameter_bounds();
     let (u2_range, v2_range) = surface2.parameter_bounds();
 

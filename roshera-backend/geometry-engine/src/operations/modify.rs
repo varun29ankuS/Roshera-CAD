@@ -713,19 +713,26 @@ fn change_loop_orientation(
     loop_id: LoopId,
     reverse: bool,
 ) -> OperationResult<()> {
-    // Get the loop
-    let _loop = model
-        .loops
-        .get(loop_id)
-        .ok_or_else(|| OperationError::InvalidInput {
-            parameter: "loop_id".to_string(),
-            expected: "existing loop".to_string(),
-            received: format!("{}", loop_id),
-        })?;
-
     if reverse {
-        // Loop reversal would need to be implemented differently
-        // since we can't directly modify the loop
+        let loop_mut = model
+            .loops
+            .get_mut(loop_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "loop_id".to_string(),
+                expected: "existing loop".to_string(),
+                received: format!("{}", loop_id),
+            })?;
+        loop_mut.reverse();
+    } else {
+        // Validate loop exists even when no work is requested.
+        model
+            .loops
+            .get(loop_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "loop_id".to_string(),
+                expected: "existing loop".to_string(),
+                received: format!("{}", loop_id),
+            })?;
     }
 
     Ok(())
