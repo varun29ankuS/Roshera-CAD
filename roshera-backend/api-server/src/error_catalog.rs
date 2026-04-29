@@ -96,6 +96,13 @@ pub enum ErrorCode {
     /// Replaying a cached response failed — never expected to fire.
     IdempotencyReplayFailed,
 
+    // ── Transaction layer ─────────────────────────────────────────
+    /// `X-Roshera-Tx-Id` referenced an unknown or pruned transaction.
+    TransactionNotFound,
+    /// Transaction has already been committed, rolled back, or expired
+    /// — no further operations may be associated with it.
+    TransactionNotActive,
+
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
     Internal,
@@ -115,10 +122,12 @@ impl ErrorCode {
             | ErrorCode::IdempotencyKeyEmpty
             | ErrorCode::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
 
-            ErrorCode::IdempotencyKeyReused => StatusCode::CONFLICT,
+            ErrorCode::IdempotencyKeyReused | ErrorCode::TransactionNotActive => {
+                StatusCode::CONFLICT
+            }
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
-            ErrorCode::SolidNotFound => StatusCode::NOT_FOUND,
+            ErrorCode::SolidNotFound | ErrorCode::TransactionNotFound => StatusCode::NOT_FOUND,
 
             ErrorCode::KernelError
             | ErrorCode::TessellationEmpty
@@ -145,7 +154,9 @@ impl ErrorCode {
             | ErrorCode::IdempotencyKeyEmpty
             | ErrorCode::IdempotencyKeyTooLong
             | ErrorCode::IdempotencyKeyReused
-            | ErrorCode::IdempotencyBodyTooLarge => false,
+            | ErrorCode::IdempotencyBodyTooLarge
+            | ErrorCode::TransactionNotFound
+            | ErrorCode::TransactionNotActive => false,
 
             // Server-side: another attempt may succeed.
             ErrorCode::KernelError
@@ -177,6 +188,8 @@ impl ErrorCode {
             ErrorCode::IdempotencyBodyTooLarge => "idempotency_body_too_large",
             ErrorCode::IdempotencyResponseTooLarge => "idempotency_response_too_large",
             ErrorCode::IdempotencyReplayFailed => "idempotency_replay_failed",
+            ErrorCode::TransactionNotFound => "transaction_not_found",
+            ErrorCode::TransactionNotActive => "transaction_not_active",
             ErrorCode::Internal => "internal_error",
         }
     }
@@ -200,6 +213,8 @@ impl ErrorCode {
             ErrorCode::IdempotencyBodyTooLarge,
             ErrorCode::IdempotencyResponseTooLarge,
             ErrorCode::IdempotencyReplayFailed,
+            ErrorCode::TransactionNotFound,
+            ErrorCode::TransactionNotActive,
             ErrorCode::Internal,
         ]
     }
