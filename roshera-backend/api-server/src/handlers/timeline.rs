@@ -325,7 +325,19 @@ pub async fn get_history(
     Path(branch_id): Path<String>,
 ) -> Result<Json<Vec<EventSummary>>, StatusCode> {
     let timeline = state.timeline.read().await;
-    let branch_id = BranchId(Uuid::parse_str(&branch_id).unwrap_or_else(|_| Uuid::new_v4()));
+    // The frontend passes the well-known label "main" rather than a UUID for
+    // the trunk. Resolve it to the canonical main branch id; otherwise parse
+    // as UUID. Falling through to a random UUID (the previous behaviour)
+    // silently returns 404 for every request, which made the timeline panel
+    // appear empty even when operations were being recorded.
+    let branch_id = if branch_id.eq_ignore_ascii_case("main") {
+        BranchId::main()
+    } else {
+        match Uuid::parse_str(&branch_id) {
+            Ok(id) => BranchId(id),
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        }
+    };
 
     let events = timeline
         .get_branch_events(&branch_id, Some(0), Some(100))

@@ -93,12 +93,12 @@ pub enum ReplayError {
     /// The kernel rejected the replayed call (e.g. missing parent solid,
     /// degenerate input). The original error message is preserved for
     /// debugging.
-    #[error("kernel rejected operation {kind}: {source}")]
+    #[error("kernel rejected operation {kind}: {message}")]
     KernelError {
         /// The operation kind whose kernel call failed.
         kind: String,
         /// String form of the kernel-side error.
-        source: String,
+        message: String,
     },
 }
 
@@ -552,7 +552,7 @@ fn dispatch_generic(
             let segments = inner
                 .get("segments")
                 .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
+                .map(|n| n as u32)
                 .unwrap_or(32);
             let cap_ends = inner
                 .get("cap_ends")
@@ -658,7 +658,7 @@ fn missing_inputs(kind: &str) -> ReplayError {
 fn kernel_err<E: std::fmt::Display>(kind: &str, e: &E) -> ReplayError {
     ReplayError::KernelError {
         kind: kind.to_string(),
-        source: e.to_string(),
+        message: e.to_string(),
     }
 }
 
