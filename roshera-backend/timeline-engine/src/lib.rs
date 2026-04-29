@@ -22,6 +22,7 @@ pub mod entity_mapping;
 pub mod execution;
 pub mod operations;
 pub mod recorder_bridge;
+pub mod replay;
 pub mod storage;
 
 // Re-export commonly used types
@@ -31,6 +32,7 @@ pub use dependency_graph::DependencyGraph;
 pub use error::{TimelineError, TimelineResult};
 pub use execution::{ExecutionConfig, ExecutionEngine, OperationImpl};
 pub use recorder_bridge::{SharedTimeline, TimelineRecorder};
+pub use replay::{apply_event, rebuild_model_from_events, ReplayError, ReplayOutcome};
 pub use timeline::Timeline;
 pub use types::*;
 
