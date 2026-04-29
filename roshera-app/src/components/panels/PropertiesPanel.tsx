@@ -12,7 +12,7 @@ export function PropertiesPanel() {
 
   if (selectedIds.size === 0) {
     return (
-      <div className="w-56 border-l border-border bg-card/80 backdrop-blur-sm flex flex-col">
+      <div className="w-56 cad-panel-elevated border-l flex flex-col">
         <div className="cad-panel-header">Properties</div>
         <div className="flex-1 flex items-center justify-center p-4">
           <p className="text-xs text-muted-foreground text-center">
@@ -25,7 +25,7 @@ export function PropertiesPanel() {
 
   if (selectedIds.size > 1) {
     return (
-      <div className="w-56 border-l border-border bg-card/80 backdrop-blur-sm flex flex-col">
+      <div className="w-56 cad-panel-elevated border-l flex flex-col">
         <div className="cad-panel-header">Properties</div>
         <div className="p-3">
           <p className="text-xs text-muted-foreground">
@@ -62,18 +62,20 @@ export function PropertiesPanel() {
           <Separator />
 
           {/* Visibility & Lock */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
             <button
               onClick={() => updateObject(id, { visible: !obj.visible })}
-              className="p-1 rounded hover:bg-accent text-muted-foreground"
+              className="cad-icon-btn h-6 w-6"
               title={obj.visible ? 'Hide' : 'Show'}
+              aria-label={obj.visible ? 'Hide object' : 'Show object'}
             >
               {obj.visible ? <Eye size={12} /> : <EyeOff size={12} />}
             </button>
             <button
               onClick={() => updateObject(id, { locked: !obj.locked })}
-              className="p-1 rounded hover:bg-accent text-muted-foreground"
+              className="cad-icon-btn h-6 w-6"
               title={obj.locked ? 'Unlock' : 'Lock'}
+              aria-label={obj.locked ? 'Unlock object' : 'Lock object'}
             >
               {obj.locked ? <Lock size={12} /> : <Unlock size={12} />}
             </button>

@@ -217,37 +217,41 @@ export function Timeline() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-muted-foreground border-b border-white/5 flex items-center justify-between">
+      <div className="cad-panel-header flex items-center justify-between">
         <div className="flex items-center gap-1.5">
           <Clock size={11} className="text-primary" />
           Timeline
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-0.5">
           <button
             onClick={handleUndo}
-            className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            className="cad-icon-btn h-5 w-5"
             title="Undo (Ctrl+Z)"
+            aria-label="Undo"
           >
             <Undo2 size={11} />
           </button>
           <button
             onClick={handleRedo}
-            className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            className="cad-icon-btn h-5 w-5"
             title="Redo (Ctrl+Shift+Z)"
+            aria-label="Redo"
           >
             <Redo2 size={11} />
           </button>
           <button
             onClick={handleCheckpoint}
-            className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            className="cad-icon-btn h-5 w-5"
             title="Create Checkpoint"
+            aria-label="Create checkpoint"
           >
             <Bookmark size={11} />
           </button>
           <button
             onClick={handleBranch}
-            className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            className="cad-icon-btn h-5 w-5"
             title="Create Branch"
+            aria-label="Create branch"
           >
             <GitBranch size={11} />
           </button>

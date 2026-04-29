@@ -61,9 +61,9 @@ export function App() {
 
         {/* Left panel: Model Tree + Timeline */}
         {leftPanelOpen && (
-          <div className="flex flex-col w-52 border-r border-white/5 bg-transparent">
+          <div className="flex flex-col w-52 cad-panel border-r">
             {/* Model Tree — top half */}
-            <div className="flex-1 min-h-0 border-b border-white/5">
+            <div className="flex-1 min-h-0 border-b border-border">
               <ModelTree />
             </div>
             {/* Timeline — bottom half */}
@@ -81,8 +81,10 @@ export function App() {
           {/* Toggle left panel button */}
           <button
             onClick={() => setLeftPanelOpen(!leftPanelOpen)}
-            className="absolute top-2 left-2 z-10 w-7 h-7 flex items-center justify-center rounded-md bg-card/80 backdrop-blur-sm border border-border text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+            className="cad-icon-btn cad-panel absolute top-2 left-2 z-10 h-7 w-7"
             title={leftPanelOpen ? 'Hide panels' : 'Show panels'}
+            aria-label={leftPanelOpen ? 'Hide panels' : 'Show panels'}
+            aria-pressed={leftPanelOpen}
           >
             {leftPanelOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
           </button>

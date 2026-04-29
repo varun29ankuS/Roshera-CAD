@@ -51,6 +51,18 @@
   --cad-edge-selected: oklch(0.60 0.20 60);
   --cad-vertex-selected: oklch(0.65 0.22 25);
   --cad-viewport-bg: oklch(0.94 0.003 260);
+
+  /* Elevation system — three discrete levels for panels, popovers, floating UI.
+     Built from layered shadows so they read as depth rather than blur halos. */
+  --shadow-panel:
+    0 1px 2px 0 oklch(0 0 0 / 0.04),
+    0 1px 3px 0 oklch(0 0 0 / 0.06);
+  --shadow-elevated:
+    0 4px 6px -1px oklch(0 0 0 / 0.07),
+    0 2px 4px -2px oklch(0 0 0 / 0.05);
+  --shadow-floating:
+    0 10px 15px -3px oklch(0 0 0 / 0.10),
+    0 4px 6px -4px oklch(0 0 0 / 0.08);
 }
 
 /* ─── Dark theme ──────────────────────────────────────────────────── */
@@ -66,7 +78,8 @@
   --secondary: oklch(0.22 0.005 260);
   --secondary-foreground: oklch(0.92 0 0);
   --muted: oklch(0.20 0.005 260);
-  --muted-foreground: oklch(0.55 0 0);
+  /* Bumped from 0.55 → 0.66 for AA contrast on dark backgrounds. */
+  --muted-foreground: oklch(0.66 0.005 260);
   --accent: oklch(0.25 0.01 260);
   --accent-foreground: oklch(0.92 0 0);
   --destructive: oklch(0.60 0.22 25);
@@ -98,6 +111,18 @@
   --cad-edge-selected: oklch(0.75 0.20 60);
   --cad-vertex-selected: oklch(0.80 0.22 25);
   --cad-viewport-bg: oklch(0.12 0.005 260);
+
+  /* Dark-mode shadows are deeper but still subtle — ambient occlusion at the
+     panel boundary, not glow. Higher alpha because dark surfaces eat shadow. */
+  --shadow-panel:
+    0 1px 2px 0 oklch(0 0 0 / 0.30),
+    0 1px 3px 0 oklch(0 0 0 / 0.20);
+  --shadow-elevated:
+    0 4px 6px -1px oklch(0 0 0 / 0.40),
+    0 2px 4px -2px oklch(0 0 0 / 0.30);
+  --shadow-floating:
+    0 10px 15px -3px oklch(0 0 0 / 0.50),
+    0 4px 6px -4px oklch(0 0 0 / 0.35);
 }
 
 @theme inline {
@@ -144,6 +169,9 @@
   --font-heading: var(--font-sans);
   --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --shadow-panel: var(--shadow-panel);
+  --shadow-elevated: var(--shadow-elevated);
+  --shadow-floating: var(--shadow-floating);
 }
 
 @layer base {
@@ -171,9 +199,29 @@
 @layer utilities {
   .cad-panel {
     @apply bg-card/95 backdrop-blur-sm border border-border;
+    box-shadow: var(--shadow-panel);
+  }
+  /* Elevated variant for floating panels (PropertiesPanel, AIChatPanel) and
+     anything that needs to read as "above" the main canvas. */
+  .cad-panel-elevated {
+    @apply bg-card/95 backdrop-blur-sm border border-border;
+    box-shadow: var(--shadow-elevated);
+  }
+  .cad-panel-floating {
+    @apply bg-popover/95 backdrop-blur-md border border-border;
+    box-shadow: var(--shadow-floating);
   }
   .cad-panel-header {
-    @apply px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-muted-foreground border-b border-border;
+    @apply px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground border-b border-border;
+  }
+  /* Standardized focus ring for all interactive elements. Use as
+     `className="cad-focus ..."` instead of repeating ring utilities. */
+  .cad-focus {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background;
+  }
+  /* Icon button base — square, hoverable, focusable. Compose with size. */
+  .cad-icon-btn {
+    @apply inline-flex items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-40;
   }
   .scrollbar-thin {
     scrollbar-width: thin;
@@ -188,5 +236,8 @@
   .scrollbar-thin::-webkit-scrollbar-thumb {
     background-color: var(--border);
     border-radius: 2px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: var(--muted-foreground);
   }
 }
