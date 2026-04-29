@@ -737,48 +737,9 @@ async fn boolean_operation(
     })))
 }
 
-async fn login(
-    State(state): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement login functionality
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "token": "temp-token",
-        "message": "Login functionality not yet implemented"
-    })))
-}
-
-async fn refresh_token(
-    State(state): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement token refresh
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "token": "new-temp-token",
-        "message": "Token refresh not yet implemented"
-    })))
-}
-
-async fn logout(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement logout functionality (invalidate token, etc.)
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Logged out successfully"
-    })))
-}
-
-async fn export_geometry(
-    State(state): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement export functionality
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Export functionality not yet implemented"
-    })))
-}
+// Auth handlers (login, logout, refresh_token) live in handlers::auth and are
+// brought into scope via `use handlers::*;`. The export endpoint dispatches to
+// handlers::export::export_mesh.
 
 async fn enhanced_create_geometry(
     State(state): State<AppState>,
@@ -2509,9 +2470,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sessions/{id}/join", post(join_session))
         .route("/api/sessions/{id}/leave", post(leave_session))
         // Export endpoints
-        .route("/api/export", post(export_geometry))
+        .route("/api/export", post(export_mesh))
         // Auth endpoints
         .route("/api/auth/login", post(login))
+        .route("/api/auth/register", post(register))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
         // Admin endpoints
