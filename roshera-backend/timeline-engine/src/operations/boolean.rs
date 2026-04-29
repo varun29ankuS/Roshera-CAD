@@ -60,21 +60,17 @@ impl OperationImpl for BooleanUnionOp {
                     "Boolean union requires at least 2 operands".to_string(),
                 ));
             }
-            // For now, handle pairwise unions
-            let mut result_id = operands[0];
-            for &operand in &operands[1..] {
-                let outputs = execute_boolean_operation(
-                    result_id,
-                    operand,
-                    BooleanOperation::Union,
-                    context,
-                )?;
-                if let Some(created) = outputs.created.first() {
-                    result_id = created.id;
-                }
-            }
-            // Return the final result
-            execute_boolean_operation(operands[0], operands[1], BooleanOperation::Union, context)
+            // Pairwise left-fold: ((operands[0] ∪ operands[1]) ∪ operands[2]) ∪ ...
+            // Each intermediate result becomes the next operand. Only the final
+            // pairwise call's outputs are surfaced; intermediates remain in
+            // context as temp entities for traceability but are not reported as
+            // freshly created by this operation.
+            chain_boolean_pairwise(
+                operands[0],
+                &operands[1..],
+                BooleanOperation::Union,
+                context,
+            )
         } else {
             Err(TimelineError::InvalidOperation(
                 "Expected BooleanUnion operation".to_string(),
@@ -131,10 +127,10 @@ impl OperationImpl for BooleanIntersectionOp {
                     "Boolean intersection requires at least 2 operands".to_string(),
                 ));
             }
-            // For now, handle pairwise intersections
-            execute_boolean_operation(
+            // Pairwise left-fold: ((operands[0] ∩ operands[1]) ∩ operands[2]) ∩ ...
+            chain_boolean_pairwise(
                 operands[0],
-                operands[1],
+                &operands[1..],
                 BooleanOperation::Intersection,
                 context,
             )
@@ -191,16 +187,16 @@ impl OperationImpl for BooleanDifferenceOp {
         context: &mut ExecutionContext,
     ) -> TimelineResult<OperationOutputs> {
         if let Operation::BooleanDifference { target, tools } = operation {
-            // For now, handle only single tool case
-            // TODO: Handle multiple tools by iterating
             if tools.is_empty() {
                 return Err(TimelineError::ValidationError(
                     "BooleanDifference requires at least one tool".to_string(),
                 ));
             }
 
-            let tool_id = tools[0];
-            execute_boolean_operation(*target, tool_id, BooleanOperation::Difference, context)
+            // Sequential subtraction: (((target − tools[0]) − tools[1]) − ...).
+            // Each intermediate becomes the target for the next pairwise diff;
+            // only the final pairwise call's outputs are surfaced.
+            chain_boolean_pairwise(*target, tools, BooleanOperation::Difference, context)
         } else {
             Err(TimelineError::InvalidOperation(
                 "Expected BooleanDifference operation".to_string(),
@@ -255,6 +251,47 @@ fn validate_boolean_operands(
     }
 
     Ok(())
+}
+
+/// Left-fold a sequence of pairwise boolean operations.
+///
+/// Given `seed` and `rest = [b, c, d, ...]`, computes
+/// `(((seed ⊕ b) ⊕ c) ⊕ d) ...` where `⊕` is the requested boolean
+/// operation. Each intermediate result is registered as a temp entity in
+/// `context` (via `execute_boolean_operation`) and its `EntityId` becomes
+/// the left operand for the next step.
+///
+/// Returns the `OperationOutputs` produced by the final pairwise call —
+/// callers see only the final solid as `created`. `rest` must contain at
+/// least one element; callers validate this before delegating here.
+fn chain_boolean_pairwise(
+    seed: EntityId,
+    rest: &[EntityId],
+    op: BooleanOperation,
+    context: &mut ExecutionContext,
+) -> TimelineResult<OperationOutputs> {
+    if rest.is_empty() {
+        return Err(TimelineError::InvalidOperation(
+            "chain_boolean_pairwise requires at least one trailing operand".to_string(),
+        ));
+    }
+
+    let mut current = seed;
+    let mut last_outputs: Option<OperationOutputs> = None;
+
+    for &operand in rest {
+        let outputs = execute_boolean_operation(current, operand, op, context)?;
+        if let Some(created) = outputs.created.first() {
+            current = created.id;
+        }
+        last_outputs = Some(outputs);
+    }
+
+    last_outputs.ok_or_else(|| {
+        TimelineError::InvalidOperation(
+            "Boolean chain produced no output (empty trailing operand list)".to_string(),
+        )
+    })
 }
 
 /// Execute boolean operation

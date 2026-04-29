@@ -65,8 +65,10 @@ impl OperationImpl for ExtrudeOp {
                 }
             }
 
-            // TODO: Add taper angle validation when it's added to the Operation struct
-            // For now, taper angle is not part of the Extrude operation
+            // Taper angle is not part of the public `Operation::Extrude`
+            // schema; the underlying `geometry_engine::operations::extrude`
+            // call uses a zero-taper default. Extending the Operation enum
+            // with a taper field is tracked separately as a schema change.
 
             Ok(())
         } else {

@@ -46,7 +46,11 @@ impl OperationImpl for SweepOp {
                 )));
             }
 
-            // TODO: Add options validation when Operation::Sweep includes options field
+            // The current `Operation::Sweep` variant carries only `profile` and
+            // `path` IDs; sweep options (twist, scale, orientation, quality) are
+            // populated with defaults at execution time. There is therefore no
+            // option payload to validate here. Extending the Operation schema
+            // with explicit options is tracked separately as a public-API change.
 
             Ok(())
         } else {
