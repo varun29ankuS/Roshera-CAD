@@ -802,28 +802,28 @@ impl FullIntegrationExecutor {
         }
     }
 
-    /// Calculate volumes for objects using production geometry engine
+    /// Calculate volumes for objects from their tessellated meshes.
+    ///
+    /// We use the signed-tetrahedron sum (Σ v0·(v1×v2) / 6) over all
+    /// triangles. For a closed, outward-oriented mesh this gives the
+    /// exact enclosed volume; for open meshes it gives the absolute
+    /// signed volume of the cone from the origin to the surface, which
+    /// is the standard graceful-degradation signal AI workflows expect.
+    ///
+    /// Reading volume directly from the kernel's `Solid::volume(...)` is
+    /// the analytical alternative but requires `&mut` access to every
+    /// topology store — for an AI workflow that is read-only over a
+    /// snapshot of the model this would force a clone of the entire
+    /// kernel state. The mesh path is exact for primitives and within
+    /// tessellation tolerance otherwise.
     async fn calculate_volumes(
         &self,
         objects: &HashMap<shared_types::ObjectId, CADObject>,
     ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error + Send + Sync>> {
         let mut volumes = HashMap::new();
-        let geometry_model = self.geometry_model.read().await;
 
-        for (object_id, obj) in objects {
-            // Map ObjectId (UUID) to SolidId for geometry engine lookup
-            let solid_id: SolidId = (object_id.as_u128() % u32::MAX as u128) as u32;
-
-            // Get the solid from the B-Rep model
-            if let Some(_solid) = geometry_model.solids.get(solid_id) {
-                // Volume calculation requires access to all stores from the geometry model
-                // For now, use a placeholder value - proper implementation would need:
-                // solid.volume(&mut shells, &mut faces, &mut loops, &vertices, &edges, &half_edges, &surfaces)
-                volumes.insert(obj.name.clone(), 1000.0); // Placeholder volume
-            } else {
-                // If solid not found, this might be a non-solid object
-                volumes.insert(obj.name.clone(), 0.0);
-            }
+        for obj in objects.values() {
+            volumes.insert(obj.name.clone(), mesh_signed_volume(&obj.mesh).abs());
         }
 
         Ok(volumes)
@@ -950,6 +950,49 @@ fn export_format_from_str(s: &str) -> ExportFormat {
         "gltf" => ExportFormat::GLTF,
         _ => ExportFormat::STL, // Default
     }
+}
+
+/// Signed enclosed volume of a triangle mesh via the divergence-theorem
+/// tetrahedron sum: `Σ_i v0_i · (v1_i × v2_i) / 6`.
+///
+/// For closed, outward-oriented meshes this is exact; the signed
+/// magnitude indicates orientation, so callers that need volume should
+/// take `.abs()`.
+fn mesh_signed_volume(mesh: &shared_types::Mesh) -> f64 {
+    let mut volume = 0.0;
+    for chunk in mesh.indices.chunks(3) {
+        if chunk.len() != 3 {
+            continue;
+        }
+        let i0 = chunk[0] as usize * 3;
+        let i1 = chunk[1] as usize * 3;
+        let i2 = chunk[2] as usize * 3;
+        if i2 + 2 >= mesh.vertices.len() {
+            continue;
+        }
+
+        let v0 = [
+            mesh.vertices[i0] as f64,
+            mesh.vertices[i0 + 1] as f64,
+            mesh.vertices[i0 + 2] as f64,
+        ];
+        let v1 = [
+            mesh.vertices[i1] as f64,
+            mesh.vertices[i1 + 1] as f64,
+            mesh.vertices[i1 + 2] as f64,
+        ];
+        let v2 = [
+            mesh.vertices[i2] as f64,
+            mesh.vertices[i2 + 1] as f64,
+            mesh.vertices[i2 + 2] as f64,
+        ];
+
+        volume += (v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
+            + v1[0] * (v2[1] * v0[2] - v2[2] * v0[1])
+            + v2[0] * (v0[1] * v1[2] - v0[2] * v1[1]))
+            / 6.0;
+    }
+    volume
 }
 
 #[cfg(test)]
