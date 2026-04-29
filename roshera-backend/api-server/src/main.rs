@@ -362,11 +362,23 @@ async fn create_geometry(
         })
         .unwrap_or([0.0, 0.0, 0.0]);
 
-    let param = |k: &str, default: f64| -> f64 {
+    // Per-shape parameters are required input from the caller — never
+    // silently substitute defaults. Missing or non-numeric values surface
+    // as a 400 BAD_REQUEST so client bugs fail loudly instead of producing
+    // a fabricated mystery solid.
+    let require = |k: &str| -> Result<f64, (StatusCode, Json<serde_json::Value>)> {
         parameters
             .get(k)
             .and_then(|v| v.as_f64())
-            .unwrap_or(default)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("missing or non-numeric parameter '{k}'")
+                    })),
+                )
+            })
     };
 
     // Drive the kernel. The model is the single source of truth — every
@@ -376,18 +388,18 @@ async fn create_geometry(
 
     let result = match shape_type.as_str() {
         "box" | "cube" => {
-            let w = param("width", 10.0);
-            let h = param("height", 10.0);
-            let d = param("depth", 10.0);
+            let w = require("width")?;
+            let h = require("height")?;
+            let d = require("depth")?;
             builder.create_box_3d(w, h, d)
         }
         "sphere" => {
-            let r = param("radius", 5.0);
+            let r = require("radius")?;
             builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r)
         }
         "cylinder" => {
-            let r = param("radius", 5.0);
-            let h = param("height", 10.0);
+            let r = require("radius")?;
+            let h = require("height")?;
             builder.create_cylinder_3d(
                 Point3::new(0.0, 0.0, 0.0),
                 Vector3::new(0.0, 0.0, 1.0),
@@ -396,8 +408,8 @@ async fn create_geometry(
             )
         }
         "cone" => {
-            let r = param("radius", 5.0);
-            let h = param("height", 10.0);
+            let r = require("radius")?;
+            let h = require("height")?;
             builder.create_cone_3d(
                 Point3::new(0.0, 0.0, 0.0),
                 Vector3::new(0.0, 0.0, 1.0),
@@ -406,8 +418,8 @@ async fn create_geometry(
             )
         }
         "torus" => {
-            let major = param("major_radius", 8.0);
-            let minor = param("minor_radius", 2.0);
+            let major = require("major_radius")?;
+            let minor = require("minor_radius")?;
             builder.create_torus_3d(
                 Point3::new(0.0, 0.0, 0.0),
                 Vector3::new(0.0, 0.0, 1.0),

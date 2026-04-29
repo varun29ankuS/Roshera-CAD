@@ -233,67 +233,69 @@ async fn handle_create_primitive(
         primitive_type, parameters
     );
 
-    // Get geometry engine
-    let mut geometry_model = state.model.write().await;
-
-    // Drive the kernel through TopologyBuilder so the timeline records the
-    // op. Default origin + Z axis; per-shape parameters come from the JSON
-    // payload. Defaults intentionally match `main.rs::create_geometry` so
-    // REST and WebSocket clients see identical behaviour.
-    let mut builder = TopologyBuilder::new(&mut geometry_model);
-    let param = |k: &str, default: f64| -> f64 {
-        parameters
-            .get(k)
-            .and_then(|v| v.as_f64())
-            .unwrap_or(default)
-    };
-    let origin = geometry_engine::math::Point3::new(0.0, 0.0, 0.0);
-    let z_axis = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0);
-
-    let result = match primitive_type.to_lowercase().as_str() {
-        "box" | "cube" => {
-            let width = param("width", 10.0);
-            let height = param("height", 10.0);
-            let depth = param("depth", 10.0);
-            builder.create_box_3d(width, height, depth)
-        }
-        "sphere" => {
-            let radius = param("radius", 5.0);
-            builder.create_sphere_3d(origin, radius)
-        }
-        "cylinder" => {
-            let radius = param("radius", 5.0);
-            let height = param("height", 10.0);
-            builder.create_cylinder_3d(origin, z_axis, radius, height)
-        }
-        "cone" => {
-            let radius = param("radius", 5.0);
-            let height = param("height", 10.0);
-            // top_radius = 0.0 → sharp-tipped cone (matches REST handler).
-            builder.create_cone_3d(origin, z_axis, radius, 0.0, height)
-        }
-        "torus" => {
-            let major = param("major_radius", 8.0);
-            let minor = param("minor_radius", 2.0);
-            match geometry_engine::primitives::torus_primitive::TorusParameters::new(
-                origin, z_axis, major, minor,
-            ) {
-                Ok(params) => geometry_engine::primitives::torus_primitive::TorusPrimitive::create(
-                    &params,
-                    &mut *builder.model,
-                )
-                .map(geometry_engine::primitives::topology_builder::GeometryId::Solid),
-                Err(e) => Err(e),
-            }
-        }
-        _ => {
+    // Validate per-shape required parameters before touching the kernel.
+    // Missing or non-numeric values surface as a structured error to the
+    // client; we never silently substitute defaults so client bugs fail
+    // loudly instead of producing a fabricated mystery solid.
+    let kind = primitive_type.to_lowercase();
+    let required: &[&str] = match kind.as_str() {
+        "box" | "cube" => &["width", "height", "depth"],
+        "sphere" => &["radius"],
+        "cylinder" => &["radius", "height"],
+        "cone" => &["radius", "height"],
+        "torus" => &["major_radius", "minor_radius"],
+        other => {
             let error = GeometryWebSocketResponse::GeometryError {
-                message: format!("Unknown primitive type: {}", primitive_type),
+                message: format!("Unknown primitive type: {other}"),
                 request_type: "CreatePrimitive".to_string(),
             };
             send_response(sender, &error).await?;
             return Ok(());
         }
+    };
+
+    let mut values = Vec::with_capacity(required.len());
+    for k in required {
+        match parameters.get(*k).and_then(|v| v.as_f64()) {
+            Some(v) => values.push(v),
+            None => {
+                let error = GeometryWebSocketResponse::GeometryError {
+                    message: format!("missing or non-numeric parameter '{k}'"),
+                    request_type: "CreatePrimitive".to_string(),
+                };
+                send_response(sender, &error).await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Get geometry engine
+    let mut geometry_model = state.model.write().await;
+
+    // Drive the kernel through TopologyBuilder so the timeline records
+    // the op. Origin + Z axis are the canonical local frame; positional
+    // placement is handled separately by transform commands.
+    let mut builder = TopologyBuilder::new(&mut geometry_model);
+    let origin = geometry_engine::math::Point3::new(0.0, 0.0, 0.0);
+    let z_axis = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0);
+
+    let result = match kind.as_str() {
+        "box" | "cube" => builder.create_box_3d(values[0], values[1], values[2]),
+        "sphere" => builder.create_sphere_3d(origin, values[0]),
+        "cylinder" => builder.create_cylinder_3d(origin, z_axis, values[0], values[1]),
+        // top_radius = 0.0 → sharp-tipped cone (matches REST handler).
+        "cone" => builder.create_cone_3d(origin, z_axis, values[0], 0.0, values[1]),
+        "torus" => match geometry_engine::primitives::torus_primitive::TorusParameters::new(
+            origin, z_axis, values[0], values[1],
+        ) {
+            Ok(p) => geometry_engine::primitives::torus_primitive::TorusPrimitive::create(
+                &p,
+                &mut *builder.model,
+            )
+            .map(geometry_engine::primitives::topology_builder::GeometryId::Solid),
+            Err(e) => Err(e),
+        },
+        _ => unreachable!("primitive type validated above"),
     };
 
     // Handle the result
