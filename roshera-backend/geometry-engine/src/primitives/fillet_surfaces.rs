@@ -171,43 +171,80 @@ impl Surface for CylindricalFillet {
         // u: parameter along spine (0 to 1)
         // v: parameter around cylinder (0 to 1)
 
-        let spine_point = self.spine.evaluate(u)?.position;
-        let spine_tangent = self.spine.tangent_at(u)?;
-        let axis = self.axis_at(u)?;
+        // Inline position evaluator — used both for the canonical (u, v)
+        // sample and for finite-difference partials. Keeps the local
+        // (x_axis, y_axis, radial) frame consistent across all stencil
+        // points, which is the only way the cross-derivative comes out
+        // right when axis_field varies with u.
+        let position_at = |u: f64, v: f64| -> MathResult<(Point3, Vector3, Vector3)> {
+            let spine_point = self.spine.evaluate(u)?.position;
+            let axis = self.axis_at(u)?;
+            let (start_angle, end_angle) = self.angles_at(u);
+            let angle = start_angle + v * (end_angle - start_angle);
 
-        // Get angle range
-        let (start_angle, end_angle) = self.angles_at(u);
-        let angle = start_angle + v * (end_angle - start_angle);
-
-        // Build local coordinate system
-        let z_axis = axis.normalize()?;
-        let x_axis = if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
-            z_axis.cross(&Vector3::X).normalize()?
-        } else {
-            z_axis.cross(&Vector3::Y).normalize()?
+            let z_axis = axis.normalize()?;
+            let x_axis = if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
+                z_axis.cross(&Vector3::X).normalize()?
+            } else {
+                z_axis.cross(&Vector3::Y).normalize()?
+            };
+            let y_axis = z_axis.cross(&x_axis);
+            let radial = x_axis * angle.cos() + y_axis * angle.sin();
+            Ok((spine_point + radial * self.radius, radial, z_axis))
         };
-        let y_axis = z_axis.cross(&x_axis);
 
-        // Compute position on cylinder
-        let radial = x_axis * angle.cos() + y_axis * angle.sin();
-        let position = spine_point + radial * self.radius;
+        let (position, radial, z_axis) = position_at(u, v)?;
+        let (start_angle, end_angle) = self.angles_at(u);
 
-        // First derivatives
-        let du = spine_tangent; // Simplified - should include radius change
-        let dv =
-            (y_axis * angle.cos() - x_axis * angle.sin()) * self.radius * (end_angle - start_angle);
+        // Central finite differences for du, with one-sided fallback at
+        // the parameter boundary. Step size 1e-5 trades round-off (∝ ε/h)
+        // against truncation (∝ h²) for f64 in the normal scale band.
+        let h = 1.0e-5_f64;
+        let u_plus = (u + h).min(1.0);
+        let u_minus = (u - h).max(0.0);
+        let span_u = (u_plus - u_minus).max(1e-12);
+        let (p_up, _, _) = position_at(u_plus, v)?;
+        let (p_um, _, _) = position_at(u_minus, v)?;
+        let du = (p_up - p_um) / span_u;
 
-        // Normal
+        let v_plus = (v + h).min(1.0);
+        let v_minus = (v - h).max(0.0);
+        let span_v = (v_plus - v_minus).max(1e-12);
+        // Analytical dv (exact for the cylinder cross-section at fixed u).
+        let dv = {
+            // Reconstruct (x_axis, y_axis) at (u, v) from radial and z_axis
+            // by extracting the v-derivative basis: ∂radial/∂angle =
+            // y_axis*cos − x_axis*sin = R·(angle+π/2). Use central FD on v
+            // for robustness when the analytical formula and frame disagree.
+            let (p_vp, _, _) = position_at(u, v_plus)?;
+            let (p_vm, _, _) = position_at(u, v_minus)?;
+            (p_vp - p_vm) / span_v
+        };
+
+        // Surface normal: radial direction (outward); preserved across the
+        // FD stencil since it only depends on u, v at the centre point.
         let normal = radial;
 
-        // Second derivatives (simplified)
-        let duu = self.spine.evaluate(u)?.derivative2.unwrap_or(Vector3::ZERO);
-        let duv = Vector3::ZERO; // Simplified
+        // Second derivatives via central FD. duu uses the standard
+        // 3-point stencil (P(u+h) - 2P(u) + P(u-h))/h². duv uses the
+        // 4-corner cross stencil. dvv uses the analytical formula since
+        // along v the cylinder is exactly an arc.
+        let duu = (p_up - position * 2.0 + p_um) / (h * h);
+        let (p_pp, _, _) = position_at(u_plus, v_plus)?;
+        let (p_pm, _, _) = position_at(u_plus, v_minus)?;
+        let (p_mp, _, _) = position_at(u_minus, v_plus)?;
+        let (p_mm, _, _) = position_at(u_minus, v_minus)?;
+        let duv = (p_pp - p_pm - p_mp + p_mm) / (span_u * span_v);
         let dvv = -radial * self.radius * (end_angle - start_angle).powi(2);
 
-        // Principal curvatures
-        let k1 = 1.0 / self.radius; // Cylinder curvature
-        let k2 = 0.0; // Along spine (simplified)
+        // Principal curvatures.
+        // k1 (around v): exact cylinder curvature 1/r along the radial.
+        // k2 (along u): II_uu / I_uu where II_uu = duu · n and
+        //              I_uu = du · du. Reduces to 0 for a straight spine.
+        let k1 = 1.0 / self.radius;
+        let i_uu = du.dot(&du).max(1e-30);
+        let ii_uu = duu.dot(&normal);
+        let k2 = ii_uu / i_uu;
 
         Ok(SurfacePoint {
             position,
@@ -333,11 +370,14 @@ impl Surface for CylindricalFillet {
 
     fn intersect(
         &self,
-        _other: &dyn Surface,
-        _tolerance: Tolerance,
+        other: &dyn Surface,
+        tolerance: Tolerance,
     ) -> Vec<SurfaceIntersectionResult> {
-        // Would implement surface-surface intersection
-        Vec::new()
+        // Delegate to the math-layer surface-surface tracer. Fillet
+        // surfaces have no closed-form SSI with arbitrary partners; the
+        // generic Patrikalakis-Maekawa tracer handles them via sampled
+        // Newton refinement on the implicit equation S₁(u,v) - S₂(s,t) = 0.
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 
     fn curvature_at(
@@ -453,42 +493,64 @@ impl Surface for ToroidalFillet {
         // u: parameter along center curve
         // v: parameter around minor circle
 
-        let center = self.center_curve.evaluate(u)?.position;
-        let center_tangent = self.center_curve.tangent_at(u)?;
-
-        // Build local frame
-        let z_axis = center_tangent.normalize()?;
-        let x_axis = if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
-            z_axis.cross(&Vector3::X).normalize()?
-        } else {
-            z_axis.cross(&Vector3::Y).normalize()?
+        // Inline position evaluator — used both for the canonical (u, v)
+        // sample and for finite-difference partials so all stencil points
+        // see the same construction (centre curve sample + Frenet-style
+        // local frame + radial offset).
+        let position_at = |u: f64, v: f64| -> MathResult<(Point3, Vector3, Vector3)> {
+            let center = self.center_curve.evaluate(u)?.position;
+            let center_tangent = self.center_curve.tangent_at(u)?;
+            let z_axis = center_tangent.normalize()?;
+            let x_axis = if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
+                z_axis.cross(&Vector3::X).normalize()?
+            } else {
+                z_axis.cross(&Vector3::Y).normalize()?
+            };
+            let y_axis = z_axis.cross(&x_axis);
+            let angle = self.angle_bounds.0 + v * (self.angle_bounds.1 - self.angle_bounds.0);
+            let radial = x_axis * angle.cos() + y_axis * angle.sin();
+            Ok((center + radial * self.minor_radius, radial, z_axis))
         };
-        let y_axis = z_axis.cross(&x_axis);
 
-        // Map v to angle range
+        let (position, radial, z_axis) = position_at(u, v)?;
         let angle = self.angle_bounds.0 + v * (self.angle_bounds.1 - self.angle_bounds.0);
-
-        // The spine IS the tube center: a fillet of constant radius around a
-        // curved edge is a tube swept along the spine, not a torus offset
-        // along x_axis. major_radius is retained only for the principal-
-        // curvature formula (k2) below.
-        let radial = x_axis * angle.cos() + y_axis * angle.sin();
-        let position = center + radial * self.minor_radius;
-
-        // Derivatives
-        let du = center_tangent;
         let angle_range = self.angle_bounds.1 - self.angle_bounds.0;
-        let dv = (y_axis * angle.cos() - x_axis * angle.sin()) * self.minor_radius * angle_range;
 
-        // Normal
+        // Central FD partials with one-sided fallback at parameter
+        // boundaries. Step 1e-5 balances f64 round-off and truncation.
+        let h = 1.0e-5_f64;
+        let u_p = (u + h).min(1.0);
+        let u_m = (u - h).max(0.0);
+        let v_p = (v + h).min(1.0);
+        let v_m = (v - h).max(0.0);
+        let span_u = (u_p - u_m).max(1e-12);
+        let span_v = (v_p - v_m).max(1e-12);
+
+        let (p_up, _, _) = position_at(u_p, v)?;
+        let (p_um, _, _) = position_at(u_m, v)?;
+        let du = (p_up - p_um) / span_u;
+
+        let (p_vp, _, _) = position_at(u, v_p)?;
+        let (p_vm, _, _) = position_at(u, v_m)?;
+        let dv = (p_vp - p_vm) / span_v;
+
+        // Surface normal: outward radial from the tube spine.
         let normal = radial;
 
-        // Second derivatives (simplified)
-        let duu = Vector3::ZERO;
-        let duv = Vector3::ZERO;
+        // duu via 3-point central stencil; duv via 4-corner cross stencil.
+        // dvv stays analytical — the v-direction is exactly an arc of
+        // radius minor_radius, so the closed form is preferable.
+        let duu = (p_up - position * 2.0 + p_um) / (h * h);
+        let (p_pp, _, _) = position_at(u_p, v_p)?;
+        let (p_pm, _, _) = position_at(u_p, v_m)?;
+        let (p_mp, _, _) = position_at(u_m, v_p)?;
+        let (p_mm, _, _) = position_at(u_m, v_m)?;
+        let duv = (p_pp - p_pm - p_mp + p_mm) / (span_u * span_v);
         let dvv = -radial * self.minor_radius * angle_range.powi(2);
 
-        // Principal curvatures
+        // Principal curvatures: k1 around the tube cross-section is the
+        // standard 1/r. k2 along the spine direction matches the torus
+        // closed form when major_radius is the local osculating radius.
         let k1 = 1.0 / self.minor_radius;
         let k2 = angle.cos() / (self.major_radius + self.minor_radius * angle.cos());
 
@@ -578,11 +640,14 @@ impl Surface for ToroidalFillet {
 
     fn intersect(
         &self,
-        _other: &dyn Surface,
-        _tolerance: Tolerance,
+        other: &dyn Surface,
+        tolerance: Tolerance,
     ) -> Vec<SurfaceIntersectionResult> {
-        // Would implement surface-surface intersection
-        Vec::new()
+        // Delegate to the math-layer surface-surface tracer. Fillet
+        // surfaces have no closed-form SSI with arbitrary partners; the
+        // generic Patrikalakis-Maekawa tracer handles them via sampled
+        // Newton refinement on the implicit equation S₁(u,v) - S₂(s,t) = 0.
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 
     fn curvature_at(
@@ -634,13 +699,65 @@ impl SphericalFillet {
             ));
         }
 
-        // Compute parameter bounds from edge configurations
-        // This is simplified - real implementation would compute from edge tangents
+        // Derive (θ, φ) bounds from the edges meeting at this vertex.
+        // For each edge we pick the endpoint nearest `center` (the vertex
+        // the blend is being placed at) and use the direction toward the
+        // far endpoint to get a representative tangent direction. Mapped
+        // into (θ = polar from +Z, φ = azimuth from +X) the bounding box
+        // of these directions, padded by 1% of π, defines the spherical
+        // patch the fillet should cover. Falls back to the canonical
+        // `+X +Y +Z` octant when no edges are supplied.
+        const PAD: f64 = 0.0314_f64; // ≈ 1% of π
+
+        let mut min_theta = f64::INFINITY;
+        let mut max_theta = f64::NEG_INFINITY;
+        let mut min_phi = f64::INFINITY;
+        let mut max_phi = f64::NEG_INFINITY;
+        let mut have_dir = false;
+
+        for edge in &edges {
+            let pr = edge.parameter_range();
+            let p_start = edge.evaluate(pr.start)?.position;
+            let p_end = edge.evaluate(pr.end)?.position;
+            let d_start = (p_start - center).magnitude_squared();
+            let d_end = (p_end - center).magnitude_squared();
+            // The far endpoint defines the tangent direction at the vertex.
+            let far = if d_start < d_end { p_end } else { p_start };
+            let raw = far - center;
+            let len = raw.magnitude();
+            if len < 1e-12 {
+                continue; // degenerate edge — skip
+            }
+            let dir = raw / len;
+            let theta = dir.z.clamp(-1.0, 1.0).acos();
+            let phi = dir.y.atan2(dir.x);
+            min_theta = min_theta.min(theta);
+            max_theta = max_theta.max(theta);
+            min_phi = min_phi.min(phi);
+            max_phi = max_phi.max(phi);
+            have_dir = true;
+        }
+
+        let (u_bounds, v_bounds) = if have_dir {
+            (
+                (
+                    (min_theta - PAD).max(0.0),
+                    (max_theta + PAD).min(std::f64::consts::PI),
+                ),
+                (min_phi - PAD, max_phi + PAD),
+            )
+        } else {
+            (
+                (0.0, std::f64::consts::PI * 0.5),
+                (0.0, std::f64::consts::PI * 0.5),
+            )
+        };
+
         Ok(Self {
             center,
             radius,
-            u_bounds: (0.0, std::f64::consts::PI * 0.5),
-            v_bounds: (0.0, std::f64::consts::PI * 0.5),
+            u_bounds,
+            v_bounds,
             edges,
         })
     }
@@ -820,10 +937,10 @@ impl Surface for SphericalFillet {
 
     fn intersect(
         &self,
-        _other: &dyn Surface,
-        _tolerance: Tolerance,
+        other: &dyn Surface,
+        tolerance: Tolerance,
     ) -> Vec<SurfaceIntersectionResult> {
-        Vec::new()
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 
     fn curvature_at(
@@ -875,28 +992,55 @@ impl VariableRadiusFillet {
         contact1: Box<dyn Curve>,
         contact2: Box<dyn Curve>,
     ) -> MathResult<Self> {
-        // Create NURBS surface for variable radius fillet
-        // This is a simplified implementation
+        // Build a NURBS surface whose u-direction follows the spine and
+        // whose v-direction sweeps an arc between the two contact curves
+        // at every spine sample. The arc lies in the plane perpendicular
+        // to the spine tangent at u, anchored on the line spine→contact1
+        // and rotated to the line spine→contact2. The radius interpolates
+        // linearly between radius_start and radius_end across the spine.
 
         let num_u = 20;
         let num_v = 5;
         let mut control_points = vec![vec![Point3::ZERO; num_v]; num_u];
         let weights = vec![vec![1.0; num_v]; num_u];
 
-        // Sample along spine
         for i in 0..num_u {
             let u = i as f64 / (num_u - 1) as f64;
             let spine_point = spine.evaluate(u)?.position;
+            let spine_tangent = spine.tangent_at(u)?;
             let radius = radius_start + u * (radius_end - radius_start);
 
-            // Create circular arc at this spine position
+            // Reproject contact directions into the plane perpendicular
+            // to the spine tangent so the arc sits in a true cross-section.
+            let z_axis = spine_tangent.normalize().unwrap_or(Vector3::Z);
+            let c1_point = contact1.evaluate(u)?.position;
+            let c2_point = contact2.evaluate(u)?.position;
+            let raw_x = c1_point - spine_point;
+            let x_in_plane = raw_x - z_axis * raw_x.dot(&z_axis);
+            let x_axis = x_in_plane.normalize().unwrap_or_else(|_| {
+                // Spine and contact1 collinear — fall back to any direction
+                // perpendicular to z_axis.
+                if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
+                    z_axis.cross(&Vector3::X).normalize().unwrap_or(Vector3::X)
+                } else {
+                    z_axis.cross(&Vector3::Y).normalize().unwrap_or(Vector3::Y)
+                }
+            });
+            let y_axis = z_axis.cross(&x_axis);
+
+            // Sweep angle is the in-plane angle between the contact
+            // directions; clamp to (0, π) for numerical safety.
+            let raw_y = c2_point - spine_point;
+            let y_in_plane = raw_y - z_axis * raw_y.dot(&z_axis);
+            let cos_sweep = (x_axis.dot(&y_in_plane) / y_in_plane.magnitude().max(1e-12))
+                .clamp(-1.0, 1.0);
+            let sweep = cos_sweep.acos().clamp(1e-6, std::f64::consts::PI);
+
             for j in 0..num_v {
                 let v = j as f64 / (num_v - 1) as f64;
-                let angle = v * std::f64::consts::PI * 0.5; // Quarter circle
-
-                // Simplified - would use actual contact geometry
-                let offset = Vector3::new(radius * angle.cos(), radius * angle.sin(), 0.0);
-                control_points[i][j] = spine_point + offset;
+                let angle = v * sweep;
+                let radial = x_axis * angle.cos() + y_axis * angle.sin();
+                control_points[i][j] = spine_point + radial * radius;
             }
         }
 
@@ -1072,10 +1216,10 @@ impl Surface for VariableRadiusFillet {
 
     fn intersect(
         &self,
-        _other: &dyn Surface,
-        _tolerance: Tolerance,
+        other: &dyn Surface,
+        tolerance: Tolerance,
     ) -> Vec<SurfaceIntersectionResult> {
-        Vec::new()
+        crate::primitives::surface::dispatch_via_math_ssi(self, other, tolerance)
     }
 
     fn curvature_at(
