@@ -153,28 +153,6 @@ impl AppState {
 
 // === Enhanced Request/Response Types ===
 
-#[derive(Deserialize, Debug)]
-struct EnhancedGeometryRequest {
-    operation: String,
-    #[serde(rename = "type")]
-    geometry_type: Option<String>,
-    parameters: Option<serde_json::Value>,
-    session_id: Option<String>,
-    user_context: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct EnhancedGeometryResponse {
-    success: bool,
-    message: String,
-    solid_id: Option<u32>,
-    shape_type: Option<String>,
-    properties: Option<GeometryProperties>,
-    cached: bool,
-    execution_time_ms: u64,
-    session_id: Option<String>,
-}
-
 #[derive(Deserialize, Clone)]
 struct EnhancedAICommandRequest {
     command: String,
@@ -202,19 +180,6 @@ struct AuthenticationResponse {
 }
 
 #[derive(Serialize)]
-struct GeometryProperties {
-    volume: Option<f64>,
-    surface_area: Option<f64>,
-    bounding_box: Option<BoundingBox>,
-}
-
-#[derive(Serialize)]
-struct BoundingBox {
-    min: [f64; 3],
-    max: [f64; 3],
-}
-
-#[derive(Serialize)]
 struct HealthResponse {
     status: String,
     version: String,
@@ -229,14 +194,6 @@ use std::error::Error as StdError;
 
 // Wrapper functions for handlers that take AuthInfo
 // These allow the handlers to work with axum's routing system
-
-async fn enhanced_create_geometry_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-    Json(payload): Json<EnhancedGeometryRequest>,
-) -> Result<Json<EnhancedGeometryResponse>, StatusCode> {
-    enhanced_create_geometry(State(state), Json(payload), auth_info).await
-}
 
 async fn get_geometry_wrapper(
     State(state): State<AppState>,
@@ -739,146 +696,6 @@ async fn boolean_operation(
 // Auth handlers (login, logout, refresh_token) live in handlers::auth and are
 // brought into scope via `use handlers::*;`. The export endpoint dispatches to
 // handlers::export::export_mesh.
-
-async fn enhanced_create_geometry(
-    State(state): State<AppState>,
-    Json(payload): Json<EnhancedGeometryRequest>,
-    auth_info: auth_middleware::AuthInfo,
-) -> Result<Json<EnhancedGeometryResponse>, StatusCode> {
-    let start = std::time::Instant::now();
-
-    tracing::info!(
-        "Enhanced geometry creation request from user {}: {:?}",
-        auth_info.user_id,
-        payload
-    );
-
-    // Check permissions
-    if !auth_info.permissions.contains(&Permission::CreateGeometry) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    // Check cache first if requested
-    let cache_key = format!("geometry_{}_{:?}", payload.operation, payload.parameters);
-
-    if let Some(cached_result) = state.cache_manager.get_command_result(&cache_key).await {
-        tracing::debug!("Returning cached geometry result");
-        return Ok(Json(EnhancedGeometryResponse {
-            success: true,
-            message: "Geometry retrieved from cache".to_string(),
-            solid_id: Some(42), // Would be from cache
-            shape_type: payload.geometry_type,
-            properties: None,
-            cached: true,
-            execution_time_ms: start.elapsed().as_millis() as u64,
-            session_id: payload.session_id,
-        }));
-    }
-
-    // Execute through full integration executor for complete feature support
-    match payload.session_id {
-        Some(session_id) => {
-            // Convert payload to ParsedCommand for AI integration
-            let parsed_command = ParsedCommand {
-                original_text: format!(
-                    "{} {}",
-                    payload.operation,
-                    payload.geometry_type.as_deref().unwrap_or("")
-                ),
-                intent: CommandIntent::Create {
-                    object_type: payload
-                        .geometry_type
-                        .clone()
-                        .unwrap_or_else(|| "box".to_string()),
-                    parameters: payload
-                        .parameters
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({})),
-                },
-                parameters: if let Some(params) = payload.parameters {
-                    serde_json::from_value(params).unwrap_or_default()
-                } else {
-                    std::collections::HashMap::new()
-                },
-                confidence: 1.0,
-                language: "en".to_string(),
-            };
-
-            // Use session-aware processing with ParsedCommand
-            let result = state
-                .full_integration_executor
-                .execute_ai_command(&session_id, &auth_info.user_id, &parsed_command)
-                .await;
-
-            match result {
-                Ok(command_result) => {
-                    // Cache the result
-                    state
-                        .cache_manager
-                        .cache_command_result(&cache_key, &command_result)
-                        .await;
-
-                    // Extract solid_id from the result
-                    let solid_id = if let Some(object_id) = &command_result.object_id {
-                        // Convert UUID to u32 for solid_id
-                        Some((object_id.0.as_u128() % u32::MAX as u128) as u32)
-                    } else {
-                        None
-                    };
-
-                    // Convert data to GeometryProperties if available
-                    let properties = if let Some(data) = &command_result.data {
-                        // Try to extract properties from the data
-                        Some(GeometryProperties {
-                            volume: data.get("volume").and_then(|v| v.as_f64()),
-                            surface_area: data.get("surface_area").and_then(|v| v.as_f64()),
-                            bounding_box: data.get("bounding_box").and_then(|v| {
-                                let min = v.get("min")?;
-                                let max = v.get("max")?;
-                                Some(BoundingBox {
-                                    min: [
-                                        min.get(0)?.as_f64()? as f64,
-                                        min.get(1)?.as_f64()? as f64,
-                                        min.get(2)?.as_f64()? as f64,
-                                    ],
-                                    max: [
-                                        max.get(0)?.as_f64()? as f64,
-                                        max.get(1)?.as_f64()? as f64,
-                                        max.get(2)?.as_f64()? as f64,
-                                    ],
-                                })
-                            }),
-                        })
-                    } else {
-                        None
-                    };
-
-                    Ok(Json(EnhancedGeometryResponse {
-                        success: command_result.success,
-                        message: command_result.message,
-                        solid_id,
-                        shape_type: payload.geometry_type,
-                        properties,
-                        cached: false,
-                        execution_time_ms: command_result.execution_time_ms,
-                        session_id: Some(session_id),
-                    }))
-                }
-                Err(e) => {
-                    tracing::error!("Geometry creation failed: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
-        }
-        None => {
-            // Fallback to basic geometry creation
-            create_basic_geometry(state, payload, auth_info, start).await
-        }
-    }
-}
-
-// Implementation continues with all enhanced endpoints...
-// [Additional handler functions would be implemented here]
 
 /// Parse AI command text into a geometry command
 fn parse_ai_command_to_geometry_command(
@@ -1617,25 +1434,6 @@ async fn process_ai_command_stream(
     });
 
     Sse::new(ReceiverStream::new(rx))
-}
-
-async fn create_basic_geometry(
-    _state: AppState,
-    _payload: EnhancedGeometryRequest,
-    _auth_info: auth_middleware::AuthInfo,
-    start: std::time::Instant,
-) -> Result<Json<EnhancedGeometryResponse>, StatusCode> {
-    // Basic geometry creation fallback
-    Ok(Json(EnhancedGeometryResponse {
-        success: true,
-        message: "Basic geometry created".to_string(),
-        solid_id: Some(1),
-        shape_type: Some("basic".to_string()),
-        properties: None,
-        cached: false,
-        execution_time_ms: start.elapsed().as_millis() as u64,
-        session_id: None,
-    }))
 }
 
 // Session lifecycle handlers (real implementations follow).
