@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { Canvas } from '@react-three/fiber'
+import { Grid3x3 } from 'lucide-react'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'
@@ -8,6 +9,7 @@ import { ReferencePlanes } from './ReferencePlanes'
 import { SceneObjects } from './SceneObjects'
 import { TransformGizmo } from './TransformGizmo'
 import { SelectionOutline } from './SelectionOutline'
+import { SubElementHighlight } from './SubElementHighlight'
 import { useSceneStore } from '@/stores/scene-store'
 import type * as THREE from 'three'
 
@@ -63,12 +65,83 @@ export function CADViewport() {
         <GizmoNav />
         <SceneObjects />
         <TransformGizmo />
+        <SubElementHighlight />
         <SelectionOutline />
       </Canvas>
 
       <ViewportFrame />
+      <ViewportControls />
       <ViewportReadout />
       <ViewportHints />
+      <ModeBanner />
+    </div>
+  )
+}
+
+/**
+ * Top-center banner that becomes visible whenever the user is in a
+ * sub-element selection mode. Hidden in object mode so the viewport stays
+ * clean. Tells the user exactly what they will pick on the next click.
+ */
+function ModeBanner() {
+  const selectionMode = useSceneStore((s) => s.selectionMode)
+  const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
+
+  if (selectionMode === 'object') return null
+
+  const labels: Record<typeof selectionMode, { title: string; hint: string }> = {
+    object: { title: 'OBJECT', hint: '' },
+    face:   { title: 'FACE MODE',   hint: 'Click a face to select · Press 1 to exit' },
+    edge:   { title: 'EDGE MODE',   hint: 'Click an edge to select · Press 1 to exit' },
+    vertex: { title: 'VERTEX MODE', hint: 'Click a vertex to select · Press 1 to exit' },
+  }
+  const { title, hint } = labels[selectionMode]
+
+  return (
+    <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-auto cad-panel px-4 py-2 flex items-center gap-3 text-[11px] uppercase tracking-wider">
+      <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
+      <span className="text-foreground font-semibold">{title}</span>
+      <span className="text-muted-foreground">{hint}</span>
+      <button
+        type="button"
+        onClick={() => setSelectionMode('object')}
+        className="ml-2 px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
+        title="Exit to object mode"
+      >
+        Exit
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Floating viewport toggles — currently a single grid on/off control.
+ * Sits just above the readout in the bottom-right corner.
+ */
+function ViewportControls() {
+  const gridVisible = useSceneStore((s) => s.gridSettings.visible)
+  const setGridSettings = useSceneStore((s) => s.setGridSettings)
+
+  const toggleGrid = useCallback(() => {
+    setGridSettings({ visible: !gridVisible })
+  }, [gridVisible, setGridSettings])
+
+  return (
+    <div className="absolute bottom-[68px] right-3 flex items-center gap-1">
+      <button
+        type="button"
+        onClick={toggleGrid}
+        title={gridVisible ? 'Hide grid' : 'Show grid'}
+        aria-pressed={gridVisible}
+        className={[
+          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
+          gridVisible
+            ? 'text-foreground border-border'
+            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
+        ].join(' ')}
+      >
+        <Grid3x3 className="w-3.5 h-3.5" />
+      </button>
     </div>
   )
 }

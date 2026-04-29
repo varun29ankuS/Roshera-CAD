@@ -121,6 +121,8 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
     [selectObject, toggleSubElementSelection, object.id, selectionMode],
   )
 
+  const setHoveredSubElement = useSceneStore((s) => s.setHoveredSubElement)
+
   const handlePointerOver = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
       e.stopPropagation()
@@ -132,10 +134,26 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
     [setHovered, object.id, selectionMode],
   )
 
+  const handlePointerMove = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (selectionMode === 'object') return
+      e.stopPropagation()
+      const faceIndex = e.faceIndex ?? 0
+      const subType = selectionMode as 'face' | 'edge' | 'vertex'
+      setHoveredSubElement({
+        objectId: object.id,
+        type: subType,
+        index: faceIndex,
+      })
+    },
+    [selectionMode, object.id, setHoveredSubElement],
+  )
+
   const handlePointerOut = useCallback(() => {
     setHovered(null)
+    setHoveredSubElement(null)
     document.body.style.cursor = 'default'
-  }, [setHovered])
+  }, [setHovered, setHoveredSubElement])
 
   return (
     <mesh
@@ -149,13 +167,14 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       receiveShadow
       onClick={handleClick}
       onPointerOver={handlePointerOver}
+      onPointerMove={handlePointerMove}
       onPointerOut={handlePointerOut}
       userData={{ cadObjectId: object.id }}
     >
       {edgeSettings.visible && (
         <Edges
           threshold={edgeSettings.threshold}
-          color={isHovered || isSelected ? accentEdgeHex : (edgeSettings.color || defaultEdgeHex)}
+          color={isHovered ? accentEdgeHex : (edgeSettings.color || defaultEdgeHex)}
           lineWidth={isSelected ? edgeSettings.lineWidth * 1.5 : edgeSettings.lineWidth}
         />
       )}

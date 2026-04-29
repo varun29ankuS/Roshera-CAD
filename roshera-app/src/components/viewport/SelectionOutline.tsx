@@ -27,16 +27,16 @@ export function SelectionOutline() {
     return mesh ? [mesh] : []
   }, [hoveredId, selectedIds, meshRefs])
 
-  // Selection / hover ink follows the blueprint accent token. Hidden
-  // edges use a desaturated derivative so they read as "occluded" without
-  // blending into the geometry.
+  // Selection / hover ink renders in black for maximum contrast against
+  // the blueprint cream / navy grounds. Hidden edges stay on the tick
+  // token so they read as "occluded" without blending into the geometry.
   const palette = useMemo(() => {
-    const accent = resolveCssVar('--cad-selected').color.getHex()
     const tick = resolveCssVar('--cad-tick').color.getHex()
+    const ink = 0x000000
     return {
-      selectVisible: accent,
+      selectVisible: ink,
       selectHidden: tick,
-      hoverVisible: accent,
+      hoverVisible: ink,
       hoverHidden: tick,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -45,7 +45,7 @@ export function SelectionOutline() {
   if (selectedMeshes.length === 0 && hoveredMeshes.length === 0) return null
 
   return (
-    <EffectComposer multisampling={4} autoClear={false}>
+    <EffectComposer multisampling={4}>
       {selectedMeshes.length > 0 ? (
         <Outline
           selection={selectedMeshes}

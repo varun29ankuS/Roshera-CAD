@@ -206,17 +206,13 @@ export function initWebSocket() {
   unsubscribe = wsClient.onMessage(handleServerMessage)
   wsClient.connect()
 
-  // Join default session once connected
-  const unsub = useWSStore.subscribe(
-    (state) => {
-      if (state.status === 'connected') {
-        wsClient.send({
-          type: 'JoinSession',
-          payload: { session_id: 'default-session' },
-        })
-      }
-    },
-  )
+  // Backend has no `JoinSession` ClientMessage variant — sessions are
+  // established automatically and the server emits `Welcome` on connect.
+  // The session id is delivered later via SessionUpdate / Welcome and
+  // routed into useWSStore from `handleServerMessage`. Nothing to send
+  // on connect; keep the subscription as a no-op so the cleanup tuple
+  // signature stays stable for future use.
+  const unsub = useWSStore.subscribe(() => {})
 
   // Return cleanup for potential future use
   return () => {
