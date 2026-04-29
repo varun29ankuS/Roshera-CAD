@@ -429,28 +429,49 @@ fn edge_lies_on_face(
     Ok(true)
 }
 
-/// Extend edges to face boundaries
+/// Extend imprinted edges to the face's boundary loops.
+///
+/// Returns `NotImplemented`. Boundary extension requires walking each
+/// new edge from its endpoints outward to the nearest intersection
+/// with the face's outer + inner loops, then trimming or extending the
+/// underlying curve. Without this the imprint may sit interior to the
+/// face with dangling endpoints that downstream operations don't
+/// understand. Failing loudly here is preferable to silently emitting
+/// dangling edges.
 fn extend_edges_to_boundaries(
     _model: &mut BRepModel,
-    _face_id: FaceId,
+    face_id: FaceId,
     _edges: &mut Vec<EdgeId>,
 ) -> OperationResult<()> {
-    // Would extend each edge to intersect face boundary loops
-    Ok(())
+    Err(OperationError::NotImplemented(format!(
+        "Imprint: edge-to-boundary extension on face {:?} is not yet implemented. \
+         Pass ImprintOptions::extend_to_boundary = false to skip this stage.",
+        face_id
+    )))
 }
 
-/// Update face with imprinted edges
+/// Persist the imprinted edges on the face.
+///
+/// Returns `NotImplemented`. The Face struct currently has no slot for
+/// non-loop "internal" edges, so the imprinted edges cannot be
+/// attached without either (a) adding a new field on Face and updating
+/// every consumer that walks faces (booleans, tessellation,
+/// validation, serialization), or (b) splitting the face along the
+/// imprint into multiple faces — both significant refactors. Until
+/// then the operation fails loudly so callers see the limitation
+/// instead of receiving a face that silently lost its imprint.
 fn update_face_with_imprinted_edges(
-    model: &mut BRepModel,
+    _model: &mut BRepModel,
     face_id: FaceId,
     new_edges: &[EdgeId],
 ) -> OperationResult<()> {
-    // Add edges to face's internal edge list
-    if let Some(face) = model.faces.get_mut(face_id) {
-        face.add_internal_edges(new_edges);
-    }
-
-    Ok(())
+    Err(OperationError::NotImplemented(format!(
+        "Imprint: cannot persist {} imprinted edge(s) on face {:?}; \
+         Face has no internal-edge storage yet. Use boolean::split_face_by_curves \
+         if you need the face split along the imprint curves instead.",
+        new_edges.len(),
+        face_id
+    )))
 }
 
 /// Validate wire connectivity
@@ -535,16 +556,10 @@ fn validate_imprint_result(
     Ok(())
 }
 
-// Extension trait for Face to support internal edges
-trait FaceInternalEdges {
-    fn add_internal_edges(&mut self, edges: &[EdgeId]);
-}
-
-impl FaceInternalEdges for Face {
-    fn add_internal_edges(&mut self, _edges: &[EdgeId]) {
-        // Would store internal edges
-    }
-}
+// Internal-edge storage on Face is intentionally absent; see
+// update_face_with_imprinted_edges for the reasoning. The previous
+// no-op extension trait has been removed because it gave callers a
+// false impression that imprinting persisted.
 
 // #[cfg(test)]
 // mod tests {
