@@ -694,6 +694,37 @@ impl Timeline {
             .collect()
     }
 
+    /// Mark a branch as abandoned. The branch and its events stay in the
+    /// timeline (so a `get_branch_events` call still returns them, e.g.
+    /// for forensics) but the state transitions to
+    /// `BranchState::Abandoned { reason }` so listing endpoints can
+    /// filter it out and merge endpoints can refuse to operate on it.
+    ///
+    /// `BranchId::main` is never allowed to be abandoned.
+    pub fn abandon_branch(&self, branch_id: BranchId, reason: String) -> TimelineResult<()> {
+        if branch_id.is_main() {
+            return Err(TimelineError::InvalidOperation(
+                "main branch cannot be abandoned".to_string(),
+            ));
+        }
+        let mut branch = self
+            .branches
+            .get_mut(&branch_id)
+            .ok_or(TimelineError::BranchNotFound(branch_id))?;
+        match branch.state {
+            BranchState::Active => {
+                branch.state = BranchState::Abandoned { reason };
+                Ok(())
+            }
+            BranchState::Merged { .. }
+            | BranchState::Abandoned { .. }
+            | BranchState::Completed { .. } => Err(TimelineError::InvalidOperation(format!(
+                "branch {} is not active (state={:?}); cannot abandon",
+                branch_id, branch.state
+            ))),
+        }
+    }
+
     /// Reconstruct complete entity state at a specific event point
     /// This performs incremental replay of events to build accurate state
     pub async fn reconstruct_entities_at_event(

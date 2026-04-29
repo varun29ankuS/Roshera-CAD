@@ -85,6 +85,28 @@ fn build_capabilities() -> Value {
                 non-retryable) or `transaction_not_active` (CONFLICT, \
                 non-retryable). Header is opt-in: omitting it preserves \
                 pre-transaction behaviour.",
+            "branches": "Agents claim sandbox branches off `main` so \
+                concurrent agents never collide in the immutable event \
+                log. `POST /api/branches` creates a branch (optional \
+                `agent_id` tag becomes the recorded author); `GET \
+                /api/branches` lists every branch with its state, agent \
+                tag, parent, and event count; `GET /api/branches/{id}` \
+                returns one; `DELETE /api/branches/{id}` flips the \
+                branch's state to `abandoned` (events stay for \
+                forensics; `main` is rejected); `POST /api/branches/\
+                {id}/merge` folds the branch into a target (default \
+                `main`) using a `strategy` of `fast-forward` (default), \
+                `three-way`, or `squash`. Branch IDs on the wire are \
+                either the literal `\"main\"` or a UUIDv4 string. \
+                Errors surface as `branch_not_found` (NOT_FOUND), \
+                `branch_invalid_state` (CONFLICT, e.g. abandoning \
+                `main` or re-abandoning a merged branch), or \
+                `branch_merge_conflict` (CONFLICT). Mutation routing \
+                — landing geometry ops on the agent's branch instead \
+                of the trunk model — is a separate kernel layer that \
+                this surface does not yet enforce; the branch \
+                lifecycle and event-log isolation it exposes are \
+                correct and useful on their own.",
             "frame": "Multimodal agents can fetch a server-rendered PNG of \
                 the live scene with `GET /api/frame`. The kernel \
                 tessellates every solid, projects with an auto-fit \
@@ -299,6 +321,13 @@ fn endpoints() -> Value {
             "get":      "GET  /api/tx/{id}",
             "commit":   "POST /api/tx/{id}/commit",
             "rollback": "POST /api/tx/{id}/rollback"
+        },
+        "branches": {
+            "list":   "GET    /api/branches",
+            "create": "POST   /api/branches",
+            "get":    "GET    /api/branches/{id}",
+            "delete": "DELETE /api/branches/{id}",
+            "merge":  "POST   /api/branches/{id}/merge"
         },
         "export": "POST /api/export"
     })
