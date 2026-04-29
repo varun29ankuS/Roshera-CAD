@@ -191,20 +191,45 @@ pub fn parallel_transport_frames(
 
         let prev = &frames[i - 1];
 
-        // Double-reflection method (Wang et al. 2008) for exact RMF:
-        //   1. Reflect the previous frame through the bisector plane of
-        //      successive tangent vectors.
-        //   2. The reflected normal already lies in the plane perpendicular
-        //      to the new tangent; a second reflection corrects residual
-        //      tangent drift.
+        // Double-reflection method (Wang, Jüttler, Zheng, Liu — ACM
+        // TOG 27(1), 2008) for exact rotation-minimising frame:
+        //   1. Reflect the previous frame through the plane normal to
+        //      v₁ = p_{i+1} − p_i (the chord). This carries (t_i, n_i)
+        //      to (t_i^L, n_i^L) on a parallel tangent plane at p_{i+1}.
+        //   2. Reflect again through the plane normal to v₂ = t_{i+1} −
+        //      t_i^L so the carried tangent aligns with t_{i+1}. The
+        //      same reflection takes n_i^L to the new normal n_{i+1}.
         //
-        // Simplified single-projection variant (stable for well-sampled curves):
-        // Project previous normal onto plane perpendicular to new tangent.
-        let projected = prev.normal - tan * tan.dot(&prev.normal);
+        // The previous code did a single projection onto the plane
+        // perpendicular to t_{i+1}, which introduces O(h²) twist drift
+        // on coarsely-sampled curves. Double-reflection is exact in the
+        // discrete sense and matches the analytic RMF as h → 0.
+        let v1 = pos - prev.position;
+        let c1 = v1.dot(&v1);
+        let (carried_normal, carried_tangent) = if c1 < 1e-30 {
+            // Coincident stations — falls back to a single projection.
+            (prev.normal, prev.tangent)
+        } else {
+            let two_over_c1 = 2.0 / c1;
+            let n_l = prev.normal - v1 * (two_over_c1 * v1.dot(&prev.normal));
+            let t_l = prev.tangent - v1 * (two_over_c1 * v1.dot(&prev.tangent));
+            (n_l, t_l)
+        };
+        let v2 = tan - carried_tangent;
+        let c2 = v2.dot(&v2);
+        let reflected_normal = if c2 < 1e-30 {
+            carried_normal
+        } else {
+            carried_normal - v2 * ((2.0 / c2) * v2.dot(&carried_normal))
+        };
+
+        // Re-orthogonalise against the new tangent (guards against
+        // accumulated rounding) and renormalise.
+        let projected = reflected_normal - tan * tan.dot(&reflected_normal);
 
         let nor = if projected.is_zero(tolerance) {
-            // Degenerate case: previous normal is exactly aligned with new tangent.
-            // Fall back to an arbitrary perpendicular.
+            // Degenerate case: reflected normal collapsed onto the new
+            // tangent. Fall back to an arbitrary perpendicular.
             tan.perpendicular().normalize()?
         } else {
             projected.normalize()?
