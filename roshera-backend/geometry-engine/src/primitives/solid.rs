@@ -226,10 +226,14 @@ pub struct Solid {
     collision_tree: Option<Arc<CollisionTree>>,
 }
 
-/// Collision detection acceleration structure
+/// Top-level AABB used as a conservative collision proxy. The detailed
+/// hierarchical descent (per-face BVH / OBB nodes) lives in
+/// `topology::accel_tree`; this struct caches only the root box so the
+/// `Solid::collides_with` fast path can reject pairs whose world-space
+/// extents do not overlap without ever touching the topology stores.
 #[derive(Debug)]
 pub struct CollisionTree {
-    // Simplified - real implementation would use OBB/AABB tree
+    /// Root axis-aligned bounding box (min, max) in world coordinates.
     pub root_bbox: (Point3, Point3),
 }
 
@@ -740,10 +744,15 @@ impl Solid {
     }
 }
 
-/// Volume integrals for mass properties
+/// Volume integrals for rigid-body mass properties: volume V = ∫dV,
+/// first moments ∫r dV (which yield centre-of-mass after dividing by V),
+/// and second-moment tensor ∫(r ⊗ r) dV (which yields the inertia tensor
+/// after the parallel-axis shift to the COM frame). This is the full set
+/// of integrals required for the standard rigid-body mass-properties
+/// pipeline; anything beyond this (third moments, higher inertia
+/// tensors) is not consumed by the kernel or any downstream module.
 #[derive(Debug, Default)]
 struct VolumeIntegrals {
-    // Simplified - real implementation would track all integrals
     volume: f64,
     first_moments: Vector3,
     second_moments: [[f64; 3]; 3],
