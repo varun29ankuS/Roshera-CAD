@@ -6,14 +6,17 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use geometry_engine::operations::recorder::OperationRecorder;
+use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
 use session_manager::BroadcastMessage;
 use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
+use std::sync::Arc;
 use timeline_engine::{
-    branch::ConflictStrategy, Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId,
-    EventMetadata, MergeStrategy, Operation, OperationInputs, SessionId, Timeline, TimelineError,
-    TimelineEvent,
+    branch::ConflictStrategy, rebuild_model_from_events, Author, BranchId, BranchManager,
+    BranchPurpose, EntityId, EventId, EventMetadata, MergeStrategy, Operation, OperationInputs,
+    ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent, TimelineRecorder,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -127,6 +130,82 @@ pub struct ReplayEventsResponse {
     pub success: bool,
     pub events_replayed: Vec<String>,
     pub message: String,
+}
+
+/// Reconcile the live `BRepModel` with the session's current timeline
+/// position by replacing it with a fresh model and replaying every event
+/// on the session's branch up to (and including) the position pointer.
+///
+/// This is the bridge between the timeline's logical position changes
+/// (`undo`, `redo`, `replay`) and the kernel's actual geometry state.
+/// `Timeline::undo`/`Timeline::redo` only advance the session position
+/// pointer — they do not touch the kernel. Without this reconciliation
+/// step the model and the timeline drift out of sync, which is what was
+/// previously documented as "undo/redo does not reconcile the live
+/// BRepModel".
+///
+/// # Lock ordering
+///
+/// Callers MUST drop any `state.timeline` write guard before invoking
+/// this helper. The function acquires the timeline read lock to fetch
+/// the session position and branch events, then acquires the model
+/// write lock to swap in a fresh `BRepModel`. The `TimelineRecorder`
+/// worker takes a timeline read lock when draining records, so holding
+/// the timeline write lock across this call would deadlock.
+///
+/// # Recorder lifecycle
+///
+/// A fresh `TimelineRecorder` is attached to the rebuilt model so that
+/// any future kernel ops continue to flow into the timeline.
+/// `rebuild_model_from_events` itself temporarily detaches the recorder
+/// for the duration of the replay (preventing replayed events from
+/// being re-recorded into the timeline) and reattaches it before
+/// returning.
+async fn replay_session_to_model(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<ReplayOutcome, String> {
+    // 1. Snapshot the session's position + fetch the events to replay.
+    //    Held under a single read lock so position and events are
+    //    consistent with each other.
+    let (branch_id, events) = {
+        let timeline = state.timeline.read().await;
+        let position = timeline
+            .get_session_position(session_uuid)
+            .ok_or_else(|| "session has no timeline position".to_string())?;
+        // `event_index` is the inclusive index of the session's current
+        // event; `get_branch_events` interprets `limit` as a count, so
+        // request `event_index + 1` events starting from the branch root.
+        let limit = position.event_index.saturating_add(1) as usize;
+        let events = timeline
+            .get_branch_events(&position.branch_id, None, Some(limit))
+            .map_err(|e| format!("failed to fetch branch events: {}", e))?;
+        (position.branch_id, events)
+    };
+
+    // 2. Replace the live model with a fresh one and reattach a recorder
+    //    so post-replay kernel ops continue to be timeline-recorded.
+    let mut model_guard = state.model.write().await;
+    *model_guard = BRepModel::new();
+    let recorder: Arc<dyn OperationRecorder> = Arc::new(TimelineRecorder::new(
+        Arc::clone(&state.timeline),
+        Author::System,
+        BranchId::main(),
+    ));
+    model_guard.attach_recorder(Some(recorder));
+
+    // 3. Replay. `rebuild_model_from_events` detaches the recorder for
+    //    the duration of the replay and reattaches it before returning.
+    let outcome = rebuild_model_from_events(&mut *model_guard, &events);
+    tracing::info!(
+        target: "timeline.replay",
+        session = %session_uuid,
+        branch = %branch_id,
+        events_applied = outcome.events_applied,
+        events_skipped = outcome.events_skipped,
+        "BRepModel reconciled with session timeline position"
+    );
+    Ok(outcome)
 }
 
 /// Initialize timeline (replaces initialize_version_control)
@@ -445,12 +524,24 @@ fn convert_purpose_dto(dto: BranchPurposeDto) -> BranchPurpose {
 }
 
 /// Replay timeline events
+///
+/// Two-phase replay:
+/// 1. Session-level replay via `SessionManager::replay_session` to drive
+///    session-side bookkeeping (broadcast/snapshot housekeeping).
+/// 2. Kernel-side replay via [`replay_session_to_model`] which rebuilds
+///    the live `BRepModel` from the events on the session's branch up to
+///    the current position pointer. This is what makes the geometry the
+///    client renders match the timeline's logical state.
 pub async fn replay_events(
     State(state): State<AppState>,
     Json(request): Json<ReplayEventsRequest>,
 ) -> Result<Json<ReplayEventsResponse>, StatusCode> {
     // Parse session ID
     let session_id = SessionId::new(request.session_id.clone());
+
+    // We also need the session UUID for the kernel-side replay step.
+    let session_uuid =
+        Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Parse from_event if provided
     let from_event = if let Some(event_str) = request.from_event {
@@ -461,26 +552,57 @@ pub async fn replay_events(
         None
     };
 
-    // Replay through session manager
-    match state
+    // Phase 1: session-side replay.
+    let replayed_events = match state
         .session_manager
         .replay_session(session_id, from_event)
         .await
     {
-        Ok(replayed_events) => {
-            let event_ids: Vec<String> = replayed_events.iter().map(|e| e.to_string()).collect();
-
-            Ok(Json(ReplayEventsResponse {
-                success: true,
-                events_replayed: event_ids,
-                message: format!("Successfully replayed {} events", replayed_events.len()),
-            }))
-        }
+        Ok(events) => events,
         Err(e) => {
-            tracing::error!("Failed to replay timeline: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            tracing::error!("Failed to replay timeline (session phase): {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-    }
+    };
+
+    // Phase 2: rebuild the live BRepModel so geometry matches the
+    // timeline. Failures here are logged and surfaced in the response,
+    // but don't fail the entire request — the session-level replay
+    // already succeeded and clients can re-issue if needed.
+    let (model_reconciled, events_applied, events_skipped) =
+        match replay_session_to_model(&state, session_uuid).await {
+            Ok(outcome) => (true, outcome.events_applied, outcome.events_skipped),
+            Err(err) => {
+                tracing::error!(
+                    target: "timeline.replay",
+                    session = %session_uuid,
+                    error = %err,
+                    "model replay failed during /replay; geometry may be stale"
+                );
+                (false, 0, 0)
+            }
+        };
+
+    let event_ids: Vec<String> = replayed_events.iter().map(|e| e.to_string()).collect();
+    let summary = if model_reconciled {
+        format!(
+            "Successfully replayed {} session events; BRepModel reconciled ({} applied, {} skipped)",
+            replayed_events.len(),
+            events_applied,
+            events_skipped
+        )
+    } else {
+        format!(
+            "Replayed {} session events; BRepModel reconciliation failed (see server logs)",
+            replayed_events.len()
+        )
+    };
+
+    Ok(Json(ReplayEventsResponse {
+        success: true,
+        events_replayed: event_ids,
+        message: summary,
+    }))
 }
 
 /// Undo the last operation
@@ -496,37 +618,50 @@ pub async fn undo_operation(
     // Parse session ID to UUID for timeline operations
     let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Get the timeline and perform undo
-    let mut timeline = state.timeline.write().await;
+    // Advance the session's timeline position (this records an undo marker
+    // and shifts the position pointer — see `Timeline::undo`).
+    let undo_result = {
+        let mut timeline = state.timeline.write().await;
+        timeline.undo(session_uuid).await
+    };
 
-    match timeline.undo(session_uuid).await {
+    match undo_result {
         Ok(event_id) => {
-            // Get the undone event details for response
-            let event = timeline
-                .get_event(event_id)
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            // Snapshot the event details we need for the response under a
+            // short read lock so the timeline lock is released before we
+            // reconcile the model (which acquires its own read lock).
+            let (entities_affected, operation_type_str) = {
+                let timeline = state.timeline.read().await;
+                let event = timeline
+                    .get_event(event_id)
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                let mut affected: Vec<String> = event
+                    .outputs
+                    .created
+                    .iter()
+                    .map(|e| e.id.to_string())
+                    .collect();
+                affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
+                affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
+                (affected, format!("{:?}", event.operation))
+            };
 
-            // Extract entities affected from the event
-            let mut entities_affected: Vec<String> = event
-                .outputs
-                .created
-                .iter()
-                .map(|e| e.id.to_string())
-                .collect();
-            entities_affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
-            entities_affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
-
-            // NOTE: `Timeline::undo` only advances the session's position
-            // pointer and records a marker event; it does **not** reconcile
-            // the live `BRepModel` (api-server's `state.model`) against the
-            // pre-undo state. `FullIntegrationExecutor` does not currently
-            // expose an `execute_event` API that could replay the inverse,
-            // so a full geometry rollback requires either a snapshot-based
-            // approach (re-apply operations from branch root up to the new
-            // position) or addition of inverse operations on the kernel.
-            // Tracked separately. Until then, undo is reflected in the
-            // event log and broadcast below; clients reading geometry state
-            // afterwards will see the pre-undo BRep.
+            // Reconcile the live BRepModel with the new (post-undo) timeline
+            // position. Drives the model back to exactly the state implied
+            // by the events up to the session's new pointer — replaces the
+            // previous "does not reconcile" gap.
+            let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
+                Ok(outcome) => Some(outcome),
+                Err(err) => {
+                    tracing::error!(
+                        target: "timeline.undo",
+                        session = %session_uuid,
+                        error = %err,
+                        "model replay after undo failed; clients may see stale geometry"
+                    );
+                    None
+                }
+            };
 
             // Broadcast the undo to connected clients
             let _ = state
@@ -543,12 +678,20 @@ pub async fn undo_operation(
                 )
                 .await;
 
+            let (events_applied, events_skipped) = replay_outcome
+                .as_ref()
+                .map(|o| (o.events_applied, o.events_skipped))
+                .unwrap_or((0, 0));
+
             Ok(Json(serde_json::json!({
                 "success": true,
                 "message": "Undo operation completed successfully",
                 "event_id": event_id.to_string(),
                 "entities_affected": entities_affected,
-                "operation_type": format!("{:?}", event.operation)
+                "operation_type": operation_type_str,
+                "model_reconciled": replay_outcome.is_some(),
+                "events_applied": events_applied,
+                "events_skipped": events_skipped,
             })))
         }
         Err(timeline_engine::TimelineError::NoMoreUndo) => Ok(Json(serde_json::json!({
@@ -585,31 +728,47 @@ pub async fn redo_operation(
     // Parse session ID to UUID for timeline operations
     let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Get the timeline and perform redo
-    let mut timeline = state.timeline.write().await;
+    // Advance the session's timeline position forward (records a redo
+    // marker and updates the position pointer — see `Timeline::redo`).
+    let redo_result = {
+        let mut timeline = state.timeline.write().await;
+        timeline.redo(session_uuid).await
+    };
 
-    match timeline.redo(session_uuid).await {
+    match redo_result {
         Ok(event_id) => {
-            // Get the redone event details for response
-            let event = timeline
-                .get_event(event_id)
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            // Snapshot event details under a short read lock so the timeline
+            // lock is released before we reconcile the live model.
+            let (entities_affected, operation_type_str) = {
+                let timeline = state.timeline.read().await;
+                let event = timeline
+                    .get_event(event_id)
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                let mut affected: Vec<String> = event
+                    .outputs
+                    .created
+                    .iter()
+                    .map(|e| e.id.to_string())
+                    .collect();
+                affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
+                affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
+                (affected, format!("{:?}", event.operation))
+            };
 
-            // Extract entities affected from the event
-            let mut entities_affected: Vec<String> = event
-                .outputs
-                .created
-                .iter()
-                .map(|e| e.id.to_string())
-                .collect();
-            entities_affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
-            entities_affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
-
-            // NOTE: `Timeline::redo` advances the position pointer and
-            // records a marker event but does **not** re-apply the redone
-            // operation against the live `BRepModel`. See the matching
-            // note in `undo_operation` for the architectural gap; the
-            // resolution is shared (snapshot/replay vs. inverse-op API).
+            // Re-apply events up through the new (post-redo) position so
+            // the BRepModel matches the timeline. Mirrors the undo path.
+            let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
+                Ok(outcome) => Some(outcome),
+                Err(err) => {
+                    tracing::error!(
+                        target: "timeline.redo",
+                        session = %session_uuid,
+                        error = %err,
+                        "model replay after redo failed; clients may see stale geometry"
+                    );
+                    None
+                }
+            };
 
             // Broadcast the redo to connected clients
             let _ = state
@@ -626,12 +785,20 @@ pub async fn redo_operation(
                 )
                 .await;
 
+            let (events_applied, events_skipped) = replay_outcome
+                .as_ref()
+                .map(|o| (o.events_applied, o.events_skipped))
+                .unwrap_or((0, 0));
+
             Ok(Json(serde_json::json!({
                 "success": true,
                 "message": "Redo operation completed successfully",
                 "event_id": event_id.to_string(),
                 "entities_affected": entities_affected,
-                "operation_type": format!("{:?}", event.operation)
+                "operation_type": operation_type_str,
+                "model_reconciled": replay_outcome.is_some(),
+                "events_applied": events_applied,
+                "events_skipped": events_skipped,
             })))
         }
         Err(timeline_engine::TimelineError::NoMoreRedo) => Ok(Json(serde_json::json!({
