@@ -126,18 +126,36 @@ pub async fn export_mesh(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?,
         ExportFormat::ROS => {
-            // ROS format requires B-Rep model, not just mesh
-            // For now, return not implemented
-            // TODO: Store B-Rep models in session state for ROS export
-            tracing::warn!("ROS export requires B-Rep model access - not yet implemented");
-            return Err(StatusCode::NOT_IMPLEMENTED);
+            // ROS export requires the full B-Rep, which lives on the
+            // server-side `AppState::model` (an Arc<RwLock<BRepModel>>).
+            // A read lock is sufficient: `export_brep_to_ros` does not
+            // mutate topology, only serialises it.
+            let model = state.model.read().await;
+            state
+                .export_engine
+                .export_ros(
+                    &model,
+                    &safe_name,
+                    export_engine::formats::ros::RosExportOptions::default(),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("ROS export failed: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
         }
         ExportFormat::STEP => {
-            // STEP format requires B-Rep model, not just mesh
-            // For now, return not implemented
-            // TODO: Store B-Rep models in session state for STEP export
-            tracing::warn!("STEP export requires B-Rep model access - not yet implemented");
-            return Err(StatusCode::NOT_IMPLEMENTED);
+            // STEP export reads the B-Rep directly; same locking story
+            // as ROS above.
+            let model = state.model.read().await;
+            state
+                .export_engine
+                .export_step(&model, &safe_name)
+                .await
+                .map_err(|e| {
+                    tracing::error!("STEP export failed: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
         }
         _ => {
             tracing::warn!("Unsupported export format: {:?}", request.format);
