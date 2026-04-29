@@ -1,14 +1,27 @@
+import { useMemo } from 'react'
+import { useThemeStore } from '@/stores/theme-store'
+import { resolveCssVar } from '@/lib/css-color'
+
 /**
- * Colored axis lines on the ground plane — X (red), Z (blue).
- * Drawn slightly above the grid to avoid z-fighting.
+ * Datum axis lines along the world origin — X, Y, Z all rendered in the
+ * blueprint tick color. Orientation is conveyed by the gizmo widget, not
+ * by RGB encoding, so the viewport reads as a single-hue technical drawing.
  */
 export function ReferencePlanes() {
   const Y = 0.005
   const LEN = 100
+  const theme = useThemeStore((s) => s.theme)
+
+  const tick = useMemo(
+    () => resolveCssVar('--cad-tick'),
+    // theme switches change the resolved CSS var; depend on it explicitly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [theme],
+  )
 
   return (
     <group name="reference-planes">
-      {/* X axis (red) */}
+      {/* X axis */}
       <line>
         <bufferGeometry>
           <bufferAttribute
@@ -16,10 +29,10 @@ export function ReferencePlanes() {
             args={[new Float32Array([-LEN, Y, 0, LEN, Y, 0]), 3]}
           />
         </bufferGeometry>
-        <lineBasicMaterial color="#e74c3c" transparent opacity={0.35} />
+        <lineBasicMaterial color={tick.color} transparent opacity={tick.alpha * 0.45} />
       </line>
 
-      {/* Y axis (green) */}
+      {/* Y axis (vertical datum — slightly stronger) */}
       <line>
         <bufferGeometry>
           <bufferAttribute
@@ -27,10 +40,10 @@ export function ReferencePlanes() {
             args={[new Float32Array([0, 0, 0, 0, LEN, 0]), 3]}
           />
         </bufferGeometry>
-        <lineBasicMaterial color="#2ecc71" transparent opacity={0.35} />
+        <lineBasicMaterial color={tick.color} transparent opacity={tick.alpha * 0.7} />
       </line>
 
-      {/* Z axis (blue) */}
+      {/* Z axis */}
       <line>
         <bufferGeometry>
           <bufferAttribute
@@ -38,7 +51,7 @@ export function ReferencePlanes() {
             args={[new Float32Array([0, Y, -LEN, 0, Y, LEN]), 3]}
           />
         </bufferGeometry>
-        <lineBasicMaterial color="#3498db" transparent opacity={0.35} />
+        <lineBasicMaterial color={tick.color} transparent opacity={tick.alpha * 0.45} />
       </line>
     </group>
   )

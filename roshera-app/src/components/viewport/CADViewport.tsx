@@ -9,7 +9,6 @@ import { SceneObjects } from './SceneObjects'
 import { TransformGizmo } from './TransformGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { useSceneStore } from '@/stores/scene-store'
-import { useThemeStore } from '@/stores/theme-store'
 import type * as THREE from 'three'
 
 export function CADViewport() {
@@ -45,17 +44,18 @@ export function CADViewport() {
   }, [deselectAll])
 
   return (
-    <div ref={containerRef} className="absolute inset-0 overflow-hidden">
+    <div
+      ref={containerRef}
+      className="absolute inset-0 overflow-hidden bg-[var(--cad-viewport-bg)]"
+    >
       <Canvas
         shadows
         dpr={[1, 2]}
         camera={{ fov: 50, near: 0.1, far: 2000, position: [20, 15, 20] }}
-        gl={{ antialias: true, alpha: false, powerPreference: 'high-performance' }}
+        gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
         onCreated={handleCreated}
         onPointerMissed={handlePointerMissed}
       >
-        <ViewportBackground />
-
         <CameraController />
         <SceneLighting />
         <CADGrid />
@@ -66,38 +66,67 @@ export function CADViewport() {
         <SelectionOutline />
       </Canvas>
 
-      <ViewportInfo />
+      <ViewportFrame />
+      <ViewportReadout />
+      <ViewportHints />
     </div>
   )
 }
 
-function ViewportBackground() {
-  const theme = useThemeStore((s) => s.theme)
-  const bg = theme === 'dark' ? '#1e1e2e' : '#eeeef2'
-  return <color attach="background" args={[bg]} />
+/**
+ * Corner-tick frame surrounding the viewport — four L-shaped marks in the
+ * blueprint border color. Purely decorative; pointer-events disabled so it
+ * never intercepts orbit/pan/zoom.
+ */
+function ViewportFrame() {
+  const tick = 'w-3 h-3 absolute pointer-events-none border-[var(--border)]'
+  return (
+    <div className="absolute inset-2 pointer-events-none">
+      <span className={`${tick} top-0 left-0 border-t border-l`} />
+      <span className={`${tick} top-0 right-0 border-t border-r`} />
+      <span className={`${tick} bottom-0 left-0 border-b border-l`} />
+      <span className={`${tick} bottom-0 right-0 border-b border-r`} />
+    </div>
+  )
 }
 
-function ViewportInfo() {
+/**
+ * Top-right blueprint readout — current tool, selection mode, selected
+ * count. Mirrors the LABEL · VALUE pattern used elsewhere in the UI.
+ */
+function ViewportReadout() {
   const activeTool = useSceneStore((s) => s.activeTool)
   const selectionMode = useSceneStore((s) => s.selectionMode)
   const selectedCount = useSceneStore((s) => s.selectedIds.size)
 
   return (
+    <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[140px]">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">Tool</span>
+        <span className="text-foreground">{activeTool}</span>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">Mode</span>
+        <span className="text-foreground">{selectionMode}</span>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">Selected</span>
+        <span className="text-foreground tabular-nums">{selectedCount}</span>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Bottom-edge mouse-control hints, blueprint styled.
+ */
+function ViewportHints() {
+  return (
     <div className="absolute bottom-0 left-0 right-0 pointer-events-none">
-      <div className="flex items-center justify-between px-3 py-1 text-[10px] text-muted-foreground bg-background/60 backdrop-blur-sm border-t border-border/50">
-        <div className="flex items-center gap-3">
-          <span className="uppercase tracking-wider">
-            {selectionMode === 'object' ? activeTool : selectionMode}
-          </span>
-          {selectedCount > 0 && (
-            <span>{selectedCount} selected</span>
-          )}
-        </div>
-        <div className="flex items-center gap-3">
-          <span>Scroll: Zoom</span>
-          <span>MMB: Pan</span>
-          <span>LMB: Orbit</span>
-        </div>
+      <div className="flex items-center justify-end gap-4 px-3 py-1 text-[10px] uppercase tracking-wider font-mono text-muted-foreground/80">
+        <span>LMB · Orbit</span>
+        <span>MMB · Pan</span>
+        <span>Scroll · Zoom</span>
       </div>
     </div>
   )

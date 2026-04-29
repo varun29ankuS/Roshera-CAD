@@ -2,10 +2,15 @@ import { useMemo } from 'react'
 import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
+import { resolveCssVar } from '@/lib/css-color'
 
 /**
  * Shader-based infinite grid on the XZ plane.
  * Renders clean single-pixel lines at any zoom level — no z-fighting.
+ *
+ * Cell and section colors are resolved from the blueprint design tokens
+ * (`--cad-grid`, `--cad-grid-section`) so the viewport stays in lockstep
+ * with the rest of the UI across theme switches.
  */
 
 const gridVertexShader = /* glsl */ `
@@ -22,6 +27,8 @@ const gridFragmentShader = /* glsl */ `
   uniform float uSectionSize;
   uniform vec3 uCellColor;
   uniform vec3 uSectionColor;
+  uniform float uCellAlpha;
+  uniform float uSectionAlpha;
   uniform float uFadeDistance;
 
   float gridLine(float coord, float size) {
@@ -45,17 +52,12 @@ const gridFragmentShader = /* glsl */ `
     );
 
     vec3 color = mix(uCellColor, uSectionColor, sectionLine);
-    float alpha = max(cellLine * 0.3, sectionLine * 0.5) * fade;
+    float alpha = max(cellLine * uCellAlpha, sectionLine * uSectionAlpha) * fade;
 
     if (alpha < 0.01) discard;
     gl_FragColor = vec4(color, alpha);
   }
 `
-
-const GRID_COLORS = {
-  dark: { cell: '#2a2f45', section: '#4a5080' },
-  light: { cell: '#c0c4d0', section: '#8890aa' },
-}
 
 export function CADGrid() {
   const { visible, cellSize, sectionSize, fadeDistance } = useSceneStore(
@@ -64,15 +66,18 @@ export function CADGrid() {
   const theme = useThemeStore((s) => s.theme)
 
   const material = useMemo(() => {
-    const colors = GRID_COLORS[theme]
+    const cell = resolveCssVar('--cad-grid')
+    const section = resolveCssVar('--cad-grid-section')
     return new THREE.ShaderMaterial({
       vertexShader: gridVertexShader,
       fragmentShader: gridFragmentShader,
       uniforms: {
         uCellSize: { value: cellSize },
         uSectionSize: { value: sectionSize },
-        uCellColor: { value: new THREE.Color(colors.cell) },
-        uSectionColor: { value: new THREE.Color(colors.section) },
+        uCellColor: { value: cell.color },
+        uSectionColor: { value: section.color },
+        uCellAlpha: { value: cell.alpha },
+        uSectionAlpha: { value: section.alpha },
         uFadeDistance: { value: fadeDistance },
       },
       transparent: true,
