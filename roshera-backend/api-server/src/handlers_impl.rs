@@ -6,106 +6,12 @@ use axum::{
     response::{sse::Event, Json, Sse},
 };
 use futures::stream;
-use geometry_engine::math::{Point3, Vector3};
-use geometry_engine::primitives::primitive_traits::Primitive;
-use geometry_engine::primitives::{
-    box_primitive::{BoxParameters, BoxPrimitive},
-    cylinder_primitive::{CylinderParameters, CylinderPrimitive},
-    sphere_primitive::{SphereParameters, SpherePrimitive},
-};
-use serde_json;
 use std::convert::Infallible;
 use std::pin::Pin;
 use tokio_stream::StreamExt;
 
 use crate::{auth_middleware::AuthInfo, AppState, EnhancedAICommandRequest};
 use session_manager::Permission;
-
-/// Create a basic geometry object without session context
-pub async fn create_basic_geometry(
-    state: State<AppState>,
-    payload: crate::EnhancedGeometryRequest,
-    auth_info: AuthInfo,
-    start: std::time::Instant,
-) -> Result<Json<crate::EnhancedGeometryResponse>, StatusCode> {
-    let mut model = state.model.write().await;
-
-    // Process the geometry creation based on operation type
-    let solid_id = match payload.operation.as_str() {
-        "create_box" => {
-            let params = payload.parameters.unwrap_or(serde_json::json!({}));
-            let width = params.get("width").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let height = params.get("height").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let depth = params.get("depth").and_then(|v| v.as_f64()).unwrap_or(1.0);
-
-            let box_params = BoxParameters {
-                width,
-                height,
-                depth,
-                corner_radius: None,
-                transform: None,
-                tolerance: None,
-            };
-            BoxPrimitive::create(box_params, &mut model).map_err(|e| {
-                tracing::error!("Failed to create box: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-        }
-        "create_sphere" => {
-            let params = payload.parameters.unwrap_or(serde_json::json!({}));
-            let radius = params.get("radius").and_then(|v| v.as_f64()).unwrap_or(1.0);
-
-            let sphere_params = SphereParameters {
-                radius,
-                center: Point3::ORIGIN,
-                u_segments: 16,
-                v_segments: 8,
-                transform: None,
-                tolerance: None,
-            };
-            SpherePrimitive::create(sphere_params, &mut model).map_err(|e| {
-                tracing::error!("Failed to create sphere: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-        }
-        "create_cylinder" => {
-            let params = payload.parameters.unwrap_or(serde_json::json!({}));
-            let radius = params.get("radius").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let height = params.get("height").and_then(|v| v.as_f64()).unwrap_or(2.0);
-
-            let cylinder_params = CylinderParameters {
-                radius,
-                height,
-                base_center: Point3::ORIGIN,
-                axis: Vector3::Z,
-                segments: 16,
-                transform: None,
-                tolerance: None,
-            };
-            CylinderPrimitive::create(cylinder_params, &mut model).map_err(|e| {
-                tracing::error!("Failed to create cylinder: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-        }
-        _ => {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-
-    Ok(Json(crate::EnhancedGeometryResponse {
-        success: true,
-        message: format!(
-            "Created {} successfully",
-            payload.geometry_type.as_deref().unwrap_or("object")
-        ),
-        solid_id: Some(solid_id),
-        shape_type: payload.geometry_type,
-        properties: None,
-        cached: false,
-        execution_time_ms: start.elapsed().as_millis() as u64,
-        session_id: None,
-    }))
-}
 
 /// Process AI command as a server-sent event stream
 ///
