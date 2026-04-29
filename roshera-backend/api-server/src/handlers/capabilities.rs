@@ -26,6 +26,7 @@
 //!   bump the patch version. Removed parameters or removed shapes bump
 //!   the minor version.
 
+use crate::error_catalog::ErrorCode;
 use axum::response::Json;
 use serde_json::{json, Value};
 
@@ -56,10 +57,14 @@ fn build_capabilities() -> Value {
             "ids": "Objects returned in responses are addressed by UUIDv4 \
                 strings. Pass these UUIDs back as inputs to subsequent \
                 operations.",
-            "errors": "Missing or non-numeric required parameters return \
-                400 BAD_REQUEST with `{\"success\": false, \"error\": \
-                \"missing or non-numeric parameter 'X'\"}`. The kernel \
-                never silently substitutes default dimensions.",
+            "errors": "Every error response carries `success: false`, a \
+                stable `error_code` (snake_case identifier from the \
+                catalog under `error_codes` below), a human-readable \
+                `error` string, and a `retryable` boolean. Optional \
+                `hint` and `details` fields may also be present. \
+                Agents must pattern-match on `error_code`, never on \
+                the prose `error`. The kernel never silently \
+                substitutes default dimensions.",
             "idempotency": "Every mutating endpoint (POST/PUT/PATCH/DELETE) \
                 honours an optional `Idempotency-Key` request header. \
                 Sending the same key + same body twice replays the \
@@ -71,8 +76,28 @@ fn build_capabilities() -> Value {
         },
         "primitives": primitives(),
         "operations": operations(),
-        "endpoints": endpoints()
+        "endpoints": endpoints(),
+        "error_codes": error_codes()
     })
+}
+
+/// Publish the closed error catalog so agents can preflight handlers
+/// against every possible failure code without having to provoke each
+/// one. The catalog is sourced from `error_catalog::ErrorCode::all()`
+/// — there is one wire-format definition for both producer and
+/// consumer, so drift between code and discovery is impossible.
+fn error_codes() -> Value {
+    let entries: Vec<Value> = ErrorCode::all()
+        .iter()
+        .map(|code| {
+            json!({
+                "code": code.as_str(),
+                "http_status": code.status().as_u16(),
+                "retryable": code.retryable(),
+            })
+        })
+        .collect();
+    Value::Array(entries)
 }
 
 fn primitives() -> Value {
@@ -264,6 +289,10 @@ mod tests {
         assert!(doc["primitives"].is_array());
         assert!(doc["operations"].is_array());
         assert!(doc["endpoints"].is_object());
+        assert!(
+            doc["error_codes"].is_array(),
+            "error_codes catalog must be published"
+        );
 
         let prims = doc["primitives"].as_array().unwrap();
         assert_eq!(
@@ -309,5 +338,34 @@ mod tests {
                 other => panic!("unexpected primitive shape_type: {other}"),
             }
         }
+    }
+
+    /// The published catalog must enumerate every variant in
+    /// `ErrorCode`. Drift here means the agent gets a code at runtime
+    /// it did not see during preflight — the exact failure mode
+    /// `error_codes` exists to prevent.
+    #[test]
+    fn error_codes_catalog_covers_every_variant() {
+        let doc = build_capabilities();
+        let codes = doc["error_codes"].as_array().unwrap();
+        assert_eq!(
+            codes.len(),
+            ErrorCode::all().len(),
+            "discovery must publish exactly the codes the catalog defines"
+        );
+        for entry in codes {
+            assert!(entry["code"].is_string());
+            assert!(entry["http_status"].is_u64());
+            assert!(entry["retryable"].is_boolean());
+        }
+        // Spot-check well-known codes.
+        let by_code: std::collections::HashMap<&str, &serde_json::Value> = codes
+            .iter()
+            .map(|e| (e["code"].as_str().unwrap(), e))
+            .collect();
+        assert_eq!(by_code["missing_parameter"]["http_status"], 400);
+        assert_eq!(by_code["missing_parameter"]["retryable"], false);
+        assert_eq!(by_code["idempotency_key_reused"]["http_status"], 409);
+        assert_eq!(by_code["kernel_error"]["retryable"], true);
     }
 }

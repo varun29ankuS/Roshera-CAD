@@ -30,6 +30,7 @@
 //! for this layer. When that changes, swap `IdempotencyStore`'s inner
 //! `DashMap` for a Redis-backed store; the public API does not move.
 
+use crate::error_catalog::{ApiError, ErrorCode};
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{Request, State},
@@ -204,18 +205,18 @@ pub async fn idempotency_layer(
     let key = match raw_key {
         None => return next.run(request).await,
         Some(s) if s.is_empty() => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "idempotency_key_empty",
+            return ApiError::new(
+                ErrorCode::IdempotencyKeyEmpty,
                 "Idempotency-Key header was present but empty",
-            );
+            )
+            .into_response();
         }
         Some(s) if s.len() > MAX_KEY_LEN => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "idempotency_key_too_long",
-                &format!("Idempotency-Key exceeds {MAX_KEY_LEN} bytes"),
-            );
+            return ApiError::new(
+                ErrorCode::IdempotencyKeyTooLong,
+                format!("Idempotency-Key exceeds {MAX_KEY_LEN} bytes"),
+            )
+            .into_response();
         }
         Some(s) => s,
     };
@@ -227,14 +228,14 @@ pub async fn idempotency_layer(
     let body_bytes = match to_bytes(body, MAX_BUFFERED_BODY).await {
         Ok(b) => b,
         Err(_) => {
-            return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "idempotency_body_too_large",
-                &format!(
+            return ApiError::new(
+                ErrorCode::IdempotencyBodyTooLarge,
+                format!(
                     "Request body exceeds the {MAX_BUFFERED_BODY}-byte \
                      limit imposed by the idempotency layer"
                 ),
-            );
+            )
+            .into_response();
         }
     };
     let fp = fingerprint(&body_bytes);
@@ -245,12 +246,13 @@ pub async fn idempotency_layer(
         if cached.request_fingerprint == fp {
             return replay(cached);
         }
-        return error_response(
-            StatusCode::CONFLICT,
-            "idempotency_key_reused",
+        return ApiError::new(
+            ErrorCode::IdempotencyKeyReused,
             "Idempotency-Key reused with a different request body. \
              Use a fresh key for a new command.",
-        );
+        )
+        .with_hint("Generate a fresh UUID per logical command.")
+        .into_response();
     }
 
     // Cache miss → reconstruct the request and forward to the inner
@@ -271,11 +273,11 @@ pub async fn idempotency_layer(
         Err(_) => {
             // Response too large to cache — emit it as-is, but skip
             // caching. Practically only happens for streamed exports.
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "idempotency_response_too_large",
+            return ApiError::new(
+                ErrorCode::IdempotencyResponseTooLarge,
                 "Response body exceeded idempotency buffer limit",
-            );
+            )
+            .into_response();
         }
     };
 
@@ -309,26 +311,14 @@ fn replay(cached: CachedResponse) -> Response {
         .header(IDEMPOTENCY_REPLAYED_HEADER, HeaderValue::from_static("true"))
         .body(Body::from(cached.body))
         // The builder only fails on programmer errors (invalid header
-        // names we control); falling back to a plain 500 is fine.
+        // names we control); falling back to a structured 500 is fine.
         .unwrap_or_else(|_| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "idempotency_replay_failed",
+            ApiError::new(
+                ErrorCode::IdempotencyReplayFailed,
                 "Failed to construct cached response",
             )
+            .into_response()
         })
-}
-
-/// Render an error in the shape every other handler uses
-/// (`{"success": false, "error": "..."}`) so agents do not need a
-/// separate parser for idempotency-layer faults.
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = serde_json::json!({
-        "success": false,
-        "error": message,
-        "error_code": code,
-    });
-    (status, axum::Json(body)).into_response()
 }
 
 #[cfg(test)]
