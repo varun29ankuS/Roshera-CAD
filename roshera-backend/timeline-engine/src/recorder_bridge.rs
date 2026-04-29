@@ -23,10 +23,21 @@ use std::sync::Arc;
 use geometry_engine::operations::recorder::{
     OperationRecorder, RecordedOperation, RecorderError,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::timeline::Timeline;
 use crate::types::{Author, BranchId, Operation};
+
+/// Shared, lock-protected handle to a [`Timeline`].
+///
+/// `Timeline::add_operation` only requires `&self` (it uses interior
+/// mutability via DashMap and AtomicU64), but the api-server stores the
+/// timeline behind a `tokio::sync::RwLock` because other timeline APIs
+/// (`undo`, `redo`, `switch_branch`, `merge_branches`) take `&mut self`.
+/// The recorder bridge therefore takes the same lock-protected handle so
+/// it can be wired directly without forcing callers to maintain two
+/// separate timeline instances.
+pub type SharedTimeline = Arc<RwLock<Timeline>>;
 
 /// Recorder that forwards geometry-operation records into a [`Timeline`].
 ///
@@ -68,11 +79,15 @@ impl TimelineRecorder {
     /// Must be called from inside a tokio runtime — construction spawns the
     /// background worker task with [`tokio::spawn`].
     ///
-    /// * `timeline` — the destination timeline. Held by `Arc` so the worker
-    ///   can keep it alive for its lifetime.
+    /// * `timeline` — the destination timeline, shared as
+    ///   `Arc<tokio::sync::RwLock<Timeline>>`. The worker takes a read
+    ///   guard per event because `Timeline::add_operation` is `&self` (its
+    ///   internal stores use interior mutability), so multiple recorders
+    ///   plus the api-server's own write-lock callers (`undo`, `redo`,
+    ///   `switch_branch`, `merge_branches`) all coexist correctly.
     /// * `author` — attributed to every event this recorder emits.
     /// * `branch_id` — the branch every event is appended to.
-    pub fn new(timeline: Arc<Timeline>, author: Author, branch_id: BranchId) -> Self {
+    pub fn new(timeline: SharedTimeline, author: Author, branch_id: BranchId) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<RecordedOperation>();
 
         let worker_author = author.clone();
@@ -81,7 +96,8 @@ impl TimelineRecorder {
         tokio::spawn(async move {
             while let Some(record) = rx.recv().await {
                 let op = to_timeline_operation(&record);
-                if let Err(err) = worker_timeline
+                let guard = worker_timeline.read().await;
+                if let Err(err) = guard
                     .add_operation(op, worker_author.clone(), worker_branch)
                     .await
                 {
@@ -177,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_forwards_to_timeline() {
-        let timeline = Arc::new(Timeline::new(TimelineConfig::default()));
+        let timeline: SharedTimeline = Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
         let recorder = TimelineRecorder::new(
             Arc::clone(&timeline),
             Author::System,
@@ -200,6 +216,8 @@ mod tests {
         let main = BranchId::main();
         for _ in 0..100 {
             let count = timeline
+                .read()
+                .await
                 .get_branch_events(&main, None, None)
                 .map(|v| v.len())
                 .unwrap_or(0);
@@ -210,6 +228,8 @@ mod tests {
         }
 
         let events = timeline
+            .read()
+            .await
             .get_branch_events(&main, None, None)
             .expect("branch events");
         assert_eq!(
@@ -230,7 +250,7 @@ mod tests {
     async fn cloned_recorder_shares_underlying_worker() {
         // A cloned TimelineRecorder shares the same MPSC sender, so events
         // from either clone flow into the same timeline in FIFO order.
-        let timeline = Arc::new(Timeline::new(TimelineConfig::default()));
+        let timeline: SharedTimeline = Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
         let recorder =
             TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
         let clone = recorder.clone();
@@ -248,6 +268,8 @@ mod tests {
         let main = BranchId::main();
         for _ in 0..100 {
             let count = timeline
+                .read()
+                .await
                 .get_branch_events(&main, None, None)
                 .map(|v| v.len())
                 .unwrap_or(0);
@@ -258,6 +280,8 @@ mod tests {
         }
 
         let events = timeline
+            .read()
+            .await
             .get_branch_events(&main, None, None)
             .expect("branch events");
         assert_eq!(events.len(), 2, "both clones should forward events");

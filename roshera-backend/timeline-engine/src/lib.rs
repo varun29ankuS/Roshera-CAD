@@ -30,7 +30,7 @@ pub use cache::{CacheConfig, CacheManager};
 pub use dependency_graph::DependencyGraph;
 pub use error::{TimelineError, TimelineResult};
 pub use execution::{ExecutionConfig, ExecutionEngine, OperationImpl};
-pub use recorder_bridge::TimelineRecorder;
+pub use recorder_bridge::{SharedTimeline, TimelineRecorder};
 pub use timeline::Timeline;
 pub use types::*;
 

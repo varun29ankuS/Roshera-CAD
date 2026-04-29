@@ -2401,6 +2401,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeline = Arc::new(RwLock::new(Timeline::new(timeline_config)));
     let branch_manager = Arc::new(BranchManager::new());
 
+    // Wire the kernel's OperationRecorder to the timeline. This is what
+    // turns every successful kernel mutation (extrude, boolean, fillet,
+    // transform, ...) into a permanent timeline event that the UI's
+    // history panel and undo/redo machinery can consume.
+    //
+    // Without this attach call the kernel's `record_operation` calls all
+    // hit `None` and silently no-op, leaving the timeline empty regardless
+    // of what the user does. See timeline-engine/src/recorder_bridge.rs
+    // for the sync→async bridge implementation.
+    {
+        let recorder: Arc<dyn geometry_engine::operations::recorder::OperationRecorder> =
+            Arc::new(timeline_engine::TimelineRecorder::new(
+                Arc::clone(&timeline),
+                timeline_engine::Author::System,
+                timeline_engine::BranchId::main(),
+            ));
+        let mut model_guard = model.write().await;
+        model_guard.attach_recorder(Some(recorder));
+        tracing::info!(
+            "TimelineRecorder attached to BRepModel (events flow into Timeline on every kernel op)"
+        );
+    }
+
     // Initialize export engine
     let export_engine = Arc::new(export_engine::ExportEngine::new());
 
@@ -2492,7 +2515,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/admin/roles", get(list_roles))
         // Monitoring endpoints
-        .route("/api/logs/stream", get(stream_logs));
+        .route("/api/logs/stream", get(stream_logs))
+        // ==================================================================
+        // Timeline endpoints — event-sourced design history.
+        // Handlers are implemented in handlers/timeline.rs and were
+        // previously orphaned (defined but no routes). Mounting them here
+        // closes Gap #2 from the timeline integration audit: the frontend
+        // Timeline panel + undo/redo/branch buttons can now reach the
+        // backend instead of receiving 404s.
+        // ==================================================================
+        .route("/api/timeline/init", post(initialize_timeline))
+        .route("/api/timeline/record", post(record_operation))
+        .route("/api/timeline/history/{branch_id}", get(get_history))
+        .route("/api/timeline/undo", post(undo_operation))
+        .route("/api/timeline/redo", post(redo_operation))
+        .route("/api/timeline/replay", post(replay_events))
+        .route("/api/timeline/checkpoint", post(create_checkpoint))
+        .route("/api/timeline/branch/create", post(create_branch))
+        .route(
+            "/api/timeline/branch/switch/{branch_id}",
+            post(switch_branch),
+        )
+        .route("/api/timeline/merge", post(merge_branches))
+        // ==================================================================
+        // Hierarchy endpoints — assembly/part tree the frontend ModelTree
+        // panel reads. Handlers are in handlers/hierarchy.rs. Closing
+        // Gap #3 from the audit so ModelTree.tsx stops falling back to
+        // its local scene store on 404.
+        // ==================================================================
+        .route("/api/hierarchy/{session_id}", get(get_hierarchy))
+        .route(
+            "/api/hierarchy/{session_id}/command",
+            post(execute_hierarchy_command),
+        )
+        .route(
+            "/api/hierarchy/{session_id}/parts",
+            post(create_part),
+        )
+        .route(
+            "/api/hierarchy/{session_id}/assemblies/{assembly_id}/parts",
+            post(add_part_to_assembly),
+        )
+        .route(
+            "/api/hierarchy/{session_id}/workflow",
+            post(set_workflow_stage),
+        );
 
     // Optional viewport debug bridge — gated by ROSHERA_DEV_BRIDGE=1.
     // Mounted only when explicitly enabled so production builds never expose
