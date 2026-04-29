@@ -9,6 +9,7 @@
 
 mod auth_middleware;
 mod delta_handlers;
+mod error_catalog;
 mod handlers;
 mod handlers_impl;
 mod idempotency;
@@ -335,15 +336,7 @@ async fn create_geometry(
     let shape_type = payload
         .get("shape_type")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": "missing 'shape_type'"
-                })),
-            )
-        })?
+        .ok_or_else(|| error_catalog::ApiError::missing_field("shape_type"))?
         .to_lowercase();
 
     let parameters = payload
@@ -365,21 +358,13 @@ async fn create_geometry(
 
     // Per-shape parameters are required input from the caller — never
     // silently substitute defaults. Missing or non-numeric values surface
-    // as a 400 BAD_REQUEST so client bugs fail loudly instead of producing
-    // a fabricated mystery solid.
-    let require = |k: &str| -> Result<f64, (StatusCode, Json<serde_json::Value>)> {
+    // as a 400 BAD_REQUEST with `error_code = "missing_parameter"` so
+    // agents pattern-match on the code, not the prose.
+    let require = |k: &str| -> Result<f64, error_catalog::ApiError> {
         parameters
             .get(k)
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "success": false,
-                        "error": format!("missing or non-numeric parameter '{k}'")
-                    })),
-                )
-            })
+            .ok_or_else(|| error_catalog::ApiError::missing_parameter(k))
     };
 
     // Drive the kernel. The model is the single source of truth — every
@@ -429,62 +414,38 @@ async fn create_geometry(
             )
         }
         other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("unknown shape_type: {other}")
-                })),
-            ));
+            return Err(error_catalog::ApiError::unknown_shape_type(other).into());
         }
     };
 
     let solid_id = match result {
         Ok(KernelGeometryId::Solid(id)) => id,
         Ok(other) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("kernel returned non-solid id: {other:?}")
-                })),
-            ));
+            return Err(error_catalog::ApiError::kernel_returned_wrong_type(format!(
+                "{other:?}"
+            ))
+            .into());
         }
         Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("kernel error: {e}")
-                })),
-            ));
+            return Err(error_catalog::ApiError::kernel_error(e).into());
         }
     };
 
     // Tessellate the freshly created solid.
-    let solid = model.solids.get(solid_id).ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": "solid vanished from store immediately after creation"
-            })),
-        )
-    })?;
+    let solid = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| error_catalog::ApiError::solid_not_found(solid_id))?;
     let tess_start = Instant::now();
     let tri_mesh = tessellate_solid(solid, &model, &TessellationParams::default());
     let tessellation_ms = tess_start.elapsed().as_millis() as u64;
 
     if tri_mesh.triangles.is_empty() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": "tessellation produced 0 triangles",
-                "solid_id": solid_id,
-                "vertex_count": tri_mesh.vertices.len(),
-            })),
-        ));
+        return Err(error_catalog::ApiError::tessellation_empty(
+            solid_id,
+            tri_mesh.vertices.len(),
+        )
+        .into());
     }
 
     // Flatten into the wire-friendly Three.js layout the frontend already
