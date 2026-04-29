@@ -5,124 +5,126 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* ─── Light theme ─────────────────────────────────────────────────── */
+/* ─── Light theme — Off-white drafting paper ─────────────────────────
+   Warm cream paper ground (hue 90, slight chroma) with deep navy strokes
+   and type (hue 252). Single-hue palette: every surface, border, and bit
+   of text reads as ink-on-paper. Shadows are nearly invisible — depth
+   comes from line weight, not elevation. */
 :root {
-  --radius: 0.5rem;
-  --background: oklch(0.97 0.002 260);
-  --foreground: oklch(0.15 0.005 260);
-  --card: oklch(0.95 0.002 260);
-  --card-foreground: oklch(0.15 0.005 260);
-  --popover: oklch(0.97 0.002 260);
-  --popover-foreground: oklch(0.15 0.005 260);
-  --primary: oklch(0.55 0.22 250);
-  --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.92 0.005 260);
-  --secondary-foreground: oklch(0.20 0.005 260);
-  --muted: oklch(0.93 0.003 260);
-  --muted-foreground: oklch(0.45 0.01 260);
-  --accent: oklch(0.91 0.005 260);
-  --accent-foreground: oklch(0.15 0.005 260);
-  --destructive: oklch(0.55 0.22 25);
-  --destructive-foreground: oklch(0.98 0 0);
-  --border: oklch(0.85 0.01 260);
-  --input: oklch(0.88 0.005 260);
-  --ring: oklch(0.55 0.22 250);
-  --chart-1: oklch(0.55 0.22 250);
-  --chart-2: oklch(0.50 0.15 160);
-  --chart-3: oklch(0.50 0.15 300);
-  --chart-4: oklch(0.55 0.15 60);
+  --radius: 0.25rem;
+  --background: oklch(0.965 0.012 90);
+  --foreground: oklch(0.22 0.07 252);
+  --card: oklch(0.945 0.012 90);
+  --card-foreground: oklch(0.22 0.07 252);
+  --popover: oklch(0.97 0.012 90);
+  --popover-foreground: oklch(0.22 0.07 252);
+  --primary: oklch(0.30 0.10 252);
+  --primary-foreground: oklch(0.97 0.012 90);
+  --secondary: oklch(0.91 0.015 90);
+  --secondary-foreground: oklch(0.22 0.07 252);
+  --muted: oklch(0.92 0.012 90);
+  --muted-foreground: oklch(0.42 0.06 252);
+  --accent: oklch(0.88 0.025 252);
+  --accent-foreground: oklch(0.22 0.07 252);
+  --destructive: oklch(0.50 0.20 25);
+  --destructive-foreground: oklch(0.97 0.012 90);
+  --border: oklch(0.55 0.08 252);
+  --input: oklch(0.85 0.03 252);
+  --ring: oklch(0.30 0.10 252);
+  /* Charts stay in the navy/cyan family — no rainbow palettes. */
+  --chart-1: oklch(0.30 0.10 252);
+  --chart-2: oklch(0.45 0.12 220);
+  --chart-3: oklch(0.55 0.10 200);
+  --chart-4: oklch(0.65 0.13 60);
   --chart-5: oklch(0.50 0.20 25);
-  --sidebar-background: oklch(0.95 0.003 260);
-  --sidebar-foreground: oklch(0.25 0.005 260);
-  --sidebar-primary: oklch(0.55 0.22 250);
-  --sidebar-primary-foreground: oklch(0.98 0 0);
-  --sidebar-accent: oklch(0.90 0.005 260);
-  --sidebar-accent-foreground: oklch(0.15 0.005 260);
-  --sidebar-border: oklch(0.85 0.01 260);
-  --sidebar-ring: oklch(0.55 0.22 250);
-  --sidebar: oklch(0.95 0.003 260);
+  --sidebar-background: oklch(0.945 0.012 90);
+  --sidebar-foreground: oklch(0.30 0.07 252);
+  --sidebar-primary: oklch(0.30 0.10 252);
+  --sidebar-primary-foreground: oklch(0.97 0.012 90);
+  --sidebar-accent: oklch(0.88 0.025 252);
+  --sidebar-accent-foreground: oklch(0.22 0.07 252);
+  --sidebar-border: oklch(0.55 0.08 252);
+  --sidebar-ring: oklch(0.30 0.10 252);
+  --sidebar: oklch(0.945 0.012 90);
 
-  /* CAD-specific tokens */
-  --cad-grid: oklch(0.80 0.01 260);
-  --cad-grid-section: oklch(0.65 0.01 260);
-  --cad-selected: oklch(0.55 0.22 250);
-  --cad-hovered: oklch(0.60 0.12 200);
-  --cad-face-selected: oklch(0.55 0.18 140);
-  --cad-edge-selected: oklch(0.60 0.20 60);
-  --cad-vertex-selected: oklch(0.65 0.22 25);
-  --cad-viewport-bg: oklch(0.94 0.003 260);
+  /* CAD-specific tokens — fine graph-paper grid in navy on cream. */
+  --cad-grid: oklch(0.55 0.08 252 / 0.18);
+  --cad-grid-section: oklch(0.45 0.10 252 / 0.45);
+  --cad-tick: oklch(0.30 0.10 252 / 0.85);
+  --cad-selected: oklch(0.65 0.18 60);   /* warm yellow — single accent */
+  --cad-hovered: oklch(0.45 0.12 220);
+  --cad-face-selected: oklch(0.65 0.18 60 / 0.30);
+  --cad-edge-selected: oklch(0.65 0.18 60);
+  --cad-vertex-selected: oklch(0.55 0.20 25);
+  --cad-viewport-bg: oklch(0.955 0.012 90);
 
-  /* Elevation system — three discrete levels for panels, popovers, floating UI.
-     Built from layered shadows so they read as depth rather than blur halos. */
-  --shadow-panel:
-    0 1px 2px 0 oklch(0 0 0 / 0.04),
-    0 1px 3px 0 oklch(0 0 0 / 0.06);
-  --shadow-elevated:
-    0 4px 6px -1px oklch(0 0 0 / 0.07),
-    0 2px 4px -2px oklch(0 0 0 / 0.05);
+  /* Blueprint UIs are line-based — shadows nearly invisible. Kept only
+     for genuinely floating popovers so they don't fuse with content. */
+  --shadow-panel: 0 0 0 transparent;
+  --shadow-elevated: 0 1px 2px 0 oklch(0.22 0.07 252 / 0.04);
   --shadow-floating:
-    0 10px 15px -3px oklch(0 0 0 / 0.10),
-    0 4px 6px -4px oklch(0 0 0 / 0.08);
+    0 8px 16px -8px oklch(0.22 0.07 252 / 0.18),
+    0 2px 4px -2px oklch(0.22 0.07 252 / 0.10);
 }
 
-/* ─── Dark theme ──────────────────────────────────────────────────── */
+/* ─── Dark theme — Navy blueprint ─────────────────────────────────────
+   Saturated navy ground (hue 252, real chroma 0.05+) with cyan strokes
+   (hue 220) and off-white type for emphasis. Reads as engineering
+   blueprint / mission control rather than neutral dark mode. */
 .dark {
-  --background: oklch(0.13 0.005 260);
-  --foreground: oklch(0.92 0 0);
-  --card: oklch(0.17 0.005 260);
-  --card-foreground: oklch(0.92 0 0);
-  --popover: oklch(0.17 0.005 260);
-  --popover-foreground: oklch(0.92 0 0);
-  --primary: oklch(0.65 0.19 250);
-  --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.22 0.005 260);
-  --secondary-foreground: oklch(0.92 0 0);
-  --muted: oklch(0.20 0.005 260);
-  /* Bumped from 0.55 → 0.66 for AA contrast on dark backgrounds. */
-  --muted-foreground: oklch(0.66 0.005 260);
-  --accent: oklch(0.25 0.01 260);
-  --accent-foreground: oklch(0.92 0 0);
-  --destructive: oklch(0.60 0.22 25);
-  --destructive-foreground: oklch(0.98 0 0);
-  --border: oklch(0.30 0.01 260);
-  --input: oklch(0.25 0.01 260);
-  --ring: oklch(0.65 0.19 250);
-  --chart-1: oklch(0.65 0.19 250);
-  --chart-2: oklch(0.60 0.15 160);
-  --chart-3: oklch(0.55 0.15 300);
-  --chart-4: oklch(0.65 0.15 60);
-  --chart-5: oklch(0.55 0.20 25);
-  --sidebar-background: oklch(0.11 0.005 260);
-  --sidebar-foreground: oklch(0.85 0 0);
-  --sidebar-primary: oklch(0.65 0.19 250);
-  --sidebar-primary-foreground: oklch(0.98 0 0);
-  --sidebar-accent: oklch(0.22 0.01 260);
-  --sidebar-accent-foreground: oklch(0.92 0 0);
-  --sidebar-border: oklch(0.25 0.01 260);
-  --sidebar-ring: oklch(0.65 0.19 250);
-  --sidebar: oklch(0.11 0.005 260);
+  --background: oklch(0.16 0.055 252);
+  --foreground: oklch(0.92 0.025 220);
+  --card: oklch(0.20 0.055 252);
+  --card-foreground: oklch(0.92 0.025 220);
+  --popover: oklch(0.20 0.060 252);
+  --popover-foreground: oklch(0.92 0.025 220);
+  --primary: oklch(0.78 0.13 220);
+  --primary-foreground: oklch(0.16 0.055 252);
+  --secondary: oklch(0.24 0.055 252);
+  --secondary-foreground: oklch(0.92 0.025 220);
+  --muted: oklch(0.22 0.050 252);
+  --muted-foreground: oklch(0.68 0.060 220);
+  --accent: oklch(0.28 0.065 252);
+  --accent-foreground: oklch(0.92 0.025 220);
+  --destructive: oklch(0.65 0.22 25);
+  --destructive-foreground: oklch(0.97 0.012 90);
+  --border: oklch(0.45 0.10 220);
+  --input: oklch(0.28 0.060 252);
+  --ring: oklch(0.78 0.13 220);
+  /* Charts stay in the cyan/navy family. */
+  --chart-1: oklch(0.78 0.13 220);
+  --chart-2: oklch(0.65 0.10 200);
+  --chart-3: oklch(0.55 0.12 252);
+  --chart-4: oklch(0.75 0.14 60);
+  --chart-5: oklch(0.65 0.20 25);
+  --sidebar-background: oklch(0.14 0.050 252);
+  --sidebar-foreground: oklch(0.85 0.025 220);
+  --sidebar-primary: oklch(0.78 0.13 220);
+  --sidebar-primary-foreground: oklch(0.16 0.055 252);
+  --sidebar-accent: oklch(0.26 0.060 252);
+  --sidebar-accent-foreground: oklch(0.92 0.025 220);
+  --sidebar-border: oklch(0.45 0.10 220);
+  --sidebar-ring: oklch(0.78 0.13 220);
+  --sidebar: oklch(0.14 0.050 252);
 
-  /* CAD-specific tokens */
-  --cad-grid: oklch(0.30 0.01 260);
-  --cad-grid-section: oklch(0.40 0.01 260);
-  --cad-selected: oklch(0.70 0.22 250);
-  --cad-hovered: oklch(0.65 0.12 200);
-  --cad-face-selected: oklch(0.65 0.18 140);
-  --cad-edge-selected: oklch(0.75 0.20 60);
-  --cad-vertex-selected: oklch(0.80 0.22 25);
-  --cad-viewport-bg: oklch(0.12 0.005 260);
+  /* CAD-specific tokens — fine cyan graph-paper grid on navy. */
+  --cad-grid: oklch(0.78 0.13 220 / 0.10);
+  --cad-grid-section: oklch(0.78 0.13 220 / 0.28);
+  --cad-tick: oklch(0.85 0.10 220 / 0.85);
+  --cad-selected: oklch(0.85 0.16 90);   /* warm yellow — single accent */
+  --cad-hovered: oklch(0.78 0.13 220);
+  --cad-face-selected: oklch(0.85 0.16 90 / 0.25);
+  --cad-edge-selected: oklch(0.85 0.16 90);
+  --cad-vertex-selected: oklch(0.80 0.20 25);
+  --cad-viewport-bg: oklch(0.14 0.060 252);
 
-  /* Dark-mode shadows are deeper but still subtle — ambient occlusion at the
-     panel boundary, not glow. Higher alpha because dark surfaces eat shadow. */
-  --shadow-panel:
-    0 1px 2px 0 oklch(0 0 0 / 0.30),
-    0 1px 3px 0 oklch(0 0 0 / 0.20);
-  --shadow-elevated:
-    0 4px 6px -1px oklch(0 0 0 / 0.40),
-    0 2px 4px -2px oklch(0 0 0 / 0.30);
+  /* Blueprint dark mode — shadows essentially absent. The cyan border
+     stroke is what reads as panel edge. */
+  --shadow-panel: 0 0 0 transparent;
+  --shadow-elevated: 0 1px 2px 0 oklch(0 0 0 / 0.25);
   --shadow-floating:
-    0 10px 15px -3px oklch(0 0 0 / 0.50),
-    0 4px 6px -4px oklch(0 0 0 / 0.35);
+    0 8px 16px -6px oklch(0 0 0 / 0.55),
+    0 2px 4px -2px oklch(0 0 0 / 0.35);
 }
 
 @theme inline {
@@ -195,33 +197,69 @@
   }
 }
 
-/* CAD-specific utility styles */
+/* CAD-specific utility styles — blueprint aesthetic.
+   Panels are line-on-paper / line-on-navy: the cyan-or-navy stroke IS
+   the affordance. Shadows are reserved for genuinely floating popovers. */
 @layer utilities {
   .cad-panel {
-    @apply bg-card/95 backdrop-blur-sm border border-border;
-    box-shadow: var(--shadow-panel);
+    @apply bg-card border-border;
   }
-  /* Elevated variant for floating panels (PropertiesPanel, AIChatPanel) and
-     anything that needs to read as "above" the main canvas. */
+  /* Elevated panels still read as flat — the only distinction is a
+     slightly stronger border weight. Used where a panel sits above the
+     viewport, not above other panels. */
   .cad-panel-elevated {
-    @apply bg-card/95 backdrop-blur-sm border border-border;
+    @apply bg-card border-border;
     box-shadow: var(--shadow-elevated);
   }
+  /* Floating popovers / flyouts — the only place real shadow earns
+     its keep, because they hover above unrelated content. */
   .cad-panel-floating {
-    @apply bg-popover/95 backdrop-blur-md border border-border;
+    @apply bg-popover backdrop-blur-md border border-border;
     box-shadow: var(--shadow-floating);
   }
   .cad-panel-header {
-    @apply px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground border-b border-border;
+    @apply px-3 py-2 text-[10px] font-mono font-medium uppercase tracking-[0.14em] text-muted-foreground border-b border-border;
+  }
+  /* Numeric / data readouts — monospace, tight tracking, used for
+     coordinates, dimensions, and any value the user is meant to read
+     as a measurement rather than prose. */
+  .cad-readout {
+    @apply font-mono tabular-nums;
   }
   /* Standardized focus ring for all interactive elements. Use as
      `className="cad-focus ..."` instead of repeating ring utilities. */
   .cad-focus {
-    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background;
+    @apply focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background;
   }
-  /* Icon button base — square, hoverable, focusable. Compose with size. */
+  /* Icon button base — square, hoverable, focusable. Composes with a
+     size class (e.g. `cad-icon-btn h-6 w-6`). */
   .cad-icon-btn {
-    @apply inline-flex items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-40;
+    @apply inline-flex items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-40;
+  }
+  /* Corner-tick frame — four 8px right-angle marks at the corners of a
+     rectangle, drawn via gradients. Apply to viewport / hero panels for
+     the engineering-drawing-frame look. */
+  .cad-frame {
+    background-image:
+      linear-gradient(to right, var(--border) 0, var(--border) 8px, transparent 8px, transparent calc(100% - 8px), var(--border) calc(100% - 8px), var(--border) 100%),
+      linear-gradient(to bottom, var(--border) 0, var(--border) 8px, transparent 8px, transparent calc(100% - 8px), var(--border) calc(100% - 8px), var(--border) 100%);
+    background-size: 100% 1px, 1px 100%;
+    background-position: 0 0, 0 0;
+    background-repeat: no-repeat;
+  }
+  /* Leader-line dotted rule for label↔value rows in side panels. Use as
+     a flex container; first child = label, last child = value, the
+     middle dotted line stretches between them. */
+  .cad-leader > :first-child::after {
+    content: "";
+    flex: 1;
+    margin: 0 0.5rem;
+    border-bottom: 1px dotted var(--border);
+    align-self: end;
+    margin-bottom: 0.35em;
+  }
+  .cad-leader > :first-child {
+    @apply flex items-baseline w-full text-muted-foreground;
   }
   .scrollbar-thin {
     scrollbar-width: thin;
@@ -235,7 +273,7 @@
   }
   .scrollbar-thin::-webkit-scrollbar-thumb {
     background-color: var(--border);
-    border-radius: 2px;
+    border-radius: 1px;
   }
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
     background-color: var(--muted-foreground);
