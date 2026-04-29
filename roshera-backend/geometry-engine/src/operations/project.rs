@@ -185,40 +185,97 @@ pub fn project_points_on_face(
     Ok(projected)
 }
 
-/// Project point using closest point method
+/// Project a point onto a surface by closest-point search.
+///
+/// First a 20×20 uniform grid samples the parameter domain to seed the
+/// search; the best seed is then refined with Newton iteration on the
+/// orthogonality conditions
+/// `f₁ = (S(u,v) - P) · S_u = 0` and `f₂ = (S(u,v) - P) · S_v = 0`,
+/// which are the necessary conditions for `|S(u,v) - P|²` to be a
+/// stationary point. The Jacobian is approximated by the first
+/// fundamental form `[E F; F G]` (Gauss-Newton-style; this is exact
+/// for the orthogonality system at the converged point and stable
+/// against the curvature term that pure Newton struggles with near
+/// flat regions).
+///
+/// Returns the converged point and its (u,v); falls back to the grid
+/// best when Newton stalls or the linearised system is singular.
 fn project_point_closest(point: Point3, surface: &dyn Surface) -> OperationResult<ProjectedPoint> {
-    // Use a simple grid search for now
-    // In production, would use Newton-Raphson or similar
     let bounds = surface.parameter_bounds();
+    let (u_min, u_max) = bounds.0;
+    let (v_min, v_max) = bounds.1;
+    let u_span = (u_max - u_min).max(1e-12);
+    let v_span = (v_max - v_min).max(1e-12);
+
+    // Stage 1: uniform grid seed.
+    const SAMPLES: usize = 20;
     let mut best_distance = f64::MAX;
-    let mut best_u = 0.0;
-    let mut best_v = 0.0;
-
-    // Grid search
-    let samples = 20;
-    for i in 0..=samples {
-        for j in 0..=samples {
-            let u = bounds.0 .0 + (i as f64 / samples as f64) * (bounds.0 .1 - bounds.0 .0);
-            let v = bounds.1 .0 + (j as f64 / samples as f64) * (bounds.1 .1 - bounds.1 .0);
-
+    let mut best_u = u_min;
+    let mut best_v = v_min;
+    for i in 0..=SAMPLES {
+        for j in 0..=SAMPLES {
+            let u = u_min + (i as f64 / SAMPLES as f64) * u_span;
+            let v = v_min + (j as f64 / SAMPLES as f64) * v_span;
             let surface_point = surface.point_at(u, v)?;
-            let distance = point.distance(&surface_point);
-
-            if distance < best_distance {
-                best_distance = distance;
+            let d = point.distance(&surface_point);
+            if d < best_distance {
+                best_distance = d;
                 best_u = u;
                 best_v = v;
             }
         }
     }
 
-    let position = surface.point_at(best_u, best_v)?;
-    let normal = surface.normal_at(best_u, best_v)?;
+    // Stage 2: Gauss-Newton refinement on the orthogonality conditions.
+    let tolerance = crate::math::Tolerance::default();
+    let pos_tol = tolerance.distance().max(1e-10);
+    const MAX_ITERS: usize = 32;
+    let mut u = best_u;
+    let mut v = best_v;
+    for _ in 0..MAX_ITERS {
+        let s_pt = match surface.point_at(u, v) {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let d_vec = s_pt - point;
+        let (su, sv) = match surface.derivatives_at(u, v) {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+        let f1 = d_vec.dot(&su);
+        let f2 = d_vec.dot(&sv);
+        if f1.abs() < pos_tol && f2.abs() < pos_tol {
+            break;
+        }
+        // First fundamental form coefficients.
+        let e = su.dot(&su);
+        let f = su.dot(&sv);
+        let g = sv.dot(&sv);
+        let det = e * g - f * f;
+        if det.abs() < 1e-18 {
+            break;
+        }
+        let du = (-g * f1 + f * f2) / det;
+        let dv = (f * f1 - e * f2) / det;
+        let new_u = (u + du).clamp(u_min, u_max);
+        let new_v = (v + dv).clamp(v_min, v_max);
+        if (new_u - u).abs() < 1e-14 && (new_v - v).abs() < 1e-14 {
+            u = new_u;
+            v = new_v;
+            break;
+        }
+        u = new_u;
+        v = new_v;
+    }
+
+    let position = surface.point_at(u, v)?;
+    let distance = point.distance(&position);
+    let normal = surface.normal_at(u, v)?;
 
     Ok(ProjectedPoint {
         position,
-        uv: (best_u, best_v),
-        distance: best_distance,
+        uv: (u, v),
+        distance,
         normal,
     })
 }
@@ -442,26 +499,180 @@ fn ray_cylinder_intersection(
     }))
 }
 
-/// Ray-sphere intersection
+/// Analytical ray-sphere intersection.
+///
+/// Solves `|(origin + t·direction) - center|² = radius²` for the
+/// smallest non-negative `t` that also respects `max_distance`. Falls
+/// back to the iterative general-surface path when the supplied
+/// `Surface` impl reports `SurfaceType::Sphere` but isn't an analytical
+/// `Sphere` (defensive — no current Surface impl forges that report).
 fn ray_sphere_intersection(
-    _origin: Point3,
-    _direction: Vector3,
-    _sphere: &dyn Surface,
-    _max_distance: Option<f64>,
+    origin: Point3,
+    direction: Vector3,
+    sphere: &dyn Surface,
+    max_distance: Option<f64>,
 ) -> OperationResult<Option<ProjectedPoint>> {
-    // Would implement analytical ray-sphere intersection
-    Ok(None)
+    use crate::primitives::surface::Sphere;
+
+    let sph = match sphere.as_any().downcast_ref::<Sphere>() {
+        Some(s) => s,
+        None => return ray_general_surface_intersection(origin, direction, sphere, max_distance),
+    };
+
+    let q = origin - sph.center;
+    let a = direction.dot(&direction);
+    if a < 1e-20 {
+        return Ok(None);
+    }
+    let b = 2.0 * q.dot(&direction);
+    let c = q.dot(&q) - sph.radius * sph.radius;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return Ok(None);
+    }
+    let sqrt_disc = disc.sqrt();
+    let t0 = (-b - sqrt_disc) / (2.0 * a);
+    let t1 = (-b + sqrt_disc) / (2.0 * a);
+
+    let mut best_t = f64::INFINITY;
+    for &t in &[t0, t1] {
+        if t < 0.0 {
+            continue;
+        }
+        if let Some(max_dist) = max_distance {
+            if t > max_dist {
+                continue;
+            }
+        }
+        if t < best_t {
+            best_t = t;
+        }
+    }
+    if !best_t.is_finite() {
+        return Ok(None);
+    }
+
+    let position = origin + direction * best_t;
+    let tolerance = crate::math::Tolerance::default();
+    let (u, v) = sphere.closest_point(&position, tolerance).unwrap_or((0.0, 0.0));
+    let normal = sphere
+        .normal_at(u, v)
+        .or_else(|_| (position - sph.center).normalize())
+        .unwrap_or(Vector3::Z);
+
+    Ok(Some(ProjectedPoint {
+        position,
+        uv: (u, v),
+        distance: best_t,
+        normal,
+    }))
 }
 
-/// Ray-general surface intersection using iteration
+/// Ray-general surface intersection.
+///
+/// Uniform-grid seeding followed by Newton-Raphson on the 3-equation
+/// system `S(u,v) - (O + t·D) = 0`, with Jacobian columns `[S_u, S_v,
+/// -D]` solved via Gaussian elimination. Returns the closest valid hit
+/// (smallest `t ≥ 0` within `max_distance`) across all converged seeds,
+/// `Ok(None)` when nothing converges. Used as the fallback for
+/// surfaces lacking an analytical specialization (NURBS patches, swept,
+/// trimmed, etc.).
 fn ray_general_surface_intersection(
-    _origin: Point3,
-    _direction: Vector3,
-    _surface: &dyn Surface,
-    _max_distance: Option<f64>,
+    origin: Point3,
+    direction: Vector3,
+    surface: &dyn Surface,
+    max_distance: Option<f64>,
 ) -> OperationResult<Option<ProjectedPoint>> {
-    // Would implement Newton-Raphson or similar iterative method
-    Ok(None)
+    use crate::math::linear_solver::gaussian_elimination;
+
+    let bounds = surface.parameter_bounds();
+    let (u_min, u_max) = bounds.0;
+    let (v_min, v_max) = bounds.1;
+    let u_span = (u_max - u_min).max(1e-12);
+    let v_span = (v_max - v_min).max(1e-12);
+
+    const SEED_GRID: usize = 8;
+    const MAX_NEWTON_ITERS: usize = 24;
+    let tolerance = crate::math::Tolerance::default();
+    let pos_tol = tolerance.distance().max(1e-9);
+
+    let mut best: Option<(f64, f64, f64, Point3)> = None; // (t, u, v, position)
+
+    for i in 0..=SEED_GRID {
+        for j in 0..=SEED_GRID {
+            let mut u = u_min + (i as f64 / SEED_GRID as f64) * u_span;
+            let mut v = v_min + (j as f64 / SEED_GRID as f64) * v_span;
+            // Initial t seeded from the projection onto the ray of the
+            // sample point — a single dot product gives a reasonable
+            // start for Newton.
+            let mut s_pt = match surface.point_at(u, v) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut t = (s_pt - origin).dot(&direction) / direction.dot(&direction).max(1e-20);
+
+            let mut converged = false;
+            for _ in 0..MAX_NEWTON_ITERS {
+                let ray_pt = origin + direction * t;
+                let f = s_pt - ray_pt; // residual: surface - ray
+                if f.magnitude() < pos_tol {
+                    converged = true;
+                    break;
+                }
+                let (su, sv) = match surface.derivatives_at(u, v) {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                // Solve [S_u  S_v  -D] · [du dv dt]^T = -f
+                let a_mat = vec![
+                    vec![su.x, sv.x, -direction.x],
+                    vec![su.y, sv.y, -direction.y],
+                    vec![su.z, sv.z, -direction.z],
+                ];
+                let b_vec = vec![-f.x, -f.y, -f.z];
+                let solved = match gaussian_elimination(a_mat, b_vec, tolerance) {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                u = (u + solved[0]).clamp(u_min, u_max);
+                v = (v + solved[1]).clamp(v_min, v_max);
+                t += solved[2];
+                s_pt = match surface.point_at(u, v) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+            }
+
+            if !converged {
+                continue;
+            }
+            if t < 0.0 {
+                continue;
+            }
+            if let Some(max_dist) = max_distance {
+                if t > max_dist {
+                    continue;
+                }
+            }
+            let position = origin + direction * t;
+            match &best {
+                None => best = Some((t, u, v, position)),
+                Some((bt, _, _, _)) if t < *bt => best = Some((t, u, v, position)),
+                _ => {}
+            }
+        }
+    }
+
+    let Some((t, u, v, position)) = best else {
+        return Ok(None);
+    };
+    let normal = surface.normal_at(u, v).unwrap_or(Vector3::Z);
+    Ok(Some(ProjectedPoint {
+        position,
+        uv: (u, v),
+        distance: t,
+        normal,
+    }))
 }
 
 /// Check if projected point is within face boundaries
