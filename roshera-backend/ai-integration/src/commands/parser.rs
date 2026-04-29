@@ -486,11 +486,37 @@ impl NaturalLanguageParser {
         None
     }
     
-    /// Extract object references from text
-    fn extract_object_references(&self, _text: &str) -> Vec<ObjectId> {
-        // In a real implementation, this would use the context analyzer
-        // For now, return placeholder IDs
-        vec![ObjectId::from(1), ObjectId::from(2)]
+    /// Extract object references from text.
+    ///
+    /// Scans the input for inline canonical UUIDs (e.g. when an upstream AI
+    /// provider passes object identifiers through verbatim) and returns them
+    /// in the order they appear. Named or anaphoric references such as "the
+    /// cube" cannot be resolved here — that requires a scene-context
+    /// analyzer with access to the current model — so this function
+    /// deliberately returns an empty vector when no UUIDs are present.
+    ///
+    /// Returning an empty vector is the correct behavior: each caller
+    /// already validates that the resulting `Vec<ObjectId>` is large enough
+    /// for the requested operation (e.g. boolean ops require ≥ 2) and emits
+    /// a `ParseError` otherwise. Fabricating placeholder UUIDs here would
+    /// silently target unrelated objects in the live scene.
+    fn extract_object_references(&self, text: &str) -> Vec<ObjectId> {
+        // Canonical UUID v1–v5 pattern (8-4-4-4-12 hex groups).
+        static UUID_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| {
+            Regex::new(
+                r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            )
+        });
+
+        let regex = match UUID_REGEX.as_ref() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        regex
+            .find_iter(text)
+            .filter_map(|m| uuid::Uuid::parse_str(m.as_str()).ok())
+            .collect()
     }
     
     /// Extract vector from text

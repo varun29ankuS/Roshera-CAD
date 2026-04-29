@@ -3,12 +3,12 @@
 //! This module builds comprehensive context from session state, user history,
 //! and scene information to provide better AI responses.
 
-use crate::providers::ConversationContext;
+use crate::providers::{CommandIntent, ConversationContext, ParsedCommand};
 use serde_json::Value;
 use session_manager::{PermissionManager, SessionManager, UserPermissions};
 use shared_types::{
-    CADObject, GeometryId, MaterialRef, ObjectId, ObjectType, SceneBoundingBox, SceneObject,
-    SceneState, SceneTransform3D, SessionState,
+    AICommand, CADObject, GeometryId, HistoryEntry, MaterialRef, ObjectId, ObjectType,
+    SceneBoundingBox, SceneObject, SceneState, SceneTransform3D, SessionState,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -225,10 +225,27 @@ impl ContextBuilder {
         let suggestions =
             self.generate_suggestions(&scene_analysis, &user_context, &collaboration_context);
 
-        // Build conversation context
+        // Build conversation context. The session's command history (a
+        // VecDeque of `HistoryEntry`) is structured (`AICommand`) rather than
+        // free-form text; we project the most recent N entries onto the
+        // provider-side `ParsedCommand` shape so downstream prompts (Claude,
+        // OpenAI) can ground continuations on prior intent. The cap matches
+        // the limit applied in `processor.rs` (10).
+        const MAX_PREVIOUS_COMMANDS: usize = 10;
+        let previous_commands: Vec<ParsedCommand> = session_state
+            .history
+            .iter()
+            .rev()
+            .take(MAX_PREVIOUS_COMMANDS)
+            .map(history_entry_to_parsed_command)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
         let conversation = ConversationContext {
             session_id: session_id.to_string(),
-            previous_commands: Vec::new(), // TODO: convert from string commands
+            previous_commands,
             active_objects: session_state
                 .objects
                 .keys()
@@ -549,6 +566,72 @@ impl ContextBuilder {
             3..=5 => SkillLevel::Advanced,
             _ => SkillLevel::Expert,
         }
+    }
+}
+
+/// Project a `HistoryEntry` (whose `command` field is a structured
+/// `AICommand`) onto the provider-side `ParsedCommand` shape used by
+/// `ConversationContext::previous_commands`.
+///
+/// The mapping is lossless on the structural side: the full `AICommand`
+/// JSON is preserved in `ParsedCommand::parameters["command"]`. The
+/// `intent` is collapsed onto `CommandIntent` so providers can branch on
+/// the high-level intent without re-deserializing the parameters. The
+/// `original_text` is reconstructed from `HistoryEntry::description`,
+/// which is the human-readable label captured when the entry was logged.
+fn history_entry_to_parsed_command(entry: &HistoryEntry) -> ParsedCommand {
+    let intent = match &entry.command {
+        AICommand::CreatePrimitive { shape_type, .. } => CommandIntent::CreatePrimitive {
+            shape: format!("{:?}", shape_type),
+        },
+        AICommand::BooleanOperation { operation, .. } => CommandIntent::BooleanOperation {
+            operation: format!("{:?}", operation),
+        },
+        AICommand::Transform { transform_type, .. } => CommandIntent::Transform {
+            operation: format!("{:?}", transform_type),
+        },
+        AICommand::ChangeView { view_type } => CommandIntent::Query {
+            target: format!("view::{:?}", view_type),
+        },
+        AICommand::ModifyMaterial { object_id, .. } => CommandIntent::Modify {
+            target: object_id.to_string(),
+            operation: "material".to_string(),
+            parameters: serde_json::to_value(&entry.command).unwrap_or(Value::Null),
+        },
+        AICommand::Export { format, .. } => CommandIntent::Export {
+            format: format!("{:?}", format),
+            options: serde_json::to_value(&entry.command).unwrap_or(Value::Null),
+        },
+        AICommand::SessionControl { action } => CommandIntent::Query {
+            target: format!("session::{:?}", action),
+        },
+        AICommand::Analyze { analysis_type, .. } => CommandIntent::Query {
+            target: format!("analyze::{:?}", analysis_type),
+        },
+    };
+
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "command".to_string(),
+        serde_json::to_value(&entry.command).unwrap_or(Value::Null),
+    );
+    if let Some(user) = &entry.user_id {
+        parameters.insert(
+            "user_id".to_string(),
+            Value::String(user.clone()),
+        );
+    }
+    parameters.insert(
+        "timestamp".to_string(),
+        serde_json::to_value(entry.timestamp).unwrap_or(Value::Null),
+    );
+
+    ParsedCommand {
+        original_text: entry.description.clone(),
+        intent,
+        parameters,
+        confidence: 1.0,
+        language: "en".to_string(),
     }
 }
 

@@ -76,11 +76,20 @@ pub async fn get_session_deltas(
         .map(|d| d.sequence)
         .unwrap_or(params.since_sequence);
 
+    // The `compressed` flag indicates whether the JSON payload itself has
+    // been pre-compressed at the application layer. The current delta wire
+    // format is plain JSON — gzip/Brotli is applied transparently by the
+    // tower compression layer when the client advertises Accept-Encoding,
+    // so the application-level flag is always false. Clients that need
+    // signal about wire compression should inspect the response's
+    // `Content-Encoding` header.
+    let compressed = false;
+
     Ok(Json(DeltaResponse {
         deltas: deltas_to_send,
         latest_sequence,
         has_more,
-        compressed: false, // TODO: Implement compression
+        compressed,
     }))
 }
 
@@ -215,9 +224,11 @@ pub async fn apply_session_delta(
         session_id, auth_info.user_id
     );
 
-    // Validate delta if requested
+    // Validate delta if requested (default: enabled). Each check rejects a
+    // malformed or hostile delta at the HTTP boundary so the
+    // `delta_manager` never sees an obviously-bad payload.
     if request.validate.unwrap_or(true) {
-        // TODO: Implement delta validation
+        validate_session_delta(&session_id, &request.delta)?;
     }
 
     // Get delta manager
@@ -350,6 +361,66 @@ pub async fn compact_session_deltas(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Structural validation of an incoming `SessionDelta`.
+///
+/// Performs cheap checks that do not require touching the delta storage:
+/// 1. The path's session id must parse and match `delta.session_id`.
+/// 2. The sequence number must be non-zero (sequences start at 1; zero is
+///    reserved for "no deltas observed yet").
+/// 3. The timestamp must not be more than 5 minutes in the future
+///    (rejects deltas with absurd clock skew that would corrupt
+///    statistics and snapshot-at-time queries).
+/// 4. The delta must carry at least one change category, otherwise it is
+///    a no-op that wastes a sequence number.
+fn validate_session_delta(
+    session_id: &str,
+    delta: &SessionDelta,
+) -> std::result::Result<(), (StatusCode, &'static str)> {
+    let path_uuid = Uuid::parse_str(session_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid session ID"))?;
+
+    if delta.session_id != path_uuid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Delta session ID does not match URL session ID",
+        ));
+    }
+
+    if delta.sequence == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Delta sequence number must be non-zero",
+        ));
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let max_future_skew_ms: u64 = 5 * 60 * 1000;
+    if delta.timestamp > now_ms.saturating_add(max_future_skew_ms) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Delta timestamp is too far in the future",
+        ));
+    }
+
+    let has_change = !delta.object_deltas.is_empty()
+        || delta.timeline_delta.is_some()
+        || delta
+            .metadata_changes
+            .as_ref()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        || delta.user_changes.is_some()
+        || delta.settings_changes.is_some();
+    if !has_change {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Delta carries no changes (would advance sequence with no effect)",
+        ));
+    }
+
+    Ok(())
 }
 
 // Wrapper functions for handlers that require AuthInfo
