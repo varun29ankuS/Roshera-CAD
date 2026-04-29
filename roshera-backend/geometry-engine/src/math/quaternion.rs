@@ -333,7 +333,10 @@ impl Quaternion {
     /// Returns (axis, angle) where angle is in radians.
     /// For identity quaternion, returns (z-axis, 0).
     pub fn to_axis_angle(&self) -> (Vector3, f64) {
-        let s = (1.0 - self.w * self.w).sqrt();
+        // Clamp to avoid sqrt of a slightly-negative value when |w| drifts
+        // marginally above 1 due to floating-point error after many
+        // multiplications (NaN here would poison the axis components below).
+        let s = (1.0 - self.w * self.w).max(0.0).sqrt();
 
         if s < consts::EPSILON {
             // Near identity quaternion
