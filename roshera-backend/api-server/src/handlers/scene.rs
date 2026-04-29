@@ -61,10 +61,16 @@ pub async fn get_scene_state(State(state): State<AppState>) -> Json<SceneRespons
                 material: None,
                 visible: true,
                 locked: false,
+                // The in-memory `BRepModel` does not carry per-solid
+                // creation/modification timestamps — that history lives in
+                // the `timeline-engine` Operation log, which this endpoint
+                // does not consult. Returning `0` is an explicit "unknown"
+                // sentinel; clients that need real timestamps must query
+                // `/api/timeline/...` and join on operation outputs.
                 properties: ObjectProperties {
                     custom: std::collections::HashMap::new(),
                     mass_properties: None,
-                    created_at: 0, // TODO: Track creation time
+                    created_at: 0,
                     modified_at: 0,
                     created_by: None,
                 },
@@ -79,6 +85,7 @@ pub async fn get_scene_state(State(state): State<AppState>) -> Json<SceneRespons
     // Calculate scene statistics
     let total_vertices = model.vertices.len();
     let total_faces = model.faces.len();
+    let total_bbox = aggregate_bounding_box(&objects);
 
     let scene_state = SceneState {
         objects,
@@ -101,10 +108,17 @@ pub async fn get_scene_state(State(state): State<AppState>) -> Json<SceneRespons
                 total_objects: solids.len(),
                 total_vertices,
                 total_faces,
-                bounding_box: None, // TODO: Calculate overall bounding box
+                bounding_box: total_bbox,
             },
         },
-        relationships: Vec::new(), // TODO: Analyze spatial relationships
+        // Spatial-relationship analysis (containment, adjacency, alignment)
+        // requires a populated spatial index over the live scene; that
+        // index is built lazily by the kernel and is not exposed through
+        // the `BRepModel` surface this endpoint reads from. We therefore
+        // return an empty list rather than fabricate relationships, and
+        // clients in need of relationship data should call the dedicated
+        // `/api/scene/query` endpoint with `SceneQueryType::Spatial{...}`.
+        relationships: Vec::new(),
     };
 
     Json(SceneResponse {
@@ -273,13 +287,16 @@ pub async fn get_object_details(
             .unwrap_or_else(|| "unknown".to_string());
         let object_type = parse_object_type(&shape_type, &object_id);
 
-        // Reborrow immutably for bounding box, then mutably for mass props.
-        let bounding_box = {
+        // Reborrow immutably for bounding box and per-object topology
+        // statistics, then mutably for mass props.
+        let (bounding_box, vertex_count, face_count) = {
             let solid = model_guard
                 .solids
                 .get(object_id)
                 .expect("solid presence verified above");
-            calculate_bounding_box(solid, &model_guard)
+            let bbox = calculate_bounding_box(solid, &model_guard);
+            let (vc, fc) = count_solid_topology(solid, &model_guard);
+            (bbox, vc, fc)
         };
 
         // Real kernel mass properties (volume + COG + inertia tensor) via
@@ -326,8 +343,8 @@ pub async fn get_object_details(
                 },
                 statistics: SceneStatistics {
                     total_objects: 1,
-                    total_vertices: 0, // TODO: Count vertices for this object
-                    total_faces: 0,    // TODO: Count faces for this object
+                    total_vertices: vertex_count,
+                    total_faces: face_count,
                     bounding_box: Some(bounding_box),
                 },
             },
@@ -445,6 +462,75 @@ fn calculate_bounding_box(
     }
 
     SceneBoundingBox { min, max }
+}
+
+/// Aggregate the per-object bounding boxes of a scene into a single
+/// scene-wide AABB. Returns `None` when the scene is empty so callers can
+/// distinguish "no objects" from "objects collapsed to a degenerate point".
+fn aggregate_bounding_box(objects: &[SceneObject]) -> Option<SceneBoundingBox> {
+    if objects.is_empty() {
+        return None;
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for obj in objects {
+        for axis in 0..3 {
+            if obj.bounding_box.min[axis] < min[axis] {
+                min[axis] = obj.bounding_box.min[axis];
+            }
+            if obj.bounding_box.max[axis] > max[axis] {
+                max[axis] = obj.bounding_box.max[axis];
+            }
+        }
+    }
+    // Guard against the pathological case where every object had
+    // degenerate (NaN/inf) bounds — return None rather than a garbage box.
+    if !min.iter().all(|x| x.is_finite()) || !max.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    Some(SceneBoundingBox { min, max })
+}
+
+/// Count the unique vertex IDs and face IDs reachable from a solid's outer
+/// shell (and any inner shells representing voids). Used by per-object
+/// scene queries that need to report topology size without materialising
+/// the entire shell.
+fn count_solid_topology(
+    solid: &geometry_engine::primitives::solid::Solid,
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+) -> (usize, usize) {
+    use std::collections::HashSet;
+    let mut vertex_ids: HashSet<u32> = HashSet::new();
+    let mut face_ids: HashSet<u32> = HashSet::new();
+
+    let mut visit_shell = |shell_id: u32| {
+        if let Some(shell) = model.shells.get(shell_id) {
+            for &face_id in &shell.faces {
+                face_ids.insert(face_id);
+                if let Some(face) = model.faces.get(face_id) {
+                    let mut loops = vec![face.outer_loop];
+                    loops.extend(face.inner_loops.iter().copied());
+                    for loop_id in loops {
+                        if let Some(loop_data) = model.loops.get(loop_id) {
+                            for &edge_id in &loop_data.edges {
+                                if let Some(edge) = model.edges.get(edge_id) {
+                                    vertex_ids.insert(edge.start_vertex);
+                                    vertex_ids.insert(edge.end_vertex);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    visit_shell(solid.outer_shell);
+    for &inner in &solid.inner_shells {
+        visit_shell(inner);
+    }
+
+    (vertex_ids.len(), face_ids.len())
 }
 
 /// Compute real mass properties (volume, surface area, center of mass) by

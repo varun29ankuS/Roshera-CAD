@@ -516,10 +516,17 @@ pub async fn undo_operation(
             entities_affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
             entities_affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
 
-            // Execute the undo through the full integration executor to update geometry state
-            // The full_integration_executor handles geometry operations with timeline awareness
-            // TODO: Execute the event when execute_event method is available
-            // let _ = state.full_integration_executor.execute_event(&event).await;
+            // NOTE: `Timeline::undo` only advances the session's position
+            // pointer and records a marker event; it does **not** reconcile
+            // the live `BRepModel` (api-server's `state.model`) against the
+            // pre-undo state. `FullIntegrationExecutor` does not currently
+            // expose an `execute_event` API that could replay the inverse,
+            // so a full geometry rollback requires either a snapshot-based
+            // approach (re-apply operations from branch root up to the new
+            // position) or addition of inverse operations on the kernel.
+            // Tracked separately. Until then, undo is reflected in the
+            // event log and broadcast below; clients reading geometry state
+            // afterwards will see the pre-undo BRep.
 
             // Broadcast the undo to connected clients
             let _ = state
@@ -598,10 +605,11 @@ pub async fn redo_operation(
             entities_affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
             entities_affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
 
-            // Execute the redo through the full integration executor to update geometry state
-            // The full_integration_executor handles geometry operations with timeline awareness
-            // TODO: Execute the event when execute_event method is available
-            // let _ = state.full_integration_executor.execute_event(&event).await;
+            // NOTE: `Timeline::redo` advances the position pointer and
+            // records a marker event but does **not** re-apply the redone
+            // operation against the live `BRepModel`. See the matching
+            // note in `undo_operation` for the architectural gap; the
+            // resolution is shared (snapshot/replay vs. inverse-op API).
 
             // Broadcast the redo to connected clients
             let _ = state
