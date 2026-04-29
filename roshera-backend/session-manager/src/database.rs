@@ -5,6 +5,60 @@
 
 use crate::auth::{ApiKey, SessionToken};
 use crate::permissions::{Permission, Role, UserPermissions};
+
+/// Parse a role string (the Debug representation of `Role`) back into the enum.
+/// Defaults to the most-restrictive role (`Viewer`) on unrecognised input —
+/// fail-closed is the correct stance for an authorization-relevant decoder.
+fn role_from_str(s: &str) -> Role {
+    match s {
+        "Owner" => Role::Owner,
+        "Editor" => Role::Editor,
+        "Viewer" => Role::Viewer,
+        "Commenter" => Role::Commenter,
+        // Custom(u32) is encoded by Debug as "Custom(<n>)" — recognise that
+        // shape and recover the discriminant; fall through to Viewer on a
+        // parse failure so authorization defaults to the least-privileged role.
+        other => {
+            if let Some(rest) = other.strip_prefix("Custom(").and_then(|s| s.strip_suffix(")")) {
+                if let Ok(n) = rest.parse::<u32>() {
+                    return Role::Custom(n);
+                }
+            }
+            Role::Viewer
+        }
+    }
+}
+
+/// Parse a permission string (Debug repr of `Permission`) back into the enum.
+/// Returns `None` for unknown variants so callers can `filter_map` cleanly.
+fn permission_from_str(s: &str) -> Option<Permission> {
+    Some(match s {
+        "DeleteSession" => Permission::DeleteSession,
+        "InviteUsers" => Permission::InviteUsers,
+        "RemoveUsers" => Permission::RemoveUsers,
+        "ChangeRoles" => Permission::ChangeRoles,
+        "ModifySettings" => Permission::ModifySettings,
+        "CreateGeometry" => Permission::CreateGeometry,
+        "ModifyGeometry" => Permission::ModifyGeometry,
+        "DeleteGeometry" => Permission::DeleteGeometry,
+        "BooleanOperations" => Permission::BooleanOperations,
+        "AdvancedFeatures" => Permission::AdvancedFeatures,
+        "ViewGeometry" => Permission::ViewGeometry,
+        "MeasureGeometry" => Permission::MeasureGeometry,
+        "ExportGeometry" => Permission::ExportGeometry,
+        "TakeScreenshots" => Permission::TakeScreenshots,
+        "UndoRedo" => Permission::UndoRedo,
+        "CreateBranches" => Permission::CreateBranches,
+        "MergeBranches" => Permission::MergeBranches,
+        "ViewHistory" => Permission::ViewHistory,
+        "AddComments" => Permission::AddComments,
+        "VoiceChat" => Permission::VoiceChat,
+        "ScreenShare" => Permission::ScreenShare,
+        "RecordSession" => Permission::RecordSession,
+        _ => return None,
+    })
+}
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -868,13 +922,30 @@ impl DatabasePersistence for PostgresDatabase {
                 id: format!("{}/{}", session_id, user_id),
             })?;
 
-        // Parse role and permissions from strings
-        // This is simplified - in production you'd have proper enum serialization
+        // Parse role and permission arrays back into the strongly-typed enums.
+        // The on-disk encoding is whatever `format!("{:?}", ...)` produces in
+        // `save_permissions` above, so the decoder here mirrors the Debug
+        // representation of the enums in `permissions.rs`.
+        let role_str: String = row.get("role");
+        let role = role_from_str(&role_str);
+
+        let explicit_perms: Vec<String> = row.get("explicit_permissions");
+        let denied_perms: Vec<String> = row.get("denied_permissions");
+
+        let explicit_permissions = explicit_perms
+            .iter()
+            .filter_map(|s| permission_from_str(s))
+            .collect();
+        let denied_permissions = denied_perms
+            .iter()
+            .filter_map(|s| permission_from_str(s))
+            .collect();
+
         Ok(UserPermissions {
             user_id: row.get("user_id"),
-            role: Role::Viewer, // TODO: Parse from string
-            explicit_permissions: std::collections::HashSet::new(), // TODO: Parse from array
-            denied_permissions: std::collections::HashSet::new(), // TODO: Parse from array
+            role,
+            explicit_permissions,
+            denied_permissions,
             updated_at: row.get("updated_at"),
             granted_by: row.get("granted_by"),
         })
