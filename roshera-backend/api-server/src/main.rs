@@ -12,6 +12,7 @@ mod delta_handlers;
 mod error_catalog;
 mod handlers;
 mod handlers_impl;
+mod frame;
 mod idempotency;
 mod kernel_state;
 mod metrics;
@@ -2430,6 +2431,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/tx/{id}/rollback", post(tx_rollback))
         // Kernel introspection (proprioception) — read-only model snapshot
         .route("/api/kernel/state", get(kernel_state::kernel_state))
+        // Frame readback (exteroception) — server-rendered PNG of the
+        // live scene. Multimodal LLMs consume the image directly.
+        .route("/api/frame", get(frame::get_frame))
         // Real mass properties (volume, COG, inertia tensor) for a single solid
         .route(
             "/api/geometry/{id}/properties",

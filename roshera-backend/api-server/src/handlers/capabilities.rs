@@ -84,7 +84,18 @@ fn build_capabilities() -> Value {
                 Errors surface as `transaction_not_found` (NOT_FOUND, \
                 non-retryable) or `transaction_not_active` (CONFLICT, \
                 non-retryable). Header is opt-in: omitting it preserves \
-                pre-transaction behaviour."
+                pre-transaction behaviour.",
+            "frame": "Multimodal agents can fetch a server-rendered PNG of \
+                the live scene with `GET /api/frame`. The kernel \
+                tessellates every solid, projects with an auto-fit \
+                isometric camera, rasterizes on the CPU with Lambert \
+                shading + per-solid hue, and returns `image/png`. \
+                Optional query parameters: `width` and `height` (1-2048, \
+                default 1024x768); `eye_x`/`eye_y`/`eye_z` and \
+                `target_x`/`target_y`/`target_z` to override the camera \
+                (all six required together to take effect); `fov_deg` \
+                (1-179, default 35). Empty scenes return a solid \
+                background image so the response is always a valid PNG."
         },
         "primitives": primitives(),
         "operations": operations(),
@@ -263,7 +274,8 @@ fn endpoints() -> Value {
         "introspection": {
             "capabilities": "GET /api/capabilities",
             "kernel_state": "GET /api/kernel/state",
-            "health": "GET /health"
+            "frame":        "GET /api/frame",
+            "health":       "GET /health"
         },
         "timeline": {
             "init": "POST /api/timeline/init",
