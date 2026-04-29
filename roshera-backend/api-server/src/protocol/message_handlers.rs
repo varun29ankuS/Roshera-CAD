@@ -341,7 +341,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
 
                                                             // Create sketch plane
                                                             // Get the actual sketch plane from geometry engine
-                                                            let model_guard = state.geometry_model.read().await;
+                                                            let model_guard = state.model.read().await;
                                                             let (position, normal, size) = if let Some(sketch_plane_entity) = model_guard.sketch_planes.get(&format!("plane_{}", sketch_plane.to_lowercase())) {
                                                                 // Use actual sketch plane properties
                                                                 (sketch_plane_entity.position.into(), sketch_plane_entity.normal.into(), sketch_plane_entity.size)

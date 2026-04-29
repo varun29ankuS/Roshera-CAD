@@ -159,7 +159,7 @@ pub async fn get_metrics(
 
     // Get geometry statistics from the model
     let (total_solids, total_faces, total_edges, total_vertices) = {
-        let model = state.geometry_model.read().await;
+        let model = state.model.read().await;
 
         // Get counts from the model's stores
         let solid_count = model.solids.stats.total_created as usize;

@@ -234,7 +234,7 @@ async fn handle_create_primitive(
     );
 
     // Get geometry engine
-    let mut geometry_model = state.geometry_model.write().await;
+    let mut geometry_model = state.model.write().await;
 
     // Create shape parameters from JSON
     // Removed wrapper import - using core geometry engine directly
@@ -484,7 +484,7 @@ async fn handle_boolean_operation(
     };
 
     // Perform the boolean operation
-    let mut geometry_model = state.geometry_model.write().await;
+    let mut geometry_model = state.model.write().await;
     // Extract solid IDs from object references
     let solid_a_id = extract_solid_id_from_mesh(&meshes[0])?;
     let solid_b_id = extract_solid_id_from_mesh(&meshes[1])?;
