@@ -8,9 +8,12 @@
 //! When no API key is configured, falls back to local parsing using the
 //! tool dispatch layer directly (deterministic, no LLM call).
 
-use super::{CommandIntent, LLMProvider, ParsedCommand, ProviderCapabilities, ProviderError};
+use super::{
+    CommandIntent, LLMProvider, LLMTokenStream, ParsedCommand, ProviderCapabilities, ProviderError,
+};
 use crate::tool_dispatch::{self, DispatchResult, ToolUseBlock};
 use async_trait::async_trait;
+use futures::stream::StreamExt;
 use geometry_engine::primitives::tool_schema_generator::ToolTier;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -250,6 +253,71 @@ impl LLMProvider for ClaudeProvider {
                 prompt
             )),
         }
+    }
+
+    async fn generate_stream(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> Result<LLMTokenStream, ProviderError> {
+        let key = match &self.config.api_key {
+            Some(k) if !k.is_empty() => k.clone(),
+            _ => {
+                // No API key — fall back to the trait default which
+                // yields the local synthetic response as a single chunk.
+                // Phase 1.J ("fail loudly") is responsible for refusing
+                // this case at the route layer; here we stay graceful so
+                // unit tests keep working without network access.
+                let full = self.generate(prompt, max_tokens).await?;
+                return Ok(Box::pin(futures::stream::once(
+                    async move { Ok(full) },
+                )));
+            }
+        };
+
+        let effective_max = if max_tokens == 0 {
+            self.config.max_tokens
+        } else {
+            max_tokens
+        };
+
+        let request_body = serde_json::json!({
+            "model": self.config.model,
+            "max_tokens": effective_max,
+            "stream": true,
+            "messages": [{"role": "user", "content": prompt}],
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/v1/messages", self.config.api_base))
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::InferenceError(format!("streaming request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::InferenceError(format!(
+                "Anthropic streaming API returned {}: {}",
+                status, body
+            )));
+        }
+
+        // Convert reqwest's byte stream into a stream of text deltas.
+        // Anthropic sends one event per `content_block_delta`; we extract
+        // the `delta.text` field for `text_delta` blocks and ignore
+        // everything else (start/stop markers, ping events, tool deltas).
+        let byte_stream = response.bytes_stream();
+        let delta_stream = anthropic_sse_to_text_deltas(byte_stream);
+        Ok(Box::pin(delta_stream))
     }
 
     async fn generate_response(
@@ -677,6 +745,139 @@ fn extract_all_numbers(text: &str) -> Vec<f64> {
         .collect()
 }
 
+/// Parse Anthropic's `text/event-stream` byte stream into a stream of
+/// text deltas.
+///
+/// Anthropic's streaming protocol is documented at
+/// <https://docs.anthropic.com/en/api/messages-streaming>. The relevant
+/// frames are:
+///
+/// ```text
+/// event: content_block_delta
+/// data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+/// ```
+///
+/// We extract `delta.text` from every `text_delta` block and yield it as
+/// a `String`. Other event types (`message_start`, `content_block_start`,
+/// `ping`, `message_stop`, tool-use deltas) are silently ignored.
+///
+/// The byte stream is buffered into a UTF-8 line accumulator because SSE
+/// frames are delimited by blank lines and a single TCP packet is not
+/// guaranteed to align with frame boundaries.
+fn anthropic_sse_to_text_deltas<S>(
+    byte_stream: S,
+) -> impl futures::Stream<Item = Result<String, ProviderError>> + Send
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+{
+    use futures::stream::unfold;
+
+    struct State<S> {
+        inner: S,
+        buf: String,
+    }
+
+    let initial = State {
+        inner: Box::pin(byte_stream),
+        buf: String::new(),
+    };
+
+    unfold(Some(initial), |state| async move {
+        let mut state = state?;
+        loop {
+            // Look for a complete SSE frame (terminated by \n\n) in the
+            // buffer first; if we find one, parse it and yield any
+            // text-delta payload.
+            if let Some(frame_end) = state.buf.find("\n\n") {
+                let frame: String = state.buf.drain(..frame_end + 2).collect();
+                if let Some(delta) = extract_text_delta_from_frame(&frame) {
+                    return Some((Ok(delta), Some(state)));
+                }
+                // Frame parsed but contained no user-visible text — keep
+                // looping to find the next frame without yielding.
+                continue;
+            }
+
+            // No complete frame buffered yet — pull more bytes.
+            match state.inner.next().await {
+                Some(Ok(chunk)) => match std::str::from_utf8(&chunk) {
+                    Ok(s) => state.buf.push_str(s),
+                    Err(_) => {
+                        // Lossy fallback: keep streaming but report once.
+                        state.buf.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                },
+                Some(Err(e)) => {
+                    return Some((
+                        Err(ProviderError::InferenceError(format!(
+                            "stream read failed: {}",
+                            e
+                        ))),
+                        None,
+                    ));
+                }
+                None => {
+                    // Stream ended. If anything remains in the buffer it
+                    // is an unterminated frame — flush any final delta we
+                    // can still recover, then end.
+                    if !state.buf.is_empty() {
+                        let frame = std::mem::take(&mut state.buf);
+                        if let Some(delta) = extract_text_delta_from_frame(&frame) {
+                            return Some((Ok(delta), None));
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+    })
+}
+
+/// Extract the `delta.text` value from a single SSE frame, or `None` if
+/// the frame is not a `text_delta` event (or has no recoverable text).
+///
+/// SSE frames look like:
+/// ```text
+/// event: content_block_delta
+/// data: {"type":"content_block_delta",...}
+///
+/// ```
+/// Multiple `data:` lines are concatenated per the SSE spec, but
+/// Anthropic always uses a single `data:` line per frame, so we accept
+/// either shape.
+fn extract_text_delta_from_frame(frame: &str) -> Option<String> {
+    let mut data = String::new();
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            // The space after `data:` is conventional, not required.
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(payload);
+        }
+    }
+
+    if data.is_empty() {
+        return None;
+    }
+
+    let parsed: Value = serde_json::from_str(&data).ok()?;
+    if parsed.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = parsed.get("delta")?;
+    if delta.get("type").and_then(|t| t.as_str()) != Some("text_delta") {
+        return None;
+    }
+    let text = delta.get("text").and_then(|t| t.as_str())?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 /// Check if the input contains any of the given keywords as whole words.
 fn contains_any(input: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|kw| {
@@ -841,6 +1042,73 @@ mod tests {
         );
         assert_eq!(cmd.parameters["major_radius"], serde_json::json!(15.0));
         assert_eq!(cmd.parameters["minor_radius"], serde_json::json!(4.0));
+    }
+
+    #[test]
+    fn test_extract_text_delta_returns_text_for_text_delta_frame() {
+        let frame = "event: content_block_delta\n\
+                     data: {\"type\":\"content_block_delta\",\"index\":0,\
+                     \"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n";
+        assert_eq!(
+            extract_text_delta_from_frame(frame),
+            Some("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_text_delta_skips_non_delta_events() {
+        let ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        assert!(extract_text_delta_from_frame(ping).is_none());
+
+        let start = "event: message_start\n\
+                     data: {\"type\":\"message_start\",\"message\":{}}\n\n";
+        assert!(extract_text_delta_from_frame(start).is_none());
+
+        let stop = "event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        assert!(extract_text_delta_from_frame(stop).is_none());
+    }
+
+    #[test]
+    fn test_extract_text_delta_skips_tool_use_deltas() {
+        let frame = "event: content_block_delta\n\
+                     data: {\"type\":\"content_block_delta\",\"index\":0,\
+                     \"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\"}}\n\n";
+        assert!(extract_text_delta_from_frame(frame).is_none());
+    }
+
+    #[test]
+    fn test_extract_text_delta_handles_missing_data_lines() {
+        let frame = "event: content_block_delta\n\n";
+        assert!(extract_text_delta_from_frame(frame).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_sse_to_text_deltas_concatenates_split_chunks() {
+        // Two text_delta frames split across three byte chunks — simulates
+        // the case where TCP packet boundaries land mid-frame.
+        let frames = "event: content_block_delta\n\
+                      data: {\"type\":\"content_block_delta\",\"index\":0,\
+                      \"delta\":{\"type\":\"text_delta\",\"text\":\"foo \"}}\n\n\
+                      event: content_block_delta\n\
+                      data: {\"type\":\"content_block_delta\",\"index\":0,\
+                      \"delta\":{\"type\":\"text_delta\",\"text\":\"bar\"}}\n\n";
+        let split_at = frames.len() / 3;
+        let split_at_two = (frames.len() * 2) / 3;
+        let chunk_a = bytes::Bytes::copy_from_slice(frames[..split_at].as_bytes());
+        let chunk_b = bytes::Bytes::copy_from_slice(frames[split_at..split_at_two].as_bytes());
+        let chunk_c = bytes::Bytes::copy_from_slice(frames[split_at_two..].as_bytes());
+
+        // Build a Stream<Item = Result<Bytes, reqwest::Error>>. We can't
+        // fabricate reqwest::Errors here, so all items are Ok; the
+        // explicit type annotation pins the Err parameter.
+        let items: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            vec![Ok(chunk_a), Ok(chunk_b), Ok(chunk_c)];
+        let inner = futures::stream::iter(items);
+        let stream = anthropic_sse_to_text_deltas(inner);
+        let collected: Vec<_> = stream.collect::<Vec<_>>().await;
+        let texts: Vec<String> = collected.into_iter().filter_map(Result::ok).collect();
+        assert_eq!(texts.join(""), "foo bar");
     }
 
     #[test]

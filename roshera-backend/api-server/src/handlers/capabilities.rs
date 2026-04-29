@@ -117,7 +117,19 @@ fn build_capabilities() -> Value {
                 `target_x`/`target_y`/`target_z` to override the camera \
                 (all six required together to take effect); `fov_deg` \
                 (1-179, default 35). Empty scenes return a solid \
-                background image so the response is always a valid PNG."
+                background image so the response is always a valid PNG.",
+            "ai_streaming": "POST /api/ai/command/stream returns an SSE \
+                stream of LLM tokens at provider cadence (~30/s for \
+                Claude Sonnet). Frames in order: `event: start` with \
+                `{command, session_id}`; then a sequence of `event: \
+                token` frames each carrying `{text}` for one delta; \
+                terminated by `event: complete` with `{text, \
+                session_id, user_id}` containing the full concatenated \
+                response. Failures surface as a single `event: error` \
+                frame with `{error, stage}` and the connection closes. \
+                If the client disconnects mid-stream the upstream HTTP \
+                request to the LLM is dropped immediately so no \
+                further tokens are billed."
         },
         "primitives": primitives(),
         "operations": operations(),

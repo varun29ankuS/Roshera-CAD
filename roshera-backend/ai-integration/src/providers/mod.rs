@@ -11,9 +11,20 @@
 /// (Claude, OpenAI, etc.). Local model runtimes (Ollama, LLaMA, Whisper,
 /// Candle) are not permitted in this codebase.
 use async_trait::async_trait;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::pin::Pin;
 use thiserror::Error;
+
+/// A boxed stream of text deltas yielded by `LLMProvider::generate_stream`.
+///
+/// Each `Ok(String)` is one token (or short run of tokens) produced by the
+/// upstream LLM at the cadence the provider receives them — for Claude
+/// Sonnet that is roughly 30 tokens/second over the SSE wire. Errors mid-
+/// stream surface as `Err(ProviderError)` and terminate the stream.
+pub type LLMTokenStream =
+    Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
 // Provider implementations — API-only (no local models)
 pub mod claude; // Claude API integration
@@ -202,6 +213,33 @@ pub trait LLMProvider: Send + Sync + Debug {
 
     /// Generate response for conversational AI
     async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, ProviderError>;
+
+    /// Stream a response token-by-token from the underlying LLM.
+    ///
+    /// Returns a `LLMTokenStream` that yields text deltas at the cadence
+    /// the upstream provider produces them. Implementations that talk to
+    /// hosted streaming APIs (e.g. Anthropic `stream: true`) should yield
+    /// each `content_block_delta` as it arrives so the client experiences
+    /// real-time output. Implementations that do not support streaming
+    /// natively inherit the default impl below, which yields the full
+    /// `generate()` result as a single chunk and terminates — correct,
+    /// just not incremental.
+    ///
+    /// # Errors
+    /// Network/auth errors surface synchronously from this call. Errors
+    /// that occur mid-stream (e.g. the upstream connection drops) are
+    /// yielded as `Err(ProviderError)` items inside the stream and end
+    /// it.
+    async fn generate_stream(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> Result<LLMTokenStream, ProviderError> {
+        let full = self.generate(prompt, max_tokens).await?;
+        Ok(Box::pin(futures::stream::once(
+            async move { Ok(full) },
+        )))
+    }
 
     /// Generate response based on command result
     async fn generate_response(
