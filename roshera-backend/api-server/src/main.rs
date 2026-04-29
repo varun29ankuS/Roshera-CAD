@@ -923,9 +923,6 @@ fn parse_ai_command_to_geometry_command(
         // Extract object references from text
         let extract_object_references =
             |command_text: &str| -> Result<(uuid::Uuid, uuid::Uuid), StatusCode> {
-                // Production-grade object reference extraction
-                let lower = command_text.to_lowercase();
-
                 // Look for explicit object IDs (UUIDs)
                 let uuid_pattern = r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b";
                 if let Ok(uuid_regex) = regex::Regex::new(uuid_pattern) {
@@ -941,56 +938,26 @@ fn parse_ai_command_to_geometry_command(
                     }
                 }
 
-                // Look for object references like "first and second", "object 1 and object 2"
-                if lower.contains("first") && lower.contains("second") {
-                    // Return placeholder UUIDs that the session manager will resolve
-                    return Ok((uuid::Uuid::nil(), uuid::Uuid::from_u128(1)));
-                }
-
-                if lower.contains("last two") || lower.contains("previous two") {
-                    // Reference to the last two created objects
-                    return Ok((
-                        uuid::Uuid::from_u128(u128::MAX - 1),
-                        uuid::Uuid::from_u128(u128::MAX),
-                    ));
-                }
-
-                // Look for numbered references
-                let number_pattern = r"(?:object|shape|solid|item)?\s*(\d+)";
-                if let Ok(number_regex) = regex::Regex::new(number_pattern) {
-                    let number_matches: Vec<_> = number_regex.captures_iter(&lower).collect();
-                    if number_matches.len() >= 2 {
-                        if let (Some(num_a), Some(num_b)) = (
-                            number_matches[0]
-                                .get(1)
-                                .and_then(|m| m.as_str().parse::<u32>().ok()),
-                            number_matches[1]
-                                .get(1)
-                                .and_then(|m| m.as_str().parse::<u32>().ok()),
-                        ) {
-                            // Convert indices to placeholder UUIDs
-                            return Ok((
-                                uuid::Uuid::from_u128(num_a as u128),
-                                uuid::Uuid::from_u128(num_b as u128),
-                            ));
-                        }
-                    }
-                }
-
-                // Look for selection keywords
-                if lower.contains("selected") {
-                    // Return special UUIDs that indicate selected objects
-                    return Ok((
-                        uuid::Uuid::from_bytes([0xFF; 16]), // Special UUID for "first selected"
-                        uuid::Uuid::from_bytes([0xFE; 16]), // Special UUID for "second selected"
-                    ));
-                }
-
-                // Default: use the last two objects created (most common case)
-                Ok((
-                    uuid::Uuid::from_u128(u128::MAX - 1),
-                    uuid::Uuid::from_u128(u128::MAX),
-                ))
+                // Anaphoric / positional references ("first and second",
+                // "last two", "object 1 and object 2", "selected", etc.)
+                // cannot be resolved at this layer because the parser has
+                // no view of the live scene. Fabricating sentinel UUIDs
+                // (`Uuid::nil`, `u128::MAX`, `0xFF` byte patterns) — the
+                // previous behaviour — silently routes boolean operations
+                // at unrelated objects in the model and corrupts results.
+                //
+                // The correct path is for callers that need positional /
+                // selection-aware resolution to first call the
+                // scene-aware command parser (`ai-integration::commands::
+                // parser`) which has access to `SessionState::history`,
+                // or to send canonical UUIDs in the request body. Until
+                // then, fail loudly when no explicit UUIDs are present.
+                tracing::warn!(
+                    command_text = command_text,
+                    "Boolean command lacks two canonical UUIDs; positional/selection \
+                     references are not resolvable from this endpoint"
+                );
+                Err(StatusCode::BAD_REQUEST)
             };
 
         let (object_a, object_b) = extract_object_references(command_text).map_err(|_| {
@@ -1007,8 +974,6 @@ fn parse_ai_command_to_geometry_command(
         // Define extract_object_references closure for intersection
         let extract_object_references =
             |command_text: &str| -> Result<(uuid::Uuid, uuid::Uuid), StatusCode> {
-                let lower = command_text.to_lowercase();
-
                 // Look for explicit object IDs (UUIDs)
                 let uuid_pattern = r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b";
                 if let Ok(uuid_regex) = regex::Regex::new(uuid_pattern) {
@@ -1023,11 +988,16 @@ fn parse_ai_command_to_geometry_command(
                     }
                 }
 
-                // Default: use the last two objects created
-                Ok((
-                    uuid::Uuid::from_u128(u128::MAX - 1),
-                    uuid::Uuid::from_u128(u128::MAX),
-                ))
+                // No anaphoric/positional fallback at this layer — see the
+                // BooleanUnion branch above for the rationale. Fail loudly
+                // rather than fabricating sentinel UUIDs that silently
+                // misroute the operation.
+                tracing::warn!(
+                    command_text = command_text,
+                    "Intersection command lacks two canonical UUIDs; \
+                     positional/selection references are not resolvable from this endpoint"
+                );
+                Err(StatusCode::BAD_REQUEST)
             };
 
         let (object_a, object_b) = extract_object_references(command_text).map_err(|_| {
@@ -1046,8 +1016,6 @@ fn parse_ai_command_to_geometry_command(
         // Define extract_object_references closure for difference
         let extract_object_references =
             |command_text: &str| -> Result<(uuid::Uuid, uuid::Uuid), StatusCode> {
-                let lower = command_text.to_lowercase();
-
                 // Look for explicit object IDs (UUIDs)
                 let uuid_pattern = r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b";
                 if let Ok(uuid_regex) = regex::Regex::new(uuid_pattern) {
@@ -1062,11 +1030,16 @@ fn parse_ai_command_to_geometry_command(
                     }
                 }
 
-                // Default: use the last two objects created
-                Ok((
-                    uuid::Uuid::from_u128(u128::MAX - 1),
-                    uuid::Uuid::from_u128(u128::MAX),
-                ))
+                // No anaphoric/positional fallback at this layer — see the
+                // BooleanUnion branch above for the rationale. Fail loudly
+                // rather than fabricating sentinel UUIDs that silently
+                // misroute the operation.
+                tracing::warn!(
+                    command_text = command_text,
+                    "Difference command lacks two canonical UUIDs; \
+                     positional/selection references are not resolvable from this endpoint"
+                );
+                Err(StatusCode::BAD_REQUEST)
             };
 
         let (object_a, object_b) = extract_object_references(command_text).map_err(|_| {
@@ -1363,65 +1336,97 @@ fn extract_arc_parameters(
     ))
 }
 
-// Placeholder implementations for missing handlers
+/// GET /api/geometry/:id — return a structured summary of the solid with the
+/// given numeric id. The path parameter must parse as a `u32` (SolidId);
+/// canonical UUID-keyed lookups go through the scene endpoints.
 async fn get_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Check permissions
     if !auth_info.permissions.contains(&Permission::ViewGeometry) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Retrieve geometry from model
-    let model = state.model.read().await;
+    let solid_id: u32 = id.parse().map_err(|_| {
+        tracing::warn!(received_id = %id, "GET /api/geometry/:id received non-numeric id");
+        StatusCode::BAD_REQUEST
+    })?;
 
-    // Return geometry data
+    let model = state.model.read().await;
+    let solid = model.solids.get(solid_id).ok_or(StatusCode::NOT_FOUND)?;
+
     Ok(Json(serde_json::json!({
-        "id": id,
-        "type": "geometry",
-        "data": "geometry_data_placeholder"
+        "id": solid.id,
+        "name": solid.name.clone().unwrap_or_default(),
+        "outer_shell": solid.outer_shell,
+        "inner_shells": solid.inner_shells,
+        "parent_assembly": solid.parent_assembly,
     })))
 }
 
+/// PUT /api/geometry/:id — direct in-place mutation of a solid is not
+/// supported through this endpoint by design: every kernel mutation must
+/// flow through the timeline so it can be replayed, branched, and
+/// audited. Clients must POST a new operation against `/api/timeline` /
+/// `/api/geometry` (create_*, transform_*, boolean_*) which the
+/// command executor will record on the active branch.
+///
+/// We still gate on permissions and validate that the solid exists, so
+/// callers see `403`/`404` before the architectural `405`.
 async fn update_geometry(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
     auth_info: auth_middleware::AuthInfo,
 ) -> Result<StatusCode, StatusCode> {
-    // Check permissions
     if !auth_info.permissions.contains(&Permission::ModifyGeometry) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Update geometry in model
-    let mut model = state.model.write().await;
+    let solid_id: u32 = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let model = state.model.read().await;
+    if model.solids.get(solid_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    drop(model);
 
-    // Process update operation
-    tracing::info!("Updating geometry {} with payload: {:?}", id, payload);
-
-    Ok(StatusCode::OK)
+    tracing::warn!(
+        solid_id = solid_id,
+        payload = %payload,
+        "Direct PUT /api/geometry/:id is not supported; use the timeline-recorded \
+         operation endpoints so mutations are replayable"
+    );
+    Err(StatusCode::METHOD_NOT_ALLOWED)
 }
 
+/// DELETE /api/geometry/:id — same architectural rule as update_geometry:
+/// deletions must flow through the timeline. The kernel does not yet
+/// expose a Solid-removal entry point that's safe to expose through a
+/// raw HTTP path, and silently soft-deleting via this endpoint would
+/// fork the timeline replay state.
 async fn delete_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    // Check permissions
     if !auth_info.permissions.contains(&Permission::DeleteGeometry) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Delete geometry from model
-    let mut model = state.model.write().await;
+    let solid_id: u32 = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let model = state.model.read().await;
+    if model.solids.get(solid_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    drop(model);
 
-    // Process deletion
-    tracing::info!("Deleting geometry {}", id);
-
-    Ok(StatusCode::NO_CONTENT)
+    tracing::warn!(
+        solid_id = solid_id,
+        "Direct DELETE /api/geometry/:id is not supported; use the timeline-recorded \
+         operation endpoints so deletions are replayable"
+    );
+    Err(StatusCode::METHOD_NOT_ALLOWED)
 }
 
 async fn process_enhanced_ai_command(
@@ -1634,22 +1639,26 @@ async fn create_basic_geometry(
     }))
 }
 
-// Additional placeholder implementations...
+// Session lifecycle handlers (real implementations follow).
+//
+// `process_voice_command` is a thin discovery endpoint: the ASR provider
+// is configured per-deployment (Whisper / Azure / Google) and full
+// audio→geometry flow lives behind `/api/ai/process` once a transcript
+// is available. This endpoint exists so AI agents and frontend clients
+// can discover the supported capability set without uploading audio.
 async fn process_voice_command(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Check permissions
     if !auth_info.permissions.contains(&Permission::CreateGeometry) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Voice command processing would integrate with ASR provider
-    // For now, return a proper response structure
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": "Voice command processing ready",
+        "message": "Voice command discovery — POST audio transcripts to /api/ai/process",
         "capabilities": ["create", "modify", "query"],
+        "audio_pipeline_endpoint": "/api/ai/process",
         "user_id": auth_info.user_id
     })))
 }
