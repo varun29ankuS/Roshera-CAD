@@ -1,7 +1,7 @@
 # Roshera CAD - Project Instructions
 
 ## Rules
-- MUST NOT run `cargo build`, `cargo run`, `npm run dev`, or `npm run build` — user manages builds
+- Do not run `cargo build`, `cargo run`, `npm run dev`, or `npm run build` on your own — only run them when Varun explicitly asks you to start, restart, or rebuild
 - MUST NOT add "Co-Authored-By" or "Generated with Claude Code" to commits
 - Production-grade code only. No TODOs, no placeholders, no mocks, no stubs
 - Understand context, intent, and impact before changing anything
