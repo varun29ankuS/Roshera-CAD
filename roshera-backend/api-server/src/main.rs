@@ -2380,7 +2380,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_manager.set_active("mock".to_string(), "mock".to_string(), None);
     }
 
-    let command_executor = Arc::new(Mutex::new(CommandExecutor::new()));
+    // Bind the AI command executor to the same kernel `model` that REST and
+    // WebSocket handlers mutate. Previously each `CommandExecutor::new()`
+    // instantiated its own isolated `BRepModel`, so AI-issued commands and
+    // direct API commands operated on disjoint kernels and agents could
+    // never observe a coherent world.
+    let command_executor = Arc::new(Mutex::new(CommandExecutor::with_model(model.clone())));
     let provider_manager_arc = Arc::new(Mutex::new(provider_manager));
     let ai_processor = Arc::new(Mutex::new(AIProcessor::new(
         provider_manager_arc.clone(),

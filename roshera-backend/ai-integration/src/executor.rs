@@ -25,8 +25,14 @@ use uuid::Uuid;
 
 /// Executes geometry commands from AI system
 pub struct CommandExecutor {
-    /// The B-Rep model containing all geometry
-    model: Arc<std::sync::RwLock<BRepModel>>, // Use sync RwLock
+    /// The B-Rep model containing all geometry.
+    ///
+    /// `tokio::sync::RwLock` rather than `std::sync::RwLock` so this lock
+    /// can be shared with the rest of the server (notably `AppState.model`)
+    /// without lock-flavor mismatches. Inside `spawn_blocking` we use
+    /// `blocking_write()` — explicitly designed for that pattern — to keep
+    /// CPU-heavy geometry work off the async runtime threads.
+    model: Arc<tokio::sync::RwLock<BRepModel>>,
     /// Map from our GeometryId to engine's SolidId
     id_map: Arc<DashMap<GeometryId, SolidId>>,
     /// Reverse map for queries
@@ -34,10 +40,26 @@ pub struct CommandExecutor {
 }
 
 impl CommandExecutor {
-    /// Create new command executor
+    /// Create a new command executor with an isolated, freshly-initialised
+    /// B-Rep model.
+    ///
+    /// Useful for tests and standalone benchmarks that don't need to share
+    /// state with the rest of the server. Production code should use
+    /// [`CommandExecutor::with_model`] to bind to the server-wide model so
+    /// AI-issued commands operate on the same kernel that REST/WS handlers
+    /// observe.
     pub fn new() -> Self {
+        Self::with_model(Arc::new(tokio::sync::RwLock::new(BRepModel::new())))
+    }
+
+    /// Create a command executor that operates on an externally-owned model.
+    ///
+    /// This is the production constructor — `AppState` shares its
+    /// `Arc<RwLock<BRepModel>>` so AI, REST, and WebSocket entry points all
+    /// mutate the same kernel state and agents see a coherent world.
+    pub fn with_model(model: Arc<tokio::sync::RwLock<BRepModel>>) -> Self {
         Self {
-            model: Arc::new(std::sync::RwLock::new(BRepModel::new())),
+            model,
             id_map: Arc::new(DashMap::new()),
             solid_to_geometry: Arc::new(DashMap::new()),
         }
@@ -107,9 +129,7 @@ impl CommandExecutor {
             // earlier code constructed a throwaway BRepModel here, which
             // meant boxes never entered executor state — every follow-up
             // command on a box id failed with InvalidParameters.
-            let mut model = model_clone
-                .write()
-                .expect("BRep model RwLock poisoned; prior holder panicked");
+            let mut model = model_clone.blocking_write();
             let solid_id = BoxPrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -148,9 +168,7 @@ impl CommandExecutor {
             };
 
             // Create sphere using the primitive system in the shared model
-            let mut model = model_clone
-                .write()
-                .expect("BRep model RwLock poisoned; prior holder panicked");
+            let mut model = model_clone.blocking_write();
             let solid_id = SpherePrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -191,9 +209,7 @@ impl CommandExecutor {
             };
 
             // Create cylinder using the primitive system in the shared model
-            let mut model = model_clone
-                .write()
-                .expect("BRep model RwLock poisoned; prior holder panicked");
+            let mut model = model_clone.blocking_write();
             let solid_id = CylinderPrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -229,9 +245,7 @@ impl CommandExecutor {
             };
 
             // Create cone using the primitive system in the shared model
-            let mut model = model_clone
-                .write()
-                .expect("BRep model RwLock poisoned; prior holder panicked");
+            let mut model = model_clone.blocking_write();
             let solid_id = ConePrimitive::create(&params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
@@ -266,9 +280,7 @@ impl CommandExecutor {
         let op_name = format!("{:?}", op);
         let model_clone = Arc::clone(&self.model);
         let result_solid_id = tokio::task::spawn_blocking(move || {
-            let mut model = model_clone
-                .write()
-                .expect("BRep model RwLock poisoned; prior holder panicked");
+            let mut model = model_clone.blocking_write();
             boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default())
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
         })
@@ -376,9 +388,7 @@ impl CommandExecutor {
                 }
             }?;
 
-            let mut model = model_clone
-                .write()
-                .expect("BRep model RwLock poisoned; prior holder panicked");
+            let mut model = model_clone.blocking_write();
             transform_solid(&mut model, solid_id, matrix, TransformOptions::default())
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
 
@@ -417,10 +427,7 @@ impl CommandExecutor {
     pub async fn clear(&mut self) {
         self.id_map.clear();
         self.solid_to_geometry.clear();
-        let mut model = self
-            .model
-            .write()
-            .expect("BRep model RwLock poisoned; prior holder panicked");
+        let mut model = self.model.write().await;
         *model = BRepModel::new();
     }
 }
