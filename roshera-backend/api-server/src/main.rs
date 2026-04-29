@@ -8,6 +8,7 @@
 //! - Full AI integration with session awareness
 
 mod auth_middleware;
+mod branches;
 mod delta_handlers;
 mod error_catalog;
 mod handlers;
@@ -2434,6 +2435,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Frame readback (exteroception) — server-rendered PNG of the
         // live scene. Multimodal LLMs consume the image directly.
         .route("/api/frame", get(frame::get_frame))
+        // Sandbox branches per agent. Each agent claims a branch via
+        // POST /api/branches; mutations land on that branch in the
+        // event log; a human approves via POST /api/branches/{id}/merge
+        // or rejects via DELETE /api/branches/{id}.
+        .route(
+            "/api/branches",
+            get(branches::list_branches).post(branches::create_branch),
+        )
+        .route(
+            "/api/branches/{id}",
+            get(branches::get_branch).delete(branches::delete_branch),
+        )
+        .route("/api/branches/{id}/merge", post(branches::merge_branch))
         // Real mass properties (volume, COG, inertia tensor) for a single solid
         .route(
             "/api/geometry/{id}/properties",

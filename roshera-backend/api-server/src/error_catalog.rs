@@ -103,6 +103,19 @@ pub enum ErrorCode {
     /// — no further operations may be associated with it.
     TransactionNotActive,
 
+    // ── Branch / sandbox layer ────────────────────────────────────
+    /// A branch ID was syntactically valid (or the literal `main`)
+    /// but no such branch exists in the timeline.
+    BranchNotFound,
+    /// A branch lifecycle transition was rejected — for example
+    /// abandoning a branch that is already merged, or merging a
+    /// branch whose state is not Active.
+    BranchInvalidState,
+    /// A merge could not be applied automatically (conflicts,
+    /// non-fast-forward without a strategy, etc.). Non-retryable
+    /// without a strategy change or manual conflict resolution.
+    BranchMergeConflict,
+
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
     Internal,
@@ -122,12 +135,15 @@ impl ErrorCode {
             | ErrorCode::IdempotencyKeyEmpty
             | ErrorCode::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
 
-            ErrorCode::IdempotencyKeyReused | ErrorCode::TransactionNotActive => {
-                StatusCode::CONFLICT
-            }
+            ErrorCode::IdempotencyKeyReused
+            | ErrorCode::TransactionNotActive
+            | ErrorCode::BranchInvalidState
+            | ErrorCode::BranchMergeConflict => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
-            ErrorCode::SolidNotFound | ErrorCode::TransactionNotFound => StatusCode::NOT_FOUND,
+            ErrorCode::SolidNotFound
+            | ErrorCode::TransactionNotFound
+            | ErrorCode::BranchNotFound => StatusCode::NOT_FOUND,
 
             ErrorCode::KernelError
             | ErrorCode::TessellationEmpty
@@ -156,7 +172,10 @@ impl ErrorCode {
             | ErrorCode::IdempotencyKeyReused
             | ErrorCode::IdempotencyBodyTooLarge
             | ErrorCode::TransactionNotFound
-            | ErrorCode::TransactionNotActive => false,
+            | ErrorCode::TransactionNotActive
+            | ErrorCode::BranchNotFound
+            | ErrorCode::BranchInvalidState
+            | ErrorCode::BranchMergeConflict => false,
 
             // Server-side: another attempt may succeed.
             ErrorCode::KernelError
@@ -190,6 +209,9 @@ impl ErrorCode {
             ErrorCode::IdempotencyReplayFailed => "idempotency_replay_failed",
             ErrorCode::TransactionNotFound => "transaction_not_found",
             ErrorCode::TransactionNotActive => "transaction_not_active",
+            ErrorCode::BranchNotFound => "branch_not_found",
+            ErrorCode::BranchInvalidState => "branch_invalid_state",
+            ErrorCode::BranchMergeConflict => "branch_merge_conflict",
             ErrorCode::Internal => "internal_error",
         }
     }
@@ -215,6 +237,9 @@ impl ErrorCode {
             ErrorCode::IdempotencyReplayFailed,
             ErrorCode::TransactionNotFound,
             ErrorCode::TransactionNotActive,
+            ErrorCode::BranchNotFound,
+            ErrorCode::BranchInvalidState,
+            ErrorCode::BranchMergeConflict,
             ErrorCode::Internal,
         ]
     }
