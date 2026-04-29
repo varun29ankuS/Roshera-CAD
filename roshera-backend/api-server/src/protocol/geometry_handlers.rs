@@ -1012,11 +1012,12 @@ async fn handle_get_analytical_properties(
                 let bounds = obj.mesh.bounds();
                 let volume = estimate_volume_from_mesh(&obj.mesh);
                 let surface_area = estimate_surface_area_from_mesh(&obj.mesh);
+                let center_of_mass = estimate_center_of_mass_from_mesh(&obj.mesh);
 
                 serde_json::json!({
                     "volume": volume,
                     "surface_area": surface_area,
-                    "center_of_mass": [0.0, 0.0, 0.0], // TODO: Calculate from mesh
+                    "center_of_mass": center_of_mass,
                     "bounding_box": {
                         "min": bounds.min,
                         "max": bounds.max
@@ -1489,35 +1490,71 @@ fn tessellate_solid_for_display(
     Ok(mesh)
 }
 
-/// Estimate solid volume (placeholder for exact analytical computation)
-fn estimate_solid_volume(solid: &geometry_engine::primitives::solid::Solid) -> f64 {
-    // In production, this would compute exact volume from B-Rep geometry
-    // For now, return a reasonable estimate
-    1000.0 // Placeholder volume
-}
+/// Volume-weighted centroid of a (closed, outward-oriented) triangle mesh.
+///
+/// Each triangle contributes a signed tetrahedron `(O, v0, v1, v2)` with
+/// volume `V_i = v0 · (v1 × v2) / 6` and centroid `(v0 + v1 + v2) / 4`.
+/// The mesh centroid is the volume-weighted mean. Returns the bounding-box
+/// centre as a graceful fallback for degenerate or open meshes (|ΣV| ≈ 0).
+fn estimate_center_of_mass_from_mesh(mesh: &Mesh) -> [f64; 3] {
+    let mut weighted = [0.0f64; 3];
+    let mut total_volume = 0.0f64;
 
-/// Estimate solid surface area (placeholder for exact analytical computation)
-fn estimate_solid_surface_area(solid: &geometry_engine::primitives::solid::Solid) -> f64 {
-    // In production, this would compute exact surface area from B-Rep geometry
-    600.0 // Placeholder surface area
-}
+    for chunk in mesh.indices.chunks(3) {
+        if chunk.len() != 3 {
+            continue;
+        }
+        let i0 = chunk[0] as usize * 3;
+        let i1 = chunk[1] as usize * 3;
+        let i2 = chunk[2] as usize * 3;
+        if i2 + 2 >= mesh.vertices.len() {
+            continue;
+        }
 
-/// Compute solid bounding box
-fn compute_solid_bounding_box(
-    solid: &geometry_engine::primitives::solid::Solid,
-) -> shared_types::BoundingBox {
-    // In production, this would compute exact bounding box from vertices
-    // For now, return a reasonable bounding box
-    shared_types::BoundingBox {
-        min: [-5.0, -5.0, -5.0],
-        max: [5.0, 5.0, 5.0],
+        let v0 = [
+            mesh.vertices[i0] as f64,
+            mesh.vertices[i0 + 1] as f64,
+            mesh.vertices[i0 + 2] as f64,
+        ];
+        let v1 = [
+            mesh.vertices[i1] as f64,
+            mesh.vertices[i1 + 1] as f64,
+            mesh.vertices[i1 + 2] as f64,
+        ];
+        let v2 = [
+            mesh.vertices[i2] as f64,
+            mesh.vertices[i2 + 1] as f64,
+            mesh.vertices[i2 + 2] as f64,
+        ];
+
+        let signed_vol = (v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
+            + v1[0] * (v2[1] * v0[2] - v2[2] * v0[1])
+            + v2[0] * (v0[1] * v1[2] - v0[2] * v1[1]))
+            / 6.0;
+        let cx = (v0[0] + v1[0] + v2[0]) * 0.25;
+        let cy = (v0[1] + v1[1] + v2[1]) * 0.25;
+        let cz = (v0[2] + v1[2] + v2[2]) * 0.25;
+
+        weighted[0] += signed_vol * cx;
+        weighted[1] += signed_vol * cy;
+        weighted[2] += signed_vol * cz;
+        total_volume += signed_vol;
     }
-}
 
-/// Compute center of mass
-fn compute_center_of_mass(solid: &geometry_engine::primitives::solid::Solid) -> [f64; 3] {
-    // In production, this would compute exact center of mass
-    [0.0, 0.0, 0.0] // Placeholder center of mass
+    if total_volume.abs() < 1.0e-12 {
+        let bounds = mesh.bounds();
+        return [
+            (bounds.min[0] + bounds.max[0]) * 0.5,
+            (bounds.min[1] + bounds.max[1]) * 0.5,
+            (bounds.min[2] + bounds.max[2]) * 0.5,
+        ];
+    }
+
+    [
+        weighted[0] / total_volume,
+        weighted[1] / total_volume,
+        weighted[2] / total_volume,
+    ]
 }
 
 /// Helper to send response

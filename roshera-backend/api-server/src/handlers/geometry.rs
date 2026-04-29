@@ -642,8 +642,14 @@ pub async fn natural_language_command(
         }
     };
 
-    // For now, use a simple pattern-based parser
-    // TODO: Integrate with full AI processor
+    // This endpoint uses the deterministic, regex-based pattern parser. The
+    // richer LLM-backed pipeline (Claude / OpenAI providers, multi-turn
+    // session memory, ambiguity resolution) lives behind
+    // `/api/ai/process` and `/api/ai/process/enhanced`, which dispatch to
+    // `state.session_aware_ai`. Routing this endpoint through the LLM
+    // pipeline would change its latency and cost profile and silently
+    // alter result shape; clients that want LLM parsing must call the
+    // enhanced endpoint explicitly.
     let commands = parse_simple_command(&request.command);
 
     if !commands.is_empty() {
