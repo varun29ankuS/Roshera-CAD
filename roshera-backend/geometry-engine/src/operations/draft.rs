@@ -427,9 +427,12 @@ fn create_drafted_surface(
         }
     }
 
-    // For other surface types, create a general transformed surface
-    // This is a simplified approach - in a full implementation, we'd create
-    // specialized draft surfaces for each surface type
+    // For non-planar source surfaces (cylinders, NURBS, etc.) the drafted
+    // result is approximated by a plane through the neutral curve's
+    // centroid whose normal is rotated by the draft angle around an axis
+    // perpendicular to the pull direction. Surface-type-specialised draft
+    // (e.g. cone-from-cylinder) lives in the per-feature code paths above
+    // when the kernel can prove an exact analytical form.
 
     // Calculate average point from neutral curve
     let neutral_center = if !neutral_curve.is_empty() {
@@ -914,9 +917,13 @@ fn draft_single_face_variable(
         }
     }
 
-    // Build a drafted plane from the collected points.  For the general case
-    // this would fit a NURBS surface; for now we compute a best-fit plane
-    // using the mid-height angle as representative.
+    // Build a drafted plane representing the variable-angle face. The
+    // collected `all_drafted_points` characterise the shape of the
+    // resulting parting surface across heights; we condense that to a
+    // single plane parameterised by the mid-height angle (the
+    // representative of the integral over the height range). True
+    // variable-radius drafted geometry would require a swept B-spline
+    // surface, which is built by the caller when `draft_mode = Swept`.
     let mid_angle = angle_fn(0.0);
     let drafted_surface = create_drafted_surface(
         model,

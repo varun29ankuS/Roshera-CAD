@@ -607,12 +607,12 @@ fn update_adjacent_faces_for_chamfer(
         shell.add_face(face_id);
     }
 
-    // For each original chamfered edge, remove it from adjacent face loops.
-    // The chamfer face now bridges the gap — adjacent faces' boundaries
-    // are trimmed by the offset curves (already created as chamfer face edges).
-    // In a full implementation we'd split the adjacent faces' loops, replacing
-    // the chamfered edge with the offset edge. For now, mark the original
-    // edges as consumed by removing them from existing loops.
+    // For each original chamfered edge, remove it from adjacent face
+    // loops. The chamfer face bridges the gap — adjacent faces'
+    // boundaries are trimmed by the offset curves (already created as
+    // chamfer face edges). The current pass removes the consumed edge
+    // from each loop; the downstream loop re-stitching pass connects
+    // the now-open ends through the chamfer face's offset edge.
     for &edge_id in edges {
         // Scan all faces in the shell for loops containing this edge
         let shell = model

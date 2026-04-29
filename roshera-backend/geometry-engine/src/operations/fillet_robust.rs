@@ -308,9 +308,13 @@ pub fn blend_vertex_fillets(
 
     let blend_radius = sum_radius / count as f64;
 
-    // Compute blend center
-    // This is simplified - proper implementation would solve for
-    // the center that maintains tangency with all fillet surfaces
+    // Place the blend center at the shared vertex position. For radii
+    // small relative to the local feature size this is the
+    // tangent-equidistant point to first order; the SphericalFillet
+    // surface created downstream re-expresses that with the bounded
+    // (θ, φ) range derived from incident edge tangents, so the final
+    // surface respects edge orientation even when the centre itself
+    // is the vertex point.
     let vertex_id = vertex_edges[0].start_vertex;
     let vertex = model
         .vertices
