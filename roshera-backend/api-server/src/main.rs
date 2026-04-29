@@ -11,6 +11,7 @@ mod auth_middleware;
 mod delta_handlers;
 mod handlers;
 mod handlers_impl;
+mod idempotency;
 mod kernel_state;
 mod metrics;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
@@ -2407,9 +2408,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/viewport/status", get(viewport_bridge::status));
     }
 
-    // Add state and CORS
+    // Idempotency layer — every mutating route honours the
+    // `Idempotency-Key` header so agents can retry without
+    // double-creating geometry. See `idempotency.rs` for the contract;
+    // unkeyed requests pass through unchanged. The store is kept
+    // outside `AppState` because its lifecycle is the router's, not
+    // the kernel's, and its `from_fn_with_state` plumbing is cleanest
+    // when its state is its own.
+    let idempotency_store = Arc::new(idempotency::IdempotencyStore::new());
+
+    // Add state, idempotency, and CORS. axum applies layers from
+    // innermost outward, so CORS sees every request first (including
+    // preflight OPTIONS, which the idempotency layer would otherwise
+    // pass through trivially), then idempotency intercepts mutating
+    // verbs, then the inner router dispatches to the handler.
     let app = app
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            idempotency_store,
+            idempotency::idempotency_layer,
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
