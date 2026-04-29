@@ -64,23 +64,41 @@ pub fn solve_quadratic(a: f64, b: f64, c: f64, tolerance: Tolerance) -> Vec<f64>
     }
 }
 
-/// Robust discriminant calculation for quadratic
+/// Robust discriminant calculation for a quadratic `a x² + b x + c`.
+///
+/// Computes `b² - 4 a c` using a fused multiply-add so the product
+/// `b·b` is folded into the subtraction with a single rounding rather
+/// than two — matching Kahan's "Mathematics Written in Sand" treatment
+/// of the quadratic discriminant. When near-cancellation is detected
+/// (the result is small relative to `|b|·|b|`), we further refine
+/// using Dekker's TwoProduct splitting of `b²` and `4ac` so the
+/// surviving low-order limbs of each product participate in the
+/// subtraction. This avoids the catastrophic cancellation that bare
+/// `b*b - 4*a*c` exhibits when `b² ≈ 4ac` (e.g. nearly tangent
+/// intersections).
 #[inline]
 fn robust_discriminant(a: f64, b: f64, c: f64) -> f64 {
-    // Use Kahan's formula for improved accuracy
-    let discriminant = b * b - 4.0 * a * c;
+    // First-cut: FMA-evaluated discriminant. Single rounding.
+    let disc = b.mul_add(b, -(4.0 * a * c));
 
-    // Refine using compensated arithmetic if needed
-    if discriminant.abs() < 1e-10 && b.abs() > 1e-5 {
-        // Use higher precision calculation
-        let b_hi = b;
-        let b_lo = 0.0; // Would use FMA to get low part
-        let prod = 4.0 * a * c;
-        let disc_hi = b_hi * b_hi - prod;
-        let disc_lo = 2.0 * b_hi * b_lo; // Compensation term
-        disc_hi + disc_lo
+    // Refine when the result is small relative to its magnitudes —
+    // i.e. when subtractive cancellation may have occurred.
+    let scale = (b * b).abs().max((4.0 * a * c).abs());
+    if scale > 0.0 && disc.abs() < 1e-10 * scale {
+        // TwoProduct(b, b) → (p, e) with p + e = b·b exactly.
+        let p_bb = b * b;
+        let e_bb = b.mul_add(b, -p_bb);
+        // TwoProduct(4a, c) similarly.
+        let four_a = 4.0 * a;
+        let p_ac = four_a * c;
+        let e_ac = four_a.mul_add(c, -p_ac);
+        // (p_bb + e_bb) - (p_ac + e_ac) reorganised to keep the
+        // larger-magnitude limbs first.
+        let hi = p_bb - p_ac;
+        let lo = e_bb - e_ac;
+        hi + lo
     } else {
-        discriminant
+        disc
     }
 }
 
@@ -1070,7 +1088,25 @@ pub struct RemezApproximation {
 }
 
 impl RemezApproximation {
-    /// Approximate function with polynomial of given degree
+    /// Build a minimax polynomial approximation of `f` over `range` of
+    /// the given `degree` using the Remez exchange algorithm.
+    ///
+    /// Algorithm (Cheney, *Introduction to Approximation Theory* §3.7):
+    /// 1. Seed `degree + 2` reference points at the extrema of the
+    ///    Chebyshev polynomial mapped onto `range`.
+    /// 2. Solve the `(degree + 2) × (degree + 2)` linear system
+    ///       p(x_i) + (-1)^i · E = f(x_i)
+    ///    for the polynomial coefficients `c_0…c_d` and the equi-
+    ///    oscillation amplitude `E`.
+    /// 3. Locate the actual extrema of `p - f` by dense sampling +
+    ///    local sign-flip detection; replace the reference set with
+    ///    those extrema (one per sign region).
+    /// 4. Iterate until the reference set stops moving (within
+    ///    `tolerance`) or `MAX_ITERS` is hit.
+    ///
+    /// The algorithm converges quadratically once near the minimax
+    /// polynomial; in practice 8–15 iterations suffice for smooth
+    /// functions and double-precision tolerance budgets.
     pub fn approximate<F>(
         f: F,
         range: Range<f64>,
@@ -1080,23 +1116,125 @@ impl RemezApproximation {
     where
         F: Fn(f64) -> f64 + Copy,
     {
-        // Initial Chebyshev nodes
-        let mut nodes = vec![0.0; degree + 2];
-        for i in 0..=degree + 1 {
-            let t = ((2 * i + 1) as f64 * consts::PI) / ((2 * (degree + 2)) as f64);
-            nodes[i] = (range.start + range.end) * 0.5 + (range.end - range.start) * 0.5 * t.cos();
+        use crate::math::linear_solver::gaussian_elimination;
+
+        if !(range.start.is_finite() && range.end.is_finite()) || range.start >= range.end {
+            return Err(MathError::InvalidParameter(format!(
+                "RemezApproximation::approximate: degenerate range [{}, {}]",
+                range.start, range.end
+            )));
         }
 
-        // Simplified Remez iteration (full implementation would be more complex)
-        let coefficients = fit_polynomial(&nodes, &f, degree)?;
-        let max_error = estimate_max_error(&coefficients, &f, range, 1000);
+        let n_nodes = degree + 2;
+        let half_span = (range.end - range.start) * 0.5;
+        let mid = (range.start + range.end) * 0.5;
 
-        // Surface to the caller when the requested degree is too low to
-        // hit their tolerance budget; without this check the
-        // approximation silently violates its precision contract.
+        // Step 1: seed with Chebyshev extrema mapped to `range`.
+        let mut nodes = vec![0.0; n_nodes];
+        for i in 0..n_nodes {
+            // cos(π·i / (n_nodes - 1)) gives the Chebyshev extrema
+            // (including the endpoints), spaced to minimise the
+            // worst-case interpolation error.
+            let t = (i as f64 * consts::PI) / ((n_nodes - 1) as f64);
+            nodes[i] = mid - half_span * t.cos();
+        }
+
+        const MAX_ITERS: usize = 50;
+        const ERROR_SAMPLES: usize = 4096;
+        let conv_tol = tolerance.distance().max(1e-14);
+
+        let mut coefficients = vec![0.0; degree + 1];
+        let mut max_error = f64::INFINITY;
+
+        for iter in 0..MAX_ITERS {
+            // Step 2: solve the (n_nodes × n_nodes) reference system.
+            let mut a = vec![vec![0.0_f64; n_nodes]; n_nodes];
+            let mut rhs = vec![0.0_f64; n_nodes];
+            for (i, &x_i) in nodes.iter().enumerate() {
+                let mut x_pow = 1.0;
+                for j in 0..=degree {
+                    a[i][j] = x_pow;
+                    x_pow *= x_i;
+                }
+                a[i][degree + 1] = if i % 2 == 0 { 1.0 } else { -1.0 };
+                rhs[i] = f(x_i);
+            }
+            let sol = gaussian_elimination(a, rhs, tolerance).map_err(|_| {
+                MathError::ConvergenceFailure {
+                    iterations: iter + 1,
+                    error: max_error,
+                }
+            })?;
+            coefficients = sol[..=degree].to_vec();
+            // The trailing solution component is the signed equi-
+            // oscillation amplitude — its absolute value is a *lower*
+            // bound on max_error; the true value comes from the dense
+            // sweep below.
+            let oscillation = sol[degree + 1].abs();
+
+            // Step 3: dense error sweep + extrema relocation.
+            let mut samples: Vec<(f64, f64)> = Vec::with_capacity(ERROR_SAMPLES);
+            for k in 0..ERROR_SAMPLES {
+                let t = k as f64 / (ERROR_SAMPLES - 1) as f64;
+                let x = range.start + (range.end - range.start) * t;
+                let err = eval_polynomial(&coefficients, x) - f(x);
+                samples.push((x, err));
+            }
+
+            // Endpoints always count as candidate extrema. Interior
+            // candidates are local |err| maxima.
+            let mut extrema: Vec<(f64, f64)> = Vec::with_capacity(n_nodes * 2);
+            extrema.push(samples[0]);
+            for k in 1..samples.len() - 1 {
+                let prev = samples[k - 1].1;
+                let cur = samples[k].1;
+                let next = samples[k + 1].1;
+                if (cur > prev && cur >= next) || (cur < prev && cur <= next) {
+                    extrema.push(samples[k]);
+                }
+            }
+            extrema.push(samples[samples.len() - 1]);
+
+            // Need at least n_nodes extrema with alternating signs to
+            // form a valid reference. If we don't have enough, the
+            // current iteration's coefficients are already as good as
+            // the algorithm can do at this degree — bail.
+            if extrema.len() < n_nodes {
+                max_error = samples
+                    .iter()
+                    .map(|&(_, e)| e.abs())
+                    .fold(0.0_f64, f64::max);
+                break;
+            }
+
+            // Pick the top n_nodes extrema by |err|, then sort by x.
+            extrema.sort_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut new_nodes: Vec<f64> = extrema.iter().take(n_nodes).map(|&(x, _)| x).collect();
+            new_nodes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Step 4: convergence check.
+            let max_shift = nodes
+                .iter()
+                .zip(new_nodes.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            nodes = new_nodes;
+            max_error = samples
+                .iter()
+                .map(|&(_, e)| e.abs())
+                .fold(0.0_f64, f64::max);
+            if max_shift < conv_tol || (max_error - oscillation).abs() < conv_tol {
+                break;
+            }
+        }
+
         if max_error > tolerance.distance() {
             return Err(MathError::ConvergenceFailure {
-                iterations: 1,
+                iterations: MAX_ITERS,
                 error: max_error,
             });
         }
