@@ -116,6 +116,14 @@ pub enum ErrorCode {
     /// without a strategy change or manual conflict resolution.
     BranchMergeConflict,
 
+    // ── AI surface ────────────────────────────────────────────────
+    /// No LLM API key was configured at server start, so AI routes
+    /// refuse to serve traffic. Operators must set `ANTHROPIC_API_KEY`
+    /// (or another supported provider key) and restart. This is a
+    /// deployment-time misconfiguration, not a transient failure —
+    /// retrying without changing server config will fail identically.
+    AiNotConfigured,
+
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
     Internal,
@@ -151,6 +159,8 @@ impl ErrorCode {
             | ErrorCode::IdempotencyResponseTooLarge
             | ErrorCode::IdempotencyReplayFailed
             | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+
+            ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -175,7 +185,8 @@ impl ErrorCode {
             | ErrorCode::TransactionNotActive
             | ErrorCode::BranchNotFound
             | ErrorCode::BranchInvalidState
-            | ErrorCode::BranchMergeConflict => false,
+            | ErrorCode::BranchMergeConflict
+            | ErrorCode::AiNotConfigured => false,
 
             // Server-side: another attempt may succeed.
             ErrorCode::KernelError
@@ -212,6 +223,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound => "branch_not_found",
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
+            ErrorCode::AiNotConfigured => "ai_not_configured",
             ErrorCode::Internal => "internal_error",
         }
     }
@@ -240,6 +252,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound,
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
+            ErrorCode::AiNotConfigured,
             ErrorCode::Internal,
         ]
     }
@@ -381,6 +394,29 @@ impl ApiError {
             format!("solid {solid_id} not found"),
         )
         .with_details(serde_json::json!({ "solid_id": solid_id }))
+    }
+
+    /// AI surface refused: no LLM API key was configured at server
+    /// start. Returned as 503 from `/api/ai/command`,
+    /// `/api/ai/command/stream`, and `/api/ai/status` until the
+    /// operator sets a provider key and restarts the server. Never
+    /// served as a transient error — agents that hit this should stop
+    /// retrying and surface the misconfiguration to a human.
+    pub fn ai_not_configured() -> Self {
+        Self::new(
+            ErrorCode::AiNotConfigured,
+            "AI provider not configured: no LLM API key found at server start"
+                .to_string(),
+        )
+        .with_hint(
+            "Set ANTHROPIC_API_KEY (or another supported provider key) in \
+             the server environment and restart. Use GET /api/ai/status \
+             to verify."
+                .to_string(),
+        )
+        .with_details(serde_json::json!({
+            "missing_env": ["ANTHROPIC_API_KEY"],
+        }))
     }
 }
 

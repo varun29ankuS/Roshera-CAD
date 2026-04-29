@@ -129,7 +129,20 @@ fn build_capabilities() -> Value {
                 frame with `{error, stage}` and the connection closes. \
                 If the client disconnects mid-stream the upstream HTTP \
                 request to the LLM is dropped immediately so no \
-                further tokens are billed."
+                further tokens are billed.",
+            "ai_configuration": "AI routes (`/api/ai/command`, \
+                `/api/ai/command/stream`) require an LLM provider key \
+                set in the server environment at startup — currently \
+                `ANTHROPIC_API_KEY`. When unset, both routes refuse \
+                with `503 ai_not_configured` (the streaming route \
+                emits a single `event: error` frame carrying the same \
+                JSON body and closes). There is no silent mock \
+                fallback: a server with no key returns the structured \
+                error every time so misconfiguration is visible to \
+                agents and operators. `GET /api/ai/status` reports \
+                `status: \"not_configured\"` with the same \
+                remediation hint, so agents can branch on a single \
+                GET without provoking a 503."
         },
         "primitives": primitives(),
         "operations": operations(),
