@@ -168,18 +168,20 @@ function TreeItem({
 
         <span className="text-[11px] truncate flex-1">{node.name}</span>
 
-        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
           <button
             onClick={(e) => {
               e.stopPropagation()
               onToggleVisibility(node.id)
             }}
-            className="p-0.5 rounded hover:bg-accent"
+            className="cad-icon-btn h-5 w-5"
+            aria-label={node.visible !== false ? 'Hide' : 'Show'}
+            title={node.visible !== false ? 'Hide' : 'Show'}
           >
             {node.visible !== false ? (
-              <Eye size={10} className="text-muted-foreground" />
+              <Eye size={10} />
             ) : (
-              <EyeOff size={10} className="text-muted-foreground/40" />
+              <EyeOff size={10} className="opacity-40" />
             )}
           </button>
           <button
@@ -187,12 +189,14 @@ function TreeItem({
               e.stopPropagation()
               onToggleLock(node.id)
             }}
-            className="p-0.5 rounded hover:bg-accent"
+            className="cad-icon-btn h-5 w-5"
+            aria-label={node.locked ? 'Unlock' : 'Lock'}
+            title={node.locked ? 'Unlock' : 'Lock'}
           >
             {node.locked ? (
-              <Lock size={10} className="text-muted-foreground" />
+              <Lock size={10} />
             ) : (
-              <Unlock size={10} className="text-muted-foreground/40" />
+              <Unlock size={10} className="opacity-40" />
             )}
           </button>
         </div>
@@ -383,7 +387,7 @@ export function ModelTree() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-muted-foreground border-b border-white/5 flex items-center gap-1.5">
+      <div className="cad-panel-header flex items-center gap-1.5">
         <FolderOpen size={11} className="text-primary" />
         Model Tree
       </div>

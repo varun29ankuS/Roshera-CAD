@@ -63,7 +63,9 @@ export function AIChatPanel() {
     return (
       <button
         onClick={togglePanel}
-        className="absolute bottom-10 left-4 z-20 w-10 h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-lg hover:scale-105 transition-transform"
+        className="cad-focus absolute bottom-10 left-4 z-20 w-10 h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-lg hover:scale-105 transition-transform"
+        aria-label="Open AI assistant"
+        title="AI Assistant"
       >
         <MessageSquare size={18} />
       </button>
@@ -71,25 +73,27 @@ export function AIChatPanel() {
   }
 
   return (
-    <div className="absolute bottom-8 left-3 z-20 w-80 max-h-[55vh] flex flex-col rounded-xl border border-white/5 bg-transparent overflow-hidden">
+    <div className="cad-panel-floating absolute bottom-8 left-3 z-20 w-80 max-h-[55vh] flex flex-col rounded-xl overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
         <div className="flex items-center gap-2">
           <MessageSquare size={14} className="text-primary" />
           <span className="text-xs font-medium">AI Assistant</span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-0.5">
           <button
             onClick={clearMessages}
-            className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            className="cad-icon-btn h-6 w-6"
             title="Clear chat"
+            aria-label="Clear chat"
           >
             <Trash2 size={12} />
           </button>
           <button
             onClick={togglePanel}
-            className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            className="cad-icon-btn h-6 w-6"
             title="Minimize"
+            aria-label="Minimize chat"
           >
             <ChevronDown size={14} />
           </button>

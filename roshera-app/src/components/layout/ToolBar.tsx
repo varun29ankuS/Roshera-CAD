@@ -263,12 +263,14 @@ function FlyoutGroup({ group, openId, onToggle }: {
         ref={triggerRef}
         onClick={() => onToggle(group.id)}
         className={cn(
-          'w-14 py-2 flex flex-col items-center justify-center rounded-lg transition-colors cursor-pointer gap-1',
+          'cad-focus w-14 py-2 flex flex-col items-center justify-center rounded-lg transition-colors cursor-pointer gap-1',
           anyActive && !isOpen && 'bg-primary/20 text-primary',
           isOpen && 'bg-accent text-foreground',
           !anyActive && !isOpen && 'text-muted-foreground hover:text-foreground hover:bg-accent',
         )}
         title={group.tooltip}
+        aria-label={group.tooltip}
+        aria-expanded={isOpen}
       >
         <group.icon size={22} strokeWidth={1.5} />
         <span className="text-[9px] leading-none tracking-wide">{group.tooltip.split(' ')[0]}</span>
@@ -281,7 +283,7 @@ function FlyoutGroup({ group, openId, onToggle }: {
           className="fixed z-[9999]"
           style={{ top: pos.top, left: pos.left }}
         >
-          <div className="min-w-[180px] py-1 rounded-lg border border-border bg-card/95 backdrop-blur-md shadow-2xl">
+          <div className="cad-panel-floating min-w-[180px] py-1 rounded-lg">
           {group.sections.map((section, si) => (
             <div key={section.label}>
               {si > 0 && <div className="h-px bg-border/40 mx-2 my-1" />}
@@ -514,7 +516,7 @@ export function ToolBar() {
   ]
 
   return (
-    <div ref={toolbarRef} className="flex flex-col items-center w-16 bg-card/80 backdrop-blur-sm border-r border-border py-2 gap-1 overflow-visible">
+    <div ref={toolbarRef} className="flex flex-col items-center w-16 cad-panel border-r py-2 gap-1 overflow-visible">
       {groups.map((group) => (
         <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
       ))}

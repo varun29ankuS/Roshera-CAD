@@ -14,7 +14,7 @@ export function StatusBar() {
   const gridSettings = useSceneStore((s) => s.gridSettings)
 
   return (
-    <div className="flex items-center h-6 border-t border-border bg-card/80 backdrop-blur-sm px-3 text-[10px] text-muted-foreground">
+    <div className="flex items-center h-6 cad-panel border-t px-3 text-[10px] text-muted-foreground">
       <span className="uppercase tracking-wider font-medium">
         {selectionMode === 'object' ? activeTool : `${selectionMode} select`}
       </span>
