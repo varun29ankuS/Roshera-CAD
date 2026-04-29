@@ -43,6 +43,9 @@ regex = "1.10"
 async-stream = "0.3"
 sysinfo = "0.30"
 base64 = "0.22"
+# CPU triangle rasterizer in `frame.rs` encodes its framebuffer as a
+# PNG so multimodal LLMs can consume the image directly.
+png = "0.17"
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 hyper = "1.0"
