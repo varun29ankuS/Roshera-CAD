@@ -242,28 +242,47 @@ fn should_encrypt_chunk(chunk_type: ChunkType) -> bool {
     chunk_type.should_encrypt()
 }
 
-/// Load chunks from v2 file (placeholder implementation)
+/// Load chunks from a v2 .ros file.
+///
+/// The v2 chunk format (legacy) is recognized by [`detect_ros_version`] but
+/// no v2 reader exists in this codebase. Returning [`RosFileError::Unsupported`]
+/// here ensures `migrate_v2_to_v3` fails loudly instead of silently producing
+/// an empty v3 file (which would corrupt downstream consumers expecting at
+/// least META and GEOM chunks).
+///
+/// To enable v2 migration, implement a parser that reads the v2 header,
+/// chunk table, and chunk payloads, then maps each entry to a [`Chunk`]
+/// with the equivalent v3 [`ChunkType`]. Until then, this is a hard error.
 fn load_v2_chunks(_file: &mut File) -> Result<Vec<Chunk>> {
-    // TODO: Implement actual v2 chunk loading
-    // This would involve:
-    // 1. Reading v2 header
-    // 2. Reading v2 chunk table
-    // 3. Loading each chunk with v2 format
-    // 4. Converting to v3 chunk format
-
-    Ok(Vec::new())
+    Err(RosFileError::Unsupported {
+        operation: "load_v2_chunks".to_string(),
+        reason: "v2 .ros chunk reader is not implemented; v2 files can be \
+                 detected but cannot be migrated to v3 in this build"
+            .to_string(),
+    })
 }
 
-/// Write a complete v3 file
+/// Write a complete v3 .ros file.
+///
+/// Layout:
+/// - bytes `[0, HEADER_SIZE)`           : 128-byte file header
+/// - bytes `[HEADER_SIZE, data_offset)` : chunk index table (`96 * N` bytes)
+/// - bytes `[data_offset, file_size)`   : chunk payloads, written sequentially
+///
+/// Each chunk's `index.offset` is stamped with its absolute byte position
+/// before the index table is written, so readers can seek to chunk data
+/// directly. The header's `file_size` is patched in-place after all chunks
+/// have been written.
 fn write_v3_file<P: AsRef<Path>>(
     path: P,
-    chunks: Vec<Chunk>,
+    mut chunks: Vec<Chunk>,
     key_set: Option<crate::ros_fs::keys::KeySet>,
     file_iv: Option<[u8; 8]>,
 ) -> Result<()> {
-    use crate::ros_fs::header::FileHeader;
+    use crate::ros_fs::chunk::{ChunkTable, CHUNK_INDEX_ENTRY_SIZE};
+    use crate::ros_fs::header::{FileHeader, HEADER_SIZE};
     use std::fs::OpenOptions;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -271,15 +290,38 @@ fn write_v3_file<P: AsRef<Path>>(
         .truncate(true)
         .open(path)?;
 
-    // Build header
-    let mut builder = FileHeader::builder()
-        .with_file_size(0) // Will be updated after writing chunks
-        .with_index_info(
-            128, // Index starts after header
-            chunks.len() as u32,
-        );
+    let chunk_count = chunks.len() as u32;
+    let index_offset: u64 = HEADER_SIZE as u64;
+    let index_size: u64 = CHUNK_INDEX_ENTRY_SIZE as u64 * chunk_count as u64;
+    let data_offset: u64 = index_offset + index_size;
 
-    // Add encryption info if applicable
+    // Stamp absolute on-disk offsets and align compressed_size with payload
+    // length. compressed_size is the source of truth for `size_on_disk()`
+    // when a chunk is stored compressed; for uncompressed chunks the field
+    // is left at 0 and `uncompressed_size` is used.
+    let mut cursor = data_offset;
+    for chunk in chunks.iter_mut() {
+        chunk.index.offset = cursor;
+        let on_disk = chunk.data.len() as u64;
+        if chunk.index.is_compressed() {
+            chunk.index.compressed_size = on_disk;
+        } else {
+            chunk.index.uncompressed_size = on_disk;
+        }
+        cursor = cursor
+            .checked_add(on_disk)
+            .ok_or_else(|| RosFileError::Other {
+                message: "v3 file size overflowed u64 while computing chunk offsets".to_string(),
+                source: None,
+            })?;
+    }
+    let total_file_size = cursor;
+
+    // Build header with the now-known file size and index location.
+    let mut builder = FileHeader::builder()
+        .with_file_size(total_file_size)
+        .with_index_info(index_offset, chunk_count);
+
     if let (Some(keys), Some(iv)) = (key_set, file_iv) {
         builder = builder.with_encryption(
             1,              // AES-256-GCM
@@ -292,12 +334,24 @@ fn write_v3_file<P: AsRef<Path>>(
 
     let mut header = builder.build();
 
-    // Write header (placeholder)
+    // 1. Header at offset 0.
     header.write_to(&mut file)?;
 
-    // Write chunk index and data
-    // TODO: Implement actual chunk writing
+    // 2. Chunk index table immediately after the header.
+    let mut table = ChunkTable::new();
+    for chunk in chunks.iter() {
+        table.add(chunk.index.clone());
+    }
+    file.seek(SeekFrom::Start(index_offset))?;
+    table.write_to(&mut file)?;
 
+    // 3. Chunk payloads in the same order as the index table.
+    file.seek(SeekFrom::Start(data_offset))?;
+    for chunk in chunks.iter() {
+        file.write_all(&chunk.data)?;
+    }
+
+    file.flush()?;
     Ok(())
 }
 
