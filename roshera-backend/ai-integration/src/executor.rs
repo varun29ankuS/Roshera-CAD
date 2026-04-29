@@ -88,7 +88,9 @@ impl CommandExecutor {
             ));
         }
 
-        // Move CPU-intensive geometry work to background thread
+        // Move CPU-intensive geometry work to background thread.
+        // The lock is acquired *inside* spawn_blocking so the async runtime
+        // thread is never blocked on it; sync RwLock is intentional here.
         let model_clone = Arc::clone(&self.model);
         let solid_id = tokio::task::spawn_blocking(move || {
             let params = BoxParameters {
@@ -100,8 +102,14 @@ impl CommandExecutor {
                 tolerance: None,
             };
 
-            // Create box using the primitive system
-            let mut model = BRepModel::new();
+            // Build the box into the shared B-Rep model so subsequent
+            // commands (boolean, transform) can resolve its SolidId. The
+            // earlier code constructed a throwaway BRepModel here, which
+            // meant boxes never entered executor state — every follow-up
+            // command on a box id failed with InvalidParameters.
+            let mut model = model_clone
+                .write()
+                .expect("BRep model RwLock poisoned; prior holder panicked");
             let solid_id = BoxPrimitive::create(params, &mut model)
                 .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
             Ok::<SolidId, ExecutorError>(solid_id)
