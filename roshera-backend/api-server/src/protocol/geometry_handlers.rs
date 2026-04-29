@@ -1484,9 +1484,9 @@ fn estimate_center_of_mass_from_mesh(mesh: &Mesh) -> [f64; 3] {
     if total_volume.abs() < 1.0e-12 {
         let bounds = mesh.bounds();
         return [
-            (bounds.min[0] + bounds.max[0]) * 0.5,
-            (bounds.min[1] + bounds.max[1]) * 0.5,
-            (bounds.min[2] + bounds.max[2]) * 0.5,
+            ((bounds.min[0] + bounds.max[0]) * 0.5) as f64,
+            ((bounds.min[1] + bounds.max[1]) * 0.5) as f64,
+            ((bounds.min[2] + bounds.max[2]) * 0.5) as f64,
         ];
     }
 
