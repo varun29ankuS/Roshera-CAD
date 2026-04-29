@@ -1347,6 +1347,52 @@ impl<'a> TopologyBuilder<'a> {
         Ok(GeometryId::Solid(solid_id))
     }
 
+    /// Create 3D torus
+    ///
+    /// Delegates topology construction to
+    /// [`crate::primitives::torus_primitive::TorusPrimitive::create`] and
+    /// records the operation on the timeline. The axis is normalised by
+    /// `TorusParameters::new`; pass any non-zero direction.
+    pub fn create_torus_3d(
+        &mut self,
+        center: Point3,
+        axis: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> Result<GeometryId, PrimitiveError> {
+        // Build & validate parameters (also normalises the axis and
+        // rejects degenerate radii / self-intersecting tori).
+        let params = crate::primitives::torus_primitive::TorusParameters::new(
+            center,
+            axis,
+            major_radius,
+            minor_radius,
+        )?;
+
+        let solid_id =
+            crate::primitives::torus_primitive::TorusPrimitive::create(&params, self.model)?;
+
+        // Record in timeline + forward to attached recorder.
+        let operation = TimelineOperation::Create3D {
+            primitive_type: "torus".to_string(),
+            parameters: [
+                ("center_x".to_string(), center.x),
+                ("center_y".to_string(), center.y),
+                ("center_z".to_string(), center.z),
+                ("axis_x".to_string(), params.axis.x),
+                ("axis_y".to_string(), params.axis.y),
+                ("axis_z".to_string(), params.axis.z),
+                ("major_radius".to_string(), major_radius),
+                ("minor_radius".to_string(), minor_radius),
+            ]
+            .into(),
+            timestamp: self.next_timestamp(),
+        };
+        self.record_and_push(operation, vec![solid_id as u64]);
+
+        Ok(GeometryId::Solid(solid_id))
+    }
+
     /// Create a plane primitive as a thin box
     pub fn plane_primitive(
         &mut self,
