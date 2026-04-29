@@ -1089,11 +1089,23 @@ impl Surface for VariableRadiusFillet {
     }
 
     fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
-        // Evaluate NURBS with second-order derivatives
+        // Evaluate NURBS with second-order derivatives. Missing first-order
+        // derivatives are a hard failure: silently substituting zero would
+        // collapse E, F, G in the first fundamental form to zero, making the
+        // curvature denominator vanish and producing fake k1=k2=0 — which
+        // then poisons fillet-radius selection downstream.
         let eval = self.nurbs.evaluate_derivatives(u, v, 2, 2);
         let position = eval.point;
-        let du = eval.du.unwrap_or(Vector3::ZERO);
-        let dv = eval.dv.unwrap_or(Vector3::ZERO);
+        let du = eval.du.ok_or_else(|| {
+            MathError::InvalidParameter(format!(
+                "NURBS du derivative unavailable at (u={u}, v={v})"
+            ))
+        })?;
+        let dv = eval.dv.ok_or_else(|| {
+            MathError::InvalidParameter(format!(
+                "NURBS dv derivative unavailable at (u={u}, v={v})"
+            ))
+        })?;
         let normal = eval
             .normal
             .or_else(|| {
@@ -1105,8 +1117,16 @@ impl Surface for VariableRadiusFillet {
                     None
                 }
             })
-            .unwrap_or(Vector3::Z);
+            .ok_or_else(|| {
+                MathError::InvalidParameter(format!(
+                    "NURBS surface degenerate at (u={u}, v={v}) — du×dv has zero length"
+                ))
+            })?;
 
+        // Second-order derivatives may legitimately be unavailable for
+        // surfaces that are only C^1; in that case we degrade to flat
+        // curvature (k1=k2=0) by substituting zero, which yields the correct
+        // shape operator on the fundamental form below.
         let duu = eval.duu.unwrap_or(Vector3::ZERO);
         let dvv = eval.dvv.unwrap_or(Vector3::ZERO);
         let duv = eval.duv.unwrap_or(Vector3::ZERO);
