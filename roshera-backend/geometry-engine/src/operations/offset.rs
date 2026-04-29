@@ -781,15 +781,32 @@ fn validate_shell_inputs(
     Ok(())
 }
 
-/// Validate shell solid
+/// Validate shell solid by running the full B-Rep validation suite.
 fn validate_shell_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
-    // Would perform full validation
     if model.solids.get(solid_id).is_none() {
         return Err(OperationError::InvalidBRep(
             "Shell solid not found".to_string(),
         ));
     }
-
+    let result = crate::primitives::validation::validate_model_enhanced(
+        model,
+        Tolerance::default(),
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !result.is_valid {
+        let summary = result
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| format!("{:?}", e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(OperationError::InvalidBRep(format!(
+            "Shell solid failed validation ({} errors): {}",
+            result.errors.len(),
+            summary
+        )));
+    }
     Ok(())
 }
 
