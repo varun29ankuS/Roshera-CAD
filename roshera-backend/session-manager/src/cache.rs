@@ -706,8 +706,8 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             sketch_planes: std::collections::HashMap::new(),
             active_sketch_plane: None,
-            orientation_cube: OrientationCubeState::default(),
-            sketch_state: SketchState::default(),
+            orientation_cube: shared_types::session::OrientationCubeState::default(),
+            sketch_state: shared_types::session::SketchState::default(),
         };
 
         manager.cache_session(&session).await;

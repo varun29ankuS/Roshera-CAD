@@ -63,13 +63,7 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
     // Process outer loop
     if let Some(outer_loop) = model.loops.get(face.outer_loop) {
         let start_idx = all_vertices.len();
-        if let Ok(vertices) = outer_loop.vertices(&model.edges) {
-            for &vertex_id in &vertices {
-                if let Some(vertex) = model.vertices.get(vertex_id) {
-                    all_vertices.push(Point3::from(vertex.position));
-                }
-            }
-        }
+        sample_loop_3d_polygon(outer_loop, model, &mut all_vertices);
         let end_idx = all_vertices.len();
         if end_idx > start_idx {
             loop_boundaries.push((start_idx, end_idx, true)); // true = outer loop
@@ -80,13 +74,7 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
     for &inner_loop_id in &face.inner_loops {
         if let Some(inner_loop) = model.loops.get(inner_loop_id) {
             let start_idx = all_vertices.len();
-            if let Ok(vertices) = inner_loop.vertices(&model.edges) {
-                for &vertex_id in &vertices {
-                    if let Some(vertex) = model.vertices.get(vertex_id) {
-                        all_vertices.push(Point3::from(vertex.position));
-                    }
-                }
-            }
+            sample_loop_3d_polygon(inner_loop, model, &mut all_vertices);
             let end_idx = all_vertices.len();
             if end_idx > start_idx {
                 loop_boundaries.push((start_idx, end_idx, false)); // false = inner loop (hole)
@@ -145,6 +133,94 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
                 vertex_map[triangle[2]],
                 vertex_map[triangle[1]],
             );
+        }
+    }
+}
+
+/// Sample a loop's edges into a dense 3D polygon for the planar
+/// tessellator.
+///
+/// # Why dense sampling is required
+/// `Loop::vertices(...)` returns one B-Rep vertex per edge (start or
+/// end depending on orientation). For a planar face with a single
+/// closed-edge loop — e.g. a cylinder cap whose only edge is a full
+/// circle whose `start_vertex == end_vertex` — that yields a
+/// **single** vertex, not enough to triangulate. The previous code
+/// then hit `all_vertices.len() < 3` and returned, emitting zero
+/// triangles for every cap. Cylinders therefore looked hollow.
+///
+/// # Strategy
+/// For each edge:
+/// * If the curve is a straight line (cross product of mid-vs-endpoint
+///   vectors below tolerance) emit a single sample at `t_start`. This
+///   matches the previous one-vertex-per-edge behaviour for box faces
+///   and keeps the resulting ear-clipping cheap.
+/// * If the edge is closed (start == end vertex) it is necessarily
+///   curved (a circle, ellipse, or NURBS loop). Sample 32 points so the
+///   resulting polygon approximates the curve well.
+/// * Otherwise (curved arc with distinct endpoints) sample 16 points.
+///
+/// Sampling uses the loop's recorded edge orientation so the polygon
+/// winds consistently — `triangulate_planar_polygon` then forces outer
+/// CCW / inner CW via the shoelace test, so absolute winding here is
+/// not load-bearing, but per-edge orientation must be respected to
+/// keep the polygon simple.
+fn sample_loop_3d_polygon(
+    loop_data: &crate::primitives::r#loop::Loop,
+    model: &BRepModel,
+    out: &mut Vec<Point3>,
+) {
+    const SAMPLES_CLOSED_EDGE: usize = 32;
+    const SAMPLES_CURVED_EDGE: usize = 16;
+    const COLLINEAR_TOL: f64 = 1e-9;
+
+    for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+        let forward = loop_data.orientations.get(i).copied().unwrap_or(true);
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e,
+            None => continue,
+        };
+        let curve = match model.curves.get(edge.curve_id) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let (t_start, t_end) = if forward {
+            (edge.param_range.start, edge.param_range.end)
+        } else {
+            (edge.param_range.end, edge.param_range.start)
+        };
+
+        // Decide sampling density. Closed edges are always curved; for
+        // open edges, a 3-point collinearity check decides.
+        let is_closed_edge = edge.start_vertex == edge.end_vertex;
+        let n = if is_closed_edge {
+            SAMPLES_CLOSED_EDGE
+        } else {
+            let mid = (t_start + t_end) * 0.5;
+            match (
+                curve.point_at(t_start),
+                curve.point_at(mid),
+                curve.point_at(t_end),
+            ) {
+                (Ok(p_start), Ok(p_mid), Ok(p_end)) => {
+                    let v1 = p_mid - p_start;
+                    let v2 = p_end - p_start;
+                    if v1.cross(&v2).magnitude() < COLLINEAR_TOL {
+                        1
+                    } else {
+                        SAMPLES_CURVED_EDGE
+                    }
+                }
+                _ => 1,
+            }
+        };
+
+        for j in 0..n {
+            let t = t_start + (j as f64) * (t_end - t_start) / (n as f64);
+            if let Ok(p) = curve.point_at(t) {
+                out.push(p);
+            }
         }
     }
 }
@@ -764,7 +840,8 @@ fn tessellate_spherical_with_poles(
             for u_idx in 0..=u_steps {
                 let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
 
-                if is_point_inside_face(u, v, face, model) {
+                let inside = is_point_inside_face(u, v, face, model);
+                if inside {
                     if let (Ok(point), Ok(normal)) = (
                         surface.point_at(u, v),
                         face.normal_at(u, v, &model.surfaces),
@@ -1526,7 +1603,14 @@ fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, 
     )
 }
 
-/// Update parameter bounds from a loop
+/// Update parameter bounds from a loop.
+///
+/// Routes through `project_loop_uv_unwrapped` so the bounds reflect the
+/// loop's true span in the lifted parameter domain. Without the unwrap
+/// a closed bottom_circle on a cylinder would produce
+/// `u_max - u_min ≈ π` (samples `0, π/10, ..., 19π/10` then wrap
+/// modulo `2π`) instead of the correct `2π`, causing the grid
+/// tessellator to cover only half the cylinder.
 fn update_bounds_from_loop(
     loop_data: &crate::primitives::r#loop::Loop,
     model: &BRepModel,
@@ -1536,28 +1620,15 @@ fn update_bounds_from_loop(
     v_min: &mut f64,
     v_max: &mut f64,
 ) {
-    // Sample edges in the loop
-    for &edge_id in &loop_data.edges {
-        if let Some(edge) = model.edges.get(edge_id) {
-            if let Some(curve) = model.curves.get(edge.curve_id) {
-                // Sample points along the edge
-                let num_samples = 10;
-                for i in 0..=num_samples {
-                    let t = edge.param_range.start
-                        + (i as f64) * (edge.param_range.end - edge.param_range.start)
-                            / (num_samples as f64);
-                    if let Ok(point_3d) = curve.point_at(t) {
-                        // Project to surface parameter space
-                        if let Ok((u, v)) = surface.closest_point(&point_3d, Tolerance::default()) {
-                            *u_min = u_min.min(u);
-                            *u_max = u_max.max(u);
-                            *v_min = v_min.min(v);
-                            *v_max = v_max.max(v);
-                        }
-                    }
-                }
-            }
-        }
+    // Bounds extremum scan: must include both endpoints of each edge
+    // so a sphere's seam-edge sample at t=π hits v=π (otherwise v_max
+    // would clamp to 10π/11, missing the north-pole region).
+    let polygon = project_loop_uv_unwrapped(loop_data, model, surface, 10, true);
+    for (u, v) in polygon {
+        *u_min = u_min.min(u);
+        *u_max = u_max.max(u);
+        *v_min = v_min.min(v);
+        *v_max = v_max.max(v);
     }
 }
 
@@ -1578,7 +1649,24 @@ fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool 
     true
 }
 
-/// Check if a point is inside a loop using winding number algorithm
+/// Check if a point is inside a loop using winding number algorithm.
+///
+/// Handles three cases explicitly:
+///
+/// 1. **Non-degenerate polygon** — winding-number test (Sunday 2001).
+///    A non-zero winding number indicates the point is enclosed.
+///
+/// 2. **Degenerate polygon** (fewer than 3 distinct samples, or
+///    near-zero signed area) — the loop is a topological seam, not a
+///    meaningful boundary in parameter space. The canonical case is a
+///    sphere face whose outer loop is a single seam edge traversed
+///    forward then reversed; in `(u, v)` it collapses onto the line
+///    `u = 0`. For an **outer** loop this means the face covers the
+///    full parametric domain — accept any point. For an **inner** loop
+///    (a hole) it means there is effectively no hole — reject any
+///    point as not-in-hole.
+///
+/// 3. **Missing loop / surface** — return `false` for safety.
 fn is_point_inside_loop(
     u: f64,
     v: f64,
@@ -1596,48 +1684,178 @@ fn is_point_inside_loop(
         None => return false,
     };
 
-    // Get loop as 2D polygon in parameter space
     let polygon = get_loop_polygon_2d(loop_data, model, surface);
+
+    // Degenerate-polygon fallback. Tolerance chosen well below any
+    // realistic face area in radians² (a 1-arc-second-square loop has
+    // area ≈ 2.3e-11) yet large enough to absorb f64 round-off in
+    // `closest_point` projections (~1e-15 per sample × 20 samples per
+    // edge × O(1) edges ≈ 2e-14 noise floor).
+    const DEGENERATE_AREA_TOL: f64 = 1e-12;
+    let is_outer = matches!(
+        loop_data.loop_type,
+        crate::primitives::r#loop::LoopType::Outer
+    );
     if polygon.len() < 3 {
-        return false;
+        return is_outer;
+    }
+    if polygon_signed_area_uv(&polygon).abs() < DEGENERATE_AREA_TOL {
+        return is_outer;
     }
 
-    // Use winding number algorithm
     let winding_number = calculate_winding_number(&(u, v), &polygon);
-
-    // Point is inside if winding number is non-zero
     winding_number.abs() > 0.5
 }
 
-/// Get loop as 2D polygon in parameter space
+/// Get loop as 2D polygon in parameter space.
+///
+/// Thin wrapper over `project_loop_uv_unwrapped`; kept as a named entry
+/// point for the winding-number test in `is_point_inside_loop`.
 fn get_loop_polygon_2d(
     loop_data: &crate::primitives::r#loop::Loop,
     model: &BRepModel,
     surface: &dyn Surface,
 ) -> Vec<(f64, f64)> {
-    let mut polygon = Vec::new();
+    // Closed loop: drop trailing endpoint of each edge to avoid
+    // duplicating the seam vertex with the next edge's start.
+    project_loop_uv_unwrapped(loop_data, model, surface, 20, false)
+}
 
-    for &edge_id in &loop_data.edges {
-        if let Some(edge) = model.edges.get(edge_id) {
-            if let Some(curve) = model.curves.get(edge.curve_id) {
-                // Sample edge to get points
-                let num_samples = 20; // Higher sampling for better accuracy
-                for i in 0..num_samples {
-                    let t = edge.param_range.start
-                        + (i as f64) * (edge.param_range.end - edge.param_range.start)
-                            / (num_samples as f64);
-                    if let Ok(point_3d) = curve.point_at(t) {
-                        // Project to surface parameter space
-                        if let Ok((u, v)) = surface.closest_point(&point_3d, Tolerance::default()) {
-                            polygon.push((u, v));
-                        }
+/// Project a B-Rep loop into the surface's `(u, v)` parameter space,
+/// unwrapping across periodicity discontinuities so consecutive samples
+/// form a continuous trace.
+///
+/// # Why the unwrap is required
+/// `Surface::closest_point` returns canonical `(u, v)` in the surface's
+/// declared parameter bounds — for a cylinder/sphere/torus this means
+/// `u ∈ [0, 2π)`. Without unwrapping, sampling a closed loop edge (e.g.
+/// the bottom_circle of a cylinder, parameterised `t ∈ [0, 2π]`)
+/// produces u-coordinates that jump from `≈ 2π` back to `0` at the
+/// seam. The resulting 2D polygon self-intersects and downstream
+/// winding-number / bounding-box logic fails:
+///
+///   * sphere face's seam-only outer loop projects to all `u = 0`
+///     (collapsed seam) — the face covers the entire surface but the
+///     winding test classifies every interior sample as "outside";
+///   * cylinder lateral's bottom_circle projects to `0 → π → 2π → 0`
+///     instead of monotone `0 → π → 2π → 4π`, the winding number is
+///     wrong over most of the surface.
+///
+/// Unwrapping pulls each new sample within `period/2` of the previous
+/// one, preserving the topological intent (the trace is the lift of
+/// the closed loop into the universal cover of the parameter domain).
+///
+/// # Arguments
+/// * `loop_data`        - The loop whose edges are sampled in order
+/// * `model`            - B-Rep model for edge / curve lookup
+/// * `surface`          - Owning surface; queried for periodicity
+/// * `intervals`        - Number of equal sub-intervals along each
+///                        edge's parameter range
+/// * `inclusive`        - If `true`, sample at both endpoints (gives
+///                        `intervals + 1` samples, used for
+///                        bounds-extremum scans). If `false`, sample
+///                        `[t_start, t_end)` (gives `intervals`
+///                        samples; preferred for closed loops to avoid
+///                        duplicating the seam vertex with the next
+///                        edge's start).
+///
+/// # Returns
+/// `(u, v)` polygon, possibly empty if no edges produced valid samples.
+fn project_loop_uv_unwrapped(
+    loop_data: &crate::primitives::r#loop::Loop,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    intervals: usize,
+    inclusive: bool,
+) -> Vec<(f64, f64)> {
+    let u_period = surface.period_u();
+    let v_period = surface.period_v();
+    let upper = if inclusive { intervals + 1 } else { intervals };
+    let mut polygon = Vec::with_capacity(loop_data.edges.len() * upper);
+    let mut last: Option<(f64, f64)> = None;
+
+    for (edge_idx, &edge_id) in loop_data.edges.iter().enumerate() {
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e,
+            None => continue,
+        };
+        let curve = match model.curves.get(edge.curve_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        // Honor the loop's recorded edge orientation: when the loop
+        // traverses an edge in reverse (orientations[i] == false), we
+        // must sample its parameter range from end → start, otherwise a
+        // sphere face's seam-edge-traversed-twice loop projects as
+        // *forward + forward* in (u, v) and accumulates a non-zero
+        // signed area. The degenerate-loop fallback in
+        // `is_point_inside_loop` would then fail to fire and the
+        // winding-number test rejects most interior samples.
+        let forward = loop_data
+            .orientations
+            .get(edge_idx)
+            .copied()
+            .unwrap_or(true);
+        let (t_a, t_b) = if forward {
+            (edge.param_range.start, edge.param_range.end)
+        } else {
+            (edge.param_range.end, edge.param_range.start)
+        };
+        for i in 0..upper {
+            let t = t_a + (i as f64) * (t_b - t_a) / (intervals as f64);
+            let point_3d = match curve.point_at(t) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let (mut u, mut v) = match surface.closest_point(&point_3d, Tolerance::default()) {
+                Ok(uv) => uv,
+                Err(_) => continue,
+            };
+            if let Some((prev_u, prev_v)) = last {
+                if let Some(period) = u_period {
+                    let half = period * 0.5;
+                    while u - prev_u > half {
+                        u -= period;
+                    }
+                    while u - prev_u < -half {
+                        u += period;
+                    }
+                }
+                if let Some(period) = v_period {
+                    let half = period * 0.5;
+                    while v - prev_v > half {
+                        v -= period;
+                    }
+                    while v - prev_v < -half {
+                        v += period;
                     }
                 }
             }
+            polygon.push((u, v));
+            last = Some((u, v));
         }
     }
 
     polygon
+}
+
+/// Compute the signed area of a closed `(u, v)` polygon (shoelace).
+///
+/// Used by the degenerate-loop fallback in `is_point_inside_loop` to
+/// detect seam-only outer loops (sphere) whose unwrapped projection
+/// still collapses onto a single line in parameter space.
+fn polygon_signed_area_uv(polygon: &[(f64, f64)]) -> f64 {
+    let n = polygon.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in 0..n {
+        let (x0, y0) = polygon[i];
+        let (x1, y1) = polygon[(i + 1) % n];
+        sum += x0 * y1 - x1 * y0;
+    }
+    sum * 0.5
 }
 
 /// Calculate winding number for point-in-polygon test

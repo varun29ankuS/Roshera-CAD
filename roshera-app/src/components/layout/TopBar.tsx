@@ -119,6 +119,10 @@ export function TopBar() {
             </MenubarSub>
             <MenubarSeparator />
             <MenubarItem onClick={clearScene}>Clear Scene</MenubarItem>
+            <MenubarSeparator />
+            <MenubarItem onClick={() => (window.location.hash = '#/demos')}>
+              Demo Gallery
+            </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
 

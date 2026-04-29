@@ -1,5 +1,6 @@
 //! OBJ file format support
 
+use shared_types::geometry::MaterialProperties;
 use shared_types::{ExportError, Mesh};
 
 /// Generate OBJ content

@@ -1,0 +1,188 @@
+{
+  "demos": [
+    {
+      "category": "booleans",
+      "filename": "box-cylinder_diff.stl",
+      "stl_path": "booleans/box-cylinder_diff.stl",
+      "verts": 20,
+      "tris": 10,
+      "tess_ms": 0.0135
+    },
+    {
+      "category": "booleans",
+      "filename": "box-cylinder_inter.stl",
+      "stl_path": "booleans/box-cylinder_inter.stl",
+      "verts": 20,
+      "tris": 10,
+      "tess_ms": 0.0088
+    },
+    {
+      "category": "booleans",
+      "filename": "box-cylinder_union.stl",
+      "stl_path": "booleans/box-cylinder_union.stl",
+      "verts": 10225,
+      "tris": 20012,
+      "tess_ms": 1.7081
+    },
+    {
+      "category": "booleans",
+      "filename": "box-sphere_diff.stl",
+      "stl_path": "booleans/box-sphere_diff.stl",
+      "verts": 28,
+      "tris": 16,
+      "tess_ms": 0.0157
+    },
+    {
+      "category": "booleans",
+      "filename": "box-sphere_inter.stl",
+      "stl_path": "booleans/box-sphere_inter.stl",
+      "verts": 6,
+      "tris": 2,
+      "tess_ms": 0.0054
+    },
+    {
+      "category": "booleans",
+      "filename": "box-sphere_union.stl",
+      "stl_path": "booleans/box-sphere_union.stl",
+      "verts": 28,
+      "tris": 16,
+      "tess_ms": 0.0369
+    },
+    {
+      "category": "booleans",
+      "filename": "sphere-cylinder_union.stl",
+      "stl_path": "booleans/sphere-cylinder_union.stl",
+      "verts": 10201,
+      "tris": 20000,
+      "tess_ms": 1.4376
+    },
+    {
+      "category": "extrude_revolve",
+      "filename": "l_extrude.stl",
+      "stl_path": "extrude_revolve/l_extrude.stl",
+      "verts": 456,
+      "tris": 536,
+      "tess_ms": 18.8463
+    },
+    {
+      "category": "extrude_revolve",
+      "filename": "rect_extrude.stl",
+      "stl_path": "extrude_revolve/rect_extrude.stl",
+      "verts": 304,
+      "tris": 356,
+      "tess_ms": 7.4959
+    },
+    {
+      "category": "extrude_revolve",
+      "filename": "ring_revolve.stl",
+      "stl_path": "extrude_revolve/ring_revolve.stl",
+      "verts": 2418,
+      "tris": 1990,
+      "tess_ms": 125.4853
+    },
+    {
+      "category": "features",
+      "filename": "chamfer_box.stl",
+      "stl_path": "features/chamfer_box.stl",
+      "verts": 1308,
+      "tris": 2136,
+      "tess_ms": 28.4778
+    },
+    {
+      "category": "features",
+      "filename": "fillet_box.stl",
+      "stl_path": "features/fillet_box.stl",
+      "verts": 24,
+      "tris": 12,
+      "tess_ms": 0.029
+    },
+    {
+      "category": "primitives",
+      "filename": "box.stl",
+      "stl_path": "primitives/box.stl",
+      "verts": 24,
+      "tris": 12,
+      "tess_ms": 0.0392
+    },
+    {
+      "category": "primitives",
+      "filename": "cone.stl",
+      "stl_path": "primitives/cone.stl",
+      "verts": 10100,
+      "tris": 19800,
+      "tess_ms": 1.886
+    },
+    {
+      "category": "primitives",
+      "filename": "cylinder.stl",
+      "stl_path": "primitives/cylinder.stl",
+      "verts": 10201,
+      "tris": 20000,
+      "tess_ms": 1.4047
+    },
+    {
+      "category": "primitives",
+      "filename": "sphere.stl",
+      "stl_path": "primitives/sphere.stl",
+      "verts": 4500,
+      "tris": 8715,
+      "tess_ms": 38.4509
+    },
+    {
+      "category": "primitives",
+      "filename": "torus.stl",
+      "stl_path": "primitives/torus.stl",
+      "verts": 5151,
+      "tris": 10000,
+      "tess_ms": 1.2147
+    },
+    {
+      "category": "sweep_loft",
+      "filename": "circle_sweep.stl",
+      "stl_path": "sweep_loft/circle_sweep.stl",
+      "verts": 82800,
+      "tris": 131300,
+      "tess_ms": 1715.1407000000002
+    },
+    {
+      "category": "sweep_loft",
+      "filename": "tri_loft.stl",
+      "stl_path": "sweep_loft/tri_loft.stl",
+      "verts": 1461,
+      "tris": 2224,
+      "tess_ms": 402.3623
+    },
+    {
+      "category": "transforms",
+      "filename": "identity.stl",
+      "stl_path": "transforms/identity.stl",
+      "verts": 24,
+      "tris": 12,
+      "tess_ms": 0.0128
+    },
+    {
+      "category": "transforms",
+      "filename": "rotated.stl",
+      "stl_path": "transforms/rotated.stl",
+      "verts": 24,
+      "tris": 12,
+      "tess_ms": 0.007
+    },
+    {
+      "category": "transforms",
+      "filename": "scaled.stl",
+      "stl_path": "transforms/scaled.stl",
+      "verts": 24,
+      "tris": 12,
+      "tess_ms": 0.0112
+    },
+    {
+      "category": "transforms",
+      "filename": "translated.stl",
+      "stl_path": "transforms/translated.stl",
+      "verts": 24,
+      "tris": 12,
+      "tess_ms": 0.0046
+    }
+  ]
+}

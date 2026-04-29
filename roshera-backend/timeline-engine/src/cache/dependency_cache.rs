@@ -278,6 +278,7 @@ fn estimate_deps_size(deps: &CachedDependencies) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConstraintType;
 
     #[test]
     fn test_dependency_cache_basic() {

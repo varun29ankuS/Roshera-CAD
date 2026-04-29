@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
@@ -7,23 +7,54 @@ import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { AIChatPanel } from '@/components/panels/AIChatPanel'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { Timeline } from '@/components/panels/Timeline'
+import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
+import { ViewportBridge } from '@/lib/viewport-bridge'
 import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+
+const DEMOS_HASH = '#/demos'
+
+function isDemosRoute(): boolean {
+  return typeof window !== 'undefined' && window.location.hash === DEMOS_HASH
+}
 
 export function App() {
   useKeyboardShortcuts()
   const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
   const [leftPanelOpen, setLeftPanelOpen] = useState(true)
+  const [route, setRoute] = useState<'workspace' | 'demos'>(
+    isDemosRoute() ? 'demos' : 'workspace',
+  )
 
   useEffect(() => {
-    initWebSocket()
-    return () => teardownWebSocket()
+    const onHashChange = () => setRoute(isDemosRoute() ? 'demos' : 'workspace')
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
+
+  // Only the workspace owns the live websocket. The gallery is purely
+  // local file fetches, so we tear the socket down when entering it and
+  // re-init when returning.
+  useEffect(() => {
+    if (route === 'workspace') {
+      initWebSocket()
+      return () => teardownWebSocket()
+    }
+  }, [route])
+
+  const exitGallery = useCallback(() => {
+    window.location.hash = ''
+  }, [])
+
+  if (route === 'demos') {
+    return <DemoGallery onExit={exitGallery} />
+  }
 
   return (
     <div className="flex flex-col h-screen w-screen bg-background text-foreground select-none">
+      <ViewportBridge />
       <TopBar />
       <div className="flex flex-1 min-h-0">
         <ToolBar />

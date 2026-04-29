@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn test_object_locking() {
         let manager = PermissionManager::new();
-        let object_id = Uuid::new_v4();
+        let object_id = uuid::Uuid::new_v4();
         let user1 = "user1";
         let user2 = "user2";
 

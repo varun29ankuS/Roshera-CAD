@@ -579,6 +579,7 @@ impl FileHeaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ros_fs::RosFileError;
     use std::io::Cursor;
 
     #[test]

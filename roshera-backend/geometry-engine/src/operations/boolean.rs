@@ -52,6 +52,7 @@ use crate::primitives::{
     vertex::VertexId,
 };
 use std::collections::{HashMap, HashSet};
+use tracing::debug;
 
 /// Type of Boolean operation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -178,6 +179,30 @@ enum FaceClassification {
 }
 
 /// Perform Boolean operation on two solids
+/// Format a "by surface-type" histogram for a slice of split faces.
+///
+/// Returns a string like `"Plane=12 Sphere=4 Cylinder=2"`. Used by the
+/// `debug!` traces in [`boolean_operation`] and friends so the test
+/// `tests::test_box_minus_sphere_diff_curved_face_survives` can pinpoint
+/// which pipeline stage drops the curved (non-planar) faces.
+fn surface_type_histogram(model: &BRepModel, faces: &[SplitFace]) -> String {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for f in faces {
+        let key = match model.surfaces.get(f.surface).map(|s| s.surface_type()) {
+            Some(t) => format!("{:?}", t),
+            None => "Missing".to_string(),
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let mut parts: Vec<(String, usize)> = counts.into_iter().collect();
+    parts.sort_by(|a, b| a.0.cmp(&b.0));
+    parts
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn boolean_operation(
     model: &mut BRepModel,
     solid_a: SolidId,
@@ -185,6 +210,12 @@ pub fn boolean_operation(
     operation: BooleanOp,
     options: BooleanOptions,
 ) -> OperationResult<SolidId> {
+    debug!(
+        target: "geometry_engine::boolean",
+        "boolean_operation: ENTRY op={:?} solid_a={} solid_b={}",
+        operation, solid_a, solid_b,
+    );
+
     // Step 1: Compute face-face intersections
     let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
 
@@ -236,13 +267,56 @@ fn compute_face_intersections(
     let faces_b = get_solid_faces(model, solid_b)?;
 
     // Test all face pairs for intersection
+    let mut pair_curves_by_type: HashMap<String, (usize, usize)> = HashMap::new();
     for &face_a in &faces_a {
         for &face_b in &faces_b {
+            // Capture surface-type pair for the diagnostic histogram, BEFORE
+            // calling `intersect_faces` (which takes &mut model).
+            let pair_key = {
+                let ta = model
+                    .faces
+                    .get(face_a)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| format!("{:?}", s.surface_type()))
+                    .unwrap_or_else(|| "?".into());
+                let tb = model
+                    .faces
+                    .get(face_b)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| format!("{:?}", s.surface_type()))
+                    .unwrap_or_else(|| "?".into());
+                if ta <= tb {
+                    format!("{}-{}", ta, tb)
+                } else {
+                    format!("{}-{}", tb, ta)
+                }
+            };
+            let entry = pair_curves_by_type.entry(pair_key).or_insert((0, 0));
+            entry.0 += 1; // pairs tested
             if let Some(intersection) = intersect_faces(model, face_a, face_b, options)? {
+                entry.1 += intersection.curves.len(); // curves produced
                 intersections.push(intersection);
             }
         }
     }
+
+    // Diagnostic: how many curves did each surface-type pair produce?
+    // The "0 curves" rows reveal which pair (e.g. Plane-Sphere) silently
+    // failed to generate cutting curves.
+    let mut summary: Vec<(String, (usize, usize))> = pair_curves_by_type.into_iter().collect();
+    summary.sort_by(|a, b| a.0.cmp(&b.0));
+    debug!(
+        target: "geometry_engine::boolean",
+        "compute_face_intersections: faces_a={} faces_b={} → {} intersections; pair-stats: {}",
+        faces_a.len(),
+        faces_b.len(),
+        intersections.len(),
+        summary
+            .iter()
+            .map(|(k, (pairs, curves))| format!("{}({}p,{}c)", k, pairs, curves))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
 
     Ok(intersections)
 }
@@ -2085,10 +2159,39 @@ fn split_faces_along_curves(
 
     // Split each face, carrying its origin solid through to the SplitFace.
     let intersected_faces: HashSet<FaceId> = face_curves.keys().copied().collect();
+    let intersected_count = intersected_faces.len();
     for (face_id, (origin_solid, curves)) in face_curves {
+        let before = split_faces.len();
         let faces = split_face_by_curves(model, face_id, origin_solid, &curves, options)?;
+        let produced = faces.len();
+        // Per-face diagnostic: input face's surface type → number of split
+        // regions emitted. A `Sphere → 0` line is the smoking gun for
+        // task #99 (curved face arrangement walker drops every region).
+        let surf_kind = model
+            .faces
+            .get(face_id)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .map(|s| format!("{:?}", s.surface_type()))
+            .unwrap_or_else(|| "?".into());
+        debug!(
+            target: "geometry_engine::boolean",
+            "  split_face_by_curves: face={} ({}) curves={} → {} split-region(s)",
+            face_id,
+            surf_kind,
+            curves.len(),
+            produced,
+        );
         split_faces.extend(faces);
+        let _ = before;
     }
+
+    debug!(
+        target: "geometry_engine::boolean",
+        "split_faces_along_curves: intersected_faces={} → split_faces={} ({})",
+        intersected_count,
+        split_faces.len(),
+        surface_type_histogram(model, &split_faces),
+    );
 
     // A face that does NOT intersect any face on the other solid must still
     // flow into classification, otherwise it vanishes from the result. Two
@@ -2104,8 +2207,21 @@ fn split_faces_along_curves(
     // which caused results to be bounded by the union of intersecting faces
     // instead of by the true inside/outside partitioning (task #48 tier-3
     // bbox tests).
+    let before_a = split_faces.len();
     add_non_intersecting_faces(model, solid_a, &intersected_faces, &mut split_faces)?;
+    let added_a = split_faces.len() - before_a;
+    let before_b = split_faces.len();
     add_non_intersecting_faces(model, solid_b, &intersected_faces, &mut split_faces)?;
+    let added_b = split_faces.len() - before_b;
+
+    debug!(
+        target: "geometry_engine::boolean",
+        "split_faces_along_curves: AFTER add_non_intersecting → +{} from A, +{} from B; total={} ({})",
+        added_a,
+        added_b,
+        split_faces.len(),
+        surface_type_histogram(model, &split_faces),
+    );
 
     Ok(split_faces)
 }

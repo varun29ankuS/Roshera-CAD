@@ -358,6 +358,7 @@ pub fn create_matrix_from_quaternion(quaternion: &[f64; 4]) -> [[f64; 4]; 4] {
 mod tests {
     use super::*;
     use crate::execution::EntityStateStore;
+    use crate::{EntityId, EntityType};
     use std::sync::Arc;
 
     #[tokio::test]

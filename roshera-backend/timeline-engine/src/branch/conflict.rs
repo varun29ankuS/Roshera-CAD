@@ -517,7 +517,10 @@ impl Default for ConflictResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Author, BranchId, EventIndex, EventMetadata, OperationInputs, OperationOutputs};
+    use crate::{
+        Author, BranchId, EventId, EventIndex, EventMetadata, OperationInputs, OperationOutputs,
+        TimelineEvent,
+    };
     use chrono::Utc;
 
     #[tokio::test]
