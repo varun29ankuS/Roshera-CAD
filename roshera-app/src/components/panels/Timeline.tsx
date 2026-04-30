@@ -1,26 +1,43 @@
-import { useState, useEffect, useCallback } from 'react'
-import { ScrollArea } from '@/components/ui/scroll-area'
+import { Fragment, useState, useEffect, useCallback } from 'react'
 import { useWSStore } from '@/stores/ws-store'
-import {
-  Clock,
-  Undo2,
-  Redo2,
-  Bookmark,
-  GitBranch,
-  Box,
-  Combine,
-  Diff,
-  SquaresIntersect,
-  ArrowUpFromLine,
-  RefreshCcw,
-  Move3d,
-  Trash2,
-  Disc,
-  Hexagon,
-  Grip,
-  type LucideIcon,
-} from 'lucide-react'
 import { cn } from '@/lib/utils'
+
+// ─── Preview mode (opt-in via ?preview URL param) ───────────────────
+
+function isPreviewMode(): boolean {
+  if (typeof window === 'undefined') return false
+  return new URLSearchParams(window.location.search).has('preview')
+}
+
+const MOCK_EVENTS: EventSummary[] = (() => {
+  const now = Date.now()
+  return [
+    { id: 'm1', sequence_number: 1, timestamp: new Date(now - 240_000).toISOString(),
+      operation_type: 'CreatePrimitive { shape_type: Box }',
+      author: 'User { id: 1, name: Varun }' },
+    { id: 'm2', sequence_number: 2, timestamp: new Date(now - 200_000).toISOString(),
+      operation_type: 'CreatePrimitive { shape_type: Sphere }',
+      author: 'AIAgent { provider: Claude }' },
+    { id: 'm3', sequence_number: 3, timestamp: new Date(now - 150_000).toISOString(),
+      operation_type: 'BooleanUnion',
+      author: 'User { id: 1, name: Varun }' },
+    { id: 'm4', sequence_number: 4, timestamp: new Date(now - 90_000).toISOString(),
+      operation_type: 'CreatePrimitive { shape_type: Cylinder }',
+      author: 'AIAgent { provider: Claude }' },
+    { id: 'm5', sequence_number: 5, timestamp: new Date(now - 45_000).toISOString(),
+      operation_type: 'BooleanDifference',
+      author: 'AIAgent { provider: Claude }' },
+    { id: 'm6', sequence_number: 6, timestamp: new Date(now - 25_000).toISOString(),
+      operation_type: 'FilletEdges',
+      author: 'User { id: 1, name: Varun }' },
+    { id: 'm7', sequence_number: 7, timestamp: new Date(now - 8_000).toISOString(),
+      operation_type: 'ExtrudeFace',
+      author: 'AIAgent { provider: Claude }' },
+    { id: 'm8', sequence_number: 8, timestamp: new Date(now - 2_000).toISOString(),
+      operation_type: 'ChamferEdges',
+      author: 'User { id: 1, name: Varun }' },
+  ]
+})()
 
 // ─── Types matching backend GET /api/timeline/history/{branch_id} ──
 
@@ -32,30 +49,53 @@ interface EventSummary {
   author: string
 }
 
-// ─── Icon map ───────────────────────────────────────────────────────
+// ─── Unicode symbol map (terminal aesthetic) ────────────────────────
 
-function iconForOperation(op: string): LucideIcon {
+function symbolForOperation(op: string): string {
+  // Try to extract primitive shape first (CreatePrimitive { shape_type: Box, ... })
+  const shapeMatch = op.match(/shape_type:\s*(\w+)/i)
+  if (shapeMatch) {
+    switch (shapeMatch[1].toLowerCase()) {
+      case 'box': return '▣'
+      case 'sphere': return '◯'
+      case 'cylinder': return '⊟'
+      case 'cone': return '△'
+      case 'torus': return '◎'
+    }
+  }
+
   const lower = op.toLowerCase()
-  if (lower.includes('createprimitive') || lower.includes('create')) return Box
-  if (lower.includes('booleanunion') || lower.includes('union')) return Combine
-  if (lower.includes('booleanintersection') || lower.includes('intersection')) return SquaresIntersect
-  if (lower.includes('booleandifference') || lower.includes('difference') || lower.includes('subtract')) return Diff
-  if (lower.includes('extrude')) return ArrowUpFromLine
-  if (lower.includes('revolve')) return RefreshCcw
-  if (lower.includes('transform')) return Move3d
-  if (lower.includes('delete')) return Trash2
-  if (lower.includes('fillet')) return Disc
-  if (lower.includes('chamfer')) return Hexagon
-  return Grip
+  if (lower.includes('union')) return '∪'
+  if (lower.includes('intersection')) return '∩'
+  if (lower.includes('difference') || lower.includes('subtract')) return '⊖'
+  if (lower.includes('extrude')) return '↑'
+  if (lower.includes('revolve')) return '↻'
+  if (lower.includes('transform')) return '⇆'
+  if (lower.includes('delete')) return '✕'
+  if (lower.includes('fillet')) return '◜'
+  if (lower.includes('chamfer')) return '⬡'
+  if (lower.includes('create')) return '▣'
+  return '◆'
 }
 
-function formatOperationType(op: string): string {
-  // Backend sends things like "CreatePrimitive { shape_type: Box, ... }"
-  // Extract the readable part
+function shortLabel(op: string): string {
+  const lower = op.toLowerCase()
+  if (lower.includes('createprimitive')) {
+    const shape = op.match(/shape_type:\s*(\w+)/i)
+    if (shape) return shape[1].slice(0, 4)
+    return 'Crt'
+  }
+  if (lower.includes('booleanunion')) return 'Un'
+  if (lower.includes('booleanintersection')) return 'Int'
+  if (lower.includes('booleandifference')) return 'Df'
+  if (lower.includes('extrude')) return 'Ext'
+  if (lower.includes('revolve')) return 'Rv'
+  if (lower.includes('transform')) return 'Tr'
+  if (lower.includes('delete')) return 'Del'
+  if (lower.includes('fillet')) return 'Fil'
+  if (lower.includes('chamfer')) return 'Cha'
   const match = op.match(/^(\w+)/)
-  if (!match) return op
-  // Convert PascalCase to spaced words
-  return match[1].replace(/([A-Z])/g, ' $1').trim()
+  return match ? match[1].slice(0, 4) : '?'
 }
 
 function formatTimestamp(ts: string): string {
@@ -64,8 +104,23 @@ function formatTimestamp(ts: string): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+// Relative human time: "now", "5s", "3m", "2h", "4d"
+function relativeTime(ts: string): string {
+  const d = new Date(ts)
+  if (isNaN(d.getTime())) return '?'
+  const deltaMs = Date.now() - d.getTime()
+  if (deltaMs < 2000) return 'now'
+  const s = Math.floor(deltaMs / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h`
+  const day = Math.floor(h / 24)
+  return `${day}d`
+}
+
 function formatAuthor(author: string): string {
-  // Backend sends "User { id: ..., name: John }" or "AIAgent { ... }" or "System"
   if (author === 'System') return 'System'
   const nameMatch = author.match(/name:\s*(\w+)/)
   if (nameMatch) return nameMatch[1]
@@ -74,63 +129,136 @@ function formatAuthor(author: string): string {
   return author
 }
 
-// ─── Timeline entry ─────────────────────────────────────────────────
+type AuthorKind = 'user' | 'ai' | 'system'
 
-function TimelineEntry({
+function authorKind(author: string): AuthorKind {
+  if (author === 'System') return 'system'
+  if (author.includes('AIAgent') || author.includes('AI')) return 'ai'
+  if (author.includes('User') || author.includes('name:')) return 'user'
+  return 'system'
+}
+
+function authorGlyph(kind: AuthorKind): string {
+  switch (kind) {
+    case 'user': return 'Ⓤ'
+    case 'ai': return 'Ⓒ'
+    case 'system': return '§'
+  }
+}
+
+// Tailwind class for author-tinted text. User = primary, AI = amber, System = muted.
+function authorTextClass(kind: AuthorKind, isLatest: boolean): string {
+  const base = (() => {
+    switch (kind) {
+      case 'user': return 'text-primary'
+      case 'ai': return 'text-amber-400'
+      case 'system': return 'text-muted-foreground'
+    }
+  })()
+  return isLatest ? base : `${base}/70`
+}
+
+// ─── Event node (3-line column) ─────────────────────────────────────
+
+function EventNode({
   event,
   isLatest,
+  now,
 }: {
   event: EventSummary
   isLatest: boolean
+  now: number // re-render anchor for relative time
 }) {
-  const icon = iconForOperation(event.operation_type)
+  const symbol = symbolForOperation(event.operation_type)
+  const label = shortLabel(event.operation_type)
+  const kind = authorKind(event.author)
+  const glyph = authorGlyph(kind)
+  // `now` participates so this re-renders when the parent ticks.
+  void now
+  const rel = relativeTime(event.timestamp)
+  const symbolColor = authorTextClass(kind, isLatest)
 
   return (
     <div
-      className={cn(
-        'flex items-start gap-2 px-3 py-1.5 transition-colors',
-        isLatest ? 'bg-primary/10' : 'hover:bg-accent/30',
-      )}
+      className="flex flex-col items-center px-1 cursor-default select-none group"
+      title={`${event.operation_type}\n${formatAuthor(event.author)} · ${formatTimestamp(event.timestamp)} · #${event.sequence_number}`}
     >
-      <div className="flex flex-col items-center pt-0.5">
-        <div
-          className={cn(
-            'w-5 h-5 rounded-full flex items-center justify-center shrink-0',
-            isLatest ? 'bg-primary/20 text-primary' : 'bg-muted text-muted-foreground',
-          )}
-        >
-          {icon({ size: 10, strokeWidth: 1.5 })}
-        </div>
+      <div className={cn('text-base leading-none transition-colors', symbolColor)}>
+        {symbol}
       </div>
-
-      <div className="flex-1 min-w-0">
-        <div className="text-[11px] text-foreground/80 truncate">
-          {formatOperationType(event.operation_type)}
-        </div>
-        <div className="flex items-center gap-2 text-[9px] text-muted-foreground/50 mt-0.5">
-          <span>#{event.sequence_number}</span>
-          <span>{formatTimestamp(event.timestamp)}</span>
-          <span>{formatAuthor(event.author)}</span>
-        </div>
+      <div
+        className={cn(
+          'text-[11px] leading-tight mt-0.5 min-w-[3ch] text-center transition-colors',
+          isLatest ? 'text-foreground/90' : 'text-foreground/50 group-hover:text-foreground/80',
+        )}
+      >
+        {label}
+      </div>
+      <div className="flex items-center gap-0.5 text-[10px] leading-tight mt-0.5">
+        <span className={authorTextClass(kind, isLatest)}>{glyph}</span>
+        <span className={isLatest ? 'text-foreground/70' : 'text-muted-foreground/60'}>{rel}</span>
       </div>
     </div>
   )
 }
 
-// ─── Main panel ─────────────────────────────────────────────────────
+// ─── Connector (── glyph aligned to symbol baseline) ────────────────
+
+function Connector() {
+  return (
+    <span className="text-muted-foreground/40 text-base leading-none self-start pt-[1px]">
+      ──
+    </span>
+  )
+}
+
+// ─── Header glyph button ────────────────────────────────────────────
+
+function HeaderButton({
+  children,
+  onClick,
+  title,
+  ariaLabel,
+}: {
+  children: React.ReactNode
+  onClick: () => void
+  title: string
+  ariaLabel: string
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-label={ariaLabel}
+      className="px-1.5 py-0.5 rounded text-foreground/70 hover:text-foreground hover:bg-accent/40 transition-colors"
+    >
+      {children}
+    </button>
+  )
+}
+
+// ─── Main strip ─────────────────────────────────────────────────────
 
 export function Timeline() {
-  const [events, setEvents] = useState<EventSummary[]>([])
+  const previewMode = isPreviewMode()
+  const [events, setEvents] = useState<EventSummary[]>(previewMode ? MOCK_EVENTS : [])
   const [loading, setLoading] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const wsStatus = useWSStore((s) => s.status)
 
+  // Tick relative-time labels every second
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+
   const fetchHistory = useCallback(async () => {
+    if (previewMode) return // hold the mock data steady in preview mode
     try {
       setLoading(true)
       const resp = await fetch('/api/timeline/history/main')
       if (resp.ok) {
         const data = await resp.json()
-        // Backend returns Vec<EventSummary> directly
         if (Array.isArray(data)) {
           setEvents(data)
         } else if (data.events && Array.isArray(data.events)) {
@@ -142,7 +270,7 @@ export function Timeline() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [previewMode])
 
   useEffect(() => {
     if (wsStatus === 'connected') {
@@ -216,65 +344,36 @@ export function Timeline() {
   }
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="cad-panel-header flex items-center justify-between">
-        <div className="flex items-center gap-1.5">
-          <Clock size={11} className="text-primary" />
-          Timeline
-        </div>
-        <div className="flex items-center gap-0.5">
-          <button
-            onClick={handleUndo}
-            className="cad-icon-btn h-5 w-5"
-            title="Undo (Ctrl+Z)"
-            aria-label="Undo"
-          >
-            <Undo2 size={11} />
-          </button>
-          <button
-            onClick={handleRedo}
-            className="cad-icon-btn h-5 w-5"
-            title="Redo (Ctrl+Shift+Z)"
-            aria-label="Redo"
-          >
-            <Redo2 size={11} />
-          </button>
-          <button
-            onClick={handleCheckpoint}
-            className="cad-icon-btn h-5 w-5"
-            title="Create Checkpoint"
-            aria-label="Create checkpoint"
-          >
-            <Bookmark size={11} />
-          </button>
-          <button
-            onClick={handleBranch}
-            className="cad-icon-btn h-5 w-5"
-            title="Create Branch"
-            aria-label="Create branch"
-          >
-            <GitBranch size={11} />
-          </button>
-        </div>
+    <div className="font-mono flex items-center gap-2 px-3 py-1.5 border-t border-border bg-card h-[80px] shrink-0">
+      {/* Header: title + glyph actions */}
+      <div className="flex items-center gap-0.5 shrink-0 text-[13px]">
+        <span className="text-foreground/80 mr-1">timeline</span>
+        <HeaderButton onClick={handleUndo} title="Undo (Ctrl+Z)" ariaLabel="Undo">↶</HeaderButton>
+        <HeaderButton onClick={handleRedo} title="Redo (Ctrl+Shift+Z)" ariaLabel="Redo">↷</HeaderButton>
+        <HeaderButton onClick={handleCheckpoint} title="Checkpoint" ariaLabel="Create checkpoint">◈</HeaderButton>
+        <HeaderButton onClick={handleBranch} title="Branch" ariaLabel="Create branch">⑂</HeaderButton>
       </div>
 
-      <ScrollArea className="flex-1">
+      <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
+
+      {/* Event stream with terminal-style connectors */}
+      <div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden">
         {events.length === 0 ? (
-          <div className="p-3 text-[11px] text-muted-foreground/60 text-center">
-            {loading ? 'Loading...' : 'No operations yet'}
+          <div className="text-[12px] text-muted-foreground/60 px-2 py-3">
+            {loading ? '⋯ loading' : '∅ no operations yet'}
           </div>
         ) : (
-          <div className="py-1">
+          <div className="flex items-start gap-0 whitespace-nowrap">
             {events.map((event, i) => (
-              <TimelineEntry
-                key={event.id}
-                event={event}
-                isLatest={i === events.length - 1}
-              />
+              <Fragment key={event.id}>
+                {i > 0 && <Connector />}
+                <EventNode event={event} isLatest={i === events.length - 1} now={now} />
+              </Fragment>
             ))}
+            <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">→</span>
           </div>
         )}
-      </ScrollArea>
+      </div>
     </div>
   )
 }

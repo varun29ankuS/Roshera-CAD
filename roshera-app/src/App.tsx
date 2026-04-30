@@ -12,7 +12,7 @@ import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
 import { ViewportBridge } from '@/lib/viewport-bridge'
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { PanelLeftOpen } from 'lucide-react'
 
 const DEMOS_HASH = '#/demos'
 
@@ -23,7 +23,7 @@ function isDemosRoute(): boolean {
 export function App() {
   useKeyboardShortcuts()
   const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
-  const [leftPanelOpen, setLeftPanelOpen] = useState(true)
+  const [browserOpen, setBrowserOpen] = useState(true)
   const [route, setRoute] = useState<'workspace' | 'demos'>(
     isDemosRoute() ? 'demos' : 'workspace',
   )
@@ -59,40 +59,33 @@ export function App() {
       <div className="flex flex-1 min-h-0">
         <ToolBar />
 
-        {/* Left panel: Model Tree + Timeline */}
-        {leftPanelOpen && (
-          <div className="flex flex-col w-52 cad-panel border-r">
-            {/* Model Tree — top half */}
-            <div className="flex-1 min-h-0 border-b border-border">
-              <ModelTree />
-            </div>
-            {/* Timeline — bottom half */}
-            <div className="flex-1 min-h-0">
-              <Timeline />
-            </div>
-          </div>
-        )}
-
-        {/* Viewport + overlays */}
+        {/* Viewport + Fusion-style floating overlays */}
         <div className="relative flex-1 overflow-hidden">
           <CADViewport />
           <AIChatPanel />
 
-          {/* Toggle left panel button */}
-          <button
-            onClick={() => setLeftPanelOpen(!leftPanelOpen)}
-            className="cad-icon-btn cad-panel absolute top-2 left-2 z-10 h-7 w-7"
-            title={leftPanelOpen ? 'Hide panels' : 'Show panels'}
-            aria-label={leftPanelOpen ? 'Hide panels' : 'Show panels'}
-            aria-pressed={leftPanelOpen}
-          >
-            {leftPanelOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
-          </button>
+          {/* Browser (Model Tree) — floating, top-left, collapsible */}
+          {browserOpen ? (
+            <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] cad-panel border rounded shadow-md flex flex-col overflow-hidden bg-card/95 backdrop-blur-sm">
+              <ModelTree onCollapse={() => setBrowserOpen(false)} />
+            </div>
+          ) : (
+            <button
+              onClick={() => setBrowserOpen(true)}
+              className="cad-icon-btn cad-panel absolute top-2 left-2 z-10 h-7 w-7 border rounded shadow-md"
+              title="Show browser"
+              aria-label="Show browser"
+            >
+              <PanelLeftOpen size={14} />
+            </button>
+          )}
         </div>
 
         {/* Right panel: Properties (conditional) */}
         {hasSelection && <PropertiesPanel />}
       </div>
+      {/* Timeline — horizontal strip, full width */}
+      <Timeline />
       <StatusBar />
     </div>
   )

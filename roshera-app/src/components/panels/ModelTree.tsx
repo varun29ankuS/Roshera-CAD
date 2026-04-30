@@ -2,32 +2,14 @@ import { useState, useEffect, useCallback } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  ChevronRight,
-  ChevronDown,
-  Box,
-  Circle,
-  Cylinder,
-  Triangle,
-  Torus,
-  Layers,
-  Eye,
-  EyeOff,
-  Lock,
-  Unlock,
-  Component,
-  FolderOpen,
-  Grip,
-  PenTool,
-  ArrowUpFromLine,
-  RefreshCcw,
-  Disc,
-  Hexagon,
-  Grid3x3,
-  CircleDot,
-  type LucideIcon,
-} from 'lucide-react'
 import { cn } from '@/lib/utils'
+
+// ─── Preview mode (opt-in via ?preview URL param) ───────────────────
+
+function isPreviewMode(): boolean {
+  if (typeof window === 'undefined') return false
+  return new URLSearchParams(window.location.search).has('preview')
+}
 
 // ─── Backend hierarchy types (GET /api/hierarchy/{session_id}) ─────
 
@@ -88,46 +70,49 @@ interface TreeNode {
   id: string
   name: string
   type: string
-  icon: LucideIcon
+  symbol: string
   children?: TreeNode[]
   visible?: boolean
   locked?: boolean
 }
 
-// ─── Icon map ───────────────────────────────────────────────────────
+// ─── Unicode symbol map (terminal aesthetic) ────────────────────────
 
-function iconForType(type: string): LucideIcon {
+function symbolForType(type: string): string {
   switch (type.toLowerCase()) {
-    case 'box': return Box
-    case 'sphere': return Circle
-    case 'cylinder': return Cylinder
-    case 'cone': return Triangle
-    case 'torus': return Torus
-    case 'assembly': return Component
-    case 'group': return Layers
-    case 'sketch': return PenTool
-    case 'extrude': return ArrowUpFromLine
-    case 'revolve': return RefreshCcw
-    case 'fillet': return Disc
-    case 'chamfer': return Hexagon
-    case 'pattern': return Grid3x3
-    case 'hole': return CircleDot
-    default: return Grip
+    case 'box': return '▣'
+    case 'sphere': return '◯'
+    case 'cylinder': return '⊟'
+    case 'cone': return '△'
+    case 'torus': return '◎'
+    case 'assembly': return '▦'
+    case 'group': return '▤'
+    case 'sketch': return '✎'
+    case 'extrude': return '↑'
+    case 'revolve': return '↻'
+    case 'fillet': return '◜'
+    case 'chamfer': return '⬡'
+    case 'pattern': return '▦'
+    case 'hole': return '⊙'
+    case 'part': return '◆'
+    default: return '•'
   }
 }
 
-// ─── Tree node component ────────────────────────────────────────────
+// ─── Tree row (terminal lineage style) ──────────────────────────────
 
 function TreeItem({
   node,
-  depth,
+  isLast,
+  ancestorIsLast,
   selectedIds,
   onSelect,
   onToggleVisibility,
   onToggleLock,
 }: {
   node: TreeNode
-  depth: number
+  isLast: boolean
+  ancestorIsLast: boolean[] // one entry per ancestor depth: true = ancestor was last sibling
   selectedIds: Set<string>
   onSelect: (id: string, additive: boolean) => void
   onToggleVisibility: (id: string) => void
@@ -135,80 +120,103 @@ function TreeItem({
 }) {
   const [expanded, setExpanded] = useState(true)
   const isSelected = selectedIds.has(node.id)
-  const hasChildren = node.children && node.children.length > 0
-  const Icon = node.icon
+  const hasChildren = !!node.children && node.children.length > 0
+
+  // Build lineage prefix: │ for ancestors with more siblings, spaces otherwise.
+  const lineagePrefix = ancestorIsLast.map((last) => (last ? '   ' : '│  ')).join('')
+
+  // Branch char + arm char (the latter doubles as the expand/collapse affordance).
+  const branchChar = isLast ? '└' : '├'
+  let armChar: string
+  if (hasChildren) {
+    armChar = expanded ? '▾' : '▸'
+  } else {
+    armChar = '─'
+  }
+
+  const visible = node.visible !== false
+  const locked = !!node.locked
 
   return (
     <div>
       <div
         className={cn(
-          'flex items-center gap-1 px-1 py-0.5 cursor-pointer transition-colors group',
+          'flex items-center cursor-pointer select-none transition-colors group font-mono text-[13px] leading-snug',
           isSelected
             ? 'bg-primary/15 text-primary'
             : 'text-foreground/70 hover:bg-accent/50 hover:text-foreground',
         )}
-        style={{ paddingLeft: `${depth * 14 + 4}px` }}
         onClick={(e) => onSelect(node.id, e.shiftKey || e.ctrlKey || e.metaKey)}
       >
-        {hasChildren ? (
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              setExpanded(!expanded)
-            }}
-            className="w-3 h-3 flex items-center justify-center shrink-0"
-          >
-            {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-          </button>
-        ) : (
-          <span className="w-3 shrink-0" />
+        {/* Lineage (ancestor connectors) — non-interactive */}
+        {lineagePrefix.length > 0 && (
+          <span className="whitespace-pre text-muted-foreground/50 shrink-0">
+            {lineagePrefix}
+          </span>
         )}
 
-        <Icon size={12} strokeWidth={1.5} className="shrink-0 text-muted-foreground" />
+        {/* Branch + arm — arm is the expand/collapse click target */}
+        <span className="whitespace-pre shrink-0">
+          <span className="text-muted-foreground/50">{branchChar}</span>
+          {hasChildren ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                setExpanded(!expanded)
+              }}
+              className="text-foreground/70 hover:text-foreground transition-colors"
+              aria-label={expanded ? 'Collapse' : 'Expand'}
+              aria-expanded={expanded}
+            >
+              {armChar}
+            </button>
+          ) : (
+            <span className="text-muted-foreground/50">{armChar}</span>
+          )}
+          <span className="text-muted-foreground/50"> </span>
+        </span>
 
-        <span className="text-[11px] truncate flex-1">{node.name}</span>
+        {/* Type symbol */}
+        <span className="shrink-0 text-muted-foreground/80 mr-1">{node.symbol}</span>
 
-        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+        {/* Name */}
+        <span className="truncate flex-1">{node.name}</span>
+
+        {/* Visibility / lock — hover-revealed unicode */}
+        <div className="flex items-center gap-1 px-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity shrink-0">
           <button
             onClick={(e) => {
               e.stopPropagation()
               onToggleVisibility(node.id)
             }}
-            className="cad-icon-btn h-5 w-5"
-            aria-label={node.visible !== false ? 'Hide' : 'Show'}
-            title={node.visible !== false ? 'Hide' : 'Show'}
+            className="text-foreground/60 hover:text-foreground transition-colors w-3 text-center"
+            aria-label={visible ? 'Hide' : 'Show'}
+            title={visible ? 'Hide' : 'Show'}
           >
-            {node.visible !== false ? (
-              <Eye size={10} />
-            ) : (
-              <EyeOff size={10} className="opacity-40" />
-            )}
+            {visible ? '●' : '○'}
           </button>
           <button
             onClick={(e) => {
               e.stopPropagation()
               onToggleLock(node.id)
             }}
-            className="cad-icon-btn h-5 w-5"
-            aria-label={node.locked ? 'Unlock' : 'Lock'}
-            title={node.locked ? 'Unlock' : 'Lock'}
+            className="text-foreground/60 hover:text-foreground transition-colors w-3 text-center"
+            aria-label={locked ? 'Unlock' : 'Lock'}
+            title={locked ? 'Unlock' : 'Lock'}
           >
-            {node.locked ? (
-              <Lock size={10} />
-            ) : (
-              <Unlock size={10} className="opacity-40" />
-            )}
+            {locked ? '■' : '□'}
           </button>
         </div>
       </div>
 
       {hasChildren && expanded && (
         <div>
-          {node.children!.map((child) => (
+          {node.children!.map((child, idx) => (
             <TreeItem
               key={child.id}
               node={child}
-              depth={depth + 1}
+              isLast={idx === node.children!.length - 1}
+              ancestorIsLast={[...ancestorIsLast, isLast]}
               selectedIds={selectedIds}
               onSelect={onSelect}
               onToggleVisibility={onToggleVisibility}
@@ -223,9 +231,7 @@ function TreeItem({
 
 // ─── Convert backend hierarchy to tree nodes ────────────────────────
 
-function hierarchyToNodes(
-  hierarchy: ProjectHierarchy,
-): TreeNode[] {
+function hierarchyToNodes(hierarchy: ProjectHierarchy): TreeNode[] {
   const { root_assembly, part_library } = hierarchy
 
   function convertNode(node: HierarchyNode): TreeNode {
@@ -237,13 +243,13 @@ function hierarchyToNodes(
         id: f.id,
         name: `${f.feature_type}`,
         type: f.feature_type.toLowerCase(),
-        icon: iconForType(f.feature_type),
+        symbol: symbolForType(f.feature_type),
       }))
       return {
         id: inst.instance_id,
         name,
         type: 'part',
-        icon: Grip,
+        symbol: symbolForType('part'),
         children: children && children.length > 0 ? children : undefined,
       }
     } else {
@@ -252,7 +258,7 @@ function hierarchyToNodes(
         id: asm.id,
         name: asm.name,
         type: 'assembly',
-        icon: Component,
+        symbol: symbolForType('assembly'),
         children: asm.children.map(convertNode),
       }
     }
@@ -291,16 +297,70 @@ function buildLocalNode(
     id: obj.id,
     name: obj.name,
     type: obj.objectType,
-    icon: iconForType(obj.objectType),
+    symbol: symbolForType(obj.objectType),
     visible: obj.visible,
     locked: obj.locked,
     children: children.length > 0 ? children : undefined,
   }
 }
 
+// ─── Mock data for preview mode ─────────────────────────────────────
+
+const MOCK_TREE_NODES: TreeNode[] = [
+  {
+    id: 'mock-box-1',
+    name: 'Box #1',
+    type: 'box',
+    symbol: symbolForType('box'),
+    visible: true,
+    locked: false,
+    children: [
+      { id: 'mock-extrude-1', name: 'Extrude', type: 'extrude', symbol: symbolForType('extrude'), visible: true },
+      { id: 'mock-fillet-1', name: 'Fillet', type: 'fillet', symbol: symbolForType('fillet'), visible: true },
+    ],
+  },
+  {
+    id: 'mock-sphere-1',
+    name: 'Sphere',
+    type: 'sphere',
+    symbol: symbolForType('sphere'),
+    visible: true,
+    locked: false,
+  },
+  {
+    id: 'mock-union-1',
+    name: 'Union #1',
+    type: 'assembly',
+    symbol: symbolForType('assembly'),
+    visible: true,
+    locked: false,
+    children: [
+      { id: 'mock-box-2', name: 'Box #2', type: 'box', symbol: symbolForType('box'), visible: true },
+      {
+        id: 'mock-cyl-1',
+        name: 'Cylinder',
+        type: 'cylinder',
+        symbol: symbolForType('cylinder'),
+        visible: true,
+        children: [
+          { id: 'mock-chamfer-1', name: 'Chamfer', type: 'chamfer', symbol: symbolForType('chamfer'), visible: true },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'mock-sketch-1',
+    name: 'Sketch',
+    type: 'sketch',
+    symbol: symbolForType('sketch'),
+    visible: false,
+    locked: true,
+  },
+]
+
 // ─── Main panel ─────────────────────────────────────────────────────
 
-export function ModelTree() {
+export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
   const objects = useSceneStore((s) => s.objects)
   const objectOrder = useSceneStore((s) => s.objectOrder)
   const selectedIds = useSceneStore((s) => s.selectedIds)
@@ -366,8 +426,11 @@ export function ModelTree() {
     }
   }, [fetchHierarchy])
 
-  // Use backend hierarchy if available, otherwise fall back to local scene
-  const treeNodes = backendNodes ?? sceneToNodes(objects, objectOrder)
+  // Preview mode short-circuits to mock data; otherwise use backend hierarchy
+  // if available, falling back to the local scene store.
+  const treeNodes = isPreviewMode()
+    ? MOCK_TREE_NODES
+    : (backendNodes ?? sceneToNodes(objects, objectOrder))
 
   const handleToggleVisibility = useCallback(
     (id: string) => {
@@ -387,26 +450,32 @@ export function ModelTree() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="cad-panel-header flex items-center gap-1.5">
-        <FolderOpen size={11} className="text-primary" />
-        Model Tree
+      <div className="cad-panel-header flex items-center gap-1.5 font-mono">
+        <span className="flex-1">browser</span>
+        {onCollapse && (
+          <button
+            onClick={onCollapse}
+            className="cad-icon-btn h-5 w-5"
+            title="Collapse browser"
+            aria-label="Collapse browser"
+          >
+            «
+          </button>
+        )}
       </div>
       <ScrollArea className="flex-1">
         {treeNodes.length === 0 ? (
-          <div className="p-3 text-[11px] text-muted-foreground/60 text-center">
-            No objects in scene
+          <div className="p-3 text-[13px] text-muted-foreground/60 text-center font-mono">
+            ∅ no objects in scene
           </div>
         ) : (
-          <div className="py-1">
-            <div className="flex items-center gap-1 px-2 py-1 text-[11px] text-muted-foreground/60">
-              <Component size={11} />
-              <span className="uppercase tracking-wider text-[9px] font-medium">Assembly</span>
-            </div>
-            {treeNodes.map((node) => (
+          <div className="py-1 px-1">
+            {treeNodes.map((node, idx) => (
               <TreeItem
                 key={node.id}
                 node={node}
-                depth={1}
+                isLast={idx === treeNodes.length - 1}
+                ancestorIsLast={[]}
                 selectedIds={selectedIds}
                 onSelect={selectObject}
                 onToggleVisibility={handleToggleVisibility}
