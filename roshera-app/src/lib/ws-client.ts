@@ -1,5 +1,5 @@
 import { useWSStore } from '@/stores/ws-store'
-import type { ServerMessage } from './protocol'
+import { parseServerMessage, type ServerMessage } from './ws-schemas'
 
 type MessageHandler = (msg: ServerMessage) => void
 
@@ -42,13 +42,19 @@ class WSClient {
     }
 
     this.ws.onmessage = (event) => {
+      let raw: unknown
       try {
-        const msg: ServerMessage = JSON.parse(event.data)
-        for (const handler of this.handlers) {
-          handler(msg)
-        }
+        raw = JSON.parse(event.data)
       } catch {
-        // non-JSON message (pong, etc.) — ignore
+        // Non-JSON frame (e.g. raw pong) — ignore. JSON parse failure
+        // is the only error this `try` is guarding; schema validation
+        // and dispatch live below so they can fail independently.
+        return
+      }
+      const msg = parseServerMessage(raw)
+      if (!msg) return
+      for (const handler of this.handlers) {
+        handler(msg)
       }
     }
 

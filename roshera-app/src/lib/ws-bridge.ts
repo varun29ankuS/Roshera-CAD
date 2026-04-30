@@ -7,13 +7,13 @@ import { wsClient } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
 import type {
-  ServerMessage,
   CADObject as ProtocolCADObject,
   MaterialProperties,
   Transform3D,
   MeshData,
   AnalyticalGeometry as ProtocolAnalyticalGeometry,
 } from './protocol'
+import type { ServerMessage } from './ws-schemas'
 import { Quaternion, Euler } from 'three'
 
 // ─── Type conversion: backend → frontend ────────────────────────────
@@ -94,103 +94,75 @@ function handleServerMessage(msg: ServerMessage) {
   const scene = useSceneStore.getState()
   const ws = useWSStore.getState()
 
+  // Each branch's `msg.payload` is correctly narrowed by the
+  // discriminated union — no runtime guards or `as` casts are
+  // necessary because `ws-schemas.ts` already validated the shape.
   switch (msg.type) {
     case 'GeometryUpdate': {
-      const payload = msg.payload as { type: string; object: ProtocolCADObject }
-      if (payload.type === 'Tessellated' && payload.object) {
-        const obj = convertCADObject(payload.object)
-        const existing = scene.objects.get(obj.id)
-        if (existing) {
-          scene.updateObject(obj.id, obj)
-        } else {
-          scene.addObject(obj)
-        }
+      const obj = convertCADObject(msg.payload.object)
+      const existing = scene.objects.get(obj.id)
+      if (existing) {
+        scene.updateObject(obj.id, obj)
+      } else {
+        scene.addObject(obj)
       }
       break
     }
 
     case 'ObjectCreated': {
-      const payload = msg.payload as ProtocolCADObject
-      if (payload) {
-        scene.addObject(convertCADObject(payload))
-      }
+      scene.addObject(convertCADObject(msg.payload))
       break
     }
 
     case 'ObjectUpdated': {
-      const payload = msg.payload as ProtocolCADObject
-      if (payload) {
-        const obj = convertCADObject(payload)
-        scene.updateObject(obj.id, obj)
-      }
+      const obj = convertCADObject(msg.payload)
+      scene.updateObject(obj.id, obj)
       break
     }
 
     case 'ObjectDeleted': {
-      const payload = msg.payload as { id: string }
-      if (payload?.id) {
-        scene.removeObject(payload.id)
-      }
+      scene.removeObject(msg.payload.id)
       break
     }
 
     case 'SceneSync': {
-      // Full scene sync — replace all objects
-      const payload = msg.payload as { objects: ProtocolCADObject[] }
-      if (payload?.objects) {
-        scene.clearScene()
-        for (const proto of payload.objects) {
-          scene.addObject(convertCADObject(proto))
-        }
+      // Full scene sync — replace all objects.
+      scene.clearScene()
+      for (const proto of msg.payload.objects) {
+        scene.addObject(convertCADObject(proto))
       }
       break
     }
 
     case 'SessionUpdate': {
-      const payload = msg.payload as { session_id: string }
-      if (payload?.session_id) {
-        ws.setSessionId(payload.session_id)
-      }
+      ws.setSessionId(msg.payload.session_id)
       break
     }
 
     case 'Pong':
-      // heartbeat response — already handled by ping timing
+      // Heartbeat response — RTT is timed at the client in
+      // `ws-client.ts::startHeartbeat`, payload is not consumed here.
       break
 
     case 'SubElementResult': {
-      // Backend resolved a sub-element pick to authoritative topology indices.
-      // Replace the optimistic local selection with the backend's answer.
-      const payload = msg.payload as {
-        object_id: string
-        elements: Array<{ type: 'face' | 'edge' | 'vertex'; index: number }>
-      }
-      if (payload?.object_id && payload.elements) {
-        scene.clearSubElementSelections()
-        for (const el of payload.elements) {
-          scene.addSubElementSelection({
-            objectId: payload.object_id,
-            type: el.type,
-            index: el.index,
-          })
-        }
+      // Backend resolved a sub-element pick to authoritative topology
+      // indices. Replace the optimistic local selection with the
+      // backend's answer.
+      scene.clearSubElementSelections()
+      for (const el of msg.payload.elements) {
+        scene.addSubElementSelection({
+          objectId: msg.payload.object_id,
+          type: el.type,
+          index: el.index,
+        })
       }
       break
     }
 
     case 'Error': {
-      const payload = msg.payload as { message: string }
-      if (payload?.message) {
-        console.error('[WS] Server error:', payload.message)
-      }
+      console.error('[WS] Server error:', msg.payload.message)
       break
     }
-
-    default:
-      // Unknown message type — log for debugging
-      if (import.meta.env.DEV) {
-        console.log('[WS] Unhandled message type:', msg.type, msg.payload)
-      }
   }
 }
 
