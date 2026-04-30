@@ -373,7 +373,10 @@ async fn handle_undo(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Undoing last operation for session: {}", session_id);
 
-    let mut timeline = state.timeline.write().await;
+    // Read lock is sufficient: `Timeline::undo` takes `&self` and mutates
+    // only `Arc<DashMap>` interior state. Avoids serializing all timeline
+    // traffic on every undo.
+    let timeline = state.timeline.read().await;
     match timeline.undo(session_id).await {
         Ok(event_id) => {
             if let Some(event) = timeline.get_event(event_id) {
@@ -425,7 +428,9 @@ async fn handle_redo(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Redoing last undone operation for session: {}", session_id);
 
-    let mut timeline = state.timeline.write().await;
+    // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
+    // only `Arc<DashMap>` interior state.
+    let timeline = state.timeline.read().await;
     match timeline.redo(session_id).await {
         Ok(event_id) => {
             if let Some(event) = timeline.get_event(event_id) {

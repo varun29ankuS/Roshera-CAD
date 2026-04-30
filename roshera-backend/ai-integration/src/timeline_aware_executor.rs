@@ -115,7 +115,9 @@ impl TimelineAwareExecutor {
         info!("Undoing last operation for session {}", session_id);
 
         let timeline = self.session_manager.timeline();
-        let mut timeline_guard = timeline.write().await;
+        // `Timeline::undo` takes `&self` (interior `Arc<DashMap>` state), so
+        // a read lock is sufficient and keeps concurrent readers unblocked.
+        let timeline_guard = timeline.read().await;
 
         // Use timeline's built-in undo
         let session_uuid =
@@ -148,7 +150,8 @@ impl TimelineAwareExecutor {
         info!("Redoing operation for session {}", session_id);
 
         let timeline = self.session_manager.timeline();
-        let mut timeline_guard = timeline.write().await;
+        // Read lock is sufficient — see `undo` for rationale.
+        let timeline_guard = timeline.read().await;
 
         // Use timeline's built-in redo
         let session_uuid =

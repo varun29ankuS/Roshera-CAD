@@ -533,8 +533,9 @@ impl CommandProcessor {
                 Ok(CommandResult::success(format!("Session '{}' loaded", name)))
             }
             SessionAction::Undo => {
-                // Timeline handles undo
-                let mut timeline = self.timeline.write().await;
+                // Timeline handles undo. Read lock is sufficient because
+                // `Timeline::undo` takes `&self` (interior DashMap state).
+                let timeline = self.timeline.read().await;
                 timeline
                     .undo(session_id.parse().map_err(|_| SessionError::InvalidInput {
                         field: "session_id".to_string(),
@@ -546,8 +547,8 @@ impl CommandProcessor {
                     })
             }
             SessionAction::Redo => {
-                // Timeline handles redo
-                let mut timeline = self.timeline.write().await;
+                // Timeline handles redo. Read lock — see Undo arm.
+                let timeline = self.timeline.read().await;
                 timeline
                     .redo(session_id.parse().map_err(|_| SessionError::InvalidInput {
                         field: "session_id".to_string(),

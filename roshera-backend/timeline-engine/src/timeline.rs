@@ -489,8 +489,14 @@ impl Timeline {
             .await
     }
 
-    /// Undo the last operation for a session
-    pub async fn undo(&mut self, session_id: uuid::Uuid) -> TimelineResult<EventId> {
+    /// Undo the last operation for a session.
+    ///
+    /// Takes `&self` (not `&mut self`): all underlying state lives behind
+    /// `Arc<DashMap>` / `AtomicU64`, so callers may hold a read lock on the
+    /// outer `RwLock<Timeline>` while invoking this. That's important because
+    /// the API server's request handlers `.await` this call, and a write lock
+    /// held across an `.await` would serialize all timeline traffic.
+    pub async fn undo(&self, session_id: uuid::Uuid) -> TimelineResult<EventId> {
         let session = SessionId::new(session_id.to_string());
 
         // Get current position
@@ -533,8 +539,13 @@ impl Timeline {
         Ok(undo_event_id)
     }
 
-    /// Redo the last undone operation for a session
-    pub async fn redo(&mut self, session_id: uuid::Uuid) -> TimelineResult<EventId> {
+    /// Redo the last undone operation for a session.
+    ///
+    /// Takes `&self` for the same reason as [`Self::undo`]: `Arc<DashMap>`
+    /// interior state means concurrent reads through the outer `RwLock` are
+    /// safe, which keeps the API server's `.await` on this call from
+    /// monopolizing the timeline.
+    pub async fn redo(&self, session_id: uuid::Uuid) -> TimelineResult<EventId> {
         let session = SessionId::new(session_id.to_string());
 
         // Get current position
