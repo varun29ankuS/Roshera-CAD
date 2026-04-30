@@ -55,10 +55,20 @@ impl SessionManager {
             timeline,
             ot_engine,
             session_crdts: Arc::new(DashMap::new()),
-            auth_manager: Arc::new(crate::auth::AuthManager::new(
-                crate::auth::AuthConfig::default(),
-                "default-jwt-secret",
-            )),
+            auth_manager: Arc::new(
+                crate::auth::AuthManager::new(
+                    crate::auth::AuthConfig::default(),
+                    "default-jwt-secret",
+                )
+                // The literal "default-jwt-secret" is a non-empty
+                // ASCII string, which the HMAC-SHA256 constructor
+                // accepts unconditionally; the only failure path is
+                // an empty key, ruled out at this call site by the
+                // hard-coded value. The expect here documents the
+                // invariant rather than guarding against runtime
+                // input.
+                .expect("default-jwt-secret literal is a valid HMAC key"),
+            ),
             permission_manager: Arc::new(crate::permissions::PermissionManager::new()),
             cache_manager: Arc::new(crate::cache::CacheManager::new(
                 crate::cache::CacheConfig::default(),
