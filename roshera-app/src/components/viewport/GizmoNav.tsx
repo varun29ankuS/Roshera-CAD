@@ -1,4 +1,5 @@
 import { GizmoHelper, GizmoViewport } from '@react-three/drei'
+import { useSceneStore } from '@/stores/scene-store'
 
 /**
  * Orientation widget in the top-right corner. Axis colours keep the
@@ -7,15 +8,25 @@ import { GizmoHelper, GizmoViewport } from '@react-three/drei'
  * black so they read clearly against the saturated coloured spheres in
  * both themes.
  *
- * `renderPriority={2}` is required so the gizmo's scissored viewport
- * render runs *after* the `EffectComposer` mounted by `SelectionOutline`
- * (priority 1). Without this the gizmo vanishes the moment a solid is
- * selected, because the composer's full-screen quad pass overwrites the
- * gizmo's corner overlay.
+ * Render-priority dance: `@react-three/fiber` disables its automatic
+ * render loop the moment *any* child has `renderPriority > 0`. We only
+ * want manual ordering when `SelectionOutline` actually mounts an
+ * `EffectComposer` (priority 1) — which only happens with a live
+ * selection or hover. Outside that window we leave priority at 0 so
+ * fiber auto-renders the main scene normally; otherwise the grid,
+ * reference axes, and scene objects vanish while the gizmo (the only
+ * priority-driven subscriber) keeps drawing.
  */
 export function GizmoNav() {
+  const hasOutlineTarget = useSceneStore(
+    (s) => s.selectedIds.size > 0 || s.hoveredId !== null,
+  )
   return (
-    <GizmoHelper alignment="top-right" margin={[72, 72]} renderPriority={2}>
+    <GizmoHelper
+      alignment="top-right"
+      margin={[72, 72]}
+      renderPriority={hasOutlineTarget ? 2 : 0}
+    >
       <GizmoViewport
         axisColors={['#e74c3c', '#2ecc71', '#3498db']}
         labelColor="#000000"
