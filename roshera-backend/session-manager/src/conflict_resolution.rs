@@ -1,7 +1,98 @@
-//! Conflict resolution using Operational Transformation (OT)
+//! Session-level conflict resolution for real-time collaboration.
 //!
-//! This module implements operational transformation algorithms to handle
-//! concurrent edits in real-time collaborative CAD sessions.
+//! # Where this module fits
+//!
+//! Roshera has **two layers** of arbitration. They serve different
+//! audiences and must not be conflated:
+//!
+//! 1. **Timeline (canonical, persistent).** The source of truth for
+//!    every accepted edit is the event-sourced timeline in
+//!    `timeline-engine`. Branches are merged with strategies
+//!    (`fast-forward`, `three-way`, `squash`) implemented in
+//!    `timeline-engine::branch::merge`; conflicts surface there as
+//!    `BranchMergeError` variants and the kernel state is rebuilt by
+//!    replaying events. **All durable arbitration runs through the
+//!    timeline.** Anything below this line is best-effort optimistic
+//!    work that has not yet been written to the timeline.
+//!
+//! 2. **Live session (best-effort, in-memory, this module).** While
+//!    multiple users (or agents) are editing the same live session,
+//!    their commands arrive over WebSocket faster than the timeline
+//!    can be merged. This module provides a thin scaffolding so the
+//!    session-manager can still serialise concurrent commands into a
+//!    single ordered stream that the kernel applies; the resulting
+//!    operations are then recorded to the timeline, which is the only
+//!    place the merge becomes durable.
+//!
+//! # Arbitration contract (as currently implemented)
+//!
+//! The session-manager calls into this module via two paths:
+//!
+//! - **`OTEngine::apply_operations(session_id, ops)`** — invoked from
+//!   `manager::SessionManager::process_command_with_ot` at
+//!   `session-manager/src/manager.rs:447`. The contract is:
+//!   * Each incoming `Operation` is timestamped at admission with
+//!     `current_timestamp()` (Unix millis from the api-server).
+//!   * The engine walks the per-session operation history and, for
+//!     every concurrent op whose timestamp is strictly later than the
+//!     incoming one, looks up a transform rule keyed by
+//!     `(format!("{:?}", op1.command), format!("{:?}", op2.command))`
+//!     and lets that rule rewrite the incoming op.
+//!   * **Default policy when no rule matches: pass through unchanged.**
+//!     The current `register_default_rules` registers under bare
+//!     strings (`"transform"`, `"boolean"`, `"create"`) which do not
+//!     match the `Debug`-formatted keys the lookup actually uses;
+//!     this means the engine today behaves as a **last-writer-wins
+//!     arbiter at the session layer**: every command is admitted in
+//!     arrival order, and the kernel is responsible for rejecting any
+//!     command it cannot apply (e.g. `BooleanOperation` against a
+//!     deleted solid). The string-keying mismatch is intentional to
+//!     document — the live system relies on the kernel and the
+//!     downstream timeline merge to reject bad interleavings rather
+//!     than on session-layer transforms.
+//!   * Returns a `TransformedOperation` per input op carrying both
+//!     the original and the (possibly-rewritten) command. The session
+//!     manager dispatches the transformed command to the kernel.
+//!
+//! - **`GeometryCRDT::apply_local` / `merge`** — invoked from
+//!   `manager::SessionManager::update_crdt_state` and
+//!   `merge_crdt_state` (`manager.rs:485`, `:524`). The contract is:
+//!   * Each user's local edits are appended to a per-user
+//!     `pending_ops` vector and a per-user counter in `state_vector`
+//!     is incremented. State vectors are version-vector clocks —
+//!     they totally order edits *per user* and partially order edits
+//!     *across users* by causality.
+//!   * `merge(remote)` compares the local state vector against
+//!     `remote`'s and pulls every op the local replica has not yet
+//!     observed. The pulled ops are returned to the caller so they
+//!     can be replayed against the kernel; this module never applies
+//!     them itself. The local state vector is updated to the remote
+//!     counter so the next merge is incremental.
+//!   * **No semantic conflict detection happens here.** Two users
+//!     translating the same object concurrently will both have their
+//!     edits replayed; whichever the kernel processes second wins,
+//!     and the timeline records both events in arrival order.
+//!
+//! # Conflict / resolution enums
+//!
+//! `Conflict`, `ConflictType`, and `ConflictResolution` are wire-format
+//! types reserved for the surface a future, richer arbitration layer
+//! will return. Today the engine emits `TransformResult { conflicts:
+//! vec![] }` on every call — i.e. no conflict is ever surfaced from
+//! this module. Callers must therefore not rely on `conflicts.is_empty()`
+//! as a "the edit is safe" signal; it is always true. Use the
+//! timeline-engine merge result to discover real conflicts.
+//!
+//! # When to use which layer
+//!
+//! - Single-user CRUD over REST/WS → kernel arbitrates inline; this
+//!   module is not in the call path.
+//! - Multi-user live session → `OTEngine` serialises arrival order so
+//!   the kernel sees a deterministic stream; arbitration is
+//!   last-writer-wins, kernel is the final acceptor.
+//! - Branch merges, undo / redo, time-travel replay → `timeline-
+//!   engine` exclusively. Do not call into this module from those
+//!   paths.
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
