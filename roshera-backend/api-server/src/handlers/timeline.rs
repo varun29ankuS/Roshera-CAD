@@ -575,8 +575,12 @@ pub async fn undo_operation(
 
     // Advance the session's timeline position (this records an undo marker
     // and shifts the position pointer — see `Timeline::undo`).
+    //
+    // `Timeline::undo` takes `&self` and only mutates `Arc<DashMap>` interior
+    // state, so a *read* lock on the outer `RwLock<Timeline>` is sufficient
+    // and keeps the lock-across-await non-blocking for other readers.
     let undo_result = {
-        let mut timeline = state.timeline.write().await;
+        let timeline = state.timeline.read().await;
         timeline.undo(session_uuid).await
     };
 
@@ -685,8 +689,11 @@ pub async fn redo_operation(
 
     // Advance the session's timeline position forward (records a redo
     // marker and updates the position pointer — see `Timeline::redo`).
+    //
+    // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
+    // only `Arc<DashMap>` interior state. Mirrors the undo path.
     let redo_result = {
-        let mut timeline = state.timeline.write().await;
+        let timeline = state.timeline.read().await;
         timeline.redo(session_uuid).await
     };
 

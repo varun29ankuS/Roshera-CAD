@@ -425,70 +425,78 @@ async fn create_geometry(
 
     // Drive the kernel. The model is the single source of truth — every
     // call funnels through TopologyBuilder so the timeline records the op.
-    let mut model = state.model.write().await;
-    let mut builder = TopologyBuilder::new(&mut model);
+    //
+    // The write lock is held *only* for the kernel call. Tessellation —
+    // which is read-only and can take tens of milliseconds for complex
+    // solids — runs under a separate read lock below so concurrent
+    // writers aren't blocked on geometry that's already been built.
+    let solid_id = {
+        let mut model = state.model.write().await;
+        let mut builder = TopologyBuilder::new(&mut model);
 
-    let result = match shape_type.as_str() {
-        "box" | "cube" => {
-            let w = require("width")?;
-            let h = require("height")?;
-            let d = require("depth")?;
-            builder.create_box_3d(w, h, d)
-        }
-        "sphere" => {
-            let r = require("radius")?;
-            builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r)
-        }
-        "cylinder" => {
-            let r = require("radius")?;
-            let h = require("height")?;
-            builder.create_cylinder_3d(
-                Point3::new(0.0, 0.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
-                r,
-                h,
-            )
-        }
-        "cone" => {
-            let r = require("radius")?;
-            let h = require("height")?;
-            // True cone: base radius `r`, apex (top_radius = 0).
-            // `create_cone_3d` accepts a frustum signature; passing 0.0
-            // for the top radius collapses it to a single-apex cone.
-            builder.create_cone_3d(
-                Point3::new(0.0, 0.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
-                r,
-                0.0,
-                h,
-            )
-        }
-        "torus" => {
-            let major = require("major_radius")?;
-            let minor = require("minor_radius")?;
-            builder.create_torus_3d(
-                Point3::new(0.0, 0.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
-                major,
-                minor,
-            )
-        }
-        other => {
-            return Err(error_catalog::ApiError::unknown_shape_type(other).into());
-        }
-    };
+        let result = match shape_type.as_str() {
+            "box" | "cube" => {
+                let w = require("width")?;
+                let h = require("height")?;
+                let d = require("depth")?;
+                builder.create_box_3d(w, h, d)
+            }
+            "sphere" => {
+                let r = require("radius")?;
+                builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r)
+            }
+            "cylinder" => {
+                let r = require("radius")?;
+                let h = require("height")?;
+                builder.create_cylinder_3d(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    r,
+                    h,
+                )
+            }
+            "cone" => {
+                let r = require("radius")?;
+                let h = require("height")?;
+                // True cone: base radius `r`, apex (top_radius = 0).
+                // `create_cone_3d` accepts a frustum signature; passing 0.0
+                // for the top radius collapses it to a single-apex cone.
+                builder.create_cone_3d(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    r,
+                    0.0,
+                    h,
+                )
+            }
+            "torus" => {
+                let major = require("major_radius")?;
+                let minor = require("minor_radius")?;
+                builder.create_torus_3d(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    major,
+                    minor,
+                )
+            }
+            other => {
+                return Err(error_catalog::ApiError::unknown_shape_type(other).into());
+            }
+        };
 
-    let solid_id = match result {
-        Ok(KernelGeometryId::Solid(id)) => id,
-        Ok(other) => {
-            return Err(error_catalog::ApiError::kernel_returned_wrong_type(format!(
-                "{other:?}"
-            ))
-            .into());
+        match result {
+            Ok(KernelGeometryId::Solid(id)) => id,
+            Ok(other) => {
+                return Err(error_catalog::ApiError::kernel_returned_wrong_type(format!(
+                    "{other:?}"
+                ))
+                .into());
+            }
+            Err(e) => {
+                return Err(error_catalog::ApiError::kernel_error(e).into());
+            }
         }
-        Err(e) => {
-            return Err(error_catalog::ApiError::kernel_error(e).into());
-        }
+        // model write guard drops here
     };
 
     // If the request opted into a transaction, register the new solid
@@ -499,14 +507,22 @@ async fn create_geometry(
         state.transactions.track_solid(id, solid_id)?;
     }
 
-    // Tessellate the freshly created solid.
-    let solid = model
-        .solids
-        .get(solid_id)
-        .ok_or_else(|| error_catalog::ApiError::solid_not_found(solid_id))?;
-    let tess_start = Instant::now();
-    let tri_mesh = tessellate_solid(solid, &model, &TessellationParams::default());
-    let tessellation_ms = tess_start.elapsed().as_millis() as u64;
+    // Tessellate under a *read* lock. Tessellation is read-only and can
+    // be expensive on complex solids; using a read lock lets other
+    // readers (frame renders, exports) proceed concurrently and — more
+    // importantly — never blocks an in-flight writer behind us.
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(solid_id)
+            .ok_or_else(|| error_catalog::ApiError::solid_not_found(solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+        // model read guard drops here
+    };
 
     if tri_mesh.triangles.is_empty() {
         return Err(error_catalog::ApiError::tessellation_empty(
@@ -539,9 +555,6 @@ async fn create_geometry(
     let object_id = object_uuid.to_string();
     let display_name = format!("{} {}", capitalize(&shape_type), solid_id);
 
-    // Drop the model write lock before mutating the id-mapping DashMap
-    // so we don't hold two locks at once.
-    drop(model);
     state.register_id_mapping(object_uuid, solid_id);
 
     let shape_type_copy = shape_type.clone();
@@ -699,86 +712,102 @@ async fn tx_rollback(
 async fn boolean_operation(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::operations::boolean::{
         boolean_operation as kernel_boolean, BooleanOp, BooleanOptions,
     };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
-    let bad_request = |msg: &str| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "success": false, "error": msg })),
-        )
-    };
-    let server_error = |msg: String| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "success": false, "error": msg })),
-        )
-    };
-
     let op_str = payload
         .get("operation")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| bad_request("missing 'operation'"))?
+        .ok_or_else(|| ApiError::missing_field("operation"))?
         .to_lowercase();
     let operation = match op_str.as_str() {
         "union" | "add" => BooleanOp::Union,
         "intersection" | "intersect" => BooleanOp::Intersection,
         "difference" | "subtract" | "minus" => BooleanOp::Difference,
         other => {
-            return Err(bad_request(&format!("unknown operation: {other}")));
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "unknown boolean operation '{other}' — expected one of \
+                     union|intersection|difference"
+                ),
+            ));
         }
     };
 
-    let parse_uuid_field =
-        |key: &str| -> Result<Uuid, (StatusCode, Json<serde_json::Value>)> {
-            let s = payload
-                .get(key)
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| bad_request(&format!("missing '{key}'")))?;
-            Uuid::parse_str(s)
-                .map_err(|_| bad_request(&format!("'{key}' is not a valid UUID")))
-        };
+    let parse_uuid_field = |key: &str| -> Result<Uuid, ApiError> {
+        let s = payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::missing_field(key))?;
+        Uuid::parse_str(s).map_err(|_| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'{key}' is not a valid UUID: {s}"),
+            )
+        })
+    };
     let uuid_a = parse_uuid_field("object_a")?;
     let uuid_b = parse_uuid_field("object_b")?;
 
+    // The id-mapping is the bridge between the public UUID surface and
+    // the kernel's u32 solid IDs. A missing entry means the client
+    // referenced a solid that was never created (or has been removed).
+    // Surface that as a 404 SolidNotFound so agents can disambiguate
+    // "you sent garbage" from "the server forgot".
     let solid_a = state.get_local_id(&uuid_a).ok_or_else(|| {
-        bad_request(&format!(
-            "no kernel solid registered for object_a={uuid_a}"
-        ))
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object_a={uuid_a}"),
+        )
     })?;
     let solid_b = state.get_local_id(&uuid_b).ok_or_else(|| {
-        bad_request(&format!(
-            "no kernel solid registered for object_b={uuid_b}"
-        ))
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object_b={uuid_b}"),
+        )
     })?;
 
     if solid_a == solid_b {
-        return Err(bad_request("object_a and object_b refer to the same solid"));
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "object_a and object_b refer to the same kernel solid".to_string(),
+        ));
     }
 
-    // Run the kernel boolean and tessellate while still holding the lock.
-    let mut model = state.model.write().await;
-    let result_solid_id =
+    // Hold the model write lock only for the kernel boolean. Tessellation
+    // — read-only and potentially expensive — runs under a read lock so
+    // concurrent writers aren't blocked on geometry that's already built.
+    let result_solid_id = {
+        let mut model = state.model.write().await;
         kernel_boolean(&mut model, solid_a, solid_b, operation, BooleanOptions::default())
-            .map_err(|e| server_error(format!("boolean kernel error: {e}")))?;
+            .map_err(ApiError::kernel_error)?
+        // model write guard drops here
+    };
 
-    let solid = model
-        .solids
-        .get(result_solid_id)
-        .ok_or_else(|| server_error("boolean result solid missing from store".into()))?;
-
-    let tess_start = Instant::now();
-    let tri_mesh = tessellate_solid(solid, &model, &TessellationParams::default());
-    let tessellation_ms = tess_start.elapsed().as_millis() as u64;
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+        // model read guard drops here
+    };
 
     if tri_mesh.triangles.is_empty() {
-        return Err(server_error(format!(
-            "boolean result tessellated to 0 triangles (solid_id={result_solid_id})"
-        )));
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
     }
 
     let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
@@ -797,8 +826,6 @@ async fn boolean_operation(
         indices.push(tri[1]);
         indices.push(tri[2]);
     }
-
-    drop(model);
 
     let result_uuid = Uuid::new_v4();
     state.register_id_mapping(result_uuid, result_solid_id);
@@ -1457,9 +1484,17 @@ async fn process_enhanced_ai_command(
             .process_text_with_session(&auth_token, &payload.command)
             .await
     } else {
-        // Parse the command and execute it properly
-        let command = parse_ai_command_to_geometry_command(&payload.command)
-            .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+        // Parse the command and execute it properly. Surface the parser's
+        // actual rejection reason — `_ => BAD_REQUEST` swallowed the message
+        // and left agents guessing whether the command was malformed,
+        // unsupported, or referred to missing entities.
+        let command = parse_ai_command_to_geometry_command(&payload.command).map_err(|e| {
+            crate::error_catalog::ApiError::new(
+                crate::error_catalog::ErrorCode::InvalidParameter,
+                format!("AI command rejected by parser: {e}"),
+            )
+            .into_response()
+        })?;
 
         state
             .command_executor
@@ -1514,12 +1549,25 @@ async fn process_enhanced_ai_command(
             })))
         }
         Err(e) => {
-            tracing::error!("AI command processing failed: {}", e);
-            Ok(Json(serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-                "execution_time_ms": start.elapsed().as_millis()
-            })))
+            // Don't dress an execution failure up as a 200 with
+            // `success: false` — agents pattern-match on HTTP status as
+            // their first signal. Surface as a proper structured error so
+            // the client can distinguish "command parsed and executed
+            // successfully but the result was negative" from "the
+            // command never actually ran." Provider/runtime details flow
+            // through the message; the structured `error_code` lets
+            // agents branch without parsing prose.
+            tracing::error!(
+                target: "ai.command",
+                command = %payload.command,
+                error = %e,
+                "AI command processing failed"
+            );
+            Err(crate::error_catalog::ApiError::new(
+                crate::error_catalog::ErrorCode::Internal,
+                format!("AI command execution failed: {e}"),
+            )
+            .into_response())
         }
     }
 }
