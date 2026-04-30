@@ -5040,17 +5040,13 @@ mod tests {
             BooleanOptions::default(),
         );
 
-        match &result {
-            Ok(_) => {}
-            Err(OperationError::NotImplemented(_)) => {
-                panic!(
-                    "Boolean operation returned NotImplemented — all stubs should be implemented"
-                );
-            }
-            Err(e) => {
-                // Other errors are acceptable (e.g., numerical issues with coincident faces)
-                eprintln!("Boolean union returned error (acceptable): {e}");
-            }
+        assert!(
+            !matches!(&result, Err(OperationError::NotImplemented(_))),
+            "Boolean operation returned NotImplemented — all stubs should be implemented"
+        );
+        if let Err(e) = &result {
+            // Non-NotImplemented errors are acceptable (e.g., numerical issues with coincident faces)
+            eprintln!("Boolean union returned error (acceptable): {e}");
         }
     }
 
