@@ -3791,8 +3791,41 @@ fn compute_edge_intersections(
                 continue;
             }
             let local_t = (*param - remaining_edge.param_range.start) / range_len;
-            if !(0.01..=0.99).contains(&local_t) {
-                // Too close to endpoint, snap to existing vertex
+            // Parametric sanity: sampling-based search may drift fractionally
+            // outside [0, 1] for endpoint-adjacent hits. Reject only true
+            // out-of-range parameters here — DO NOT use a parametric proximity
+            // threshold to decide endpoint coincidence; that scales with edge
+            // length and silently swallows real T-junctions on long edges.
+            if !(0.0..=1.0).contains(&local_t) {
+                continue;
+            }
+            // Tolerant-modeling rule (Parasolid/ACIS imprint semantics):
+            // merge the new split vertex with an existing endpoint iff its
+            // 3D position lies inside the endpoint's tolerance sphere.
+            // Otherwise force the split — a sliver sub-edge whose length is
+            // well above tolerance is a legitimate T-junction.
+            let split_pos = match model.vertices.get_position(*split_vid) {
+                Some(p) => p,
+                None => continue,
+            };
+            let tol_sq = tolerance.distance() * tolerance.distance();
+            let coincident = |vid: VertexId| -> bool {
+                if vid == 0 || vid == u32::MAX {
+                    return false;
+                }
+                match model.vertices.get_position(vid) {
+                    Some(pos) => {
+                        let dx = pos[0] - split_pos[0];
+                        let dy = pos[1] - split_pos[1];
+                        let dz = pos[2] - split_pos[2];
+                        dx * dx + dy * dy + dz * dz < tol_sq
+                    }
+                    None => false,
+                }
+            };
+            if coincident(remaining_edge.start_vertex)
+                || coincident(remaining_edge.end_vertex)
+            {
                 continue;
             }
 
@@ -6551,4 +6584,5 @@ mod tests {
             check_topology_wellformed(&result, &model, op)?;
         }
     }
+
 }
