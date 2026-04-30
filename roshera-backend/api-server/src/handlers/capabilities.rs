@@ -27,22 +27,29 @@
 //!   the minor version.
 
 use crate::error_catalog::ErrorCode;
+use crate::AppState;
+use axum::extract::State;
 use axum::response::Json;
 use serde_json::{json, Value};
 
-/// Returns the static capability document. Pure function — no kernel state
-/// is read, so this is safe to serve under any auth context and cheap to
-/// call repeatedly. Agents are expected to memoise the result for the
-/// duration of a session.
-pub async fn capabilities() -> Json<Value> {
-    Json(build_capabilities())
+/// Returns the capability document. The catalog (primitives, operations,
+/// endpoints, error codes) is static, but the embedded `runtime` block
+/// reflects deployment-time configuration — currently whether an LLM
+/// provider key was found at server start. Agents are expected to call
+/// this once per session and memoise the catalog portion; the runtime
+/// flags are cheap to re-read if they want fresh state.
+pub async fn capabilities(State(state): State<AppState>) -> Json<Value> {
+    Json(build_capabilities(state.ai_configured))
 }
 
-fn build_capabilities() -> Value {
+fn build_capabilities(ai_configured: bool) -> Value {
     json!({
         "kernel": "roshera-geometry-engine",
         "kernel_version": env!("CARGO_PKG_VERSION"),
         "discovery_version": "1.0.0",
+        "runtime": {
+            "ai_configured": ai_configured,
+        },
         "description": "Agent-readable surface for the Roshera B-Rep kernel. \
             Every primitive and operation listed here is reachable via the \
             documented HTTP endpoint and produces a real solid in the \
@@ -139,10 +146,12 @@ fn build_capabilities() -> Value {
                 JSON body and closes). There is no silent mock \
                 fallback: a server with no key returns the structured \
                 error every time so misconfiguration is visible to \
-                agents and operators. `GET /api/ai/status` reports \
-                `status: \"not_configured\"` with the same \
-                remediation hint, so agents can branch on a single \
-                GET without provoking a 503."
+                agents and operators. The live state is published as \
+                `runtime.ai_configured` on this same document, so \
+                agents can branch their behaviour off the same GET \
+                they use for capability discovery without provoking a \
+                503. `GET /api/ai/status` exposes the same flag plus \
+                the active provider name and remediation hint."
         },
         "primitives": primitives(),
         "operations": operations(),
@@ -367,7 +376,7 @@ mod tests {
     /// test fails immediately rather than at agent runtime.
     #[test]
     fn capability_document_has_required_sections() {
-        let doc = build_capabilities();
+        let doc = build_capabilities(true);
         assert_eq!(doc["kernel"], "roshera-geometry-engine");
         assert!(doc["discovery_version"].is_string());
         assert!(doc["primitives"].is_array());
@@ -376,6 +385,10 @@ mod tests {
         assert!(
             doc["error_codes"].is_array(),
             "error_codes catalog must be published"
+        );
+        assert!(
+            doc["runtime"].is_object(),
+            "runtime block must be present so agents can read live config"
         );
 
         let prims = doc["primitives"].as_array().unwrap();
@@ -401,23 +414,40 @@ mod tests {
         }
     }
 
+    /// `runtime.ai_configured` must reflect the AppState flag exactly so
+    /// agents can branch on a single GET. A drift here would force them
+    /// to also poll `/api/ai/status` or provoke a 503 to discover state.
+    #[test]
+    fn runtime_ai_configured_reflects_state() {
+        let on = build_capabilities(true);
+        let off = build_capabilities(false);
+        assert_eq!(on["runtime"]["ai_configured"], serde_json::Value::Bool(true));
+        assert_eq!(off["runtime"]["ai_configured"], serde_json::Value::Bool(false));
+    }
+
     /// Lock in the exact required parameter keys for each primitive so
     /// that drift between this document and `main.rs::create_geometry` /
     /// `handle_create_primitive` produces a test failure rather than
     /// silent agent confusion.
     #[test]
     fn primitive_required_parameters_match_kernel_contract() {
-        let doc = build_capabilities();
+        // The contract is the *set* of required keys, not their JSON
+        // serialization order — `serde_json::Map` iteration order is an
+        // implementation detail (alphabetical without `preserve_order`,
+        // insertion order with it). Compare as sorted vectors so this
+        // test stays a contract test, not an iteration-order assertion.
+        let doc = build_capabilities(true);
         let prims = doc["primitives"].as_array().unwrap();
         for p in prims {
             let shape = p["shape_type"].as_str().unwrap();
             let req = p["required_parameters"].as_object().unwrap();
-            let keys: Vec<&str> = req.keys().map(|k| k.as_str()).collect();
+            let mut keys: Vec<&str> = req.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
             match shape {
-                "box" => assert_eq!(keys, vec!["width", "height", "depth"]),
+                "box" => assert_eq!(keys, vec!["depth", "height", "width"]),
                 "sphere" => assert_eq!(keys, vec!["radius"]),
-                "cylinder" => assert_eq!(keys, vec!["radius", "height"]),
-                "cone" => assert_eq!(keys, vec!["radius", "height"]),
+                "cylinder" => assert_eq!(keys, vec!["height", "radius"]),
+                "cone" => assert_eq!(keys, vec!["height", "radius"]),
                 "torus" => assert_eq!(keys, vec!["major_radius", "minor_radius"]),
                 other => panic!("unexpected primitive shape_type: {other}"),
             }
@@ -430,7 +460,7 @@ mod tests {
     /// `error_codes` exists to prevent.
     #[test]
     fn error_codes_catalog_covers_every_variant() {
-        let doc = build_capabilities();
+        let doc = build_capabilities(true);
         let codes = doc["error_codes"].as_array().unwrap();
         assert_eq!(
             codes.len(),
