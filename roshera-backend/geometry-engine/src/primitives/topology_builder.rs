@@ -101,7 +101,7 @@ impl EstimatedComplexity {
 
         // Analytical estimation based on topology relationships:
         // - Each part has ~features_per_part features (fillets, holes, etc.)
-        // - Each feature creates ~8 faces on average (empirical data from Parasolid models)
+        // - Each feature creates ~8 faces on average (empirical heuristic for CAD features)
         // - Euler formula: V - E + F = 2(1-g) where g is genus
         // - For manifold solids: E ≈ 1.5F, V ≈ 0.5F (empirical ratios)
 

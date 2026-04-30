@@ -591,11 +591,10 @@ fn create_guided_loft(
     // the closest correspondence column in each bounding profile. We pick
     // the nearest vertex (by Euclidean distance) per profile and rewrite
     // the correspondence so the lofted ruled surface actually emanates from
-    // (and terminates on) the guide endpoints. This is the same pinning
-    // approach Parasolid uses in `PK_BODY_loft` for guide-driven lofts;
-    // a full re-sampling of the guide and projection of every control point
-    // would tighten interior fidelity but is not required for endpoint
-    // incidence, which is what guide-driven semantics demand.
+    // (and terminates on) the guide endpoints. A full re-sampling of the
+    // guide and projection of every control point would tighten interior
+    // fidelity but is not required for endpoint incidence, which is what
+    // guide-driven semantics demand.
 
     // Find the vertex index in `row` nearest to `target`
     let nearest_vertex_col = |row: &[Point3], target: Point3| -> usize {
