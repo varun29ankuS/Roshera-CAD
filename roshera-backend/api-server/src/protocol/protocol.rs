@@ -19,12 +19,39 @@ use uuid::Uuid;
 // Use the geometry commands QueryType for geometry queries
 use shared_types::geometry_commands::QueryType as GeometryQueryType;
 
-// Import TimelineOperation from timeline_handlers
-use super::timeline_handlers::TimelineOperation;
-
 // ============================================================================
 // SUPPORTING TYPES (must be defined before the message types that use them)
 // ============================================================================
+
+/// Timeline operation payload carried by `TimelineWSCommand::ExecuteOperation`.
+/// Lives here (not in a separate `timeline_handlers` module) because this is
+/// the only consumer — the legacy `timeline_handlers.rs` dispatch shim was
+/// orphaned by the move to `message_handlers.rs` and was deleted in #29.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation_type")]
+pub enum TimelineOperation {
+    CreatePrimitive {
+        primitive_type: String,
+        parameters: serde_json::Value,
+    },
+    Transform {
+        entity_id: String,
+        transformation: [[f64; 4]; 4],
+    },
+    BooleanUnion {
+        operands: Vec<String>,
+    },
+    BooleanIntersection {
+        operands: Vec<String>,
+    },
+    BooleanDifference {
+        target: String,
+        tools: Vec<String>,
+    },
+    Delete {
+        entities: Vec<String>,
+    },
+}
 
 /// Geometry WebSocket commands
 #[derive(Debug, Clone, Serialize, Deserialize)]
