@@ -1,7 +1,8 @@
 //! Implementation of timeline methods for API integration
 //!
-//! This module provides the missing methods that the API server expects,
-//! implementing a world-class event-sourced timeline system.
+//! Provides the timeline surface the api-server consumes: branch
+//! creation/merge, session position tracking, undo/redo, and event-state
+//! transitions over the event-sourced timeline.
 
 use crate::branch::{MergeResult, MergeStatistics};
 use crate::timeline::{OperationState, SessionPosition};

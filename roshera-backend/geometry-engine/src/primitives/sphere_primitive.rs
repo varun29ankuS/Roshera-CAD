@@ -1,7 +1,8 @@
 //! Sphere primitive with full B-Rep topology
 //!
-//! This module implements a world-class parametric sphere primitive that meets
-//! all requirements for exact geometry, complete topology, and parametric updates.
+//! Parametric sphere primitive with exact analytic geometry, a complete
+//! B-Rep topology (1 face, 2 edges, 2 poles), and parametric updates that
+//! preserve identity across edits.
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{

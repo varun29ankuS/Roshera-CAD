@@ -1,8 +1,8 @@
 //! Core trait system for parametric CAD primitives
 //!
-//! This module defines the fundamental traits that all primitives must implement
-//! to meet world-class CAD requirements for parametric modeling, exact geometry,
-//! and complete topological representation.
+//! Defines the trait surface every primitive must implement: parametric
+//! definition, exact analytic geometry, and a complete B-Rep topology
+//! (vertices, edges, faces, shells, solids).
 
 use crate::math::{Point3, Vector3};
 use crate::primitives::{

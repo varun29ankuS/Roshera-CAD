@@ -1,7 +1,8 @@
 //! Box/Cuboid primitive with full B-Rep topology
 //!
-//! This module implements a world-class parametric box primitive that meets
-//! all requirements for exact geometry, complete topology, and parametric updates.
+//! Parametric box primitive with exact analytic geometry, a complete
+//! B-Rep topology (8 vertices, 12 edges, 6 faces), and parametric updates
+//! that preserve identity across edits.
 //!
 //! Indexed access into the 8-vertex / 12-edge / 6-face buffers is the canonical
 //! idiom — bounded by box topology constants. Matches nurbs.rs pattern.

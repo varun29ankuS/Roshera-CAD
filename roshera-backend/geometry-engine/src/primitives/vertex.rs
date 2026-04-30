@@ -41,7 +41,7 @@ pub enum VertexAttribute {
     Selected(bool),
 }
 
-/// Compact vertex representation with world-class features
+/// Compact vertex representation: position, surface params, id, attribute set
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Vertex {

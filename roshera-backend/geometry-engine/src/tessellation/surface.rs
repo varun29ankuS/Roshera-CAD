@@ -1468,7 +1468,7 @@ fn tessellate_surface_grid(
     }
 }
 
-/// Tessellate a NURBS face with world-class adaptive refinement
+/// Tessellate a NURBS face with curvature-driven adaptive refinement
 fn tessellate_nurbs_face(
     face: &Face,
     model: &BRepModel,

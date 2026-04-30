@@ -2,13 +2,13 @@
 mod aerospace_tolerance_tests {
     use crate::math::{bspline::BSplineCurve, Point3};
 
-    /// Aerospace industry standard geometric tolerance
-    const AEROSPACE_TOLERANCE: f64 = 1e-10;
+    /// Tight geometric tolerance for B-Spline numerical regression checks
+    const TIGHT_TOLERANCE: f64 = 1e-10;
 
-    /// Typical CAD-kernel tolerance used across the industry
-    const CAD_KERNEL_TOLERANCE: f64 = 1e-10;
+    /// Reference tolerance used by the kernel default `Tolerance::default()`
+    const KERNEL_TOLERANCE: f64 = 1e-10;
 
-    /// Maximum acceptable error for aerospace applications
+    /// Worst-case acceptable error for these regression assertions
     const MAX_ACCEPTABLE_ERROR: f64 = 1e-12;
 
     #[test]
@@ -161,17 +161,12 @@ mod aerospace_tolerance_tests {
 
     #[test]
     fn test_compliance_summary() {
-        println!("\n╔══════════════════════════════════════════════════════════════════╗");
-        println!("║            AEROSPACE COMPLIANCE TEST SUMMARY                      ║");
-        println!("╚══════════════════════════════════════════════════════════════════╗");
-        println!("  Geometric Tolerance:    {:.2e} ✓", AEROSPACE_TOLERANCE);
-        println!("  CAD Kernel Standard:    {:.2e} ✓", CAD_KERNEL_TOLERANCE);
-        println!("  Maximum Error:          {:.2e} ✓", MAX_ACCEPTABLE_ERROR);
-        println!("  Deterministic Results:  YES ✓");
-        println!("  Boundary Exactness:     YES ✓");
-        println!("  Numerical Stability:    YES ✓");
-        println!("══════════════════════════════════════════════════════════════════");
-        println!("  AEROSPACE INDUSTRY READY: ✅");
-        println!("══════════════════════════════════════════════════════════════════");
+        println!("\nB-Spline tolerance regression summary:");
+        println!("  Tight tolerance:        {:.2e}", TIGHT_TOLERANCE);
+        println!("  Kernel tolerance:       {:.2e}", KERNEL_TOLERANCE);
+        println!("  Max acceptable error:   {:.2e}", MAX_ACCEPTABLE_ERROR);
+        println!("  Deterministic results:  yes");
+        println!("  Boundary exactness:     yes");
+        println!("  Numerical stability:    yes");
     }
 }
