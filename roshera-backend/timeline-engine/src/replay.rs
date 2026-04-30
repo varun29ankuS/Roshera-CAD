@@ -56,7 +56,9 @@ use geometry_engine::operations::{
     chamfer::{chamfer_edges, ChamferOptions, ChamferType},
     extrude::{extrude_face, ExtrudeOptions},
     fillet::{fillet_edges, FilletOptions, FilletType},
+    loft::{loft_profiles, LoftOptions, LoftType},
     revolve::{revolve_face, RevolveOptions},
+    sweep::{sweep_profile, SweepOptions, SweepQuality, SweepType},
     transform::{transform_edges, transform_faces, transform_solid, TransformOptions},
 };
 use geometry_engine::primitives::edge::EdgeId;
@@ -573,17 +575,139 @@ fn dispatch_generic(
             Ok(())
         }
 
-        // The kernel currently records sweep / loft with profile *edges*
-        // in `inputs`, not the parent profile face. Replay needs the
-        // face, so until the recorder is enriched these are skipped with
-        // a structured error rather than executed against the wrong
-        // entity type.
-        "sweep_profile" | "loft_profiles" => Err(ReplayError::InvalidParameters {
-            kind: kind.to_string(),
-            reason: "kernel-side recorder is currently lossy for this op \
-                     (profile edges recorded, not face) — replay deferred"
-                .to_string(),
-        }),
+        // ----------------------------------------------------------------
+        // Sweep — `inputs` is `[profile_edge_0, ..., profile_edge_{n-1},
+        // path_edge]`. `params.profile_edge_count = n` partitions them.
+        // The kernel ignores the bulk of `SweepOptions` apart from
+        // `sweep_type` / `quality` / scaling; the replayed call uses
+        // defaults for path-tangent / twist / quality controls. Lossy
+        // for those — but the **topology** is reproducible, which is
+        // what timeline replay must preserve.
+        // ----------------------------------------------------------------
+        "sweep_profile" => {
+            let inputs_arr = parameters
+                .get("inputs")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| missing_inputs(kind))?;
+            let profile_edge_count = inner
+                .get("profile_edge_count")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing `profile_edge_count`".to_string(),
+                })?;
+            if inputs_arr.len() != profile_edge_count + 1 {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!(
+                        "inputs length {} does not match profile_edge_count + 1 = {}",
+                        inputs_arr.len(),
+                        profile_edge_count + 1
+                    ),
+                });
+            }
+            let raw_inputs: Vec<u64> = inputs_arr.iter().filter_map(|v| v.as_u64()).collect();
+            if raw_inputs.len() != inputs_arr.len() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "inputs[] contains non-u64 entries".to_string(),
+                });
+            }
+            let profile: Vec<EdgeId> = raw_inputs[..profile_edge_count]
+                .iter()
+                .map(|&id| remap_id(id, id_remap) as EdgeId)
+                .collect();
+            let path_raw = raw_inputs[profile_edge_count];
+            let path = remap_id(path_raw, id_remap) as EdgeId;
+            // Recover sweep_type / quality from their Debug-formatted
+            // strings (the original options carry non-Serialize
+            // function-pointer fields, hence the Debug round-trip).
+            let sweep_type = inner
+                .get("sweep_type")
+                .and_then(|v| v.as_str())
+                .map(parse_sweep_type)
+                .unwrap_or(SweepType::Path);
+            let quality = inner
+                .get("quality")
+                .and_then(|v| v.as_str())
+                .map(parse_sweep_quality)
+                .unwrap_or(SweepQuality::Standard);
+            let options = SweepOptions {
+                sweep_type,
+                quality,
+                ..SweepOptions::default()
+            };
+            let new_solid = sweep_profile(model, profile, path, options)
+                .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------
+        // Loft — `inputs` is the flat concatenation of profile edges,
+        // partitioned by `params.profile_edge_counts: [usize; n]`.
+        // Lossy for guide curves and explicit vertex correspondence
+        // (those carry types that don't round-trip through JSON);
+        // replay falls back to the kernel's automatic correspondence.
+        // ----------------------------------------------------------------
+        "loft_profiles" => {
+            let inputs_arr = parameters
+                .get("inputs")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| missing_inputs(kind))?;
+            let counts: Vec<usize> = inner
+                .get("profile_edge_counts")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing `profile_edge_counts`".to_string(),
+                })?
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect();
+            let raw_inputs: Vec<u64> = inputs_arr.iter().filter_map(|v| v.as_u64()).collect();
+            if raw_inputs.len() != counts.iter().sum::<usize>() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!(
+                        "inputs length {} does not match Σ profile_edge_counts {:?}",
+                        raw_inputs.len(),
+                        counts
+                    ),
+                });
+            }
+            let mut cursor = 0usize;
+            let mut profiles: Vec<Vec<EdgeId>> = Vec::with_capacity(counts.len());
+            for c in &counts {
+                let slice: Vec<EdgeId> = raw_inputs[cursor..cursor + c]
+                    .iter()
+                    .map(|&id| remap_id(id, id_remap) as EdgeId)
+                    .collect();
+                profiles.push(slice);
+                cursor += c;
+            }
+            let loft_type = inner
+                .get("loft_type")
+                .and_then(|v| v.as_str())
+                .map(parse_loft_type)
+                .unwrap_or(LoftType::Linear);
+            let closed = inner.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+            let create_solid = inner
+                .get("create_solid")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let options = LoftOptions {
+                loft_type,
+                closed,
+                create_solid,
+                ..LoftOptions::default()
+            };
+            let new_solid =
+                loft_profiles(model, profiles, options).map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
 
         unknown => Err(ReplayError::UnknownKind(unknown.to_string())),
     }
@@ -680,6 +804,41 @@ fn parse_fillet_constant_radius(params: &Value) -> Option<f64> {
     let s = params.get("fillet_type")?.as_str()?;
     let inner = s.strip_prefix("Constant(")?.strip_suffix(')')?;
     inner.trim().parse::<f64>().ok()
+}
+
+/// Recover a `SweepType` from its Debug-formatted string. Sweep records
+/// use `format!("{:?}", options.sweep_type)` because `SweepOptions`
+/// carries non-`Serialize` callback fields and cannot round-trip through
+/// JSON directly. Unknown strings fall back to `Path` (the default).
+fn parse_sweep_type(s: &str) -> SweepType {
+    match s {
+        "Path" => SweepType::Path,
+        "MultiGuide" => SweepType::MultiGuide,
+        "Rail" => SweepType::Rail,
+        "BiRail" => SweepType::BiRail,
+        _ => SweepType::Path,
+    }
+}
+
+/// Recover a `SweepQuality` from its Debug string. Unknown → `Standard`.
+fn parse_sweep_quality(s: &str) -> SweepQuality {
+    match s {
+        "Draft" => SweepQuality::Draft,
+        "Standard" => SweepQuality::Standard,
+        "High" => SweepQuality::High,
+        _ => SweepQuality::Standard,
+    }
+}
+
+/// Recover a `LoftType` from its Debug string. Unknown → `Linear`.
+fn parse_loft_type(s: &str) -> LoftType {
+    match s {
+        "Linear" => LoftType::Linear,
+        "Cubic" => LoftType::Cubic,
+        "MinimalTwist" => LoftType::MinimalTwist,
+        "Guided" => LoftType::Guided,
+        _ => LoftType::Linear,
+    }
 }
 
 /// Erase the `GeometryId` discriminant — see the matching kernel-side
