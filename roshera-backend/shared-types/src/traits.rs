@@ -1,8 +1,9 @@
 //! Trait definitions for cross-module interfaces
 //!
 //! This module defines the core traits that establish contracts between
-//! different modules in the Roshera CAD system. These traits ensure
-//! type safety and enable world-class CAD kernel architecture.
+//! different modules in the Roshera CAD system. These traits enforce
+//! type safety at the crate boundary so the geometry kernel, timeline,
+//! session manager, and exporters can talk through stable interfaces.
 
 use crate::{BooleanOp, GeometryId, MaterialProperties, Mesh, Transform3D};
 #[cfg(not(target_arch = "wasm32"))]
@@ -12,8 +13,9 @@ use uuid::Uuid;
 
 /// Core trait for any geometric entity in the system
 ///
-/// This is the fundamental interface that all geometry types must implement,
-/// similar to how Parasolid has a base Entity class.
+/// Every geometric type (vertex, edge, face, solid, sketch element)
+/// implements this trait so that callers can reason about identity,
+/// bounds, and bookkeeping without depending on the concrete type.
 pub trait GeometricEntity: Send + Sync {
     /// Get the unique identifier for this entity
     fn id(&self) -> GeometryId;
@@ -297,7 +299,7 @@ impl From<&str> for GeometryId {
     }
 }
 
-/// Performance monitoring trait for world-class metrics
+/// Performance monitoring trait for internal regression metrics
 pub trait PerformanceMonitor: Send + Sync {
     /// Record operation timing
     fn record_operation_time(&self, operation: &str, duration_ms: u64);

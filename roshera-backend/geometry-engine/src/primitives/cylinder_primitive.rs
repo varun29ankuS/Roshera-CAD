@@ -1,7 +1,8 @@
 //! Cylinder primitive with full B-Rep topology
 //!
-//! This module implements a world-class parametric cylinder primitive that meets
-//! all requirements for exact geometry, complete topology, and parametric updates.
+//! Parametric cylinder primitive with exact analytic geometry, a complete
+//! B-Rep topology (lateral + cap faces, axial + circular edges), and
+//! parametric updates that preserve identity across edits.
 //!
 //! Indexed access into the (2N+2) vertex / (3N) edge / (N+2) face buffers is
 //! the canonical idiom — indices are bounded by the segment count `n` chosen
