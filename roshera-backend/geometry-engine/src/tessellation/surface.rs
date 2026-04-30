@@ -119,21 +119,25 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
         vertex_map.push(index);
     }
 
-    // Add triangles to mesh with proper orientation
+    // Add triangles to mesh.
+    //
+    // No additional orientation flip is needed here: the triangulator
+    // was passed the already-flipped face normal (`face.normal_at`
+    // applies `orientation.sign()`), and `compute_plane_axes` builds
+    // a right-handed basis where `u_axis × v_axis = normal`. The
+    // triangulator forces 2D CCW in that basis, so every emitted
+    // triangle's geometric normal `(b - a) × (c - a)` aligns with
+    // the stored vertex normal. A previous `if Forward { (a,b,c) }
+    // else { (a,c,b) }` branch was a double-flip that wound 8/12
+    // box-face triangles backwards relative to their stored normals
+    // — the bug `box_tessellation_winding_agrees_with_vertex_normals`
+    // catches.
     for triangle in triangles {
-        if face.orientation == crate::primitives::face::FaceOrientation::Forward {
-            mesh.add_triangle(
-                vertex_map[triangle[0]],
-                vertex_map[triangle[1]],
-                vertex_map[triangle[2]],
-            );
-        } else {
-            mesh.add_triangle(
-                vertex_map[triangle[0]],
-                vertex_map[triangle[2]],
-                vertex_map[triangle[1]],
-            );
-        }
+        mesh.add_triangle(
+            vertex_map[triangle[0]],
+            vertex_map[triangle[1]],
+            vertex_map[triangle[2]],
+        );
     }
 }
 
@@ -681,7 +685,12 @@ fn tessellate_cylindrical_face(
         vertex_grid.push(row);
     }
 
-    // Generate triangles
+    // Generate triangles. Winding follows `face.orientation` so the
+    // emitted geometric normal (CCW cross product) agrees with the
+    // stored vertex normal (which `Face::normal_at` already flips for
+    // backward faces); without this, downstream back-face culling
+    // would invert reversed faces.
+    let forward = face.orientation.is_forward();
     for v_idx in 0..v_steps {
         for u_idx in 0..u_steps {
             if vertex_grid[v_idx].len() > u_idx + 1 && vertex_grid[v_idx + 1].len() > u_idx + 1 {
@@ -690,8 +699,13 @@ fn tessellate_cylindrical_face(
                 let v2 = vertex_grid[v_idx + 1][u_idx];
                 let v3 = vertex_grid[v_idx + 1][u_idx + 1];
 
-                mesh.add_triangle(v0, v1, v2);
-                mesh.add_triangle(v1, v3, v2);
+                if forward {
+                    mesh.add_triangle(v0, v1, v2);
+                    mesh.add_triangle(v1, v3, v2);
+                } else {
+                    mesh.add_triangle(v0, v2, v1);
+                    mesh.add_triangle(v1, v2, v3);
+                }
             }
         }
     }
@@ -863,7 +877,11 @@ fn tessellate_spherical_with_poles(
         vertex_grid.push(row);
     }
 
-    // Generate triangles with special handling for poles
+    // Generate triangles with special handling for poles. Winding
+    // follows `face.orientation` for the same reason as the
+    // cylindrical path — a backward face must emit reversed CCW so
+    // the geometric normal agrees with the stored vertex normal.
+    let forward = face.orientation.is_forward();
     for v_idx in 0..v_steps {
         let at_south_pole = near_south_pole && v_idx == 0;
         let at_north_pole = near_north_pole && v_idx == v_steps - 1;
@@ -877,7 +895,11 @@ fn tessellate_spherical_with_poles(
                     vertex_grid[1].get(u_idx).and_then(|&v| v),
                     vertex_grid[1].get(u_idx + 1).and_then(|&v| v),
                 ) {
-                    mesh.add_triangle(pole_vertex, v1, v2);
+                    if forward {
+                        mesh.add_triangle(pole_vertex, v1, v2);
+                    } else {
+                        mesh.add_triangle(pole_vertex, v2, v1);
+                    }
                 }
             }
         } else if at_north_pole
@@ -892,7 +914,11 @@ fn tessellate_spherical_with_poles(
                     vertex_grid[v_idx].get(u_idx).and_then(|&v| v),
                     vertex_grid[v_idx].get(u_idx + 1).and_then(|&v| v),
                 ) {
-                    mesh.add_triangle(v1, v2, pole_vertex);
+                    if forward {
+                        mesh.add_triangle(v1, v2, pole_vertex);
+                    } else {
+                        mesh.add_triangle(v2, v1, pole_vertex);
+                    }
                 }
             }
         } else {
@@ -905,14 +931,43 @@ fn tessellate_spherical_with_poles(
 
                 match (v0, v1, v2, v3) {
                     (Some(a), Some(b), Some(c), Some(d)) => {
-                        mesh.add_triangle(a, b, c);
-                        mesh.add_triangle(b, d, c);
+                        if forward {
+                            mesh.add_triangle(a, b, c);
+                            mesh.add_triangle(b, d, c);
+                        } else {
+                            mesh.add_triangle(a, c, b);
+                            mesh.add_triangle(b, c, d);
+                        }
                     }
                     // Handle degenerate cases
-                    (Some(a), Some(b), Some(c), None) => mesh.add_triangle(a, b, c),
-                    (Some(a), Some(b), None, Some(d)) => mesh.add_triangle(a, b, d),
-                    (Some(a), None, Some(c), Some(d)) => mesh.add_triangle(a, d, c),
-                    (None, Some(b), Some(c), Some(d)) => mesh.add_triangle(b, d, c),
+                    (Some(a), Some(b), Some(c), None) => {
+                        if forward {
+                            mesh.add_triangle(a, b, c);
+                        } else {
+                            mesh.add_triangle(a, c, b);
+                        }
+                    }
+                    (Some(a), Some(b), None, Some(d)) => {
+                        if forward {
+                            mesh.add_triangle(a, b, d);
+                        } else {
+                            mesh.add_triangle(a, d, b);
+                        }
+                    }
+                    (Some(a), None, Some(c), Some(d)) => {
+                        if forward {
+                            mesh.add_triangle(a, d, c);
+                        } else {
+                            mesh.add_triangle(a, c, d);
+                        }
+                    }
+                    (None, Some(b), Some(c), Some(d)) => {
+                        if forward {
+                            mesh.add_triangle(b, d, c);
+                        } else {
+                            mesh.add_triangle(b, c, d);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -965,14 +1020,21 @@ fn tessellate_spherical_regular(
         }
     }
 
-    // Add triangles with mapping
+    // Add triangles with mapping. Winding follows `face.orientation`
+    // so the geometric normal agrees with the stored vertex normal
+    // (`Face::normal_at` already flips for backward faces).
+    let forward = face.orientation.is_forward();
     for triangle in &temp_mesh.triangles {
         if let (Some(v0), Some(v1), Some(v2)) = (
             vertex_map.get(triangle[0] as usize).and_then(|&v| v),
             vertex_map.get(triangle[1] as usize).and_then(|&v| v),
             vertex_map.get(triangle[2] as usize).and_then(|&v| v),
         ) {
-            mesh.add_triangle(v0, v1, v2);
+            if forward {
+                mesh.add_triangle(v0, v1, v2);
+            } else {
+                mesh.add_triangle(v0, v2, v1);
+            }
         }
     }
 }
@@ -1140,7 +1202,9 @@ fn tessellate_conical_with_apex(
         vertex_grid.push(row);
     }
 
-    // Generate triangles
+    // Generate triangles. Winding follows `face.orientation`
+    // (see cylindrical path for rationale).
+    let forward = face.orientation.is_forward();
     for v_idx in 0..vertex_grid.len() - 1 {
         if v_idx == 0 && vertex_grid[0].len() == 1 {
             // Triangles from apex
@@ -1150,7 +1214,11 @@ fn tessellate_conical_with_apex(
                         vertex_grid[1].get(u_idx).and_then(|&v| v),
                         vertex_grid[1].get(u_idx + 1).and_then(|&v| v),
                     ) {
-                        mesh.add_triangle(apex, v1, v2);
+                        if forward {
+                            mesh.add_triangle(apex, v1, v2);
+                        } else {
+                            mesh.add_triangle(apex, v2, v1);
+                        }
                     }
                 }
             }
@@ -1163,8 +1231,13 @@ fn tessellate_conical_with_apex(
                     vertex_grid[v_idx + 1].get(u_idx).and_then(|&v| v),
                     vertex_grid[v_idx + 1].get(u_idx + 1).and_then(|&v| v),
                 ) {
-                    mesh.add_triangle(v0, v1, v2);
-                    mesh.add_triangle(v1, v3, v2);
+                    if forward {
+                        mesh.add_triangle(v0, v1, v2);
+                        mesh.add_triangle(v1, v3, v2);
+                    } else {
+                        mesh.add_triangle(v0, v2, v1);
+                        mesh.add_triangle(v1, v2, v3);
+                    }
                 }
             }
         }
@@ -1515,7 +1588,9 @@ fn tessellate_generic_face(
         vertex_grid.push(row);
     }
 
-    // Generate triangles
+    // Generate triangles. Winding follows `face.orientation`
+    // (see cylindrical path for rationale).
+    let forward = face.orientation.is_forward();
     for v_idx in 0..v_steps {
         for u_idx in 0..u_steps {
             if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (
@@ -1524,8 +1599,13 @@ fn tessellate_generic_face(
                 vertex_grid[v_idx + 1].get(u_idx).and_then(|&v| v),
                 vertex_grid[v_idx + 1].get(u_idx + 1).and_then(|&v| v),
             ) {
-                mesh.add_triangle(v0, v1, v2);
-                mesh.add_triangle(v1, v3, v2);
+                if forward {
+                    mesh.add_triangle(v0, v1, v2);
+                    mesh.add_triangle(v1, v3, v2);
+                } else {
+                    mesh.add_triangle(v0, v2, v1);
+                    mesh.add_triangle(v1, v2, v3);
+                }
             }
         }
     }
@@ -1967,11 +2047,10 @@ fn tessellate_nurbs_adaptive(
         0,
     );
 
-    // Convert quadtree to triangles
-    let vertices = quad_tree_to_mesh(&quad_tree, surface, face, model, mesh);
-
-    // Post-process for watertight mesh
-    ensure_watertight_mesh(mesh, &vertices);
+    // Convert quadtree to triangles. The vertex map is kept locally for
+    // QuadTree->mesh stamping; watertight welding is handled at the
+    // shell level by `tessellate_shell`, so we don't run it here.
+    let _ = quad_tree_to_mesh(&quad_tree, surface, face, model, mesh);
 }
 
 /// Quadtree structure for adaptive subdivision
@@ -2239,12 +2318,25 @@ fn quad_tree_to_mesh(
                 }
             }
 
-            // Create triangles if we have all 4 vertices
+            // Create triangles if we have all 4 vertices. Winding
+            // follows `face.orientation` so the geometric normal
+            // agrees with the stored vertex normal — see cylindrical
+            // path for the full rationale.
+            let forward = face.orientation.is_forward();
             if indices.len() == 4 {
-                mesh.add_triangle(indices[0], indices[1], indices[2]);
-                mesh.add_triangle(indices[0], indices[2], indices[3]);
+                if forward {
+                    mesh.add_triangle(indices[0], indices[1], indices[2]);
+                    mesh.add_triangle(indices[0], indices[2], indices[3]);
+                } else {
+                    mesh.add_triangle(indices[0], indices[2], indices[1]);
+                    mesh.add_triangle(indices[0], indices[3], indices[2]);
+                }
             } else if indices.len() == 3 {
-                mesh.add_triangle(indices[0], indices[1], indices[2]);
+                if forward {
+                    mesh.add_triangle(indices[0], indices[1], indices[2]);
+                } else {
+                    mesh.add_triangle(indices[0], indices[2], indices[1]);
+                }
             }
         }
     }
@@ -2261,100 +2353,224 @@ fn discretize_uv(u: f64, v: f64) -> (usize, usize) {
     )
 }
 
-/// Ensure the mesh is watertight by welding vertices
-fn ensure_watertight_mesh(mesh: &mut TriangleMesh, _vertex_map: &HashMap<(usize, usize), u32>) {
-    // Build spatial hash for fast vertex lookup
-    let mut spatial_hash: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
-    const GRID_SIZE: f64 = 0.001; // 1mm grid
+/// Weld coincident vertices into a single index, producing a watertight
+/// triangle mesh.
+///
+/// Tessellation emits each face independently — adjacent faces sharing
+/// a B-Rep edge sample its curve at the same canonical parameters, so
+/// they produce **3D-coincident vertices** along the shared boundary
+/// (the per-edge sampling is symmetric: forward face A at {t_start,
+/// t_start+Δ, …, t_end-Δ} ∪ {t_end via next edge} and backward face B
+/// at {t_end, t_end-Δ, …, t_start+Δ} ∪ {t_start via next edge} contain
+/// the same N+1 parameters). What is missing without this pass is the
+/// **index unification** — the mesh has two distinct vertex IDs at the
+/// same 3D position, so the seam appears as a topological gap to any
+/// downstream consumer (STL export, BVH builder, edge-flow analysis).
+///
+/// Algorithm: voxel-grid spatial hash, O(n) expected, neighbourhood
+/// scan over the 27 surrounding cells. Indices ≥ i are never collapsed
+/// onto i (we always keep the lower index as canonical). Triangles are
+/// rewritten with the remapped indices in place; orphaned vertices in
+/// `mesh.vertices` are not garbage-collected (the rendering layer
+/// tolerates them, and downstream STL/OBJ exporters apply their own
+/// dedup pass — see `export-engine/src/validation.rs`).
+///
+/// `weld_tolerance` should match the kernel's geometric tolerance for
+/// the model — typically `1e-6` for mm-scale parts, looser for
+/// metre-scale assemblies. The grid cell size is chosen as
+/// `weld_tolerance.max(1e-9) * 1e3` so that a 1×1×1 cell comfortably
+/// brackets any pair within tolerance even at the cell edges.
+pub(crate) fn weld_mesh_watertight(mesh: &mut TriangleMesh, weld_tolerance: f64) {
+    weld_mesh_watertight_range(mesh, weld_tolerance, 0, 0);
+}
 
-    // Hash all vertices
-    for (i, vertex) in mesh.vertices.iter().enumerate() {
-        let x = vertex.position.x;
-        let y = vertex.position.y;
-        let z = vertex.position.z;
+/// Range-restricted variant of [`weld_mesh_watertight`] used by
+/// `tessellate_shell` to weld each shell independently while preserving
+/// vertex/triangle indices from earlier shells already in the mesh.
+///
+/// Welds only vertices at indices `>= v_start` and triangles at indices
+/// `>= t_start`. Cross-shell coincidences (e.g. between an outer shell
+/// and an inner void shell) are intentionally left un-welded — they
+/// represent topologically-distinct boundaries.
+pub(crate) fn weld_mesh_watertight_range(
+    mesh: &mut TriangleMesh,
+    weld_tolerance: f64,
+    v_start: usize,
+    t_start: usize,
+) {
+    let n = mesh.vertices.len();
+    let m = mesh.triangles.len();
+    if v_start >= n || t_start >= m {
+        return;
+    }
 
-        let grid_x = (x / GRID_SIZE).floor() as i32;
-        let grid_y = (y / GRID_SIZE).floor() as i32;
-        let grid_z = (z / GRID_SIZE).floor() as i32;
+    // Cell size: a few orders of magnitude larger than tolerance so two
+    // points within tolerance reliably share a cell or land in adjacent
+    // cells. Floor at 1e-9 to avoid pathological 0/negative tolerances
+    // collapsing every vertex onto the origin cell.
+    let safe_tol = weld_tolerance.max(1e-9);
+    let grid_size = safe_tol * 1.0e3;
+    let inv_grid = 1.0 / grid_size;
+    let tol_sq = safe_tol * safe_tol;
 
+    let to_cell = |p: Point3| -> (i32, i32, i32) {
+        // Defensive non-finite handling: treat NaN/inf positions as
+        // their own bucket so they don't poison the dedup pass.
+        if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() {
+            return (i32::MIN, i32::MIN, i32::MIN);
+        }
+        (
+            (p.x * inv_grid).floor() as i32,
+            (p.y * inv_grid).floor() as i32,
+            (p.z * inv_grid).floor() as i32,
+        )
+    };
+
+    let mut spatial_hash: HashMap<(i32, i32, i32), Vec<u32>> =
+        HashMap::with_capacity(n - v_start);
+    for i in v_start..n {
         spatial_hash
-            .entry((grid_x, grid_y, grid_z))
+            .entry(to_cell(mesh.vertices[i].position))
             .or_default()
             .push(i as u32);
     }
 
-    // Build vertex remapping for welding
-    let mut vertex_remap: HashMap<u32, u32> = HashMap::new();
-    let weld_tolerance = 1e-6;
+    // remap[i] = canonical index for vertex i, only meaningful for
+    // i >= v_start. Earlier vertices are identity-mapped (we don't
+    // touch them).
+    let mut remap: Vec<u32> = (0..n as u32).collect();
 
-    for i in 0..mesh.vertices.len() {
-        if vertex_remap.contains_key(&(i as u32)) {
-            continue;
-        }
-
+    for i in v_start..n {
         let pos = mesh.vertices[i].position;
+        let (cx, cy, cz) = to_cell(pos);
 
-        // Check neighboring grid cells
-        let grid_x = (pos.x / GRID_SIZE).floor() as i32;
-        let grid_y = (pos.y / GRID_SIZE).floor() as i32;
-        let grid_z = (pos.z / GRID_SIZE).floor() as i32;
-
-        let mut found_match = false;
-
-        for dx in -1..=1 {
+        // Scan the 3×3×3 neighbourhood. Stop at the first vertex with
+        // a strictly-smaller original index (still inside the welding
+        // range — `cand >= v_start`) that is within tolerance — we
+        // keep the lowest index as canonical, which gives a
+        // deterministic mapping regardless of insertion order.
+        let mut canonical = i as u32;
+        'scan: for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    if let Some(candidates) =
-                        spatial_hash.get(&(grid_x + dx, grid_y + dy, grid_z + dz))
-                    {
-                        for &candidate in candidates {
-                            if candidate >= i as u32 {
+                    if let Some(bucket) = spatial_hash.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &cand in bucket {
+                            if (cand as usize) < v_start || cand >= i as u32 {
                                 continue;
                             }
-
-                            let candidate_pos = mesh.vertices[candidate as usize].position;
-
-                            if pos.distance(&candidate_pos) < weld_tolerance {
-                                vertex_remap.insert(i as u32, candidate);
-                                found_match = true;
-                                break;
+                            let dp = mesh.vertices[cand as usize].position - pos;
+                            if dp.dot(&dp) <= tol_sq {
+                                canonical = remap[cand as usize];
+                                break 'scan;
                             }
                         }
                     }
-                    if found_match {
-                        break;
-                    }
                 }
-                if found_match {
-                    break;
-                }
-            }
-            if found_match {
-                break;
             }
         }
+        remap[i] = canonical;
+    }
 
-        if !found_match {
-            vertex_remap.insert(i as u32, i as u32);
+    let mut welded: u32 = 0;
+    for i in v_start..n {
+        if remap[i] != i as u32 {
+            welded += 1;
         }
     }
 
-    // Remap indices
-    for triangle in &mut mesh.triangles {
-        for vertex_idx in triangle {
-            if let Some(&new_idx) = vertex_remap.get(vertex_idx) {
-                *vertex_idx = new_idx;
-            }
+    // K14 — G1 normal continuity at smooth seams.
+    //
+    // Accumulate every welded contributor's normal into its canonical
+    // bucket. Then, for canonicals with ≥ 2 contributors, write back
+    // the unit-length average **only when contributors agree** — i.e.
+    // when |Σnᵢ| / N exceeds `G1_SMOOTHNESS_THRESHOLD`.
+    //
+    // This is a length-of-mean test: identical normals give |avg| = 1;
+    // 18° spread gives |avg| ≈ 0.95; a 90° box corner gives
+    // |avg| ≈ 0.71; opposing seam normals collapse to |avg| ≈ 0.
+    // The 0.95 threshold accepts smooth cylinder / sphere / NURBS
+    // seams (where adjacent faces share the same surface tangent at
+    // the seam) and rejects sharp B-Rep edges (where each face's
+    // normal is correct as emitted; averaging them would smear the
+    // shading discontinuity that the renderer needs).
+    //
+    // The canonical's own original normal is included in the sum.
+    // No vertex is duplicated and the watertight invariant from
+    // `weld_mesh_watertight` is preserved — only the canonical's
+    // `MeshVertex.normal` is mutated in place.
+    const G1_SMOOTHNESS_THRESHOLD: f64 = 0.95;
+    let mut normal_accum: HashMap<u32, (Vector3, u32)> = HashMap::with_capacity(n - v_start);
+    for i in v_start..n {
+        let canon = remap[i];
+        let ni = mesh.vertices[i].normal;
+        let entry = normal_accum
+            .entry(canon)
+            .or_insert((Vector3::new(0.0, 0.0, 0.0), 0));
+        entry.0 = entry.0 + ni;
+        entry.1 += 1;
+    }
+    let mut g1_smoothed: u32 = 0;
+    for (canon, (sum, count)) in normal_accum.iter() {
+        if *count <= 1 {
+            continue;
         }
+        let inv_count = 1.0 / (*count as f64);
+        let avg = *sum * inv_count;
+        let mag = avg.dot(&avg).sqrt();
+        if mag >= G1_SMOOTHNESS_THRESHOLD {
+            // Defensive: mag was just verified ≥ 0.95 so 1/mag is finite.
+            mesh.vertices[*canon as usize].normal = avg * (1.0 / mag);
+            g1_smoothed += 1;
+        }
+        // else: sharp edge — preserve canonical's first-emitter normal.
     }
 
-    // Log welding statistics
-    let welded_count = vertex_remap
-        .iter()
-        .filter(|(&key, &value)| key != value)
-        .count();
-    if welded_count > 0 {
-        tracing::debug!("Welded {} vertices for watertight mesh", welded_count);
+    // Rewrite triangle indices in [t_start..]. Drop triangles that
+    // collapse to a degenerate sliver (two indices remap to the same
+    // canonical) and keep `face_map` consistent with the surviving
+    // triangles — both arrays are indexed in lock-step, so a single
+    // combined walk is the only way to preserve that invariant.
+    let has_face_map = mesh.face_map.len() == m;
+    let head_triangles: Vec<[u32; 3]> = mesh.triangles[..t_start].to_vec();
+    let head_face_map: Vec<u32> = if has_face_map {
+        mesh.face_map[..t_start].to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut new_triangles: Vec<[u32; 3]> = Vec::with_capacity(m);
+    let mut new_face_map: Vec<u32> = if has_face_map {
+        Vec::with_capacity(m)
+    } else {
+        Vec::new()
+    };
+    new_triangles.extend(head_triangles);
+    if has_face_map {
+        new_face_map.extend(head_face_map);
+    }
+    for idx in t_start..m {
+        let tri = mesh.triangles[idx];
+        let a = remap[tri[0] as usize];
+        let b = remap[tri[1] as usize];
+        let c = remap[tri[2] as usize];
+        if a == b || b == c || a == c {
+            continue;
+        }
+        new_triangles.push([a, b, c]);
+        if has_face_map {
+            new_face_map.push(mesh.face_map[idx]);
+        }
+    }
+    mesh.triangles = new_triangles;
+    if has_face_map {
+        mesh.face_map = new_face_map;
+    }
+
+    if welded > 0 || g1_smoothed > 0 {
+        tracing::debug!(
+            "weld_mesh_watertight_range: collapsed {welded} duplicate vertices, \
+             G1-smoothed {g1_smoothed} canonical normals \
+             (tol={weld_tolerance:e}, v_start={v_start})"
+        );
     }
 }
 
