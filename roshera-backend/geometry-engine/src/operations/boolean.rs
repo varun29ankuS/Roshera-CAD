@@ -5546,6 +5546,95 @@ mod tests {
         expect_solid(geom)
     }
 
+    /// Build an origin-centered sphere from an explicit radius. Used by
+    /// Phase-C sphere/sphere and sphere/cylinder pairings; box/sphere
+    /// keeps its inline `create_sphere_3d` call to preserve identical
+    /// bytecode for the Tier-1 box pairings.
+    fn make_sphere(model: &mut BRepModel, radius: f64) -> SolidId {
+        let geom = TopologyBuilder::new(model)
+            .create_sphere_3d(Point3::ORIGIN, radius)
+            .expect("strategy bounds guarantee positive radius");
+        expect_solid(geom)
+    }
+
+    /// Build an origin-anchored Z-axis cylinder from explicit (radius, height).
+    fn make_cylinder(model: &mut BRepModel, params: (f64, f64)) -> SolidId {
+        let (radius, height) = params;
+        let geom = TopologyBuilder::new(model)
+            .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)
+            .expect("strategy bounds guarantee positive cylinder parameters");
+        expect_solid(geom)
+    }
+
+    /// World-space translation envelope for `deep_clone_solid`. The range
+    /// straddles zero so proptest exercises overlapping (small magnitude),
+    /// near-tangent, and fully disjoint operand pairs in the same suite —
+    /// otherwise the boolean classifier's two regimes (face-face splitting
+    /// vs whole-operand inclusion/exclusion) only see one regime per test.
+    fn arb_offset() -> impl Strategy<Value = Vector3> {
+        (-25.0_f64..25.0, -25.0_f64..25.0, -25.0_f64..25.0)
+            .prop_map(|(x, y, z)| Vector3::new(x, y, z))
+    }
+
+    /// Topological well-formedness check on a successful boolean output.
+    ///
+    /// Asserts (only on the `Ok` path — `Err` is accepted at the Tier-1
+    /// ceiling and skipped here):
+    ///
+    /// * the result solid's `outer_shell` resolves in `model.shells`;
+    /// * that shell has at least one face (a zero-face shell is a degenerate
+    ///   reconstruction even at the current robustness ceiling);
+    /// * every face's `outer_loop` resolves in `model.loops` — i.e. no face
+    ///   carries a dangling loop reference.
+    ///
+    /// What is intentionally NOT asserted here: edge ↔ face manifoldness,
+    /// loop closure, Euler characteristic, or face-count parity. Those
+    /// belong to a future tier once the kernel's coincident-face handling
+    /// is hardened — see the module docs.
+    fn check_topology_wellformed(
+        result: &OperationResult<SolidId>,
+        model: &BRepModel,
+        operation: BooleanOp,
+    ) -> Result<(), TestCaseError> {
+        let solid_id = match result {
+            Ok(id) => *id,
+            Err(_) => return Ok(()),
+        };
+        let solid = match model.solids.get(solid_id) {
+            Some(s) => s,
+            None => return Err(TestCaseError::fail(format!(
+                "{operation:?} returned Ok({solid_id}) but solid is missing from model",
+            ))),
+        };
+        let shell = match model.shells.get(solid.outer_shell) {
+            Some(s) => s,
+            None => return Err(TestCaseError::fail(format!(
+                "{operation:?} solid {solid_id} outer_shell {} missing from shell store",
+                solid.outer_shell,
+            ))),
+        };
+        if shell.faces.is_empty() {
+            return Err(TestCaseError::fail(format!(
+                "{operation:?} solid {solid_id} outer_shell has zero faces — degenerate reconstruction",
+            )));
+        }
+        for &face_id in &shell.faces {
+            let face = match model.faces.get(face_id) {
+                Some(f) => f,
+                None => return Err(TestCaseError::fail(format!(
+                    "{operation:?} face {face_id} referenced by shell missing from face store",
+                ))),
+            };
+            if model.loops.get(face.outer_loop).is_none() {
+                return Err(TestCaseError::fail(format!(
+                    "{operation:?} face {face_id} outer_loop {} missing from loop store — dangling reference",
+                    face.outer_loop,
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Tier-1 robustness invariants on a boolean result, returning a
     /// `TestCaseError` so proptest can record the failure, run its
     /// shrinker, and persist a regression seed in `proptest-regressions/`.
@@ -6282,6 +6371,184 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Phase-C extensions exercise the same pipeline on broader
+            // pair topologies and translated operands. cases=32 mirrors
+            // Tier 2/3 — enough to drive shrinking on real failures
+            // without doubling CI walltime.
+            cases: 32,
+            max_global_rejects: 1024,
+            ..ProptestConfig::default()
+        })]
+
+        // -------------------------------------------------------------
+        // Tier 1c — additional analytical-classifier pairings.
+        //
+        // Box/box, box/sphere, and box/cyl already cover plane/plane,
+        // plane/sphere, plane/cyl. The pairings below extend coverage
+        // to sphere/sphere, sphere/cyl, and cyl/cyl, all of which take
+        // distinct code paths in `intersect_curve_surface` and the
+        // analytical face-face routing.
+        // -------------------------------------------------------------
+
+        #[test]
+        fn prop_tier1c_sphere_sphere_all_ops(
+            ra in arb_sphere_radius(),
+            rb in arb_sphere_radius(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_sphere(&mut model, ra);
+            let solid_b = make_sphere(&mut model, rb);
+            let result =
+                boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default());
+            check_tier1(&result, &model, op)?;
+        }
+
+        #[test]
+        fn prop_tier1c_sphere_cylinder_all_ops(
+            radius in arb_sphere_radius(),
+            cyl in arb_cylinder_params(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_sphere(&mut model, radius);
+            let solid_b = make_cylinder(&mut model, cyl);
+            let result =
+                boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default());
+            check_tier1(&result, &model, op)?;
+        }
+
+        #[test]
+        fn prop_tier1c_cylinder_cylinder_all_ops(
+            cyl_a in arb_cylinder_params(),
+            cyl_b in arb_cylinder_params(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_cylinder(&mut model, cyl_a);
+            let solid_b = make_cylinder(&mut model, cyl_b);
+            let result =
+                boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default());
+            check_tier1(&result, &model, op)?;
+        }
+
+        // -------------------------------------------------------------
+        // Tier 2c — translated-operand structural correctness.
+        //
+        // The seeded suite only exercised origin-centered pairs (and
+        // a single deep_clone with zero offset). Driving the offset
+        // through `arb_offset` lets proptest sweep the classifier
+        // through overlapping, tangent, and disjoint regimes in one
+        // suite — these regimes hit different branches of the boolean
+        // pipeline (whole-operand fast-path vs face-face splitting).
+        // -------------------------------------------------------------
+
+        /// Translated self-union: `A ∪ A_t` where A_t is a deep-clone of
+        /// A translated by `offset`. Asserts only Tier-1 + pipeline
+        /// success, mirroring the seeded `prop_tier2_self_union_*` ceiling.
+        #[test]
+        fn prop_tier2c_translated_self_union(
+            dims in arb_box_dims(),
+            offset in arb_offset(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, dims);
+            let a_t = deep_clone_solid(&mut model, a, Some(offset))
+                .expect("deep_clone_solid with offset must succeed for a valid box");
+            prop_assert_ne!(a, a_t, "deep_clone_solid must return a new SolidId");
+            let result = boolean_operation(
+                &mut model, a, a_t, BooleanOp::Union, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Union)?;
+        }
+
+        /// Translated self-difference: `A - A_t` where A_t is a translated
+        /// deep-clone. Hits the difference pipeline through the same
+        /// regime sweep — the difference path has its own classifier
+        /// invariants and is not symmetric with the union path.
+        #[test]
+        fn prop_tier2c_translated_self_difference(
+            dims in arb_box_dims(),
+            offset in arb_offset(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, dims);
+            let a_t = deep_clone_solid(&mut model, a, Some(offset))
+                .expect("deep_clone_solid with offset must succeed for a valid box");
+            let result = boolean_operation(
+                &mut model, a, a_t, BooleanOp::Difference, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Difference)?;
+        }
+
+        // -------------------------------------------------------------
+        // Tier 4 — topological well-formedness on the success path.
+        //
+        // Tightens the in-module ceiling beyond "pipeline returns a
+        // typed outcome": when an operation reports `Ok`, the resulting
+        // solid must be structurally walkable (outer_shell resolves,
+        // shell has ≥1 face, every face's outer_loop resolves).
+        // Asserting this catches a class of regressions where the
+        // boolean machinery emits a SolidId pointing at a half-built
+        // topology that downstream tessellation / feature recognition
+        // would silently mishandle.
+        //
+        // The Tier-1 acceptance of arbitrary `Err(..)` is preserved —
+        // these properties only fire on `Ok`, so they cannot regress
+        // any operand pair that the kernel currently rejects.
+        // -------------------------------------------------------------
+
+        #[test]
+        fn prop_tier4_box_box_topology_wellformed(
+            a in arb_box_dims(),
+            b in arb_box_dims(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, a);
+            let solid_b = make_box(&mut model, b);
+            let result = boolean_operation(
+                &mut model, solid_a, solid_b, op, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, op)?;
+            check_topology_wellformed(&result, &model, op)?;
+        }
+
+        #[test]
+        fn prop_tier4_box_sphere_topology_wellformed(
+            box_dims in arb_box_dims(),
+            radius in arb_sphere_radius(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, box_dims);
+            let solid_b = make_sphere(&mut model, radius);
+            let result = boolean_operation(
+                &mut model, solid_a, solid_b, op, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, op)?;
+            check_topology_wellformed(&result, &model, op)?;
+        }
+
+        #[test]
+        fn prop_tier4_box_cylinder_topology_wellformed(
+            box_dims in arb_box_dims(),
+            cyl in arb_cylinder_params(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, box_dims);
+            let solid_b = make_cylinder(&mut model, cyl);
+            let result = boolean_operation(
+                &mut model, solid_a, solid_b, op, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, op)?;
+            check_topology_wellformed(&result, &model, op)?;
         }
     }
 }
