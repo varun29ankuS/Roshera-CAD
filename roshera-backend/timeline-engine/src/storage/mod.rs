@@ -130,7 +130,7 @@ impl StorageEngine {
             .map_err(TimelineError::StorageError)?;
 
         let file_path = branch_path.join(format!("{}.branch", branch.id.0));
-        let data = bincode::serialize(branch)
+        let data = rmp_serde::to_vec(branch)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         let compressed = if self.config.compression_enabled {
@@ -169,7 +169,8 @@ impl StorageEngine {
             compressed
         };
 
-        bincode::deserialize(&data).map_err(|e| TimelineError::SerializationError(e.to_string()))
+        rmp_serde::from_slice(&data)
+            .map_err(|e| TimelineError::SerializationError(e.to_string()))
     }
 
     /// Persist a checkpoint

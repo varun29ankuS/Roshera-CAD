@@ -61,8 +61,10 @@ impl EventLog {
 
     /// Append an event to the log
     pub async fn append(&self, event: &TimelineEvent) -> TimelineResult<EventLocation> {
-        // Serialize event
-        let data = bincode::serialize(event)
+        // Serialize event with MessagePack (self-describing; round-trips
+        // `serde_json::Value` via `deserialize_any`, which bincode 1.x
+        // cannot do).
+        let data = rmp_serde::to_vec(event)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         // Compress if enabled
@@ -106,8 +108,25 @@ impl EventLog {
             compressed: self.compression_enabled,
         };
 
-        let header_bytes = bincode::serialize(&header)
+        let header_bytes = rmp_serde::to_vec(&header)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
+
+        // MessagePack is variable-length, so the reader cannot use
+        // `size_of::<EventHeader>()` to size its buffer the way the old
+        // bincode-with-`#[repr(C)]` layout pretended to. Length-prefix
+        // the header with a 4-byte LE u32 so `read_event` can pull the
+        // exact byte count off the stream before decoding.
+        let header_len = u32::try_from(header_bytes.len()).map_err(|_| {
+            TimelineError::SerializationError(format!(
+                "event header too large: {} bytes",
+                header_bytes.len()
+            ))
+        })?;
+        let header_len_bytes = header_len.to_le_bytes();
+
+        file.write_all(&header_len_bytes)
+            .await
+            .map_err(TimelineError::StorageError)?;
 
         file.write_all(&header_bytes)
             .await
@@ -122,7 +141,7 @@ impl EventLog {
         file.flush().await.map_err(TimelineError::StorageError)?;
 
         // Update size
-        let written = header_bytes.len() + compressed.len();
+        let written = header_len_bytes.len() + header_bytes.len() + compressed.len();
         self.current_size
             .fetch_add(written as u64, Ordering::Relaxed);
 
@@ -148,13 +167,29 @@ impl EventLog {
             .await
             .map_err(TimelineError::StorageError)?;
 
-        // Read header
-        let mut header_buf = vec![0u8; std::mem::size_of::<EventHeader>()];
+        // Read length-prefix (4-byte LE u32) — see `append` for why this
+        // exists. MessagePack headers are variable-length.
+        let mut header_len_bytes = [0u8; 4];
+        file.read_exact(&mut header_len_bytes)
+            .await
+            .map_err(TimelineError::StorageError)?;
+        let header_len = u32::from_le_bytes(header_len_bytes) as usize;
+
+        // Sanity-cap to keep a corrupt prefix from triggering a multi-GiB
+        // allocation. Real headers are well under 1 KiB.
+        if header_len > 4096 {
+            return Err(TimelineError::StorageError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("event header length out of range: {}", header_len),
+            )));
+        }
+
+        let mut header_buf = vec![0u8; header_len];
         file.read_exact(&mut header_buf)
             .await
             .map_err(TimelineError::StorageError)?;
 
-        let header: EventHeader = bincode::deserialize(&header_buf)
+        let header: EventHeader = rmp_serde::from_slice(&header_buf)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         // Validate header
@@ -193,7 +228,7 @@ impl EventLog {
         };
 
         // Deserialize
-        bincode::deserialize(&decompressed)
+        rmp_serde::from_slice(&decompressed)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))
     }
 
@@ -306,9 +341,11 @@ impl EventLog {
     }
 }
 
-/// Event header for storage
+/// Event header for storage. Length-prefixed on disk (see `append` /
+/// `read_event`); MessagePack-encoded, so the in-memory layout
+/// attribute that used to be here (`#[repr(C)]`) was load-bearing for
+/// no reader and is omitted.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[repr(C)]
 struct EventHeader {
     /// Magic number for validation
     magic: u32,
