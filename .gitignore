@@ -54,6 +54,7 @@ nul
 *.txt
 !requirements.txt
 !LICENSE.txt
+!**/proptest-regressions/**/*.txt
 
 # Profiling & Coverage
 *.profraw
