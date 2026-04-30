@@ -73,6 +73,26 @@ const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// (UUIDs are 36 bytes, request IDs typically <64).
 const MAX_KEY_LEN: usize = 255;
 
+/// Hard cap on cached entries. Bounds memory regardless of TTL: lazy
+/// per-key eviction only fires when the agent re-fetches that key, but
+/// a planner that emits a fresh UUID per command would never re-fetch
+/// — without this cap the map grows linearly with command volume
+/// until the 24 h TTL window closes. 50_000 entries × ~10 KiB typical
+/// JSON response ≈ 500 MiB worst-case footprint, which is the budget
+/// the api-server reserves for idempotency state on a single tenant.
+/// Tests may construct a smaller store via `with_capacity` to exercise
+/// the eviction path quickly.
+const DEFAULT_MAX_ENTRIES: usize = 50_000;
+
+/// Fraction of `max_entries` to retain after a forced eviction. When a
+/// sweep cannot satisfy the cap by dropping expired entries alone, the
+/// oldest entries are evicted until len() ≤ max_entries * RETAIN_NUM /
+/// RETAIN_DEN. Trimming 20% (4/5 retention) amortises sweep cost over
+/// the next 20% of inserts so the steady-state-at-cap insert path is
+/// O(1) amortised even though each individual sweep is O(n log n).
+const RETAIN_NUM: usize = 4;
+const RETAIN_DEN: usize = 5;
+
 /// One cached HTTP response, indexed by `Idempotency-Key`. Stored
 /// fully materialised (status + headers we care about + body) so a
 /// replay is a single map lookup followed by a clone — no async work,
@@ -98,20 +118,45 @@ struct CachedResponse {
 /// Concurrent, in-memory store of `Idempotency-Key` → cached response.
 ///
 /// Cloning is cheap (`Arc<DashMap>`), so a single instance is shared
-/// across the whole `AppState`. Eviction is lazy: stale entries are
-/// dropped on access. A periodic sweeper would be required only if
-/// agents stop reusing keys after the window closes; for the agent
-/// workload we expect (constant-rate planners), lazy is enough.
-#[derive(Debug, Default)]
+/// across the whole `AppState`. Eviction is two-tier:
+/// 1. **Lazy TTL** on `get`: stale entries are dropped on access.
+/// 2. **Bounded sweep** on `insert`: when `len() >= max_entries`, all
+///    expired entries are dropped first; if that fails to make room,
+///    the oldest entries by `inserted_at` are evicted down to a
+///    retention floor (`RETAIN_NUM / RETAIN_DEN` of the cap). The
+///    floor amortises sweep cost: each sweep is O(n log n) but only
+///    fires once per `(1 - retention) * cap` inserts, giving O(1)
+///    amortised steady-state insert cost.
+#[derive(Debug)]
 pub struct IdempotencyStore {
     entries: DashMap<String, CachedResponse>,
+    max_entries: usize,
+}
+
+impl Default for IdempotencyStore {
+    fn default() -> Self {
+        Self {
+            entries: DashMap::new(),
+            max_entries: DEFAULT_MAX_ENTRIES,
+        }
+    }
 }
 
 impl IdempotencyStore {
-    /// Create an empty store. Wrapped in `Arc` by the caller (see
-    /// `AppState::new` in `main.rs`).
+    /// Create an empty store with the production cap. Wrapped in `Arc`
+    /// by the caller (see `AppState::new` in `main.rs`).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty store with a custom entry cap. Used by tests
+    /// that want to exercise the eviction path without inserting tens
+    /// of thousands of entries.
+    pub fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            max_entries,
+        }
     }
 
     /// Look up a key. Returns the cached entry only if it has not
@@ -130,9 +175,62 @@ impl IdempotencyStore {
     }
 
     /// Insert a fresh response. Overwrites any expired entry that
-    /// happened to share the key.
+    /// happened to share the key. When the cap is reached this kicks
+    /// off a sweep (see `sweep_for_capacity`) so the cache size stays
+    /// bounded even when every agent emits a fresh UUID per command.
     fn insert(&self, key: String, value: CachedResponse) {
+        if self.entries.len() >= self.max_entries {
+            self.sweep_for_capacity();
+        }
         self.entries.insert(key, value);
+    }
+
+    /// Bounded sweep used by `insert` when the cap is reached.
+    ///
+    /// Two passes:
+    /// 1. Collect-then-remove every entry past `CACHE_TTL`. If this
+    ///    drops `len()` below `max_entries` we stop here.
+    /// 2. Otherwise sort the surviving entries by `inserted_at` and
+    ///    evict the oldest until `len() <= max_entries * RETAIN_NUM
+    ///    / RETAIN_DEN`. The retention floor (default 80%) leaves
+    ///    headroom for the next 20% of inserts so we don't sweep on
+    ///    every subsequent call.
+    ///
+    /// Both passes collect keys before mutating to avoid holding a
+    /// DashMap iterator across `.remove()` calls (which can deadlock
+    /// the per-shard locks on contention).
+    fn sweep_for_capacity(&self) {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| now.duration_since(e.value().inserted_at) > CACHE_TTL)
+            .map(|e| e.key().clone())
+            .collect();
+        for k in &expired {
+            self.entries.remove(k);
+        }
+        if self.entries.len() < self.max_entries {
+            return;
+        }
+
+        // Still at cap → force-evict oldest entries down to the
+        // retention floor. Saturating arithmetic keeps the floor
+        // sensible even if a future caller passes max_entries = 0.
+        let floor = self
+            .max_entries
+            .saturating_mul(RETAIN_NUM)
+            .saturating_div(RETAIN_DEN.max(1));
+        let mut by_age: Vec<(String, Instant)> = self
+            .entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().inserted_at))
+            .collect();
+        by_age.sort_by_key(|(_, t)| *t);
+        let to_drop = by_age.len().saturating_sub(floor);
+        for (k, _) in by_age.into_iter().take(to_drop) {
+            self.entries.remove(&k);
+        }
     }
 
     /// Number of live entries — exposed for tests and `/health`-style
@@ -145,6 +243,12 @@ impl IdempotencyStore {
     /// `len() == 0`; required by clippy when `len` is public.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The configured entry cap. Exposed for `/health`-style
+    /// introspection so operators can see headroom at a glance.
+    pub fn capacity(&self) -> usize {
+        self.max_entries
     }
 }
 
@@ -506,6 +610,117 @@ mod tests {
             "GET must be invoked every time even with an Idempotency-Key"
         );
         assert_eq!(store.len(), 0);
+    }
+
+    /// Verify the `insert`-time cap evicts when the store reaches its
+    /// configured ceiling. With a 4-entry cap and 80% retention, the
+    /// 5th insert must drop the oldest entries down to 3 (the floor)
+    /// before adding the new one — final len() is 4 entries, not 5.
+    #[test]
+    fn insert_evicts_when_cap_reached() {
+        let store = IdempotencyStore::with_capacity(4);
+        // Stagger `inserted_at` so the sort in sweep_for_capacity has
+        // a deterministic oldest-to-newest ordering. Without the
+        // sleep two inserts can land on the same `Instant` tick on
+        // fast machines and the eviction order becomes non-
+        // deterministic, which would flake the test.
+        for i in 0..4 {
+            store.insert(
+                format!("k{i}"),
+                CachedResponse {
+                    request_fingerprint: i as u64,
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: Bytes::new(),
+                    inserted_at: Instant::now(),
+                },
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(store.len(), 4, "first 4 inserts fit under the cap");
+
+        // 5th insert triggers sweep. No expired entries (TTL=24h),
+        // so force-eviction kicks in: floor = 4 * 4/5 = 3 retained,
+        // then the new entry brings len back to 4.
+        store.insert(
+            "k4".to_string(),
+            CachedResponse {
+                request_fingerprint: 4,
+                status: StatusCode::OK,
+                content_type: None,
+                body: Bytes::new(),
+                inserted_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            store.len(),
+            4,
+            "at cap, sweep retains the floor and admits the new entry"
+        );
+        assert!(
+            store.entries.contains_key("k4"),
+            "the just-inserted entry must survive the sweep"
+        );
+        assert!(
+            !store.entries.contains_key("k0"),
+            "the oldest entry must be the one evicted"
+        );
+    }
+
+    /// When the sweep finds enough expired entries to free space, the
+    /// force-eviction branch must NOT fire — recently-inserted live
+    /// entries should survive even at the cap.
+    #[test]
+    fn sweep_prefers_expired_over_oldest() {
+        let store = IdempotencyStore::with_capacity(4);
+        // Two entries with `inserted_at` faked to be already expired.
+        let stale_marker = Instant::now()
+            .checked_sub(CACHE_TTL + Duration::from_secs(60))
+            .expect("test machine clock supports subtracting 24h+");
+        for i in 0..2 {
+            store.entries.insert(
+                format!("stale{i}"),
+                CachedResponse {
+                    request_fingerprint: i as u64,
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: Bytes::new(),
+                    inserted_at: stale_marker,
+                },
+            );
+        }
+        // Two live entries.
+        for i in 0..2 {
+            store.entries.insert(
+                format!("live{i}"),
+                CachedResponse {
+                    request_fingerprint: 10 + i as u64,
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: Bytes::new(),
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(store.len(), 4);
+
+        // 5th insert: sweep should drop both stale entries, freeing
+        // enough room that the force-eviction branch never runs.
+        store.insert(
+            "fresh".to_string(),
+            CachedResponse {
+                request_fingerprint: 99,
+                status: StatusCode::OK,
+                content_type: None,
+                body: Bytes::new(),
+                inserted_at: Instant::now(),
+            },
+        );
+        assert!(store.entries.contains_key("live0"));
+        assert!(store.entries.contains_key("live1"));
+        assert!(store.entries.contains_key("fresh"));
+        assert!(!store.entries.contains_key("stale0"));
+        assert!(!store.entries.contains_key("stale1"));
     }
 
     #[tokio::test]
