@@ -5490,21 +5490,41 @@ mod tests {
     // disjoint/contained spatial relationships).
 
     use crate::operations::deep_clone::deep_clone_solid;
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use proptest::prelude::*;
 
-    /// Base seed — bump when the harness is re-pointed at a different input
-    /// space so CI acknowledges the semantic change.
-    const BOOLEAN_HARNESS_SEED: u64 = 0xB001_EAF1_C0DE_F1FE;
+    // -----------------------------------------------------------------
+    // Strategies
+    //
+    // Range envelopes are inherited from the previous seeded harness so
+    // coverage doesn't shift with the migration. Shrinking will pull
+    // each dimension toward its lower bound on failure, giving CI a
+    // minimal failing primitive pair instead of an unstructured seed.
+    // -----------------------------------------------------------------
 
-    /// Per-test iteration counts, sized so the full randomized suite stays
-    /// under ~5 s wall-clock on a developer laptop. Each iteration runs the
-    /// full boolean pipeline (face-face intersection + splitting +
-    /// classification + topology reconstruction), so overall runtime is
-    /// dominated by ITERATIONS × pipeline cost.
-    const ITER_ROBUSTNESS: usize = 50;
-    const ITER_STRUCTURAL: usize = 30;
-    const ITER_BBOX: usize = 30;
+    /// (width, height, depth) for an origin-centered axis-aligned box.
+    fn arb_box_dims() -> impl Strategy<Value = (f64, f64, f64)> {
+        (2.0_f64..20.0, 2.0_f64..20.0, 2.0_f64..20.0)
+    }
+
+    /// Sphere radius envelope — exercises the plane/sphere classification
+    /// pairing without driving the analytical curve solver into degenerate
+    /// regimes.
+    fn arb_sphere_radius() -> impl Strategy<Value = f64> {
+        1.0_f64..10.0
+    }
+
+    /// (radius, height) for an origin-anchored Z-axis cylinder.
+    fn arb_cylinder_params() -> impl Strategy<Value = (f64, f64)> {
+        (1.0_f64..8.0, 5.0_f64..25.0)
+    }
+
+    fn arb_op() -> impl Strategy<Value = BooleanOp> {
+        prop_oneof![
+            Just(BooleanOp::Union),
+            Just(BooleanOp::Intersection),
+            Just(BooleanOp::Difference),
+        ]
+    }
 
     /// Unwrap a `GeometryId::Solid`, panicking with context on the unit-test
     /// error path only (contract-violation inside the harness itself).
@@ -5515,37 +5535,48 @@ mod tests {
         }
     }
 
-    /// Build a random axis-aligned box at the origin.
-    fn make_random_box(rng: &mut StdRng, model: &mut BRepModel) -> SolidId {
-        let w = rng.gen_range(2.0..20.0);
-        let h = rng.gen_range(2.0..20.0);
-        let d = rng.gen_range(2.0..20.0);
+    /// Build an axis-aligned box at the origin from explicit dimensions.
+    /// Unlike the previous `make_random_box`, this is a pure constructor —
+    /// the dimensions arrive from a proptest strategy.
+    fn make_box(model: &mut BRepModel, dims: (f64, f64, f64)) -> SolidId {
+        let (w, h, d) = dims;
         let geom = TopologyBuilder::new(model)
             .create_box_3d(w, h, d)
-            .expect("valid positive dimensions must produce a solid");
+            .expect("strategy bounds guarantee positive dimensions");
         expect_solid(geom)
     }
 
-    /// Assert the Tier-1 robustness invariants on a boolean result.
-    fn assert_tier1(
+    /// Tier-1 robustness invariants on a boolean result, returning a
+    /// `TestCaseError` so proptest can record the failure, run its
+    /// shrinker, and persist a regression seed in `proptest-regressions/`.
+    ///
+    /// Asserts:
+    /// * the call did not return `OperationError::NotImplemented`
+    ///   (every supported operand pair must reach the typed-error layer);
+    /// * any `Ok(solid_id)` references a solid that actually exists in
+    ///   the model.
+    ///
+    /// All other typed `Err(..)` outcomes are accepted — the numerical
+    /// robustness ceiling is tracked by the deferred invariants
+    /// documented at the top of this module.
+    fn check_tier1(
         result: &OperationResult<SolidId>,
         model: &BRepModel,
         operation: BooleanOp,
-        context: &str,
-    ) {
+    ) -> Result<(), TestCaseError> {
         if let Err(OperationError::NotImplemented(msg)) = result {
-            panic!(
-                "{operation:?} returned NotImplemented('{msg}') for {context} — regression"
-            );
+            return Err(TestCaseError::fail(format!(
+                "{operation:?} returned NotImplemented('{msg}') — regression",
+            )));
         }
         if let Ok(solid_id) = result {
-            assert!(
-                model.solids.get(*solid_id).is_some(),
-                "{operation:?} returned Ok({solid_id:?}) for {context} but the solid is not in the model"
-            );
+            if model.solids.get(*solid_id).is_none() {
+                return Err(TestCaseError::fail(format!(
+                    "{operation:?} returned Ok({solid_id}) but the solid is missing from the model",
+                )));
+            }
         }
-        // Any other `Err(..)` is an accepted Tier-1 outcome — numerical
-        // robustness ceiling is tracked by the deferred invariants above.
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -5874,223 +5905,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Tier 1 — robustness: 5 tests, 50 iterations each, multiple
-    // primitive-pair topologies.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn prop_tier1_union_random_box_pairs() {
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED);
-        for i in 0..ITER_ROBUSTNESS {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
-            let result = boolean_operation(
-                &mut model, a, b, BooleanOp::Union, BooleanOptions::default(),
-            );
-            assert_tier1(&result, &model, BooleanOp::Union, &format!("iter {i} box-box"));
-        }
-    }
-
-    #[test]
-    fn prop_tier1_intersection_random_box_pairs() {
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x01);
-        for i in 0..ITER_ROBUSTNESS {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
-            let result = boolean_operation(
-                &mut model, a, b, BooleanOp::Intersection, BooleanOptions::default(),
-            );
-            assert_tier1(&result, &model, BooleanOp::Intersection, &format!("iter {i} box-box"));
-        }
-    }
-
-    #[test]
-    fn prop_tier1_difference_random_box_pairs() {
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x02);
-        for i in 0..ITER_ROBUSTNESS {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
-            let result = boolean_operation(
-                &mut model, a, b, BooleanOp::Difference, BooleanOptions::default(),
-            );
-            assert_tier1(&result, &model, BooleanOp::Difference, &format!("iter {i} box-box"));
-        }
-    }
-
-    #[test]
-    fn prop_tier1_box_sphere_all_ops() {
-        // Exercises the plane/sphere classification pairing.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x10);
-        for i in 0..ITER_ROBUSTNESS {
-            let mut model = BRepModel::new();
-            let side = rng.gen_range(2.0..15.0);
-            let radius = rng.gen_range(1.0..10.0);
-            let a = expect_solid(
-                TopologyBuilder::new(&mut model)
-                    .create_box_3d(side, side, side)
-                    .expect("valid box dimensions"),
-            );
-            let b = expect_solid(
-                TopologyBuilder::new(&mut model)
-                    .create_sphere_3d(Point3::ORIGIN, radius)
-                    .expect("valid sphere radius"),
-            );
-            for op in [BooleanOp::Union, BooleanOp::Intersection, BooleanOp::Difference] {
-                let result =
-                    boolean_operation(&mut model, a, b, op, BooleanOptions::default());
-                assert_tier1(
-                    &result,
-                    &model,
-                    op,
-                    &format!("iter {i} box({side})-sphere({radius})"),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn prop_tier1_box_cylinder_all_ops() {
-        // Exercises the plane/cylinder classification pairing — a distinct
-        // analytical intersection code path from sphere/plane.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x20);
-        for i in 0..ITER_ROBUSTNESS {
-            let mut model = BRepModel::new();
-            let side = rng.gen_range(5.0..20.0);
-            let radius = rng.gen_range(1.0..8.0);
-            let height = rng.gen_range(5.0..25.0);
-            let a = expect_solid(
-                TopologyBuilder::new(&mut model)
-                    .create_box_3d(side, side, side)
-                    .expect("valid box dimensions"),
-            );
-            let b = expect_solid(
-                TopologyBuilder::new(&mut model)
-                    .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)
-                    .expect("valid cylinder parameters"),
-            );
-            for op in [BooleanOp::Union, BooleanOp::Intersection, BooleanOp::Difference] {
-                let result =
-                    boolean_operation(&mut model, a, b, op, BooleanOptions::default());
-                assert_tier1(
-                    &result,
-                    &model,
-                    op,
-                    &format!("iter {i} box({side})-cyl(r={radius},h={height})"),
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // Tier 2 — structural correctness.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn prop_tier2_self_union_via_deep_clone_must_succeed() {
-        // `A ∪ A'` where A' is a deep-clone of A (zero offset): a correct
-        // boolean engine must produce a solid whose bounding extent equals
-        // A's. We only assert Tier-1 + pipeline-success here; stricter
-        // volume equality awaits numerical hardening.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x30);
-        for i in 0..ITER_STRUCTURAL {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let a_clone = deep_clone_solid(&mut model, a, None)
-                .expect("deep_clone_solid must succeed for a valid box");
-            assert_ne!(a, a_clone, "deep_clone_solid must return a new SolidId");
-            let result = boolean_operation(
-                &mut model,
-                a,
-                a_clone,
-                BooleanOp::Union,
-                BooleanOptions::default(),
-            );
-            assert_tier1(&result, &model, BooleanOp::Union, &format!("iter {i} self-union"));
-        }
-    }
-
-    #[test]
-    fn prop_tier2_self_intersection_via_deep_clone() {
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x31);
-        for i in 0..ITER_STRUCTURAL {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let a_clone = deep_clone_solid(&mut model, a, None)
-                .expect("deep_clone_solid must succeed for a valid box");
-            let result = boolean_operation(
-                &mut model,
-                a,
-                a_clone,
-                BooleanOp::Intersection,
-                BooleanOptions::default(),
-            );
-            assert_tier1(
-                &result,
-                &model,
-                BooleanOp::Intersection,
-                &format!("iter {i} self-intersect"),
-            );
-        }
-    }
-
-    #[test]
-    fn prop_tier2_union_commutativity_parity() {
-        // `A ∪ B` and `B ∪ A` must have the same success/failure parity.
-        // Different outcomes indicate asymmetric classification — a real
-        // regression even at the current robustness ceiling. Both
-        // orderings run against the same model so the solid IDs remain
-        // addressable after each boolean creates a new output solid.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x40);
-        for i in 0..ITER_STRUCTURAL {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
-            let r_ab = boolean_operation(
-                &mut model, a, b, BooleanOp::Union, BooleanOptions::default(),
-            );
-            let r_ba = boolean_operation(
-                &mut model, b, a, BooleanOp::Union, BooleanOptions::default(),
-            );
-            assert_tier1(&r_ab, &model, BooleanOp::Union, &format!("iter {i} A∪B"));
-            assert_tier1(&r_ba, &model, BooleanOp::Union, &format!("iter {i} B∪A"));
-            assert_eq!(
-                r_ab.is_ok(),
-                r_ba.is_ok(),
-                "iter {i}: A ∪ B success-parity {ab} != B ∪ A success-parity {ba} — asymmetric classification regression",
-                ab = r_ab.is_ok(),
-                ba = r_ba.is_ok(),
-            );
-        }
-    }
-
-    #[test]
-    fn prop_tier2_intersection_commutativity_parity() {
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x41);
-        for i in 0..ITER_STRUCTURAL {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
-            let r_ab = boolean_operation(
-                &mut model, a, b, BooleanOp::Intersection, BooleanOptions::default(),
-            );
-            let r_ba = boolean_operation(
-                &mut model, b, a, BooleanOp::Intersection, BooleanOptions::default(),
-            );
-            assert_tier1(&r_ab, &model, BooleanOp::Intersection, &format!("iter {i} A∩B"));
-            assert_tier1(&r_ba, &model, BooleanOp::Intersection, &format!("iter {i} B∩A"));
-            assert_eq!(
-                r_ab.is_ok(),
-                r_ba.is_ok(),
-                "iter {i}: A ∩ B success-parity != B ∩ A success-parity — asymmetric classification regression",
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // Tier 3 — bbox-level geometric correctness.
+    // Tier 3 helpers — relocated above the proptest! blocks because
+    // proptest's macro expansion places the test-fn bodies inside an
+    // `mod` namespace where free-function definitions can't follow.
     //
     // `solid.bounding_box(...)` requires split-borrow access to five
     // `BRepModel` stores. We use the `primitives::solid::Solid::bounding_
@@ -6138,123 +5955,330 @@ mod tests {
             && o_max.z + eps >= i_max.z
     }
 
-    #[test]
-    fn prop_tier3_union_bbox_contains_both_inputs_when_disjoint() {
-        // For a box A at origin and a deep-cloned A' translated well past
-        // A's extent, `bbox(A ∪ A') ⊇ bbox(A) ∪ bbox(A')`.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x50);
-        for i in 0..ITER_BBOX {
-            let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Tier 1 ran 50 deterministic iterations per test; 64 cases
+            // gives proptest enough draws to drive its shrinker without
+            // dominating CI. Each case runs the full boolean pipeline.
+            cases: 64,
+            max_global_rejects: 1024,
+            ..ProptestConfig::default()
+        })]
 
-            let bbox_a = match solid_bbox(&mut model, a) {
-                Some(bb) => bb,
-                None => continue, // bbox may be unavailable pre-translation; skip
-            };
+        // -------------------------------------------------------------
+        // Tier 1 — robustness: 5 properties, multiple primitive-pair
+        // topologies. Replaces the 5 seeded `prop_tier1_*` tests.
+        // -------------------------------------------------------------
+
+        #[test]
+        fn prop_tier1_union_random_box_pairs(
+            a in arb_box_dims(),
+            b in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, a);
+            let solid_b = make_box(&mut model, b);
+            let result = boolean_operation(
+                &mut model, solid_a, solid_b, BooleanOp::Union, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Union)?;
+        }
+
+        #[test]
+        fn prop_tier1_intersection_random_box_pairs(
+            a in arb_box_dims(),
+            b in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, a);
+            let solid_b = make_box(&mut model, b);
+            let result = boolean_operation(
+                &mut model, solid_a, solid_b, BooleanOp::Intersection, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Intersection)?;
+        }
+
+        #[test]
+        fn prop_tier1_difference_random_box_pairs(
+            a in arb_box_dims(),
+            b in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, a);
+            let solid_b = make_box(&mut model, b);
+            let result = boolean_operation(
+                &mut model, solid_a, solid_b, BooleanOp::Difference, BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Difference)?;
+        }
+
+        /// Exercises the plane/sphere classification pairing.
+        #[test]
+        fn prop_tier1_box_sphere_all_ops(
+            box_dims in arb_box_dims(),
+            radius in arb_sphere_radius(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, box_dims);
+            let solid_b = expect_solid(
+                TopologyBuilder::new(&mut model)
+                    .create_sphere_3d(Point3::ORIGIN, radius)
+                    .expect("strategy bounds guarantee positive radius"),
+            );
+            let result =
+                boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default());
+            check_tier1(&result, &model, op)?;
+        }
+
+        /// Exercises the plane/cylinder classification pairing — a
+        /// distinct analytical intersection code path from sphere/plane.
+        #[test]
+        fn prop_tier1_box_cylinder_all_ops(
+            box_dims in arb_box_dims(),
+            cyl in arb_cylinder_params(),
+            op in arb_op(),
+        ) {
+            let mut model = BRepModel::new();
+            let solid_a = make_box(&mut model, box_dims);
+            let (radius, height) = cyl;
+            let solid_b = expect_solid(
+                TopologyBuilder::new(&mut model)
+                    .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)
+                    .expect("strategy bounds guarantee positive cylinder parameters"),
+            );
+            let result =
+                boolean_operation(&mut model, solid_a, solid_b, op, BooleanOptions::default());
+            check_tier1(&result, &model, op)?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Tier 2/3 ran 25 / 20 seeded iterations; 32 cases is enough
+            // for shrinking on the structural and bbox-containment
+            // invariants without doubling CI walltime.
+            cases: 32,
+            max_global_rejects: 1024,
+            ..ProptestConfig::default()
+        })]
+
+        // -------------------------------------------------------------
+        // Tier 2 — structural correctness.
+        // -------------------------------------------------------------
+
+        /// `A ∪ A'` where A' is a deep-clone of A (zero offset): a
+        /// correct boolean engine must produce a solid whose bounding
+        /// extent equals A's. We only assert Tier-1 + pipeline-success
+        /// here; stricter volume equality awaits numerical hardening.
+        #[test]
+        fn prop_tier2_self_union_via_deep_clone_must_succeed(
+            dims in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, dims);
+            let a_clone = deep_clone_solid(&mut model, a, None)
+                .expect("deep_clone_solid must succeed for a valid box");
+            prop_assert_ne!(a, a_clone, "deep_clone_solid must return a new SolidId");
+            let result = boolean_operation(
+                &mut model,
+                a,
+                a_clone,
+                BooleanOp::Union,
+                BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Union)?;
+        }
+
+        #[test]
+        fn prop_tier2_self_intersection_via_deep_clone(
+            dims in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, dims);
+            let a_clone = deep_clone_solid(&mut model, a, None)
+                .expect("deep_clone_solid must succeed for a valid box");
+            let result = boolean_operation(
+                &mut model,
+                a,
+                a_clone,
+                BooleanOp::Intersection,
+                BooleanOptions::default(),
+            );
+            check_tier1(&result, &model, BooleanOp::Intersection)?;
+        }
+
+        /// `A ∪ B` and `B ∪ A` must have the same success/failure parity.
+        /// Different outcomes indicate asymmetric classification — a real
+        /// regression even at the current robustness ceiling. Both
+        /// orderings run against the same model so the solid IDs remain
+        /// addressable after each boolean creates a new output solid.
+        #[test]
+        fn prop_tier2_union_commutativity_parity(
+            a_dims in arb_box_dims(),
+            b_dims in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, a_dims);
+            let b = make_box(&mut model, b_dims);
+            let r_ab = boolean_operation(
+                &mut model, a, b, BooleanOp::Union, BooleanOptions::default(),
+            );
+            let r_ba = boolean_operation(
+                &mut model, b, a, BooleanOp::Union, BooleanOptions::default(),
+            );
+            check_tier1(&r_ab, &model, BooleanOp::Union)?;
+            check_tier1(&r_ba, &model, BooleanOp::Union)?;
+            prop_assert_eq!(
+                r_ab.is_ok(),
+                r_ba.is_ok(),
+                "A ∪ B success-parity ({}) != B ∪ A success-parity ({}) — asymmetric classification regression",
+                r_ab.is_ok(),
+                r_ba.is_ok(),
+            );
+        }
+
+        #[test]
+        fn prop_tier2_intersection_commutativity_parity(
+            a_dims in arb_box_dims(),
+            b_dims in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, a_dims);
+            let b = make_box(&mut model, b_dims);
+            let r_ab = boolean_operation(
+                &mut model, a, b, BooleanOp::Intersection, BooleanOptions::default(),
+            );
+            let r_ba = boolean_operation(
+                &mut model, b, a, BooleanOp::Intersection, BooleanOptions::default(),
+            );
+            check_tier1(&r_ab, &model, BooleanOp::Intersection)?;
+            check_tier1(&r_ba, &model, BooleanOp::Intersection)?;
+            prop_assert_eq!(
+                r_ab.is_ok(),
+                r_ba.is_ok(),
+                "A ∩ B success-parity ({}) != B ∩ A success-parity ({}) — asymmetric classification regression",
+                r_ab.is_ok(),
+                r_ba.is_ok(),
+            );
+        }
+
+        // -------------------------------------------------------------
+        // Tier 3 — bbox-level geometric correctness.
+        //
+        // `prop_assume!(...)` skips the case (without counting it as a
+        // pass) when the bbox isn't computable yet — equivalent to the
+        // seeded loop's `continue`. Persisted regressions land in
+        // `proptest-regressions/operations/boolean.txt`.
+        // -------------------------------------------------------------
+
+        /// For a box A at origin and a deep-cloned A' translated well
+        /// past A's extent, `bbox(A ∪ A') ⊇ bbox(A) ∪ bbox(A')`.
+        #[test]
+        fn prop_tier3_union_bbox_contains_both_inputs_when_disjoint(
+            dims in arb_box_dims(),
+        ) {
+            let mut model = BRepModel::new();
+            let a = make_box(&mut model, dims);
+
+            let bbox_a = solid_bbox(&mut model, a);
+            prop_assume!(bbox_a.is_some()); // bbox may be unavailable pre-translation; skip
+            let bbox_a = bbox_a.expect("guarded by prop_assume");
             let a_extent = bbox_a.1.x - bbox_a.0.x;
             // Translate far enough that A and A' cannot share any face.
             let offset = Vector3::new(a_extent * 3.0 + 50.0, 0.0, 0.0);
             let b = deep_clone_solid(&mut model, a, Some(offset))
                 .expect("deep_clone_solid with offset must succeed");
 
-            let bbox_b = match solid_bbox(&mut model, b) {
-                Some(bb) => bb,
-                None => continue,
-            };
+            let bbox_b = solid_bbox(&mut model, b);
+            prop_assume!(bbox_b.is_some());
+            let bbox_b = bbox_b.expect("guarded by prop_assume");
 
             let result = boolean_operation(
                 &mut model, a, b, BooleanOp::Union, BooleanOptions::default(),
             );
-            assert_tier1(&result, &model, BooleanOp::Union, &format!("iter {i} disjoint-union"));
+            check_tier1(&result, &model, BooleanOp::Union)?;
 
             if let Ok(result_id) = result {
                 if let Some(bbox_r) = solid_bbox(&mut model, result_id) {
-                    assert!(
+                    prop_assert!(
                         bbox_contains(bbox_r, bbox_a, BBOX_EPS),
-                        "iter {i}: bbox(A ∪ A') does not contain bbox(A). result={bbox_r:?} a={bbox_a:?}",
+                        "bbox(A ∪ A') does not contain bbox(A). result={:?} a={:?}",
+                        bbox_r, bbox_a,
                     );
-                    assert!(
+                    prop_assert!(
                         bbox_contains(bbox_r, bbox_b, BBOX_EPS),
-                        "iter {i}: bbox(A ∪ A') does not contain bbox(A'). result={bbox_r:?} a'={bbox_b:?}",
+                        "bbox(A ∪ A') does not contain bbox(A'). result={:?} a'={:?}",
+                        bbox_r, bbox_b,
                     );
                 }
             }
         }
-    }
 
-    #[test]
-    fn prop_tier3_intersection_bbox_within_both_inputs() {
-        // `bbox(A ∩ B) ⊆ bbox(A)` and `⊆ bbox(B)` always — the intersection
-        // cannot exceed either operand in any axis.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x51);
-        for i in 0..ITER_BBOX {
+        /// `bbox(A ∩ B) ⊆ bbox(A)` and `⊆ bbox(B)` always — the
+        /// intersection cannot exceed either operand in any axis.
+        #[test]
+        fn prop_tier3_intersection_bbox_within_both_inputs(
+            a_dims in arb_box_dims(),
+            b_dims in arb_box_dims(),
+        ) {
             let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
+            let a = make_box(&mut model, a_dims);
+            let b = make_box(&mut model, b_dims);
 
-            let bbox_a = match solid_bbox(&mut model, a) {
-                Some(bb) => bb,
-                None => continue,
-            };
-            let bbox_b = match solid_bbox(&mut model, b) {
-                Some(bb) => bb,
-                None => continue,
-            };
+            let bbox_a = solid_bbox(&mut model, a);
+            prop_assume!(bbox_a.is_some());
+            let bbox_a = bbox_a.expect("guarded by prop_assume");
+            let bbox_b = solid_bbox(&mut model, b);
+            prop_assume!(bbox_b.is_some());
+            let bbox_b = bbox_b.expect("guarded by prop_assume");
 
             let result = boolean_operation(
                 &mut model, a, b, BooleanOp::Intersection, BooleanOptions::default(),
             );
-            assert_tier1(
-                &result,
-                &model,
-                BooleanOp::Intersection,
-                &format!("iter {i} intersection-bbox"),
-            );
+            check_tier1(&result, &model, BooleanOp::Intersection)?;
 
             if let Ok(result_id) = result {
                 if let Some(bbox_r) = solid_bbox(&mut model, result_id) {
-                    assert!(
+                    prop_assert!(
                         bbox_contains(bbox_a, bbox_r, BBOX_EPS),
-                        "iter {i}: bbox(A ∩ B) is not contained in bbox(A). result={bbox_r:?} a={bbox_a:?}",
+                        "bbox(A ∩ B) is not contained in bbox(A). result={:?} a={:?}",
+                        bbox_r, bbox_a,
                     );
-                    assert!(
+                    prop_assert!(
                         bbox_contains(bbox_b, bbox_r, BBOX_EPS),
-                        "iter {i}: bbox(A ∩ B) is not contained in bbox(B). result={bbox_r:?} b={bbox_b:?}",
+                        "bbox(A ∩ B) is not contained in bbox(B). result={:?} b={:?}",
+                        bbox_r, bbox_b,
                     );
                 }
             }
         }
-    }
 
-    #[test]
-    fn prop_tier3_difference_bbox_within_minuend() {
-        // `bbox(A - B) ⊆ bbox(A)` — subtracting cannot grow the operand.
-        let mut rng = StdRng::seed_from_u64(BOOLEAN_HARNESS_SEED ^ 0x52);
-        for i in 0..ITER_BBOX {
+        /// `bbox(A - B) ⊆ bbox(A)` — subtracting cannot grow the operand.
+        #[test]
+        fn prop_tier3_difference_bbox_within_minuend(
+            a_dims in arb_box_dims(),
+            b_dims in arb_box_dims(),
+        ) {
             let mut model = BRepModel::new();
-            let a = make_random_box(&mut rng, &mut model);
-            let b = make_random_box(&mut rng, &mut model);
+            let a = make_box(&mut model, a_dims);
+            let b = make_box(&mut model, b_dims);
 
-            let bbox_a = match solid_bbox(&mut model, a) {
-                Some(bb) => bb,
-                None => continue,
-            };
+            let bbox_a = solid_bbox(&mut model, a);
+            prop_assume!(bbox_a.is_some());
+            let bbox_a = bbox_a.expect("guarded by prop_assume");
 
             let result = boolean_operation(
                 &mut model, a, b, BooleanOp::Difference, BooleanOptions::default(),
             );
-            assert_tier1(
-                &result,
-                &model,
-                BooleanOp::Difference,
-                &format!("iter {i} difference-bbox"),
-            );
+            check_tier1(&result, &model, BooleanOp::Difference)?;
 
             if let Ok(result_id) = result {
                 if let Some(bbox_r) = solid_bbox(&mut model, result_id) {
-                    assert!(
+                    prop_assert!(
                         bbox_contains(bbox_a, bbox_r, BBOX_EPS),
-                        "iter {i}: bbox(A - B) is not contained in bbox(A). result={bbox_r:?} a={bbox_a:?}",
+                        "bbox(A - B) is not contained in bbox(A). result={:?} a={:?}",
+                        bbox_r, bbox_a,
                     );
                 }
             }
