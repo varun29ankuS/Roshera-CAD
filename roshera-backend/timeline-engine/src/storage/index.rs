@@ -198,9 +198,9 @@ impl StorageIndex {
             timestamp: chrono::Utc::now(),
         };
 
-        // Save main index file
+        // Save main index file (MessagePack — see Cargo.toml comment).
         let index_file = self.index_path.join("index.dat");
-        let data = bincode::serialize(&snapshot)
+        let data = rmp_serde::to_vec(&snapshot)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         fs::write(&index_file, data)
@@ -215,7 +215,7 @@ impl StorageIndex {
             .map(|entry| (*entry.key(), *entry.value()))
             .collect();
 
-        let data = bincode::serialize(&locations)
+        let data = rmp_serde::to_vec(&locations)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         fs::write(&locations_file, data)
@@ -238,7 +238,7 @@ impl StorageIndex {
             })
             .collect();
 
-        let data = bincode::serialize(&branch_data)
+        let data = rmp_serde::to_vec(&branch_data)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
         fs::write(&branch_file, data)
             .await
@@ -252,7 +252,7 @@ impl StorageIndex {
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
 
-        let data = bincode::serialize(&entity_data)
+        let data = rmp_serde::to_vec(&entity_data)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
         fs::write(&entity_file, data)
             .await
@@ -274,7 +274,7 @@ impl StorageIndex {
             .await
             .map_err(TimelineError::StorageError)?;
 
-        let snapshot: IndexSnapshot = bincode::deserialize(&data)
+        let snapshot: IndexSnapshot = rmp_serde::from_slice(&data)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         self.event_count
@@ -287,7 +287,7 @@ impl StorageIndex {
                 .await
                 .map_err(TimelineError::StorageError)?;
 
-            let locations: Vec<(EventId, EventLocation)> = bincode::deserialize(&data)
+            let locations: Vec<(EventId, EventLocation)> = rmp_serde::from_slice(&data)
                 .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
             for (event_id, location) in locations {
@@ -302,7 +302,7 @@ impl StorageIndex {
                 .await
                 .map_err(TimelineError::StorageError)?;
 
-            let branch_data: Vec<(BranchId, Vec<(u64, EventId)>)> = bincode::deserialize(&data)
+            let branch_data: Vec<(BranchId, Vec<(u64, EventId)>)> = rmp_serde::from_slice(&data)
                 .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
             for (branch_id, events) in branch_data {
@@ -323,7 +323,7 @@ impl StorageIndex {
                 .await
                 .map_err(TimelineError::StorageError)?;
 
-            let entity_data: Vec<(EntityId, Vec<EventId>)> = bincode::deserialize(&data)
+            let entity_data: Vec<(EntityId, Vec<EventId>)> = rmp_serde::from_slice(&data)
                 .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
             for (entity_id, event_ids) in entity_data {
@@ -379,13 +379,18 @@ impl StorageIndex {
 
             let mut offset = 0;
             while offset < file_data.len() {
-                // Try to deserialize an event from the current position
-                if let Ok(event) = bincode::deserialize::<TimelineEvent>(&file_data[offset..]) {
+                // Try to deserialize an event from the current position.
+                if let Ok(event) = rmp_serde::from_slice::<TimelineEvent>(&file_data[offset..]) {
                     // Index the event
                     self.index_event(&event).await?;
 
-                    // Move to next event (estimate size)
-                    let event_size = bincode::serialized_size(&event).unwrap_or(1024) as usize;
+                    // Move to next event (estimate size by re-encoding —
+                    // rmp-serde has no `serialized_size` equivalent, and
+                    // this rebuild path is a recovery fallback, not a
+                    // hot path).
+                    let event_size = rmp_serde::to_vec(&event)
+                        .map(|v| v.len())
+                        .unwrap_or(1024);
                     offset += event_size;
                 } else {
                     // Skip to next potential event boundary

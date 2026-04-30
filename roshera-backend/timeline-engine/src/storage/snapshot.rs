@@ -218,8 +218,8 @@ impl SnapshotManager {
     pub async fn save_snapshot(&self, snapshot: &Snapshot) -> TimelineResult<()> {
         let start = std::time::Instant::now();
 
-        // Serialize snapshot
-        let data = bincode::serialize(snapshot)
+        // Serialize snapshot (MessagePack — see Cargo.toml comment).
+        let data = rmp_serde::to_vec(snapshot)
             .map_err(|e| TimelineError::SerializationError(e.to_string()))?;
 
         let uncompressed_size = data.len() as u64;
@@ -309,7 +309,8 @@ impl SnapshotManager {
         };
 
         // Deserialize
-        bincode::deserialize(&data).map_err(|e| TimelineError::SerializationError(e.to_string()))
+        rmp_serde::from_slice(&data)
+            .map_err(|e| TimelineError::SerializationError(e.to_string()))
     }
 
     /// Get the latest snapshot for a branch

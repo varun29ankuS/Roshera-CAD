@@ -24,7 +24,6 @@ petgraph = { version = "0.6", features = ["serde-1"] }
 parking_lot = "0.12"
 
 # Storage
-bincode = "1.3"
 lz4_flex = "0.11"
 crc32fast = "1.4"
 
@@ -40,7 +39,11 @@ rand = "0.8"
 # Lazy static for global state
 lazy_static = "1.5"
 
-# For BRep serialization
+# Serialization. rmp-serde (MessagePack) is the workspace's binary format
+# of choice: self-describing (round-trips serde_json::Value via
+# deserialize_any, unlike bincode 1.x and postcard) and actively
+# maintained (bincode 1.x is unmaintained). Used for event log entries,
+# snapshots, the storage index, and persisted branches.
 rmp-serde = "1.3"
 once_cell = "1.20"
 

@@ -9,13 +9,15 @@
 //!    recorder's worker task drains the channel, and `Timeline::add_operation`
 //!    appends one event per op to the main branch.
 //! 2. **Persist.** The collected `Vec<TimelineEvent>` is serialized with
-//!    `serde_json` and written to a tempfile on disk. JSON is the only
-//!    serde format in the workspace that round-trips
-//!    `Operation::Generic.parameters` — a `serde_json::Value` whose
-//!    `Deserialize` impl requires `deserialize_any`, which the binary
-//!    formats (`bincode`, `rmp-serde`) do not support. The storage
-//!    layer's segmented event log is a separate concern; this test pins
-//!    the *payload-format* contract, not the segment layout.
+//!    `serde_json` and written to a tempfile on disk. JSON is used here
+//!    purely for human-inspectability of the test artefact — it is not
+//!    the wire format. The production storage layer (`storage/event_log`)
+//!    uses MessagePack via `rmp-serde`, which also round-trips
+//!    `Operation::Generic.parameters` (a `serde_json::Value` whose
+//!    `Deserialize` impl requires `deserialize_any`; bincode 1.x and
+//!    postcard do not support that). The storage layer's segmented event
+//!    log is a separate concern; this test pins the *payload-format*
+//!    contract, not the segment layout.
 //! 3. **Load.** A new tempfile read + `serde_json` deserialize round-trips
 //!    the events into an identical `Vec<TimelineEvent>`. Lossless
 //!    persistence is a precondition for replay; if this step
@@ -159,7 +161,7 @@ async fn record_persist_load_replay_round_trip() {
         "lossless persist round-trip — deserialized count must match"
     );
     // Spot-check: the operation kind on every event must survive the
-    // bincode round-trip. If the discriminator gets mangled the replay
+    // serde round-trip. If the discriminator gets mangled the replay
     // dispatcher would silently route to UnknownKind and skip-count it.
     for (orig, round) in events.iter().zip(loaded.iter()) {
         assert_eq!(
