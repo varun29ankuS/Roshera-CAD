@@ -26,13 +26,21 @@ use thiserror::Error;
 pub type LLMTokenStream =
     Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
-// Provider implementations — API-only (no local models)
+// Provider implementations — API-only (no local models).
+//
+// Mock providers are gated behind `cfg(test)` or the `mock-providers`
+// feature so a release build cannot accidentally serve traffic from a
+// stub. Production code paths (e.g. `NativeProviderFactory`) must
+// surface a real `ProviderUnavailable` error instead of silently
+// swapping in a mock.
 pub mod claude; // Claude API integration
-pub mod mock; // Mock providers for testing
+#[cfg(any(test, feature = "mock-providers"))]
+pub mod mock; // Mock providers for testing only
 pub mod native_factory; // Factory for creating providers
 
 // Re-exports for convenience
 pub use claude::ClaudeProvider;
+#[cfg(any(test, feature = "mock-providers"))]
 pub use mock::{MockASRProvider, MockLLMProvider, MockTTSProvider};
 pub use native_factory::{NativeProviderConfig, NativeProviderFactory};
 
