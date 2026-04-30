@@ -14,9 +14,9 @@ use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use timeline_engine::{
-    branch::ConflictStrategy, rebuild_model_from_events, Author, BranchId, BranchManager,
-    BranchPurpose, EntityId, EventId, EventMetadata, MergeStrategy, Operation, OperationInputs,
-    ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent, TimelineRecorder,
+    rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId,
+    EventMetadata, Operation, OperationInputs, ReplayOutcome, SessionId, Timeline, TimelineError,
+    TimelineEvent, TimelineRecorder,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -97,15 +97,6 @@ pub struct BranchInfo {
     pub parent: Option<String>,
     pub event_count: usize,
     pub state: String,
-}
-
-/// Merge branches request
-#[derive(Serialize, Deserialize)]
-pub struct MergeBranchesRequest {
-    pub source_branch: String,
-    pub target_branch: String,
-    pub strategy: String, // "fast-forward", "three-way", "squash"
-    pub message: Option<String>,
 }
 
 /// Timeline status response
@@ -241,10 +232,10 @@ pub async fn record_operation(
 
     let author = convert_author_dto(request.author);
 
-    let branch_id = request
-        .branch_id
-        .map(|id| BranchId(Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4())))
-        .unwrap_or_else(BranchId::main);
+    let branch_id = match request.branch_id {
+        Some(id) => resolve_branch_ref(&id)?,
+        None => BranchId::main(),
+    };
 
     // Parse session ID to UUID
     let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -272,10 +263,10 @@ pub async fn create_branch(
 ) -> Result<Json<BranchInfo>, StatusCode> {
     let branch_manager = &state.branch_manager;
 
-    let parent = request
-        .parent_branch
-        .map(|id| BranchId(Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4())))
-        .unwrap_or_else(BranchId::main);
+    let parent = match request.parent_branch {
+        Some(id) => resolve_branch_ref(&id)?,
+        None => BranchId::main(),
+    };
 
     let purpose = convert_purpose_dto(request.purpose);
     let author = convert_author_dto(request.author);
@@ -319,25 +310,31 @@ pub async fn switch_branch(
     })))
 }
 
+/// Resolve a branch reference into a `BranchId`.
+///
+/// The frontend (and many agent payloads) refer to the trunk by the
+/// well-known label `"main"` rather than a UUID. This helper resolves
+/// `"main"` to `BranchId::main()` and otherwise parses the input as a
+/// UUID. A malformed UUID is reported as `400 BAD_REQUEST` instead of
+/// silently being replaced with `Uuid::new_v4()` (which would later
+/// 404 against an invented branch and obscure the real cause).
+fn resolve_branch_ref(reference: &str) -> Result<BranchId, StatusCode> {
+    if reference.eq_ignore_ascii_case("main") {
+        Ok(BranchId::main())
+    } else {
+        Uuid::parse_str(reference)
+            .map(BranchId)
+            .map_err(|_| StatusCode::BAD_REQUEST)
+    }
+}
+
 /// Get timeline history
 pub async fn get_history(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
 ) -> Result<Json<Vec<EventSummary>>, StatusCode> {
     let timeline = state.timeline.read().await;
-    // The frontend passes the well-known label "main" rather than a UUID for
-    // the trunk. Resolve it to the canonical main branch id; otherwise parse
-    // as UUID. Falling through to a random UUID (the previous behaviour)
-    // silently returns 404 for every request, which made the timeline panel
-    // appear empty even when operations were being recorded.
-    let branch_id = if branch_id.eq_ignore_ascii_case("main") {
-        BranchId::main()
-    } else {
-        match Uuid::parse_str(&branch_id) {
-            Ok(id) => BranchId(id),
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
-        }
-    };
+    let branch_id = resolve_branch_ref(&branch_id)?;
 
     let events = timeline
         .get_branch_events(&branch_id, Some(0), Some(100))
@@ -365,60 +362,6 @@ pub struct EventSummary {
     pub timestamp: String,
     pub operation_type: String,
     pub author: String,
-}
-
-/// Merge branches
-pub async fn merge_branches(
-    State(state): State<AppState>,
-    Json(request): Json<MergeBranchesRequest>,
-) -> Result<Json<MergeResult>, StatusCode> {
-    let source =
-        BranchId(Uuid::parse_str(&request.source_branch).unwrap_or_else(|_| Uuid::new_v4()));
-    let target =
-        BranchId(Uuid::parse_str(&request.target_branch).unwrap_or_else(|_| Uuid::new_v4()));
-
-    let strategy = match request.strategy.as_str() {
-        "fast-forward" => MergeStrategy::FastForward,
-        "three-way" => MergeStrategy::ThreeWay {
-            conflict_strategy: ConflictStrategy::PreferNewest,
-        },
-        "squash" => MergeStrategy::Squash {
-            message: request
-                .message
-                .unwrap_or_else(|| "Squashed commit".to_string()),
-        },
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
-
-    // Use the timeline's merge functionality
-    let mut timeline = state.timeline.write().await;
-    match timeline.merge_branches(source, target, strategy).await {
-        Ok(merge_result) => Ok(Json(MergeResult {
-            success: merge_result.success,
-            message: format!(
-                "Merged branch {} into {}",
-                request.source_branch, request.target_branch
-            ),
-            conflicts: merge_result
-                .conflicts
-                .into_iter()
-                .map(|c| format!("{:?}", c))
-                .collect(),
-        })),
-        Err(e) => Ok(Json(MergeResult {
-            success: false,
-            message: format!("Merge failed: {}", e),
-            conflicts: vec![format!("{}", e)],
-        })),
-    }
-}
-
-/// Merge result
-#[derive(Serialize, Deserialize)]
-pub struct MergeResult {
-    pub success: bool,
-    pub message: String,
-    pub conflicts: Vec<String>,
 }
 
 /// Checkpoint/tag a specific state
