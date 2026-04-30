@@ -289,10 +289,9 @@ mod math_benchmarks_tests {
         println!("• No performance degradation at high counts");
         println!("• Consistent sub-microsecond per-operation times");
 
-        println!("\n🎯 INDUSTRY COMPARISON ESTIMATES:");
-        println!("• ~3-5x faster than typical CAD math libraries");
-        println!("• ~2-3x more memory efficient");
-        println!("• Comparable to hand-optimized SIMD code");
+        println!("\nNumerical-kernel notes:");
+        println!("• Hot paths use #[inline] and avoid heap allocation in core loops");
+        println!("• Math types are #[repr(C)] with natural alignment for cache locality");
     }
 
     fn print_performance(operation: &str, count: usize, duration: std::time::Duration) {

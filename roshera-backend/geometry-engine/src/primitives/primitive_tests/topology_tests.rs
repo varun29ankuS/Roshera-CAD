@@ -258,16 +258,8 @@ mod tests {
         println!("    Curve creation: {}ns (Target: <500ns)", curve_ns);
         println!("    Edge linking:   {}ns (Target: <200ns)", linking_ns);
 
-        // Internal target only — no third-party comparison made.
         let total_ns = curve_ns + linking_ns;
-        let industry_avg_ns = 30_000; // 30μs average
-        let speedup = industry_avg_ns as f64 / total_ns as f64;
-
         println!("    Total time:     {}ns", total_ns);
-        println!(
-            "    vs Industry:    {:.1}x faster (Industry avg: ~30μs)",
-            speedup
-        );
 
         // Assert performance targets (realistic for debug builds, much faster in release)
         assert!(
@@ -418,7 +410,7 @@ mod tests {
             edges_per_sec
         );
 
-        println!("  ✅ Batch edge operations achieving exponential speedup over industry");
+        println!("  ✅ Batch edge operations completed within budget");
     }
 
     #[test]
@@ -524,13 +516,6 @@ mod tests {
         let avg_ns = total_operations / performance_data.len() as u128;
         println!("    Average:  {}ns", avg_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 12_500; // 12.5μs
-        let speedup = industry_avg_ns as f64 / avg_ns as f64;
-        println!(
-            "    Speedup:  {:.1}x vs industry average (~12.5μs)",
-            speedup
-        );
 
         // Verify all integrations successful
         assert_eq!(model.edges.len(), 3);
@@ -658,14 +643,6 @@ mod tests {
         println!("    Edge creation:  {}ns (4 edges)", edge_ns);
         println!("    Loop creation:  {}ns (Target: <100μs)", loop_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 150_000; // 150μs average
-        let speedup = industry_avg_ns as f64 / loop_ns as f64;
-
-        println!(
-            "    vs Industry:    {:.1}x faster (Industry avg: ~150μs)",
-            speedup
-        );
 
         // Performance assertions
         assert!(
@@ -1174,14 +1151,6 @@ mod tests {
         println!("    Face creation:    {}ns (Target: <50ns)", face_ns);
         println!("    Total time:       {}ns", total_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 300_000; // 300μs average
-        let speedup = industry_avg_ns as f64 / total_ns as f64;
-
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~300μs)",
-            speedup
-        );
 
         // Performance assertions (realistic targets based on actual results)
         assert!(
@@ -1493,14 +1462,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Area computation: {}ns (Target: <10μs)", area_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 150_000; // 150μs average
-        let speedup = industry_avg_ns as f64 / area_ns as f64;
-
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~150μs)",
-            speedup
-        );
 
         // Performance assertion - realistic target based on debug build overhead
         // In release mode this would be much faster (< 10μs)
@@ -1677,14 +1638,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Avg per test:     {}ns (Target: <1μs)", avg_test_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 1500; // 1.5μs average
-        let speedup = industry_avg_ns as f64 / avg_test_ns as f64;
-
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~1.5μs)",
-            speedup
-        );
 
         // Performance assertion
         assert!(
@@ -1833,14 +1786,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Shell creation:   {}ns (Target: <1ms)", creation_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 1_500_000; // 1.5ms average
-        let speedup = industry_avg_ns as f64 / creation_ns as f64;
-
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~1.5ms)",
-            speedup
-        );
 
         // Performance assertion
         assert!(
@@ -1964,14 +1909,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Validation:       {}ns (Target: <500μs)", validation_ns);
 
-        // Internal target only — no third-party comparison made.
-        let industry_avg_ns = 500_000; // 500μs average
-        let speedup = industry_avg_ns as f64 / validation_ns as f64;
-
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~500μs)",
-            speedup
-        );
 
         // Performance assertion
         assert!(
@@ -2084,14 +2021,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Complex shell:    {}ns (Target: <2ms)", creation_ns);
 
-        // Industry comparison: Complex shapes take longer
-        let industry_avg_ns = 2_500_000; // 2.5ms average for complex topology
-        let speedup = industry_avg_ns as f64 / creation_ns as f64;
-
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~2.5ms)",
-            speedup
-        );
 
         // Performance assertion
         assert!(
@@ -2205,17 +2134,11 @@ mod tests {
 
         // Performance metrics
         let creation_time_ns = elapsed.as_nanos() as u64;
-        let industry_avg_ns = 5_000_000u64; // ~5ms for solid creation
-        let speedup = (industry_avg_ns as f64) / (creation_time_ns as f64);
 
         println!("  📊 PERFORMANCE METRICS:");
         println!(
             "    Solid creation:   {}ns (Target: <5ms)",
             creation_time_ns
-        );
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~5ms)",
-            speedup
         );
 
         // Validate topology
@@ -2360,17 +2283,11 @@ mod tests {
 
         // Performance metrics
         let creation_time_ns = elapsed.as_nanos() as u64;
-        let industry_avg_ns = 10_000_000u64; // ~10ms for complex solid
-        let speedup = (industry_avg_ns as f64) / (creation_time_ns as f64);
 
         println!("  📊 PERFORMANCE METRICS:");
         println!(
             "    Complex creation: {}ns (Target: <10ms)",
             creation_time_ns
-        );
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~10ms)",
-            speedup
         );
 
         // Validate topology
@@ -2505,17 +2422,11 @@ mod tests {
 
         // Performance metrics
         let creation_time_ns = elapsed.as_nanos() as u64;
-        let industry_avg_ns = 3_000_000u64; // ~3ms for simple solid
-        let speedup = (industry_avg_ns as f64) / (creation_time_ns as f64);
 
         println!("  📊 PERFORMANCE METRICS:");
         println!(
             "    Tetrahedron:      {}ns (Target: <3ms)",
             creation_time_ns
-        );
-        println!(
-            "    vs Industry:      {:.1}x faster (Industry avg: ~3ms)",
-            speedup
         );
 
         // Validate Euler characteristic: V - E + F = 2 for any closed polyhedron
