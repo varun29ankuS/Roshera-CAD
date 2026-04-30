@@ -37,11 +37,18 @@ impl NativeProviderFactory {
         Ok(ClaudeProvider::new())
     }
 
-    /// Create a complete provider manager with API-based providers
+    /// Create a complete provider manager with API-based providers.
     ///
-    /// Uses Claude for LLM and mock providers for ASR/TTS.
-    /// ASR and TTS will be replaced with API providers (e.g. OpenAI Whisper API)
-    /// when those integrations are built.
+    /// Production policy is **API-only**: only the Claude LLM provider is
+    /// registered. ASR and TTS are intentionally left empty until their
+    /// hosted API integrations land — `ProviderManager::asr()` /
+    /// `tts(...)` will return `ProviderUnavailable` so callers fail loudly
+    /// instead of silently dispatching to a mock.
+    ///
+    /// Test and `mock-providers`-feature builds also register the mock
+    /// ASR/LLM/TTS providers and select them as the active backend so
+    /// integration tests run without an API key. Release builds without
+    /// the feature flag never compile the mock module.
     pub async fn create_provider_manager(
         config: &NativeProviderConfig,
     ) -> Result<ProviderManager, ProviderError> {
@@ -49,38 +56,60 @@ impl NativeProviderFactory {
 
         tracing::info!("Initializing AI provider manager (API-only mode)...");
 
-        // ASR Provider — mock until API-based ASR is integrated
-        manager.register_asr("mock".to_string(), Box::new(MockASRProvider::new()));
-        tracing::info!("Registered mock ASR provider (API ASR not yet integrated)");
-
-        // LLM Provider — Claude API
+        // LLM Provider — Claude API. If this fails the manager is returned
+        // with no active LLM, and the API server's `ai_configured` gate
+        // will surface a 503 to clients. We never silently fall back to
+        // a mock in release builds.
+        let mut active_llm = String::new();
         match Self::create_claude_provider(config).await {
             Ok(provider) => {
                 manager.register_llm("claude".to_string(), Box::new(provider));
+                active_llm = "claude".to_string();
                 tracing::info!("Registered Claude API LLM provider");
             }
             Err(e) => {
-                tracing::warn!("Failed to create Claude provider: {}. Using mock.", e);
-                manager.register_llm("mock".to_string(), Box::new(MockLLMProvider::new()));
+                tracing::warn!(
+                    "Failed to create Claude provider: {}. \
+                     LLM dispatch will return ProviderUnavailable until the \
+                     deployment configures a working provider.",
+                    e
+                );
             }
         }
 
-        // TTS Provider — mock until API-based TTS is integrated
-        manager.register_tts("mock".to_string(), Box::new(MockTTSProvider::new()));
-        tracing::info!("Registered mock TTS provider (API TTS not yet integrated)");
+        // ASR / TTS: real API integrations are not yet wired. Production
+        // builds register nothing here — `manager.asr()` returns
+        // ProviderUnavailable and the upstream handler refuses the request.
 
-        // Set active providers
-        let llm_provider = if manager.llm_providers.contains_key("claude") {
-            "claude"
+        // Mock-flavored builds (tests, benches, dev with `--features
+        // mock-providers`) register the mocks and select them as default.
+        #[cfg(any(test, feature = "mock-providers"))]
+        {
+            manager.register_asr("mock".to_string(), Box::new(MockASRProvider::new()));
+            manager.register_tts("mock".to_string(), Box::new(MockTTSProvider::new()));
+            if active_llm.is_empty() {
+                manager.register_llm("mock".to_string(), Box::new(MockLLMProvider::new()));
+                active_llm = "mock".to_string();
+            }
+            tracing::info!(
+                "Registered mock ASR/TTS providers (test / mock-providers feature build)"
+            );
+        }
+
+        // Activate whichever backends were registered. In a release build
+        // without an LLM key, `active_llm` stays empty; consumers must
+        // check `ProviderManager::llm()` and surface the error.
+        let active_asr = if manager.asr_providers.contains_key("mock") {
+            "mock".to_string()
         } else {
-            "mock"
+            String::new()
         };
-
-        manager.set_active(
-            "mock".to_string(),
-            llm_provider.to_string(),
-            Some("mock".to_string()),
-        );
+        let active_tts = if manager.tts_providers.contains_key("mock") {
+            Some("mock".to_string())
+        } else {
+            None
+        };
+        manager.set_active(active_asr, active_llm, active_tts);
 
         let memory_mb = manager.total_memory_requirement_mb();
         tracing::info!(
