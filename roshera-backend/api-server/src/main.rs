@@ -228,7 +228,7 @@ async fn update_geometry_wrapper(
     Path(id): Path<String>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, error_catalog::ApiError> {
     update_geometry(State(state), Path(id), Json(payload), auth_info).await
 }
 
@@ -236,7 +236,7 @@ async fn delete_geometry_wrapper(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, error_catalog::ApiError> {
     delete_geometry(Extension(auth_info), State(state), Path(id)).await
 }
 
@@ -1338,15 +1338,21 @@ async fn update_geometry(
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
     auth_info: auth_middleware::AuthInfo,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, error_catalog::ApiError> {
     if !auth_info.permissions.contains(&Permission::ModifyGeometry) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(error_catalog::ApiError::permission_denied("ModifyGeometry"));
     }
 
-    let solid_id: u32 = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let solid_id: u32 = id.parse().map_err(|_| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::InvalidParameter,
+            format!("solid id '{id}' is not a u32"),
+        )
+        .with_details(serde_json::json!({ "received": id }))
+    })?;
     let model = state.model.read().await;
     if model.solids.get(solid_id).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(error_catalog::ApiError::solid_not_found(solid_id));
     }
     drop(model);
 
@@ -1356,7 +1362,12 @@ async fn update_geometry(
         "Direct PUT /api/geometry/:id is not supported; use the timeline-recorded \
          operation endpoints so mutations are replayable"
     );
-    Err(StatusCode::METHOD_NOT_ALLOWED)
+    Err(error_catalog::ApiError::method_not_allowed(
+        "Direct PUT /api/geometry/{id} is disabled; mutations must flow through \
+         the timeline so they remain replayable.",
+        "Use POST /api/timeline/record (or a higher-level operation endpoint) \
+         instead. See GET /api/capabilities for the supported timeline routes.",
+    ))
 }
 
 /// DELETE /api/geometry/:id — same architectural rule as update_geometry:
@@ -1368,15 +1379,21 @@ async fn delete_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, error_catalog::ApiError> {
     if !auth_info.permissions.contains(&Permission::DeleteGeometry) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(error_catalog::ApiError::permission_denied("DeleteGeometry"));
     }
 
-    let solid_id: u32 = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let solid_id: u32 = id.parse().map_err(|_| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::InvalidParameter,
+            format!("solid id '{id}' is not a u32"),
+        )
+        .with_details(serde_json::json!({ "received": id }))
+    })?;
     let model = state.model.read().await;
     if model.solids.get(solid_id).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(error_catalog::ApiError::solid_not_found(solid_id));
     }
     drop(model);
 
@@ -1385,7 +1402,13 @@ async fn delete_geometry(
         "Direct DELETE /api/geometry/:id is not supported; use the timeline-recorded \
          operation endpoints so deletions are replayable"
     );
-    Err(StatusCode::METHOD_NOT_ALLOWED)
+    Err(error_catalog::ApiError::method_not_allowed(
+        "Direct DELETE /api/geometry/{id} is disabled; deletions must flow \
+         through the timeline so they remain replayable.",
+        "Use POST /api/timeline/record with a delete operation (or POST \
+         /api/timeline/undo) instead. See GET /api/capabilities for the \
+         supported timeline routes.",
+    ))
 }
 
 async fn process_enhanced_ai_command(
@@ -2395,7 +2418,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             require_special: false,
         },
     };
-    let auth_manager = Arc::new(AuthManager::new(auth_config, "secret_key"));
+    // JWT signing key. `AuthManager::new` is fallible (rejects empty
+    // keys); we propagate any error out of `main` so a misconfigured
+    // operator gets a typed startup failure rather than a panic.
+    let auth_manager = Arc::new(
+        AuthManager::new(auth_config, "secret_key")
+            .map_err(|e| format!("AuthManager init failed: {e}"))?,
+    );
     let permission_manager = Arc::new(PermissionManager::new());
     let cache_config = session_manager::cache::CacheConfig {
         session_capacity: 1000,
@@ -2543,6 +2572,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transactions: Arc::new(transactions::TransactionManager::new()),
     };
 
+    // Background sweeper for expired transactions. The TX_TTL inside
+    // `TransactionManager` (1 hour) only documents intent; without an
+    // active driver, an agent that crashed between `begin` and
+    // `commit`/`rollback` would leak its tracked solids forever.
+    // Tick every five minutes — coarse enough to be invisible on the
+    // model write lock, fine enough that an expired tx is reaped
+    // within ~5 minutes of its TTL elapsing. The model lock is taken
+    // only when there is actual cleanup to do, so idle servers pay
+    // nothing.
+    {
+        let transactions = state.transactions.clone();
+        let model = state.model.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+            // Skip the immediate first tick; first sweep happens one
+            // interval after startup, never at startup itself.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let expired = transactions.sweep_expired();
+                if expired.is_empty() {
+                    continue;
+                }
+                let solids_removed: usize =
+                    expired.iter().map(|(_, s)| s.len()).sum();
+                {
+                    let mut model = model.write().await;
+                    for (_, solids) in &expired {
+                        for sid in solids {
+                            model.solids.remove(*sid);
+                        }
+                    }
+                }
+                tracing::warn!(
+                    expired_transactions = expired.len(),
+                    solids_removed,
+                    "tx sweeper rolled back expired transactions"
+                );
+            }
+        });
+    }
+
     // Build router with all routes
     let mut app = Router::new()
         // Root and health
@@ -2651,7 +2723,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/timeline/branch/switch/{branch_id}",
             post(switch_branch),
         )
-        .route("/api/timeline/merge", post(merge_branches))
+        // ==================================================================
+        // Note: branch merging is exposed exclusively under
+        // /api/branches/{id}/merge (handled by `branches::merge_branch`).
+        // The earlier duplicate /api/timeline/merge route was removed
+        // because two surfaces calling the same kernel function only
+        // multiplied the test matrix and let agents discover an
+        // undocumented spelling.
         // ==================================================================
         // Hierarchy endpoints — assembly/part tree the frontend ModelTree
         // panel reads. Handlers are in handlers/hierarchy.rs. Closing

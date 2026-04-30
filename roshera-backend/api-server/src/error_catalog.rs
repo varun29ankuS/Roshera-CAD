@@ -124,6 +124,18 @@ pub enum ErrorCode {
     /// retrying without changing server config will fail identically.
     AiNotConfigured,
 
+    // ── Authorization / routing ───────────────────────────────────
+    /// Caller authenticated but lacks the permission needed for this
+    /// route. Mapped to HTTP 403 — not retryable from the same
+    /// principal; needs an operator to grant the role.
+    PermissionDenied,
+    /// The route exists but the requested HTTP method is not the
+    /// supported one (e.g. PUT/DELETE on `/api/geometry/{id}`, where
+    /// the architecture forces mutations through the timeline).
+    /// Mapped to HTTP 405. Non-retryable — the client must change
+    /// endpoint, not just retry.
+    MethodNotAllowed,
+
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
     Internal,
@@ -161,6 +173,9 @@ impl ErrorCode {
             | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
 
             ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+
+            ErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
+            ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 
@@ -186,7 +201,9 @@ impl ErrorCode {
             | ErrorCode::BranchNotFound
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
-            | ErrorCode::AiNotConfigured => false,
+            | ErrorCode::AiNotConfigured
+            | ErrorCode::PermissionDenied
+            | ErrorCode::MethodNotAllowed => false,
 
             // Server-side: another attempt may succeed.
             ErrorCode::KernelError
@@ -224,6 +241,8 @@ impl ErrorCode {
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
             ErrorCode::AiNotConfigured => "ai_not_configured",
+            ErrorCode::PermissionDenied => "permission_denied",
+            ErrorCode::MethodNotAllowed => "method_not_allowed",
             ErrorCode::Internal => "internal_error",
         }
     }
@@ -253,6 +272,8 @@ impl ErrorCode {
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
             ErrorCode::AiNotConfigured,
+            ErrorCode::PermissionDenied,
+            ErrorCode::MethodNotAllowed,
             ErrorCode::Internal,
         ]
     }
@@ -394,6 +415,25 @@ impl ApiError {
             format!("solid {solid_id} not found"),
         )
         .with_details(serde_json::json!({ "solid_id": solid_id }))
+    }
+
+    /// Caller is authenticated but lacks the required permission for
+    /// this route. The `permission` detail names the missing scope so
+    /// agents can request the right grant from a human operator.
+    pub fn permission_denied(permission: &str) -> Self {
+        Self::new(
+            ErrorCode::PermissionDenied,
+            format!("missing required permission '{permission}'"),
+        )
+        .with_details(serde_json::json!({ "permission": permission }))
+    }
+
+    /// Endpoint exists but the requested method is intentionally
+    /// disabled — typically because the architecture funnels mutations
+    /// through a different surface (the timeline). The hint should
+    /// point the caller at the correct endpoint.
+    pub fn method_not_allowed(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::new(ErrorCode::MethodNotAllowed, message).with_hint(hint)
     }
 
     /// AI surface refused: no LLM API key was configured at server
