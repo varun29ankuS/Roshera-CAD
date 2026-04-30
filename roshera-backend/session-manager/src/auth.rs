@@ -245,12 +245,27 @@ impl Default for AuthConfig {
 }
 
 impl AuthManager {
-    /// Create new auth manager
-    pub fn new(config: AuthConfig, jwt_secret: &str) -> Self {
-        let jwt_secret =
-            HmacSha256::new_from_slice(jwt_secret.as_bytes()).expect("Invalid JWT secret");
+    /// Create new auth manager.
+    ///
+    /// Returns `SessionError::InvalidInput` if `jwt_secret` is empty
+    /// or otherwise rejected by the HMAC-SHA256 key constructor. Up
+    /// until now this case panicked at startup with `expect("Invalid
+    /// JWT secret")`; making it a typed error lets the API server
+    /// surface a configuration problem to the operator instead of
+    /// crashing the process.
+    pub fn new(config: AuthConfig, jwt_secret: &str) -> Result<Self, SessionError> {
+        if jwt_secret.is_empty() {
+            return Err(SessionError::InvalidInput {
+                field: "jwt_secret must not be empty".to_string(),
+            });
+        }
+        let jwt_secret = HmacSha256::new_from_slice(jwt_secret.as_bytes()).map_err(|e| {
+            SessionError::InvalidInput {
+                field: format!("jwt_secret rejected by HMAC-SHA256: {e}"),
+            }
+        })?;
 
-        Self {
+        Ok(Self {
             jwt_secret: Arc::new(jwt_secret),
             tokens: Arc::new(DashMap::new()),
             api_keys: Arc::new(DashMap::new()),
@@ -260,7 +275,7 @@ impl AuthManager {
             failed_attempts: Arc::new(DashMap::new()),
             rate_limits: Arc::new(DashMap::new()),
             config,
-        }
+        })
     }
 
     /// Hash password using Argon2
@@ -770,7 +785,7 @@ mod tests {
 
     #[test]
     fn test_password_hashing() {
-        let auth = AuthManager::new(AuthConfig::default(), "test-secret");
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let password = "StrongP@ssw0rd!";
         let hash = auth.hash_password(password).unwrap();
@@ -781,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_jwt_tokens() {
-        let auth = AuthManager::new(AuthConfig::default(), "test-secret");
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let token = auth
             .create_token(
@@ -804,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_api_keys() {
-        let auth = AuthManager::new(AuthConfig::default(), "test-secret");
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let (raw_key, api_key) = auth
             .create_api_key(
@@ -828,7 +843,7 @@ mod tests {
         config.max_failed_attempts = 3;
         config.lockout_duration_seconds = 60;
 
-        let auth = AuthManager::new(config, "test-secret");
+        let auth = AuthManager::new(config, "test-secret").unwrap();
 
         // Record failed attempts
         for _ in 0..3 {
