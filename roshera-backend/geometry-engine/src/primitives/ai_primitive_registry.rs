@@ -17,6 +17,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use crate::math::tolerance::Tolerance;
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
     edge::EdgeId,
@@ -1149,20 +1150,22 @@ impl PrimitiveRegistry {
 
     /// Extract technical information for AI learning.
     ///
-    /// Counts are derived from the actual B-Rep topology via
-    /// [`walk_solid_topology`]. Mass properties (`volume`, `surface_area`) are
-    /// reported as `None` because the underlying `Solid::volume` /
-    /// `Solid::surface_area` APIs require `&mut` access that is unavailable
-    /// here. Downstream consumers that need them should recompute via the
-    /// solid's mass-property cache.
+    /// Counts and bbox extents come from a topology walk
+    /// ([`walk_solid_topology`]). Mass properties are computed live via
+    /// [`crate::primitives::solid::Solid::compute_mass_properties`] (volume +
+    /// center-of-mass via the divergence-theorem integral, cached on the
+    /// solid for repeat queries) and [`Solid::surface_area`] (sum of the
+    /// per-face areas). The mutable `BRepModel` is required because both
+    /// kernel APIs take `&mut` access to the shell/face/loop stores; this is
+    /// the AI surface, so it must report the truth rather than `None`.
     fn extract_technical_info(
         &self,
         geometry_id: SolidId,
-        model: &BRepModel,
+        model: &mut BRepModel,
         command: &AICommand,
         validation: &ValidationReport,
     ) -> AITechnicalInfo {
-        let counts = self.walk_solid_topology(geometry_id, model);
+        let counts = self.walk_solid_topology(geometry_id, &*model);
 
         let (vertex_count, edge_count, face_count, extents) = match &counts {
             Some(c) => (c.vertex_count, c.edge_count, c.face_count, c.extents.clone()),
@@ -1178,7 +1181,7 @@ impl PrimitiveRegistry {
         // watertight solid, so we reuse it here.
         let is_closed = is_manifold;
 
-        let (bbox, centroid) = match extents {
+        let (bbox, fallback_centroid) = match extents {
             Some(e) => {
                 let bbox = AIBoundingBox {
                     min: AIPoint3D {
@@ -1221,6 +1224,51 @@ impl PrimitiveRegistry {
             }
         };
 
+        // Mass properties — computed live from the kernel rather than reported
+        // as `None`. `compute_mass_properties` caches on the solid, so repeat
+        // queries are O(1). Disjoint-field borrows of `model.{solids, shells,
+        // faces, loops}` are valid because the borrow checker treats them as
+        // independent paths.
+        let tolerance = Tolerance::default();
+        let (volume, surface_area, center_of_mass_pt) =
+            if let Some(solid) = model.solids.get_mut(geometry_id) {
+                let (vol, com) = match solid.compute_mass_properties(
+                    &mut model.shells,
+                    &mut model.faces,
+                    &mut model.loops,
+                    &model.vertices,
+                    &model.edges,
+                    &model.curves,
+                    &model.surfaces,
+                ) {
+                    Ok(mp) => (Some(mp.volume), Some(mp.center_of_mass)),
+                    Err(_) => (None, None),
+                };
+                let area = solid
+                    .surface_area(
+                        &mut model.shells,
+                        &mut model.faces,
+                        &mut model.loops,
+                        &model.vertices,
+                        &model.edges,
+                        &model.surfaces,
+                        tolerance,
+                    )
+                    .ok();
+                (vol, area, com)
+            } else {
+                (None, None, None)
+            };
+
+        let center_of_mass = match center_of_mass_pt {
+            Some(p) => AIPoint3D {
+                x: p.x,
+                y: p.y,
+                z: p.z,
+            },
+            None => fallback_centroid,
+        };
+
         AITechnicalInfo {
             final_parameters: Self::collect_numeric_parameters(&command.parameters),
             topology: AITopologyInfo {
@@ -1232,10 +1280,10 @@ impl PrimitiveRegistry {
                 is_closed,
             },
             properties: AIGeometricProperties {
-                volume: None,
-                surface_area: None,
+                volume,
+                surface_area,
                 bounding_box: bbox,
-                center_of_mass: centroid,
+                center_of_mass,
             },
         }
     }
