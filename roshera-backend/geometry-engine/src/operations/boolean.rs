@@ -3703,10 +3703,15 @@ fn compute_edge_intersections(
                 None => continue,
             };
 
-            // Sample-based closest point search between two curves
-            let (t_a, t_b, dist) = find_curve_curve_closest_point(curve_a, curve_b, tolerance)?;
-
-            if dist < tolerance.distance() {
+            // Multi-crossing curve-curve intersection. The closest-point
+            // search returns only the global minimum, which silently drops
+            // the second hit of a line bisecting a circle, the second
+            // crossing of two arcs, etc. — leaving the boolean with a
+            // half-imprinted face arrangement. `find_curve_curve_intersections`
+            // returns every local minimum below tolerance, so the split-op
+            // loop below produces one T-junction per crossing per edge.
+            let hits = find_curve_curve_intersections(curve_a, curve_b, tolerance)?;
+            for (t_a, t_b, dist) in hits {
                 let point = curve_a.point_at(t_a)?;
                 new_intersections.push((eid_a, eid_b, point, t_a, t_b, dist));
             }
@@ -3918,78 +3923,193 @@ fn compute_edge_intersections(
     Ok(())
 }
 
-/// Find closest point between two curves using sampling + Newton refinement
-fn find_curve_curve_closest_point(
+/// Find ALL crossings between two curves.
+///
+/// Tolerant-modeling boolean imprint requires every face-pair intersection
+/// hit, not just the global minimum. A line bisecting a circle produces
+/// two crossings; two arcs whose half-circles cross produce two; a NURBS
+/// curve sweeping through a planar boundary may produce three or more.
+/// A closest-point search returns only the deepest minimum, so upstream
+/// the split-op loop would emit a single T-junction per edge and the
+/// boolean produces a half-imprinted face arrangement that fails DCEL
+/// loop closure.
+///
+/// Algorithm (Patrikalakis & Maekawa §4.6.1, "all-pairs sampling +
+/// independent refinement"):
+///   1. Coarse sample distance grid `d[i][j] = |C_a(i/N) - C_b(j/N)|`
+///      over (N+1)×(N+1) parameter pairs, N = 24.
+///   2. Mark every (i, j) as a seed iff its distance is strictly less
+///      than every existing 8-neighbour (interior cells: 8 neighbours;
+///      edge cells: 5; corner cells: 3). Boundary seeds matter:
+///      endpoint-coincident crossings sit on the edge of the parameter
+///      square and Newton cannot exit it.
+///   3. Refine each seed independently with a step-halving Newton loop.
+///      Each seed converges to its own local minimum, never to a
+///      neighbour's.
+///   4. Filter by `dist < tolerance.distance()` — only true crossings
+///      survive. Coarse seeds whose refined distance still exceeds
+///      tolerance are not crossings, just local minima of distance.
+///   5. Cluster surviving hits in `(t_a, t_b)` space within `1e-6` to
+///      collapse duplicates that converged to the same minimum from
+///      adjacent seeds.
+///   6. Sort by `t_a` so the consumer sees crossings in parameter
+///      order along curve A — this is what the split-op loop needs to
+///      walk an edge front-to-back without re-sorting.
+///
+/// The grid resolution N = 24 separates two distinct minima whose
+/// parameter footprints are at least ~4% of curve length apart in both
+/// dimensions. Closer minima require subdividing curves upstream
+/// (boolean's curve-clipping passes already do this for line/circle
+/// boundary clipping). Production CAD inputs rarely place two
+/// boolean-relevant crossings closer than that on a single edge pair.
+fn find_curve_curve_intersections(
     curve_a: &dyn Curve,
     curve_b: &dyn Curve,
     tolerance: &Tolerance,
-) -> OperationResult<(f64, f64, f64)> {
-    const SAMPLES: usize = 20;
-    let mut best_t_a = 0.0;
-    let mut best_t_b = 0.0;
-    let mut best_dist = f64::MAX;
+) -> OperationResult<Vec<(f64, f64, f64)>> {
+    const N: usize = 24;
 
-    // Coarse sampling
-    for i in 0..=SAMPLES {
-        let t_a = i as f64 / SAMPLES as f64;
-        let pt_a = curve_a.point_at(t_a)?;
+    // Pre-evaluate curve points at every parameter on the grid axes so
+    // the (N+1)² distance grid is a single subtract+magnitude per cell.
+    let mut pts_a: Vec<Point3> = Vec::with_capacity(N + 1);
+    for i in 0..=N {
+        pts_a.push(curve_a.point_at(i as f64 / N as f64)?);
+    }
+    let mut pts_b: Vec<Point3> = Vec::with_capacity(N + 1);
+    for j in 0..=N {
+        pts_b.push(curve_b.point_at(j as f64 / N as f64)?);
+    }
 
-        for j in 0..=SAMPLES {
-            let t_b = j as f64 / SAMPLES as f64;
-            let pt_b = curve_b.point_at(t_b)?;
+    let mut grid = vec![vec![0.0_f64; N + 1]; N + 1];
+    for i in 0..=N {
+        for j in 0..=N {
+            grid[i][j] = (pts_a[i] - pts_b[j]).magnitude();
+        }
+    }
 
-            let dist = (pt_a - pt_b).magnitude();
-            if dist < best_dist {
-                best_dist = dist;
-                best_t_a = t_a;
-                best_t_b = t_b;
+    // All local minima vs 8-neighbour stencil. Strict inequality on the
+    // neighbour comparison so flat plateaus (two coincident curves) seed
+    // exactly one cell per plateau and the dedup pass collapses the rest.
+    let mut seeds: Vec<(usize, usize)> = Vec::new();
+    for i in 0..=N {
+        for j in 0..=N {
+            let center = grid[i][j];
+            let mut is_min = true;
+            'neighbour_scan: for di in -1i32..=1 {
+                for dj in -1i32..=1 {
+                    if di == 0 && dj == 0 {
+                        continue;
+                    }
+                    let ni = i as i32 + di;
+                    let nj = j as i32 + dj;
+                    if ni < 0 || nj < 0 || ni > N as i32 || nj > N as i32 {
+                        continue;
+                    }
+                    if grid[ni as usize][nj as usize] < center {
+                        is_min = false;
+                        break 'neighbour_scan;
+                    }
+                }
+            }
+            if is_min {
+                seeds.push((i, j));
             }
         }
     }
 
-    // Newton-style refinement with unconditional step halving.
+    // Refine each seed independently. The step-halving stencil mirrors
+    // `find_curve_curve_closest_point` but with full diagonal coverage
+    // (8 directions instead of 6) — diagonals matter when a seed sits
+    // adjacent to a curve-endpoint wall and the axial steps are clamped.
+    let mut refined: Vec<(f64, f64, f64)> = Vec::with_capacity(seeds.len());
+    for (i, j) in seeds {
+        let mut best_t_a = i as f64 / N as f64;
+        let mut best_t_b = j as f64 / N as f64;
+        let mut best_dist = grid[i][j];
+
+        let mut step = 0.5 / N as f64;
+        let min_step = 1e-14_f64;
+        for _ in 0..60 {
+            for &(dt_a, dt_b) in &[
+                (step, 0.0),
+                (-step, 0.0),
+                (0.0, step),
+                (0.0, -step),
+                (step, step),
+                (-step, -step),
+                (step, -step),
+                (-step, step),
+            ] {
+                let t_a = (best_t_a + dt_a).clamp(0.0, 1.0);
+                let t_b = (best_t_b + dt_b).clamp(0.0, 1.0);
+                let pt_a = curve_a.point_at(t_a)?;
+                let pt_b = curve_b.point_at(t_b)?;
+                let dist = (pt_a - pt_b).magnitude();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_t_a = t_a;
+                    best_t_b = t_b;
+                }
+            }
+            if best_dist < tolerance.distance() * 0.1 || step < min_step {
+                break;
+            }
+            step *= 0.5;
+        }
+
+        refined.push((best_t_a, best_t_b, best_dist));
+    }
+
+    // Tolerance gate: only true crossings survive. Sub-tolerance local
+    // minima that aren't actually crossings (e.g. nearest-approach pairs
+    // of skew lines that miss by 1 µm with a 1 nm tolerance) drop out.
+    let global_tol = tolerance.distance();
+    refined.retain(|&(_, _, d)| d < global_tol);
+
+    // Dedup in parameter space. Two adjacent seeds frequently converge
+    // to the same minimum; without dedup the split-op loop would emit
+    // duplicate vertices that the per-vertex tolerance merge then has
+    // to fold back together. Cheaper to collapse here.
     //
-    // When no direction improves at the current step, we still halve the
-    // step and retry — overshooting the optimum by a fraction of `step`
-    // is the common cause of "no improvement" near convergence, and a
-    // finer step then resolves sub-`step` offsets. We bail only once the
-    // step is numerically negligible or the distance is already below
-    // tolerance. This is essential for boolean face-face intersection
-    // where a cutting-line endpoint coincides with a boundary-edge
-    // crossing: the `t_b=0` wall prevents Newton from moving in `t_b`,
-    // forcing it to converge in `t_a` alone across many step halvings.
-    let mut step = 0.5 / SAMPLES as f64;
-    let min_step = 1e-14_f64;
-    for _ in 0..60 {
-        for &(dt_a, dt_b) in &[
-            (step, 0.0),
-            (-step, 0.0),
-            (0.0, step),
-            (0.0, -step),
-            (step, step),
-            (-step, -step),
-        ] {
-            let t_a = (best_t_a + dt_a).clamp(0.0, 1.0);
-            let t_b = (best_t_b + dt_b).clamp(0.0, 1.0);
-
-            let pt_a = curve_a.point_at(t_a)?;
-            let pt_b = curve_b.point_at(t_b)?;
-            let dist = (pt_a - pt_b).magnitude();
-
-            if dist < best_dist {
-                best_dist = dist;
-                best_t_a = t_a;
-                best_t_b = t_b;
-            }
+    // Periodic curves (Circle, full NURBS loops) treat t=0 and t=1 as
+    // physically identical, so the parameter-distance metric wraps mod
+    // period. Without this, a line crossing near a circle's seam
+    // produces two minima — one at t_b ≈ 0 and one at t_b ≈ 1 —
+    // that name the same point and survive a naive abs() dedup.
+    let curve_a_period = if curve_a.is_periodic() {
+        curve_a.period()
+    } else {
+        None
+    };
+    let curve_b_period = if curve_b.is_periodic() {
+        curve_b.period()
+    } else {
+        None
+    };
+    let param_dist = |t1: f64, t2: f64, period: Option<f64>| -> f64 {
+        let raw = (t1 - t2).abs();
+        match period {
+            Some(p) if p > 0.0 => raw.min(p - raw),
+            _ => raw,
         }
-
-        if best_dist < tolerance.distance() * 0.1 || step < min_step {
-            break;
+    };
+    let cluster_tol = 1e-6_f64;
+    let mut deduped: Vec<(f64, f64, f64)> = Vec::with_capacity(refined.len());
+    for hit in refined {
+        let dup = deduped.iter().any(|&(ta, tb, _)| {
+            param_dist(ta, hit.0, curve_a_period) < cluster_tol
+                && param_dist(tb, hit.1, curve_b_period) < cluster_tol
+        });
+        if !dup {
+            deduped.push(hit);
         }
-        step *= 0.5;
     }
 
-    Ok((best_t_a, best_t_b, best_dist))
+    // Parameter-order along curve A — the split-op loop walks edges in
+    // ascending parameter and would otherwise re-sort downstream.
+    deduped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(deduped)
 }
 
 /// Find existing vertex near a point or create a real vertex in the model
@@ -5239,21 +5359,136 @@ mod tests {
     }
 
     #[test]
-    fn test_curve_curve_closest_point() {
+    fn crossing_lines_yield_one_intersection() {
+        // Sanity: two perpendicular lines crossing in the middle should
+        // yield exactly one hit at (t_a, t_b) ≈ (0.5, 0.5).
         use crate::primitives::curve::Line;
 
         let line_a = Line::new(Point3::new(0.0, 5.0, 0.0), Point3::new(10.0, 5.0, 0.0));
         let line_b = Line::new(Point3::new(5.0, 0.0, 0.0), Point3::new(5.0, 10.0, 0.0));
 
         let tol = Tolerance::default();
-        let (t_a, t_b, dist) = find_curve_curve_closest_point(&line_a, &line_b, &tol).unwrap();
+        let hits = find_curve_curve_intersections(&line_a, &line_b, &tol).unwrap();
 
-        assert!(
-            dist < 1e-6,
-            "Lines cross, distance should be ~0, got {dist}"
-        );
+        assert_eq!(hits.len(), 1, "Crossing lines should yield 1 hit");
+        let (t_a, t_b, dist) = hits[0];
+        assert!(dist < tol.distance(), "Hit distance {dist} exceeds tol");
         assert!((t_a - 0.5).abs() < 0.05, "Expected t_a ≈ 0.5, got {t_a}");
         assert!((t_b - 0.5).abs() < 0.05, "Expected t_b ≈ 0.5, got {t_b}");
+    }
+
+    #[test]
+    fn line_through_circle_yields_two_crossings() {
+        // A diameter line through a circle of radius 5 produces two
+        // crossings — one at each end of the diameter. The closest-point
+        // search returns only the global minimum (the deepest of two
+        // ties), so the boolean's split-op loop would emit a single
+        // T-junction and the face arrangement loop closure would fail.
+        use crate::primitives::curve::{Circle, Line};
+
+        let circle = Circle::new(Point3::ORIGIN, Vector3::Z, 5.0).unwrap();
+        let line = Line::new(Point3::new(-10.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let tol = Tolerance::default();
+
+        let hits = find_curve_curve_intersections(&line, &circle, &tol).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            2,
+            "Diameter line should cross circle twice, got {} hits",
+            hits.len()
+        );
+        for (t_a, _t_b, dist) in &hits {
+            assert!(*dist < tol.distance(), "Hit distance {dist} exceeds tol");
+            assert!(
+                (0.0..=1.0).contains(t_a),
+                "Curve A parameter {t_a} out of [0, 1]"
+            );
+        }
+        // Sorted ascending by t_a: line crosses circle at x = -5 (t_a ≈ 0.25)
+        // and x = +5 (t_a ≈ 0.75).
+        assert!(
+            hits[0].0 < hits[1].0,
+            "Hits should be sorted by curve-A parameter"
+        );
+        assert!(
+            (hits[0].0 - 0.25).abs() < 0.05,
+            "First crossing expected near t_a = 0.25, got {}",
+            hits[0].0
+        );
+        assert!(
+            (hits[1].0 - 0.75).abs() < 0.05,
+            "Second crossing expected near t_a = 0.75, got {}",
+            hits[1].0
+        );
+    }
+
+    #[test]
+    fn parallel_lines_yield_zero_crossings() {
+        // Two parallel lines never cross. The closest-point search
+        // returns a single best-pair with positive separation; the
+        // tolerance gate must drop it.
+        use crate::primitives::curve::Line;
+
+        let line_a = Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let line_b = Line::new(Point3::new(0.0, 1.0, 0.0), Point3::new(10.0, 1.0, 0.0));
+        let tol = Tolerance::default();
+
+        let hits = find_curve_curve_intersections(&line_a, &line_b, &tol).unwrap();
+        assert_eq!(
+            hits.len(),
+            0,
+            "Parallel lines must not cross, got {} hits",
+            hits.len()
+        );
+    }
+
+    #[test]
+    fn tangent_line_to_circle_yields_one_crossing() {
+        // A line tangent to a circle touches at exactly one point.
+        // Without dedup, adjacent grid seeds along the tangent line
+        // would all converge to the same minimum and emit duplicate
+        // crossings.
+        use crate::primitives::curve::{Circle, Line};
+
+        let circle = Circle::new(Point3::ORIGIN, Vector3::Z, 5.0).unwrap();
+        // Horizontal line tangent to top of circle (y = 5).
+        let line = Line::new(Point3::new(-10.0, 5.0, 0.0), Point3::new(10.0, 5.0, 0.0));
+        let tol = Tolerance::default();
+
+        let hits = find_curve_curve_intersections(&line, &circle, &tol).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "Tangent line should touch circle once, got {} hits",
+            hits.len()
+        );
+        assert!(hits[0].2 < tol.distance());
+    }
+
+    #[test]
+    fn perpendicular_circles_yield_two_crossings() {
+        // Two circles in perpendicular planes (XY and XZ), both centered
+        // at the origin with the same radius, cross at the two points
+        // where their planes meet (the X-axis): (+5, 0, 0) and (-5, 0, 0).
+        // This is the canonical curve-curve multi-crossing case that
+        // closest-point silently collapses to a single hit.
+        use crate::primitives::curve::Circle;
+
+        let circle_a = Circle::new(Point3::ORIGIN, Vector3::Z, 5.0).unwrap();
+        let circle_b = Circle::new(Point3::ORIGIN, Vector3::Y, 5.0).unwrap();
+        let tol = Tolerance::default();
+
+        let hits = find_curve_curve_intersections(&circle_a, &circle_b, &tol).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "Perpendicular circles should cross twice, got {} hits",
+            hits.len()
+        );
+        for (_, _, dist) in &hits {
+            assert!(*dist < tol.distance(), "Hit distance {dist} exceeds tol");
+        }
     }
 
     // =============================================
