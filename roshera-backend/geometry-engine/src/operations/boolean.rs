@@ -3655,8 +3655,12 @@ fn compute_edge_intersections(
     // Collect edge IDs to iterate (avoid borrow issues)
     let edge_ids: Vec<EdgeId> = graph.edges.keys().copied().collect();
 
-    // Find intersections between all edge pairs that share no vertex
-    let mut new_intersections: Vec<(EdgeId, EdgeId, Point3, f64, f64)> = Vec::new();
+    // Find intersections between all edge pairs that share no vertex.
+    // The trailing `f64` is the geometric residual from
+    // `find_curve_curve_closest_point` — used to stamp the new
+    // intersection vertex with a representative tolerance (Parasolid
+    // tolerant-modeling: vertex tolerance ≥ true geometric uncertainty).
+    let mut new_intersections: Vec<(EdgeId, EdgeId, Point3, f64, f64, f64)> = Vec::new();
 
     for i in 0..edge_ids.len() {
         for j in (i + 1)..edge_ids.len() {
@@ -3704,7 +3708,7 @@ fn compute_edge_intersections(
 
             if dist < tolerance.distance() {
                 let point = curve_a.point_at(t_a)?;
-                new_intersections.push((eid_a, eid_b, point, t_a, t_b));
+                new_intersections.push((eid_a, eid_b, point, t_a, t_b, dist));
             }
         }
     }
@@ -3718,9 +3722,13 @@ fn compute_edge_intersections(
     }
     let mut split_ops: Vec<SplitOp> = Vec::new();
 
-    for (eid_a, eid_b, point, t_a, t_b) in &new_intersections {
-        // Create a real vertex in the model
-        let vid = find_or_create_intersection_vertex(model, graph, *point, tolerance);
+    for (eid_a, eid_b, point, t_a, t_b, dist) in &new_intersections {
+        // Create a real vertex in the model. `dist` is propagated as the
+        // geometric residual so the new vertex is stamped with a tolerance
+        // of at least max(global_tol, dist) — this is what lets the
+        // tolerant-modeling merge predicate downstream see the same
+        // uncertainty radius the intersection finder did.
+        let vid = find_or_create_intersection_vertex(model, graph, *point, tolerance, *dist);
 
         // Record intersection points as split ops on each edge.
         if graph.edges.contains_key(eid_a) {
@@ -3802,26 +3810,35 @@ fn compute_edge_intersections(
             // Tolerant-modeling rule (Parasolid/ACIS imprint semantics):
             // merge the new split vertex with an existing endpoint iff its
             // 3D position lies inside the endpoint's tolerance sphere.
-            // Otherwise force the split — a sliver sub-edge whose length is
-            // well above tolerance is a legitimate T-junction.
+            // The radius is max(global_tol, split_vertex.tolerance,
+            // endpoint_vertex.tolerance) — Parasolid PK_VERTEX semantics —
+            // so a sliver sub-edge whose length is well above tolerance
+            // still produces a real T-junction, while a vertex previously
+            // stamped with a wider tolerance from an upstream sliver hit
+            // continues to absorb it.
             let split_pos = match model.vertices.get_position(*split_vid) {
                 Some(p) => p,
                 None => continue,
             };
-            let tol_sq = tolerance.distance() * tolerance.distance();
+            let global_tol = tolerance.distance();
+            let split_tol = model
+                .vertices
+                .get_tolerance(*split_vid)
+                .unwrap_or(global_tol);
             let coincident = |vid: VertexId| -> bool {
                 if vid == 0 || vid == u32::MAX {
                     return false;
                 }
-                match model.vertices.get_position(vid) {
-                    Some(pos) => {
-                        let dx = pos[0] - split_pos[0];
-                        let dy = pos[1] - split_pos[1];
-                        let dz = pos[2] - split_pos[2];
-                        dx * dx + dy * dy + dz * dz < tol_sq
-                    }
-                    None => false,
-                }
+                let pos = match model.vertices.get_position(vid) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let v_tol = model.vertices.get_tolerance(vid).unwrap_or(global_tol);
+                let merge_radius = global_tol.max(v_tol).max(split_tol);
+                let dx = pos[0] - split_pos[0];
+                let dy = pos[1] - split_pos[1];
+                let dz = pos[2] - split_pos[2];
+                dx * dx + dy * dy + dz * dz < merge_radius * merge_radius
             };
             if coincident(remaining_edge.start_vertex)
                 || coincident(remaining_edge.end_vertex)
@@ -3981,26 +3998,44 @@ fn find_or_create_intersection_vertex(
     graph: &IntersectionGraph,
     point: Point3,
     tolerance: &Tolerance,
+    geometric_residual: f64,
 ) -> VertexId {
-    // Check existing graph nodes for a nearby vertex already in the model
-    let tol_sq = tolerance.distance() * tolerance.distance();
+    // Per-vertex tolerance merge predicate (Parasolid PK_VERTEX_ask_tolerance
+    // semantics): the merge radius for any candidate is the max of (global
+    // modelling tolerance, candidate's stored vertex tolerance, this
+    // intersection's geometric residual). A vertex previously stamped with
+    // a wider tolerance because of an upstream sliver intersection still
+    // absorbs nearby new hits without re-introducing duplicates; a tight
+    // global tolerance never narrows an already-loose vertex.
+    let global_tol = tolerance.distance();
+    let residual = geometric_residual.max(0.0);
     for &vid in graph.nodes.keys() {
         if vid == 0 || vid == u32::MAX {
             continue;
         }
         if let Some(pos) = model.vertices.get_position(vid) {
+            let v_tol = model.vertices.get_tolerance(vid).unwrap_or(global_tol);
+            let merge_radius = global_tol.max(v_tol).max(residual);
             let dx = pos[0] - point.x;
             let dy = pos[1] - point.y;
             let dz = pos[2] - point.z;
-            if dx * dx + dy * dy + dz * dz < tol_sq {
+            if dx * dx + dy * dy + dz * dz < merge_radius * merge_radius {
                 return vid;
             }
         }
     }
-    // Create a real vertex in the model
-    model
+    // Create a real vertex in the model and stamp its tolerance with the
+    // larger of (global, geometric_residual). The stamp persists so
+    // downstream tolerant-modelling predicates can see the true geometric
+    // uncertainty of this intersection, not just the global default.
+    let vid = model
         .vertices
-        .add_or_find(point.x, point.y, point.z, tolerance.distance())
+        .add_or_find(point.x, point.y, point.z, global_tol);
+    let stamp = global_tol.max(residual);
+    if stamp > model.vertices.get_tolerance(vid).unwrap_or(global_tol) {
+        model.vertices.set_tolerance(vid, stamp);
+    }
+    vid
 }
 
 /// Create split face from edges. `origin_solid` is stamped directly on the
@@ -6585,4 +6620,90 @@ mod tests {
         }
     }
 
+    /// Per-vertex tolerance: a graph node already stamped with a wider
+    /// tolerance must absorb a new intersection point that lies inside
+    /// its tolerance sphere, even when that point is well outside the
+    /// global Tolerance::default() radius.
+    #[test]
+    fn intersection_vertex_respects_per_vertex_tolerance() {
+        use crate::math::Point3;
+        let mut model = BRepModel::new();
+
+        // Reserve vertex id 0; the boolean pipeline reserves it as an
+        // "unresolved" sentinel and `find_or_create_intersection_vertex`
+        // skips it when scanning graph nodes for merge candidates.
+        let _sentinel = model.vertices.add_or_find(0.0, 0.0, -100.0, 1e-9);
+
+        // Seed an existing vertex and stamp it with a wide tolerance.
+        let existing = model.vertices.add_or_find(0.0, 0.0, 0.0, 1e-9);
+        assert_ne!(existing, 0, "test setup: seeded vertex must not be id 0");
+        let widened = 1e-3;
+        assert!(model.vertices.set_tolerance(existing, widened));
+
+        // Build a graph node referencing that vertex so the intersection
+        // helper considers it as a merge candidate.
+        let mut graph = IntersectionGraph::new();
+        graph.nodes.insert(
+            existing,
+            GraphNode {
+                incident_edges: HashSet::new(),
+            },
+        );
+
+        // A new intersection 2e-4 away from the seed: outside the global
+        // default tolerance (1e-9) but well inside the widened sphere
+        // (1e-3). Must merge with the existing vertex, not duplicate.
+        let probe = Point3::new(2.0e-4, 0.0, 0.0);
+        let tol = Tolerance::default();
+        let merged = find_or_create_intersection_vertex(
+            &mut model, &graph, probe, &tol, 0.0,
+        );
+        assert_eq!(
+            merged, existing,
+            "per-vertex tolerance sphere must absorb hits inside it"
+        );
+
+        // A new intersection 5e-3 away — outside even the widened
+        // sphere — must create a fresh vertex.
+        let far = Point3::new(5.0e-3, 0.0, 0.0);
+        let fresh = find_or_create_intersection_vertex(
+            &mut model, &graph, far, &tol, 0.0,
+        );
+        assert_ne!(
+            fresh, existing,
+            "hits outside every tolerance sphere must create a new vertex"
+        );
+    }
+
+    /// Stamping behaviour: a new intersection vertex created with a
+    /// non-trivial geometric residual must persist that residual as its
+    /// per-vertex tolerance, so subsequent merge predicates see the
+    /// uncertainty radius the intersection finder reported.
+    #[test]
+    fn new_intersection_vertex_stamps_geometric_residual() {
+        use crate::math::Point3;
+        let mut model = BRepModel::new();
+        // Reserve vertex id 0 (sentinel — see test above).
+        let _sentinel = model.vertices.add_or_find(0.0, 0.0, -100.0, 1e-9);
+        let graph = IntersectionGraph::new();
+
+        let tol = Tolerance::default();
+        let residual = 7.5e-5;
+        let probe = Point3::new(1.0, 2.0, 3.0);
+
+        let vid = find_or_create_intersection_vertex(
+            &mut model, &graph, probe, &tol, residual,
+        );
+
+        let stamped = model
+            .vertices
+            .get_tolerance(vid)
+            .expect("new vertex must have a tolerance");
+        assert!(
+            stamped >= residual,
+            "vertex tolerance {} must be >= geometric residual {}",
+            stamped,
+            residual
+        );
+    }
 }
