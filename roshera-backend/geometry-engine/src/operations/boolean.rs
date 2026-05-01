@@ -2592,14 +2592,14 @@ pub(super) enum EdgeType {
 }
 
 impl IntersectionGraph {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             nodes: HashMap::new(),
             edges: HashMap::new(),
         }
     }
 
-    fn add_edge(&mut self, edge_id: EdgeId, edge_type: EdgeType) {
+    pub(super) fn add_edge(&mut self, edge_id: EdgeId, edge_type: EdgeType) {
         // Insert with deferred vertex IDs — they're filled in by
         // `resolve_vertices` once the BRepModel is available. `u32::MAX`
         // is the canonical "unresolved" sentinel because vertex ID 0 is
@@ -2615,7 +2615,7 @@ impl IntersectionGraph {
         self.edges.insert(edge_id, graph_edge);
     }
 
-    fn resolve_vertices(&mut self, model: &BRepModel) {
+    pub(super) fn resolve_vertices(&mut self, model: &BRepModel) {
         for (_, graph_edge) in self.edges.iter_mut() {
             if let Some(edge) = model.edges.get(graph_edge.edge_id) {
                 graph_edge.start_vertex = edge.start_vertex;
@@ -2645,7 +2645,7 @@ impl IntersectionGraph {
 /// shorter than its `edges` vector (legacy data), missing entries default
 /// to `true` to match the historical behavior of the code that hard-coded
 /// `forward=true` at loop reconstruction.
-fn get_face_boundary_edges(
+pub(super) fn get_face_boundary_edges(
     model: &BRepModel,
     face_id: FaceId,
 ) -> OperationResult<Vec<(EdgeId, bool)>> {
@@ -3602,7 +3602,10 @@ fn apply_circle_clip_to_faces(
 }
 
 /// Create edge from curve
-fn create_edge_from_curve(model: &mut BRepModel, curve_id: CurveId) -> OperationResult<EdgeId> {
+pub(super) fn create_edge_from_curve(
+    model: &mut BRepModel,
+    curve_id: CurveId,
+) -> OperationResult<EdgeId> {
     let curve = model
         .curves
         .get(curve_id)
@@ -3644,7 +3647,7 @@ fn create_edge_from_curve(model: &mut BRepModel, curve_id: CurveId) -> Operation
 /// find intersection points using 3D closest-point computation on curves.
 /// Real vertices are created in the model at intersection points, and edges
 /// are split into sub-edges so that loop tracing has proper vertex connectivity.
-fn compute_edge_intersections(
+pub(super) fn compute_edge_intersections(
     graph: &mut IntersectionGraph,
     model: &mut BRepModel,
     tolerance: &Tolerance,
