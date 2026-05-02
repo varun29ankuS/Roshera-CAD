@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import * as THREE from 'three'
-import { useSceneStore } from '@/stores/scene-store'
+import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { resolveCssVar } from '@/lib/css-color'
 
@@ -8,26 +8,27 @@ import { resolveCssVar } from '@/lib/css-color'
  * Renders visual feedback for sub-element selections (face / edge / vertex).
  *
  * The CADMesh click handler stores a `SubElementSelection { objectId, type,
- * index }` where `index` is the THREE.js triangle index produced by the
- * raycast. We resolve that to the three corner positions in world space and
- * paint:
- *   - face   → a filled triangle overlay (slightly inflated along its
- *              normal to win the depth test)
- *   - edge   → the three line segments of the triangle (closest one to the
- *              click is the "edge" — without backend topology resolution we
- *              currently render all three so the user has something to see)
- *   - vertex → a small sphere at each corner
+ * index }`. For `face` selections, `index` is the kernel `FaceId` (resolved
+ * via the per-triangle `mesh.faceIds` map shipped on every broadcast). For
+ * `edge` and `vertex` it is still the raw Three.js triangle index — the
+ * kernel doesn't yet ship per-triangle edge/vertex maps, so the backend
+ * resolves those from the picked point.
  *
- * NOTE: This is a frontend-only heuristic — `index` is a triangle index, not
- * a B-Rep face id. Proper face/edge highlighting (covering all triangles
- * that belong to the same B-Rep face) requires the backend SubElementPick
- * handler to return the topology id and the triangle range. Tracked as
- * task #121 (extrude wiring) since it's the same data dependency.
+ * Face overlay strategy: collect every triangle whose `faceIds[t]` matches
+ * the selected face id and render them as a single merged BufferGeometry,
+ * inflated slightly along each triangle's normal to win the depth test.
+ * If the mesh has no `faceIds` map (legacy frame), fall back to drawing
+ * just the single triangle the user clicked.
+ *
+ * Edge / vertex paths still draw the three corners of the picked triangle —
+ * a real backend topology lookup is what unlocks proper edge/vertex
+ * highlighting and is handled by `SubElementResult` from the server.
  */
 export function SubElementHighlight() {
   const subElementSelections = useSceneStore((s) => s.subElementSelections)
   const hoveredSubElement = useSceneStore((s) => s.hoveredSubElement)
   const meshRefs = useSceneStore((s) => s.meshRefs)
+  const objects = useSceneStore((s) => s.objects)
   const theme = useThemeStore((s) => s.theme)
 
   const palette = useMemo(() => {
@@ -42,15 +43,20 @@ export function SubElementHighlight() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme])
 
-  // Resolve every selection to its three world-space corner positions.
+  // Resolve every selection to its world-space corner positions. Face
+  // selections may fan out to many triangles (every triangle whose
+  // `faceIds[t]` matches the selected face id). Edge / vertex
+  // selections always resolve to a single triangle.
   const resolved = useMemo(() => {
     const out: Array<{
       key: string
       type: 'face' | 'edge' | 'vertex'
-      a: THREE.Vector3
-      b: THREE.Vector3
-      c: THREE.Vector3
-      normal: THREE.Vector3
+      triangles: Array<{
+        a: THREE.Vector3
+        b: THREE.Vector3
+        c: THREE.Vector3
+        normal: THREE.Vector3
+      }>
       hover: boolean
     }> = []
 
@@ -79,58 +85,87 @@ export function SubElementHighlight() {
         | THREE.BufferAttribute
         | undefined
       if (!positions) continue
-
-      const i0 = sel.index * 3
       const indexAttr = geom.getIndex()
 
-      // If the geometry is indexed (typical for our backend meshes), the
-      // triangle's three vertex positions are looked up via the index
-      // buffer. Otherwise the three positions are stored sequentially.
-      let vi0: number, vi1: number, vi2: number
-      if (indexAttr) {
-        if (i0 + 2 >= indexAttr.count) continue
-        vi0 = indexAttr.getX(i0)
-        vi1 = indexAttr.getX(i0 + 1)
-        vi2 = indexAttr.getX(i0 + 2)
+      const cadObject: CADObject | undefined = objects.get(sel.objectId)
+      const faceIds = cadObject?.mesh.faceIds
+
+      // Decide which triangle indices to render.
+      const triangleIndices: number[] = []
+      if (sel.type === 'face' && faceIds) {
+        // Fan out: every triangle in the mesh whose face id matches the
+        // selected kernel FaceId belongs to the same B-Rep face.
+        for (let t = 0; t < faceIds.length; t++) {
+          if (faceIds[t] === sel.index) {
+            triangleIndices.push(t)
+          }
+        }
+        // Defensive: if nothing matched (stale frame, mismatched face id)
+        // fall back to the single picked triangle so the click still
+        // registers visually.
+        if (triangleIndices.length === 0) {
+          triangleIndices.push(sel.index)
+        }
       } else {
-        vi0 = i0
-        vi1 = i0 + 1
-        vi2 = i0 + 2
-      }
-      if (
-        vi0 >= positions.count ||
-        vi1 >= positions.count ||
-        vi2 >= positions.count
-      ) {
-        continue
+        triangleIndices.push(sel.index)
       }
 
-      const a = new THREE.Vector3()
-        .fromBufferAttribute(positions, vi0)
-        .applyMatrix4(mesh.matrixWorld)
-      const b = new THREE.Vector3()
-        .fromBufferAttribute(positions, vi1)
-        .applyMatrix4(mesh.matrixWorld)
-      const c = new THREE.Vector3()
-        .fromBufferAttribute(positions, vi2)
-        .applyMatrix4(mesh.matrixWorld)
+      const triangles: Array<{
+        a: THREE.Vector3
+        b: THREE.Vector3
+        c: THREE.Vector3
+        normal: THREE.Vector3
+      }> = []
 
-      const ab = new THREE.Vector3().subVectors(b, a)
-      const ac = new THREE.Vector3().subVectors(c, a)
-      const normal = new THREE.Vector3().crossVectors(ab, ac).normalize()
+      for (const t of triangleIndices) {
+        const i0 = t * 3
+        let vi0: number, vi1: number, vi2: number
+        if (indexAttr) {
+          if (i0 + 2 >= indexAttr.count) continue
+          vi0 = indexAttr.getX(i0)
+          vi1 = indexAttr.getX(i0 + 1)
+          vi2 = indexAttr.getX(i0 + 2)
+        } else {
+          vi0 = i0
+          vi1 = i0 + 1
+          vi2 = i0 + 2
+        }
+        if (
+          vi0 >= positions.count ||
+          vi1 >= positions.count ||
+          vi2 >= positions.count
+        ) {
+          continue
+        }
+
+        const a = new THREE.Vector3()
+          .fromBufferAttribute(positions, vi0)
+          .applyMatrix4(mesh.matrixWorld)
+        const b = new THREE.Vector3()
+          .fromBufferAttribute(positions, vi1)
+          .applyMatrix4(mesh.matrixWorld)
+        const c = new THREE.Vector3()
+          .fromBufferAttribute(positions, vi2)
+          .applyMatrix4(mesh.matrixWorld)
+
+        const ab = new THREE.Vector3().subVectors(b, a)
+        const ac = new THREE.Vector3().subVectors(c, a)
+        const normal = new THREE.Vector3().crossVectors(ab, ac).normalize()
+
+        triangles.push({ a, b, c, normal })
+      }
+
+      if (triangles.length === 0) continue
 
       out.push({
         key: `${hover ? 'hover' : 'sel'}:${sel.objectId}:${sel.type}:${sel.index}`,
         type: sel.type,
-        a,
-        b,
-        c,
-        normal,
+        triangles,
         hover,
       })
     }
     return out
-  }, [subElementSelections, hoveredSubElement, meshRefs])
+  }, [subElementSelections, hoveredSubElement, meshRefs, objects])
 
   if (resolved.length === 0) return null
 
@@ -140,10 +175,7 @@ export function SubElementHighlight() {
         <SelectionMark
           key={r.key}
           type={r.type}
-          a={r.a}
-          b={r.b}
-          c={r.c}
-          normal={r.normal}
+          triangles={r.triangles}
           colors={palette}
           hover={r.hover}
         />
@@ -152,76 +184,132 @@ export function SubElementHighlight() {
   )
 }
 
-interface SelectionMarkProps {
-  type: 'face' | 'edge' | 'vertex'
+interface Triangle {
   a: THREE.Vector3
   b: THREE.Vector3
   c: THREE.Vector3
   normal: THREE.Vector3
+}
+
+interface SelectionMarkProps {
+  type: 'face' | 'edge' | 'vertex'
+  triangles: Triangle[]
   colors: { face: string; edge: string; vertex: string }
   hover: boolean
 }
 
-function SelectionMark({ type, a, b, c, normal, colors, hover }: SelectionMarkProps) {
-  // Inflate the triangle slightly along its normal so the overlay wins the
-  // depth test against the underlying mesh without z-fighting.
-  const offset = 0.002
-  const ao = a.clone().addScaledVector(normal, offset)
-  const bo = b.clone().addScaledVector(normal, offset)
-  const co = c.clone().addScaledVector(normal, offset)
+const OFFSET = 0.002
 
-  const opacity = hover ? 0.2 : 0.45
+function inflate(p: THREE.Vector3, normal: THREE.Vector3): THREE.Vector3 {
+  return p.clone().addScaledVector(normal, OFFSET)
+}
 
+function SelectionMark({ type, triangles, colors, hover }: SelectionMarkProps) {
   if (type === 'face') {
-    const geometry = new THREE.BufferGeometry()
-    const positions = new Float32Array([
-      ao.x, ao.y, ao.z,
-      bo.x, bo.y, bo.z,
-      co.x, co.y, co.z,
-    ])
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-    geometry.computeVertexNormals()
-    return (
-      <mesh geometry={geometry}>
-        <meshBasicMaterial
-          color={colors.face}
-          side={THREE.DoubleSide}
-          transparent
-          opacity={opacity}
-          depthWrite={false}
-        />
-      </mesh>
-    )
+    return <FaceMark triangles={triangles} color={colors.face} hover={hover} />
   }
-
+  // Edge / vertex always operate on the single picked triangle.
+  const tri = triangles[0]
+  const ao = inflate(tri.a, tri.normal)
+  const bo = inflate(tri.b, tri.normal)
+  const co = inflate(tri.c, tri.normal)
   if (type === 'edge') {
-    // Three line segments forming the triangle outline. Without backend
-    // topology resolution we don't yet know which of the three is the
-    // user-intended edge; outlining all three still makes "I clicked
-    // somewhere and something happened" obvious.
-    const points = [ao, bo, bo, co, co, ao]
-    const geometry = new THREE.BufferGeometry().setFromPoints(points)
-    return (
-      <lineSegments geometry={geometry}>
-        <lineBasicMaterial
-          color={colors.edge}
-          linewidth={hover ? 1 : 2}
-          depthTest={false}
-          transparent
-          opacity={hover ? 0.5 : 1}
-        />
-      </lineSegments>
-    )
+    return <EdgeMark ao={ao} bo={bo} co={co} color={colors.edge} hover={hover} />
   }
+  return <VertexMark ao={ao} bo={bo} co={co} color={colors.vertex} hover={hover} />
+}
 
-  // vertex — small spheres at each corner
+interface FaceMarkProps {
+  triangles: Triangle[]
+  color: string
+  hover: boolean
+}
+
+function FaceMark({ triangles, color, hover }: FaceMarkProps) {
+  // Merge every matching triangle into one BufferGeometry so the overlay
+  // is a single draw call regardless of tessellation density.
+  const geometry = useMemo(() => {
+    const positions = new Float32Array(triangles.length * 9)
+    for (let i = 0; i < triangles.length; i++) {
+      const { a, b, c, normal } = triangles[i]
+      const ao = inflate(a, normal)
+      const bo = inflate(b, normal)
+      const co = inflate(c, normal)
+      const off = i * 9
+      positions[off + 0] = ao.x
+      positions[off + 1] = ao.y
+      positions[off + 2] = ao.z
+      positions[off + 3] = bo.x
+      positions[off + 4] = bo.y
+      positions[off + 5] = bo.z
+      positions[off + 6] = co.x
+      positions[off + 7] = co.y
+      positions[off + 8] = co.z
+    }
+    const geom = new THREE.BufferGeometry()
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geom.computeVertexNormals()
+    return geom
+  }, [triangles])
+
+  return (
+    <mesh geometry={geometry}>
+      <meshBasicMaterial
+        color={color}
+        side={THREE.DoubleSide}
+        transparent
+        opacity={hover ? 0.2 : 0.45}
+        depthWrite={false}
+      />
+    </mesh>
+  )
+}
+
+interface EdgeMarkProps {
+  ao: THREE.Vector3
+  bo: THREE.Vector3
+  co: THREE.Vector3
+  color: string
+  hover: boolean
+}
+
+function EdgeMark({ ao, bo, co, color, hover }: EdgeMarkProps) {
+  // Three line segments forming the triangle outline. Without backend
+  // topology resolution we don't yet know which of the three is the
+  // user-intended edge; outlining all three still makes "I clicked
+  // somewhere and something happened" obvious.
+  const geometry = useMemo(() => {
+    return new THREE.BufferGeometry().setFromPoints([ao, bo, bo, co, co, ao])
+  }, [ao, bo, co])
+  return (
+    <lineSegments geometry={geometry}>
+      <lineBasicMaterial
+        color={color}
+        linewidth={hover ? 1 : 2}
+        depthTest={false}
+        transparent
+        opacity={hover ? 0.5 : 1}
+      />
+    </lineSegments>
+  )
+}
+
+interface VertexMarkProps {
+  ao: THREE.Vector3
+  bo: THREE.Vector3
+  co: THREE.Vector3
+  color: string
+  hover: boolean
+}
+
+function VertexMark({ ao, bo, co, color, hover }: VertexMarkProps) {
   return (
     <group>
       {[ao, bo, co].map((p, i) => (
         <mesh key={i} position={p}>
           <sphereGeometry args={[hover ? 0.1 : 0.15, 8, 8]} />
           <meshBasicMaterial
-            color={colors.vertex}
+            color={color}
             depthTest={false}
             transparent
             opacity={hover ? 0.5 : 1}
