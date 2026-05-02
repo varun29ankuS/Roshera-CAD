@@ -68,6 +68,7 @@ export function SketchPanel() {
   const clearSketchPoints = useSceneStore((s) => s.clearSketchPoints)
   const exitSketch = useSceneStore((s) => s.exitSketch)
   const setSketchView = useSceneStore((s) => s.setSketchView)
+  const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
 
   const [busy, setBusy] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -148,6 +149,12 @@ export function SketchPanel() {
       } else if (e.key === 'Backspace' || e.key === 'Delete') {
         e.preventDefault()
         popSketchPoint()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        // Ctrl+Z (Cmd+Z on macOS) inside sketch mode pops the last
+        // confirmed point. Same effect as Backspace, mapped to the
+        // standard undo gesture.
+        e.preventDefault()
+        popSketchPoint()
       } else if (e.key === '1') {
         setSketchTool('polyline')
       } else if (e.key === '2') {
@@ -161,14 +168,23 @@ export function SketchPanel() {
   }, [sketch.active, exitSketch, popSketchPoint, setSketchTool, handleFinish])
 
   // Live measurements summary for the bottom of the panel.
+  // Important: compute these from the *materialised* profile (rectangle
+  // has 4 corners, circle has N edge samples) — using the raw click
+  // points would give nonsense for rectangle/circle since the user
+  // only ever places 2 anchor points for those.
   const summary = useMemo(() => {
-    const pts = sketch.points
-    if (pts.length < 2) return null
-    const closed = pts.length >= 3
-    const peri = perimeter(pts, closed)
-    const area = closed ? Math.abs(signedArea(pts)) : 0
-    return { count: pts.length, perimeter: peri, area, closed }
-  }, [sketch.points])
+    if (sketch.points.length < 2) return null
+    const profile = buildProfile2D(
+      sketch.tool,
+      sketch.points,
+      sketch.circleSegments,
+    )
+    if (!profile) return null
+    const closed = profile.length >= 3
+    const peri = perimeter(profile, closed)
+    const area = closed ? Math.abs(signedArea(profile)) : 0
+    return { count: profile.length, perimeter: peri, area, closed }
+  }, [sketch.tool, sketch.points, sketch.circleSegments])
 
   if (!sketch.active) return null
 
@@ -284,6 +300,15 @@ export function SketchPanel() {
         </div>
       </div>
 
+      {/* Per-tool dimension inputs — type exact lengths instead of
+          (or in addition to) clicking. Visible once enough points
+          exist for the dimensions to be meaningful. */}
+      <DimensionInputs
+        tool={sketch.tool}
+        points={sketch.points}
+        setSketchPoint={setSketchPoint}
+      />
+
       {/* Action row */}
       <div className="flex items-center gap-2">
         <button
@@ -379,5 +404,133 @@ function NumberField({ label, value, onChange, min, step }: NumberFieldProps) {
         className="w-16 px-1.5 py-0.5 bg-background/40 border border-border/40 text-foreground text-[10px] font-mono focus:outline-none focus:border-border"
       />
     </label>
+  )
+}
+
+// ─── Per-tool dimension entry ────────────────────────────────────────
+
+interface DimensionInputsProps {
+  tool: SketchTool
+  points: Array<[number, number]>
+  setSketchPoint: (index: number, point: [number, number]) => void
+}
+
+/**
+ * Lets the user type exact lengths for the current tool. The inputs
+ * mutate the existing sketch points in place so the live preview +
+ * dimension labels update immediately:
+ *   - Rectangle: width / height drive points[1] relative to points[0]
+ *   - Circle:    radius drives points[1] along the existing direction
+ *                from points[0] (or +u when no direction yet)
+ *   - Polyline:  per-segment length list; editing length L of segment
+ *                {i, i+1} moves points[i+1] along the segment's unit
+ *                direction so the magnitude is exactly L.
+ *
+ * Returns `null` until there is enough confirmed input for the entry
+ * to be meaningful (avoids showing controls that have nothing to bind).
+ */
+function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps) {
+  if (tool === 'rectangle') {
+    if (points.length < 1) return null
+    const [a] = points
+    const b = points[1] ?? a
+    const width = b[0] - a[0]
+    const height = b[1] - a[1]
+    const setWidth = (w: number) => {
+      if (!Number.isFinite(w)) return
+      // Preserve sign of the existing offset so the corner stays on
+      // the same side of `a`; if the user hasn't moved off `a` yet,
+      // assume positive.
+      const sign = width === 0 ? 1 : Math.sign(width)
+      const target: [number, number] = [a[0] + sign * Math.abs(w), b[1]]
+      if (points.length < 2) {
+        // Promote the hover-only second corner into a confirmed point.
+        useSceneStore.getState().addSketchPoint(target)
+      } else {
+        setSketchPoint(1, target)
+      }
+    }
+    const setHeight = (h: number) => {
+      if (!Number.isFinite(h)) return
+      const sign = height === 0 ? 1 : Math.sign(height)
+      const target: [number, number] = [b[0], a[1] + sign * Math.abs(h)]
+      if (points.length < 2) {
+        useSceneStore.getState().addSketchPoint(target)
+      } else {
+        setSketchPoint(1, target)
+      }
+    }
+    return (
+      <div className="flex items-center gap-3 pt-1 border-t border-border/30">
+        <span className="text-muted-foreground text-[10px]">Dimensions</span>
+        <NumberField label="W" value={Math.abs(width)} onChange={setWidth} min={0} step={1} />
+        <NumberField label="H" value={Math.abs(height)} onChange={setHeight} min={0} step={1} />
+      </div>
+    )
+  }
+
+  if (tool === 'circle') {
+    if (points.length < 1) return null
+    const [c] = points
+    const e = points[1] ?? [c[0] + 1, c[1]]
+    const dx = e[0] - c[0]
+    const dy = e[1] - c[1]
+    const r = Math.hypot(dx, dy)
+    const setRadius = (newR: number) => {
+      if (!Number.isFinite(newR) || newR <= 0) return
+      const ux = r > 1e-9 ? dx / r : 1
+      const uy = r > 1e-9 ? dy / r : 0
+      const target: [number, number] = [c[0] + ux * newR, c[1] + uy * newR]
+      if (points.length < 2) {
+        useSceneStore.getState().addSketchPoint(target)
+      } else {
+        setSketchPoint(1, target)
+      }
+    }
+    return (
+      <div className="flex items-center gap-3 pt-1 border-t border-border/30">
+        <span className="text-muted-foreground text-[10px]">Dimensions</span>
+        <NumberField label="R" value={r} onChange={setRadius} min={0.001} step={0.5} />
+        <span className="text-muted-foreground/60 text-[10px] font-mono">
+          Ø {(r * 2).toFixed(2)}
+        </span>
+      </div>
+    )
+  }
+
+  // Polyline — list each segment as an editable length.
+  if (points.length < 2) return null
+  const segments = points.slice(0, -1).map((p, i) => {
+    const q = points[i + 1]
+    return { i, length: Math.hypot(q[0] - p[0], q[1] - p[1]) }
+  })
+  const setSegmentLength = (i: number, newLen: number) => {
+    if (!Number.isFinite(newLen) || newLen <= 0) return
+    const p = points[i]
+    const q = points[i + 1]
+    const dx = q[0] - p[0]
+    const dy = q[1] - p[1]
+    const cur = Math.hypot(dx, dy)
+    if (cur < 1e-9) return
+    const ux = dx / cur
+    const uy = dy / cur
+    setSketchPoint(i + 1, [p[0] + ux * newLen, p[1] + uy * newLen])
+  }
+  return (
+    <div className="flex items-start gap-3 pt-1 border-t border-border/30">
+      <span className="text-muted-foreground text-[10px] mt-1">Segments</span>
+      <div className="flex flex-wrap items-center gap-2 flex-1">
+        {segments.map((s) => (
+          <NumberField
+            key={s.i}
+            label={`${s.i + 1}→${s.i + 2}`}
+            value={s.length}
+            onChange={(n) => setSegmentLength(s.i, n)}
+            min={0.001}
+            step={0.5}
+          />
+        ))}
+      </div>
+    </div>
   )
 }
