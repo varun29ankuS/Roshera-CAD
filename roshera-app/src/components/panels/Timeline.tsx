@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useCallback } from 'react'
+import { Fragment, useState, useEffect, useCallback, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
 import { cn } from '@/lib/utils'
 
@@ -200,10 +200,12 @@ function EventNode({
   event,
   isLatest,
   now,
+  onContextMenu,
 }: {
   event: EventSummary
   isLatest: boolean
   now: number // re-render anchor for relative time
+  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
 }) {
   const symbol = symbolForOperation(event.operation_type)
   const label = shortLabel(event.operation_type)
@@ -216,6 +218,7 @@ function EventNode({
 
   return (
     <div
+      onContextMenu={(e) => onContextMenu(e, event)}
       className="flex flex-col items-center px-1 cursor-default select-none group"
       title={`${event.operation_type}\n${formatAuthor(event.author)} · ${formatTimestamp(event.timestamp)} · #${event.sequence_number}`}
     >
@@ -275,12 +278,30 @@ function HeaderButton({
 
 // ─── Main strip ─────────────────────────────────────────────────────
 
+interface EventContextMenuState {
+  x: number
+  y: number
+  event: EventSummary
+}
+
 export function Timeline() {
   const previewMode = isPreviewMode()
   const [events, setEvents] = useState<EventSummary[]>(previewMode ? MOCK_EVENTS : [])
   const [loading, setLoading] = useState(false)
   const [now, setNow] = useState(() => Date.now())
+  const [menu, setMenu] = useState<EventContextMenuState | null>(null)
   const wsStatus = useWSStore((s) => s.status)
+
+  const handleEventContextMenu = useCallback(
+    (e: React.MouseEvent, event: EventSummary) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setMenu({ x: e.clientX, y: e.clientY, event })
+    },
+    [],
+  )
+
+  const closeMenu = useCallback(() => setMenu(null), [])
 
   // Tick relative-time labels every second
   useEffect(() => {
@@ -403,13 +424,119 @@ export function Timeline() {
             {events.map((event, i) => (
               <Fragment key={event.id}>
                 {i > 0 && <Connector />}
-                <EventNode event={event} isLatest={i === events.length - 1} now={now} />
+                <EventNode
+                  event={event}
+                  isLatest={i === events.length - 1}
+                  now={now}
+                  onContextMenu={handleEventContextMenu}
+                />
               </Fragment>
             ))}
             <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">→</span>
           </div>
         )}
       </div>
+
+      {menu && <EventContextMenu menu={menu} onClose={closeMenu} />}
     </div>
+  )
+}
+
+// ─── Per-event context menu (right-click → copy id / kind / json) ───
+
+function EventContextMenu({
+  menu,
+  onClose,
+}: {
+  menu: EventContextMenuState
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const onMouseDown = (e: MouseEvent) => {
+      const el = ref.current
+      if (el && e.target instanceof Node && el.contains(e.target)) return
+      onClose()
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [onClose])
+
+  const copy = useCallback(
+    async (text: string) => {
+      try {
+        await navigator.clipboard.writeText(text)
+      } catch (err) {
+        console.error('[timeline] clipboard write failed:', err)
+      } finally {
+        onClose()
+      }
+    },
+    [onClose],
+  )
+
+  // The event details that go to the clipboard for "Copy JSON" — prefer
+  // the full structured operation when the backend ships it, fall back
+  // to the slim summary so the action always produces something useful.
+  const fullJson = JSON.stringify(
+    {
+      id: menu.event.id,
+      sequence_number: menu.event.sequence_number,
+      timestamp: menu.event.timestamp,
+      operation_type: menu.event.operation_type,
+      author: menu.event.author,
+      author_kind: menu.event.author_kind,
+      operation: menu.event.operation,
+    },
+    null,
+    2,
+  )
+
+  const kind = normalizeKind(menu.event.operation_type)
+
+  return (
+    <div
+      ref={ref}
+      className="fixed z-50 cad-panel min-w-[180px] py-1 text-[12px] shadow-lg select-none"
+      style={{ left: menu.x, top: menu.y }}
+      role="menu"
+    >
+      <TimelineMenuItem onClick={() => copy(menu.event.id)}>
+        <span className="text-muted-foreground">id ·</span> {menu.event.id.slice(0, 8)}…
+      </TimelineMenuItem>
+      <TimelineMenuItem onClick={() => copy(kind)}>
+        <span className="text-muted-foreground">kind ·</span> {kind}
+      </TimelineMenuItem>
+      <TimelineMenuItem onClick={() => copy(fullJson)}>
+        <span className="text-muted-foreground">json ·</span> full event
+      </TimelineMenuItem>
+    </div>
+  )
+}
+
+function TimelineMenuItem({
+  children,
+  onClick,
+}: {
+  children: React.ReactNode
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className="w-full text-left px-3 py-1.5 hover:bg-accent/40 transition-colors text-foreground/90"
+    >
+      {children}
+    </button>
   )
 }
