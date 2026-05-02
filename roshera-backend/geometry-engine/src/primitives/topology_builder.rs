@@ -15,7 +15,7 @@ use crate::primitives::{
     edge::{Edge, EdgeId, EdgeOrientation, EdgeStore},
     face::{Face, FaceId, FaceOrientation, FaceStore},
     primitive_traits::PrimitiveError,
-    r#loop::{Loop, LoopStore, LoopType},
+    r#loop::{Loop, LoopId, LoopStore, LoopType},
     shell::{Shell, ShellId, ShellStore, ShellType},
     solid::{Solid, SolidId, SolidStore},
     surface::{Cylinder, Plane, Sphere, SurfaceStore},
@@ -693,6 +693,191 @@ impl BRepModel {
 
         Some(area)
     }
+
+    /// Cascading delete of a vertex.
+    ///
+    /// Removes every edge that uses the vertex, then every loop that uses one
+    /// of those edges, then every face whose outer or inner loop is removed,
+    /// and finally drops the face from each shell that referenced it. The
+    /// vertex itself is removed last.
+    ///
+    /// Linear scans are used to find dependents because the per-store
+    /// reverse-index (`vertex_to_edges`, `edge_to_loops`, `loop_to_faces`,
+    /// `face_to_shells`) is only maintained on the slow `add_with_indexing`
+    /// path; the fast `add` path skips it, so the cached lookup is unreliable
+    /// in the general case. Cascade delete is not on the hot creation path —
+    /// linear is correct and predictable.
+    ///
+    /// On success the operation is recorded via [`record_operation`] with the
+    /// full set of removed entity ids in the parameters. A vertex that is
+    /// already absent yields an empty [`CascadeReport`] and no record.
+    pub fn delete_vertex_cascade(&mut self, vertex_id: VertexId) -> CascadeReport {
+        let mut report = CascadeReport::default();
+
+        let dependent_edges: Vec<EdgeId> = self
+            .edges
+            .iter()
+            .filter_map(|(eid, e)| {
+                (e.start_vertex == vertex_id || e.end_vertex == vertex_id).then_some(eid)
+            })
+            .collect();
+        for eid in dependent_edges {
+            self.cascade_delete_edge(eid, &mut report);
+        }
+
+        if self.vertices.remove(vertex_id) {
+            report.removed_vertices.push(vertex_id);
+            self.record_cascade("delete_vertex_cascade", vertex_id as u64, &report);
+        }
+        report
+    }
+
+    /// Cascading delete of an edge — removes dependent loops, faces, and
+    /// shell face-references before dropping the edge.
+    pub fn delete_edge_cascade(&mut self, edge_id: EdgeId) -> CascadeReport {
+        let mut report = CascadeReport::default();
+        let removed = self.cascade_delete_edge(edge_id, &mut report);
+        if removed {
+            self.record_cascade("delete_edge_cascade", edge_id as u64, &report);
+        }
+        report
+    }
+
+    /// Cascading delete of a face — removes the face from every referencing
+    /// shell, then drops the face. Loops are not deleted: they may be shared
+    /// with other faces. Use [`delete_loop_cascade`] explicitly if you also
+    /// want the bounding loop torn down.
+    pub fn delete_face_cascade(&mut self, face_id: FaceId) -> CascadeReport {
+        let mut report = CascadeReport::default();
+        let removed = self.cascade_delete_face(face_id, &mut report);
+        if removed {
+            self.record_cascade("delete_face_cascade", face_id as u64, &report);
+        }
+        report
+    }
+
+    /// Cascading delete of a loop — removes faces that bound on the loop
+    /// (and their shell references), then drops the loop. Edges are not
+    /// deleted: they may be shared with other loops.
+    pub fn delete_loop_cascade(&mut self, loop_id: LoopId) -> CascadeReport {
+        let mut report = CascadeReport::default();
+        let removed = self.cascade_delete_loop(loop_id, &mut report);
+        if removed {
+            self.record_cascade("delete_loop_cascade", loop_id as u64, &report);
+        }
+        report
+    }
+
+    fn cascade_delete_edge(&mut self, edge_id: EdgeId, report: &mut CascadeReport) -> bool {
+        if report.removed_edges.contains(&edge_id) {
+            return false;
+        }
+
+        let dependent_loops: Vec<LoopId> = self
+            .loops
+            .iter()
+            .filter_map(|(lid, l)| l.edges.contains(&edge_id).then_some(lid))
+            .collect();
+        for lid in dependent_loops {
+            self.cascade_delete_loop(lid, report);
+        }
+
+        if self.edges.remove(edge_id).is_some() {
+            report.removed_edges.push(edge_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cascade_delete_loop(&mut self, loop_id: LoopId, report: &mut CascadeReport) -> bool {
+        if report.removed_loops.contains(&loop_id) {
+            return false;
+        }
+
+        let dependent_faces: Vec<FaceId> = self
+            .faces
+            .iter()
+            .filter_map(|(fid, f)| {
+                (f.outer_loop == loop_id || f.inner_loops.contains(&loop_id)).then_some(fid)
+            })
+            .collect();
+        for fid in dependent_faces {
+            self.cascade_delete_face(fid, report);
+        }
+
+        if self.loops.remove(loop_id).is_some() {
+            report.removed_loops.push(loop_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cascade_delete_face(&mut self, face_id: FaceId, report: &mut CascadeReport) -> bool {
+        if report.removed_faces.contains(&face_id) {
+            return false;
+        }
+
+        let referencing_shells: Vec<ShellId> = self
+            .shells
+            .iter()
+            .filter_map(|(sid, s)| s.find_face(face_id).map(|_| sid))
+            .collect();
+        for sid in referencing_shells {
+            if let Some(shell) = self.shells.get_mut(sid) {
+                shell.remove_face(face_id);
+            }
+            if !report.affected_shells.contains(&sid) {
+                report.affected_shells.push(sid);
+            }
+        }
+
+        if self.faces.remove(face_id).is_some() {
+            report.removed_faces.push(face_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_cascade(&self, kind: &str, root_id: u64, report: &CascadeReport) {
+        use crate::operations::recorder::RecordedOperation;
+        let outputs: Vec<u64> = report
+            .removed_vertices
+            .iter()
+            .map(|id| *id as u64)
+            .chain(report.removed_edges.iter().map(|id| *id as u64))
+            .chain(report.removed_loops.iter().map(|id| *id as u64))
+            .chain(report.removed_faces.iter().map(|id| *id as u64))
+            .collect();
+        self.record_operation(
+            RecordedOperation::new(kind)
+                .with_inputs(vec![root_id])
+                .with_outputs(outputs)
+                .with_parameters(serde_json::json!({
+                    "removed_vertices": report.removed_vertices,
+                    "removed_edges": report.removed_edges,
+                    "removed_loops": report.removed_loops,
+                    "removed_faces": report.removed_faces,
+                    "affected_shells": report.affected_shells,
+                })),
+        );
+    }
+}
+
+/// Report returned by the cascading-delete entry points on [`BRepModel`].
+///
+/// Each `removed_*` list contains the entity ids that were marked deleted
+/// (in topological discovery order). `affected_shells` lists the shells that
+/// had at least one face reference removed but whose own ids remain valid.
+#[derive(Debug, Clone, Default)]
+pub struct CascadeReport {
+    pub removed_vertices: Vec<VertexId>,
+    pub removed_edges: Vec<EdgeId>,
+    pub removed_loops: Vec<LoopId>,
+    pub removed_faces: Vec<FaceId>,
+    pub affected_shells: Vec<ShellId>,
 }
 
 impl Default for BRepModel {
@@ -2230,6 +2415,182 @@ impl<'a> TopologyBuilder<'a> {
         }
     }
 
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::r#loop::Loop;
+    use crate::primitives::shell::Shell;
+
+    /// Build a single-face triangle on z = 0:
+    ///     v1 = (0, 0, 0)
+    ///     v2 = (1, 0, 0)
+    ///     v3 = (0.5, 1, 0)
+    /// returns (model, [v1, v2, v3], [e1_v1v2, e2_v2v3, e3_v3v1], loop_id,
+    /// face_id, shell_id).
+    fn make_triangle() -> (
+        BRepModel,
+        [VertexId; 3],
+        [EdgeId; 3],
+        LoopId,
+        FaceId,
+        ShellId,
+    ) {
+        let mut model = BRepModel::new();
+        let tol = Tolerance::default().distance();
+
+        let v1 = model.vertices.add_or_find(0.0, 0.0, 0.0, tol);
+        let v2 = model.vertices.add_or_find(1.0, 0.0, 0.0, tol);
+        let v3 = model.vertices.add_or_find(0.5, 1.0, 0.0, tol);
+
+        let c1 = model.curves.add(Box::new(Line::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        )));
+        let c2 = model.curves.add(Box::new(Line::new(
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.5, 1.0, 0.0),
+        )));
+        let c3 = model.curves.add(Box::new(Line::new(
+            Point3::new(0.5, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        )));
+
+        let e1 = model.edges.add_or_find(Edge::new(
+            0,
+            v1,
+            v2,
+            c1,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let e2 = model.edges.add_or_find(Edge::new(
+            0,
+            v2,
+            v3,
+            c2,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let e3 = model.edges.add_or_find(Edge::new(
+            0,
+            v3,
+            v1,
+            c3,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+
+        let mut face_loop = Loop::new(0, LoopType::Outer);
+        face_loop.add_edge(e1, true);
+        face_loop.add_edge(e2, true);
+        face_loop.add_edge(e3, true);
+        let loop_id = model.loops.add(face_loop);
+
+        let plane = Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X)
+            .expect("plane construction must succeed for axis-aligned XY plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+        let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        let face_id = model.faces.add(face);
+
+        let mut shell = Shell::new(0, ShellType::Open);
+        shell.add_face(face_id);
+        let shell_id = model.shells.add(shell);
+
+        (model, [v1, v2, v3], [e1, e2, e3], loop_id, face_id, shell_id)
+    }
+
+    #[test]
+    fn delete_face_cascade_drops_face_and_shell_reference() {
+        let (mut model, _v, _e, _loop_id, face_id, shell_id) = make_triangle();
+
+        let report = model.delete_face_cascade(face_id);
+
+        assert_eq!(report.removed_faces, vec![face_id]);
+        assert!(report.removed_loops.is_empty());
+        assert!(report.removed_edges.is_empty());
+        assert!(report.removed_vertices.is_empty());
+        assert_eq!(report.affected_shells, vec![shell_id]);
+
+        assert_eq!(model.faces.iter().count(), 0);
+        assert_eq!(model.loops.iter().count(), 1);
+        assert_eq!(model.edges.iter().count(), 3);
+        let live_shell = model
+            .shells
+            .get(shell_id)
+            .expect("shell still exists after face cascade");
+        assert!(live_shell.find_face(face_id).is_none());
+    }
+
+    #[test]
+    fn delete_edge_cascade_propagates_through_loop_and_face() {
+        let (mut model, _v, e, loop_id, face_id, shell_id) = make_triangle();
+
+        let report = model.delete_edge_cascade(e[1]);
+
+        assert!(report.removed_edges.contains(&e[1]));
+        assert_eq!(report.removed_loops, vec![loop_id]);
+        assert_eq!(report.removed_faces, vec![face_id]);
+        assert_eq!(report.affected_shells, vec![shell_id]);
+
+        let live_edges: Vec<_> = model.edges.iter().map(|(eid, _)| eid).collect();
+        assert!(!live_edges.contains(&e[1]));
+        assert_eq!(model.loops.iter().count(), 0);
+        assert_eq!(model.faces.iter().count(), 0);
+    }
+
+    #[test]
+    fn delete_loop_cascade_drops_face_but_preserves_edges_and_vertices() {
+        let (mut model, _v, _e, loop_id, face_id, _shell_id) = make_triangle();
+
+        let report = model.delete_loop_cascade(loop_id);
+
+        assert_eq!(report.removed_loops, vec![loop_id]);
+        assert_eq!(report.removed_faces, vec![face_id]);
+        assert!(report.removed_edges.is_empty());
+        assert!(report.removed_vertices.is_empty());
+
+        assert_eq!(model.loops.iter().count(), 0);
+        assert_eq!(model.faces.iter().count(), 0);
+        // Edges and vertices belong to no other face, but cascading does not
+        // chase ownership downward — they stay live.
+        assert_eq!(model.edges.iter().count(), 3);
+        assert_eq!(model.vertices.iter().count(), 3);
+    }
+
+    #[test]
+    fn delete_vertex_cascade_on_missing_id_is_a_noop() {
+        let mut model = BRepModel::new();
+        let report = model.delete_vertex_cascade(99);
+        assert!(report.removed_vertices.is_empty());
+        assert!(report.removed_edges.is_empty());
+        assert!(report.removed_loops.is_empty());
+        assert!(report.removed_faces.is_empty());
+        assert!(report.affected_shells.is_empty());
+    }
+
+    #[test]
+    fn delete_vertex_cascade_on_isolated_vertex_does_not_touch_topology() {
+        let (mut model, v, _e, loop_id, face_id, _shell_id) = make_triangle();
+        let tol = Tolerance::default().distance();
+        let isolated = model.vertices.add_or_find(5.0, 5.0, 5.0, tol);
+
+        let report = model.delete_vertex_cascade(isolated);
+
+        assert_eq!(report.removed_vertices, vec![isolated]);
+        assert!(report.removed_edges.is_empty());
+        assert!(report.removed_loops.is_empty());
+        assert!(report.removed_faces.is_empty());
+
+        // Original triangle survives intact.
+        assert!(model.loops.get(loop_id).is_some());
+        assert!(model.faces.get(face_id).is_some());
+        for vid in v {
+            assert!(model.vertices.get(vid).is_some());
+        }
+    }
 }
 
 // Circle and Sphere implementations are in their respective modules
