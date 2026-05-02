@@ -32,6 +32,11 @@ export const meshDataSchema = z.object({
   normals: z.array(z.number()),
   uvs: z.array(z.number()).optional(),
   colors: z.array(z.number()).optional(),
+  // Per-triangle B-Rep `FaceId` array. Length = `indices.length / 3`.
+  // Frontend uses it to map a Three.js raycast hit (which gives a
+  // triangle index) back to a kernel face — that's what unlocks
+  // Fusion-style face picking and face-extrude.
+  face_ids: z.array(z.number()).optional(),
 })
 
 export const analyticalGeometrySchema = z.object({
@@ -87,6 +92,25 @@ const subElementSchema = z.object({
 // ─── Discriminated union of every accepted ServerMessage variant ────
 
 export const serverMessageSchema = z.discriminatedUnion('type', [
+  // First frame the server sends after a successful WebSocket upgrade.
+  // Backend variant is unflattened (`{ "type": "Welcome", "connection_id":
+  // …, "server_version": …, "capabilities": [...] }`) — i.e. fields
+  // sit at the top level alongside `type` rather than under `payload`.
+  // We accept both shapes so a backend rev that nests under `payload`
+  // doesn't break the bridge.
+  z.object({
+    type: z.literal('Welcome'),
+    connection_id: z.string().optional(),
+    server_version: z.string().optional(),
+    capabilities: z.array(z.string()).optional(),
+    payload: z
+      .object({
+        connection_id: z.string().optional(),
+        server_version: z.string().optional(),
+        capabilities: z.array(z.string()).optional(),
+      })
+      .optional(),
+  }),
   // GeometryUpdate carries a nested `Tessellated` envelope so that
   // the backend can later add other geometry-update flavours
   // (LevelOfDetail, Diff, etc.) without rebroadcasting an existing
