@@ -93,6 +93,38 @@ export interface GridSettings {
   infiniteGrid: boolean
 }
 
+// ─── Sketch mode ─────────────────────────────────────────────────────
+/**
+ * 2D sketch plane. Points are stored in plane-local (u, v) coordinates
+ * and lifted to 3D when finalised. xy → (u, v, 0); xz → (u, 0, v); yz → (0, u, v).
+ * The corresponding extrude direction is the plane's outward normal.
+ */
+export type SketchPlane = 'xy' | 'xz' | 'yz'
+
+/** Drawing tool inside sketch mode. */
+export type SketchTool = 'polyline' | 'rectangle' | 'circle'
+
+export interface SketchState {
+  active: boolean
+  plane: SketchPlane
+  tool: SketchTool
+  /** Confirmed sketch points in plane-local (u, v) coordinates. */
+  points: Array<[number, number]>
+  /**
+   * Live cursor position on the sketch plane for the rubber-band preview.
+   * `null` when the cursor is off-plane or sketch mode is idle.
+   */
+  hover: [number, number] | null
+  /** Number of segments to tessellate a circle into for extrude. */
+  circleSegments: number
+  /** Snap step in plane units. 0 disables snapping. */
+  snapStep: number
+  /** Show angles + perimeter + area annotations during sketching. */
+  measure: boolean
+  /** Default extrude thickness applied by the panel's "Finish" button. */
+  thickness: number
+}
+
 // ─── Scene store ─────────────────────────────────────────────────────
 interface SceneState {
   // Objects
@@ -142,6 +174,9 @@ interface SceneState {
    */
   contextMenu: { x: number; y: number; objectId: string } | null
 
+  /** Interactive 2D sketch state. See {@link SketchState}. */
+  sketch: SketchState
+
   // Three.js refs (set by canvas components)
   sceneRef: THREE.Scene | null
   cameraRef: THREE.Camera | null
@@ -179,6 +214,18 @@ interface SceneState {
   setViewportSize: (size: { width: number; height: number }) => void
   openContextMenu: (menu: { x: number; y: number; objectId: string }) => void
   closeContextMenu: () => void
+
+  enterSketch: (plane?: SketchPlane, tool?: SketchTool) => void
+  exitSketch: () => void
+  setSketchTool: (tool: SketchTool) => void
+  setSketchPlane: (plane: SketchPlane) => void
+  addSketchPoint: (point: [number, number]) => void
+  popSketchPoint: () => void
+  clearSketchPoints: () => void
+  setSketchHover: (point: [number, number] | null) => void
+  setSketchView: (
+    patch: Partial<Pick<SketchState, 'snapStep' | 'measure' | 'thickness'>>,
+  ) => void
   setSceneRef: (scene: THREE.Scene | null) => void
   setCameraRef: (camera: THREE.Camera | null) => void
   setGlRef: (gl: THREE.WebGLRenderer | null) => void
@@ -216,6 +263,17 @@ export const useSceneStore = create<SceneState>()(
     },
     viewportSize: { width: 0, height: 0 },
     contextMenu: null,
+    sketch: {
+      active: false,
+      plane: 'xy',
+      tool: 'polyline',
+      points: [],
+      hover: null,
+      circleSegments: 64,
+      snapStep: 0.5,
+      measure: true,
+      thickness: 5,
+    },
     sceneRef: null,
     cameraRef: null,
     glRef: null,
@@ -354,6 +412,86 @@ export const useSceneStore = create<SceneState>()(
 
     openContextMenu: (menu) => set({ contextMenu: menu }),
     closeContextMenu: () => set({ contextMenu: null }),
+
+    enterSketch: (plane, tool) => {
+      const targetPlane = plane ?? useSceneStore.getState().sketch.plane
+      // Snap the camera flat to the chosen plane so the user sees the
+      // sketch face-on. xy → top, xz → front, yz → right.
+      const presetForPlane: Record<SketchPlane, string> = {
+        xy: 'top',
+        xz: 'front',
+        yz: 'right',
+      }
+      const presetData = CAMERA_PRESETS[presetForPlane[targetPlane]]
+      set((state) => ({
+        sketch: {
+          ...state.sketch,
+          active: true,
+          plane: targetPlane,
+          tool: tool ?? state.sketch.tool,
+          points: [],
+          hover: null,
+        },
+        // Drop any object/sub-element selection so the picker can't fire
+        // beneath the sketch overlay.
+        selectedIds: new Set(),
+        subElementSelections: [],
+        hoveredSubElement: null,
+        contextMenu: null,
+        cameraPreset: presetForPlane[targetPlane],
+        pendingCameraPreset: presetData ?? state.pendingCameraPreset,
+      }))
+    },
+
+    exitSketch: () =>
+      set((state) => ({
+        sketch: { ...state.sketch, active: false, points: [], hover: null },
+      })),
+
+    setSketchTool: (tool) =>
+      set((state) => ({
+        // Switching tools mid-sketch wipes the in-progress points; the
+        // primitives don't share semantics (polyline = N points, rectangle
+        // = 2 corners, circle = center+radius), so reusing prior clicks
+        // would always be wrong.
+        sketch: { ...state.sketch, tool, points: [], hover: state.sketch.hover },
+      })),
+
+    setSketchPlane: (plane) => {
+      // Mirror enterSketch: re-orient the camera to face the new plane
+      // so the sketcher always sees the surface flat-on.
+      const presetForPlane: Record<SketchPlane, string> = {
+        xy: 'top',
+        xz: 'front',
+        yz: 'right',
+      }
+      const presetData = CAMERA_PRESETS[presetForPlane[plane]]
+      set((state) => ({
+        sketch: { ...state.sketch, plane, points: [], hover: null },
+        cameraPreset: presetForPlane[plane],
+        pendingCameraPreset: presetData ?? state.pendingCameraPreset,
+      }))
+    },
+
+    addSketchPoint: (point) =>
+      set((state) => ({
+        sketch: { ...state.sketch, points: [...state.sketch.points, point] },
+      })),
+
+    popSketchPoint: () =>
+      set((state) => ({
+        sketch: { ...state.sketch, points: state.sketch.points.slice(0, -1) },
+      })),
+
+    clearSketchPoints: () =>
+      set((state) => ({ sketch: { ...state.sketch, points: [] } })),
+
+    setSketchHover: (point) =>
+      set((state) => ({ sketch: { ...state.sketch, hover: point } })),
+
+    setSketchView: (patch) =>
+      set((state) => ({ sketch: { ...state.sketch, ...patch } })),
+
     setSceneRef: (scene) => set({ sceneRef: scene }),
     setCameraRef: (camera) => set({ cameraRef: camera }),
     setGlRef: (gl) => set({ glRef: gl }),

@@ -29,6 +29,7 @@ export function CameraController() {
   const pendingFrameObjectId = useSceneStore((s) => s.pendingFrameObjectId)
   const setPendingFrameObject = useSceneStore((s) => s.setPendingFrameObject)
   const setCameraRef = useSceneStore((s) => s.setCameraRef)
+  const sketchActive = useSceneStore((s) => s.sketch.active)
 
   useEffect(() => {
     setCameraRef(camera)
@@ -162,10 +163,17 @@ export function CameraController() {
       zoomSpeed={1.2}
       minDistance={1}
       maxDistance={500}
+      // Sketch mode owns left-click for point placement; rotate must
+      // not fire on the same gesture. Pan + zoom stay enabled via
+      // middle button + scroll so the user can still navigate while
+      // drawing on a plane.
+      enableRotate={!sketchActive}
       enablePan
       screenSpacePanning
       mouseButtons={{
-        LEFT: THREE.MOUSE.ROTATE,
+        // Sketch mode owns left-click; OrbitControls treats `undefined`
+        // as "no binding" so the gesture passes through cleanly.
+        LEFT: sketchActive ? (undefined as unknown as THREE.MOUSE) : THREE.MOUSE.ROTATE,
         MIDDLE: THREE.MOUSE.PAN,
         // RIGHT intentionally unbound — reserved for the viewport
         // context menu (CADMesh.onContextMenu). Pan is still

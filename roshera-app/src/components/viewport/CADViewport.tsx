@@ -11,6 +11,8 @@ import { TransformGizmo } from './TransformGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { SubElementHighlight } from './SubElementHighlight'
 import { ViewportContextMenu } from './ViewportContextMenu'
+import { SketchOverlay } from './SketchOverlay'
+import { SketchPanel } from '@/components/panels/SketchPanel'
 import { useSceneStore } from '@/stores/scene-store'
 import type * as THREE from 'three'
 
@@ -78,6 +80,7 @@ export function CADViewport() {
         <TransformGizmo />
         <SubElementHighlight />
         <SelectionOutline />
+        <SketchOverlay />
       </Canvas>
 
       <ViewportFrame />
@@ -86,6 +89,7 @@ export function CADViewport() {
       <ViewportHints />
       <ModeBanner />
       <ViewportContextMenu />
+      <SketchPanel />
     </div>
   )
 }
@@ -101,8 +105,7 @@ function ModeBanner() {
 
   if (selectionMode === 'object') return null
 
-  const labels: Record<typeof selectionMode, { title: string; hint: string }> = {
-    object: { title: 'OBJECT', hint: '' },
+  const labels: Record<'face' | 'edge' | 'vertex', { title: string; hint: string }> = {
     face:   { title: 'FACE MODE',   hint: 'Click a face to select · Press 1 to exit' },
     edge:   { title: 'EDGE MODE',   hint: 'Click an edge to select · Press 1 to exit' },
     vertex: { title: 'VERTEX MODE', hint: 'Click a vertex to select · Press 1 to exit' },
