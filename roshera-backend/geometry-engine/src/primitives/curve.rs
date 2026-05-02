@@ -2040,25 +2040,12 @@ impl Curve for NurbsCurve {
     }
 
     fn is_planar(&self, tolerance: Tolerance) -> bool {
-        // Check if all control points lie in a plane
-        if self.control_points.len() < 4 {
-            return true;
+        // Delegate to math-layer best-fit-plane planarity test (single
+        // source of truth for the convex-hull collinear/coplanar check).
+        match self.to_math_curve() {
+            Ok(m) => m.is_planar(tolerance.distance()),
+            Err(_) => self.control_points.len() < 4,
         }
-
-        // Find best-fit plane using first three non-collinear points
-        let (plane, found) = self.find_plane_from_points();
-        if !found {
-            return true; // All points are collinear
-        }
-
-        // Check remaining points
-        for p in &self.control_points {
-            if plane.distance_to_point(p).abs() > tolerance.distance() {
-                return false;
-            }
-        }
-
-        true
     }
 
     fn get_plane(&self, tolerance: Tolerance) -> Option<crate::primitives::surface::Plane> {
@@ -2118,40 +2105,15 @@ impl Curve for NurbsCurve {
     }
 
     fn parameter_at_length(&self, target_length: f64, tolerance: Tolerance) -> MathResult<f64> {
-        // Newton-Raphson iteration to find parameter at arc length
-        let total_length = self.arc_length(tolerance);
-
-        if target_length <= 0.0 {
-            return Ok(0.0);
-        }
-        if target_length >= total_length {
-            return Ok(1.0);
-        }
-
-        // Initial guess
-        let mut t = target_length / total_length;
-
-        for _ in 0..20 {
-            let current_length = self.arc_length_between(0.0, t, tolerance)?;
-            let error = current_length - target_length;
-
-            if error.abs() < tolerance.distance() {
-                break;
-            }
-
-            // Get derivative (speed)
-            let eval = self.evaluate(t)?;
-            let speed = eval.derivative1.magnitude();
-
-            if speed < consts::EPSILON {
-                break;
-            }
-
-            t -= error / speed;
-            t = t.clamp(0.0, 1.0);
-        }
-
-        Ok(t)
+        // Delegate to math-layer arc-length inversion. The math layer
+        // clamps to `[u_min, u_max]` (the curve's natural knot domain),
+        // which matches `self.range` for our adapter and correctly handles
+        // non-[0,1] knot vectors — the previous primitives-layer
+        // implementation hard-clamped to [0,1] which was wrong for
+        // arbitrary parameter domains.
+        Ok(self
+            .to_math_curve()?
+            .parameter_at_length(target_length, tolerance.distance()))
     }
 
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, Point3)> {
@@ -2275,19 +2237,15 @@ impl Curve for NurbsCurve {
     }
 
     fn bounding_box(&self) -> (Point3, Point3) {
-        let mut min = self.control_points[0];
-        let mut max = self.control_points[0];
-
-        for p in self.control_points.iter().skip(1) {
-            min.x = min.x.min(p.x);
-            min.y = min.y.min(p.y);
-            min.z = min.z.min(p.z);
-            max.x = max.x.max(p.x);
-            max.y = max.y.max(p.y);
-            max.z = max.z.max(p.z);
+        // Delegate to math-layer bounding box (control-polygon AABB,
+        // conservative bound by the convex-hull property of NURBS).
+        // Falls back to a degenerate point at the origin only if the
+        // adapter cannot construct a math curve, which requires a
+        // non-empty control polygon — Self::new already enforces that.
+        match self.to_math_curve() {
+            Ok(m) => m.bounding_box(),
+            Err(_) => (Point3::ZERO, Point3::ZERO),
         }
-
-        (min, max)
     }
 
     fn intersect_curve(&self, other: &dyn Curve, tolerance: Tolerance) -> Vec<CurveIntersection> {
@@ -3211,42 +3169,34 @@ impl NurbsCurve {
         None
     }
 
-    /// Find plane from first three non-collinear control points
+    /// Find plane from first three non-collinear control points.
+    ///
+    /// Delegates the numerical search to `math::nurbs::NurbsCurve::best_fit_plane`
+    /// (the single source of truth for the control-polygon planar fit) and
+    /// then wraps the resulting `(origin, normal)` pair in a primitives-layer
+    /// `Plane`. Returns `(plane, true)` when a non-degenerate plane is found
+    /// and `(fallback_plane, false)` when all control points are collinear,
+    /// preserving the caller's existing two-tuple contract.
     fn find_plane_from_points(&self) -> (crate::primitives::surface::Plane, bool) {
         use crate::primitives::surface::Plane;
 
-        for i in 0..self.control_points.len() - 2 {
-            for j in i + 1..self.control_points.len() - 1 {
-                for k in j + 1..self.control_points.len() {
-                    let p0 = self.control_points[i];
-                    let p1 = self.control_points[j];
-                    let p2 = self.control_points[k];
-
-                    let v1 = p1 - p0;
-                    let v2 = p2 - p0;
-                    let normal = v1.cross(&v2);
-
-                    if normal.magnitude() > consts::EPSILON {
-                        if let Ok(norm) = normal.normalize() {
-                            if let Ok(plane) = Plane::from_point_normal(p0, norm) {
-                                return (plane, true);
-                            }
-                        }
-                    }
+        if let Ok(m) = self.to_math_curve() {
+            if let Some((origin, normal)) = m.best_fit_plane() {
+                if let Ok(plane) = Plane::from_point_normal(origin, normal) {
+                    return (plane, true);
                 }
             }
         }
 
-        // All points are collinear, create arbitrary plane
+        // Collinear (or unreachable construction failure): construct an
+        // arbitrary plane through the first control point along a vector
+        // perpendicular to the polygon's first chord.
         let p0 = self.control_points[0];
         let dir = (self.control_points[1] - p0)
             .normalize()
             .unwrap_or(Vector3::X);
         let normal = dir.perpendicular();
-        let plane = Plane::from_point_normal(p0, normal).unwrap_or_else(|_| {
-            // Fallback to XY plane if creation fails
-            Plane::xy(0.0)
-        });
+        let plane = Plane::from_point_normal(p0, normal).unwrap_or_else(|_| Plane::xy(0.0));
         (plane, false)
     }
 
