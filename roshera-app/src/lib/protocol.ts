@@ -14,6 +14,11 @@ export interface MeshData {
   normals: number[]
   uvs?: number[]
   colors?: number[]
+  /**
+   * Per-triangle B-Rep `FaceId` array. Length = `indices.length / 3`.
+   * Drives face picking on the frontend.
+   */
+  face_ids?: number[]
 }
 
 export interface AnalyticalGeometry {

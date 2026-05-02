@@ -23,6 +23,7 @@ function convertMesh(mesh: MeshData): CADMesh {
     vertices: new Float32Array(mesh.vertices),
     indices: new Uint32Array(mesh.indices),
     normals: new Float32Array(mesh.normals),
+    faceIds: mesh.face_ids ? new Uint32Array(mesh.face_ids) : undefined,
   }
 }
 
