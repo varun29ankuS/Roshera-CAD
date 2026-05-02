@@ -118,6 +118,13 @@ interface SceneState {
   // Camera
   cameraPreset: string | null
   pendingCameraPreset: CameraPreset | null
+  /**
+   * Object id the viewport should auto-frame on next animation tick.
+   * Set by `ws-bridge` when `ObjectCreated` arrives so newly-created
+   * geometry doesn't land off-screen. Cleared by CameraController
+   * once the animation has been seeded.
+   */
+  pendingFrameObjectId: string | null
 
   // Edges
   edgeSettings: EdgeSettings
@@ -158,6 +165,7 @@ interface SceneState {
 
   setCameraPreset: (preset: string) => void
   clearPendingCameraPreset: () => void
+  setPendingFrameObject: (id: string | null) => void
 
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
@@ -189,6 +197,7 @@ export const useSceneStore = create<SceneState>()(
     },
     cameraPreset: 'isometric',
     pendingCameraPreset: null,
+    pendingFrameObjectId: null,
     gridSettings: {
       visible: true,
       cellSize: 1,
@@ -318,6 +327,8 @@ export const useSceneStore = create<SceneState>()(
     },
 
     clearPendingCameraPreset: () => set({ pendingCameraPreset: null }),
+
+    setPendingFrameObject: (id) => set({ pendingFrameObjectId: id }),
 
     setEdgeSettings: (settings) =>
       set((state) => ({

@@ -106,12 +106,22 @@ function handleServerMessage(msg: ServerMessage) {
         scene.updateObject(obj.id, obj)
       } else {
         scene.addObject(obj)
+        // Same rationale as ObjectCreated — backend sometimes ships new
+        // geometry as a Tessellated GeometryUpdate (e.g., REST creates
+        // followed by tessellation). Frame it.
+        scene.setPendingFrameObject(obj.id)
       }
       break
     }
 
     case 'ObjectCreated': {
-      scene.addObject(convertCADObject(msg.payload))
+      const obj = convertCADObject(msg.payload)
+      scene.addObject(obj)
+      // Auto-frame the viewport on the new object so the user always
+      // sees what they just made — backend may place it off-screen
+      // (e.g., booleans land at world origin, extrudes shift along the
+      // face normal). CameraController consumes & clears this flag.
+      scene.setPendingFrameObject(obj.id)
       break
     }
 
