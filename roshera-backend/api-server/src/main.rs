@@ -151,6 +151,18 @@ impl AppState {
         self.local_to_uuid.insert(local_id, uuid);
     }
 
+    /// Drop a UUID-to-local ID mapping. Called by every endpoint that
+    /// retires a kernel solid (boolean ops consume their operands; the
+    /// face-extrude path replaces the host solid with a new one; the
+    /// DELETE endpoint removes the solid outright). Leaving stale rows
+    /// behind would let a subsequent request resolve the UUID to a
+    /// non-existent solid_id.
+    pub fn unregister_id_mapping(&self, uuid: &uuid::Uuid) {
+        if let Some((_, local_id)) = self.uuid_to_local.remove(uuid) {
+            self.local_to_uuid.remove(&local_id);
+        }
+    }
+
     /// Get local ID from UUID
     pub fn get_local_id(&self, uuid: &uuid::Uuid) -> Option<u32> {
         self.uuid_to_local.get(uuid).map(|entry| *entry.value())
@@ -532,30 +544,29 @@ async fn create_geometry(
         .into());
     }
 
-    // Flatten into the wire-friendly Three.js layout the frontend already
-    // consumes for STL imports.
-    let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
-    let mut normals = Vec::with_capacity(tri_mesh.vertices.len() * 3);
-    for v in &tri_mesh.vertices {
-        vertices.push(v.position.x as f32);
-        vertices.push(v.position.y as f32);
-        vertices.push(v.position.z as f32);
-        normals.push(v.normal.x as f32);
-        normals.push(v.normal.y as f32);
-        normals.push(v.normal.z as f32);
-    }
-    let mut indices = Vec::with_capacity(tri_mesh.triangles.len() * 3);
-    for tri in &tri_mesh.triangles {
-        indices.push(tri[0]);
-        indices.push(tri[1]);
-        indices.push(tri[2]);
-    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
 
     let object_uuid = Uuid::new_v4();
     let object_id = object_uuid.to_string();
     let display_name = format!("{} {}", capitalize(&shape_type), solid_id);
 
     state.register_id_mapping(object_uuid, solid_id);
+
+    // Side-channel mutators (curl, AI runners, scripts) bypass the
+    // frontend's REST→store path. Broadcast an `ObjectCreated` frame so
+    // every connected WS subscriber sees the new solid in the viewport.
+    broadcast_object_created(
+        &object_id,
+        &display_name,
+        solid_id,
+        &shape_type,
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        position,
+    );
 
     let shape_type_copy = shape_type.clone();
     Ok(Json(serde_json::json!({
@@ -569,6 +580,7 @@ async fn create_geometry(
                 "vertices": vertices,
                 "indices":  indices,
                 "normals":  normals,
+                "face_ids": face_ids,
             },
             "analyticalGeometry": {
                 "type":   shape_type,
@@ -810,24 +822,17 @@ async fn boolean_operation(
         ));
     }
 
-    let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
-    let mut normals = Vec::with_capacity(tri_mesh.vertices.len() * 3);
-    for v in &tri_mesh.vertices {
-        vertices.push(v.position.x as f32);
-        vertices.push(v.position.y as f32);
-        vertices.push(v.position.z as f32);
-        normals.push(v.normal.x as f32);
-        normals.push(v.normal.y as f32);
-        normals.push(v.normal.z as f32);
-    }
-    let mut indices = Vec::with_capacity(tri_mesh.triangles.len() * 3);
-    for tri in &tri_mesh.triangles {
-        indices.push(tri[0]);
-        indices.push(tri[1]);
-        indices.push(tri[2]);
-    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    // Drop the consumed operands from the id-mapping table. The kernel
+    // boolean has already merged or removed those solids; leaving stale
+    // UUID→solid_id rows around would let a subsequent request resolve
+    // a UUID to a non-existent solid.
+    state.unregister_id_mapping(&uuid_a);
+    state.unregister_id_mapping(&uuid_b);
 
     let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let op_label = match operation {
@@ -836,19 +841,39 @@ async fn boolean_operation(
         BooleanOp::Difference => "difference",
     };
     let display_name = format!("{} {}", capitalize(op_label), result_solid_id);
+    let parameters = serde_json::json!({ "operation": op_label });
+
+    // Order matters: tell viewers the operands are gone before adding
+    // the new solid, so the new solid never momentarily appears
+    // alongside the originals.
+    broadcast_object_deleted(&uuid_a.to_string());
+    broadcast_object_deleted(&uuid_b.to_string());
+    broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        result_solid_id,
+        op_label,
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
 
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
         "consumed": [uuid_a.to_string(), uuid_b.to_string()],
         "object": {
-            "id":         result_uuid.to_string(),
+            "id":         result_id_str,
             "name":       display_name,
             "objectType": op_label,
             "mesh": {
                 "vertices": vertices,
                 "indices":  indices,
                 "normals":  normals,
+                "face_ids": face_ids,
             },
             "analyticalGeometry": serde_json::Value::Null,
             "position": [0.0_f32, 0.0, 0.0],
@@ -2133,6 +2158,173 @@ fn broadcast_log(level: &str, message: &str) {
         message: message.to_string(),
     };
     let _ = LOG_BROADCASTER.send(log_msg);
+}
+
+/// Pre-serialized `ServerMessage` JSON frames pushed by side-channel
+/// kernel mutators (REST `/api/geometry`, AI command runners, etc.).
+/// Every WS connection subscribes once on connect and forwards
+/// received frames straight to its peer, so a human watching the
+/// viewport sees live updates regardless of who poked the kernel.
+static GEOMETRY_BROADCASTER: std::sync::LazyLock<broadcast::Sender<String>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, _) = broadcast::channel(256);
+        tx
+    });
+
+/// Subscriber handle for `protocol::message_handlers::handle_websocket_connection`.
+pub fn geometry_broadcaster() -> &'static broadcast::Sender<String> {
+    &GEOMETRY_BROADCASTER
+}
+
+/// Flatten a `TriangleMesh` into the wire-friendly Three.js layout: a
+/// flat `vertices` / `normals` array (3 floats per vertex), an `indices`
+/// array (3 u32 per triangle), and a `face_ids` array (one `FaceId` per
+/// triangle, length = `indices.len() / 3`). The `face_ids` payload is
+/// what the frontend uses to resolve a Three.js raycast hit (which
+/// gives a triangle index) back to the kernel `FaceId` — the unlock
+/// for Fusion-style face picking. `face_map` is sized by tessellation
+/// per the kernel's contract; if it ever comes back shorter than the
+/// triangle count we pad with `0` rather than panic — the frontend
+/// just won't be able to face-pick those triangles.
+fn flatten_tri_mesh(
+    tri_mesh: &geometry_engine::tessellation::TriangleMesh,
+) -> (Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
+    let mut normals = Vec::with_capacity(tri_mesh.vertices.len() * 3);
+    for v in &tri_mesh.vertices {
+        vertices.push(v.position.x as f32);
+        vertices.push(v.position.y as f32);
+        vertices.push(v.position.z as f32);
+        normals.push(v.normal.x as f32);
+        normals.push(v.normal.y as f32);
+        normals.push(v.normal.z as f32);
+    }
+    let mut indices = Vec::with_capacity(tri_mesh.triangles.len() * 3);
+    for tri in &tri_mesh.triangles {
+        indices.push(tri[0]);
+        indices.push(tri[1]);
+        indices.push(tri[2]);
+    }
+    let mut face_ids = Vec::with_capacity(tri_mesh.triangles.len());
+    for i in 0..tri_mesh.triangles.len() {
+        face_ids.push(tri_mesh.face_map.get(i).copied().unwrap_or(0));
+    }
+    (vertices, indices, normals, face_ids)
+}
+
+/// Compute the axis-aligned bounding box of a flat `[x0, y0, z0, x1, y1, z1, …]`
+/// vertex array. Returns `([min_x, min_y, min_z], [max_x, max_y, max_z],
+/// [center_x, center_y, center_z])`. An empty input yields the origin in
+/// all three slots — callers should treat that as a degenerate fall-back.
+fn compute_bbox_and_center(vertices: &[f32]) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    if vertices.len() < 3 {
+        return ([0.0; 3], [0.0; 3], [0.0; 3]);
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for chunk in vertices.chunks_exact(3) {
+        for axis in 0..3 {
+            if chunk[axis] < min[axis] {
+                min[axis] = chunk[axis];
+            }
+            if chunk[axis] > max[axis] {
+                max[axis] = chunk[axis];
+            }
+        }
+    }
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    (min, max, center)
+}
+
+/// Build an `ObjectCreated` frame matching `roshera-app/src/lib/ws-schemas.ts`
+/// and publish it. Field names are snake_case to match `cadObjectSchema`.
+///
+/// `face_ids` is the per-triangle B-Rep `FaceId` array from
+/// `TriangleMesh::face_map`. Length is `indices.len() / 3`. Frontend uses
+/// it to map a Three.js raycast hit (which gives a triangle index) back
+/// to a kernel face — that's what unlocks Fusion-style face picking.
+///
+/// Bounding box and center are computed from the vertex array; volume
+/// and surface area remain zero until the kernel exposes a per-solid
+/// query for them.
+#[allow(clippy::too_many_arguments)]
+fn broadcast_object_created(
+    object_id: &str,
+    name: &str,
+    solid_id: u32,
+    primitive_type: &str,
+    parameters: &serde_json::Value,
+    vertices: &[f32],
+    indices: &[u32],
+    normals: &[f32],
+    face_ids: &[u32],
+    position: [f32; 3],
+) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let (bbox_min, bbox_max, center) = compute_bbox_and_center(vertices);
+    let frame = serde_json::json!({
+        "type": "ObjectCreated",
+        "payload": {
+            "id": object_id,
+            "name": name,
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analytical_geometry": {
+                "solid_id":       solid_id,
+                "primitive_type": primitive_type,
+                "parameters":     parameters,
+                "properties": {
+                    "volume":         0.0,
+                    "surface_area":   0.0,
+                    "bounding_box":   { "min": bbox_min, "max": bbox_max },
+                    "center_of_mass": center,
+                }
+            },
+            "transform": {
+                "translation": position,
+                "rotation":    [0.0, 0.0, 0.0, 1.0],
+                "scale":       [1.0, 1.0, 1.0],
+            },
+            "material": {
+                "diffuse_color": [0.7, 0.7, 0.75, 1.0],
+                "metallic":      0.1,
+                "roughness":     0.8,
+                "emission":      [0.0, 0.0, 0.0],
+                "name":          "default",
+            },
+            "visible":     true,
+            "locked":      false,
+            "children":    [],
+            "metadata":    {},
+            "created_at":  now,
+            "modified_at": now,
+        }
+    });
+    if let Ok(text) = serde_json::to_string(&frame) {
+        let _ = GEOMETRY_BROADCASTER.send(text);
+    }
+}
+
+/// Publish an `ObjectDeleted` frame so every connected viewer drops the
+/// solid from its scene. Used by the boolean op (consumed operands), the
+/// DELETE endpoint, and the face-extrude endpoint (the host solid is
+/// replaced by a new id once the kernel finishes).
+fn broadcast_object_deleted(object_id: &str) {
+    let frame = serde_json::json!({
+        "type": "ObjectDeleted",
+        "payload": { "id": object_id }
+    });
+    if let Ok(text) = serde_json::to_string(&frame) {
+        let _ = GEOMETRY_BROADCASTER.send(text);
+    }
 }
 
 // SSE endpoint for streaming logs
