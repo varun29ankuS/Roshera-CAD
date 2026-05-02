@@ -1879,49 +1879,30 @@ pub struct NurbsCurve {
 }
 
 impl NurbsCurve {
-    /// Create new NURBS curve
+    /// Create new NURBS curve.
+    ///
+    /// Construction is delegated to `math::nurbs::NurbsCurve::new`, which
+    /// performs the canonical NURBS validation — control-point / weight
+    /// length agreement, strictly positive and finite weights, and a
+    /// monotone knot vector of length `n + degree + 1`. Centralising the
+    /// rules in the math layer eliminates the prior duplicated checks
+    /// here and additionally guards against zero / negative / non-finite
+    /// weights, which the previous primitives-layer validator silently
+    /// accepted.
     pub fn new(
         degree: usize,
         control_points: Vec<Point3>,
         weights: Vec<f64>,
         knots: Vec<f64>,
     ) -> MathResult<Self> {
-        // Validate inputs
-        let n = control_points.len();
-        if n < degree + 1 {
-            return Err(MathError::InvalidParameter(
-                "Not enough control points for degree".to_string(),
-            ));
-        }
-        if weights.len() != n {
-            return Err(MathError::InvalidParameter(
-                "Weights count must match control points".to_string(),
-            ));
-        }
-        if knots.len() != n + degree + 1 {
-            return Err(MathError::InvalidParameter(
-                "Invalid knot vector length".to_string(),
-            ));
-        }
-
-        // Check knot vector is non-decreasing
-        for i in 1..knots.len() {
-            if knots[i] < knots[i - 1] {
-                return Err(MathError::InvalidParameter(
-                    "Knot vector must be non-decreasing".to_string(),
-                ));
-            }
-        }
-
-        let range = ParameterRange::new(knots[degree], knots[n]);
-
-        Ok(Self {
-            degree,
+        let m = crate::math::nurbs::NurbsCurve::new(
             control_points,
             weights,
             knots,
-            range,
-        })
+            degree,
+        )
+        .map_err(|e| MathError::InvalidParameter(e.to_string()))?;
+        Self::from_math_curve(m)
     }
 
     /// Create from B-spline (no weights)
@@ -1962,10 +1943,30 @@ impl NurbsCurve {
     /// Wrap a `math::nurbs::NurbsCurve` result back into `primitives::NurbsCurve`.
     ///
     /// The resulting curve's `range` spans `[knots[degree], knots[n]]`, the
-    /// natural domain of a clamped NURBS curve.
+    /// natural domain of a clamped NURBS curve. The math layer already
+    /// validated the field shapes when building `m`, so this constructor
+    /// skips re-validation and assembles the struct directly — going back
+    /// through `Self::new` would re-enter the math-layer validator (a
+    /// no-op for already-valid input) and would also cause unbounded
+    /// recursion now that `Self::new` itself delegates construction to
+    /// the math layer.
     fn from_math_curve(m: crate::math::nurbs::NurbsCurve) -> MathResult<Self> {
         let knots = m.knots.values().to_vec();
-        Self::new(m.degree, m.control_points, m.weights, knots)
+        let degree = m.degree;
+        let n = m.control_points.len();
+        if knots.len() <= n {
+            return Err(MathError::InvalidParameter(
+                "knot vector shorter than expected for math NurbsCurve".to_string(),
+            ));
+        }
+        let range = ParameterRange::new(knots[degree], knots[n]);
+        Ok(Self {
+            degree,
+            control_points: m.control_points,
+            weights: m.weights,
+            knots,
+            range,
+        })
     }
 }
 
@@ -1993,24 +1994,28 @@ impl Curve for NurbsCurve {
     }
 
     fn evaluate_derivatives(&self, t: f64, order: usize) -> MathResult<Vec<Vector3>> {
-        let eval = self.evaluate(t)?;
-        let mut result = vec![eval.position];
+        // Directly delegate to the math-layer evaluator and fan the
+        // resulting `NurbsPoint` out into the caller's flat
+        // `Vec<Vector3>` shape. This avoids round-tripping through the
+        // `CurvePoint` packed-derivative struct that `Self::evaluate`
+        // builds and lets the math layer skip computing derivatives the
+        // caller did not request (`order` ≤ 2 saves a third-derivative
+        // pass; `order == 0` saves all of them).
+        let t = self.range.clamp(t);
+        let m = self.to_math_curve()?;
+        let p = m.evaluate_derivatives(t, order.min(3));
 
+        let mut result = Vec::with_capacity(order + 1);
+        result.push(p.point);
         if order >= 1 {
-            result.push(eval.derivative1);
+            result.push(p.derivative1.unwrap_or(Vector3::ZERO));
         }
-        if order >= 2 && eval.derivative2.is_some() {
-            if let Some(d2) = eval.derivative2 {
-                result.push(d2);
-            }
+        if order >= 2 {
+            result.push(p.derivative2.unwrap_or(Vector3::ZERO));
         }
-        if order >= 3 && eval.derivative3.is_some() {
-            if let Some(d3) = eval.derivative3 {
-                result.push(d3);
-            }
+        if order >= 3 {
+            result.push(p.derivative3.unwrap_or(Vector3::ZERO));
         }
-
-        // Fill remaining with zeros
         while result.len() <= order {
             result.push(Vector3::ZERO);
         }
