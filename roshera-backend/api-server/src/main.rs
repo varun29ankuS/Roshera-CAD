@@ -888,6 +888,446 @@ async fn boolean_operation(
     })))
 }
 
+/// POST /api/geometry/extrude — sketch a closed planar polygon and
+/// extrude it into a solid in one shot.
+///
+/// Request:
+/// ```json
+/// { "profile":   [[x0,y0,z0], [x1,y1,z1], …],   // ≥3 unique points, closes implicitly
+///   "direction": [0.0, 0.0, 1.0],                // optional, defaults to +Z
+///   "distance":  5.0,
+///   "name":      "MyExtrusion"                   // optional display name
+/// }
+/// ```
+///
+/// The handler builds vertices + line edges + a face from the profile
+/// using kernel primitives (`VertexStore::add_or_find` + `Line::new` +
+/// `EdgeStore::add` + `create_face_from_profile`), then dispatches to
+/// `extrude_face`. Result is tessellated, broadcast to every WS
+/// subscriber, and returned with the standard `mesh + face_ids`
+/// payload.
+async fn create_extrude(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let profile_arr = payload
+        .get("profile")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("profile"))?;
+    if profile_arr.len() < 3 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "profile needs at least 3 points to form a closed polygon (got {})",
+                profile_arr.len()
+            ),
+        ));
+    }
+    let parse_pt = |v: &serde_json::Value, idx: usize| -> Result<Point3, ApiError> {
+        let arr = v.as_array().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("profile[{idx}] must be an array of 3 numbers"),
+            )
+        })?;
+        if arr.len() != 3 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("profile[{idx}] needs exactly 3 numbers, got {}", arr.len()),
+            ));
+        }
+        let coord = |i: usize| -> Result<f64, ApiError> {
+            arr[i].as_f64().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("profile[{idx}][{i}] is not a number"),
+                )
+            })
+        };
+        Ok(Point3::new(coord(0)?, coord(1)?, coord(2)?))
+    };
+    let mut points: Vec<Point3> = Vec::with_capacity(profile_arr.len());
+    for (i, v) in profile_arr.iter().enumerate() {
+        points.push(parse_pt(v, i)?);
+    }
+
+    let direction = match payload.get("direction") {
+        Some(d) => {
+            let arr = d.as_array().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "direction must be an array of 3 numbers".to_string(),
+                )
+            })?;
+            if arr.len() != 3 {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("direction needs 3 numbers, got {}", arr.len()),
+                ));
+            }
+            let dx = arr[0].as_f64().unwrap_or(0.0);
+            let dy = arr[1].as_f64().unwrap_or(0.0);
+            let dz = arr[2].as_f64().unwrap_or(1.0);
+            Vector3::new(dx, dy, dz)
+        }
+        None => Vector3::Z,
+    };
+    let distance = payload
+        .get("distance")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("distance"))?;
+    if !distance.is_finite() || distance.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("distance must be non-zero and finite (got {distance})"),
+        ));
+    }
+    let display_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tolerance = Tolerance::default();
+
+    // Build profile edges + run extrude under a single write lock so a
+    // concurrent request can't observe a half-built sketch.
+    let result_solid_id = {
+        let mut model = state.model.write().await;
+
+        let mut profile_edges = Vec::with_capacity(points.len());
+        for i in 0..points.len() {
+            let p_start = points[i];
+            let p_end = points[(i + 1) % points.len()];
+            let v_start = model
+                .vertices
+                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
+            let v_end = model
+                .vertices
+                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
+            if v_start == v_end {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "profile[{i}] and profile[{}] collapse to the same vertex \
+                         under tolerance {}",
+                        (i + 1) % points.len(),
+                        tolerance.distance()
+                    ),
+                ));
+            }
+            let line = Line::new(p_start, p_end);
+            let curve_id = model.curves.add(Box::new(line));
+            let edge = Edge::new(
+                0,
+                v_start,
+                v_end,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            let edge_id = model.edges.add(edge);
+            profile_edges.push(edge_id);
+        }
+
+        let options = ExtrudeOptions {
+            direction,
+            distance,
+            ..ExtrudeOptions::default()
+        };
+        extrude_profile(&mut model, profile_edges, options).map_err(ApiError::kernel_error)?
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("Extrude {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "profile":   profile_arr,
+        "direction": [direction.x, direction.y, direction.z],
+        "distance":  distance,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "extrude",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "extrude",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
+/// POST /api/geometry/face/extrude — Fusion-style face-pull. Pick a face
+/// of an existing solid + a distance + (optional) direction; the kernel
+/// extrudes that face into the parent solid.
+///
+/// Request:
+/// ```json
+/// { "object_uuid": "<uuid of host solid>",
+///   "face_id":     17,                          // FaceId from `mesh.face_ids`
+///   "distance":    5.0,
+///   "direction":   [0.0, 0.0, 1.0]              // optional; defaults to face normal
+/// }
+/// ```
+///
+/// The kernel may either modify the existing solid in place or return
+/// a new solid id. Either way we (1) drop the old UUID from the
+/// id-mapping and broadcast `ObjectDeleted`, then (2) register a fresh
+/// UUID for the result and broadcast `ObjectCreated`. Frontends treat
+/// it as a delete-then-create rather than guessing replacement
+/// semantics.
+async fn extrude_face_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::extrude::{extrude_face, ExtrudeOptions};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let object_uuid_str = payload
+        .get("object_uuid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object_uuid"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("object_uuid is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+    let face_id = payload
+        .get("face_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ApiError::missing_field("face_id"))?
+        as u32;
+    let distance = payload
+        .get("distance")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("distance"))?;
+    if !distance.is_finite() || distance.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("distance must be non-zero and finite (got {distance})"),
+        ));
+    }
+
+    // Resolve UUID → kernel solid_id and assert the face actually lives
+    // on that solid before spending a write lock on extrude_face.
+    let host_solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for {object_uuid}"),
+        )
+    })?;
+    {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(host_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(host_solid_id))?;
+        let mut owns_face = false;
+        for &shell_id in &solid.shells {
+            if let Some(shell) = model.shells.get(shell_id) {
+                if shell.faces.contains(&face_id) {
+                    owns_face = true;
+                    break;
+                }
+            }
+        }
+        if !owns_face {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "face_id {face_id} does not belong to solid {host_solid_id} \
+                     (uuid {object_uuid})"
+                ),
+            ));
+        }
+    }
+
+    // Fall back to the face's own surface normal when the caller didn't
+    // pin a direction. Sample at the surface mid-parameter — Face stores
+    // its uv extents but not a single canonical evaluation point.
+    let direction = match payload.get("direction") {
+        Some(d) => {
+            let arr = d.as_array().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "direction must be an array of 3 numbers".to_string(),
+                )
+            })?;
+            if arr.len() != 3 {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("direction needs 3 numbers, got {}", arr.len()),
+                ));
+            }
+            Vector3::new(
+                arr[0].as_f64().unwrap_or(0.0),
+                arr[1].as_f64().unwrap_or(0.0),
+                arr[2].as_f64().unwrap_or(0.0),
+            )
+        }
+        None => {
+            let model = state.model.read().await;
+            let face = model.faces.get(face_id).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("face {face_id} not found"),
+                )
+            })?;
+            face.normal_at(0.5, 0.5, &model.surfaces).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    format!("failed to evaluate normal on face {face_id}: {e}"),
+                )
+            })?
+        }
+    };
+
+    let result_solid_id = {
+        let mut model = state.model.write().await;
+        let options = ExtrudeOptions {
+            direction,
+            distance,
+            ..ExtrudeOptions::default()
+        };
+        extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    // Retire the old uuid (whether or not the kernel reused the solid
+    // id) and mint a fresh one for the result. Order matters — viewers
+    // see ObjectDeleted before the new ObjectCreated, never the reverse.
+    state.unregister_id_mapping(&object_uuid);
+    broadcast_object_deleted(&object_uuid.to_string());
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = format!("FaceExtrude {result_solid_id}");
+    let parameters = serde_json::json!({
+        "host_uuid": object_uuid_str,
+        "face_id":   face_id,
+        "direction": [direction.x, direction.y, direction.z],
+        "distance":  distance,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "face_extrude",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "consumed": [object_uuid_str],
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "face_extrude",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 // Auth handlers (login, logout, refresh_token) live in handlers::auth and are
 // brought into scope via `use handlers::*;`. The export endpoint dispatches to
 // handlers::export::export_mesh.
@@ -2910,6 +3350,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_geometry).delete(delete_geometry),
         )
         .route("/api/geometry/boolean", post(boolean_operation))
+        .route("/api/geometry/extrude", post(create_extrude))
+        .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.
