@@ -13,7 +13,11 @@ class WSClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private url: string
-  private intentionalClose = false
+  // Marks the *current* socket as intentionally closing. Reassigned on
+  // every `connect()` so each socket owns its own flag via closure —
+  // prevents a React StrictMode double-mount from letting the old
+  // socket's `onclose` clobber the new socket's `'connected'` status.
+  private markIntentional: (() => void) | null = null
 
   constructor(url: string) {
     this.url = url
@@ -22,26 +26,35 @@ class WSClient {
   connect() {
     if (this.ws?.readyState === WebSocket.OPEN) return
 
-    this.intentionalClose = false
     const store = useWSStore.getState()
     store.setStatus('connecting')
 
+    let ws: WebSocket
     try {
-      this.ws = new WebSocket(this.url)
+      ws = new WebSocket(this.url)
     } catch {
       store.setError('Failed to create WebSocket connection')
       this.scheduleReconnect()
       return
     }
 
-    this.ws.onopen = () => {
+    // Per-socket flag captured by the handler closures below. The old
+    // socket's onclose continues to see its own `intentional` even after
+    // a fresh `connect()` has installed a new one.
+    let intentional = false
+    this.ws = ws
+    this.markIntentional = () => {
+      intentional = true
+    }
+
+    ws.onopen = () => {
       const s = useWSStore.getState()
       s.setStatus('connected')
       s.resetReconnect()
       this.startHeartbeat()
     }
 
-    this.ws.onmessage = (event) => {
+    ws.onmessage = (event) => {
       let raw: unknown
       try {
         raw = JSON.parse(event.data)
@@ -58,21 +71,22 @@ class WSClient {
       }
     }
 
-    this.ws.onclose = () => {
+    ws.onclose = () => {
+      if (intentional) return
       this.stopHeartbeat()
-      if (!this.intentionalClose) {
-        useWSStore.getState().setStatus('disconnected')
-        this.scheduleReconnect()
-      }
+      useWSStore.getState().setStatus('disconnected')
+      this.scheduleReconnect()
     }
 
-    this.ws.onerror = () => {
+    ws.onerror = () => {
+      if (intentional) return
       useWSStore.getState().setError('WebSocket error')
     }
   }
 
   disconnect() {
-    this.intentionalClose = true
+    this.markIntentional?.()
+    this.markIntentional = null
     this.stopHeartbeat()
     this.clearReconnect()
     this.ws?.close()
