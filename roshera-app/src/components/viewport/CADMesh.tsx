@@ -77,6 +77,22 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
 
   const toggleSubElementSelection = useSceneStore((s) => s.toggleSubElementSelection)
 
+  // Resolve a Three.js raycast triangle index to the kernel `FaceId`. The
+  // backend tessellator stores one FaceId per triangle in `mesh.faceIds`
+  // (length = indices/3); when present we use it directly. When absent
+  // (legacy frame, or merged client-side mesh) we fall back to the raw
+  // triangle index — backend topology lookup will reject anything stale.
+  const resolveFaceId = useCallback(
+    (triangleIndex: number): number => {
+      const map = object.mesh.faceIds
+      if (map && triangleIndex < map.length) {
+        return map[triangleIndex]
+      }
+      return triangleIndex
+    },
+    [object.mesh.faceIds],
+  )
+
   const handleClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation()
@@ -86,19 +102,21 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
         return
       }
 
-      // Sub-element picking: use the face index from the raycast intersection.
-      // Three.js provides faceIndex on the intersection — this maps directly to
-      // the triangle index in the BufferGeometry. The backend resolves this to
-      // the actual B-Rep face/edge/vertex via topology lookup.
-      const faceIndex = e.faceIndex ?? 0
+      // Sub-element picking: triangle index from the raycast → kernel
+      // FaceId via the per-triangle face_map shipped on the mesh. Edge
+      // and vertex modes still fall back to the raw triangle index for
+      // now — the kernel doesn't ship per-triangle edge/vertex maps yet,
+      // so the backend resolves those from the picked point.
+      const triangleIndex = e.faceIndex ?? 0
       const point = e.point.toArray() as [number, number, number]
+      const subType = selectionMode as 'face' | 'edge' | 'vertex'
+      const elementIndex = subType === 'face' ? resolveFaceId(triangleIndex) : triangleIndex
 
       // Optimistic local selection so the UI feels instant
-      const subType = selectionMode as 'face' | 'edge' | 'vertex'
       toggleSubElementSelection({
         objectId: object.id,
         type: subType,
-        index: faceIndex,
+        index: elementIndex,
       })
 
       // Send pick request to backend for authoritative topology resolution.
@@ -109,16 +127,17 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
           query_type: {
             SubElementPick: {
               object_id: object.id,
-              face_index: faceIndex,
+              face_index: elementIndex,
+              triangle_index: triangleIndex,
               point,
               mode: selectionMode,
             },
           },
         },
-        request_id: `pick-${object.id}-${faceIndex}-${Date.now()}`,
+        request_id: `pick-${object.id}-${elementIndex}-${Date.now()}`,
       })
     },
-    [selectObject, toggleSubElementSelection, object.id, selectionMode],
+    [selectObject, toggleSubElementSelection, resolveFaceId, object.id, selectionMode],
   )
 
   const setHoveredSubElement = useSceneStore((s) => s.setHoveredSubElement)

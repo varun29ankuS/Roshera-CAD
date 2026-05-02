@@ -28,6 +28,14 @@ export interface CADMesh {
   vertices: Float32Array
   indices: Uint32Array
   normals: Float32Array
+  /**
+   * Per-triangle B-Rep `FaceId` array. Length = `indices.length / 3`.
+   * Optional because legacy frames (and frontend-side merged meshes)
+   * may not carry it; when present, the viewport uses it to resolve a
+   * Three.js raycast hit (which gives a triangle index) back to a
+   * kernel face for face picking and face-extrude.
+   */
+  faceIds?: Uint32Array
 }
 
 export interface AnalyticalGeometry {
