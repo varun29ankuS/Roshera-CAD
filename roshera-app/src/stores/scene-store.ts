@@ -135,6 +135,13 @@ interface SceneState {
   // Viewport
   viewportSize: { width: number; height: number }
 
+  /**
+   * Right-click context-menu state for the viewport. `objectId` is the
+   * CADObject the menu is acting on (set when the user right-clicks a
+   * mesh). `null` while the menu is closed.
+   */
+  contextMenu: { x: number; y: number; objectId: string } | null
+
   // Three.js refs (set by canvas components)
   sceneRef: THREE.Scene | null
   cameraRef: THREE.Camera | null
@@ -170,6 +177,8 @@ interface SceneState {
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
   setViewportSize: (size: { width: number; height: number }) => void
+  openContextMenu: (menu: { x: number; y: number; objectId: string }) => void
+  closeContextMenu: () => void
   setSceneRef: (scene: THREE.Scene | null) => void
   setCameraRef: (camera: THREE.Camera | null) => void
   setGlRef: (gl: THREE.WebGLRenderer | null) => void
@@ -206,6 +215,7 @@ export const useSceneStore = create<SceneState>()(
       infiniteGrid: true,
     },
     viewportSize: { width: 0, height: 0 },
+    contextMenu: null,
     sceneRef: null,
     cameraRef: null,
     glRef: null,
@@ -341,6 +351,9 @@ export const useSceneStore = create<SceneState>()(
       })),
 
     setViewportSize: (size) => set({ viewportSize: size }),
+
+    openContextMenu: (menu) => set({ contextMenu: menu }),
+    closeContextMenu: () => set({ contextMenu: null }),
     setSceneRef: (scene) => set({ sceneRef: scene }),
     setCameraRef: (camera) => set({ cameraRef: camera }),
     setGlRef: (gl) => set({ glRef: gl }),

@@ -10,6 +10,7 @@ import { SceneObjects } from './SceneObjects'
 import { TransformGizmo } from './TransformGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { SubElementHighlight } from './SubElementHighlight'
+import { ViewportContextMenu } from './ViewportContextMenu'
 import { useSceneStore } from '@/stores/scene-store'
 import type * as THREE from 'three'
 
@@ -45,9 +46,19 @@ export function CADViewport() {
     deselectAll()
   }, [deselectAll])
 
+  // Suppress the browser's native context menu over the entire viewport
+  // so neither empty-space right-clicks nor the synthesized contextmenu
+  // events from a CADMesh hit ever surface "Save image as / Inspect".
+  // The CADMesh onContextMenu handler opens our own menu; clicks on
+  // empty viewport space simply do nothing.
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+  }, [])
+
   return (
     <div
       ref={containerRef}
+      onContextMenu={handleContextMenu}
       className="absolute inset-0 overflow-hidden bg-[var(--cad-viewport-bg)]"
     >
       <Canvas
@@ -74,6 +85,7 @@ export function CADViewport() {
       <ViewportReadout />
       <ViewportHints />
       <ModeBanner />
+      <ViewportContextMenu />
     </div>
   )
 }

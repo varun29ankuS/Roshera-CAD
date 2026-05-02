@@ -167,7 +167,9 @@ export function CameraController() {
       mouseButtons={{
         LEFT: THREE.MOUSE.ROTATE,
         MIDDLE: THREE.MOUSE.PAN,
-        RIGHT: THREE.MOUSE.PAN,
+        // RIGHT intentionally unbound — reserved for the viewport
+        // context menu (CADMesh.onContextMenu). Pan is still
+        // available via MIDDLE.
       }}
     />
   )

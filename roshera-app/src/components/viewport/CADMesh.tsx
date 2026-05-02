@@ -141,6 +141,26 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   )
 
   const setHoveredSubElement = useSceneStore((s) => s.setHoveredSubElement)
+  const openContextMenu = useSceneStore((s) => s.openContextMenu)
+
+  const handleContextMenu = useCallback(
+    (e: ThreeEvent<MouseEvent>) => {
+      e.stopPropagation()
+      // Three.js gives us a synthetic event — pull screen coords from the
+      // underlying native event so the menu lands at the cursor.
+      const native = e.nativeEvent
+      native.preventDefault?.()
+      // Right-click implicitly selects the object so subsequent menu
+      // actions (delete, hide) act on the visible target.
+      selectObject(object.id, false)
+      openContextMenu({
+        x: native.clientX,
+        y: native.clientY,
+        objectId: object.id,
+      })
+    },
+    [object.id, selectObject, openContextMenu],
+  )
 
   const handlePointerOver = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
@@ -185,6 +205,7 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       castShadow
       receiveShadow
       onClick={handleClick}
+      onContextMenu={handleContextMenu}
       onPointerOver={handlePointerOver}
       onPointerMove={handlePointerMove}
       onPointerOut={handlePointerOut}
