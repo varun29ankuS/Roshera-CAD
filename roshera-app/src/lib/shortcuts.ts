@@ -62,6 +62,14 @@ export function useKeyboardShortcuts() {
       const ctrl = e.ctrlKey || e.metaKey
       const state = useSceneStore.getState()
 
+      // Inside sketch mode the SketchPanel owns Enter/Esc/Backspace
+      // and Ctrl+Z so they affect points, not the timeline. Bail out
+      // here for the keys it claims and let its window listener run.
+      if (state.sketch.active) {
+        const k = e.key.toLowerCase()
+        if (k === 'z' && ctrl) return
+      }
+
       switch (e.key.toLowerCase()) {
         // Undo / Redo
         case 'z':

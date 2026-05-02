@@ -58,6 +58,15 @@ export interface CADObject {
   parentId?: string
 }
 
+// ─── Camera projection ───────────────────────────────────────────────
+/**
+ * Lens projection. Perspective is the default (foreshortens depth);
+ * orthographic projects parallel rays — preferred for engineering
+ * drawings where parallel lines must stay parallel and dimensions
+ * remain measurable on-screen.
+ */
+export type CameraProjection = 'perspective' | 'orthographic'
+
 // ─── Camera presets ──────────────────────────────────────────────────
 export interface CameraPreset {
   name: string
@@ -158,6 +167,9 @@ interface SceneState {
    */
   pendingFrameObjectId: string | null
 
+  /** Active lens projection. See {@link CameraProjection}. */
+  cameraProjection: CameraProjection
+
   // Edges
   edgeSettings: EdgeSettings
 
@@ -208,6 +220,8 @@ interface SceneState {
   setCameraPreset: (preset: string) => void
   clearPendingCameraPreset: () => void
   setPendingFrameObject: (id: string | null) => void
+  setCameraProjection: (projection: CameraProjection) => void
+  toggleCameraProjection: () => void
 
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
@@ -223,6 +237,12 @@ interface SceneState {
   popSketchPoint: () => void
   clearSketchPoints: () => void
   setSketchHover: (point: [number, number] | null) => void
+  /**
+   * Replace a single sketch point in place. Used by the panel's
+   * dimension inputs so the user can type exact coordinates / sizes
+   * rather than only approximate by click.
+   */
+  setSketchPoint: (index: number, point: [number, number]) => void
   setSketchView: (
     patch: Partial<Pick<SketchState, 'snapStep' | 'measure' | 'thickness'>>,
   ) => void
@@ -254,6 +274,7 @@ export const useSceneStore = create<SceneState>()(
     cameraPreset: 'isometric',
     pendingCameraPreset: null,
     pendingFrameObjectId: null,
+    cameraProjection: 'perspective',
     gridSettings: {
       visible: true,
       cellSize: 1,
@@ -398,6 +419,13 @@ export const useSceneStore = create<SceneState>()(
 
     setPendingFrameObject: (id) => set({ pendingFrameObjectId: id }),
 
+    setCameraProjection: (projection) => set({ cameraProjection: projection }),
+    toggleCameraProjection: () =>
+      set((state) => ({
+        cameraProjection:
+          state.cameraProjection === 'perspective' ? 'orthographic' : 'perspective',
+      })),
+
     setEdgeSettings: (settings) =>
       set((state) => ({
         edgeSettings: { ...state.edgeSettings, ...settings },
@@ -417,9 +445,13 @@ export const useSceneStore = create<SceneState>()(
       const targetPlane = plane ?? useSceneStore.getState().sketch.plane
       // Snap the camera flat to the chosen plane so the user sees the
       // sketch face-on. xy → top, xz → front, yz → right.
+      // Y-up world: Top view looks down -Y (sees XZ plane); Front
+      // view looks down -Z (sees XY plane); Right view looks down -X
+      // (sees YZ plane). Match the plane to the view that shows it
+      // face-on.
       const presetForPlane: Record<SketchPlane, string> = {
-        xy: 'top',
-        xz: 'front',
+        xy: 'front',
+        xz: 'top',
         yz: 'right',
       }
       const presetData = CAMERA_PRESETS[presetForPlane[targetPlane]]
@@ -460,9 +492,13 @@ export const useSceneStore = create<SceneState>()(
     setSketchPlane: (plane) => {
       // Mirror enterSketch: re-orient the camera to face the new plane
       // so the sketcher always sees the surface flat-on.
+      // Y-up world: Top view looks down -Y (sees XZ plane); Front
+      // view looks down -Z (sees XY plane); Right view looks down -X
+      // (sees YZ plane). Match the plane to the view that shows it
+      // face-on.
       const presetForPlane: Record<SketchPlane, string> = {
-        xy: 'top',
-        xz: 'front',
+        xy: 'front',
+        xz: 'top',
         yz: 'right',
       }
       const presetData = CAMERA_PRESETS[presetForPlane[plane]]
@@ -488,6 +524,14 @@ export const useSceneStore = create<SceneState>()(
 
     setSketchHover: (point) =>
       set((state) => ({ sketch: { ...state.sketch, hover: point } })),
+
+    setSketchPoint: (index, point) =>
+      set((state) => {
+        if (index < 0 || index >= state.sketch.points.length) return state
+        const points = state.sketch.points.slice()
+        points[index] = point
+        return { sketch: { ...state.sketch, points } }
+      }),
 
     setSketchView: (patch) =>
       set((state) => ({ sketch: { ...state.sketch, ...patch } })),
