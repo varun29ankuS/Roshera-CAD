@@ -9,6 +9,7 @@ export function TransformGizmo() {
   const activeTool = useSceneStore((s) => s.activeTool)
   const selectedIds = useSceneStore((s) => s.selectedIds)
   const transformSpace = useSceneStore((s) => s.transformSpace)
+  const selectionMode = useSceneStore((s) => s.selectionMode)
   const objects = useSceneStore((s) => s.objects)
   const updateObject = useSceneStore((s) => s.updateObject)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -18,7 +19,13 @@ export function TransformGizmo() {
 
   const selectedId = selectedIds.size === 1 ? Array.from(selectedIds)[0] : null
   const selectedObj = selectedId ? objects.get(selectedId) : null
-  const showGizmo = selectedObj && activeTool !== 'select'
+  // Sub-element selection modes (face / edge / vertex) own their own
+  // per-element gizmos (e.g. `ExtrudeGizmo` for face-pull). Letting the
+  // whole-object translate/rotate/scale gizmo render on top of those
+  // produces overlapping affordances and stray rotation rings around a
+  // face-extrude arrow. Restrict to `object` mode.
+  const showGizmo =
+    selectedObj && activeTool !== 'select' && selectionMode === 'object'
 
   const targetMesh = useMemo((): Object3D | null => {
     if (!selectedId) return null

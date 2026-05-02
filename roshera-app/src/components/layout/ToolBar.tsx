@@ -40,7 +40,7 @@ import {
   SquareDashedBottom,
   type LucideIcon,
 } from 'lucide-react'
-import { useSceneStore, type TransformTool, type CADObject } from '@/stores/scene-store'
+import { useSceneStore, type TransformTool } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { cn } from '@/lib/utils'
@@ -76,10 +76,13 @@ const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
  * Deterministic operations (create primitive, boolean, export) don't need
  * NLP parsing — this eliminates latency and misinterpretation risk.
  *
- * Backend returns `{ success, object, stats, solid_id }` where `object`
- * matches the `CADObject` shape but with plain JS arrays. This function
- * promotes the mesh arrays to typed arrays and pushes into the scene
- * store so the viewport renders immediately.
+ * Backend remains the single source of truth: the kernel mutates topology,
+ * registers the new object, and broadcasts `ObjectCreated` over the
+ * WebSocket. `ws-bridge.ts` consumes that frame and adds the object to
+ * the local scene store with the full mesh + per-triangle `faceIds` map.
+ * This function never adds objects locally — doing so would (a) duplicate
+ * the entry on the WS broadcast and (b) drop `faceIds` because the REST
+ * response shape predates per-triangle face mapping.
  *
  * Falls back to NLP pipeline if the direct endpoint fails.
  */
@@ -110,16 +113,14 @@ async function sendDirectGeometry(
       throw new Error(data?.error || 'malformed response')
     }
 
-    const obj = hydrateBackendObject(data.object, shapeType)
-    useSceneStore.getState().addObject(obj)
-
+    const objectId = String(data.object.id)
     const stats = data.stats
       ? ` (${data.stats.vertex_count} verts, ${data.stats.triangle_count} tris, ${data.stats.tessellation_ms} ms)`
       : ''
     addMessage({
       role: 'assistant',
       content: `Created ${shapeType}${stats}.`,
-      objectsAffected: [obj.id],
+      objectsAffected: [objectId],
     })
   } catch (err) {
     // Direct API unavailable — fall back to NLP pipeline
@@ -132,44 +133,13 @@ async function sendDirectGeometry(
 }
 
 /**
- * Promote backend `object` payload (plain arrays) to a `CADObject`
- * (typed arrays + defaults). Backend guarantees: id, name, objectType,
- * mesh.{vertices,indices,normals}, position, rotation, scale.
- */
-function hydrateBackendObject(raw: Record<string, unknown>, shapeType: string): CADObject {
-  const mesh = raw.mesh as { vertices: number[]; indices: number[]; normals: number[] }
-  const position = (raw.position as [number, number, number]) ?? [0, 0, 0]
-  const rotation = (raw.rotation as [number, number, number]) ?? [0, 0, 0]
-  const scale = (raw.scale as [number, number, number]) ?? [1, 1, 1]
-
-  return {
-    id: String(raw.id),
-    name: String(raw.name ?? shapeType),
-    objectType: String(raw.objectType ?? shapeType),
-    mesh: {
-      vertices: new Float32Array(mesh.vertices),
-      indices: new Uint32Array(mesh.indices),
-      normals: new Float32Array(mesh.normals),
-    },
-    material: {
-      color: '#9ca8c4',
-      metalness: 0.1,
-      roughness: 0.45,
-      opacity: 1,
-    },
-    position,
-    rotation,
-    scale,
-    visible: true,
-    locked: false,
-    analyticalGeometry: raw.analyticalGeometry as CADObject['analyticalGeometry'],
-  }
-}
-
-/**
  * Run a boolean operation against the two currently-selected objects
- * via the REST API. On success, swap the operands out of the scene
- * for the result so the user sees the boolean immediately.
+ * via the REST API. The kernel consumes both operands, broadcasts
+ * `ObjectDeleted` for each, then broadcasts `ObjectCreated` for the
+ * result — `ws-bridge.ts` reconciles the local scene store. This
+ * function does not mutate scene state directly; doing so would
+ * duplicate the result on the WS broadcast and drop the per-triangle
+ * `faceIds` map (the REST response predates that field).
  */
 async function sendDirectBoolean(
   operation: 'union' | 'intersection' | 'difference',
@@ -206,19 +176,14 @@ async function sendDirectBoolean(
       throw new Error(data?.error || 'malformed response')
     }
 
-    const obj = hydrateBackendObject(data.object, operation)
-    const removeObject = useSceneStore.getState().removeObject
-    const consumed: string[] = Array.isArray(data.consumed) ? data.consumed : [a, b]
-    consumed.forEach((id) => removeObject(id))
-    useSceneStore.getState().addObject(obj)
-
+    const objectId = String(data.object.id)
     const stats = data.stats
       ? ` (${data.stats.vertex_count} verts, ${data.stats.triangle_count} tris, ${data.stats.tessellation_ms} ms)`
       : ''
     addMessage({
       role: 'assistant',
       content: `${operation}${stats}.`,
-      objectsAffected: [obj.id],
+      objectsAffected: [objectId],
     })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { Canvas } from '@react-three/fiber'
-import { Grid3x3 } from 'lucide-react'
+import { Box, Grid3x3, SquareDashed } from 'lucide-react'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'
@@ -8,6 +8,7 @@ import { CameraController } from './CameraController'
 import { ReferencePlanes } from './ReferencePlanes'
 import { SceneObjects } from './SceneObjects'
 import { TransformGizmo } from './TransformGizmo'
+import { ExtrudeGizmo } from './ExtrudeGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { SubElementHighlight } from './SubElementHighlight'
 import { ViewportContextMenu } from './ViewportContextMenu'
@@ -66,7 +67,6 @@ export function CADViewport() {
       <Canvas
         shadows
         dpr={[1, 2]}
-        camera={{ fov: 50, near: 0.1, far: 2000, position: [20, 15, 20] }}
         gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
         onCreated={handleCreated}
         onPointerMissed={handlePointerMissed}
@@ -79,6 +79,7 @@ export function CADViewport() {
         <SceneObjects />
         <TransformGizmo />
         <SubElementHighlight />
+        <ExtrudeGizmo />
         <SelectionOutline />
         <SketchOverlay />
       </Canvas>
@@ -130,19 +131,46 @@ function ModeBanner() {
 }
 
 /**
- * Floating viewport toggles — currently a single grid on/off control.
- * Sits just above the readout in the bottom-right corner.
+ * Floating viewport toggles — grid on/off and projection (perspective
+ * vs orthographic). Sits just above the readout in the bottom-right
+ * corner. Engineers expect orthographic for measurement-accurate
+ * views; designers prefer perspective for spatial reasoning. The
+ * toggle preserves camera position/orientation across the swap (see
+ * `CameraController`'s projection effect for the FOV ↔ zoom mapping).
  */
 function ViewportControls() {
   const gridVisible = useSceneStore((s) => s.gridSettings.visible)
   const setGridSettings = useSceneStore((s) => s.setGridSettings)
+  const projection = useSceneStore((s) => s.cameraProjection)
+  const toggleProjection = useSceneStore((s) => s.toggleCameraProjection)
 
   const toggleGrid = useCallback(() => {
     setGridSettings({ visible: !gridVisible })
   }, [gridVisible, setGridSettings])
 
+  const isOrtho = projection === 'orthographic'
+  const ProjectionIcon = isOrtho ? SquareDashed : Box
+
   return (
     <div className="absolute bottom-[68px] right-3 flex items-center gap-1">
+      <button
+        type="button"
+        onClick={toggleProjection}
+        title={
+          isOrtho
+            ? 'Orthographic — click for perspective'
+            : 'Perspective — click for orthographic'
+        }
+        aria-pressed={isOrtho}
+        className={[
+          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
+          isOrtho
+            ? 'text-foreground border-border'
+            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
+        ].join(' ')}
+      >
+        <ProjectionIcon className="w-3.5 h-3.5" />
+      </button>
       <button
         type="button"
         onClick={toggleGrid}

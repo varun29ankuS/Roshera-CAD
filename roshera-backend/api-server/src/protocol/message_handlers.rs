@@ -1634,6 +1634,25 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                             } => {
                                 info!("Processing query: {:?}", query_type);
 
+                                // SubElementPick intercept. The frontend sends an
+                                // externally-tagged inner enum
+                                //   `{ "SubElementPick": { object_id, ..., mode } }`
+                                // which does not match `WSQueryType`'s internally-
+                                // tagged `query_type` discriminator. Detect that
+                                // shape and dispatch to the picker; everything
+                                // else falls through to the existing parser.
+                                if let Some(pick_payload) = query_type.get("SubElementPick") {
+                                    let frame = handle_subelement_pick(
+                                        &state,
+                                        pick_payload,
+                                    )
+                                    .await;
+                                    if let Ok(json) = serde_json::to_string(&frame) {
+                                        let _ = sender.send(Message::Text(json.into())).await;
+                                    }
+                                    continue;
+                                }
+
                                 // Parse the query type from JSON and execute
                                 let result = if let Ok(query) =
                                     serde_json::from_value::<super::protocol::WSQueryType>(
@@ -2021,4 +2040,259 @@ async fn send_collaborators_update(
     }
 
     Ok(())
+}
+
+/// Resolve a `SubElementPick` query against the live `BRepModel` and
+/// build the matching wire frame.
+///
+/// Wire shape (frontend → backend):
+/// ```jsonc
+/// {
+///   "object_id":      "<UUID>",
+///   "face_index":     <FaceId | raw triangle idx>,
+///   "triangle_index": <raw triangle idx>,
+///   "point":          [x, y, z],
+///   "mode":           "face" | "edge" | "vertex"
+/// }
+/// ```
+///
+/// Wire shape (backend → frontend, matching `ws-schemas.ts`
+/// `SubElementResult`):
+/// ```jsonc
+/// { "type": "SubElementResult",
+///   "payload": { "object_id": "<UUID>",
+///                "elements":  [ { "type": "<face|edge|vertex>",
+///                                 "index": <id> } ] } }
+/// ```
+///
+/// Resolution strategy:
+/// - **face**: trust `face_index` — the frontend already mapped a
+///   raycast triangle hit to a kernel `FaceId` via the per-triangle
+///   `face_ids` array shipped on the mesh.
+/// - **edge**: walk every edge reachable from the solid's outer/inner
+///   shells, evaluate `Curve::closest_point` against the picked 3D
+///   point, return the minimum-distance `EdgeId`.
+/// - **vertex**: walk every distinct vertex along those same edges,
+///   return the closest `VertexId` by Euclidean distance.
+///
+/// Returns either a typed `SubElementResult` frame or an `Error`
+/// frame (kept on the same path so the bridge can surface it).
+async fn handle_subelement_pick(
+    state: &AppState,
+    pick: &serde_json::Value,
+) -> serde_json::Value {
+    use geometry_engine::math::{Point3, Tolerance};
+
+    let object_id_str = pick
+        .get("object_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mode = pick
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("face");
+    let face_index = pick
+        .get("face_index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let point: [f64; 3] = pick
+        .get("point")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            [
+                a.first().and_then(|n| n.as_f64()).unwrap_or(0.0),
+                a.get(1).and_then(|n| n.as_f64()).unwrap_or(0.0),
+                a.get(2).and_then(|n| n.as_f64()).unwrap_or(0.0),
+            ]
+        })
+        .unwrap_or([0.0; 3]);
+
+    let object_uuid = match Uuid::parse_str(object_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return subelement_error(
+                object_id_str,
+                "invalid object_id (not a UUID)",
+            );
+        }
+    };
+
+    let local_id = match state.get_local_id(&object_uuid) {
+        Some(id) => id,
+        None => {
+            return subelement_error(object_id_str, "object not found");
+        }
+    };
+
+    let model = state.model.read().await;
+    let solid = match model.get_solid(local_id) {
+        Some(s) => s,
+        None => {
+            return subelement_error(object_id_str, "solid not found in model");
+        }
+    };
+
+    // Gather every face reachable from this solid (outer shell + holes).
+    // Using a Vec rather than a HashSet — face IDs across shells are
+    // distinct by construction; the de-dup at the edge / vertex layer
+    // catches incidental sharing.
+    let mut face_ids: Vec<u32> = Vec::new();
+    if let Some(outer) = model.shells.get(solid.outer_shell) {
+        face_ids.extend(outer.faces.iter().copied());
+    }
+    for &shell_id in &solid.inner_shells {
+        if let Some(shell) = model.shells.get(shell_id) {
+            face_ids.extend(shell.faces.iter().copied());
+        }
+    }
+
+    let pick_point = Point3::new(point[0], point[1], point[2]);
+    let tolerance = Tolerance::default();
+
+    let element = match mode {
+        "face" => {
+            // Frontend already resolved triangle → FaceId on the
+            // per-triangle face_ids array. Trust it; just echo back.
+            let idx = match face_index {
+                Some(i) => i,
+                None => {
+                    return subelement_error(
+                        object_id_str,
+                        "face_index missing for face mode",
+                    );
+                }
+            };
+            serde_json::json!({ "type": "face", "index": idx })
+        }
+        "edge" => {
+            let mut best: Option<(u32, f64)> = None;
+            let mut seen_edges: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            for &fid in &face_ids {
+                let face = match model.faces.get(fid) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let mut loop_ids: Vec<u32> = Vec::with_capacity(1 + face.inner_loops.len());
+                loop_ids.push(face.outer_loop);
+                loop_ids.extend(face.inner_loops.iter().copied());
+                for lid in loop_ids {
+                    let loop_ = match model.loops.get(lid) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    for &eid in &loop_.edges {
+                        if !seen_edges.insert(eid) {
+                            continue;
+                        }
+                        let edge = match model.edges.get(eid) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        let curve = match model.curves.get(edge.curve_id) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        let closest = match curve.closest_point(&pick_point, tolerance) {
+                            Ok((_, p)) => p,
+                            Err(_) => continue,
+                        };
+                        let d = pick_point.distance(&closest);
+                        if best.map_or(true, |(_, bd)| d < bd) {
+                            best = Some((eid, d));
+                        }
+                    }
+                }
+            }
+            match best {
+                Some((eid, _)) => serde_json::json!({ "type": "edge", "index": eid }),
+                None => {
+                    return subelement_error(
+                        object_id_str,
+                        "no edges reachable from solid",
+                    );
+                }
+            }
+        }
+        "vertex" => {
+            let mut best: Option<(u32, f64)> = None;
+            let mut seen_verts: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            for &fid in &face_ids {
+                let face = match model.faces.get(fid) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let mut loop_ids: Vec<u32> = Vec::with_capacity(1 + face.inner_loops.len());
+                loop_ids.push(face.outer_loop);
+                loop_ids.extend(face.inner_loops.iter().copied());
+                for lid in loop_ids {
+                    let loop_ = match model.loops.get(lid) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    for &eid in &loop_.edges {
+                        let edge = match model.edges.get(eid) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        for vid in [edge.start_vertex, edge.end_vertex] {
+                            if !seen_verts.insert(vid) {
+                                continue;
+                            }
+                            let vertex = match model.vertices.get(vid) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let dx = pick_point.x - vertex.position[0];
+                            let dy = pick_point.y - vertex.position[1];
+                            let dz = pick_point.z - vertex.position[2];
+                            let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                            if best.map_or(true, |(_, bd)| d < bd) {
+                                best = Some((vid, d));
+                            }
+                        }
+                    }
+                }
+            }
+            match best {
+                Some((vid, _)) => serde_json::json!({ "type": "vertex", "index": vid }),
+                None => {
+                    return subelement_error(
+                        object_id_str,
+                        "no vertices reachable from solid",
+                    );
+                }
+            }
+        }
+        other => {
+            return subelement_error(
+                object_id_str,
+                &format!("unknown pick mode: {}", other),
+            );
+        }
+    };
+
+    serde_json::json!({
+        "type": "SubElementResult",
+        "payload": {
+            "object_id": object_id_str,
+            "elements": [element],
+        }
+    })
+}
+
+/// Build a typed Error frame for SubElementPick failures.
+///
+/// The frontend's `ws-schemas.ts` only validates `{ type, payload }`
+/// shapes; `Error.payload.message` is the surface the bridge logs.
+/// Inlining the object id keeps the failure attributable in the
+/// browser console without needing a request_id round-trip.
+fn subelement_error(object_id: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "Error",
+        "payload": {
+            "message": format!("SubElementPick({}): {}", object_id, message),
+        }
+    })
 }

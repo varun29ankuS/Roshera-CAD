@@ -26,7 +26,194 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::VertexId,
 };
+use std::collections::HashMap;
 use tracing::debug;
+
+/// Topology built once per extruded loop so all side faces and the top
+/// face share vertices and edges instead of synthesizing duplicates.
+///
+/// Each unique bottom vertex maps to exactly one translated top vertex
+/// and one vertical edge, both reused by the two side faces that meet
+/// at that corner. Without this sharing, the shell would be open along
+/// every seam, exports would fail watertightness, and vertex-normal
+/// averaging would break (visible as banded shading on the front face).
+struct ExtrusionLoopTopology {
+    /// Bottom `VertexId` → translated top `VertexId`. One entry per
+    /// unique vertex in the base loop.
+    top_vertex: HashMap<VertexId, VertexId>,
+    /// Bottom `VertexId` → vertical `EdgeId` joining bottom→top. Shared
+    /// between the two side faces that meet at this corner.
+    vertical_edge: HashMap<VertexId, EdgeId>,
+    /// Translated top edges, in the same order as `base_loop.edges`.
+    top_edges: Vec<EdgeId>,
+}
+
+/// Build the bottom→top vertex map, the per-corner vertical edges, and
+/// the per-bottom-edge translated top edges in one pass over the loop.
+fn build_extrusion_loop_topology(
+    model: &mut BRepModel,
+    base_loop: &Loop,
+    direction: Vector3,
+    distance: f64,
+) -> OperationResult<ExtrusionLoopTopology> {
+    // Snapshot every bottom edge up-front so we can mutate the model
+    // while still walking the loop.
+    let snapshot: Vec<Edge> = base_loop
+        .edges
+        .iter()
+        .map(|&edge_id| {
+            model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
+                .map(|e| e.clone())
+        })
+        .collect::<OperationResult<Vec<_>>>()?;
+
+    // 1. One translated top vertex per unique bottom vertex.
+    let translation = direction * distance;
+    let mut top_vertex: HashMap<VertexId, VertexId> = HashMap::new();
+    for edge in &snapshot {
+        for &bv in &[edge.start_vertex, edge.end_vertex] {
+            if top_vertex.contains_key(&bv) {
+                continue;
+            }
+            let v = model.vertices.get(bv).ok_or_else(|| {
+                OperationError::InvalidGeometry("Vertex not found".to_string())
+            })?;
+            let pos = Point3::from(v.position) + translation;
+            let tv = model.vertices.add(pos.x, pos.y, pos.z);
+            top_vertex.insert(bv, tv);
+        }
+    }
+
+    // 2. One vertical edge per unique bottom vertex — both adjacent
+    //    side faces reference this same edge.
+    let mut vertical_edge: HashMap<VertexId, EdgeId> = HashMap::new();
+    for &bv in top_vertex.keys().copied().collect::<Vec<_>>().iter() {
+        let tv = *top_vertex
+            .get(&bv)
+            .ok_or_else(|| OperationError::InvalidGeometry("Top vertex map miss".to_string()))?;
+        let ve = create_straight_edge(model, bv, tv)?;
+        vertical_edge.insert(bv, ve);
+    }
+
+    // 3. One translated top edge per bottom edge, reusing the shared
+    //    top vertices computed above.
+    let translation_matrix = Matrix4::from_translation(&translation);
+    let mut top_edges: Vec<EdgeId> = Vec::with_capacity(snapshot.len());
+    for edge in &snapshot {
+        let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Curve not found".to_string())
+        })?;
+        let translated_curve = curve.transform(&translation_matrix);
+        let new_curve_id = model.curves.add(translated_curve);
+
+        let top_start = *top_vertex.get(&edge.start_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Top vertex map miss (edge start)".to_string())
+        })?;
+        let top_end = *top_vertex.get(&edge.end_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Top vertex map miss (edge end)".to_string())
+        })?;
+
+        let new_edge = Edge::new(
+            0,
+            top_start,
+            top_end,
+            new_curve_id,
+            edge.orientation,
+            edge.param_range,
+        );
+        top_edges.push(model.edges.add(new_edge));
+    }
+
+    Ok(ExtrusionLoopTopology {
+        top_vertex,
+        vertical_edge,
+        top_edges,
+    })
+}
+
+/// Create one side face that walks bottom-edge → right-vertical →
+/// top-edge (reversed) → left-vertical (reversed). The vertical edges
+/// come from the shared topology, so the next side face along the
+/// loop will reference the same right-vertical edge as its left-vertical
+/// — that's what makes the shell watertight.
+fn create_side_face_shared(
+    model: &mut BRepModel,
+    bottom_edge_id: EdgeId,
+    bottom_forward: bool,
+    bottom_start_v: VertexId,
+    bottom_end_v: VertexId,
+    top_edge_id: EdgeId,
+    topology: &ExtrusionLoopTopology,
+) -> OperationResult<FaceId> {
+    let left_vertical = *topology.vertical_edge.get(&bottom_start_v).ok_or_else(|| {
+        OperationError::InvalidGeometry("Vertical edge map miss (left)".to_string())
+    })?;
+    let right_vertical = *topology.vertical_edge.get(&bottom_end_v).ok_or_else(|| {
+        OperationError::InvalidGeometry("Vertical edge map miss (right)".to_string())
+    })?;
+
+    let mut face_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+    // Walk the side-face boundary as a closed quad. With `bottom_forward`
+    // we go start→end along the bottom, then up the right vertical,
+    // back along the top (reversed), and down the left vertical.
+    face_loop.add_edge(bottom_edge_id, bottom_forward);
+    face_loop.add_edge(right_vertical, true);
+    face_loop.add_edge(top_edge_id, !bottom_forward);
+    face_loop.add_edge(left_vertical, false);
+    let loop_id = model.loops.add(face_loop);
+
+    let surface = create_ruled_surface(model, bottom_edge_id, top_edge_id)?;
+    let surface_id = model.surfaces.add(surface);
+
+    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    Ok(model.faces.add(face))
+}
+
+/// Build the top cap face from the shared topology: translates the base
+/// face's surface, then assembles a loop from the per-bottom-edge top
+/// edges in the same order/orientation as the base loop. No fresh
+/// vertices, no fresh edges — the top face's outer boundary is exactly
+/// the upper edge of the side faces.
+fn create_top_face_shared(
+    model: &mut BRepModel,
+    base_face: &Face,
+    base_loop: &Loop,
+    topology: &ExtrusionLoopTopology,
+    direction: Vector3,
+    distance: f64,
+) -> OperationResult<FaceId> {
+    let original_surface = model.surfaces.get(base_face.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry("Surface not found".to_string())
+    })?;
+    let translated_surface =
+        original_surface.transform(&Matrix4::from_translation(&(direction * distance)));
+    let new_surface_id = model.surfaces.add(translated_surface);
+
+    if base_loop.edges.len() != topology.top_edges.len() {
+        return Err(OperationError::InvalidGeometry(
+            "Top edge count does not match base loop".to_string(),
+        ));
+    }
+
+    let mut top_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+    for (i, &top_edge_id) in topology.top_edges.iter().enumerate() {
+        top_loop.add_edge(top_edge_id, base_loop.orientations[i]);
+    }
+    let loop_id = model.loops.add(top_loop);
+
+    // Top cap normal points opposite to the base face — its outward
+    // direction is along `direction`, while the base face's outward
+    // direction is `-direction`.
+    let new_orientation = match base_face.orientation {
+        FaceOrientation::Forward => FaceOrientation::Backward,
+        FaceOrientation::Backward => FaceOrientation::Forward,
+    };
+    let face = Face::new(0, new_surface_id, loop_id, new_orientation);
+    Ok(model.faces.add(face))
+}
 
 /// Find the solid that contains the given face
 fn find_parent_solid(model: &BRepModel, face_id: FaceId) -> Option<SolidId> {
@@ -207,23 +394,58 @@ fn create_unified_extrusion(
     let cloned_faces = deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
     unified_faces.extend(cloned_faces);
 
-    // 2. Create side faces by extruding each edge of the base face
+    // 2. Build the shared extrusion topology once — top vertices,
+    //    vertical edges, and top edges are all created here so the
+    //    side faces and top cap reference the same `VertexId` /
+    //    `EdgeId`s and the resulting shell is watertight.
     let base_loop = model
         .loops
         .get(base_face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
-    for (i, &edge_id) in base_loop.edges.iter().enumerate() {
-        let edge_forward = base_loop.orientations[i];
-        let side_face =
-            create_extruded_edge_face(model, edge_id, edge_forward, direction, distance)?;
+    let topology = build_extrusion_loop_topology(model, &base_loop, direction, distance)?;
+
+    // Snapshot bottom edge endpoints so we can index into the topology
+    // without re-fetching during side-face construction.
+    let bottom_endpoints: Vec<(VertexId, VertexId)> = base_loop
+        .edges
+        .iter()
+        .map(|&edge_id| {
+            model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
+                .map(|e| (e.start_vertex, e.end_vertex))
+        })
+        .collect::<OperationResult<Vec<_>>>()?;
+
+    for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
+        let bottom_forward = base_loop.orientations[i];
+        let (raw_start, raw_end) = bottom_endpoints[i];
+        // When the bottom edge is walked in reverse, its "start" along
+        // the loop is the raw end vertex.
+        let (loop_start, loop_end) = if bottom_forward {
+            (raw_start, raw_end)
+        } else {
+            (raw_end, raw_start)
+        };
+        let side_face = create_side_face_shared(
+            model,
+            bottom_edge_id,
+            bottom_forward,
+            loop_start,
+            loop_end,
+            topology.top_edges[i],
+            &topology,
+        )?;
         unified_faces.push(side_face);
     }
 
-    // 3. Create the top face (translated base face)
+    // 3. Top cap built from the shared top edges — no fresh vertices.
     if cap_ends {
-        let top_face = create_translated_face(model, base_face, direction * distance)?;
+        let top_face =
+            create_top_face_shared(model, base_face, &base_loop, &topology, direction, distance)?;
         unified_faces.push(top_face);
     }
 
@@ -238,7 +460,9 @@ fn create_unified_extrusion(
     debug!(
         shell_id = unified_shell_id,
         face_count = unified_faces.len(),
-        "Created unified shell"
+        top_vertices = topology.top_vertex.len(),
+        vertical_edges = topology.vertical_edge.len(),
+        "Created watertight unified shell"
     );
     for (i, &face_id) in unified_faces.iter().enumerate() {
         if let Some(face) = model.faces.get(face_id) {
@@ -299,23 +523,53 @@ fn create_fresh_extrusion(
         unified_faces.push(base_face_id);
     }
 
-    // Side faces — one per edge of the base loop.
+    // Side faces — one per edge of the base loop. All vertical seams
+    // share `VertexId`/`EdgeId`s through the shared topology, so the
+    // resulting shell is watertight.
     let base_loop = model
         .loops
         .get(base_face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
-    for (i, &edge_id) in base_loop.edges.iter().enumerate() {
-        let edge_forward = base_loop.orientations[i];
-        let side_face =
-            create_extruded_edge_face(model, edge_id, edge_forward, direction, distance)?;
+    let topology = build_extrusion_loop_topology(model, &base_loop, direction, distance)?;
+
+    let bottom_endpoints: Vec<(VertexId, VertexId)> = base_loop
+        .edges
+        .iter()
+        .map(|&edge_id| {
+            model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
+                .map(|e| (e.start_vertex, e.end_vertex))
+        })
+        .collect::<OperationResult<Vec<_>>>()?;
+
+    for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
+        let bottom_forward = base_loop.orientations[i];
+        let (raw_start, raw_end) = bottom_endpoints[i];
+        let (loop_start, loop_end) = if bottom_forward {
+            (raw_start, raw_end)
+        } else {
+            (raw_end, raw_start)
+        };
+        let side_face = create_side_face_shared(
+            model,
+            bottom_edge_id,
+            bottom_forward,
+            loop_start,
+            loop_end,
+            topology.top_edges[i],
+            &topology,
+        )?;
         unified_faces.push(side_face);
     }
 
-    // Top cap (translated copy of the base face).
+    // Top cap built from the shared top edges.
     if cap_ends {
-        let top_face = create_translated_face(model, base_face, direction * distance)?;
+        let top_face =
+            create_top_face_shared(model, base_face, &base_loop, &topology, direction, distance)?;
         unified_faces.push(top_face);
     }
 
@@ -513,98 +767,6 @@ pub fn extrude_profile(
     extrude_face(model, face_id, options)
 }
 
-/// Create a face by extruding an edge
-fn create_extruded_edge_face(
-    model: &mut BRepModel,
-    edge_id: EdgeId,
-    edge_forward: bool,
-    direction: Vector3,
-    distance: f64,
-) -> OperationResult<FaceId> {
-    let edge = model
-        .edges
-        .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
-        .clone();
-
-    // Get edge endpoints
-    let start_vertex = model
-        .vertices
-        .get(edge.start_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
-    let end_vertex = model
-        .vertices
-        .get(edge.end_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
-
-    // Create translated vertices
-    let start_pos_top = Point3::from(start_vertex.position) + direction * distance;
-    let end_pos_top = Point3::from(end_vertex.position) + direction * distance;
-
-    let top_start = model
-        .vertices
-        .add(start_pos_top.x, start_pos_top.y, start_pos_top.z);
-    let top_end = model
-        .vertices
-        .add(end_pos_top.x, end_pos_top.y, end_pos_top.z);
-
-    // Create edges for the face
-    let mut face_edges = Vec::new();
-
-    // Bottom edge (original)
-    face_edges.push((edge_id, edge_forward));
-
-    // Right edge (end vertex to top)
-    let right_edge = create_straight_edge(
-        model,
-        if edge_forward {
-            edge.end_vertex
-        } else {
-            edge.start_vertex
-        },
-        if edge_forward { top_end } else { top_start },
-    )?;
-    face_edges.push((right_edge, true));
-
-    // Top edge (reversed)
-    let top_edge = create_edge_translation(model, &edge, direction * distance)?;
-    face_edges.push((top_edge, !edge_forward));
-
-    // Left edge (start vertex to top, reversed)
-    let left_edge = create_straight_edge(
-        model,
-        if edge_forward {
-            edge.start_vertex
-        } else {
-            edge.end_vertex
-        },
-        if edge_forward { top_start } else { top_end },
-    )?;
-    face_edges.push((left_edge, false));
-
-    // Create loop
-    let mut face_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer); // Will be assigned by store
-    for (edge_id, forward) in face_edges {
-        face_loop.add_edge(edge_id, forward);
-    }
-    let loop_id = model.loops.add(face_loop);
-
-    // Create ruled surface between bottom and top edges
-    let surface = create_ruled_surface(model, edge_id, top_edge)?;
-    let surface_id = model.surfaces.add(surface);
-
-    // Create face
-    let face = Face::new(
-        0, // Will be assigned by store
-        surface_id,
-        loop_id,
-        FaceOrientation::Forward,
-    );
-    let face_id = model.faces.add(face);
-
-    Ok(face_id)
-}
-
 /// Create a straight line edge between two vertices
 fn create_straight_edge(
     model: &mut BRepModel,
@@ -633,56 +795,6 @@ fn create_straight_edge(
         EdgeOrientation::Forward,
     );
     let edge_id = model.edges.add(edge);
-
-    Ok(edge_id)
-}
-
-/// Create a translated copy of an edge
-fn create_edge_translation(
-    model: &mut BRepModel,
-    edge: &Edge,
-    translation: Vector3,
-) -> OperationResult<EdgeId> {
-    // Get original curve
-    let curve = model
-        .curves
-        .get(edge.curve_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
-
-    // Create translated curve
-    let translated_curve = curve.transform(&Matrix4::from_translation(&translation));
-    let new_curve_id = model.curves.add(translated_curve);
-
-    // Get translated vertices
-    let start_vertex = model
-        .vertices
-        .get(edge.start_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
-    let end_vertex = model
-        .vertices
-        .get(edge.end_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
-
-    let new_start_pos = Point3::from(start_vertex.position) + translation;
-    let new_end_pos = Point3::from(end_vertex.position) + translation;
-
-    let new_start = model
-        .vertices
-        .add(new_start_pos.x, new_start_pos.y, new_start_pos.z);
-    let new_end = model
-        .vertices
-        .add(new_end_pos.x, new_end_pos.y, new_end_pos.z);
-
-    // Create new edge
-    let new_edge = Edge::new(
-        0, // Will be assigned by store
-        new_start,
-        new_end,
-        new_curve_id,
-        edge.orientation,
-        edge.param_range,
-    );
-    let edge_id = model.edges.add(new_edge);
 
     Ok(edge_id)
 }
@@ -751,52 +863,6 @@ pub fn create_face_from_profile(
     );
     let face_id = model.faces.add(face);
 
-    Ok(face_id)
-}
-
-/// Create a translated copy of a face
-fn create_translated_face(
-    model: &mut BRepModel,
-    face: &Face,
-    translation: Vector3,
-) -> OperationResult<FaceId> {
-    // Transform the surface
-    let original_surface = model
-        .surfaces
-        .get(face.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
-    let translated_surface = original_surface.transform(&Matrix4::from_translation(&translation));
-    let new_surface_id = model.surfaces.add(translated_surface);
-
-    // Transform the outer loop
-    let translated_outer_loop = translate_loop(model, face.outer_loop, translation)?;
-    let new_outer_loop_id = model.loops.add(translated_outer_loop);
-
-    // Transform inner loops if any
-    let mut new_inner_loops = Vec::new();
-    for &inner_loop_id in &face.inner_loops {
-        let translated_inner_loop = translate_loop(model, inner_loop_id, translation)?;
-        let new_inner_loop_id = model.loops.add(translated_inner_loop);
-        new_inner_loops.push(new_inner_loop_id);
-    }
-
-    // Create new face with reversed orientation for top face
-    let mut new_face = Face::new(
-        0, // Will be assigned by store
-        new_surface_id,
-        new_outer_loop_id,
-        match face.orientation {
-            FaceOrientation::Forward => FaceOrientation::Backward,
-            FaceOrientation::Backward => FaceOrientation::Forward,
-        },
-    );
-
-    // Add inner loops
-    for inner_loop_id in new_inner_loops {
-        new_face.add_inner_loop(inner_loop_id);
-    }
-
-    let face_id = model.faces.add(new_face);
     Ok(face_id)
 }
 
@@ -1065,36 +1131,6 @@ fn validate_extruded_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
     }
 
     Ok(())
-}
-
-/// Translate a loop by a given vector
-fn translate_loop(
-    model: &mut BRepModel,
-    loop_id: u32,
-    translation: Vector3,
-) -> OperationResult<Loop> {
-    let original_loop = model
-        .loops
-        .get(loop_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
-        .clone();
-
-    let mut new_loop = Loop::new(0, original_loop.loop_type);
-
-    // Translate each edge in the loop
-    for (i, &edge_id) in original_loop.edges.iter().enumerate() {
-        let forward = original_loop.orientations[i];
-        let edge = model
-            .edges
-            .get(edge_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
-            .clone(); // Clone to avoid borrowing issues
-
-        let translated_edge = create_edge_translation(model, &edge, translation)?;
-        new_loop.add_edge(translated_edge, forward);
-    }
-
-    Ok(new_loop)
 }
 
 /// Create a quadrilateral face from four vertices
