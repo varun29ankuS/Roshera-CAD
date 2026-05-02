@@ -2917,20 +2917,40 @@ mod tests {
         shell.add_face(face_id);
         model.shells.add(shell);
 
-        // Now delete a vertex - this should cascade through the topology
-        // In a real implementation, this would need to handle:
-        // - All edges using this vertex
-        // - All loops using those edges
-        // - All faces using those loops
-        // - All shells using those faces
+        // Sanity check the pre-delete topology before cascading.
+        assert_eq!(model.vertices.iter().count(), 3);
+        assert_eq!(model.edges.iter().count(), 3);
+        assert_eq!(model.loops.iter().count(), 1);
+        assert_eq!(model.faces.iter().count(), 1);
 
-        // For now, just verify the structure exists
-        assert_eq!(model.vertices.len(), 3);
-        assert_eq!(model.edges.len(), 3);
-        assert_eq!(model.faces.len(), 1);
+        // Cascading delete: removing v1 must propagate through e1+e3
+        // (both reference v1) → the single bounding loop → the face → the
+        // shell's face list.
+        let report = model.delete_vertex_cascade(v1);
 
-        // TODO: Implement actual deletion cascading
-        println!("⚠️ Vertex deletion cascading not yet implemented - this is a critical feature!");
+        assert!(report.removed_vertices.contains(&v1));
+        assert!(report.removed_edges.contains(&e1));
+        assert!(report.removed_edges.contains(&e3));
+        assert!(report.removed_loops.contains(&loop_id));
+        assert!(report.removed_faces.contains(&face_id));
+        assert_eq!(report.affected_shells.len(), 1);
+
+        // Post-cascade the dependent stores should be empty: only e2 (which
+        // does not touch v1) survives in the live edge set.
+        assert_eq!(model.vertices.iter().count(), 2);
+        let live_edges: Vec<_> = model.edges.iter().map(|(eid, _)| eid).collect();
+        assert_eq!(live_edges, vec![e2]);
+        assert_eq!(model.loops.iter().count(), 0);
+        assert_eq!(model.faces.iter().count(), 0);
+
+        // Shell must no longer reference the deleted face.
+        let live_shell = model
+            .shells
+            .iter()
+            .next()
+            .expect("shell should still exist after cascade")
+            .1;
+        assert!(live_shell.find_face(face_id).is_none());
     }
 
     #[test]
