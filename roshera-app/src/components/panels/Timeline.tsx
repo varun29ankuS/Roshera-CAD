@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useCallback, useRef } from 'react'
+import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
 import { cn } from '@/lib/utils'
 
@@ -452,6 +452,32 @@ function EventContextMenu({
   onClose: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
+  // Flip upward / inward when the click is near the viewport edge — the
+  // Timeline strip lives at the bottom of the screen so a downward menu
+  // routinely fell off the page. Measure after first paint, then reposition.
+  const [pos, setPos] = useState<{ x: number; y: number; ready: boolean }>({
+    x: menu.x,
+    y: menu.y,
+    ready: false,
+  })
+
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const margin = 8
+    let x = menu.x
+    let y = menu.y
+    if (x + rect.width > vw - margin) {
+      x = Math.max(margin, menu.x - rect.width)
+    }
+    if (y + rect.height > vh - margin) {
+      y = Math.max(margin, menu.y - rect.height)
+    }
+    setPos({ x, y, ready: true })
+  }, [menu.x, menu.y])
 
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
@@ -506,7 +532,7 @@ function EventContextMenu({
     <div
       ref={ref}
       className="fixed z-50 cad-panel min-w-[180px] py-1 text-[12px] shadow-lg select-none"
-      style={{ left: menu.x, top: menu.y }}
+      style={{ left: pos.x, top: pos.y, visibility: pos.ready ? 'visible' : 'hidden' }}
       role="menu"
     >
       <TimelineMenuItem onClick={() => copy(menu.event.id)}>

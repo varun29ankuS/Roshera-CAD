@@ -1,77 +1,26 @@
 /**
- * Convert an interactive 2D sketch into a closed polygon profile and
- * ship it to the backend `/api/geometry/extrude` endpoint. The kernel
- * builds a face from the polygon and lifts it by `thickness` along the
- * sketch plane's outward normal, then broadcasts `ObjectCreated` so
- * `ws-bridge` adds the resulting solid to the scene.
+ * Geometry helpers for the in-canvas 2D sketch preview.
+ *
+ * The actual extrude pipeline has moved to the backend
+ * (`POST /api/sketch/{id}/extrude` — see `sketch-api.ts`); the
+ * sketch session is the source of truth and the kernel materialises
+ * the polygon + lifts it. The helpers below are kept for the panel's
+ * live perimeter / area summary, where running the materialisation
+ * client-side avoids a REST round-trip on every cursor tick.
  *
  * Coordinate convention: sketch points are stored in plane-local
- * (u, v) coordinates. Lifting back to world coordinates:
- *   xy → (u, v, 0)   normal +Z
- *   xz → (u, 0, v)   normal +Y
- *   yz → (0, u, v)   normal +X
+ * (u, v) coordinates; the backend lifts to world coordinates on
+ * extrude.
  */
 
-import type { SketchPlane, SketchTool } from '@/stores/scene-store'
-
-const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
-
-const MIN_AREA = 1e-6
-const MIN_PERIMETER = 1e-4
-
-export interface SketchExtrudeRequest {
-  plane: SketchPlane
-  tool: SketchTool
-  /** Confirmed sketch points in plane-local (u, v) coordinates. */
-  points: Array<[number, number]>
-  /** Extrude distance along the plane's outward normal (millimetres). */
-  thickness: number
-  /** Tessellation steps for `circle`. Ignored for polyline / rectangle. */
-  circleSegments: number
-  /** Optional human-readable name for the resulting solid. */
-  name?: string
-}
-
-export interface SketchExtrudeResult {
-  solidId: string
-  objectId: string
-  vertexCount?: number
-  triangleCount?: number
-  tessellationMs?: number
-}
-
-/** Convert a (u, v) point to a [x, y, z] tuple on the chosen sketch plane. */
-export function liftToPlane(
-  point: [number, number],
-  plane: SketchPlane,
-): [number, number, number] {
-  const [u, v] = point
-  switch (plane) {
-    case 'xy':
-      return [u, v, 0]
-    case 'xz':
-      return [u, 0, v]
-    case 'yz':
-      return [0, u, v]
-  }
-}
-
-/** Outward normal of the sketch plane, used as the extrude direction. */
-export function planeNormal(plane: SketchPlane): [number, number, number] {
-  switch (plane) {
-    case 'xy': return [0, 0, 1]
-    case 'xz': return [0, 1, 0]
-    case 'yz': return [1, 0, 0]
-  }
-}
+import type { SketchTool } from '@/stores/scene-store'
 
 /**
  * Materialise the current sketch tool's input into the closed polygon
- * the backend expects. Returns `null` when the input is degenerate
- * (e.g. polyline with < 3 points, rectangle with < 2 corners,
- * zero-radius circle). Output is in plane-local (u, v) coordinates and
- * does NOT repeat the first point at the end — the kernel closes the
- * loop implicitly.
+ * the backend would build on extrude. Returns `null` when the input is
+ * degenerate (e.g. polyline with < 3 points, rectangle with < 2
+ * corners, zero-radius circle). Output is in plane-local (u, v) and
+ * does NOT repeat the first point at the end.
  */
 export function buildProfile2D(
   tool: SketchTool,
@@ -156,67 +105,4 @@ export function perimeter(points: Array<[number, number]>, closed: boolean): num
     p += Math.hypot(b[0] - a[0], b[1] - a[1])
   }
   return p
-}
-
-/**
- * POST the finished sketch to `/api/geometry/extrude`. Throws on HTTP
- * failure or backend `success: false`. The caller should listen for
- * `ObjectCreated` on the WebSocket bridge to add the resulting solid
- * to the scene — this function does not touch the scene store.
- */
-export async function extrudeSketch(
-  req: SketchExtrudeRequest,
-): Promise<SketchExtrudeResult> {
-  const profile2D = buildProfile2D(req.tool, req.points, req.circleSegments)
-  if (!profile2D) {
-    throw new Error('sketch is empty or degenerate')
-  }
-  const area = Math.abs(signedArea(profile2D))
-  if (area < MIN_AREA) {
-    throw new Error('sketch encloses zero area')
-  }
-  if (perimeter(profile2D, true) < MIN_PERIMETER) {
-    throw new Error('sketch is too small to extrude')
-  }
-
-  // Ensure CCW so the kernel's face normal aligns with our extrude
-  // direction (avoids inverted-solid topology).
-  const oriented =
-    signedArea(profile2D) >= 0 ? profile2D : profile2D.slice().reverse()
-
-  const profile3D = oriented.map((p) => liftToPlane(p, req.plane))
-  const direction = planeNormal(req.plane)
-
-  if (!Number.isFinite(req.thickness) || req.thickness <= 0) {
-    throw new Error('thickness must be a positive finite number')
-  }
-
-  const resp = await fetch(`${API_BASE}/geometry/extrude`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      profile: profile3D,
-      direction,
-      distance: req.thickness,
-      name: req.name ?? 'Sketch',
-    }),
-  })
-
-  if (!resp.ok) {
-    const errBody = await resp.json().catch(() => ({}))
-    throw new Error(errBody?.message || errBody?.error || `HTTP ${resp.status}`)
-  }
-
-  const data = await resp.json()
-  if (data?.success !== true) {
-    throw new Error(data?.error || 'extrude failed')
-  }
-
-  return {
-    solidId: data.solid_id,
-    objectId: data.object?.id ?? data.solid_id,
-    vertexCount: data.stats?.vertex_count,
-    triangleCount: data.stats?.triangle_count,
-    tessellationMs: data.stats?.tessellation_ms,
-  }
 }

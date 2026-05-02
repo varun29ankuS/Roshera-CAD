@@ -6,6 +6,7 @@
 import { wsClient } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
+import { sketchApi } from './sketch-api'
 import type {
   CADObject as ProtocolCADObject,
   MaterialProperties,
@@ -116,6 +117,18 @@ function handleServerMessage(msg: ServerMessage) {
 
     case 'ObjectCreated': {
       const obj = convertCADObject(msg.payload)
+      // Diagnostic: surfaces whether the WS path is wired and whether
+      // the per-triangle FaceId map reached the bridge. If `faceIds` is
+      // 0 here, face-picking will silently fall back to raw triangle
+      // indices and the kernel pick query will reject them.
+      // eslint-disable-next-line no-console
+      console.log(
+        '[WS] ObjectCreated',
+        obj.id.slice(0, 8),
+        obj.objectType,
+        `tris=${obj.mesh.indices.length / 3}`,
+        `faceIds=${obj.mesh.faceIds?.length ?? 0}`,
+      )
       scene.addObject(obj)
       // Auto-frame the viewport on the new object so the user always
       // sees what they just made — backend may place it off-screen
@@ -147,6 +160,12 @@ function handleServerMessage(msg: ServerMessage) {
 
     case 'SessionUpdate': {
       ws.setSessionId(msg.payload.session_id)
+      // First time we know the session is live, hydrate the sketch
+      // collection from REST. The model tree needs every existing
+      // sketch to render — Sketch{Created,Updated,Deleted} frames
+      // only fire on changes after this point, so without the seed
+      // a page reload would leave the tree blind to live sessions.
+      hydrateSketchesOnce()
       break
     }
 
@@ -174,7 +193,51 @@ function handleServerMessage(msg: ServerMessage) {
       console.error('[WS] Server error:', msg.payload.message)
       break
     }
+
+    // Sketch lifecycle frames. Backend is the source of truth for
+    // sketch sessions; the local store mirrors the snapshots.
+    case 'SketchCreated':
+    case 'SketchUpdated': {
+      scene.applyServerSketchSnapshot(msg.payload)
+      break
+    }
+    case 'SketchDeleted': {
+      scene.clearServerSketchId(msg.payload.id)
+      break
+    }
+    case 'SketchExtruded': {
+      // The actual mesh arrives via `ObjectCreated` (broadcast just
+      // before this frame). Nothing to wire into the scene store yet —
+      // future timeline / chat hooks can attribute the new solid back
+      // to its sketch via `payload.sketch_id`.
+      break
+    }
   }
+}
+
+// ─── Sketch hydration ───────────────────────────────────────────────
+
+// Latch so we only call `sketchApi.list()` once per WebSocket lifecycle.
+// `SessionUpdate` can fire multiple times (initial Welcome + later
+// reconciliations), but the bootstrapping fetch is idempotent and
+// expensive enough to be worth deduplicating.
+let sketchesHydrated = false
+
+function hydrateSketchesOnce() {
+  if (sketchesHydrated) return
+  sketchesHydrated = true
+  sketchApi
+    .list()
+    .then((sessions) => {
+      useSceneStore.getState().setServerSketches(sessions)
+    })
+    .catch((err) => {
+      // Sketch listing is best-effort; if the endpoint is unreachable
+      // (older backend, network blip), the model tree falls back to
+      // showing only sketches that arrive via WS frames.
+      console.warn('[ws-bridge] sketch hydration failed:', err)
+      sketchesHydrated = false
+    })
 }
 
 // ─── Lifecycle ──────────────────────────────────────────────────────
@@ -210,4 +273,5 @@ export function teardownWebSocket() {
   unsubscribe?.()
   wsClient.disconnect()
   initialized = false
+  sketchesHydrated = false
 }

@@ -18,6 +18,7 @@ mod idempotency;
 mod kernel_state;
 mod metrics;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
+mod sketch;
 mod transactions;
 mod viewport_bridge;
               // Using core geometry-engine directly
@@ -134,6 +135,13 @@ pub struct AppState {
     /// through `track_solid`; `POST /api/tx/{id}/rollback` then
     /// removes them from the kernel store. See `transactions.rs`.
     pub transactions: Arc<transactions::TransactionManager>,
+
+    /// In-progress 2D sketch sessions. Frontend creates one per
+    /// click-to-place workflow; finalising via `POST /api/sketch/{id}/extrude`
+    /// materialises the polygon, lifts it onto the chosen plane, and
+    /// hands it to the existing `extrude_profile` pipeline. See
+    /// `sketch.rs`.
+    pub sketches: Arc<sketch::SketchManager>,
 }
 
 impl AppState {
@@ -248,7 +256,7 @@ async fn delete_geometry_wrapper(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<StatusCode, error_catalog::ApiError> {
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     delete_geometry(Extension(auth_info), State(state), Path(id)).await
 }
 
@@ -1182,8 +1190,14 @@ async fn extrude_face_endpoint(
             .solids
             .get(host_solid_id)
             .ok_or_else(|| ApiError::solid_not_found(host_solid_id))?;
+        // A solid's faces span the outer shell and any inner (void) shells.
+        // The kernel models them in two separate fields rather than a unified
+        // `shells: Vec<ShellId>` so the outer is structurally distinguished
+        // from voids — chain both when answering "does this face belong to
+        // this solid?".
         let mut owns_face = false;
-        for &shell_id in &solid.shells {
+        let outer = std::iter::once(&solid.outer_shell);
+        for &shell_id in outer.chain(solid.inner_shells.iter()) {
             if let Some(shell) = model.shells.get(shell_id) {
                 if shell.faces.contains(&face_id) {
                     owns_face = true;
@@ -1923,12 +1937,41 @@ async fn delete_geometry(
     };
 
     state.unregister_id_mapping(&uuid);
+
+    // Cascade-delete the kernel-side B-Rep so the model isn't left holding
+    // dangling shells/faces/edges; record the operation through the
+    // attached `OperationRecorder` so the timeline panel reflects deletes
+    // alongside creates and edits. Without this hook, deletes were
+    // invisible to the timeline (only the UUID mapping was being dropped),
+    // leaving the history desynced from the visible scene.
+    {
+        let mut model = state.model.write().await;
+        if let Err(e) = geometry_engine::operations::delete::delete_solid(
+            &mut model, solid_id, /* cascade */ true,
+        ) {
+            tracing::warn!(
+                solid_id = solid_id,
+                error = %e,
+                "delete_solid failed; mapping was dropped but kernel state may retain residue"
+            );
+        }
+        model.record_operation(
+            geometry_engine::operations::recorder::RecordedOperation::new("delete_solid")
+                .with_parameters(serde_json::json!({
+                    "uuid":     uuid.to_string(),
+                    "solid_id": solid_id,
+                    "cascade":  true,
+                }))
+                .with_inputs(vec![solid_id as u64]),
+        );
+    }
+
     broadcast_object_deleted(&uuid.to_string());
 
     tracing::info!(
         solid_id = solid_id,
         uuid = %uuid,
-        "DELETE /api/geometry/:id — logical delete (id-mapping dropped, ObjectDeleted broadcast)"
+        "DELETE /api/geometry/:id — kernel solid deleted, recorded, ObjectDeleted broadcast"
     );
 
     Ok(Json(serde_json::json!({
@@ -2661,7 +2704,7 @@ pub fn geometry_broadcaster() -> &'static broadcast::Sender<String> {
 /// per the kernel's contract; if it ever comes back shorter than the
 /// triangle count we pad with `0` rather than panic — the frontend
 /// just won't be able to face-pick those triangles.
-fn flatten_tri_mesh(
+pub(crate) fn flatten_tri_mesh(
     tri_mesh: &geometry_engine::tessellation::TriangleMesh,
 ) -> (Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(tri_mesh.vertices.len() * 3);
@@ -2727,7 +2770,7 @@ fn compute_bbox_and_center(vertices: &[f32]) -> ([f32; 3], [f32; 3], [f32; 3]) {
 /// and surface area remain zero until the kernel exposes a per-solid
 /// query for them.
 #[allow(clippy::too_many_arguments)]
-fn broadcast_object_created(
+pub(crate) fn broadcast_object_created(
     object_id: &str,
     name: &str,
     solid_id: u32,
@@ -2792,7 +2835,7 @@ fn broadcast_object_created(
 /// solid from its scene. Used by the boolean op (consumed operands), the
 /// DELETE endpoint, and the face-extrude endpoint (the host solid is
 /// replaced by a new id once the kernel finishes).
-fn broadcast_object_deleted(object_id: &str) {
+pub(crate) fn broadcast_object_deleted(object_id: &str) {
     let frame = serde_json::json!({
         "type": "ObjectDeleted",
         "payload": { "id": object_id }
@@ -3285,6 +3328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         performance_metrics: Arc::new(Mutex::new(metrics::PerformanceTracker::default())),
         viewport_bridge: viewport_bridge::ViewportBridge::new(),
         transactions: Arc::new(transactions::TransactionManager::new()),
+        sketches: Arc::new(sketch::SketchManager::new()),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside
@@ -3352,6 +3396,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/boolean", post(boolean_operation))
         .route("/api/geometry/extrude", post(create_extrude))
         .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
+        // 2D sketch sessions — backend-owned source of truth for the
+        // click-to-place workflow. Frontend creates a session, streams
+        // points / plane / tool changes through the REST surface, and
+        // finalises with `/extrude` to lift the polygon into a solid.
+        // Every mutation publishes a Sketch* WS frame so collaborators
+        // see each other's drawings live. See `sketch.rs`.
+        .route(
+            "/api/sketch",
+            post(sketch::create_sketch).get(sketch::list_sketches),
+        )
+        .route(
+            "/api/sketch/{id}",
+            get(sketch::get_sketch).delete(sketch::delete_sketch),
+        )
+        .route("/api/sketch/{id}/point", post(sketch::add_sketch_point))
+        .route(
+            "/api/sketch/{id}/point/last",
+            delete(sketch::pop_sketch_point),
+        )
+        .route(
+            "/api/sketch/{id}/point/{idx}",
+            put(sketch::set_sketch_point),
+        )
+        .route(
+            "/api/sketch/{id}/points",
+            delete(sketch::clear_sketch_points),
+        )
+        .route("/api/sketch/{id}/plane", put(sketch::set_sketch_plane))
+        .route("/api/sketch/{id}/tool", put(sketch::set_sketch_tool))
+        .route(
+            "/api/sketch/{id}/circle-segments",
+            put(sketch::set_sketch_circle_segments),
+        )
+        .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.

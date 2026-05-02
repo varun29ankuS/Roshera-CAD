@@ -24,7 +24,10 @@ export interface MeshData {
 export interface AnalyticalGeometry {
   solid_id: number
   primitive_type: string
-  parameters: Record<string, number>
+  // Heterogeneous: primitives ship numeric dimensions, but booleans/
+  // extrudes ship strings, arrays, and nested values. Mirrors the
+  // backend `serde_json::json!` payload exactly.
+  parameters: Record<string, unknown>
   properties: {
     volume: number
     surface_area: number

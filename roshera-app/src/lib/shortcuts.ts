@@ -1,13 +1,24 @@
 import { useEffect } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
+import { useWSStore } from '@/stores/ws-store'
 import { wsClient } from './ws-client'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
 async function timelineAction(action: 'undo' | 'redo') {
+  // Backend `undo_operation` / `redo_operation` require a `session_id`
+  // in the JSON body — without it they 400 and the keyboard shortcut
+  // appears to do nothing. Pull the live session id from the WS store
+  // (populated by `Welcome` / `SessionUpdate` frames) and POST it.
+  const sessionId = useWSStore.getState().sessionId
+  if (!sessionId) return
   try {
-    await fetch(`${API_BASE}/api/timeline/${action}`, { method: 'POST' })
+    await fetch(`${API_BASE}/api/timeline/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    })
   } catch {
     // backend not running
   }

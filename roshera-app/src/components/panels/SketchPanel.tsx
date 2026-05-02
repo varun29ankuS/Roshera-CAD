@@ -38,10 +38,10 @@ import {
 import { useChatStore } from '@/stores/chat-store'
 import {
   buildProfile2D,
-  extrudeSketch,
   perimeter,
   signedArea,
 } from '@/lib/sketch-extrude'
+import { sketchApi } from '@/lib/sketch-api'
 import { cn } from '@/lib/utils'
 
 const PLANE_OPTIONS: Array<{ value: SketchPlane; label: string }> = [
@@ -93,28 +93,35 @@ export function SketchPanel() {
       setError('Need more points')
       return
     }
+    if (!sketch.serverId) {
+      // The backend create round-trip hasn't landed yet. The user can
+      // retry in a moment; we don't fall back to the legacy
+      // frontend-driven extrude because that would silently drop the
+      // session lifecycle frames the timeline panel depends on.
+      setError('Preparing sketch session — try again in a moment')
+      return
+    }
     setBusy(true)
     try {
-      const result = await extrudeSketch({
-        plane: sketch.plane,
-        tool: sketch.tool,
-        points: sketch.points,
-        thickness: sketch.thickness,
-        circleSegments: sketch.circleSegments,
+      const result = await sketchApi.extrude(sketch.serverId, {
+        distance: sketch.thickness,
         name: `${sketch.tool}-extrude`,
       })
       const { addMessage } = useChatStore.getState()
       const stats =
-        result.vertexCount && result.triangleCount
-          ? ` (${result.vertexCount} verts, ${result.triangleCount} tris${
-              result.tessellationMs ? `, ${result.tessellationMs} ms` : ''
+        result.stats?.vertex_count && result.stats?.triangle_count
+          ? ` (${result.stats.vertex_count} verts, ${result.stats.triangle_count} tris${
+              result.stats.tessellation_ms ? `, ${result.stats.tessellation_ms} ms` : ''
             })`
           : ''
       addMessage({
         role: 'assistant',
         content: `Extruded ${sketch.tool} on ${sketch.plane.toUpperCase()} plane (t=${sketch.thickness})${stats}.`,
-        objectsAffected: [result.objectId],
+        objectsAffected: [result.object.id],
       })
+      // Backend has consumed the session (default `consume: true`),
+      // so a `SketchDeleted` broadcast already cleared `serverId` in
+      // the store. Tear down the local active flag too.
       exitSketch()
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -128,6 +135,7 @@ export function SketchPanel() {
     sketch.circleSegments,
     sketch.plane,
     sketch.points,
+    sketch.serverId,
     sketch.thickness,
     sketch.tool,
   ])

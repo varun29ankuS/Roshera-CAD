@@ -42,7 +42,14 @@ export const meshDataSchema = z.object({
 export const analyticalGeometrySchema = z.object({
   solid_id: z.number(),
   primitive_type: z.string(),
-  parameters: z.record(z.string(), z.number()),
+  // Operation parameters are heterogeneous: primitives ship `{width, height,
+  // depth}` (numbers), but booleans ship `{operation: "union"}`, extrudes
+  // ship `{profile: [[x,y],…], direction: [x,y,z], distance: n}`, and
+  // face-extrudes ship `{host_uuid: "…", face_id: n, direction: […], distance: n}`.
+  // Locking values to numbers caused every non-primitive ObjectCreated frame
+  // to fail validation and be silently dropped — Timeline showed the op,
+  // but Browser and the viewport stayed empty. Accept any JSON value.
+  parameters: z.record(z.string(), z.unknown()),
   properties: z.object({
     volume: z.number(),
     surface_area: z.number(),
@@ -87,6 +94,18 @@ export const cadObjectSchema = z.object({
 const subElementSchema = z.object({
   type: z.enum(['face', 'edge', 'vertex']),
   index: z.number(),
+})
+
+// Backend `SketchSession` wire shape (snake_case as serialised by serde).
+// Mirrors `roshera-backend/api-server/src/sketch.rs::SketchSession`.
+export const sketchSessionSchema = z.object({
+  id: z.string(),
+  plane: z.enum(['xy', 'xz', 'yz']),
+  tool: z.enum(['polyline', 'rectangle', 'circle']),
+  points: z.array(z.tuple([z.number(), z.number()])),
+  circle_segments: z.number(),
+  created_at: z.number(),
+  updated_at: z.number(),
 })
 
 // ─── Discriminated union of every accepted ServerMessage variant ────
@@ -159,6 +178,34 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('Error'),
     payload: z.object({ message: z.string() }),
+  }),
+  // Sketch lifecycle frames. Backend pushes one after every mutating
+  // REST call so peers stay in lock-step with the authoring client.
+  // `SketchCreated` / `SketchUpdated` carry the full session snapshot;
+  // `SketchDeleted` carries only the id; `SketchExtruded` links the
+  // session to the solid it produced (the actual mesh arrives via
+  // `ObjectCreated` immediately before this frame).
+  z.object({
+    type: z.literal('SketchCreated'),
+    payload: sketchSessionSchema,
+  }),
+  z.object({
+    type: z.literal('SketchUpdated'),
+    payload: sketchSessionSchema,
+  }),
+  z.object({
+    type: z.literal('SketchDeleted'),
+    payload: z.object({ id: z.string() }),
+  }),
+  z.object({
+    type: z.literal('SketchExtruded'),
+    payload: z.object({
+      sketch_id: z.string(),
+      object_id: z.string(),
+      solid_id: z.number(),
+      plane: z.enum(['xy', 'xz', 'yz']),
+      tool: z.enum(['polyline', 'rectangle', 'circle']),
+    }),
   }),
 ])
 
