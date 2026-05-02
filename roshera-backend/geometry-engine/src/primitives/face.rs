@@ -310,6 +310,97 @@ impl Face {
         !self.trim_curves.is_empty()
     }
 
+    /// Check if this face is geometrically degenerate.
+    ///
+    /// A face is reported as degenerate when any of the following hold:
+    /// - The outer loop is missing or one of its referenced edges/vertices
+    ///   cannot be resolved (structural degeneracy).
+    /// - The outer loop has fewer than 3 *distinct* vertex positions under
+    ///   `tolerance.distance()` (consecutive duplicates and the wrap-around
+    ///   pair are collapsed before the count).
+    /// - The boundary's signed planar area, computed via Newell's method,
+    ///   is at or below `tolerance.distance().powi(2)` — this catches
+    ///   collinear vertices and otherwise "thin" sliver loops while
+    ///   matching the squared-length scale that `Tolerance::distance()`
+    ///   already uses elsewhere in the kernel.
+    ///
+    /// Inner loops are intentionally not validated here: they are bounded
+    /// by the outer loop, and a face whose outer boundary is sound but
+    /// whose inner loops are degenerate is a separate validation concern.
+    /// Run loop-level validation through `LoopStore` if hole geometry
+    /// must also be checked.
+    pub fn is_degenerate(
+        &self,
+        loop_store: &LoopStore,
+        edge_store: &EdgeStore,
+        vertex_store: &VertexStore,
+        tolerance: Tolerance,
+    ) -> bool {
+        let outer_loop = match loop_store.get(self.outer_loop) {
+            Some(l) => l,
+            None => return true,
+        };
+
+        let vertex_ids = match outer_loop.vertices_cached(edge_store) {
+            Ok(v) => v,
+            Err(_) => return true,
+        };
+
+        if vertex_ids.len() < 3 {
+            return true;
+        }
+
+        let tol = tolerance.distance();
+        let tol_sq = tol * tol;
+
+        // Resolve vertex positions and collapse consecutive duplicates.
+        let mut positions: Vec<Point3> = Vec::with_capacity(vertex_ids.len());
+        for vid in &vertex_ids {
+            let v = match vertex_store.get(*vid) {
+                Some(v) => v,
+                None => return true,
+            };
+            let p = Vector3::new(v.position[0], v.position[1], v.position[2]);
+            if let Some(last) = positions.last() {
+                if (*last - p).magnitude_squared() <= tol_sq {
+                    continue;
+                }
+            }
+            positions.push(p);
+        }
+
+        // Collapse the wrap-around duplicate (loops are closed by
+        // construction; the last cached vertex may equal the first).
+        if positions.len() > 1 {
+            // Indexing by len()-1 is bounded by the explicit len() > 1 guard
+            // immediately above and never panics.
+            let first = positions[0];
+            let last = positions[positions.len() - 1];
+            if (first - last).magnitude_squared() <= tol_sq {
+                positions.pop();
+            }
+        }
+
+        if positions.len() < 3 {
+            return true;
+        }
+
+        // Newell's formula for the planar projected area of a polygon in
+        // 3D: A = 0.5 * |Σ_i (P_i × P_{i+1})|. This is exact for planar
+        // polygons and yields a near-zero magnitude for collinear or
+        // sliver loops regardless of the loop's plane orientation.
+        let n = positions.len();
+        let mut area_vec = Vector3::new(0.0, 0.0, 0.0);
+        for i in 0..n {
+            let p0 = positions[i];
+            let p1 = positions[(i + 1) % n];
+            area_vec = area_vec + p0.cross(&p1);
+        }
+        let area = 0.5 * area_vec.magnitude();
+
+        area <= tol_sq
+    }
+
     /// Get normal at UV point (oriented)
     #[inline]
     pub fn normal_at(&self, u: f64, v: f64, surface_store: &SurfaceStore) -> MathResult<Vector3> {

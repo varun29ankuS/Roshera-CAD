@@ -3141,16 +3141,98 @@ mod tests {
         let surface_id = model.surfaces.add(Box::new(plane));
         let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
 
-        // In a robust system, we should detect this is degenerate
-        // For now, just create it and note the issue
         let face_id = model.faces.add(face);
 
-        println!("⚠️ Zero-area face created without validation - this is a critical issue!");
-        println!("   Real implementation must detect and handle degenerate geometry");
+        // Verify the face exists and that the kernel reports it as degenerate.
+        // The boundary v1=(0,0,0) → v2=(1,0,0) → v3=(0.5,0,0) is collinear,
+        // so the Newell-area term collapses to ~0 and `is_degenerate` must
+        // return true.
+        let stored_face = model
+            .faces
+            .get(face_id)
+            .expect("face was just inserted into the store");
+        assert!(
+            stored_face.is_degenerate(&model.loops, &model.edges, &model.vertices, tolerance),
+            "collinear-vertex face must be reported as degenerate"
+        );
+    }
 
-        // Verify the face exists but is degenerate
-        assert!(model.faces.get(face_id).is_some());
-        // TODO: Add face.is_degenerate() check
+    #[test]
+    fn test_non_degenerate_face_passes() {
+        use crate::primitives::{
+            curve::{Line, ParameterRange},
+            edge::{Edge, EdgeOrientation},
+            r#loop::{Loop, LoopType},
+            topology_builder::BRepModel,
+        };
+
+        let tolerance = Tolerance::default();
+        let mut model = BRepModel::new();
+
+        // Build a proper, non-collinear right triangle on the z=0 plane.
+        let v1 = model
+            .vertices
+            .add_or_find(0.0, 0.0, 0.0, tolerance.distance());
+        let v2 = model
+            .vertices
+            .add_or_find(1.0, 0.0, 0.0, tolerance.distance());
+        let v3 = model
+            .vertices
+            .add_or_find(0.0, 1.0, 0.0, tolerance.distance());
+
+        let line1 = Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0));
+        let c1 = model.curves.add(Box::new(line1));
+        let e1 = model.edges.add_or_find(Edge::new(
+            0,
+            v1,
+            v2,
+            c1,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+
+        let line2 = Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0));
+        let c2 = model.curves.add(Box::new(line2));
+        let e2 = model.edges.add_or_find(Edge::new(
+            0,
+            v2,
+            v3,
+            c2,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+
+        let line3 = Line::new(Point3::new(0.0, 1.0, 0.0), Point3::new(0.0, 0.0, 0.0));
+        let c3 = model.curves.add(Box::new(line3));
+        let e3 = model.edges.add_or_find(Edge::new(
+            0,
+            v3,
+            v1,
+            c3,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+
+        let mut loop_ = Loop::new(0, LoopType::Outer);
+        loop_.add_edge(e1, true);
+        loop_.add_edge(e2, true);
+        loop_.add_edge(e3, true);
+        let loop_id = model.loops.add(loop_);
+
+        let plane = Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X)
+            .expect("Plane creation should succeed");
+        let surface_id = model.surfaces.add(Box::new(plane));
+        let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        let face_id = model.faces.add(face);
+
+        let stored_face = model
+            .faces
+            .get(face_id)
+            .expect("face was just inserted into the store");
+        assert!(
+            !stored_face.is_degenerate(&model.loops, &model.edges, &model.vertices, tolerance),
+            "right triangle with area 0.5 must not be reported as degenerate"
+        );
     }
 
     #[test]
