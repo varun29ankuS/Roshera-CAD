@@ -1,9 +1,16 @@
 //! Export handlers
+//!
+//! Sources every export from the kernel's `BRepModel` directly — the
+//! REST geometry pipeline never writes into `session_manager.objects`,
+//! so the old session-state path was always empty. Resolution order:
+//! `request.objects` UUIDs flow through `AppState::uuid_to_local`;
+//! plain numeric strings are accepted as legacy local solid ids; an
+//! empty list means "every reachable solid".
 
 use crate::AppState;
 use axum::{extract::State, http::StatusCode, response::Json};
+use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use shared_types::*;
-use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -13,79 +20,102 @@ pub async fn export_mesh(
 ) -> Result<Json<ExportResponse>, StatusCode> {
     let start = Instant::now();
 
-    // Get the first available session for demo
-    // In production, this would come from auth context
-    let session_id = match state.session_manager.list_sessions().await.first() {
-        Some(id) => id.to_string(),
-        None => {
-            // Create a demo session if none exists
-            state
-                .session_manager
-                .create_session("demo".to_string())
-                .await
-        }
-    };
+    // Hold a read guard for the duration of the export — both the
+    // tessellation pass below and (later) the ROS/STEP exporters need
+    // a stable kernel snapshot.
+    let model = state.model.read().await;
 
-    // Get the session
-    let session = state
-        .session_manager
-        .get_session(&session_id)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-
-    let session_state = session.read().await;
-
-    // Collect meshes and objects to export
-    let mut meshes_to_export = Vec::new();
-    let mut objects_to_export = Vec::new();
-    let mut object_names = Vec::new();
-
-    if request.objects.is_empty() {
-        // Export all objects
-        for (_, object) in &session_state.objects {
-            meshes_to_export.push(object.mesh.clone());
-            objects_to_export.push(object.clone());
-            object_names.push(object.name.clone());
-        }
+    // Resolve which kernel solid_ids to export. Three input shapes:
+    // * empty list  → every reachable solid
+    // * UUID string → resolve via id-mapping
+    // * numeric str → legacy local id
+    let solids_to_export: Vec<u32> = if request.objects.is_empty() {
+        model.solids.iter().map(|(sid, _)| sid).collect()
     } else {
-        // Export specific objects
+        let mut ids = Vec::with_capacity(request.objects.len());
         for object_id in &request.objects {
-            if let Some(object) = session_state.objects.get(object_id) {
-                meshes_to_export.push(object.mesh.clone());
-                objects_to_export.push(object.clone());
-                object_names.push(object.name.clone());
+            let id_str = object_id.to_string();
+            if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                if let Some(local) = state.get_local_id(&uuid) {
+                    ids.push(local);
+                } else {
+                    tracing::warn!(uuid = %uuid, "export: UUID has no kernel mapping");
+                }
+            } else if let Ok(numeric) = id_str.parse::<u32>() {
+                if model.solids.get(numeric).is_some() {
+                    ids.push(numeric);
+                } else {
+                    tracing::warn!(local_id = numeric, "export: numeric id not in kernel");
+                }
             } else {
-                tracing::warn!("Object {} not found in session", object_id);
+                tracing::warn!(received = %id_str, "export: object id is neither UUID nor numeric");
             }
         }
-    }
+        ids
+    };
 
-    if meshes_to_export.is_empty() {
-        tracing::error!("No objects to export");
+    if solids_to_export.is_empty() {
+        tracing::error!("export: no solids to export");
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Handle multiple meshes
-    let final_mesh = match meshes_to_export.len() {
-        0 => {
-            // Already guarded by the `meshes_to_export.is_empty()` check above,
-            // but handle defensively rather than panicking.
-            tracing::error!("No meshes available to export after collection");
-            return Err(StatusCode::NOT_FOUND);
-        }
-        1 => meshes_to_export.swap_remove(0),
-        _ => {
-            // Merge multiple meshes into one
-            tracing::info!("Merging {} meshes for export", meshes_to_export.len());
+    // Tessellate every selected solid and merge into a single
+    // `shared_types::Mesh`. We can't use `Mesh::merge_multiple` here —
+    // the kernel produces `tessellation::TriangleMesh`, not
+    // `shared_types::Mesh` — so the offset+append loop is inline.
+    let tess_params = TessellationParams::default();
+    let mut merged_vertices: Vec<f32> = Vec::new();
+    let mut merged_normals: Vec<f32> = Vec::new();
+    let mut merged_indices: Vec<u32> = Vec::new();
+    let mut vertex_offset: u32 = 0;
+    let mut object_names: Vec<String> = Vec::with_capacity(solids_to_export.len());
 
-            // Collect references and transforms for merging
-            let mesh_refs: Vec<&Mesh> = meshes_to_export.iter().collect();
-            let transforms: Vec<&Transform3D> =
-                objects_to_export.iter().map(|obj| &obj.transform).collect();
-
-            // Use the new mesh merging functionality
-            Mesh::merge_multiple(mesh_refs, Some(transforms))
+    for &solid_id in &solids_to_export {
+        let solid = match model.solids.get(solid_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let tri_mesh = tessellate_solid(solid, &model, &tess_params);
+        if tri_mesh.triangles.is_empty() {
+            tracing::warn!(solid_id, "export: solid tessellated to zero triangles, skipping");
+            continue;
         }
+        for v in &tri_mesh.vertices {
+            merged_vertices.push(v.position.x as f32);
+            merged_vertices.push(v.position.y as f32);
+            merged_vertices.push(v.position.z as f32);
+            merged_normals.push(v.normal.x as f32);
+            merged_normals.push(v.normal.y as f32);
+            merged_normals.push(v.normal.z as f32);
+        }
+        for tri in &tri_mesh.triangles {
+            merged_indices.push(tri[0] + vertex_offset);
+            merged_indices.push(tri[1] + vertex_offset);
+            merged_indices.push(tri[2] + vertex_offset);
+        }
+        vertex_offset += tri_mesh.vertices.len() as u32;
+        // Use the reverse id-mapping as the display name when available;
+        // fall back to the local id stringified.
+        let label = state
+            .local_to_uuid
+            .get(&solid_id)
+            .map(|entry| entry.value().to_string())
+            .unwrap_or_else(|| format!("solid_{solid_id}"));
+        object_names.push(label);
+    }
+
+    if merged_indices.is_empty() {
+        tracing::error!("export: every selected solid tessellated to empty");
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let final_mesh = Mesh {
+        vertices: merged_vertices,
+        indices: merged_indices,
+        normals: merged_normals,
+        uvs: None,
+        colors: None,
+        face_map: None,
     };
 
     // Generate filename
@@ -125,38 +155,26 @@ pub async fn export_mesh(
                 tracing::error!("OBJ export failed: {:?}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?,
-        ExportFormat::ROS => {
-            // ROS export requires the full B-Rep, which lives on the
-            // server-side `AppState::model` (an Arc<RwLock<BRepModel>>).
-            // A read lock is sufficient: `export_brep_to_ros` does not
-            // mutate topology, only serialises it.
-            let model = state.model.read().await;
-            state
-                .export_engine
-                .export_ros(
-                    &model,
-                    &safe_name,
-                    export_engine::formats::ros::RosExportOptions::default(),
-                )
-                .await
-                .map_err(|e| {
-                    tracing::error!("ROS export failed: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-        }
-        ExportFormat::STEP => {
-            // STEP export reads the B-Rep directly; same locking story
-            // as ROS above.
-            let model = state.model.read().await;
-            state
-                .export_engine
-                .export_step(&model, &safe_name)
-                .await
-                .map_err(|e| {
-                    tracing::error!("STEP export failed: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-        }
+        ExportFormat::ROS => state
+            .export_engine
+            .export_ros(
+                &model,
+                &safe_name,
+                export_engine::formats::ros::RosExportOptions::default(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("ROS export failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
+        ExportFormat::STEP => state
+            .export_engine
+            .export_step(&model, &safe_name)
+            .await
+            .map_err(|e| {
+                tracing::error!("STEP export failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
         _ => {
             tracing::warn!("Unsupported export format: {:?}", request.format);
             return Err(StatusCode::NOT_IMPLEMENTED);

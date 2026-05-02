@@ -28,30 +28,49 @@ async function timelineAction(action: 'undo' | 'redo') {
   }
 }
 
+// Two-step export: POST /api/export returns { filename, download_url, … };
+// the actual bytes live behind a follow-up GET /api/download/:filename so
+// the server can stream large STEP/ROS payloads off disk without buffering
+// them in the JSON response. Frontend stitches the two together into a
+// single user-visible download.
 async function exportGeometry(format: string) {
-  const sessionId = useWSStore.getState().sessionId || 'default-session'
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
   try {
-    const resp = await fetch(`${API_BASE}/api/export`, {
+    const exportResp = await fetch(`${API_BASE}/api/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         format,
-        session_id: sessionId,
-        objects: selectedIds.length > 0 ? selectedIds : undefined,
+        objects: selectedIds,
         options: { binary: true, include_materials: true, merge_objects: false },
       }),
     })
-    if (!resp.ok) return
-    const blob = await resp.blob()
+    if (!exportResp.ok) {
+      console.error(`Export failed: ${exportResp.status} ${exportResp.statusText}`)
+      return
+    }
+    const meta = (await exportResp.json()) as {
+      filename: string
+      download_url: string
+      file_size: number
+      success: boolean
+    }
+    if (!meta.success || !meta.download_url) return
+
+    const fileResp = await fetch(`${API_BASE}${meta.download_url}`)
+    if (!fileResp.ok) {
+      console.error(`Download failed: ${fileResp.status} ${fileResp.statusText}`)
+      return
+    }
+    const blob = await fileResp.blob()
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `export.${format.toLowerCase()}`
+    a.download = meta.filename
     a.click()
     URL.revokeObjectURL(url)
-  } catch {
-    // backend not running
+  } catch (err) {
+    console.error('Export error:', err)
   }
 }
 

@@ -3397,6 +3397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sessions/{id}/leave", post(leave_session))
         // Export endpoints
         .route("/api/export", post(export_mesh))
+        .route("/api/download/{filename}", get(download_file))
         // Auth endpoints
         .route("/api/auth/login", post(login))
         .route("/api/auth/register", post(register))
