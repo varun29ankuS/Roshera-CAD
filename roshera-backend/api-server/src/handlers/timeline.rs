@@ -346,22 +346,73 @@ pub async fn get_history(
             id: event.id.to_string(),
             sequence_number: event.sequence_number,
             timestamp: event.timestamp.to_rfc3339(),
-            operation_type: format!("{:?}", event.operation),
-            author: format!("{:?}", event.author),
+            operation_type: operation_kind(&event.operation),
+            operation: serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null),
+            author: author_label(&event.author),
+            author_kind: author_kind(&event.author),
         })
         .collect();
 
     Ok(Json(summaries))
 }
 
+/// Extract the clean kernel-level kind name from an Operation.
+///
+/// For `Operation::Generic { command_type, .. }` (which is how the
+/// kernel→timeline bridge encodes every recorded kernel call) this is
+/// the kernel kind verbatim — `"create_box_3d"`, `"extrude_face"`, …
+/// For other variants we surface the serde tag (`"BooleanUnion"`,
+/// `"CreateSketch"`, …) which is stable across releases.
+fn operation_kind(op: &Operation) -> String {
+    if let Operation::Generic { command_type, .. } = op {
+        return command_type.clone();
+    }
+    // Use serde's tag — every variant carries one via `#[serde(tag = "type")]`.
+    serde_json::to_value(op)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Human-readable display name for an Author.
+fn author_label(author: &Author) -> String {
+    match author {
+        Author::User { name, .. } => name.clone(),
+        Author::AIAgent { id, .. } => id.clone(),
+        Author::System => "System".to_string(),
+    }
+}
+
+/// Coarse classification for UI tinting: "user" | "ai" | "system".
+fn author_kind(author: &Author) -> String {
+    match author {
+        Author::User { .. } => "user".to_string(),
+        Author::AIAgent { .. } => "ai".to_string(),
+        Author::System => "system".to_string(),
+    }
+}
+
 /// Event summary for history
 #[derive(Serialize, Deserialize)]
 pub struct EventSummary {
+    /// Event UUID
     pub id: String,
+    /// Branch-local monotonic sequence number
     pub sequence_number: u64,
+    /// RFC 3339 timestamp
     pub timestamp: String,
+    /// Clean kernel-level operation kind ("create_box_3d", "BooleanUnion", …)
     pub operation_type: String,
+    /// Full structured operation as tagged JSON
+    pub operation: serde_json::Value,
+    /// Display name of the author
     pub author: String,
+    /// Author classification for UI tinting: "user" | "ai" | "system"
+    pub author_kind: String,
 }
 
 /// Checkpoint/tag a specific state
@@ -602,7 +653,7 @@ pub async fn undo_operation(
                     .collect();
                 affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
                 affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
-                (affected, format!("{:?}", event.operation))
+                (affected, operation_kind(&event.operation))
             };
 
             // Reconcile the live BRepModel with the new (post-undo) timeline
@@ -714,7 +765,7 @@ pub async fn redo_operation(
                     .collect();
                 affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
                 affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
-                (affected, format!("{:?}", event.operation))
+                (affected, operation_kind(&event.operation))
             };
 
             // Re-apply events up through the new (post-redo) position so

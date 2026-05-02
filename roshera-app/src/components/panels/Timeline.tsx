@@ -45,56 +45,89 @@ interface EventSummary {
   id: string
   sequence_number: number
   timestamp: string // ISO 8601
-  operation_type: string
-  author: string
+  operation_type: string // clean kernel kind, e.g. "create_box_3d"
+  /** Full structured operation as tagged JSON (backend-emitted). */
+  operation?: unknown
+  author: string // clean display name
+  /** Backend-emitted classification: "user" | "ai" | "system". */
+  author_kind?: AuthorKind
 }
 
-// ─── Unicode symbol map (terminal aesthetic) ────────────────────────
+// ─── Kernel kind → symbol/label (terminal aesthetic) ────────────────
+//
+// `operation_type` is the clean kernel command name emitted by the
+// timeline-engine bridge — e.g. "create_box_3d", "extrude_face",
+// "boolean_operation", "fillet_edges". The legacy debug-string format
+// (`Generic { command_type: "create_box_3d", ... }`) is still tolerated
+// as a fallback so old timelines on disk render correctly.
+
+function normalizeKind(op: string): string {
+  // Legacy: "Generic { command_type: \"create_box_3d\", ... }"
+  const inner = op.match(/command_type:\s*"?(\w+)"?/)
+  if (inner) return inner[1]
+  // Legacy: "CreatePrimitive { shape_type: Box, ... }" → "createprimitive_box"
+  const shape = op.match(/shape_type:\s*(\w+)/i)
+  if (shape && /^createprimitive/i.test(op)) {
+    return `create_${shape[1].toLowerCase()}_3d`
+  }
+  return op
+}
 
 function symbolForOperation(op: string): string {
-  // Try to extract primitive shape first (CreatePrimitive { shape_type: Box, ... })
-  const shapeMatch = op.match(/shape_type:\s*(\w+)/i)
-  if (shapeMatch) {
-    switch (shapeMatch[1].toLowerCase()) {
-      case 'box': return '▣'
-      case 'sphere': return '◯'
-      case 'cylinder': return '⊟'
-      case 'cone': return '△'
-      case 'torus': return '◎'
-    }
-  }
-
-  const lower = op.toLowerCase()
-  if (lower.includes('union')) return '∪'
-  if (lower.includes('intersection')) return '∩'
-  if (lower.includes('difference') || lower.includes('subtract')) return '⊖'
-  if (lower.includes('extrude')) return '↑'
-  if (lower.includes('revolve')) return '↻'
-  if (lower.includes('transform')) return '⇆'
-  if (lower.includes('delete')) return '✕'
-  if (lower.includes('fillet')) return '◜'
-  if (lower.includes('chamfer')) return '⬡'
-  if (lower.includes('create')) return '▣'
+  const k = normalizeKind(op).toLowerCase()
+  if (k.startsWith('create_box') || k === 'create_cube_3d') return '▣'
+  if (k.startsWith('create_sphere')) return '◯'
+  if (k.startsWith('create_cylinder')) return '⊟'
+  if (k.startsWith('create_cone')) return '△'
+  if (k.startsWith('create_torus')) return '◎'
+  if (k.startsWith('create_point')) return '·'
+  if (k.startsWith('create_line')) return '─'
+  if (k.startsWith('create_circle')) return '○'
+  if (k.startsWith('create_rectangle')) return '▭'
+  if (k.startsWith('plane_')) return '▱'
+  if (k.startsWith('extrude')) return '↑'
+  if (k.startsWith('revolve')) return '↻'
+  if (k.startsWith('sweep')) return '↝'
+  if (k.startsWith('loft')) return '≋'
+  if (k.startsWith('fillet')) return '◜'
+  if (k.startsWith('chamfer')) return '⬡'
+  if (k.startsWith('transform')) return '⇆'
+  if (k.startsWith('boolean')) return '⊕'
+  if (k.includes('union')) return '∪'
+  if (k.includes('intersection')) return '∩'
+  if (k.includes('difference') || k.includes('subtract')) return '⊖'
+  if (k.includes('delete')) return '✕'
+  if (k.includes('update')) return '✎'
+  if (k.startsWith('create')) return '▣'
   return '◆'
 }
 
 function shortLabel(op: string): string {
-  const lower = op.toLowerCase()
-  if (lower.includes('createprimitive')) {
-    const shape = op.match(/shape_type:\s*(\w+)/i)
-    if (shape) return shape[1].slice(0, 4)
-    return 'Crt'
-  }
-  if (lower.includes('booleanunion')) return 'Un'
-  if (lower.includes('booleanintersection')) return 'Int'
-  if (lower.includes('booleandifference')) return 'Df'
-  if (lower.includes('extrude')) return 'Ext'
-  if (lower.includes('revolve')) return 'Rv'
-  if (lower.includes('transform')) return 'Tr'
-  if (lower.includes('delete')) return 'Del'
-  if (lower.includes('fillet')) return 'Fil'
-  if (lower.includes('chamfer')) return 'Cha'
-  const match = op.match(/^(\w+)/)
+  const k = normalizeKind(op).toLowerCase()
+  if (k.startsWith('create_box') || k === 'create_cube_3d') return 'Box'
+  if (k.startsWith('create_sphere')) return 'Sph'
+  if (k.startsWith('create_cylinder')) return 'Cyl'
+  if (k.startsWith('create_cone')) return 'Con'
+  if (k.startsWith('create_torus')) return 'Tor'
+  if (k.startsWith('create_point')) return 'Pt'
+  if (k.startsWith('create_line')) return 'Lin'
+  if (k.startsWith('create_circle')) return 'Cir'
+  if (k.startsWith('create_rectangle')) return 'Rec'
+  if (k.startsWith('plane_')) return 'Pln'
+  if (k.startsWith('extrude')) return 'Ext'
+  if (k.startsWith('revolve')) return 'Rev'
+  if (k.startsWith('sweep')) return 'Swp'
+  if (k.startsWith('loft')) return 'Lft'
+  if (k.startsWith('fillet')) return 'Fil'
+  if (k.startsWith('chamfer')) return 'Cha'
+  if (k.startsWith('transform')) return 'Tr'
+  if (k.startsWith('boolean')) return 'Bool'
+  if (k.includes('union')) return 'Un'
+  if (k.includes('intersection')) return 'Int'
+  if (k.includes('difference')) return 'Df'
+  if (k.includes('delete')) return 'Del'
+  if (k.includes('update')) return 'Upd'
+  const match = k.match(/^(\w+)/)
   return match ? match[1].slice(0, 4) : '?'
 }
 
@@ -121,17 +154,20 @@ function relativeTime(ts: string): string {
 }
 
 function formatAuthor(author: string): string {
-  if (author === 'System') return 'System'
+  // New backend already emits clean strings ("Varun", "Claude", "System").
+  // Legacy Debug strings ("User { id: 1, name: Varun }") still parsed as
+  // a fallback so persisted timelines render the right name.
+  if (!author) return '?'
   const nameMatch = author.match(/name:\s*(\w+)/)
   if (nameMatch) return nameMatch[1]
-  if (author.includes('AIAgent')) return 'AI'
-  if (author.includes('User')) return 'User'
   return author
 }
 
 type AuthorKind = 'user' | 'ai' | 'system'
 
-function authorKind(author: string): AuthorKind {
+function authorKind(author: string, hint?: AuthorKind): AuthorKind {
+  // Prefer the backend-supplied classification when present.
+  if (hint === 'user' || hint === 'ai' || hint === 'system') return hint
   if (author === 'System') return 'system'
   if (author.includes('AIAgent') || author.includes('AI')) return 'ai'
   if (author.includes('User') || author.includes('name:')) return 'user'
@@ -171,7 +207,7 @@ function EventNode({
 }) {
   const symbol = symbolForOperation(event.operation_type)
   const label = shortLabel(event.operation_type)
-  const kind = authorKind(event.author)
+  const kind = authorKind(event.author, event.author_kind)
   const glyph = authorGlyph(kind)
   // `now` participates so this re-renders when the parent ticks.
   void now
