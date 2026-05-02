@@ -1422,45 +1422,80 @@ async fn update_geometry(
     ))
 }
 
-/// DELETE /api/geometry/:id — same architectural rule as update_geometry:
-/// deletions must flow through the timeline. The kernel does not yet
-/// expose a Solid-removal entry point that's safe to expose through a
-/// raw HTTP path, and silently soft-deleting via this endpoint would
-/// fork the timeline replay state.
+/// DELETE /api/geometry/:id — logical delete.
+///
+/// Accepts either a UUID (preferred) or the legacy numeric solid id.
+/// The kernel's `SolidStore::remove` shifts every subsequent solid id,
+/// which would corrupt the id-mapping for unrelated objects, so we do
+/// **not** call it. Instead we drop the UUID↔solid_id rows from the
+/// id-mapping table and publish an `ObjectDeleted` frame so every
+/// connected viewer drops the solid from its scene. The kernel solid
+/// remains in `BRepModel.solids` as an orphan — it is no longer
+/// reachable via REST and is no longer broadcast on subsequent state
+/// pushes, but the underlying topology lives until the model is
+/// rebuilt from the timeline.
 async fn delete_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, error_catalog::ApiError> {
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+
     if !auth_info.permissions.contains(&Permission::DeleteGeometry) {
-        return Err(error_catalog::ApiError::permission_denied("DeleteGeometry"));
+        return Err(ApiError::permission_denied("DeleteGeometry"));
     }
 
-    let solid_id: u32 = id.parse().map_err(|_| {
-        error_catalog::ApiError::new(
-            error_catalog::ErrorCode::InvalidParameter,
-            format!("solid id '{id}' is not a u32"),
-        )
-        .with_details(serde_json::json!({ "received": id }))
-    })?;
-    let model = state.model.read().await;
-    if model.solids.get(solid_id).is_none() {
-        return Err(error_catalog::ApiError::solid_not_found(solid_id));
-    }
-    drop(model);
+    // Two id forms accepted: canonical UUID (the form the WS frame
+    // ships under `payload.id`) and the legacy numeric local solid id
+    // (CLI / debugging path). Try UUID first; fall through to numeric.
+    let (uuid, solid_id) = if let Ok(parsed) = Uuid::parse_str(&id) {
+        let solid_id = state.get_local_id(&parsed).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::SolidNotFound,
+                format!("no kernel solid registered for {parsed}"),
+            )
+        })?;
+        (parsed, solid_id)
+    } else if let Ok(numeric) = id.parse::<u32>() {
+        let model = state.model.read().await;
+        if model.solids.get(numeric).is_none() {
+            return Err(ApiError::solid_not_found(numeric));
+        }
+        drop(model);
+        // Numeric form: derive the UUID via the reverse mapping so the
+        // broadcast frame still references the canonical id viewers know.
+        let uuid = state
+            .local_to_uuid
+            .get(&numeric)
+            .map(|entry| *entry.value())
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::SolidNotFound,
+                    format!("solid {numeric} has no UUID mapping; cannot broadcast"),
+                )
+            })?;
+        (uuid, numeric)
+    } else {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'{id}' is neither a UUID nor a numeric solid id"),
+        ));
+    };
 
-    tracing::warn!(
+    state.unregister_id_mapping(&uuid);
+    broadcast_object_deleted(&uuid.to_string());
+
+    tracing::info!(
         solid_id = solid_id,
-        "Direct DELETE /api/geometry/:id is not supported; use the timeline-recorded \
-         operation endpoints so deletions are replayable"
+        uuid = %uuid,
+        "DELETE /api/geometry/:id — logical delete (id-mapping dropped, ObjectDeleted broadcast)"
     );
-    Err(error_catalog::ApiError::method_not_allowed(
-        "Direct DELETE /api/geometry/{id} is disabled; deletions must flow \
-         through the timeline so they remain replayable.",
-        "Use POST /api/timeline/record with a delete operation (or POST \
-         /api/timeline/undo) instead. See GET /api/capabilities for the \
-         supported timeline routes.",
-    ))
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "id":       uuid.to_string(),
+        "solid_id": solid_id,
+    })))
 }
 
 async fn process_enhanced_ai_command(
