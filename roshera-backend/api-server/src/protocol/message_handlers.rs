@@ -164,9 +164,17 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
         let _ = sender.send(Message::Text(welcome_json.into())).await;
     }
 
+    // Subscribe to the global geometry broadcast so REST / AI / CLI
+    // mutators that bypass this connection still surface in the
+    // viewport. Frames arrive pre-serialized; we just forward bytes.
+    let mut broadcast_rx = crate::geometry_broadcaster().subscribe();
+
     // Handle incoming messages
-    while let Some(msg) = receiver.next().await {
-        match msg {
+    loop {
+        tokio::select! {
+            ws_msg = receiver.next() => {
+                let Some(msg) = ws_msg else { break; };
+                match msg {
             Ok(Message::Text(text)) => {
                 // Try to parse as ClientMessage from protocol.rs
                 match serde_json::from_str::<ClientMessage>(&text) {
@@ -1925,6 +1933,22 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                 break;
             }
             _ => {}
+        }
+            }
+            bcast = broadcast_rx.recv() => {
+                match bcast {
+                    Ok(text) => {
+                        let _ = sender.send(Message::Text(text.into())).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "WS broadcast subscriber for user={} lagged by {} frames",
+                            user_id, n
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 
