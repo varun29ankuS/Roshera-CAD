@@ -1854,6 +1854,37 @@ fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, 
         v_max = v_range.1;
     }
 
+    // Full-period collapse: when the unwrapped loop spans the surface's
+    // full u- or v-period, snap to the canonical surface bounds instead
+    // of clamping the lifted polygon's `[u_min, u_max]` against
+    // `[u_range.0, u_range.1]`. The clamp loses the **angular offset**
+    // between the boundary curve's local x-axis and the surface's
+    // `ref_dir`. Concrete failure (cone): the wide-end `Circle` is
+    // built from `Circle::new(center, axis = +Z, …)` whose canonical
+    // x-axis for `+Z` is `+X`, while `Cone::ref_dir` is computed via
+    // `axis.perpendicular()` which for `+Z` returns `-Y`. The two
+    // frames are 90° apart, so `closest_point` lifts the circle into
+    // u-space as `[π/2, 5π/2]` — a full 2π span, but offset. Clamping
+    // that to `[0, 2π]` truncates to `[π/2, 2π]` and the grid
+    // tessellator sees only 270° = **75% of the lateral surface**.
+    // The torus (full + partial-V) and any other periodic surface
+    // where the boundary edge frame disagrees with `ref_dir` exhibit
+    // the same shear; snapping to surface bounds whenever the lifted
+    // span covers the full period is the only correct response.
+    const PERIOD_TOL: f64 = 1e-6;
+    if let Some(period) = surface.period_u() {
+        if (u_max - u_min) >= period - PERIOD_TOL {
+            u_min = u_range.0;
+            u_max = u_range.1;
+        }
+    }
+    if let Some(period) = surface.period_v() {
+        if (v_max - v_min) >= period - PERIOD_TOL {
+            v_min = v_range.0;
+            v_max = v_range.1;
+        }
+    }
+
     // Use the loop's UV bounds directly, clamped to the surface's own
     // parameter domain. A previous `±1% margin` expansion was meant to
     // give "numerical stability" room but instead pushed the outermost
