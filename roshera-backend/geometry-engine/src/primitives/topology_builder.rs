@@ -2019,15 +2019,25 @@ impl<'a> TopologyBuilder<'a> {
 
         // ---- edges: closed circles + linear seam. ----
         // Closed circle edges: start_vertex == end_vertex (the seam vertex).
-        // Parameter range is the full angular sweep [0, 2π).
-        let two_pi = std::f64::consts::TAU;
+        // The underlying `Circle` curve uses the `Arc` parameterization
+        // with `range = ParameterRange::unit()` (i.e. t ∈ [0, 1]) and
+        // `angle_at(t) = sweep_angle · t`, where `Arc::evaluate(t)`
+        // *clamps* `t` to `[0, 1]`. So the edge's parameter sub-range
+        // must match: full circle ⇒ `[0, 1]`, NOT `[0, 2π]`. Using
+        // `[0, 2π]` here causes any tessellator that samples at
+        // `t = j · 2π / N` to clamp every `t > 1` (i.e. every `j ≥ ⌈N/(2π)⌉`)
+        // to `t = 1` → angle 2π → all collapsed to the seam vertex.
+        // For r=5, default params (N=100), only the first ~16 samples
+        // are unique; the remaining 84 pile up at +ref_dir·radius,
+        // producing a 16-gon-shaped cap and visible cracks where the
+        // cap boundary fails to meet the lateral cylinder boundary.
         let bottom_edge = self.model.edges.add(Edge::new(
             0,
             v_bottom,
             v_bottom,
             bottom_circle_id,
             EdgeOrientation::Forward,
-            ParameterRange::new(0.0, two_pi),
+            ParameterRange::new(0.0, 1.0),
         ));
         let top_edge = self.model.edges.add(Edge::new(
             0,
@@ -2035,7 +2045,7 @@ impl<'a> TopologyBuilder<'a> {
             v_top,
             top_circle_id,
             EdgeOrientation::Forward,
-            ParameterRange::new(0.0, two_pi),
+            ParameterRange::new(0.0, 1.0),
         ));
         let seam_edge = self.model.edges.add(Edge::new(
             0,
