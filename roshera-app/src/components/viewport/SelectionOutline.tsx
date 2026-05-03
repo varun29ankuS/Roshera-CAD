@@ -42,40 +42,45 @@ export function SelectionOutline() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme])
 
-  if (selectedMeshes.length === 0 && hoveredMeshes.length === 0) return null
+  // EffectComposer must stay mounted across selection-state changes.
+  // @react-three/postprocessing replaces the renderer's render function
+  // when EffectComposer mounts; when it unmounts (e.g. selection cleared
+  // by clicking a non-mesh tree node like a sketch) the original render
+  // function is not always restored, leaving the canvas rendering
+  // through a stale composer pipeline — solids appear to vanish until
+  // a subsequent state change forces a remount (e.g. mouse-hover sets
+  // hoveredId → selectedMeshes/hoveredMeshes non-empty → composer
+  // remounts → render pipeline reinitialises → solid reappears).
+  // Always render EffectComposer with at least one Outline child; when
+  // there's nothing to outline pass an empty selection array, which
+  // Outline treats as a no-op pass.
+  const showSelect = selectedMeshes.length > 0
+  const showHover = hoveredMeshes.length > 0
 
   return (
     <EffectComposer multisampling={4}>
-      {selectedMeshes.length > 0 ? (
-        <Outline
-          selection={selectedMeshes}
-          blendFunction={BlendFunction.ALPHA}
-          edgeStrength={3}
-          pulseSpeed={0}
-          visibleEdgeColor={palette.selectVisible}
-          hiddenEdgeColor={palette.selectHidden}
-          kernelSize={KernelSize.SMALL}
-          blur
-          xRay={false}
-        />
-      ) : (
-        <></>
-      )}
-      {hoveredMeshes.length > 0 ? (
-        <Outline
-          selection={hoveredMeshes}
-          blendFunction={BlendFunction.ALPHA}
-          edgeStrength={1.5}
-          pulseSpeed={0}
-          visibleEdgeColor={palette.hoverVisible}
-          hiddenEdgeColor={palette.hoverHidden}
-          kernelSize={KernelSize.VERY_SMALL}
-          blur
-          xRay={false}
-        />
-      ) : (
-        <></>
-      )}
+      <Outline
+        selection={showSelect ? selectedMeshes : []}
+        blendFunction={BlendFunction.ALPHA}
+        edgeStrength={3}
+        pulseSpeed={0}
+        visibleEdgeColor={palette.selectVisible}
+        hiddenEdgeColor={palette.selectHidden}
+        kernelSize={KernelSize.SMALL}
+        blur
+        xRay={false}
+      />
+      <Outline
+        selection={showHover ? hoveredMeshes : []}
+        blendFunction={BlendFunction.ALPHA}
+        edgeStrength={1.5}
+        pulseSpeed={0}
+        visibleEdgeColor={palette.hoverVisible}
+        hiddenEdgeColor={palette.hoverHidden}
+        kernelSize={KernelSize.VERY_SMALL}
+        blur
+        xRay={false}
+      />
     </EffectComposer>
   )
 }

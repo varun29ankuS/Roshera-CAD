@@ -37,42 +37,156 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::primitives::surface::Plane;
+use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-/// Plane the sketch is being drawn on. The frontend supplies the
-/// in-plane (u, v) coordinates; the lift is handled here on finalise.
-///
-///   * `Xy` — u → world X, v → world Y, normal +Z
-///   * `Xz` — u → world X, v → world Z, normal +Y
-///   * `Yz` — u → world Y, v → world Z, normal +X
+/// One of the three world-axis-aligned planes. Wire format is the
+/// lowercase string (`"xy"` / `"xz"` / `"yz"`) so the standard cases
+/// stay ergonomic for the frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SketchPlane {
+pub enum StandardPlane {
     Xy,
     Xz,
     Yz,
 }
 
+/// A free plane derived from a B-Rep planar face (or, in the future,
+/// typed in by hand). `origin` anchors plane-local (0, 0); `u_axis`
+/// and `v_axis` are unit vectors in world space (orthonormal — the
+/// `SketchPlane::from_face` constructor enforces this). The implied
+/// outward normal is `u_axis × v_axis`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CustomPlane {
+    pub origin: [f64; 3],
+    pub u_axis: [f64; 3],
+    pub v_axis: [f64; 3],
+}
+
+/// Plane the sketch is being drawn on. The frontend supplies the
+/// in-plane (u, v) coordinates; the lift is handled here on finalise.
+///
+/// Wire format is shape-disambiguated:
+///
+///   * Standard variants serialise as bare strings `"xy"`, `"xz"`,
+///     `"yz"` — the original wire shape, retained so existing routes
+///     don't break.
+///   * `Custom` serialises as the inner `CustomPlane` object
+///     (`{origin, u_axis, v_axis}`), distinguishable from the strings
+///     by JSON shape.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SketchPlane {
+    Standard(StandardPlane),
+    Custom(CustomPlane),
+}
+
 impl SketchPlane {
+    /// Constants matching the previous variant names so existing
+    /// callers (`SketchPlane::XY` etc.) read naturally without having
+    /// to nest through the `Standard` wrapper at every site.
+    pub const XY: SketchPlane = SketchPlane::Standard(StandardPlane::Xy);
+    pub const XZ: SketchPlane = SketchPlane::Standard(StandardPlane::Xz);
+    pub const YZ: SketchPlane = SketchPlane::Standard(StandardPlane::Yz);
+
     /// Outward normal of the plane in world coordinates. Used as the
     /// default extrude direction when the client doesn't override it.
-    pub fn normal(self) -> Vector3 {
+    pub fn normal(&self) -> Vector3 {
         match self {
-            SketchPlane::Xy => Vector3::new(0.0, 0.0, 1.0),
-            SketchPlane::Xz => Vector3::new(0.0, 1.0, 0.0),
-            SketchPlane::Yz => Vector3::new(1.0, 0.0, 0.0),
+            SketchPlane::Standard(StandardPlane::Xy) => Vector3::new(0.0, 0.0, 1.0),
+            SketchPlane::Standard(StandardPlane::Xz) => Vector3::new(0.0, 1.0, 0.0),
+            SketchPlane::Standard(StandardPlane::Yz) => Vector3::new(1.0, 0.0, 0.0),
+            SketchPlane::Custom(c) => {
+                // Cross of two unit orthogonal axes is already unit
+                // length; `from_face` is the only constructor and it
+                // guarantees orthonormality.
+                let u = Vector3::new(c.u_axis[0], c.u_axis[1], c.u_axis[2]);
+                let v = Vector3::new(c.v_axis[0], c.v_axis[1], c.v_axis[2]);
+                u.cross(&v)
+            }
         }
     }
 
     /// Lift a plane-local (u, v) onto a world-space `Point3`.
-    pub fn lift(self, u: f64, v: f64) -> Point3 {
+    pub fn lift(&self, u: f64, v: f64) -> Point3 {
         match self {
-            SketchPlane::Xy => Point3::new(u, v, 0.0),
-            SketchPlane::Xz => Point3::new(u, 0.0, v),
-            SketchPlane::Yz => Point3::new(0.0, u, v),
+            SketchPlane::Standard(StandardPlane::Xy) => Point3::new(u, v, 0.0),
+            SketchPlane::Standard(StandardPlane::Xz) => Point3::new(u, 0.0, v),
+            SketchPlane::Standard(StandardPlane::Yz) => Point3::new(0.0, u, v),
+            SketchPlane::Custom(c) => Point3::new(
+                c.origin[0] + c.u_axis[0] * u + c.v_axis[0] * v,
+                c.origin[1] + c.u_axis[1] * u + c.v_axis[1] * v,
+                c.origin[2] + c.u_axis[2] * u + c.v_axis[2] * v,
+            ),
         }
+    }
+
+    /// Build a `Custom` plane from a planar B-Rep face.
+    ///
+    /// The face's outward normal (from `Face::normal_at`) defines the
+    /// orientation of the sketch frame — drawing on this face produces
+    /// a default-extrude direction that pushes *out of the part*, which
+    /// is what the user expects. The u-basis is taken from the
+    /// underlying surface's `u_dir`; the v-basis is re-derived as
+    /// `normal × u` so the frame is right-handed against the face's
+    /// own outward direction (not the surface's, which may be flipped
+    /// relative to the face orientation).
+    ///
+    /// Returns `InvalidParameter` if the face is missing, its surface
+    /// is missing, or the surface is non-planar.
+    pub fn from_face(
+        model: &BRepModel,
+        face_id: u32,
+    ) -> Result<Self, ApiError> {
+        let face = model.faces.get(face_id).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("face {face_id} not found"),
+            )
+        })?;
+        let surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "surface {} for face {face_id} not found",
+                    face.surface_id
+                ),
+            )
+        })?;
+        let plane = surface.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "face {face_id} is not planar (surface type: {:?}); \
+                     sketches can only be placed on planar faces",
+                    surface.surface_type()
+                ),
+            )
+        })?;
+
+        // Use the face's outward normal so the default extrude
+        // direction pulls away from the part regardless of how the
+        // underlying Plane was oriented.
+        let normal = face.normal_at(0.5, 0.5, &model.surfaces).map_err(|e| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("failed to evaluate normal on face {face_id}: {e}"),
+            )
+        })?;
+        let u_axis = plane.u_dir;
+        // Re-derive v_axis against the face's outward normal so the
+        // (u, v, n) frame is right-handed regardless of any flip
+        // between Plane::normal and Face's outward direction.
+        let v_axis = normal.cross(&u_axis);
+
+        Ok(SketchPlane::Custom(CustomPlane {
+            origin: [plane.origin.x, plane.origin.y, plane.origin.z],
+            u_axis: [u_axis.x, u_axis.y, u_axis.z],
+            v_axis: [v_axis.x, v_axis.y, v_axis.z],
+        }))
     }
 }
 
@@ -513,6 +627,17 @@ pub struct SetPlaneBody {
     pub plane: SketchPlane,
 }
 
+/// `POST /api/sketch/plane-from-face` body. Resolves a UUID-tagged
+/// solid + face id pair into a `SketchPlane::Custom` matched to the
+/// face's plane geometry. The frontend then feeds the result back into
+/// `POST /api/sketch` (or `PUT /api/sketch/{id}/plane`) so the new
+/// session is anchored on that face.
+#[derive(Debug, Deserialize)]
+pub struct PlaneFromFaceBody {
+    pub object_id: Uuid,
+    pub face_id: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetToolBody {
     pub tool: SketchTool,
@@ -873,6 +998,53 @@ pub async fn extrude_sketch(
     })))
 }
 
+/// `POST /api/sketch/plane-from-face` — derive a `SketchPlane::Custom`
+/// from a planar B-Rep face. The frontend uses this to power the
+/// "Sketch on face" right-click action: the user picks a face, this
+/// endpoint returns a plane spec, and the frontend then hands it to
+/// `POST /api/sketch` to start a session anchored to that face.
+///
+/// Verifies the face actually belongs to the named solid before
+/// touching the kernel — same ownership check `extrude_face_endpoint`
+/// uses, so the two paths can't disagree about which faces are valid.
+pub async fn plane_from_face(
+    State(state): State<AppState>,
+    Json(body): Json<PlaneFromFaceBody>,
+) -> Result<Json<SketchPlane>, ApiError> {
+    let solid_id = state.get_local_id(&body.object_id).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for {}", body.object_id),
+        )
+    })?;
+    let model = state.model.read().await;
+    let solid = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
+    let mut owns_face = false;
+    let outer = std::iter::once(&solid.outer_shell);
+    for &shell_id in outer.chain(solid.inner_shells.iter()) {
+        if let Some(shell) = model.shells.get(shell_id) {
+            if shell.faces.contains(&body.face_id) {
+                owns_face = true;
+                break;
+            }
+        }
+    }
+    if !owns_face {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "face_id {} does not belong to solid {} (uuid {})",
+                body.face_id, solid_id, body.object_id
+            ),
+        ));
+    }
+    let plane = SketchPlane::from_face(&model, body.face_id)?;
+    Ok(Json(plane))
+}
+
 // ── WebSocket broadcast helpers ─────────────────────────────────────
 
 /// Push a `SketchCreated` frame onto the geometry broadcaster. Every
@@ -938,7 +1110,7 @@ mod tests {
     fn rectangle_materialises_to_four_ccw_corners() {
         let session = SketchSession {
             id: Uuid::new_v4(),
-            plane: SketchPlane::Xy,
+            plane: SketchPlane::XY,
             tool: SketchTool::Rectangle,
             points: vec![[2.0, 1.0], [-3.0, -4.0]],
             circle_segments: 64,
@@ -963,7 +1135,7 @@ mod tests {
     fn circle_materialises_n_samples_around_radius() {
         let session = SketchSession {
             id: Uuid::new_v4(),
-            plane: SketchPlane::Xy,
+            plane: SketchPlane::XY,
             tool: SketchTool::Circle,
             points: vec![[0.0, 0.0], [5.0, 0.0]],
             circle_segments: 16,
@@ -982,7 +1154,7 @@ mod tests {
     fn rectangle_rejects_degenerate_width() {
         let session = SketchSession {
             id: Uuid::new_v4(),
-            plane: SketchPlane::Xy,
+            plane: SketchPlane::XY,
             tool: SketchTool::Rectangle,
             points: vec![[1.0, 0.0], [1.0, 5.0]],
             circle_segments: 64,
@@ -999,7 +1171,7 @@ mod tests {
     fn polyline_strips_repeated_terminal_point() {
         let session = SketchSession {
             id: Uuid::new_v4(),
-            plane: SketchPlane::Xy,
+            plane: SketchPlane::XY,
             tool: SketchTool::Polyline,
             points: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]],
             circle_segments: 64,
@@ -1013,7 +1185,7 @@ mod tests {
     #[test]
     fn manager_create_get_delete_round_trip() {
         let mgr = SketchManager::new();
-        let s = mgr.create(SketchPlane::Xz, SketchTool::Polyline);
+        let s = mgr.create(SketchPlane::XZ, SketchTool::Polyline);
         assert_eq!(mgr.get(&s.id).map(|x| x.id), Some(s.id));
         assert_eq!(mgr.list().len(), 1);
         assert_eq!(mgr.delete(&s.id).map(|x| x.id), Some(s.id));
@@ -1023,7 +1195,7 @@ mod tests {
     #[test]
     fn add_pop_set_point_update_session_state() {
         let mgr = SketchManager::new();
-        let s = mgr.create(SketchPlane::Xy, SketchTool::Polyline);
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         let s1 = mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
         assert_eq!(s1.points, vec![[1.0, 2.0]]);
         let s2 = mgr.add_point(&s.id, [3.0, 4.0]).expect("add");
@@ -1037,7 +1209,7 @@ mod tests {
     #[test]
     fn set_tool_clears_points_when_tool_changes() {
         let mgr = SketchManager::new();
-        let s = mgr.create(SketchPlane::Xy, SketchTool::Polyline);
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
         let after = mgr.set_tool(&s.id, SketchTool::Rectangle).expect("tool");
         assert!(after.points.is_empty());
@@ -1046,18 +1218,18 @@ mod tests {
     #[test]
     fn set_plane_clears_points_when_plane_changes() {
         let mgr = SketchManager::new();
-        let s = mgr.create(SketchPlane::Xy, SketchTool::Polyline);
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
-        let after = mgr.set_plane(&s.id, SketchPlane::Yz).expect("plane");
+        let after = mgr.set_plane(&s.id, SketchPlane::YZ).expect("plane");
         assert!(after.points.is_empty());
-        assert_eq!(after.plane, SketchPlane::Yz);
+        assert_eq!(after.plane, SketchPlane::YZ);
     }
 
     #[test]
     fn lift_polygon_routes_uv_to_world_axes() {
         let session = SketchSession {
             id: Uuid::new_v4(),
-            plane: SketchPlane::Yz,
+            plane: SketchPlane::YZ,
             tool: SketchTool::Rectangle,
             points: vec![[0.0, 0.0], [2.0, 3.0]],
             circle_segments: 64,
@@ -1075,8 +1247,69 @@ mod tests {
     #[test]
     fn add_point_rejects_non_finite() {
         let mgr = SketchManager::new();
-        let s = mgr.create(SketchPlane::Xy, SketchTool::Polyline);
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         let err = mgr.add_point(&s.id, [f64::NAN, 0.0]).unwrap_err();
         assert!(matches!(err, SketchError::NonFinitePoint { .. }));
+    }
+
+    #[test]
+    fn custom_plane_lift_uses_origin_and_axes() {
+        // A custom plane shifted +5 along world X with axes rotated 90°
+        // around the world Z so plane-u → world +Y, plane-v → world +Z.
+        // Implied normal = u × v = +Y × +Z = +X.
+        let plane = SketchPlane::Custom(CustomPlane {
+            origin: [5.0, 0.0, 0.0],
+            u_axis: [0.0, 1.0, 0.0],
+            v_axis: [0.0, 0.0, 1.0],
+        });
+        let p = plane.lift(2.0, 3.0);
+        assert!((p.x - 5.0).abs() < 1e-12);
+        assert!((p.y - 2.0).abs() < 1e-12);
+        assert!((p.z - 3.0).abs() < 1e-12);
+        let n = plane.normal();
+        assert!((n.x - 1.0).abs() < 1e-12);
+        assert!(n.y.abs() < 1e-12);
+        assert!(n.z.abs() < 1e-12);
+    }
+
+    #[test]
+    fn custom_plane_serialises_as_object_standard_as_string() {
+        let plane = SketchPlane::Custom(CustomPlane {
+            origin: [1.0, 2.0, 3.0],
+            u_axis: [1.0, 0.0, 0.0],
+            v_axis: [0.0, 1.0, 0.0],
+        });
+        // Custom serialises as the bare CustomPlane object — no kind
+        // tag, the JSON shape itself is the discriminator.
+        let v = serde_json::to_value(plane).expect("serialise custom plane");
+        assert_eq!(v["origin"], serde_json::json!([1.0, 2.0, 3.0]));
+        assert_eq!(v["u_axis"], serde_json::json!([1.0, 0.0, 0.0]));
+        assert_eq!(v["v_axis"], serde_json::json!([0.0, 1.0, 0.0]));
+
+        // Standard variants serialise as the bare lowercase string,
+        // matching the original wire format.
+        let xy = serde_json::to_value(SketchPlane::XY).expect("serialise xy");
+        assert_eq!(xy, serde_json::json!("xy"));
+    }
+
+    #[test]
+    fn custom_plane_round_trips_through_serde() {
+        let original = SketchPlane::Custom(CustomPlane {
+            origin: [0.5, -1.5, 2.0],
+            u_axis: [1.0, 0.0, 0.0],
+            v_axis: [0.0, 0.0, 1.0],
+        });
+        let s = serde_json::to_string(&original).expect("ser");
+        let back: SketchPlane = serde_json::from_str(&s).expect("de");
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn standard_plane_round_trips_through_serde() {
+        for plane in [SketchPlane::XY, SketchPlane::XZ, SketchPlane::YZ] {
+            let s = serde_json::to_string(&plane).expect("ser");
+            let back: SketchPlane = serde_json::from_str(&s).expect("de");
+            assert_eq!(plane, back);
+        }
     }
 }

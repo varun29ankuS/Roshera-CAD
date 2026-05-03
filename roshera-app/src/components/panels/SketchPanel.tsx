@@ -31,9 +31,11 @@ import {
   X,
 } from 'lucide-react'
 import {
+  isStandardPlane,
   useSceneStore,
   type SketchPlane,
   type SketchTool,
+  type StandardPlane,
 } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import {
@@ -44,11 +46,22 @@ import {
 import { sketchApi } from '@/lib/sketch-api'
 import { cn } from '@/lib/utils'
 
-const PLANE_OPTIONS: Array<{ value: SketchPlane; label: string }> = [
+const PLANE_OPTIONS: Array<{ value: StandardPlane; label: string }> = [
   { value: 'xy', label: 'XY' },
   { value: 'xz', label: 'XZ' },
   { value: 'yz', label: 'YZ' },
 ]
+
+/**
+ * Human-readable label for the active plane. Standard planes get the
+ * usual XY/XZ/YZ. Custom (face-anchored) planes don't carry a name on
+ * the wire, so we render a stable "FACE" tag — enough for the chat
+ * confirmation and any future status text without leaking origin /
+ * basis numbers into the UI.
+ */
+function planeLabel(plane: SketchPlane): string {
+  return isStandardPlane(plane) ? plane.toUpperCase() : 'FACE'
+}
 
 const TOOL_OPTIONS: Array<{
   value: SketchTool
@@ -103,9 +116,48 @@ export function SketchPanel() {
     }
     setBusy(true)
     try {
+      // Re-edit replace semantics: when this Finish is closing out an
+      // edit pass on an existing feature (sketch was opened via "Edit
+      // sketch" from the model tree), delete the prior solid first so
+      // the upcoming extrude *replaces* it rather than appending a
+      // duplicate alongside. The DELETE cascades to a kernel
+      // `delete_solid` + `ObjectDeleted` broadcast; the WS bridge
+      // removes the object from the local store.
+      if (sketch.editingSourceObjectId) {
+        const apiBase = import.meta.env.VITE_API_URL || ''
+        try {
+          const resp = await fetch(
+            `${apiBase}/api/geometry/${sketch.editingSourceObjectId}`,
+            { method: 'DELETE' },
+          )
+          if (!resp.ok) {
+            // 404 here is fine — the prior solid was already removed
+            // (e.g. via the model tree's Delete action mid-edit). Any
+            // other status is logged but we still proceed; the user
+            // gets a duplicate at worst, not a hard failure.
+            if (resp.status !== 404) {
+              console.warn(
+                '[sketch] re-edit: failed to delete prior solid',
+                sketch.editingSourceObjectId,
+                resp.status,
+              )
+            }
+          }
+        } catch (err) {
+          console.warn('[sketch] re-edit: delete prior solid threw', err)
+        }
+      }
+
+      // `consume: false` keeps the sketch session alive on the backend
+      // after the extrude lands, so the user can right-click the
+      // resulting feature in the model tree → "Edit sketch" and reopen
+      // the same profile. Without this, the backend deletes the
+      // session (default behaviour) and re-edit silently fails because
+      // there's nothing to load.
       const result = await sketchApi.extrude(sketch.serverId, {
         distance: sketch.thickness,
         name: `${sketch.tool}-extrude`,
+        consume: false,
       })
       const { addMessage } = useChatStore.getState()
       const stats =
@@ -116,13 +168,16 @@ export function SketchPanel() {
           : ''
       addMessage({
         role: 'assistant',
-        content: `Extruded ${sketch.tool} on ${sketch.plane.toUpperCase()} plane (t=${sketch.thickness})${stats}.`,
+        content: `Extruded ${sketch.tool} on ${planeLabel(sketch.plane)} plane (t=${sketch.thickness})${stats}.`,
         objectsAffected: [result.object.id],
       })
-      // Backend has consumed the session (default `consume: true`),
-      // so a `SketchDeleted` broadcast already cleared `serverId` in
-      // the store. Tear down the local active flag too.
-      exitSketch()
+      // We pass `consume: false` above, so the backend keeps the
+      // session alive — but the user is done with this editing pass,
+      // so tear down the local active flag. Pass `deleteBackend:
+      // false` so the in-memory `SketchSession` survives; otherwise
+      // the default `exitSketch` path issues `DELETE /api/sketch/{id}`
+      // and the "Edit sketch" lookup later 404s.
+      exitSketch({ deleteBackend: false })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       setError(msg)
@@ -133,6 +188,7 @@ export function SketchPanel() {
     busy,
     exitSketch,
     sketch.circleSegments,
+    sketch.editingSourceObjectId,
     sketch.plane,
     sketch.points,
     sketch.serverId,
@@ -223,6 +279,14 @@ export function SketchPanel() {
           {hint}
         </span>
         <div className="ml-auto flex items-center gap-1">
+          {!isStandardPlane(sketch.plane) && (
+            <span
+              className="px-2 py-0.5 border border-amber-400/60 text-amber-300 bg-amber-500/10 text-[10px] font-mono"
+              title="Sketch is anchored to a model face. Click XY/XZ/YZ to pivot off the face."
+            >
+              FACE
+            </span>
+          )}
           {PLANE_OPTIONS.map((opt) => (
             <button
               key={opt.value}
@@ -230,7 +294,7 @@ export function SketchPanel() {
               onClick={() => setSketchPlane(opt.value)}
               className={cn(
                 'px-2 py-0.5 border text-[10px] font-mono transition-colors',
-                sketch.plane === opt.value
+                isStandardPlane(sketch.plane) && sketch.plane === opt.value
                   ? 'border-border text-foreground bg-foreground/10'
                   : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
               )}

@@ -1,7 +1,11 @@
 import { useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
-import { useSceneStore, type SketchPlane } from '@/stores/scene-store'
+import {
+  isStandardPlane,
+  useSceneStore,
+  type StandardPlane,
+} from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { resolveCssVar } from '@/lib/css-color'
 
@@ -24,7 +28,7 @@ import { resolveCssVar } from '@/lib/css-color'
  */
 
 // Mesh rotation that aligns the +Z plane geometry with each sketch plane.
-const PLANE_ROTATION: Record<SketchPlane, [number, number, number]> = {
+const PLANE_ROTATION: Record<StandardPlane, [number, number, number]> = {
   xy: [0, 0, 0],
   xz: [-Math.PI / 2, 0, 0],
   yz: [0, Math.PI / 2, 0],
@@ -42,7 +46,7 @@ const PLANE_ROTATION: Record<SketchPlane, [number, number, number]> = {
  *   xz: rotation [-π/2,0,0]   → local x→worldX, local y→world(-Z) → diag(1,-1)
  *   yz: rotation [0,π/2,0]    → local x→world(-Z), local y→worldY → swap+sign
  */
-const PLANE_MAP: Record<SketchPlane, [number, number, number, number]> = {
+const PLANE_MAP: Record<StandardPlane, [number, number, number, number]> = {
   xy: [1, 0, 0, 1],
   xz: [1, 0, 0, -1],
   yz: [0, -1, 1, 0],
@@ -50,7 +54,7 @@ const PLANE_MAP: Record<SketchPlane, [number, number, number, number]> = {
 
 /** World-space mesh origin so the plane stays centered under the camera. */
 function meshPositionForPlane(
-  plane: SketchPlane,
+  plane: StandardPlane,
   camera: THREE.Camera,
   out: THREE.Vector3,
 ): THREE.Vector3 {
@@ -66,7 +70,7 @@ function meshPositionForPlane(
 
 /** Camera projected onto the active plane in (u, v) coordinates. */
 function cameraOnPlane(
-  plane: SketchPlane,
+  plane: StandardPlane,
   camera: THREE.Camera,
   out: THREE.Vector2,
 ): THREE.Vector2 {
@@ -88,7 +92,13 @@ export function CADGrid() {
   // grid stays on the conventional XZ ground plane.
   const sketchActive = useSceneStore((s) => s.sketch.active)
   const sketchPlane = useSceneStore((s) => s.sketch.plane)
-  const activePlane: SketchPlane = sketchActive ? sketchPlane : 'xz'
+  // The infinite grid shader is parametrised over the three axis-
+  // aligned planes; on a custom (face-anchored) sketch plane we fall
+  // back to the XZ ground grid rather than fight the shader to track
+  // an arbitrarily oriented plane. The sketch overlay still renders
+  // a face-aligned authoring quad on top.
+  const activePlane: StandardPlane =
+    sketchActive && isStandardPlane(sketchPlane) ? sketchPlane : 'xz'
 
   const theme = useThemeStore((s) => s.theme)
   const { camera } = useThree()

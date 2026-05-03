@@ -65,7 +65,12 @@ export function CADViewport() {
       className="absolute inset-0 overflow-hidden bg-[var(--cad-viewport-bg)]"
     >
       <Canvas
-        shadows
+        // Three.js r170+ deprecated PCFSoftShadowMap (the default that
+        // `shadows` / `shadows={true}` resolves to) and now silently
+        // remaps it to PCFShadowMap with a console warning. Pin to
+        // PCFShadowMap explicitly so the warning is gone and the actual
+        // shadow algorithm matches what the renderer is using.
+        shadows="percentage"
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
         onCreated={handleCreated}

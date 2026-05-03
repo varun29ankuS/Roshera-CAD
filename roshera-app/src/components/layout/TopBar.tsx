@@ -17,6 +17,7 @@ import { useThemeStore } from '@/stores/theme-store'
 import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
 import { wsClient } from '@/lib/ws-client'
+import { exportSceneAs } from '@/lib/export-api'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -28,49 +29,15 @@ async function timelineAction(action: 'undo' | 'redo') {
   }
 }
 
-// Two-step export: POST /api/export returns { filename, download_url, … };
-// the actual bytes live behind a follow-up GET /api/download/:filename so
-// the server can stream large STEP/ROS payloads off disk without buffering
-// them in the JSON response. Frontend stitches the two together into a
-// single user-visible download.
+// Two-step export (POST /api/export → GET /api/download/:filename) is
+// implemented in `lib/export-api.ts` and shared with the ToolBar Export
+// flyout. Both surfaces hit the kernel directly so a missing AI key
+// can't 5xx a deterministic export.
 async function exportGeometry(format: string) {
-  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
-  try {
-    const exportResp = await fetch(`${API_BASE}/api/export`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        format,
-        objects: selectedIds,
-        options: { binary: true, include_materials: true, merge_objects: false },
-      }),
-    })
-    if (!exportResp.ok) {
-      console.error(`Export failed: ${exportResp.status} ${exportResp.statusText}`)
-      return
-    }
-    const meta = (await exportResp.json()) as {
-      filename: string
-      download_url: string
-      file_size: number
-      success: boolean
-    }
-    if (!meta.success || !meta.download_url) return
-
-    const fileResp = await fetch(`${API_BASE}${meta.download_url}`)
-    if (!fileResp.ok) {
-      console.error(`Download failed: ${fileResp.status} ${fileResp.statusText}`)
-      return
-    }
-    const blob = await fileResp.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = meta.filename
-    a.click()
-    URL.revokeObjectURL(url)
-  } catch (err) {
-    console.error('Export error:', err)
+  const result = await exportSceneAs(format)
+  if (!result.ok && result.error) {
+    // eslint-disable-next-line no-console
+    console.error('Export error:', result.error)
   }
 }
 
@@ -131,9 +98,6 @@ export function TopBar() {
                 <MenubarItem onClick={() => exportGeometry('STEP')}>STEP</MenubarItem>
                 <MenubarItem onClick={() => exportGeometry('STL')}>STL</MenubarItem>
                 <MenubarItem onClick={() => exportGeometry('OBJ')}>OBJ</MenubarItem>
-                <MenubarItem onClick={() => exportGeometry('glTF')}>glTF</MenubarItem>
-                <MenubarItem onClick={() => exportGeometry('IGES')}>IGES</MenubarItem>
-                <MenubarItem onClick={() => exportGeometry('FBX')}>FBX</MenubarItem>
               </MenubarSubContent>
             </MenubarSub>
             <MenubarSeparator />

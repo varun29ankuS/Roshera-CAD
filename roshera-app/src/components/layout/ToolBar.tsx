@@ -43,6 +43,7 @@ import {
 import { useSceneStore, type TransformTool } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
+import { exportSceneAs } from '@/lib/export-api'
 import { cn } from '@/lib/utils'
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -199,6 +200,37 @@ async function sendDirectBoolean(
 /** Fallback: route through NLP pipeline for complex/freeform commands */
 function sendCommand(cmd: string) {
   processUserMessage(cmd)
+}
+
+/**
+ * Export the current selection (or whole scene if nothing is selected)
+ * directly via `POST /api/export`. Bypasses the NLP pipeline so a
+ * missing `ANTHROPIC_API_KEY` (which 5xxs the AI command path) can't
+ * block deterministic export operations. Reports success / failure to
+ * the chat panel so the user gets visible feedback either way.
+ */
+async function sendDirectExport(format: string) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  addMessage({ role: 'user', content: `Export selected as ${format}` })
+  setProcessing(true)
+  try {
+    const result = await exportSceneAs(format)
+    if (result.ok) {
+      addMessage({
+        role: 'assistant',
+        content: result.filename
+          ? `Exported as ${result.filename}.`
+          : `Export ready.`,
+      })
+    } else {
+      addMessage({
+        role: 'assistant',
+        content: `Export failed: ${result.error ?? 'unknown error'}`,
+      })
+    }
+  } finally {
+    setProcessing(false)
+  }
 }
 
 // ─── Flyout group — pure CSS hover, no timers ────────────────────
@@ -463,13 +495,10 @@ export function ToolBar() {
         {
           label: 'Export',
           items: [
-            { icon: FileDown, label: 'ROS (Roshera)', action: () => sendCommand('export selected as ROS') },
-            { icon: FileDown, label: 'STEP', action: () => sendCommand('export selected as STEP') },
-            { icon: FileDown, label: 'STL', action: () => sendCommand('export selected as STL') },
-            { icon: FileDown, label: 'glTF', action: () => sendCommand('export selected as glTF') },
-            { icon: FileDown, label: 'IGES', action: () => sendCommand('export selected as IGES') },
-            { icon: FileDown, label: 'OBJ', action: () => sendCommand('export selected as OBJ') },
-            { icon: FileDown, label: 'FBX', action: () => sendCommand('export selected as FBX') },
+            { icon: FileDown, label: 'ROS (Roshera)', action: () => sendDirectExport('ROS') },
+            { icon: FileDown, label: 'STEP', action: () => sendDirectExport('STEP') },
+            { icon: FileDown, label: 'STL', action: () => sendDirectExport('STL') },
+            { icon: FileDown, label: 'OBJ', action: () => sendDirectExport('OBJ') },
           ],
         },
       ],

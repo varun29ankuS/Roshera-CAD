@@ -22,6 +22,14 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   const unregisterMeshRef = useSceneStore((s) => s.unregisterMeshRef)
   const edgeSettings = useSceneStore((s) => s.edgeSettings)
   const theme = useThemeStore((s) => s.theme)
+  // While the user is editing an existing sketch, dim every solid so
+  // the focus is on the 2D profile + dimension labels, not the
+  // surrounding geometry. Distinct from "creating a new sketch" — that
+  // path leaves `serverId` null because the panel issues `POST /api/sketch`
+  // but doesn't reuse an existing session, so dimming would be confusing.
+  const editingSketch = useSceneStore(
+    (s) => s.sketch.active && s.sketch.serverId !== null,
+  )
 
   const { defaultEdgeHex, accentEdgeHex } = useMemo(() => {
     const tick = resolveCssVar('--cad-tick')
@@ -64,16 +72,22 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   }, [object.mesh])
 
   // Material — no color swap for selection (outline post-processing handles that)
+  // In edit-sketch mode the solid is rendered at low opacity with
+  // depthWrite disabled so the in-canvas dimension labels and
+  // 2D profile lines read clearly through the geometry.
   const material = useMemo(() => {
+    const editingOpacity = 0.18
+    const opacity = editingSketch ? editingOpacity : object.material.opacity
     return new THREE.MeshStandardMaterial({
       color: object.material.color,
       metalness: object.material.metalness,
       roughness: object.material.roughness,
-      transparent: object.material.opacity < 1,
-      opacity: object.material.opacity,
+      transparent: editingSketch || object.material.opacity < 1,
+      opacity,
+      depthWrite: editingSketch ? false : true,
       side: THREE.DoubleSide,
     })
-  }, [object.material])
+  }, [object.material, editingSketch])
 
   const toggleSubElementSelection = useSceneStore((s) => s.toggleSubElementSelection)
 
@@ -153,13 +167,21 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       // Right-click implicitly selects the object so subsequent menu
       // actions (delete, hide) act on the visible target.
       selectObject(object.id, false)
+      // Resolve the picked triangle to its kernel FaceId so the menu
+      // can offer "Sketch on this face". Falls back to the raw triangle
+      // index if the mesh hasn't shipped a per-triangle face_map — the
+      // backend's plane-from-face endpoint will reject anything stale.
+      const triangleIndex = e.faceIndex
+      const faceId =
+        typeof triangleIndex === 'number' ? resolveFaceId(triangleIndex) : undefined
       openContextMenu({
         x: native.clientX,
         y: native.clientY,
         objectId: object.id,
+        faceId,
       })
     },
-    [object.id, selectObject, openContextMenu],
+    [object.id, selectObject, openContextMenu, resolveFaceId],
   )
 
   const handlePointerOver = useCallback(

@@ -30,18 +30,46 @@ pub fn tessellate_face(
     };
 
     match surface.type_name() {
-        "Plane" => tessellate_planar_face(face, model, mesh),
+        "Plane" => tessellate_planar_face(face, model, params, mesh),
         "Cylinder" => tessellate_cylindrical_face(face, model, params, mesh),
         "Sphere" => tessellate_spherical_face(face, model, params, mesh),
         "Cone" => tessellate_conical_face(face, model, params, mesh),
         "Torus" => tessellate_toroidal_face(face, model, params, mesh),
         "NURBS" => tessellate_nurbs_face(face, model, params, mesh),
-        _ => tessellate_generic_face(face, model, params, mesh),
+        _ => {
+            // RuledSurface (extruded straight-line side faces, prismatic
+            // sweeps, etc.) is geometrically planar whenever its two
+            // boundary curves keep parallel tangents along the rail —
+            // which is the dominant case for extrude. Routing those
+            // through `tessellate_planar_face` is mandatory for
+            // watertightness: the planar caps that share the same B-Rep
+            // edges sample those edges via `sample_loop_3d_polygon`,
+            // which emits exactly one sample per straight segment.
+            // `tessellate_generic_face`'s UV-grid sampler instead emits
+            // N+1 samples along every boundary parametric direction, so
+            // the side face's interior boundary samples have no twin on
+            // the cap for `weld_mesh_watertight_range` to collapse —
+            // leaving the seam open and visible as a crack on the
+            // rendered solid. Routing planar generics through the
+            // polygon path makes both faces agree at every shared edge.
+            let planar_tolerance =
+                Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
+            if surface.is_planar(planar_tolerance) {
+                tessellate_planar_face(face, model, params, mesh);
+            } else {
+                tessellate_generic_face(face, model, params, mesh);
+            }
+        }
     }
 }
 
 /// Tessellate a planar face using constrained Delaunay triangulation
-fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMesh) {
+fn tessellate_planar_face(
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) {
     // Get surface and compute normal
     let surface = match model.surfaces.get(face.surface_id) {
         Some(s) => s,
@@ -63,7 +91,7 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
     // Process outer loop
     if let Some(outer_loop) = model.loops.get(face.outer_loop) {
         let start_idx = all_vertices.len();
-        sample_loop_3d_polygon(outer_loop, model, &mut all_vertices);
+        sample_loop_3d_polygon(outer_loop, model, params, &mut all_vertices);
         let end_idx = all_vertices.len();
         if end_idx > start_idx {
             loop_boundaries.push((start_idx, end_idx, true)); // true = outer loop
@@ -74,7 +102,7 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
     for &inner_loop_id in &face.inner_loops {
         if let Some(inner_loop) = model.loops.get(inner_loop_id) {
             let start_idx = all_vertices.len();
-            sample_loop_3d_polygon(inner_loop, model, &mut all_vertices);
+            sample_loop_3d_polygon(inner_loop, model, params, &mut all_vertices);
             let end_idx = all_vertices.len();
             if end_idx > start_idx {
                 loop_boundaries.push((start_idx, end_idx, false)); // false = inner loop (hole)
@@ -153,16 +181,30 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
 /// then hit `all_vertices.len() < 3` and returned, emitting zero
 /// triangles for every cap. Cylinders therefore looked hollow.
 ///
+/// # Why sample density is chord-tolerance driven
+/// The primitive tessellators (cylindrical, spherical, conical,
+/// toroidal) derive their UV-grid step counts from
+/// `params.max_edge_length` via the chord-length-to-arc relationship
+/// `n = ceil(arc_length / max_edge_length)`. For shared edges between
+/// a primitive's curved face and an adjacent planar cap (e.g. cylinder
+/// bottom edge: shared by the bottom cap and the lateral face),
+/// `weld_mesh_watertight_range` can only collapse the seam if BOTH
+/// faces emit the same number of boundary samples at the same curve
+/// parameters. Hardcoding `32` for closed edges and `16` for arcs
+/// breaks that invariant the moment the chord-tolerance asks for any
+/// other count. Instead we derive `n` from the same chord-tolerance
+/// rule the primitive tessellators use, so the boundary always lines
+/// up regardless of tolerance.
+///
 /// # Strategy
 /// For each edge:
 /// * If the curve is a straight line (cross product of mid-vs-endpoint
 ///   vectors below tolerance) emit a single sample at `t_start`. This
 ///   matches the previous one-vertex-per-edge behaviour for box faces
 ///   and keeps the resulting ear-clipping cheap.
-/// * If the edge is closed (start == end vertex) it is necessarily
-///   curved (a circle, ellipse, or NURBS loop). Sample 32 points so the
-///   resulting polygon approximates the curve well.
-/// * Otherwise (curved arc with distinct endpoints) sample 16 points.
+/// * Otherwise sample `compute_curve_sample_count(...)` points — a
+///   chord-tolerance-driven count that matches the primitive grid
+///   density.
 ///
 /// Sampling uses the loop's recorded edge orientation so the polygon
 /// winds consistently — `triangulate_planar_polygon` then forces outer
@@ -172,10 +214,9 @@ fn tessellate_planar_face(face: &Face, model: &BRepModel, mesh: &mut TriangleMes
 fn sample_loop_3d_polygon(
     loop_data: &crate::primitives::r#loop::Loop,
     model: &BRepModel,
+    params: &TessellationParams,
     out: &mut Vec<Point3>,
 ) {
-    const SAMPLES_CLOSED_EDGE: usize = 32;
-    const SAMPLES_CURVED_EDGE: usize = 16;
     const COLLINEAR_TOL: f64 = 1e-9;
 
     for (i, &edge_id) in loop_data.edges.iter().enumerate() {
@@ -196,10 +237,11 @@ fn sample_loop_3d_polygon(
         };
 
         // Decide sampling density. Closed edges are always curved; for
-        // open edges, a 3-point collinearity check decides.
+        // open edges, a 3-point collinearity check decides whether to
+        // collapse to a single sample.
         let is_closed_edge = edge.start_vertex == edge.end_vertex;
         let n = if is_closed_edge {
-            SAMPLES_CLOSED_EDGE
+            compute_curve_sample_count(curve, t_start, t_end, params)
         } else {
             let mid = (t_start + t_end) * 0.5;
             match (
@@ -213,7 +255,7 @@ fn sample_loop_3d_polygon(
                     if v1.cross(&v2).magnitude() < COLLINEAR_TOL {
                         1
                     } else {
-                        SAMPLES_CURVED_EDGE
+                        compute_curve_sample_count(curve, t_start, t_end, params)
                     }
                 }
                 _ => 1,
@@ -227,6 +269,43 @@ fn sample_loop_3d_polygon(
             }
         }
     }
+}
+
+/// Compute the chord-tolerance-driven sample count for a curve segment.
+///
+/// Estimates arc length via a 16-point polyline probe, then returns
+/// `ceil(arc_length / max_edge_length)` clamped to
+/// `[min_segments, max_segments]`. The sample count is identical to
+/// what the cylindrical / spherical / conical / toroidal tessellators
+/// derive from the same chord tolerance applied to their parametric
+/// span — so boundary samples land at the same curve parameters as
+/// the curved-surface grid samples, and `weld_mesh_watertight_range`
+/// collapses the shared edge cleanly. This is the invariant that lets
+/// a primitive cylinder render watertight: cap and lateral face
+/// agree on every closed-circle boundary point.
+fn compute_curve_sample_count(
+    curve: &dyn crate::primitives::curve::Curve,
+    t_start: f64,
+    t_end: f64,
+    params: &TessellationParams,
+) -> usize {
+    const PROBE: usize = 16;
+    let mut total_length = 0.0_f64;
+    let mut prev = curve.point_at(t_start).ok();
+    for i in 1..=PROBE {
+        let t = t_start + (i as f64) * (t_end - t_start) / (PROBE as f64);
+        let cur = curve.point_at(t).ok();
+        if let (Some(a), Some(b)) = (prev.as_ref(), cur.as_ref()) {
+            total_length += (*b - *a).magnitude();
+        }
+        prev = cur;
+    }
+    let n = if params.max_edge_length > 0.0 {
+        (total_length / params.max_edge_length).ceil() as usize
+    } else {
+        params.min_segments
+    };
+    n.max(params.min_segments.max(3)).min(params.max_segments)
 }
 
 /// Triangulate a planar face's outer + (optional) inner loops in the
@@ -1539,19 +1618,94 @@ fn tessellate_generic_face(
         })
         .collect();
 
+    // Boundary tolerance, scaled to the polygon's own UV span so it
+    // works for unit-cube RuledSurfaces (span ≈ 1) and large-domain
+    // NURBS alike. `calculate_winding_number` uses atan2 + subtended-
+    // angle accumulation, which cancels to ≈ 0 (not 0.5) at axis-
+    // aligned polygon corners, so a corner sample that lands exactly
+    // on the polygon boundary is otherwise classified as "outside" by
+    // the strict `< 0.5` test. Accepting samples within this tolerance
+    // of any polygon edge bridges the gap without weakening the
+    // interior/exterior decision.
+    let polygon_span = {
+        let mut span = 0.0_f64;
+        if outer_polygon.len() >= 2 {
+            let (mut u_lo, mut u_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            let (mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &(uu, vv) in &outer_polygon {
+                u_lo = u_lo.min(uu);
+                u_hi = u_hi.max(uu);
+                v_lo = v_lo.min(vv);
+                v_hi = v_hi.max(vv);
+            }
+            span = (u_hi - u_lo).max(v_hi - v_lo);
+        }
+        if span > 0.0 { span } else { 1.0 }
+    };
+    let boundary_tol = polygon_span * 1e-9;
+    let boundary_tol_sq = boundary_tol * boundary_tol;
+
+    // Squared distance from a 2D point to the closed polyline of
+    // `polygon`. Used to detect samples that land on the polygon
+    // boundary (where atan2 winding is unreliable).
+    let point_to_polygon_distance_sq = |p: (f64, f64), polygon: &[(f64, f64)]| -> f64 {
+        let n = polygon.len();
+        if n < 2 {
+            return f64::INFINITY;
+        }
+        let mut best = f64::INFINITY;
+        for i in 0..n {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % n];
+            let dx = b.0 - a.0;
+            let dy = b.1 - a.1;
+            let len_sq = dx * dx + dy * dy;
+            let (cx, cy) = if len_sq <= 0.0 {
+                a
+            } else {
+                let t = ((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq;
+                let tc = t.max(0.0).min(1.0);
+                (a.0 + tc * dx, a.1 + tc * dy)
+            };
+            let ex = p.0 - cx;
+            let ey = p.1 - cy;
+            let d2 = ex * ex + ey * ey;
+            if d2 < best {
+                best = d2;
+            }
+        }
+        best
+    };
+
     let inside_face = |u: f64, v: f64| -> bool {
         if outer_polygon.len() < 3 {
             // Surface has no usable boundary; accept the whole grid so we
             // still emit triangles rather than silently dropping the face.
             return true;
         }
-        if calculate_winding_number(&(u, v), &outer_polygon).abs() < 0.5 {
+        let p = (u, v);
+        // Boundary acceptance: a sample within `boundary_tol` of the
+        // outer polygon's edges is on the face boundary and must be
+        // emitted, regardless of how atan2 cancellation rules its
+        // winding number.
+        let on_outer_boundary =
+            point_to_polygon_distance_sq(p, &outer_polygon) <= boundary_tol_sq;
+        if !on_outer_boundary
+            && calculate_winding_number(&p, &outer_polygon).abs() < 0.5
+        {
             return false;
         }
         for hole in &inner_polygons {
-            if hole.len() >= 3
-                && calculate_winding_number(&(u, v), hole).abs() > 0.5
-            {
+            if hole.len() < 3 {
+                continue;
+            }
+            // A sample on a hole boundary IS on the face boundary,
+            // accept it. Strict-interior of a hole (winding > 0.5 and
+            // not on hole boundary) is rejected.
+            if point_to_polygon_distance_sq(p, hole) <= boundary_tol_sq {
+                continue;
+            }
+            if calculate_winding_number(&p, hole).abs() > 0.5 {
                 return false;
             }
         }
@@ -1668,18 +1822,23 @@ fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, 
         v_max = v_range.1;
     }
 
-    // Add a small margin for numerical stability, but never let the
-    // expanded interval escape the surface's own parameter domain. Going
-    // below the surface's v_min in particular collides with apex-detection
-    // logic (`v_min.abs() < 1e-6`) downstream, and going beyond a surface's
-    // u/v limits has no defined evaluation.
-    let u_margin = (u_max - u_min) * 0.01;
-    let v_margin = (v_max - v_min) * 0.01;
+    // Use the loop's UV bounds directly, clamped to the surface's own
+    // parameter domain. A previous `±1% margin` expansion was meant to
+    // give "numerical stability" room but instead pushed the outermost
+    // grid samples (`u_idx = 0` and `u_idx = u_steps`) **strictly
+    // outside** the loop polygon, where `inside_face` then rejected
+    // them. The result was a ~9 % un-tessellated strip around every
+    // face boundary — visible as the "cracks on side faces" symptom
+    // for any RuledSurface / NURBS face routed through the generic
+    // grid tessellator (the planar fast-path uses ear-clipping and
+    // is unaffected). Sample exactly at the loop bounds; the
+    // `inside_face` boundary-tolerance branch handles atan2 noise at
+    // axis-aligned polygon corners.
     (
-        (u_min - u_margin).max(u_range.0),
-        (u_max + u_margin).min(u_range.1),
-        (v_min - v_margin).max(v_range.0),
-        (v_max + v_margin).min(v_range.1),
+        u_min.max(u_range.0),
+        u_max.min(u_range.1),
+        v_min.max(v_range.0),
+        v_max.min(v_range.1),
     )
 }
 

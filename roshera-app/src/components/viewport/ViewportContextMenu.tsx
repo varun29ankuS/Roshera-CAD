@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { Eye, EyeOff, Trash2 } from 'lucide-react'
+import { Eye, EyeOff, PenTool, Trash2 } from 'lucide-react'
 import { useSceneStore } from '@/stores/scene-store'
+import { sketchApi } from '@/lib/sketch-api'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -68,6 +69,26 @@ export function ViewportContextMenu() {
     close()
   }, [menu, updateObject, close])
 
+  const handleSketchOnFace = useCallback(async () => {
+    if (!menu || menu.faceId === undefined) return
+    close()
+    try {
+      // Backend resolves the face → planar surface → SketchPlane::Custom
+      // {origin, u_axis, v_axis} in the same right-handed frame the
+      // kernel uses, so the in-canvas overlay and any subsequent
+      // extrude all see consistent (u, v) coordinates.
+      const plane = await sketchApi.planeFromFace(menu.objectId, menu.faceId)
+      useSceneStore.getState().enterSketch(plane, 'polyline')
+    } catch (err) {
+      // Most common failure here is a non-planar face (face/surface
+      // wasn't a Plane). Surface to the dev console rather than a
+      // toast so we don't silently drop the rejection — the picker
+      // already prevents non-face right-clicks from reaching this
+      // path, so any failure is a kernel surprise worth logging.
+      console.error('[viewport] sketch-on-face failed:', err)
+    }
+  }, [menu, close])
+
   if (!menu) return null
 
   const obj = useSceneStore.getState().objects.get(menu.objectId)
@@ -84,6 +105,15 @@ export function ViewportContextMenu() {
         {isVisible ? <EyeOff size={13} /> : <Eye size={13} />}
         {isVisible ? 'Hide' : 'Show'}
       </MenuItem>
+      {menu.faceId !== undefined && (
+        <>
+          <div className="my-1 border-t border-border/50" />
+          <MenuItem onClick={handleSketchOnFace}>
+            <PenTool size={13} />
+            Sketch on this face
+          </MenuItem>
+        </>
+      )}
       <div className="my-1 border-t border-border/50" />
       <MenuItem onClick={handleDelete} danger>
         <Trash2 size={13} />

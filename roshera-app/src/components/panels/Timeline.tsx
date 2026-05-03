@@ -366,15 +366,31 @@ export function Timeline() {
   }, [fetchHistory])
 
   const handleUndo = async () => {
+    // Backend `/api/timeline/undo` requires `session_id` in the body
+    // (see handlers/timeline.rs::undo_operation). Without it the call
+    // silently 400s and the toolbar button looks broken. Mirror the
+    // keyboard-shortcut path in `lib/shortcuts.ts`.
+    const sessionId = useWSStore.getState().sessionId
+    if (!sessionId) return
     try {
-      const resp = await fetch('/api/timeline/undo', { method: 'POST' })
+      const resp = await fetch('/api/timeline/undo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      })
       if (resp.ok) fetchHistory()
     } catch { /* backend not running */ }
   }
 
   const handleRedo = async () => {
+    const sessionId = useWSStore.getState().sessionId
+    if (!sessionId) return
     try {
-      const resp = await fetch('/api/timeline/redo', { method: 'POST' })
+      const resp = await fetch('/api/timeline/redo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      })
       if (resp.ok) fetchHistory()
     } catch { /* backend not running */ }
   }
@@ -437,7 +453,38 @@ export function Timeline() {
         )}
       </div>
 
-      {menu && <EventContextMenu menu={menu} onClose={closeMenu} />}
+      {menu && (
+        <EventContextMenu
+          menu={menu}
+          onClose={closeMenu}
+          onTruncate={async (mode) => {
+            const sessionId = useWSStore.getState().sessionId
+            if (!sessionId) {
+              closeMenu()
+              return
+            }
+            try {
+              const resp = await fetch('/api/timeline/truncate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  session_id: sessionId,
+                  event_id: menu.event.id,
+                  mode,
+                }),
+              })
+              if (!resp.ok) {
+                console.error('[timeline] truncate failed:', resp.status)
+              }
+            } catch (err) {
+              console.error('[timeline] truncate threw:', err)
+            } finally {
+              closeMenu()
+              fetchHistory()
+            }
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -447,9 +494,11 @@ export function Timeline() {
 function EventContextMenu({
   menu,
   onClose,
+  onTruncate,
 }: {
   menu: EventContextMenuState
   onClose: () => void
+  onTruncate: (mode: 'from_here' | 'after_here') => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   // Flip upward / inward when the click is near the viewport edge — the
@@ -544,6 +593,13 @@ function EventContextMenu({
       <TimelineMenuItem onClick={() => copy(fullJson)}>
         <span className="text-muted-foreground">json ·</span> full event
       </TimelineMenuItem>
+      <div className="my-1 border-t border-border/40" />
+      <TimelineMenuItem onClick={() => onTruncate('after_here')}>
+        <span className="text-muted-foreground">↺ ·</span> rewind to here
+      </TimelineMenuItem>
+      <TimelineMenuItem onClick={() => onTruncate('from_here')} danger>
+        <span className="text-muted-foreground">✕ ·</span> delete from here
+      </TimelineMenuItem>
     </div>
   )
 }
@@ -551,16 +607,21 @@ function EventContextMenu({
 function TimelineMenuItem({
   children,
   onClick,
+  danger,
 }: {
   children: React.ReactNode
   onClick: () => void
+  danger?: boolean
 }) {
   return (
     <button
       type="button"
       role="menuitem"
       onClick={onClick}
-      className="w-full text-left px-3 py-1.5 hover:bg-accent/40 transition-colors text-foreground/90"
+      className={cn(
+        'w-full text-left px-3 py-1.5 hover:bg-accent/40 transition-colors',
+        danger ? 'text-orange-500 hover:text-orange-400' : 'text-foreground/90',
+      )}
     >
       {children}
     </button>
