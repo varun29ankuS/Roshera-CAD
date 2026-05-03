@@ -188,14 +188,20 @@ impl Primitive for CylinderPrimitive {
         let seam_line_id = model.curves.add(Box::new(seam_line));
 
         // ---- edges: closed circles + linear seam. ----
-        let two_pi = std::f64::consts::TAU;
+        // Edge param range MUST match the underlying `Circle`'s
+        // normalized [0, 1] parameterization — `Arc::evaluate(t)` clamps
+        // `t` to its internal `range = ParameterRange::unit()`. Using
+        // `[0, 2π]` here would cause every tessellator sample at
+        // `t = j · 2π / N > 1` to collapse onto angle 2π, leaving the
+        // cap as a polygon and the cap-lateral seam open. See the same
+        // comment block in `topology_builder::create_cylinder_topology`.
         let bottom_edge = model.edges.add(Edge::new(
             0,
             v_bottom,
             v_bottom,
             bottom_circle_id,
             EdgeOrientation::Forward,
-            ParameterRange::new(0.0, two_pi),
+            ParameterRange::new(0.0, 1.0),
         ));
         let top_edge = model.edges.add(Edge::new(
             0,
@@ -203,7 +209,7 @@ impl Primitive for CylinderPrimitive {
             v_top,
             top_circle_id,
             EdgeOrientation::Forward,
-            ParameterRange::new(0.0, two_pi),
+            ParameterRange::new(0.0, 1.0),
         ));
         let seam_edge = model.edges.add(Edge::new(
             0,
