@@ -1228,17 +1228,49 @@ fn tessellate_conical_with_apex(
 ) {
     let mut vertex_grid = Vec::new();
 
-    // First row is the apex
+    // First row is the apex.
+    //
+    // `Cone::evaluate_full(u, 0)` returns `Err(DivisionByZero)` because at
+    // `v = 0` the radius is zero, `du` is the zero vector, and the surface
+    // normal `du.cross(&dv).normalize()` fails. Falling through to the
+    // `surface.point_at` / `face.normal_at` path therefore drops the apex
+    // vertex entirely — every fan triangle then evaluates `vertex_grid[0][0]`
+    // as `None` and emits nothing, leaving a visible hole at the cone tip.
+    //
+    // Synthesize the apex directly from the `Cone` primitive: the position
+    // is `cone.apex`, and the limit normal averaged over `u` is `-axis`
+    // (each (u, v=ε) sample's outward normal direction is
+    // `(cos u · cos α, sin u · cos α, -sin α)`; integrating over `u`
+    // cancels the radial components and leaves `(0, 0, -sin α)`, which
+    // unit-normalizes to `-axis`). Multiply by the face orientation sign
+    // so a backward face flips the normal to match the rest of its lateral
+    // ring. This function is only reached from `tessellate_conical_face`
+    // when `includes_apex` is true, so the downcast is sound by
+    // construction; the fallback to surface evaluation covers any future
+    // dispatcher that routes a non-`Cone` apex-singular surface here.
     if v_min.abs() < 1e-6 {
         let u = (u_min + u_max) / 2.0; // Any u value at apex
         let v = v_min;
 
-        if let (Ok(point), Ok(normal)) = (
-            surface.point_at(u, v),
-            face.normal_at(u, v, &model.surfaces),
-        ) {
+        let apex_synth = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Cone>()
+            .map(|cone| (cone.apex, -cone.axis * face.orientation.sign()));
+
+        let apex_vertex = match apex_synth {
+            Some((position, normal)) => Some((position, normal)),
+            None => match (
+                surface.point_at(u, v),
+                face.normal_at(u, v, &model.surfaces),
+            ) {
+                (Ok(p), Ok(n)) => Some((p, n)),
+                _ => None,
+            },
+        };
+
+        if let Some((position, normal)) = apex_vertex {
             let index = mesh.add_vertex(MeshVertex {
-                position: point,
+                position,
                 normal,
                 uv: Some((u, v)),
             });
