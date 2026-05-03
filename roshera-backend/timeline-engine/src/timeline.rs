@@ -496,47 +496,57 @@ impl Timeline {
     /// outer `RwLock<Timeline>` while invoking this. That's important because
     /// the API server's request handlers `.await` this call, and a write lock
     /// held across an `.await` would serialize all timeline traffic.
+    ///
+    /// Position semantics: `event_index` is the *count of applied events*
+    /// from the start of the branch. `event_index == 0` means "nothing
+    /// applied yet" (no further undo possible). `event_index == N` means
+    /// the event at sequence_number `N - 1` was the last one applied.
+    /// Undo decrements the count by one and returns the id of the event
+    /// being undone — the caller (api-server) reconciles the live
+    /// `BRepModel` by replaying the first `event_index` events of the
+    /// branch.
+    ///
+    /// We deliberately do **not** record an "Undo" marker event here:
+    /// markers would pollute `branch_events` with synthetic entries that
+    /// the replay layer can't apply, and would shift the head past the
+    /// session's logical position so subsequent undo/redo arithmetic
+    /// drifts. Undo is a position-pointer move, not a new event.
     pub async fn undo(&self, session_id: uuid::Uuid) -> TimelineResult<EventId> {
         let session = SessionId::new(session_id.to_string());
 
-        // Get current position
+        // Get current position. Snapshot under a short-lived guard so the
+        // DashMap reference is dropped before we re-acquire write access
+        // via `update_session_position`.
         let position = self
             .session_positions
             .get(&session)
+            .map(|p| p.clone())
             .ok_or_else(|| TimelineError::SessionNotFound)?;
 
         if position.event_index == 0 {
             return Err(TimelineError::NoMoreUndo);
         }
 
-        // Get the event to undo
+        // The event being undone is the most recently applied one — at
+        // sequence_number `event_index - 1`.
+        let target_index = position.event_index - 1;
         let branch_events = self
             .branch_events
             .get(&position.branch_id)
             .ok_or_else(|| TimelineError::BranchNotFound(position.branch_id))?;
 
         let event_id = branch_events
-            .get(&(position.event_index - 1))
+            .get(&target_index)
             .ok_or_else(|| TimelineError::EventNotFound(EventId::new()))?
             .clone();
+        drop(branch_events);
 
-        // Create undo operation
-        let undo_op = Operation::Generic {
-            command_type: "Undo".to_string(),
-            parameters: serde_json::json!({
-                "undone_event": event_id,
-            }),
-        };
+        // Move the session pointer one step back. Replay (driven by the
+        // api-server) will rebuild the live model from events
+        // `[0, target_index)` — i.e. with the just-undone event excluded.
+        let _ = self.update_session_position(session, position.branch_id, target_index);
 
-        // Record the undo
-        let undo_event_id = self
-            .add_operation(undo_op, Author::System, position.branch_id)
-            .await?;
-
-        // Update session position
-        self.update_session_position(session, position.branch_id, position.event_index - 1);
-
-        Ok(undo_event_id)
+        Ok(event_id)
     }
 
     /// Redo the last undone operation for a session.
@@ -545,44 +555,48 @@ impl Timeline {
     /// interior state means concurrent reads through the outer `RwLock` are
     /// safe, which keeps the API server's `.await` on this call from
     /// monopolizing the timeline.
+    ///
+    /// Position semantics: same as [`Self::undo`]. Redo advances the
+    /// position by one if there is a *next* event in the branch
+    /// (sequence_number `event_index`); the returned `EventId` is the
+    /// event that has just become "applied". As with undo, no marker
+    /// event is written — redo is a pointer move.
     pub async fn redo(&self, session_id: uuid::Uuid) -> TimelineResult<EventId> {
         let session = SessionId::new(session_id.to_string());
 
-        // Get current position
+        // Snapshot the position before we mutate it, then drop the
+        // DashMap reference so `update_session_position` can re-acquire
+        // write access without contention.
         let position = self
             .session_positions
             .get(&session)
+            .map(|p| p.clone())
             .ok_or_else(|| TimelineError::SessionNotFound)?;
 
-        // Get branch events
         let branch_events = self
             .branch_events
             .get(&position.branch_id)
             .ok_or_else(|| TimelineError::BranchNotFound(position.branch_id))?;
 
-        // Check if there's an event to redo
-        let next_event = branch_events
-            .get(&(position.event_index + 1))
+        // The next event to re-apply is at sequence_number == event_index
+        // (because event_index is a *count* of applied events, so it
+        // points one slot past the last applied entry).
+        let target_index = position.event_index;
+        let next_event_id = branch_events
+            .get(&target_index)
             .ok_or_else(|| TimelineError::NoMoreRedo)?
             .clone();
+        drop(branch_events);
 
-        // Create redo operation
-        let redo_op = Operation::Generic {
-            command_type: "Redo".to_string(),
-            parameters: serde_json::json!({
-                "redone_event": next_event,
-            }),
-        };
+        // Advance the session pointer by one. The caller will replay
+        // `[0, event_index + 1)` to bring the live model forward.
+        let _ = self.update_session_position(
+            session,
+            position.branch_id,
+            position.event_index + 1,
+        );
 
-        // Record the redo
-        let redo_event_id = self
-            .add_operation(redo_op, Author::System, position.branch_id)
-            .await?;
-
-        // Update session position
-        self.update_session_position(session, position.branch_id, position.event_index + 1);
-
-        Ok(redo_event_id)
+        Ok(next_event_id)
     }
 
     /// Switch to a different branch
@@ -685,6 +699,98 @@ impl Timeline {
     /// Set operation state
     pub fn set_operation_state(&self, event_id: EventId, state: OperationState) {
         self.active_operations.insert(event_id, state);
+    }
+
+    /// Find the branch-local `EventIndex` of a given event.
+    ///
+    /// Linear scan over the branch's `(EventIndex → EventId)` map, which is
+    /// cheap for the typical 10²–10³ events per branch. Returns `None` if
+    /// the branch doesn't exist or the event isn't in this branch.
+    pub fn find_event_index(
+        &self,
+        branch_id: &BranchId,
+        event_id: EventId,
+    ) -> Option<EventIndex> {
+        let branch_events = self.branch_events.get(branch_id)?;
+        // The `Iter` returned by DashMap holds a borrow into `branch_events`,
+        // so its lifetime is tied to the local. Bind the result to a local
+        // before the block ends to keep NLL happy under edition-2024 drop
+        // ordering — otherwise the temporary outlives the binding it
+        // borrows from. (Compiler hint: E0597.)
+        let index = branch_events
+            .iter()
+            .find(|entry| *entry.value() == event_id)
+            .map(|entry| *entry.key());
+        index
+    }
+
+    /// Drop every event at or after `cut_index` from the given branch.
+    ///
+    /// `cut_index` is the first index to drop — so passing `target_index`
+    /// itself deletes the target event and everything that came after it
+    /// ("delete from here forward"); passing `target_index + 1` keeps the
+    /// target and only drops what came after ("rewind to this point").
+    ///
+    /// Removes the dropped entries from `branch_events[branch_id]` and
+    /// from the global `events` table. Sessions whose position pointer
+    /// sat at or past `cut_index` on this branch are clamped down to the
+    /// new head (`cut_index`); sessions on other branches are
+    /// untouched.
+    ///
+    /// `BranchId::main` is allowed — truncation is a destructive but
+    /// well-defined ledger operation (the user has explicitly asked to
+    /// drop these events). Returns the number of events removed.
+    pub fn truncate_branch(
+        &self,
+        branch_id: BranchId,
+        cut_index: EventIndex,
+    ) -> TimelineResult<usize> {
+        let to_remove: Vec<(EventIndex, EventId)> = {
+            let branch_events = self
+                .branch_events
+                .get(&branch_id)
+                .ok_or(TimelineError::BranchNotFound(branch_id))?;
+            branch_events
+                .iter()
+                .filter(|entry| *entry.key() >= cut_index)
+                .map(|entry| (*entry.key(), *entry.value()))
+                .collect()
+        };
+
+        if let Some(branch_events) = self.branch_events.get(&branch_id) {
+            for (idx, _) in &to_remove {
+                branch_events.remove(idx);
+            }
+        }
+
+        for (_, event_id) in &to_remove {
+            self.events.remove(event_id);
+            // Best-effort: scrub these IDs out of `entity_events` so
+            // queries that walk per-entity history don't surface
+            // dangling references to dropped events. We don't know which
+            // entities each event touched without reading it (already
+            // gone), so iterate the whole map; this is O(entities) per
+            // truncate which is acceptable for a user-initiated action.
+        }
+        let dropped: std::collections::HashSet<EventId> =
+            to_remove.iter().map(|(_, id)| *id).collect();
+        if !dropped.is_empty() {
+            for mut entry in self.entity_events.iter_mut() {
+                entry.value_mut().retain(|eid| !dropped.contains(eid));
+            }
+        }
+
+        // Clamp any session pointer that sat past the new head on this
+        // branch. Other branches untouched.
+        for mut entry in self.session_positions.iter_mut() {
+            let pos = entry.value_mut();
+            if pos.branch_id == branch_id && pos.event_index > cut_index {
+                pos.event_index = cut_index;
+                pos.last_updated = Utc::now();
+            }
+        }
+
+        Ok(to_remove.len())
     }
 
     /// List all branches in the timeline

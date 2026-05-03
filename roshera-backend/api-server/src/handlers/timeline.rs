@@ -123,17 +123,62 @@ pub struct ReplayEventsResponse {
     pub message: String,
 }
 
+/// Ensure the session has a timeline position pointing at the head of
+/// the main branch.
+///
+/// The `TimelineRecorder` (attached at startup) appends every kernel
+/// operation under `Author::System` via `Timeline::add_operation`, which
+/// does **not** touch `session_positions` — there is no per-session
+/// pointer in the kernel call path. As a result a freshly-connected
+/// session never has a position registered, and the very first
+/// `Timeline::undo` / `Timeline::redo` call would fail with
+/// `SessionNotFound`. This helper plants a position at the current head
+/// of `main` so that first undo/redo lands on the latest recorded event.
+///
+/// `event_index` is a *count of applied events* (see `Timeline::undo`'s
+/// docstring), so head = `events.len()`.
+async fn ensure_session_position_at_head(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<(), String> {
+    let timeline = state.timeline.read().await;
+    if timeline.get_session_position(session_uuid).is_some() {
+        return Ok(());
+    }
+    // Count of events in main = head pointer (one past the last applied
+    // event). Errors here are non-fatal — an empty branch is a valid
+    // state and means `event_index = 0`, which short-circuits undo
+    // cleanly via `NoMoreUndo`.
+    let head_count = timeline
+        .get_branch_events(&BranchId::main(), None, None)
+        .map(|events| events.len() as u64)
+        .unwrap_or(0);
+    timeline
+        .update_session_position(
+            SessionId::new(session_uuid.to_string()),
+            BranchId::main(),
+            head_count,
+        )
+        .map_err(|e| format!("update session position: {}", e))
+}
+
 /// Reconcile the live `BRepModel` with the session's current timeline
 /// position by replacing it with a fresh model and replaying every event
-/// on the session's branch up to (and including) the position pointer.
+/// on the session's branch up to (but not including) the position pointer.
 ///
 /// This is the bridge between the timeline's logical position changes
 /// (`undo`, `redo`, `replay`) and the kernel's actual geometry state.
 /// `Timeline::undo`/`Timeline::redo` only advance the session position
 /// pointer — they do not touch the kernel. Without this reconciliation
-/// step the model and the timeline drift out of sync, which is what was
-/// previously documented as "undo/redo does not reconcile the live
-/// BRepModel".
+/// step the model and the timeline drift out of sync.
+///
+/// After replay, every connected viewer is brought up-to-date by
+/// emitting `ObjectDeleted` frames for every previously-known UUID and
+/// `ObjectCreated` frames for every solid in the rebuilt model. The
+/// frontend's WS pump only listens to the `geometry_broadcaster`
+/// channel (see `protocol/message_handlers.rs`), so the per-session
+/// `BroadcastMessage::TimelineUpdate` envelope is informational only —
+/// these geometry frames are what actually rerenders the scene.
 ///
 /// # Lock ordering
 ///
@@ -159,18 +204,24 @@ async fn replay_session_to_model(
     // 1. Snapshot the session's position + fetch the events to replay.
     //    Held under a single read lock so position and events are
     //    consistent with each other.
+    //
+    //    `event_index` is the *count of applied events*, so it equals
+    //    the number of events to fetch from the branch root. Events are
+    //    sorted by `sequence_number` because `get_branch_events`
+    //    iterates a `DashMap` whose ordering is non-deterministic —
+    //    replay correctness depends on monotonically increasing
+    //    sequence application.
     let (branch_id, events) = {
         let timeline = state.timeline.read().await;
         let position = timeline
             .get_session_position(session_uuid)
             .ok_or_else(|| "session has no timeline position".to_string())?;
-        // `event_index` is the inclusive index of the session's current
-        // event; `get_branch_events` interprets `limit` as a count, so
-        // request `event_index + 1` events starting from the branch root.
-        let limit = position.event_index.saturating_add(1) as usize;
-        let events = timeline
-            .get_branch_events(&position.branch_id, None, Some(limit))
+        let limit = position.event_index as usize;
+        let mut events = timeline
+            .get_branch_events(&position.branch_id, None, None)
             .map_err(|e| format!("failed to fetch branch events: {}", e))?;
+        events.sort_by_key(|e| e.sequence_number);
+        events.truncate(limit);
         (position.branch_id, events)
     };
 
@@ -196,6 +247,60 @@ async fn replay_session_to_model(
         events_skipped = outcome.events_skipped,
         "BRepModel reconciled with session timeline position"
     );
+
+    // 4. Tell every connected viewer about the new world.
+    //
+    //    Strategy: brute-force scene reload. We snapshot every UUID the
+    //    api-server currently knows about, drop them from id_mapping,
+    //    and emit `ObjectDeleted` for each. We then walk the rebuilt
+    //    `BRepModel`, mint fresh UUIDs for each solid, register them in
+    //    id_mapping, and emit `ObjectCreated`.
+    //
+    //    Why fresh UUIDs: `BRepModel::new()` resets the kernel's
+    //    `SolidId` counter, so the rebuilt model's solids have
+    //    `SolidId`s that may collide with stale id_mapping entries that
+    //    referred to entirely different (now-evicted) solids. Re-using
+    //    UUIDs for "the same logical solid" would require tracking
+    //    operation outputs across replay, which the recorder's current
+    //    envelope (`{"params", "inputs", "outputs"}`) doesn't surface
+    //    in a way the post-replay walk can reconstruct cheaply.
+    //    Fresh-mint is correct and cheap for the common case (1–10
+    //    solids); revisit if scenes grow to thousands.
+    let old_uuids = state.snapshot_registered_uuids();
+    for uuid in &old_uuids {
+        state.unregister_id_mapping(uuid);
+        crate::broadcast_object_deleted(&uuid.to_string());
+    }
+
+    let tess_params = geometry_engine::tessellation::TessellationParams::default();
+    for (solid_id, solid) in model_guard.solids.iter() {
+        let mesh = geometry_engine::tessellation::tessellate_solid(
+            solid,
+            &model_guard,
+            &tess_params,
+        );
+        let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
+        let uuid = state.create_uuid_for_local(solid_id);
+        // No analytical-geometry envelope after replay: the kernel
+        // doesn't track which primitive produced each surviving solid
+        // (e.g. boolean output), so we ship the mesh as a generic
+        // "mesh" — the frontend's `convertCADObject` falls through to
+        // the mesh path for this case and the solid still renders,
+        // selects, and exports correctly.
+        crate::broadcast_object_created(
+            &uuid.to_string(),
+            solid.name.as_deref().unwrap_or("Solid"),
+            solid_id,
+            "mesh",
+            &serde_json::json!({}),
+            &vertices,
+            &indices,
+            &normals,
+            &face_ids,
+            [0.0, 0.0, 0.0],
+        );
+    }
+
     Ok(outcome)
 }
 
@@ -624,9 +729,21 @@ pub async fn undo_operation(
     // Parse session ID to UUID for timeline operations
     let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Advance the session's timeline position (this records an undo marker
-    // and shifts the position pointer — see `Timeline::undo`).
-    //
+    // The recorder bridge appends every kernel op under `Author::System`
+    // and never updates `session_positions`, so a freshly-connected
+    // session has no pointer to undo from. Plant one at the current
+    // head of `main` before delegating; subsequent undo/redo calls then
+    // walk the pointer the way `Timeline::undo` expects.
+    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
+        tracing::error!(
+            target: "timeline.undo",
+            session = %session_uuid,
+            error = %err,
+            "failed to seed session position; undo will fail"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     // `Timeline::undo` takes `&self` and only mutates `Arc<DashMap>` interior
     // state, so a *read* lock on the outer `RwLock<Timeline>` is sufficient
     // and keeps the lock-across-await non-blocking for other readers.
@@ -725,6 +842,147 @@ pub async fn undo_operation(
     }
 }
 
+/// Request to truncate a branch's history at a specific event.
+///
+/// `mode = "from_here"` drops the event itself and everything that came
+/// after; `mode = "after_here"` keeps the event and only drops what came
+/// after. Branch defaults to `main` when unspecified.
+#[derive(Serialize, Deserialize)]
+pub struct TruncateHistoryRequest {
+    pub session_id: String,
+    pub event_id: String,
+    #[serde(default)]
+    pub branch_id: Option<String>,
+    #[serde(default = "default_truncate_mode")]
+    pub mode: TruncateModeDto,
+}
+
+fn default_truncate_mode() -> TruncateModeDto {
+    TruncateModeDto::FromHere
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncateModeDto {
+    /// Drop the target event and every event after it.
+    FromHere,
+    /// Keep the target event; drop only events after it.
+    AfterHere,
+}
+
+/// Truncate a branch by deleting the specified event and (optionally)
+/// every event that came after it, then rebuild the live `BRepModel`
+/// against the surviving prefix and broadcast the new scene to all
+/// connected viewers.
+///
+/// This is the implementation of the timeline's "delete from here" /
+/// "rewind to this point" right-click action. It is a destructive
+/// ledger operation — the dropped events are removed from the timeline
+/// permanently — so callers (the frontend context menu in particular)
+/// must obtain explicit user confirmation before issuing it.
+pub async fn truncate_history(
+    State(state): State<AppState>,
+    Json(request): Json<TruncateHistoryRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session_uuid =
+        Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let event_id = EventId(
+        Uuid::parse_str(&request.event_id).map_err(|_| StatusCode::BAD_REQUEST)?,
+    );
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+
+    // Locate the event in the branch so we know the cut index.
+    let target_index = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .find_event_index(&branch_id, event_id)
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    let cut_index = match request.mode {
+        TruncateModeDto::FromHere => target_index,
+        TruncateModeDto::AfterHere => target_index + 1,
+    };
+
+    // Make sure the requesting session has a position planted before we
+    // mutate the branch — otherwise the post-truncate replay step would
+    // 404 with `SessionNotFound`.
+    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
+        tracing::error!(
+            target: "timeline.truncate",
+            session = %session_uuid,
+            error = %err,
+            "failed to seed session position; truncate aborted"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Drop events from the branch. `Timeline::truncate_branch` clamps
+    // any session pointer past `cut_index` down to the new head, so the
+    // following replay sees a consistent (position, branch_events) pair.
+    let removed = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .truncate_branch(branch_id, cut_index)
+            .map_err(|e| {
+                tracing::error!(
+                    target: "timeline.truncate",
+                    branch = %branch_id,
+                    cut = cut_index,
+                    error = %e,
+                    "branch truncate failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+
+    // Rebuild the live model from the surviving event prefix and push
+    // ObjectDeleted/Created frames so every connected client refreshes.
+    let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
+        Ok(outcome) => Some(outcome),
+        Err(err) => {
+            tracing::error!(
+                target: "timeline.truncate",
+                session = %session_uuid,
+                error = %err,
+                "model replay after truncate failed; clients may see stale geometry"
+            );
+            None
+        }
+    };
+
+    let _ = state
+        .session_manager
+        .broadcast_manager()
+        .broadcast_to_session(
+            &request.session_id,
+            BroadcastMessage::TimelineUpdate {
+                session_id: session_uuid,
+                event_id: event_id.to_string(),
+                operation: "truncate".to_string(),
+                user_id: "system".to_string(),
+            },
+        )
+        .await;
+
+    let (events_applied, events_skipped) = replay_outcome
+        .as_ref()
+        .map(|o| (o.events_applied, o.events_skipped))
+        .unwrap_or((0, 0));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "events_removed": removed,
+        "model_reconciled": replay_outcome.is_some(),
+        "events_applied": events_applied,
+        "events_skipped": events_skipped,
+        "cut_index": cut_index,
+    })))
+}
+
 /// Redo the last undone operation
 pub async fn redo_operation(
     State(state): State<AppState>,
@@ -738,9 +996,20 @@ pub async fn redo_operation(
     // Parse session ID to UUID for timeline operations
     let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Advance the session's timeline position forward (records a redo
-    // marker and updates the position pointer — see `Timeline::redo`).
-    //
+    // Same first-time seeding as the undo path — without a session
+    // position, redo would always fail with `SessionNotFound`. Init at
+    // head so a "redo with nothing to redo" gives a clean
+    // `NoMoreRedo`, not an opaque session error.
+    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
+        tracing::error!(
+            target: "timeline.redo",
+            session = %session_uuid,
+            error = %err,
+            "failed to seed session position; redo will fail"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
     // only `Arc<DashMap>` interior state. Mirrors the undo path.
     let redo_result = {

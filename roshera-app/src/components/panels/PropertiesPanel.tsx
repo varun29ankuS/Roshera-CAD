@@ -474,16 +474,20 @@ function TransformRow({
     <div className="flex items-center gap-1">
       <span className="text-[9px] text-muted-foreground w-5 shrink-0">{label}</span>
       {([0, 1, 2] as const).map((i) => (
-        <div key={i} className="flex-1 flex items-center gap-0.5 bg-background/50 rounded px-1 py-0.5">
-          <span className={`text-[8px] ${colors[i]}`}>{axes[i]}</span>
+        // `min-w-0` is required so the flex item can shrink below the
+        // browser's default `<input type="number">` intrinsic width
+        // (~150px in Chromium). Without it, three axis cells each
+        // refuse to shrink and the row blows past the panel column.
+        <div key={i} className="flex-1 min-w-0 flex items-center gap-0.5 bg-background/50 rounded px-1 py-0.5">
+          <span className={`text-[8px] ${colors[i]} shrink-0`}>{axes[i]}</span>
           <input
             type="number"
             step={label === 'Scl' ? 0.1 : 1}
             value={values[i].toFixed(label === 'Scl' ? 2 : 1)}
             onChange={(e) => onChange(i, e.target.value)}
-            className="w-full bg-transparent text-[10px] font-mono outline-none text-foreground"
+            className="w-full min-w-0 bg-transparent text-[10px] font-mono outline-none text-foreground"
           />
-          {suffix && <span className="text-[8px] text-muted-foreground">{suffix}</span>}
+          {suffix && <span className="text-[8px] text-muted-foreground shrink-0">{suffix}</span>}
         </div>
       ))}
     </div>

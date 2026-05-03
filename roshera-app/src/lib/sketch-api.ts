@@ -90,6 +90,23 @@ export const sketchApi = {
   setPlane(id: string, plane: SketchPlane): Promise<ServerSketchSession> {
     return request('PUT', `/sketch/${id}/plane`, { plane })
   },
+  /**
+   * Resolve a face on a B-Rep object into a face-anchored
+   * `SketchPlane::Custom { origin, u_axis, v_axis }`. The endpoint
+   * downcasts the face's surface to a `Plane`, takes the face's
+   * outward normal at (0.5, 0.5), and re-derives v_axis = n × u_axis
+   * for a right-handed in-plane frame. Returns the plane in the
+   * untagged object form the rest of the sketch surface accepts.
+   */
+  planeFromFace(
+    objectId: string,
+    faceId: number,
+  ): Promise<SketchPlane> {
+    return request('POST', '/sketch/plane-from-face', {
+      object_id: objectId,
+      face_id: faceId,
+    })
+  },
   setTool(id: string, tool: SketchTool): Promise<ServerSketchSession> {
     return request('PUT', `/sketch/${id}/tool`, { tool })
   },

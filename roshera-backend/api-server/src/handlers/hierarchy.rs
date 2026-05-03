@@ -11,29 +11,28 @@ pub async fn get_hierarchy(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.hierarchy_manager.get_hierarchy(&session_id).await {
-        Some(hierarchy) => {
-            let workflow_state = state
-                .hierarchy_manager
-                .get_workflow_state(&session_id)
-                .await;
-            let response = serde_json::json!({
-                "success": true,
-                "data": {
-                    "hierarchy": hierarchy,
-                    "workflow_state": workflow_state
-                }
-            });
-            (StatusCode::OK, Json(response))
+    // Lazy-create on first GET. The frontend ModelTree polls this every 5 s
+    // from page load, so 404-on-missing turned the console into a torrent of
+    // errors and drowned out real diagnostics. Hierarchy sessions are
+    // in-memory only, no auth boundary on this endpoint, and an empty
+    // ProjectHierarchy is the natural "no data yet" answer — so create on
+    // demand rather than 404.
+    let hierarchy = match state.hierarchy_manager.get_hierarchy(&session_id).await {
+        Some(h) => h,
+        None => state.hierarchy_manager.create_session(session_id.clone()).await,
+    };
+    let workflow_state = state
+        .hierarchy_manager
+        .get_workflow_state(&session_id)
+        .await;
+    let response = serde_json::json!({
+        "success": true,
+        "data": {
+            "hierarchy": hierarchy,
+            "workflow_state": workflow_state
         }
-        None => {
-            let response = serde_json::json!({
-                "success": false,
-                "error": "Session not found"
-            });
-            (StatusCode::NOT_FOUND, Json(response))
-        }
-    }
+    });
+    (StatusCode::OK, Json(response))
 }
 
 pub async fn execute_hierarchy_command(

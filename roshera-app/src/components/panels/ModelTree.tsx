@@ -1,7 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { Eye, EyeOff, Trash2, Pencil } from 'lucide-react'
-import { useSceneStore, type CADObject } from '@/stores/scene-store'
+import { useSceneStore, isStandardPlane, type CADObject, type SketchPlane } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -197,7 +197,16 @@ function TreeItem({
               e.stopPropagation()
               onToggleVisibility(node.id)
             }}
-            className="text-foreground/60 hover:text-foreground transition-colors w-3 text-center"
+            // Hidden rows render the indicator in orange so the user
+            // can scan the tree and immediately spot what's been
+            // toggled off, instead of relying on the dim ○/● shape
+            // alone (which is easy to miss against muted text).
+            className={cn(
+              'transition-colors w-3 text-center',
+              visible
+                ? 'text-foreground/60 hover:text-foreground'
+                : 'text-orange-500 hover:text-orange-400',
+            )}
             aria-label={visible ? 'Hide' : 'Show'}
             title={visible ? 'Hide' : 'Show'}
           >
@@ -287,11 +296,21 @@ function hierarchyToNodes(hierarchy: ProjectHierarchy): TreeNode[] {
  * stable across re-renders — backend `Map` iteration order is
  * insertion-order today but we don't want to rely on that.
  */
+function sketchPlaneLabel(plane: SketchPlane): string {
+  // Standard planes serialise as bare strings ('xy' | 'xz' | 'yz');
+  // face-anchored sketches arrive as { origin, u_axis, v_axis } objects
+  // which have no `.toUpperCase()`. Calling it unconditionally on a
+  // discriminated union throws at runtime and tears down the model
+  // tree render — that's how Task #38's plane refactor leaked into the
+  // browser as a "nothing renders, can't right-click anything" state.
+  return isStandardPlane(plane) ? plane.toUpperCase() : 'FACE'
+}
+
 function sketchesToNodes(sketches: Map<string, ServerSketchSession>): TreeNode[] {
   return Array.from(sketches.values())
     .sort((a, b) => a.created_at - b.created_at)
     .map((s, idx) => {
-      const planeLabel = s.plane.toUpperCase()
+      const planeLabel = sketchPlaneLabel(s.plane)
       const ptSuffix = s.points.length === 1 ? 'pt' : 'pts'
       return {
         id: s.id,

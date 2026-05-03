@@ -89,6 +89,55 @@ export const CAMERA_PRESETS: Record<string, CameraPreset> = {
   isometric:   { name: 'Isometric',   position: [20, 15, 20], target: [0, 0, 0], up: [0, 1, 0] },
 }
 
+/**
+ * Resolve the (camera-preset key, full preset data) pair the viewport
+ * should snap to when a sketch is opened on `plane`.
+ *
+ *   * Standard planes map to the matching axis-aligned built-in preset.
+ *   * Custom planes (sketches anchored to a B-Rep face) synthesise a
+ *     camera looking along the face normal at the plane's origin, with
+ *     `up` aligned to the plane's v_axis. This gives the user a
+ *     flat-on view of the face regardless of orientation.
+ */
+function sketchCameraSetup(plane: SketchPlane): {
+  presetKey: string
+  preset: CameraPreset | undefined
+} {
+  if (isStandardPlane(plane)) {
+    // Y-up world: Top view looks down -Y (sees XZ); Front looks down
+    // -Z (sees XY); Right looks down -X (sees YZ). Match each plane
+    // to the view that shows it face-on.
+    const standardPresetKey: Record<StandardPlane, string> = {
+      xy: 'front',
+      xz: 'top',
+      yz: 'right',
+    }
+    const presetKey = standardPresetKey[plane]
+    return { presetKey, preset: CAMERA_PRESETS[presetKey] }
+  }
+  const distance = 30
+  // u × v gives the outward-facing normal under the right-hand rule
+  // (matches the backend's SketchPlane::Custom::normal).
+  const normal: [number, number, number] = [
+    plane.u_axis[1] * plane.v_axis[2] - plane.u_axis[2] * plane.v_axis[1],
+    plane.u_axis[2] * plane.v_axis[0] - plane.u_axis[0] * plane.v_axis[2],
+    plane.u_axis[0] * plane.v_axis[1] - plane.u_axis[1] * plane.v_axis[0],
+  ]
+  return {
+    presetKey: 'sketch-custom',
+    preset: {
+      name: 'Sketch Plane',
+      position: [
+        plane.origin[0] + normal[0] * distance,
+        plane.origin[1] + normal[1] * distance,
+        plane.origin[2] + normal[2] * distance,
+      ],
+      target: plane.origin,
+      up: plane.v_axis,
+    },
+  }
+}
+
 // ─── Edge display settings ──────────────────────────────────────────
 export interface EdgeSettings {
   visible: boolean
@@ -109,10 +158,37 @@ export interface GridSettings {
 // ─── Sketch mode ─────────────────────────────────────────────────────
 /**
  * 2D sketch plane. Points are stored in plane-local (u, v) coordinates
- * and lifted to 3D when finalised. xy → (u, v, 0); xz → (u, 0, v); yz → (0, u, v).
- * The corresponding extrude direction is the plane's outward normal.
+ * and lifted to 3D when finalised.
+ *
+ *   * `'xy'` → (u, v, 0); `'xz'` → (u, 0, v); `'yz'` → (0, u, v).
+ *   * `CustomSketchPlane` is a free plane derived from a B-Rep planar
+ *     face (or, in the future, typed in by hand). Lift is
+ *     `origin + u*u_axis + v*v_axis`; the implied outward normal —
+ *     and therefore the default extrude direction — is
+ *     `u_axis × v_axis`.
+ *
+ * The wire form is shape-disambiguated: standard planes serialise as
+ * the bare lowercase string; custom planes serialise as the bare
+ * `CustomSketchPlane` object. Use {@link isStandardPlane} /
+ * {@link isCustomPlane} to discriminate at use sites.
  */
-export type SketchPlane = 'xy' | 'xz' | 'yz'
+export type StandardPlane = 'xy' | 'xz' | 'yz'
+
+export interface CustomSketchPlane {
+  origin: [number, number, number]
+  u_axis: [number, number, number]
+  v_axis: [number, number, number]
+}
+
+export type SketchPlane = StandardPlane | CustomSketchPlane
+
+export function isStandardPlane(p: SketchPlane): p is StandardPlane {
+  return typeof p === 'string'
+}
+
+export function isCustomPlane(p: SketchPlane): p is CustomSketchPlane {
+  return typeof p !== 'string'
+}
 
 /** Drawing tool inside sketch mode. */
 export type SketchTool = 'polyline' | 'rectangle' | 'circle'
@@ -146,6 +222,15 @@ export interface SketchState {
   measure: boolean
   /** Default extrude thickness applied by the panel's "Finish" button. */
   thickness: number
+  /**
+   * When set, the active sketch session was reopened via "Edit sketch"
+   * from the model tree, and this id is the existing extruded solid
+   * that was originally produced from this sketch. The Finish handler
+   * deletes that solid before re-running `extrude`, so editing the
+   * profile *replaces* the feature instead of stamping out a duplicate.
+   * `null` for a fresh sketch (the toolbar's "New Sketch" path).
+   */
+  editingSourceObjectId: string | null
 }
 
 // ─── Scene store ─────────────────────────────────────────────────────
@@ -206,9 +291,16 @@ interface SceneState {
   /**
    * Right-click context-menu state for the viewport. `objectId` is the
    * CADObject the menu is acting on (set when the user right-clicks a
-   * mesh). `null` while the menu is closed.
+   * mesh). `faceId` is set when the click resolved to a kernel face —
+   * used to gate the "Sketch on this face" item. `null` while the menu
+   * is closed.
    */
-  contextMenu: { x: number; y: number; objectId: string } | null
+  contextMenu: {
+    x: number
+    y: number
+    objectId: string
+    faceId?: number
+  } | null
 
   /** Interactive 2D sketch state. See {@link SketchState}. */
   sketch: SketchState
@@ -261,11 +353,19 @@ interface SceneState {
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
   setViewportSize: (size: { width: number; height: number }) => void
-  openContextMenu: (menu: { x: number; y: number; objectId: string }) => void
+  openContextMenu: (menu: { x: number; y: number; objectId: string; faceId?: number }) => void
   closeContextMenu: () => void
 
   enterSketch: (plane?: SketchPlane, tool?: SketchTool) => void
-  exitSketch: () => void
+  /**
+   * Tear down the local sketch UI. By default this also deletes the
+   * backend session (matches user-initiated cancel via Esc / X / toolbar
+   * exit). Pass `{ deleteBackend: false }` from paths that want the
+   * session to survive — most importantly the post-extrude finish path,
+   * which uses `consume: false` so the user can later "Edit sketch"
+   * from the model tree and reopen the same profile.
+   */
+  exitSketch: (options?: { deleteBackend?: boolean }) => void
   setSketchTool: (tool: SketchTool) => void
   setSketchPlane: (plane: SketchPlane) => void
   addSketchPoint: (point: [number, number]) => void
@@ -317,7 +417,7 @@ interface SceneState {
 }
 
 export const useSceneStore = create<SceneState>()(
-  subscribeWithSelector((set) => ({
+  subscribeWithSelector((set, get) => ({
     objects: new Map(),
     objectOrder: [],
     selectedIds: new Set(),
@@ -361,6 +461,7 @@ export const useSceneStore = create<SceneState>()(
       snapStep: 0.5,
       measure: true,
       thickness: 5,
+      editingSourceObjectId: null,
     },
     serverSketches: new Map(),
     sceneRef: null,
@@ -536,17 +637,10 @@ export const useSceneStore = create<SceneState>()(
       const targetPlane = plane ?? useSceneStore.getState().sketch.plane
       const targetTool = tool ?? useSceneStore.getState().sketch.tool
       // Snap the camera flat to the chosen plane so the user sees the
-      // sketch face-on. xy → top, xz → front, yz → right.
-      // Y-up world: Top view looks down -Y (sees XZ plane); Front
-      // view looks down -Z (sees XY plane); Right view looks down -X
-      // (sees YZ plane). Match the plane to the view that shows it
-      // face-on.
-      const presetForPlane: Record<SketchPlane, string> = {
-        xy: 'front',
-        xz: 'top',
-        yz: 'right',
-      }
-      const presetData = CAMERA_PRESETS[presetForPlane[targetPlane]]
+      // sketch face-on. Standard planes hit one of the axis presets;
+      // custom (face-anchored) planes synthesise a fresh preset along
+      // the face normal — see sketchCameraSetup.
+      const { presetKey, preset } = sketchCameraSetup(targetPlane)
       set((state) => ({
         sketch: {
           ...state.sketch,
@@ -556,6 +650,9 @@ export const useSceneStore = create<SceneState>()(
           tool: targetTool,
           points: [],
           hover: null,
+          // Fresh sketch from the toolbar — not editing an existing
+          // feature, so the post-extrude path will create a new solid.
+          editingSourceObjectId: null,
         },
         // Drop any object/sub-element selection so the picker can't fire
         // beneath the sketch overlay.
@@ -563,8 +660,8 @@ export const useSceneStore = create<SceneState>()(
         subElementSelections: [],
         hoveredSubElement: null,
         contextMenu: null,
-        cameraPreset: presetForPlane[targetPlane],
-        pendingCameraPreset: presetData ?? state.pendingCameraPreset,
+        cameraPreset: presetKey,
+        pendingCameraPreset: preset ?? state.pendingCameraPreset,
       }))
       // Fire the backend create. The server is the source of truth —
       // a `SketchCreated` WS frame will reconcile the snapshot, but
@@ -584,8 +681,17 @@ export const useSceneStore = create<SceneState>()(
         })
     },
 
-    exitSketch: () => {
-      const id = useSceneStore.getState().sketch.serverId
+    exitSketch: (options) => {
+      const cur = useSceneStore.getState().sketch
+      const id = cur.serverId
+      // When the panel is closing on a sketch that was reopened from
+      // an existing feature ("Edit sketch" path), the backend session
+      // *is* that feature's profile — deleting it would orphan the
+      // visible solid. Default the implicit-delete to false in that
+      // case; a caller that genuinely wants to wipe the session can
+      // still pass `deleteBackend: true` explicitly.
+      const defaultDelete = cur.editingSourceObjectId === null
+      const deleteBackend = options?.deleteBackend ?? defaultDelete
       set((state) => ({
         sketch: {
           ...state.sketch,
@@ -593,13 +699,17 @@ export const useSceneStore = create<SceneState>()(
           serverId: null,
           points: [],
           hover: null,
+          editingSourceObjectId: null,
         },
       }))
       // Best-effort delete on the backend. If the session never
       // materialised (id null) there's nothing to do; the in-flight
       // create is orphaned but harmless — the manager keeps it until
       // a future GC sweep or process restart.
-      if (id) {
+      // Skipped when `deleteBackend` is false: the extrude finish path
+      // wants the session preserved (consume:false) so the user can
+      // reopen it from the model tree's "Edit sketch" action.
+      if (id && deleteBackend) {
         sketchApi.delete(id).catch((err) => {
           console.error('[sketch] delete failed:', err)
         })
@@ -624,22 +734,16 @@ export const useSceneStore = create<SceneState>()(
 
     setSketchPlane: (plane) => {
       // Mirror enterSketch: re-orient the camera to face the new plane
-      // so the sketcher always sees the surface flat-on.
-      // Y-up world: Top view looks down -Y (sees XZ plane); Front
-      // view looks down -Z (sees XY plane); Right view looks down -X
-      // (sees YZ plane). Match the plane to the view that shows it
-      // face-on.
-      const presetForPlane: Record<SketchPlane, string> = {
-        xy: 'front',
-        xz: 'top',
-        yz: 'right',
-      }
-      const presetData = CAMERA_PRESETS[presetForPlane[plane]]
+      // so the sketcher always sees the surface flat-on. Standard
+      // planes hit one of the axis presets; custom (face-anchored)
+      // planes synthesise a fresh preset along the face normal — see
+      // sketchCameraSetup.
+      const { presetKey, preset } = sketchCameraSetup(plane)
       const id = useSceneStore.getState().sketch.serverId
       set((state) => ({
         sketch: { ...state.sketch, plane, points: [], hover: null },
-        cameraPreset: presetForPlane[plane],
-        pendingCameraPreset: presetData ?? state.pendingCameraPreset,
+        cameraPreset: presetKey,
+        pendingCameraPreset: preset ?? state.pendingCameraPreset,
       }))
       if (id) {
         sketchApi.setPlane(id, plane).catch((err) => {
@@ -774,34 +878,83 @@ export const useSceneStore = create<SceneState>()(
         return { serverSketches }
       }),
 
-    editServerSketch: (id) =>
-      set((state) => {
-        const session = state.serverSketches.get(id)
-        if (!session) return state
-
-        // Mirror enterSketch's camera preset choice so the user lands
-        // looking face-on at the plane.
-        const presetForPlane: Record<SketchPlane, string> = {
-          xy: 'top',
-          xz: 'front',
-          yz: 'right',
+    editServerSketch: async (id) => {
+      // Resolve the session: prefer the locally-mirrored copy, but fall
+      // back to a REST GET when the id isn't in the store. This matters
+      // for sketches surfaced as children of an extruded solid — the
+      // model-tree synthesizes those nodes from `analyticalGeometry.
+      // params.sketch_id`, which survives even when the polling refresh
+      // hasn't yet repopulated `serverSketches`. If the backend itself
+      // 404s, the sketch was consumed by the extrude (`consume: true`
+      // is the default on `/sketch/{id}/extrude`); surface a clear
+      // warning so the click doesn't appear to silently no-op.
+      let session = get().serverSketches.get(id)
+      if (!session) {
+        try {
+          session = await sketchApi.get(id)
+          // Mirror the freshly-fetched session into the store so the
+          // model tree (and any other consumer) sees it consistently.
+          set((state) => {
+            const next = new Map(state.serverSketches)
+            next.set(session!.id, session!)
+            return { serverSketches: next }
+          })
+        } catch (err) {
+          console.warn(
+            `[scene-store] editServerSketch(${id}): backend has no session ` +
+              `for this sketch. It was likely consumed by an extrude — ` +
+              `re-create the sketch to edit it.`,
+            err,
+          )
+          return
         }
+      }
 
-        return {
-          sketch: {
-            ...state.sketch,
-            active: true,
-            serverId: session.id,
-            plane: session.plane,
-            tool: session.tool,
-            points: session.points,
-            circleSegments: session.circle_segments,
-            hover: null,
-          },
-          pendingCameraPreset:
-            CAMERA_PRESETS[presetForPlane[session.plane]] ?? null,
+      // Match enterSketch / setSketchPlane: standard planes hit one of
+      // the axis presets; custom (face-anchored) planes synthesise a
+      // fresh preset along the face normal. See sketchCameraSetup.
+      const { presetKey, preset } = sketchCameraSetup(session.plane)
+
+      // Find the existing extruded solid produced from this sketch so
+      // the Finish handler can replace it on re-extrude. We scan the
+      // local object map for `analyticalGeometry.params.sketch_id ===
+      // session.id`. If no match (e.g. the source solid has been
+      // deleted in this session), the post-extrude path falls back to
+      // append behaviour, which is the right thing to do.
+      let editingSourceObjectId: string | null = null
+      for (const obj of get().objects.values()) {
+        const params = obj.analyticalGeometry?.params as
+          | Record<string, unknown>
+          | undefined
+        if (params && params['sketch_id'] === session.id) {
+          editingSourceObjectId = obj.id
+          break
         }
-      }),
+      }
+
+      set((state) => ({
+        sketch: {
+          ...state.sketch,
+          active: true,
+          serverId: session!.id,
+          plane: session!.plane,
+          tool: session!.tool,
+          points: session!.points,
+          circleSegments: session!.circle_segments,
+          hover: null,
+          editingSourceObjectId,
+        },
+        // Clear any stale selection / sub-element / context-menu state
+        // so the sketch overlay receives clicks cleanly. Mirrors the
+        // teardown enterSketch already does on first-time entry.
+        selectedIds: new Set(),
+        subElementSelections: [],
+        hoveredSubElement: null,
+        contextMenu: null,
+        cameraPreset: presetKey,
+        pendingCameraPreset: preset ?? state.pendingCameraPreset,
+      }))
+    },
 
     setSceneRef: (scene) => set({ sceneRef: scene }),
     setCameraRef: (camera) => set({ cameraRef: camera }),

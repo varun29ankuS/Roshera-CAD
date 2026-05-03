@@ -11,17 +11,20 @@
  *      `measure` toggle is on, also annotate angles between adjacent
  *      polyline segments and the total perimeter / enclosed area.
  *
- * Coordinate convention matches `lib/sketch-extrude.ts`:
+ * Coordinate convention matches `lib/sketch-extrude.ts` and the
+ * backend `SketchPlane::lift`:
  *   xy: (u, v) → (u, v, 0), normal +Z
  *   xz: (u, v) → (u, 0, v), normal +Y
  *   yz: (u, v) → (0, u, v), normal +X
+ *   custom: (u, v) → origin + u·u_axis + v·v_axis, normal = u × v
  */
 
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState, useEffect, useRef } from 'react'
 import { Html, Line } from '@react-three/drei'
 import type { ThreeEvent } from '@react-three/fiber'
 import * as THREE from 'three'
 import {
+  isStandardPlane,
   useSceneStore,
   type SketchPlane,
   type SketchTool,
@@ -35,11 +38,22 @@ function pointToPlaneUV(
   p: THREE.Vector3,
   plane: SketchPlane,
 ): [number, number] {
-  switch (plane) {
-    case 'xy': return [p.x, p.y]
-    case 'xz': return [p.x, p.z]
-    case 'yz': return [p.y, p.z]
+  if (isStandardPlane(plane)) {
+    switch (plane) {
+      case 'xy': return [p.x, p.y]
+      case 'xz': return [p.x, p.z]
+      case 'yz': return [p.y, p.z]
+    }
   }
+  // Custom face-anchored plane: subtract origin then dot against the
+  // in-plane basis. Backend's SketchPlane::from_face guarantees u_axis
+  // and v_axis are orthonormal, so this gives the same (u, v) the
+  // backend's lift() inverts.
+  const origin = new THREE.Vector3(...plane.origin)
+  const uAxis = new THREE.Vector3(...plane.u_axis)
+  const vAxis = new THREE.Vector3(...plane.v_axis)
+  const d = p.clone().sub(origin)
+  return [d.dot(uAxis), d.dot(vAxis)]
 }
 
 /** Inverse of `pointToPlaneUV` — lift a (u, v) onto the world plane. */
@@ -48,20 +62,54 @@ function uvToWorld(
   plane: SketchPlane,
 ): THREE.Vector3 {
   const [u, v] = point
-  switch (plane) {
-    case 'xy': return new THREE.Vector3(u, v, 0)
-    case 'xz': return new THREE.Vector3(u, 0, v)
-    case 'yz': return new THREE.Vector3(0, u, v)
+  if (isStandardPlane(plane)) {
+    switch (plane) {
+      case 'xy': return new THREE.Vector3(u, v, 0)
+      case 'xz': return new THREE.Vector3(u, 0, v)
+      case 'yz': return new THREE.Vector3(0, u, v)
+    }
   }
+  // origin + u·u_axis + v·v_axis — exactly mirrors the backend's
+  // SketchPlane::lift so frontend ghost geometry agrees with what the
+  // server records.
+  return new THREE.Vector3(...plane.origin)
+    .add(new THREE.Vector3(...plane.u_axis).multiplyScalar(u))
+    .add(new THREE.Vector3(...plane.v_axis).multiplyScalar(v))
 }
 
-/** Euler rotation that aligns the +Z plane mesh with the sketch plane. */
-function planeRotation(plane: SketchPlane): [number, number, number] {
-  switch (plane) {
-    case 'xy': return [0, 0, 0]                 // already +Z up
-    case 'xz': return [-Math.PI / 2, 0, 0]      // rotate to ground
-    case 'yz': return [0, Math.PI / 2, 0]       // rotate to side
+/** World position for the capture-plane mesh (origin for custom planes). */
+function planeMeshPosition(plane: SketchPlane): THREE.Vector3 {
+  if (isStandardPlane(plane)) return new THREE.Vector3(0, 0, 0)
+  return new THREE.Vector3(...plane.origin)
+}
+
+/**
+ * Quaternion that orients the default `<planeGeometry>` (whose local
+ * +X is right, +Y is up, +Z is normal) to lie on the sketch plane.
+ * For standard planes we replay the same Euler rotations the previous
+ * implementation used so the visual result is unchanged. For custom
+ * planes we build an orthonormal basis directly from u_axis / v_axis
+ * and extract the quaternion from the basis matrix.
+ */
+function planeMeshQuaternion(plane: SketchPlane): THREE.Quaternion {
+  const q = new THREE.Quaternion()
+  if (isStandardPlane(plane)) {
+    const euler = (() => {
+      switch (plane) {
+        case 'xy': return new THREE.Euler(0, 0, 0)
+        case 'xz': return new THREE.Euler(-Math.PI / 2, 0, 0)
+        case 'yz': return new THREE.Euler(0, Math.PI / 2, 0)
+      }
+    })()
+    q.setFromEuler(euler)
+    return q
   }
+  const uAxis = new THREE.Vector3(...plane.u_axis)
+  const vAxis = new THREE.Vector3(...plane.v_axis)
+  const nAxis = new THREE.Vector3().crossVectors(uAxis, vAxis)
+  const m = new THREE.Matrix4().makeBasis(uAxis, vAxis, nAxis)
+  q.setFromRotationMatrix(m)
+  return q
 }
 
 /** Snap a value to the nearest `step` (no snap when step ≤ 0). */
@@ -155,7 +203,8 @@ export function SketchOverlay() {
     <group name="sketch-overlay">
       {/* Capture plane — large, faintly tinted, double-sided. */}
       <mesh
-        rotation={planeRotation(sketch.plane)}
+        position={planeMeshPosition(sketch.plane)}
+        quaternion={planeMeshQuaternion(sketch.plane)}
         onPointerMove={handlePointerMove}
         onPointerOut={handlePointerOut}
         onClick={handleClick}
@@ -257,6 +306,8 @@ function PolylinePreview({
   hoverWorld,
   showMeasure,
 }: PolylineProps) {
+  const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
+
   const segmentLine = useMemo(() => {
     if (confirmedWorld.length === 0) return null
     const pts = [...confirmedWorld]
@@ -270,9 +321,23 @@ function PolylinePreview({
     return [confirmedWorld[confirmedWorld.length - 1], confirmedWorld[0]]
   }, [confirmedWorld])
 
-  // Per-segment dimension labels at midpoints.
+  // Per-segment dimension labels at midpoints. Each label tracks
+  // its segment endpoint indices so that confirmed→confirmed segments
+  // can be made editable (segment i→i+1: keep point i, move point i+1
+  // along the segment direction so its length matches the typed
+  // value). Hover-tail segments are read-only — there's no point on
+  // the backend to update yet.
   const labels = useMemo(() => {
-    const items: Array<{ pos: THREE.Vector3; text: string }> = []
+    type Item = {
+      pos: THREE.Vector3
+      text: string
+      len: number
+      // index of the moving endpoint in confirmedUV; -1 = read-only
+      // (e.g. tail segment to hover, or closing chord).
+      movingIndex: number
+      anchor?: [number, number]
+    }
+    const items: Item[] = []
     const allUV = hoverUV ? [...confirmedUV, hoverUV] : confirmedUV
     for (let i = 0; i < allUV.length - 1; i++) {
       const a = allUV[i]
@@ -280,15 +345,24 @@ function PolylinePreview({
       const len = Math.hypot(b[0] - a[0], b[1] - a[1])
       if (len < 1e-6) continue
       const mid = uvToWorld([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], plane)
-      items.push({ pos: mid, text: fmtLen(len) })
+      const isConfirmedSegment = i + 1 < confirmedUV.length
+      items.push({
+        pos: mid,
+        text: fmtLen(len),
+        len,
+        movingIndex: isConfirmedSegment ? i + 1 : -1,
+        anchor: isConfirmedSegment ? a : undefined,
+      })
     }
     if (showMeasure && confirmedUV.length >= 3) {
-      // Closing chord length
+      // Closing chord length — read-only; editing it would require
+      // moving either the first or last point and the right answer
+      // depends on intent.
       const a = confirmedUV[confirmedUV.length - 1]
       const b = confirmedUV[0]
       const len = Math.hypot(b[0] - a[0], b[1] - a[1])
       const mid = uvToWorld([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], plane)
-      items.push({ pos: mid, text: `${fmtLen(len)} (close)` })
+      items.push({ pos: mid, text: `${fmtLen(len)} (close)`, len, movingIndex: -1 })
     }
     return items
   }, [confirmedUV, hoverUV, plane, showMeasure])
@@ -342,9 +416,43 @@ function PolylinePreview({
       ))}
       {hoverWorld && <PointMarker position={hoverWorld} ghost />}
 
-      {labels.map((l, i) => (
-        <DimLabel key={`len-${i}`} position={l.pos} text={l.text} />
-      ))}
+      {labels.map((l, i) => {
+        // Editing a confirmed→confirmed segment: keep the anchor end
+        // fixed, slide the moving end along the existing direction so
+        // the segment length matches the typed value. Subsequent
+        // segments retain their original lengths because they only
+        // depend on later confirmed points; the moved point shifts the
+        // chain rigidly downstream — that's the right answer for a
+        // free-form polyline (the user typed a length they wanted
+        // exactly there).
+        const editable = l.movingIndex >= 0 && l.anchor !== undefined
+        const onCommit = editable
+          ? (next: number) => {
+              if (next <= 0) return
+              const anchor = l.anchor as [number, number]
+              const movingIdx = l.movingIndex
+              const cur = confirmedUV[movingIdx]
+              const dx = cur[0] - anchor[0]
+              const dy = cur[1] - anchor[1]
+              const oldLen = Math.hypot(dx, dy)
+              if (oldLen < 1e-6) return
+              const k = next / oldLen
+              setSketchPoint(movingIdx, [
+                anchor[0] + dx * k,
+                anchor[1] + dy * k,
+              ])
+            }
+          : undefined
+        return (
+          <DimLabel
+            key={`len-${i}`}
+            position={l.pos}
+            text={l.text}
+            value={editable ? l.len : undefined}
+            onCommit={onCommit}
+          />
+        )
+      })}
       {angleLabels.map((l, i) => (
         <DimLabel key={`ang-${i}`} position={l.pos} text={l.text} variant="angle" />
       ))}
@@ -361,6 +469,9 @@ interface RectangleProps {
 }
 
 function RectanglePreview({ plane, confirmedUV, hoverUV }: RectangleProps) {
+  const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
+  const editable = confirmedUV.length >= 2
+
   const corners = useMemo(() => {
     if (confirmedUV.length === 0) return null
     if (confirmedUV.length === 1 && !hoverUV) return null
@@ -373,6 +484,33 @@ function RectanglePreview({ plane, confirmedUV, hoverUV }: RectangleProps) {
       height: Math.abs(b[1] - a[1]),
     }
   }, [confirmedUV, hoverUV])
+
+  // Width edit: keep corner A, move corner B along the existing
+  // x-direction so |B.x - A.x| = newWidth. Sign preserved so the
+  // user doesn't see the rectangle flip across A.
+  const commitWidth = useCallback(
+    (next: number) => {
+      if (!editable || next <= 0) return
+      const a = confirmedUV[0]
+      const b = confirmedUV[1]
+      const sign = b[0] >= a[0] ? 1 : -1
+      const newB: [number, number] = [a[0] + sign * next, b[1]]
+      setSketchPoint(1, newB)
+    },
+    [editable, confirmedUV, setSketchPoint],
+  )
+
+  const commitHeight = useCallback(
+    (next: number) => {
+      if (!editable || next <= 0) return
+      const a = confirmedUV[0]
+      const b = confirmedUV[1]
+      const sign = b[1] >= a[1] ? 1 : -1
+      const newB: [number, number] = [b[0], a[1] + sign * next]
+      setSketchPoint(1, newB)
+    },
+    [editable, confirmedUV, setSketchPoint],
+  )
 
   if (!corners) {
     // First click pending — render the cursor ghost only.
@@ -404,8 +542,18 @@ function RectanglePreview({ plane, confirmedUV, hoverUV }: RectangleProps) {
       <Line points={loop} color="#3498db" lineWidth={2} />
       <PointMarker position={uvToWorld(a, plane)} active />
       <PointMarker position={uvToWorld(b, plane)} ghost={confirmedUV.length < 2} />
-      <DimLabel position={widthLabelPos} text={fmtLen(width)} />
-      <DimLabel position={heightLabelPos} text={fmtLen(height)} />
+      <DimLabel
+        position={widthLabelPos}
+        text={fmtLen(width)}
+        value={editable ? width : undefined}
+        onCommit={editable ? commitWidth : undefined}
+      />
+      <DimLabel
+        position={heightLabelPos}
+        text={fmtLen(height)}
+        value={editable ? height : undefined}
+        onCommit={editable ? commitHeight : undefined}
+      />
     </>
   )
 }
@@ -419,6 +567,9 @@ interface CircleProps {
 }
 
 function CirclePreview({ plane, confirmedUV, hoverUV }: CircleProps) {
+  const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
+  const editable = confirmedUV.length >= 2
+
   const data = useMemo(() => {
     if (confirmedUV.length === 0) return null
     const center = confirmedUV[0]
@@ -429,6 +580,27 @@ function CirclePreview({ plane, confirmedUV, hoverUV }: CircleProps) {
     const r = Math.hypot(edge[0] - center[0], edge[1] - center[1])
     return { center, edge, r }
   }, [confirmedUV, hoverUV])
+
+  // Radius edit: scale the (edge - center) vector to the new length.
+  // Falls back to a +u-axis edge point when the existing radius is
+  // degenerate (center and edge coincide), so the user can recover
+  // from a 0-radius sketch by typing a length.
+  const commitRadius = useCallback(
+    (next: number) => {
+      if (!editable || next <= 0) return
+      const center = confirmedUV[0]
+      const edge = confirmedUV[1]
+      const dx = edge[0] - center[0]
+      const dy = edge[1] - center[1]
+      const oldR = Math.hypot(dx, dy)
+      const newEdge: [number, number] =
+        oldR > 1e-6
+          ? [center[0] + (dx / oldR) * next, center[1] + (dy / oldR) * next]
+          : [center[0] + next, center[1]]
+      setSketchPoint(1, newEdge)
+    },
+    [editable, confirmedUV, setSketchPoint],
+  )
 
   if (!data) {
     if (hoverUV) {
@@ -471,7 +643,12 @@ function CirclePreview({ plane, confirmedUV, hoverUV }: CircleProps) {
         position={uvToWorld(edge, plane)}
         ghost={confirmedUV.length < 2}
       />
-      <DimLabel position={labelPos} text={`R ${fmtLen(r)}`} />
+      <DimLabel
+        position={labelPos}
+        text={`R ${fmtLen(r)}`}
+        value={editable ? r : undefined}
+        onCommit={editable ? commitRadius : undefined}
+      />
     </>
   )
 }
@@ -503,23 +680,103 @@ interface DimLabelProps {
   position: THREE.Vector3
   text: string
   variant?: 'length' | 'angle'
+  /**
+   * Current numeric value (length in mm, angle in degrees). When set
+   * together with `onCommit`, the label becomes editable: double-click
+   * swaps it for a text input. Enter commits, Escape cancels, blur
+   * commits if the value parses. Without these props the label is a
+   * read-only annotation, matching the original behaviour during
+   * click-to-place.
+   */
+  value?: number
+  onCommit?: (next: number) => void
 }
 
-function DimLabel({ position, text, variant = 'length' }: DimLabelProps) {
+function DimLabel({
+  position,
+  text,
+  variant = 'length',
+  value,
+  onCommit,
+}: DimLabelProps) {
+  const editable = onCommit !== undefined && value !== undefined
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const inputRef = useRef<HTMLInputElement | null>(null)
+
+  // Focus the input on entry and select its contents so the user can
+  // type a replacement value without clearing first.
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  const commit = useCallback(() => {
+    if (!onCommit) return
+    const parsed = parseFloat(draft)
+    if (Number.isFinite(parsed)) {
+      onCommit(parsed)
+    }
+    setEditing(false)
+  }, [draft, onCommit])
+
+  const cancel = useCallback(() => {
+    setEditing(false)
+  }, [])
+
+  const beginEdit = useCallback(() => {
+    if (!editable || value === undefined) return
+    // Round to 3 decimals so the input doesn't show 4.999999... .
+    setDraft(value.toFixed(3).replace(/\.?0+$/, ''))
+    setEditing(true)
+  }, [editable, value])
+
   const tone =
     variant === 'angle' ? 'border-amber-400/40 text-amber-300' : 'border-border/60 text-foreground'
+
+  // While editing, the label needs pointer events to receive keystrokes
+  // and clicks. While read-only (no editable wiring) we keep
+  // `pointerEvents="none"` so labels don't intercept the sketch capture
+  // plane during click-to-place.
   return (
     <Html
       position={position}
       center
-      pointerEvents="none"
+      pointerEvents={editable ? 'auto' : 'none'}
       zIndexRange={[100, 0]}
     >
-      <div
-        className={`pointer-events-none px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/80 border ${tone} backdrop-blur-sm whitespace-nowrap`}
-      >
-        {text}
-      </div>
+      {editing ? (
+        <input
+          ref={inputRef}
+          type="text"
+          inputMode="decimal"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            // Stop key events bubbling — without this, hotkeys on the
+            // viewport (1/2/3 view switch, Del to delete) would fire
+            // while the user is typing dimension values.
+            e.stopPropagation()
+            if (e.key === 'Enter') commit()
+            else if (e.key === 'Escape') cancel()
+          }}
+          className={`px-1.5 py-0.5 w-20 text-[10px] font-mono uppercase tracking-wider bg-background border ${tone} outline-none focus:ring-1 focus:ring-primary/40`}
+        />
+      ) : (
+        <div
+          // Double-click rather than single-click so the user can still
+          // marquee-select / pan over labels without accidentally
+          // entering edit mode. `cursor-text` only when editable so
+          // the affordance signals which labels are interactive.
+          onDoubleClick={editable ? beginEdit : undefined}
+          className={`px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/80 border ${tone} backdrop-blur-sm whitespace-nowrap select-none ${editable ? 'cursor-text hover:bg-background' : 'pointer-events-none'}`}
+        >
+          {text}
+        </div>
+      )}
     </Html>
   )
 }

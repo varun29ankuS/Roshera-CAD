@@ -189,6 +189,19 @@ impl AppState {
         self.register_id_mapping(uuid, local_id);
         uuid
     }
+
+    /// Snapshot every UUID currently registered in the id_mapping.
+    ///
+    /// The timeline replay path uses this to drop stale UUIDs (whose
+    /// backing kernel `solid_id` no longer exists in the rebuilt model)
+    /// and broadcast `ObjectDeleted` for each before re-broadcasting the
+    /// rebuilt geometry under fresh UUIDs.
+    pub fn snapshot_registered_uuids(&self) -> Vec<uuid::Uuid> {
+        self.uuid_to_local
+            .iter()
+            .map(|entry| *entry.key())
+            .collect()
+    }
 }
 
 // === Enhanced Request/Response Types ===
@@ -1285,15 +1298,20 @@ async fn extrude_face_endpoint(
     }
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    // Retire the old uuid (whether or not the kernel reused the solid
-    // id) and mint a fresh one for the result. Order matters — viewers
-    // see ObjectDeleted before the new ObjectCreated, never the reverse.
-    state.unregister_id_mapping(&object_uuid);
-    broadcast_object_deleted(&object_uuid.to_string());
-
-    let result_uuid = Uuid::new_v4();
-    let result_id_str = result_uuid.to_string();
-    state.register_id_mapping(result_uuid, result_solid_id);
+    // Preserve the host UUID across the operation. The user's mental
+    // model is "I pulled a face on this box; it's still the same box,
+    // just modified" — retiring the UUID and minting a fresh one
+    // breaks that lineage in the model tree. We rebroadcast the
+    // existing id with the new tessellation; the frontend `addObject`
+    // path upserts on collision so the row stays put with refreshed
+    // mesh data. Only the kernel-side mapping needs touching — and
+    // only when `extrude_face` produced a new solid id (it sometimes
+    // does, sometimes mutates in place).
+    if result_solid_id != host_solid_id {
+        state.unregister_id_mapping(&object_uuid);
+        state.register_id_mapping(object_uuid, result_solid_id);
+    }
+    let result_id_str = object_uuid.to_string();
 
     let name = format!("FaceExtrude {result_solid_id}");
     let parameters = serde_json::json!({
@@ -3430,6 +3448,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             put(sketch::set_sketch_circle_segments),
         )
         .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
+        .route(
+            "/api/sketch/plane-from-face",
+            post(sketch::plane_from_face),
+        )
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.
@@ -3513,6 +3535,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(crate::handlers::timeline::redo_operation),
         )
         .route("/api/timeline/replay", post(replay_events))
+        .route(
+            "/api/timeline/truncate",
+            post(crate::handlers::timeline::truncate_history),
+        )
         .route("/api/timeline/checkpoint", post(create_checkpoint))
         .route("/api/timeline/branch/create", post(create_branch))
         .route(
