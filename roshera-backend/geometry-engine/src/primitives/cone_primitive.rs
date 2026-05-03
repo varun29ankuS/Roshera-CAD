@@ -220,7 +220,7 @@ impl ConePrimitive {
                     start_vertex, // closed curve
                     curve_id,
                     EdgeOrientation::Forward,
-                    ParameterRange::new(0.0, consts::TWO_PI),
+                    ParameterRange::new(0.0, 1.0),
                 );
                 let top_edge_id = model.edges.add_or_find(top_edge);
 
@@ -245,7 +245,7 @@ impl ConePrimitive {
                     bottom_vertex, // closed curve
                     bottom_curve_id,
                     EdgeOrientation::Forward,
-                    ParameterRange::new(0.0, consts::TWO_PI),
+                    ParameterRange::new(0.0, 1.0),
                 );
                 let bottom_edge_id = model.edges.add_or_find(bottom_edge);
 
@@ -259,7 +259,7 @@ impl ConePrimitive {
                     top_vertex, // closed curve
                     top_curve_id,
                     EdgeOrientation::Forward,
-                    ParameterRange::new(0.0, consts::TWO_PI),
+                    ParameterRange::new(0.0, 1.0),
                 );
                 let top_edge_id = model.edges.add_or_find(top_edge);
 
@@ -312,7 +312,9 @@ impl ConePrimitive {
             top_vertex, // closed curve
             top_curve_id,
             EdgeOrientation::Forward,
-            ParameterRange::new(0.0, consts::TWO_PI),
+            // Match `Circle`'s normalized [0, 1] parameterization — the
+            // underlying `Arc::evaluate(t)` clamps `t` to `[0, 1]`.
+            ParameterRange::new(0.0, 1.0),
         );
         let top_circle_edge_id = model.edges.add_or_find(top_circle_edge);
 
@@ -346,7 +348,8 @@ impl ConePrimitive {
                 bottom_vertex, // closed curve
                 bottom_curve_id,
                 EdgeOrientation::Forward,
-                ParameterRange::new(0.0, consts::TWO_PI),
+                // Match `Circle`'s normalized [0, 1] parameterization.
+                ParameterRange::new(0.0, 1.0),
             );
             let bottom_circle_edge_id = model.edges.add_or_find(bottom_circle_edge);
 
