@@ -433,6 +433,12 @@ async fn create_geometry(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
+    tracing::info!(
+        shape_type = %shape_type,
+        parameters = %parameters,
+        "POST /api/geometry — primitive create request received"
+    );
+
     let position: [f32; 3] = payload
         .get("position")
         .and_then(|v| v.as_array())
@@ -481,12 +487,15 @@ async fn create_geometry(
             "cylinder" => {
                 let r = require("radius")?;
                 let h = require("height")?;
-                builder.create_cylinder_3d(
+                tracing::info!(radius = r, height = h, "create_cylinder_3d entry");
+                let res = builder.create_cylinder_3d(
                     Point3::new(0.0, 0.0, 0.0),
                     Vector3::new(0.0, 0.0, 1.0),
                     r,
                     h,
-                )
+                );
+                tracing::info!(result = ?res, "create_cylinder_3d returned");
+                res
             }
             "cone" => {
                 let r = require("radius")?;
@@ -550,9 +559,28 @@ async fn create_geometry(
             .solids
             .get(solid_id)
             .ok_or_else(|| error_catalog::ApiError::solid_not_found(solid_id))?;
+        let face_count = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .filter_map(|sid| model.shells.get(sid))
+            .map(|sh| sh.faces.len())
+            .sum::<usize>();
+        tracing::info!(
+            solid_id,
+            shape_type = %shape_type,
+            face_count,
+            "tessellate_solid entry"
+        );
         let tess_start = Instant::now();
         let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
         let elapsed = tess_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            solid_id,
+            shape_type = %shape_type,
+            vertex_count = mesh.vertices.len(),
+            triangle_count = mesh.triangles.len(),
+            elapsed_ms = elapsed,
+            "tessellate_solid returned"
+        );
         (mesh, elapsed)
         // model read guard drops here
     };
