@@ -3771,48 +3771,81 @@ fn presplit_closed_loop_edges(
             None => continue,
         };
 
-        // Evaluate at the parametric midpoint of the edge (which maps
-        // to a curve parameter via `edge_to_curve_parameter`, honouring
-        // both `param_range` and `orientation`).
-        let mid_curve_t = original.edge_to_curve_parameter(0.5);
+        // A closed self-loop must be split into AT LEAST three sub-edges.
+        // Splitting at a single midpoint produces a digon (two arcs
+        // sharing two vertices) — `extract_regions` then walks each
+        // half-edge and reaches `next == start` after just two steps,
+        // so the resulting cycle has length 2 and is unconditionally
+        // discarded by the `trimmed.len() < 3` rule. The closed loop
+        // (e.g. a circular intersection of cylinder side ∩ box top)
+        // vanishes from the arrangement, the host face emits only its
+        // outer rectangle, and the boolean classifies the whole face by
+        // a single centroid that lands inside the cylinder — silently
+        // dropping the box top from `box ∖ cylinder`.
+        //
+        // Split at 1/3 and 2/3 of the edge's parametric range, giving
+        // three sub-edges connecting four vertex slots; for a self-loop
+        // start_vertex == end_vertex, so we get three vertices total
+        // (start/end, third1, third2) and a 3-cycle that survives.
         let curve = match model.curves.get(original.curve_id) {
             Some(c) => c,
             None => continue,
         };
-        let mid_pt = match curve.point_at(mid_curve_t) {
+        let third1_curve_t = original.edge_to_curve_parameter(1.0 / 3.0);
+        let third2_curve_t = original.edge_to_curve_parameter(2.0 / 3.0);
+        let third1_pt = match curve.point_at(third1_curve_t) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let third2_pt = match curve.point_at(third2_curve_t) {
             Ok(p) => p,
             Err(_) => continue,
         };
 
-        // Register the midpoint vertex. `add_or_find` dedups on
-        // tolerance, so two closed curves crossing at the same point
-        // share one midpoint vertex.
-        let mid_vid =
+        // Register cut vertices. `add_or_find` dedups on tolerance, so
+        // two closed curves crossing at the same point share a vertex.
+        let third1_vid =
             model
                 .vertices
-                .add_or_find(mid_pt.x, mid_pt.y, mid_pt.z, global_tol);
+                .add_or_find(third1_pt.x, third1_pt.y, third1_pt.z, global_tol);
+        let third2_vid =
+            model
+                .vertices
+                .add_or_find(third2_pt.x, third2_pt.y, third2_pt.z, global_tol);
 
-        // Degenerate case: the curve's midpoint coincides with the
-        // seam vertex (zero-length / micro self-loop). Splitting would
-        // produce two zero-length sub-edges that the arrangement
-        // would re-filter — leave the original alone in this case.
-        if mid_vid == original.start_vertex {
+        // Degenerate cases: any pair of cut points collapses to the same
+        // vertex (zero-length / micro self-loop). Splitting would
+        // produce sub-edges that the arrangement re-filters — leave the
+        // original alone.
+        if third1_vid == original.start_vertex
+            || third2_vid == original.start_vertex
+            || third1_vid == third2_vid
+        {
             continue;
         }
 
-        // Edge::split_at returns two halves with INVALID_VERTEX_ID
-        // sentinels at the cut; the caller fills them in. The first
-        // half keeps the original start_vertex; the second keeps the
-        // original end_vertex (which equals start_vertex for a self-
-        // loop).
-        let (mut first, mut second) = original.split_at(0.5);
-        first.end_vertex = mid_vid;
-        second.start_vertex = mid_vid;
+        // Two-stage parametric split: first cut at 1/3, then cut the
+        // tail at its own midpoint, which lies at 2/3 of the original
+        // parametric range. `Edge::split_at` returns two halves with
+        // INVALID_VERTEX_ID sentinels at the cut; the caller fills them
+        // in.
+        let (mut first, tail) = original.split_at(1.0 / 3.0);
+        first.end_vertex = third1_vid;
+
+        // Splitting the tail at its parametric 0.5 corresponds to
+        // original t = 1/3 + (1 - 1/3)/2 = 2/3 — the second cut.
+        let (mut second, mut third) = tail.split_at(0.5);
+        second.start_vertex = third1_vid;
+        second.end_vertex = third2_vid;
+        third.start_vertex = third2_vid;
+        // `third.end_vertex` is already `original.end_vertex` from
+        // split_at's second half.
 
         let first_id = model.edges.add(first);
         let second_id = model.edges.add(second);
+        let third_id = model.edges.add(third);
 
-        // Replace the original in the graph with the two halves.
+        // Replace the original in the graph with the three thirds.
         graph.edges.remove(&edge_id);
         for node in graph.nodes.values_mut() {
             node.incident_edges.remove(&edge_id);
@@ -3824,7 +3857,7 @@ fn presplit_closed_loop_edges(
                 edge_id: first_id,
                 edge_type,
                 start_vertex: original.start_vertex,
-                end_vertex: mid_vid,
+                end_vertex: third1_vid,
             },
         );
         graph.edges.insert(
@@ -3832,7 +3865,16 @@ fn presplit_closed_loop_edges(
             GraphEdge {
                 edge_id: second_id,
                 edge_type,
-                start_vertex: mid_vid,
+                start_vertex: third1_vid,
+                end_vertex: third2_vid,
+            },
+        );
+        graph.edges.insert(
+            third_id,
+            GraphEdge {
+                edge_id: third_id,
+                edge_type,
+                start_vertex: third2_vid,
                 end_vertex: original.end_vertex,
             },
         );
@@ -3840,9 +3882,11 @@ fn presplit_closed_loop_edges(
         // Update node incidence for the new endpoints.
         for (vid, eid) in [
             (original.start_vertex, first_id),
-            (mid_vid, first_id),
-            (mid_vid, second_id),
-            (original.end_vertex, second_id),
+            (third1_vid, first_id),
+            (third1_vid, second_id),
+            (third2_vid, second_id),
+            (third2_vid, third_id),
+            (original.end_vertex, third_id),
         ] {
             graph
                 .nodes
@@ -5899,8 +5943,34 @@ mod tests {
         assert!(hits.is_empty(), "Ray should miss cylinder");
     }
 
+    /// Install a stderr tracing subscriber once per process so the
+    /// `debug!` lines emitted by `boolean_operation` (split-region counts,
+    /// classify verdicts, select KEEP/drop, build_shells component
+    /// membership) are visible when a test fails. Idempotent;
+    /// `RUST_LOG=geometry_engine::boolean=debug` is the recommended
+    /// invocation. Without an env var the default filter is debug for
+    /// the boolean module.
+    fn init_test_tracing() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new(
+                                "geometry_engine::boolean=debug",
+                            )
+                        }),
+                )
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
     #[test]
     fn test_boolean_difference_box_cylinder_runs() {
+        init_test_tracing();
         // The classic "drill a hole" test
         let mut model = BRepModel::new();
 
