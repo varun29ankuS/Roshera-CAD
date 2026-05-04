@@ -100,6 +100,31 @@ function handleServerMessage(msg: ServerMessage) {
   // discriminated union — no runtime guards or `as` casts are
   // necessary because `ws-schemas.ts` already validated the shape.
   switch (msg.type) {
+    case 'Welcome': {
+      // The backend `ServerMessage` enum is `#[serde(tag = "type",
+      // content = "data")]`, so the live wire shape is
+      //   { "type": "Welcome", "data": { "connection_id": "..." } }
+      // The zod schema also tolerates top-level / `payload`-wrapped
+      // shapes for older emitters; check all three and use whichever
+      // carries the UUID. The backend's timeline handler lazily seeds
+      // `session_positions` for any UUID it sees, so we don't need a
+      // separate `JoinSession` round-trip — without this set, the
+      // Ctrl+Z handler in `shortcuts.ts` bails at the null guard
+      // and the keypress silently does nothing.
+      const connectionId =
+        msg.data?.connection_id ??
+        msg.connection_id ??
+        msg.payload?.connection_id
+      if (connectionId) {
+        ws.setSessionId(connectionId)
+        // First time we know the session is live, hydrate sketches —
+        // mirrors the SessionUpdate path so the model tree fills in
+        // even on the connection-id-only protocol path.
+        hydrateSketchesOnce()
+      }
+      break
+    }
+
     case 'GeometryUpdate': {
       const obj = convertCADObject(msg.payload.object)
       const existing = scene.objects.get(obj.id)
@@ -252,11 +277,12 @@ export function initWebSocket() {
   unsubscribe = wsClient.onMessage(handleServerMessage)
   wsClient.connect()
 
-  // Backend has no `JoinSession` ClientMessage variant — sessions are
-  // established automatically and the server emits `Welcome` on connect.
-  // The session id is delivered later via SessionUpdate / Welcome and
-  // routed into useWSStore from `handleServerMessage`. Nothing to send
-  // on connect; keep the subscription as a no-op so the cleanup tuple
+  // The backend emits `Welcome` on connect carrying the per-connection
+  // UUID; `handleServerMessage` lifts that into `useWSStore.sessionId`
+  // so REST endpoints (timeline undo/redo, etc.) have a key to thread
+  // through. No client-initiated handshake is required — sessions are
+  // seeded lazily server-side keyed on whichever UUID the client uses.
+  // Keep the store subscription as a no-op so the cleanup tuple
   // signature stays stable for future use.
   const unsub = useWSStore.subscribe(() => {})
 
