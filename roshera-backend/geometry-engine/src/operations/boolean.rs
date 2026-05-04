@@ -5104,7 +5104,7 @@ fn build_shells_from_faces(
     }
 
     // Group faces into connected components by shared edges
-    let components = group_faces_by_adjacency(&faces);
+    let components = group_faces_by_adjacency(&faces, model);
 
     // Closed-manifold sanity: a closed orientable surface needs ≥4 faces
     // (tetrahedron). If non-manifold results aren't allowed, reject under-sized
@@ -5188,18 +5188,51 @@ fn build_shells_from_faces(
 }
 
 /// Group faces into connected components based on shared boundary edges.
-fn group_faces_by_adjacency(faces: &[SplitFace]) -> Vec<Vec<usize>> {
+///
+/// Two faces share an edge if either (a) they reference the same `EdgeId`,
+/// or (b) they reference different edges that connect the same (sorted)
+/// endpoint vertex pair. Case (b) is essential after a boolean split:
+/// each face's `split_face_by_curves` independently stamps a new
+/// `EdgeId` for what is geometrically a shared intersection curve, so
+/// pure ID-based unioning leaves the cylinder side and its caps in
+/// disjoint components and a closed manifold can never be assembled.
+/// Vertices are already deduplicated by `VertexStore::add_or_find` with
+/// tolerance, so endpoint identity is the correct invariant.
+fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<usize>> {
     let n = faces.len();
     if n == 0 {
         return vec![];
     }
 
-    // Build edge-to-face-index adjacency. Adjacency is by edge identity
-    // only — orientation does not change which faces share an edge.
+    // Adjacency by raw EdgeId — catches faces that genuinely share an
+    // edge instance (the common pre-split case for the donor solid's
+    // own faces).
     let mut edge_to_faces: HashMap<EdgeId, Vec<usize>> = HashMap::new();
     for (idx, face) in faces.iter().enumerate() {
         for &(eid, _) in &face.boundary_edges {
             edge_to_faces.entry(eid).or_default().push(idx);
+        }
+    }
+
+    // Adjacency by endpoint vertex pair — catches faces that share an
+    // intersection curve but were independently re-stamped with new
+    // EdgeIds during per-face arrangement. The pair is normalized to
+    // (min, max) so direction does not split the equivalence class.
+    let mut vpair_to_faces: HashMap<(VertexId, VertexId), Vec<usize>> = HashMap::new();
+    for (idx, face) in faces.iter().enumerate() {
+        for &(eid, _) in &face.boundary_edges {
+            if let Some(edge) = model.edges.get(eid) {
+                let a = edge.start_vertex;
+                let b = edge.end_vertex;
+                if a == crate::primitives::vertex::INVALID_VERTEX_ID
+                    || b == crate::primitives::vertex::INVALID_VERTEX_ID
+                    || a == b
+                {
+                    continue;
+                }
+                let key = if a < b { (a, b) } else { (b, a) };
+                vpair_to_faces.entry(key).or_default().push(idx);
+            }
         }
     }
 
@@ -5230,8 +5263,16 @@ fn group_faces_by_adjacency(faces: &[SplitFace]) -> Vec<Vec<usize>> {
         }
     }
 
-    // Union faces that share edges
+    // Union faces that share edges by raw EdgeId.
     for face_indices in edge_to_faces.values() {
+        for i in 1..face_indices.len() {
+            union(&mut parent, face_indices[0], face_indices[i]);
+        }
+    }
+
+    // Union faces that share an endpoint vertex pair — the geometric
+    // edge identity that survives per-face EdgeId re-stamping.
+    for face_indices in vpair_to_faces.values() {
         for i in 1..face_indices.len() {
             union(&mut parent, face_indices[0], face_indices[i]);
         }
@@ -5369,7 +5410,8 @@ mod tests {
             },
         ];
 
-        let groups = group_faces_by_adjacency(&faces);
+        let model = BRepModel::new();
+        let groups = group_faces_by_adjacency(&faces, &model);
         assert_eq!(groups.len(), 1, "Isolated faces should form one shell");
         assert_eq!(groups[0].len(), 2);
     }
@@ -5405,7 +5447,8 @@ mod tests {
             },
         ];
 
-        let groups = group_faces_by_adjacency(&faces);
+        let model = BRepModel::new();
+        let groups = group_faces_by_adjacency(&faces, &model);
         assert_eq!(
             groups.len(),
             2,
