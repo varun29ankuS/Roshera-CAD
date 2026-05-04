@@ -5,21 +5,17 @@
 <h1 align="center">Roshera</h1>
 
 <p align="center">
-  <strong>AI-native CAD engine — B-Rep geometry kernel built from scratch in Rust.</strong>
+  A B-Rep geometry kernel written in Rust, with an LLM-driven CAD workflow on top.
 </p>
 
 <p align="center">
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/primitives-production-brightgreen" alt="Primitives" /></a>
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/NURBS-production-brightgreen" alt="NURBS" /></a>
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/booleans-working-yellow" alt="Booleans" /></a>
-  <a href="#what-works-today"><img src="https://img.shields.io/badge/AI--native-working-yellow" alt="AI" /></a>
-  <a href="#performance"><img src="https://img.shields.io/badge/tests-555%20passing-brightgreen" alt="Tests" /></a>
+  <a href="#status"><img src="https://img.shields.io/badge/status-work%20in%20progress-yellow" alt="Status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-dual-blue" alt="License" /></a>
 </p>
 
 ---
 
-Roshera is a boundary representation CAD system with an LLM-driven design workflow, production-grade NURBS mathematics, and a vision-aware AI pipeline that sees your viewport. No wrappers around OpenCASCADE or Parasolid — every line of the geometry kernel is original.
+Roshera is an experimental CAD system. The kernel is written from scratch in Rust (no wrapper around OpenCASCADE or Parasolid) and there's a React/Three.js frontend that talks to it over REST + WebSocket. Many things work, many things don't — see [Status](#status) for what's actually usable today.
 
 | Dark Mode | Light Mode |
 |-----------|------------|
@@ -43,33 +39,33 @@ roshera-app/           React + Three.js + TypeScript browser client
 
 ## Status
 
-Measured numbers for each subsystem below are in the [Performance](#performance) section.
+What follows is honest about what's tested versus what's implemented but rough. Measured perf numbers are in [Performance](#performance).
 
 | Layer | Component | Status |
 |-------|-----------|--------|
-| **Math** | Vector3, Matrix4, Quaternion | Tested, SIMD-optimized |
-| | B-spline, NURBS evaluation | Tested, hardened against singularities; perf above budget (see Performance) |
+| **Math** | Vector3, Matrix4, Quaternion | Tested |
+| | B-spline, NURBS evaluation | Tested; perf above budget (see Performance) |
 | **Primitives** | Box, Sphere, Cylinder, Cone, Torus | B-Rep topology with Euler validation |
 | **Topology** | Manifold detection, adjacency | Tested |
-| **Tessellation** | Per-surface dispatch, adaptive subdivision | Tested for analytic surfaces; perf above budget (see Performance) |
-| **Operations** | Extrude (draft, taper, twist) | Tested |
-| | Boolean (union, intersect, difference) | Implemented, edge cases in progress |
-| | Fillet (constant-radius) | Implemented |
-| | Chamfer, Offset, Sewing | Implemented |
-| | Revolve (full/partial) | Implemented |
-| | Sweep (single path) | Implemented, multi-guide not started |
-| | Loft (ruled surfaces) | Implemented, smooth NURBS loft not started |
+| **Tessellation** | Per-surface dispatch, adaptive subdivision | Works for analytic surfaces; extruded curved profiles still have watertightness issues |
+| **Operations** | Extrude (draft, taper, twist) | Implemented; side-face seam bugs being chased |
+| | Boolean (union, intersect, difference) | Implemented; edge cases (e.g. drill-through-cube) still fail in places |
+| | Fillet (constant-radius) | Implemented, lightly tested |
+| | Chamfer, Offset, Sewing | Implemented, lightly tested |
+| | Revolve (full/partial) | Implemented, lightly tested |
+| | Sweep (single path) | Implemented; multi-guide not done |
+| | Loft (ruled surfaces) | Implemented; smooth NURBS loft not done |
 | **Sketch 2D** | Newton-Raphson constraint solver | Implemented |
-| **Assembly** | Data model + mates | Defined; constraint solver not started |
-| **Export** | STL, OBJ, encrypted .ros | Working |
-| | STEP | Bridge implemented, output validation needed |
-| **AI** | Claude + OpenAI providers | Working |
+| **Assembly** | Data model + mates | Defined; constraint solver not done |
+| **Export** | STL, OBJ, encrypted .ros | Works |
+| | STEP | Skeleton in place; output not validated |
+| **AI** | Claude + OpenAI providers | Works |
 | | Vision pipeline + smart routing | Implemented |
-| | Natural language command parsing | Working |
-| **Infrastructure** | Timeline (event-sourced history) | Working |
-| | RAG (Vamana vector index) | Working |
-| | Session manager (multi-user, RBAC) | Working |
-| **Frontend** | React + R3F viewport, toolbar, chat | Working |
+| | Natural language command parsing | Works for common commands |
+| **Infrastructure** | Timeline (event-sourced history) | Works |
+| | RAG (Vamana vector index) | Works |
+| | Session manager (multi-user, RBAC) | Works |
+| **Frontend** | React + R3F viewport, toolbar, chat | Works; rough around the edges |
 
 ## Performance
 
@@ -111,7 +107,7 @@ Internal benchmark suite on 1k-face inputs, release build.
 | Boolean intersection | 75.4 ms | <150 ms |
 | Face–face intersection | 25.3 ms | <50 ms |
 
-All three are comfortably under their internal regression budgets.
+All three are within their internal regression budgets on this host.
 
 ### NURBS and B-spline evaluation
 
@@ -131,7 +127,7 @@ Both are above their internal regression budgets — NURBS eval by ~6× and B-sp
 | Tessellation (1M triangles, estimated) | 5,350 ms | <250 ms |
 | Memory per 1M vertices (SoA layout) | 34.3 MB | <192 MB |
 
-Memory is well under budget thanks to the structure-of-arrays vertex layout. Tessellation is the single biggest performance gap (~21× over target) and is the top candidate for the next optimization pass.
+Memory is under budget on this host. Tessellation is the largest performance gap (~21× over target) and the next thing to profile.
 
 ### Coverage gaps
 
@@ -211,7 +207,7 @@ ws.send(JSON.stringify({
   <img src="assets/logo-dimensions.png" alt="Roshera Logo Dimensions" width="400" />
 </p>
 
-The Roshera mark is constructed from a Boolean union of a rectangle (2x × 3.236x) and a circle (radius x), expressing the core operation of the geometry kernel itself.
+The Roshera mark is a Boolean union of a rectangle (2x × 3.236x) and a circle (radius x).
 
 ## License
 
