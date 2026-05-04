@@ -407,11 +407,26 @@ impl TorusPrimitive {
             + ref_dir * (params.major_radius * cos_u)
             + y_dir * (params.major_radius * sin_u);
 
-        // The minor circle's reference direction (radial_dir) is implicit
-        // in (center, minor_axis); Circle::new / Arc::new will derive it
-        // from `minor_axis`. Keeping it as a separate local would silently
-        // diverge if `params.axis` is later renormalised.
-        let minor_axis = params.axis;
+        // The minor circle lies in the tube cross-section plane spanned
+        // by (radial_dir, axis). Its plane normal is therefore
+        // `radial_dir × axis`, NOT `axis` itself — using axis here puts
+        // the minor circle in the same horizontal plane as the major
+        // circle, collapsing the tube to a flat ring. The tessellator
+        // then sees the boundary edge tracing only z=0 samples, lifts
+        // those to v ∈ {0, π}, and renders only the top half of the
+        // torus ("sliced bagel" bug).
+        let radial_dir = ref_dir * cos_u + y_dir * sin_u;
+        // radial_dir lies in the (ref_dir, y_dir) plane which is
+        // perpendicular to axis, so |radial_dir × axis| = 1 and
+        // normalize() cannot fail here.
+        #[allow(clippy::expect_used)]
+        // Reason: radial_dir ⟂ axis by construction (radial_dir is a
+        // unit vector in the plane perpendicular to axis), so the
+        // cross product has unit length and normalize() never errs.
+        let minor_axis = radial_dir
+            .cross(&params.axis)
+            .normalize()
+            .expect("radial_dir ⟂ axis ⇒ |cross| = 1, normalize cannot fail");
 
         if (v_end - v_start - consts::TWO_PI).abs() < consts::EPSILON {
             Box::new(
