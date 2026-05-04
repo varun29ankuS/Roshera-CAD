@@ -2350,6 +2350,15 @@ fn split_face_by_curves(
         graph.add_edge(edge_id, EdgeType::Splitting);
     }
 
+    // Pre-split closed self-loop edges (full circles, periodic curves)
+    // before crossing detection. The DCEL planar arrangement filters
+    // edges where start_vertex == end_vertex, and `compute_edge_intersections`
+    // skips edge pairs that share a vertex — both rules silently drop
+    // closed-curve imprints unless we first introduce a synthetic
+    // midpoint vertex on every self-loop. See `presplit_closed_loop_edges`
+    // for the full rationale.
+    presplit_closed_loop_edges(&mut graph, model, &options.common.tolerance)?;
+
     // Find intersections between all edges and split edges at intersection points
     compute_edge_intersections(&mut graph, model, &options.common.tolerance)?;
 
@@ -3686,6 +3695,167 @@ pub(super) fn create_edge_from_curve(
     );
 
     Ok(model.edges.add(edge))
+}
+
+/// Pre-split closed self-loop edges in the intersection graph.
+///
+/// A closed curve (full circle from a cylinder cap, periodic NURBS, the
+/// circle that arises from a plane–cylinder intersection, etc.) is stored
+/// as a single edge whose `start_vertex == end_vertex` — both endpoints
+/// resolve to the same seam vertex because `curve.point_at(0)` and
+/// `curve.point_at(1)` evaluate to the same 3D location.
+///
+/// Two downstream rules silently drop these edges from the face
+/// arrangement:
+///   1. `face_arrangement::build_arrangement` filters self-loops because
+///      a half-edge whose origin equals its target cannot participate in
+///      cycle traversal under the angular-next rule.
+///   2. `compute_edge_intersections` skips edge pairs that share a vertex,
+///      which means a closed splitting circle stamped at the same seam
+///      as a cylinder cap circle never has its crossings detected.
+///
+/// Both rules are correct in general — a true zero-length edge IS
+/// degenerate. The fix is to break the topological self-loop without
+/// changing the geometric curve: evaluate at the parametric midpoint,
+/// register the resulting 3D point as a fresh vertex via
+/// `VertexStore::add_or_find`, then use `Edge::split_at(0.5)` to
+/// substitute two open arcs for the original closed edge. Both halves
+/// inherit the same `EdgeType` so boundary/splitting roles are preserved.
+///
+/// The new edges are added to `BRepModel::edges` and registered in the
+/// graph with explicit `start_vertex`/`end_vertex` resolved from the
+/// split. The original entry is removed from the graph (its model entry
+/// is left in place — `EdgeStore::remove` would tear down indices used
+/// elsewhere, and nothing in the boolean pipeline reads the original id
+/// after this point).
+fn presplit_closed_loop_edges(
+    graph: &mut IntersectionGraph,
+    model: &mut BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<()> {
+    // Populate start/end vertices from the model so we can identify
+    // self-loops. (`compute_edge_intersections` will re-resolve after
+    // we return — that's harmless because our new edges already have
+    // correct vertices stored on the model.)
+    graph.resolve_vertices(model);
+
+    // Snapshot the self-loop set before mutating `graph.edges`.
+    // u32::MAX is the unresolved sentinel; treat unresolved edges as
+    // "not yet known to be self-loops" and leave them alone.
+    let self_loops: Vec<(EdgeId, EdgeType)> = graph
+        .edges
+        .iter()
+        .filter_map(|(&eid, ge)| {
+            if ge.start_vertex != u32::MAX
+                && ge.start_vertex == ge.end_vertex
+            {
+                Some((eid, ge.edge_type))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if self_loops.is_empty() {
+        return Ok(());
+    }
+
+    let global_tol = tolerance.distance();
+
+    for (edge_id, edge_type) in self_loops {
+        // Clone the original edge so the split is independent of the
+        // store. `EdgeStore::add` reassigns ids, so the clone's id is
+        // not consumed.
+        let original = match model.edges.get(edge_id) {
+            Some(e) => e.clone(),
+            None => continue,
+        };
+
+        // Evaluate at the parametric midpoint of the edge (which maps
+        // to a curve parameter via `edge_to_curve_parameter`, honouring
+        // both `param_range` and `orientation`).
+        let mid_curve_t = original.edge_to_curve_parameter(0.5);
+        let curve = match model.curves.get(original.curve_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        let mid_pt = match curve.point_at(mid_curve_t) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Register the midpoint vertex. `add_or_find` dedups on
+        // tolerance, so two closed curves crossing at the same point
+        // share one midpoint vertex.
+        let mid_vid =
+            model
+                .vertices
+                .add_or_find(mid_pt.x, mid_pt.y, mid_pt.z, global_tol);
+
+        // Degenerate case: the curve's midpoint coincides with the
+        // seam vertex (zero-length / micro self-loop). Splitting would
+        // produce two zero-length sub-edges that the arrangement
+        // would re-filter — leave the original alone in this case.
+        if mid_vid == original.start_vertex {
+            continue;
+        }
+
+        // Edge::split_at returns two halves with INVALID_VERTEX_ID
+        // sentinels at the cut; the caller fills them in. The first
+        // half keeps the original start_vertex; the second keeps the
+        // original end_vertex (which equals start_vertex for a self-
+        // loop).
+        let (mut first, mut second) = original.split_at(0.5);
+        first.end_vertex = mid_vid;
+        second.start_vertex = mid_vid;
+
+        let first_id = model.edges.add(first);
+        let second_id = model.edges.add(second);
+
+        // Replace the original in the graph with the two halves.
+        graph.edges.remove(&edge_id);
+        for node in graph.nodes.values_mut() {
+            node.incident_edges.remove(&edge_id);
+        }
+
+        graph.edges.insert(
+            first_id,
+            GraphEdge {
+                edge_id: first_id,
+                edge_type,
+                start_vertex: original.start_vertex,
+                end_vertex: mid_vid,
+            },
+        );
+        graph.edges.insert(
+            second_id,
+            GraphEdge {
+                edge_id: second_id,
+                edge_type,
+                start_vertex: mid_vid,
+                end_vertex: original.end_vertex,
+            },
+        );
+
+        // Update node incidence for the new endpoints.
+        for (vid, eid) in [
+            (original.start_vertex, first_id),
+            (mid_vid, first_id),
+            (mid_vid, second_id),
+            (original.end_vertex, second_id),
+        ] {
+            graph
+                .nodes
+                .entry(vid)
+                .or_insert_with(|| GraphNode {
+                    incident_edges: HashSet::new(),
+                })
+                .incident_edges
+                .insert(eid);
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute intersections between edges in the intersection graph.
