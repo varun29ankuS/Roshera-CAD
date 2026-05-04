@@ -211,6 +211,17 @@ function handleServerMessage(msg: ServerMessage) {
         `tris=${obj.mesh.indices.length / 3}`,
         `faceIds=${obj.mesh.faceIds?.length ?? 0}`,
       )
+      // In-place upsert (e.g., face-extrude that mutates the host solid
+      // and rebroadcasts on the same UUID): preserve the user-visible
+      // name. Backend handlers that mutate-in-place currently emit a
+      // generated name like "FaceExtrude {solid_id}", which would
+      // otherwise clobber whatever the user named the host ("Box 0",
+      // "Bracket A", …). Object identity is the UUID, not the name —
+      // when we already know the object, only the geometry is new.
+      const existing = scene.objects.get(obj.id)
+      if (existing) {
+        obj.name = existing.name
+      }
       scene.addObject(obj)
       // Auto-frame the viewport on the new object so the user always
       // sees what they just made — backend may place it off-screen
