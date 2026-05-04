@@ -6,6 +6,7 @@
 import { wsClient } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
+import { useChatStore } from '@/stores/chat-store'
 import { sketchApi } from './sketch-api'
 import type {
   CADObject as ProtocolCADObject,
@@ -72,6 +73,54 @@ function convertAnalyticalGeometry(
   }
 }
 
+// ─── Dimension echo formatter ───────────────────────────────────────
+//
+// Format an `Object created` chat message from a freshly-broadcast
+// proto payload. Backend ships authoritative bbox + volume in
+// `analytical_geometry.properties` for every primitive / op result;
+// when absent (raw mesh imports, etc.) we fall back to a vertex scan.
+// Volume is omitted in the fallback path because there's no robust way
+// to recover it from a tessellated mesh without reconstructing topology.
+function bboxFromVertices(verts: number[]): {
+  min: [number, number, number]
+  max: [number, number, number]
+} | null {
+  if (verts.length < 3 || verts.length % 3 !== 0) return null
+  let minX = Infinity, minY = Infinity, minZ = Infinity
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+  for (let i = 0; i < verts.length; i += 3) {
+    const x = verts[i], y = verts[i + 1], z = verts[i + 2]
+    if (x < minX) minX = x; if (x > maxX) maxX = x
+    if (y < minY) minY = y; if (y > maxY) maxY = y
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z
+  }
+  return { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] }
+}
+
+function fmtNum(n: number): string {
+  // 0–999.99 → up to 2 decimals; ≥1000 → no decimals (compact for chat)
+  if (Math.abs(n) >= 1000) return n.toFixed(0)
+  return n.toFixed(2).replace(/\.?0+$/, '')
+}
+
+function dimensionEchoMessage(proto: ProtocolCADObject): string | null {
+  const props = proto.analytical_geometry?.properties
+  let bbox = props?.bounding_box ?? bboxFromVertices(proto.mesh.vertices)
+  if (!bbox) return null
+  const dx = bbox.max[0] - bbox.min[0]
+  const dy = bbox.max[1] - bbox.min[1]
+  const dz = bbox.max[2] - bbox.min[2]
+  const dims = `${fmtNum(dx)} × ${fmtNum(dy)} × ${fmtNum(dz)} mm`
+  const vol = props?.volume
+  const triCount = Math.floor(proto.mesh.indices.length / 3)
+  const parts = [`Created **${proto.name}** — ${dims}`]
+  if (typeof vol === 'number' && Number.isFinite(vol) && vol > 0) {
+    parts.push(`volume ${fmtNum(vol)} mm³`)
+  }
+  parts.push(`${triCount} tris`)
+  return parts.join(' · ')
+}
+
 function convertCADObject(proto: ProtocolCADObject): CADObject {
   const { position, rotation, scale } = convertTransform(proto.transform)
   return {
@@ -136,6 +185,14 @@ function handleServerMessage(msg: ServerMessage) {
         // geometry as a Tessellated GeometryUpdate (e.g., REST creates
         // followed by tessellation). Frame it.
         scene.setPendingFrameObject(obj.id)
+        const echo = dimensionEchoMessage(msg.payload.object)
+        if (echo) {
+          useChatStore.getState().addMessage({
+            role: 'system',
+            content: echo,
+            objectsAffected: [obj.id],
+          })
+        }
       }
       break
     }
@@ -160,6 +217,14 @@ function handleServerMessage(msg: ServerMessage) {
       // (e.g., booleans land at world origin, extrudes shift along the
       // face normal). CameraController consumes & clears this flag.
       scene.setPendingFrameObject(obj.id)
+      const echo = dimensionEchoMessage(msg.payload)
+      if (echo) {
+        useChatStore.getState().addMessage({
+          role: 'system',
+          content: echo,
+          objectsAffected: [obj.id],
+        })
+      }
       break
     }
 
