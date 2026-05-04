@@ -5106,6 +5106,31 @@ fn build_shells_from_faces(
     // Group faces into connected components by shared edges
     let components = group_faces_by_adjacency(&faces, model);
 
+    // Diagnostic: dump component contents (orig_face, surface_type, edge ids)
+    // so we can see exactly which face is becoming a singleton, and whether
+    // its edges should be shared with neighbours but aren't.
+    for (i, component) in components.iter().enumerate() {
+        for &idx in component {
+            let f = &faces[idx];
+            let st = model
+                .surfaces
+                .get(f.surface)
+                .map(|s| format!("{:?}", s.surface_type()))
+                .unwrap_or_else(|| "?".to_string());
+            let edge_ids: Vec<EdgeId> =
+                f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
+            tracing::debug!(
+                "build_shells: comp={} face_idx={} orig={} surf={} type={} edges={:?}",
+                i,
+                idx,
+                f.original_face,
+                f.surface,
+                st,
+                edge_ids
+            );
+        }
+    }
+
     // Closed-manifold sanity: a closed orientable surface needs ≥4 faces
     // (tetrahedron). If non-manifold results aren't allowed, reject under-sized
     // components up front rather than emitting a degenerate shell.
