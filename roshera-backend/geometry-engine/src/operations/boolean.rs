@@ -787,52 +787,99 @@ fn plane_cylinder_intersection(
     let cyl_origin = cylinder_impl.origin;
     let cyl_radius = cylinder_impl.radius;
 
-    // Compute intersection based on angle between plane normal and cylinder axis
+    // Plane orientation relative to cylinder axis:
+    //   axis_dot_normal = cyl_axis · plane_normal
+    //   angle_cos       = |cos θ|, θ between axis and plane normal.
+    // Mapping to plane orientation:
+    //   axis ⊥ normal  (angle_cos ≈ 0) ⇔ plane PARALLEL to axis      → 2 lines / chord
+    //   axis ∥ normal  (angle_cos ≈ 1) ⇔ plane PERPENDICULAR to axis → circle
+    //   otherwise                                                      → ellipse
     let axis_dot_normal = cyl_axis.dot(&plane_normal);
     let angle_cos = axis_dot_normal.abs();
 
-    // Distance from cylinder axis to plane
-    let axis_to_plane_vec = plane_point - cyl_origin;
-    let axis_to_plane_dist = axis_to_plane_vec.dot(&plane_normal).abs();
+    // Signed offset from the cylinder origin (= base center) to the plane
+    // along the plane's normal. Used two different ways below:
+    //   * In the parallel branch, |plane_offset_signed| is the perpendicular
+    //     distance from the (line-shaped) axis to the plane — this is the
+    //     "radius vs distance" chord criterion.
+    //   * In the perpendicular/oblique branch, divided by axis_dot_normal it
+    //     gives the axis parameter where the plane meets the cylinder axis,
+    //     which is what the finite-cylinder height check needs.
+    let plane_offset_signed = (plane_point - cyl_origin).dot(&plane_normal);
 
-    if axis_to_plane_dist > cyl_radius + tolerance.distance() {
-        // No intersection
-        return Ok(vec![]);
-    }
-
-    // angle_cos = |axis · normal| = |cos θ| between cylinder axis and plane normal.
-    // Plane parallel to axis ⇔ axis ⊥ normal ⇔ |cos θ| ≈ 0; compare against sin(angle_tol).
     if angle_cos < tolerance.parallel_threshold() {
-        // Plane is parallel to cylinder axis
+        // PARALLEL — chord criterion: |distance(axis, plane)| ≤ radius.
+        // Previously this guard sat OUTSIDE the branch dispatch and rejected
+        // every plane whose origin-projection exceeded the radius, including
+        // box top/bottom faces that legitimately cut the cylinder side as a
+        // circle. That is the bug behind "Cylinder-Plane(6p,0c)" in stage-1
+        // diagnostics: 6 box×cyl-side pairs producing zero curves silently.
+        let axis_to_plane_dist = plane_offset_signed.abs();
+        if axis_to_plane_dist > cyl_radius + tolerance.distance() {
+            return Ok(vec![]);
+        }
         if axis_to_plane_dist < tolerance.distance() {
-            // Plane passes through cylinder axis - intersection is two lines
+            // Plane passes through cylinder axis — two diametral lines.
             create_cylinder_axis_intersection_lines(cylinder_impl, &plane_normal, plane_point)
-        } else if axis_to_plane_dist <= cyl_radius {
-            // Plane cuts cylinder parallel to axis - intersection is two lines
+        } else {
+            // Plane parallel to axis but offset — two parallel chord lines.
             create_cylinder_parallel_intersection_lines(
                 cylinder_impl,
                 plane_normal,
                 plane_point,
                 axis_to_plane_dist,
             )
-        } else {
-            // No intersection
-            Ok(vec![])
         }
-    } else if (1.0 - angle_cos).abs() < tolerance.aligned_threshold() {
-        // Plane perpendicular to cylinder axis ⇔ axis ∥ normal ⇔ cos θ ≈ 1.
-        // Compare (1 − cos θ) against (1 − cos(angle_tol)); for small θ this
-        // is ≈ θ²/2, much stricter than θ itself but semantically correct.
-        // Intersection is a circle.
-        create_cylinder_perpendicular_intersection_circle(cylinder_impl, plane_normal, plane_point)
     } else {
-        // General case - intersection is an ellipse
-        create_cylinder_oblique_intersection_ellipse(
-            cylinder_impl,
-            plane_normal,
-            plane_point,
-            angle_cos,
-        )
+        // PERPENDICULAR or OBLIQUE — the infinite plane always meets the
+        // infinite cylinder. For finite cylinders (height_limits set), reject
+        // only when the plane misses the cylinder's height extent entirely.
+        //
+        //   axis_param = (plane_offset_signed) / (axis_dot_normal)
+        // is the axis parameter (relative to cyl_origin) where the plane
+        // crosses the cylinder axis.
+        //
+        // Perpendicular plane intersects the cylinder side as a flat circle
+        // at axis_param, so the axial extent of the intersection curve is 0.
+        //
+        // Oblique plane intersects the (infinite) cylinder side as an
+        // ellipse whose axial half-extent is r·|cos(plane-vs-axis-angle)|·
+        // /|sin(plane-vs-axis-angle)| = r·√(1−cos²θ)/cos θ where θ is the
+        // axis–normal angle (so cos θ = angle_cos). Substituting:
+        //   half_extent = r · √(1 − angle_cos²) / angle_cos
+        // For angle_cos → 1 this collapses to the circle (extent → 0); for
+        // angle_cos → 0 this diverges (which is fine — the parallel branch
+        // takes over before that point per `parallel_threshold`).
+        if let Some([h_min, h_max]) = cylinder_impl.height_limits {
+            let axis_param = plane_offset_signed / axis_dot_normal;
+            let half_extent = if angle_cos >= 1.0 - 1e-15 {
+                0.0
+            } else {
+                cyl_radius * (1.0 - angle_cos * angle_cos).sqrt() / angle_cos
+            };
+            if axis_param + half_extent < h_min - tolerance.distance()
+                || axis_param - half_extent > h_max + tolerance.distance()
+            {
+                return Ok(vec![]);
+            }
+        }
+
+        if (1.0 - angle_cos).abs() < tolerance.aligned_threshold() {
+            // Plane perpendicular to cylinder axis — circular intersection.
+            create_cylinder_perpendicular_intersection_circle(
+                cylinder_impl,
+                plane_normal,
+                plane_point,
+            )
+        } else {
+            // Oblique — elliptical intersection.
+            create_cylinder_oblique_intersection_ellipse(
+                cylinder_impl,
+                plane_normal,
+                plane_point,
+                angle_cos,
+            )
+        }
     }
 }
 
