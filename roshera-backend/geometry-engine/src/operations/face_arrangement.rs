@@ -42,7 +42,7 @@ use super::{OperationError, OperationResult};
 use crate::math::{Tolerance, Vector3};
 use crate::primitives::{
     edge::EdgeId,
-    surface::{Surface, SurfaceId},
+    surface::{Surface, SurfaceId, SurfaceType},
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -337,6 +337,11 @@ pub(super) fn extract_regions(
         let trimmed = strip_dangling_pairs(&he_cycle, arr);
 
         if trimmed.len() < 3 {
+            tracing::debug!(
+                "extract_regions: cycle of {} stripped to {} (<3) — discarded",
+                he_cycle.len(),
+                trimmed.len()
+            );
             continue;
         }
 
@@ -345,6 +350,12 @@ pub(super) fn extract_regions(
         // area and is discarded. Zero-area cycles (pure lollipops) are
         // also discarded.
         let signed = signed_area_of_cycle(&trimmed, arr, model, surface, tol);
+        tracing::debug!(
+            "extract_regions: cycle of {} (trimmed {}) signed_area={:.4}",
+            he_cycle.len(),
+            trimmed.len(),
+            signed
+        );
         if signed <= tol.distance() * tol.distance() {
             continue;
         }
@@ -475,8 +486,30 @@ fn strip_dangling_pairs(cycle: &[HalfEdgeId], arr: &Arrangement) -> Vec<HalfEdge
     v
 }
 
-/// Signed area of a half-edge cycle projected into the tangent plane at
-/// the cycle's 3D centroid. Positive ⇒ CCW under the surface normal.
+/// Signed area of a half-edge cycle on the underlying surface.
+///
+/// For planar surfaces the cycle is projected into the tangent plane at
+/// the cycle's 3D centroid (positive ⇒ CCW under the surface normal).
+///
+/// For non-planar surfaces (cylinder, cone, sphere, NURBS, …) a flat
+/// tangent-plane projection is unsound: a closed cycle that wraps a
+/// cylindrical band, for example, has all its vertices on the seam line
+/// (because the angular midpoint of every closed cap-circle is at
+/// `u = π`, which lies on `y = 0` together with `u = 0` itself), so the
+/// projection collapses to zero and every region is incorrectly
+/// rejected as "outer face". Instead, we work in the surface's
+/// parametric `(u, v)` space and apply a 2D shoelace there. This is
+/// exact on parametric surfaces because the cycle's interior in 3D
+/// corresponds (modulo the seam) to a simple polygon in `(u, v)`.
+///
+/// For periodic surfaces the seam introduces an angular ambiguity:
+/// `closest_point` may return either `u = 0` or `u = period` for a
+/// vertex on the seam. We resolve this by **edge-midpoint anchoring**:
+/// each edge's midpoint is sampled, its `(u, v)` is computed, and the
+/// successive vertex's `u` is unwrapped to whichever periodic copy
+/// makes the midpoint lie on the linear path between the two endpoint
+/// `u` values. This walks the cycle continuously around the seam
+/// without ambiguity.
 fn signed_area_of_cycle(
     cycle: &[HalfEdgeId],
     arr: &Arrangement,
@@ -498,29 +531,149 @@ fn signed_area_of_cycle(
         return 0.0;
     }
 
-    // Centroid and local tangent frame at that centroid.
-    let n = positions.len() as f64;
-    let centroid = positions
-        .iter()
-        .fold(Vector3::ZERO, |acc, p| acc + *p)
-        / n;
-    let (e1, e2) = match tangent_frame_at(surface, &centroid, tol) {
-        Some(f) => f,
+    // Planar surfaces: use the legacy tangent-plane projection at the
+    // 3D centroid. This is the optimal frame for a planar polygon and
+    // matches all of the existing planar-boolean tests.
+    if surface.surface_type() == SurfaceType::Plane {
+        let n = positions.len() as f64;
+        let centroid = positions
+            .iter()
+            .fold(Vector3::ZERO, |acc, p| acc + *p)
+            / n;
+        let (e1, e2) = match tangent_frame_at(surface, &centroid, tol) {
+            Some(f) => f,
+            None => return 0.0,
+        };
+
+        let mut area2 = 0.0;
+        for i in 0..positions.len() {
+            let a = positions[i] - centroid;
+            let b = positions[(i + 1) % positions.len()] - centroid;
+            let ax = a.dot(&e1);
+            let ay = a.dot(&e2);
+            let bx = b.dot(&e1);
+            let by = b.dot(&e2);
+            area2 += ax * by - bx * ay;
+        }
+        return 0.5 * area2;
+    }
+
+    // Non-planar surfaces: work in parametric (u, v) with seam unwrap.
+    let uvs = match unwrap_cycle_uv(cycle, arr, model, surface, tol) {
+        Some(uvs) => uvs,
         None => return 0.0,
     };
+    if uvs.len() < 3 {
+        return 0.0;
+    }
 
-    // Shoelace in the (e1, e2) plane.
     let mut area2 = 0.0;
-    for i in 0..positions.len() {
-        let a = positions[i] - centroid;
-        let b = positions[(i + 1) % positions.len()] - centroid;
-        let ax = a.dot(&e1);
-        let ay = a.dot(&e2);
-        let bx = b.dot(&e1);
-        let by = b.dot(&e2);
+    for i in 0..uvs.len() {
+        let (ax, ay) = uvs[i];
+        let (bx, by) = uvs[(i + 1) % uvs.len()];
         area2 += ax * by - bx * ay;
     }
     0.5 * area2
+}
+
+/// Compute parametric `(u, v)` for every vertex in a cycle, unwrapped
+/// across periodic seams using each edge's midpoint as a continuity
+/// anchor.
+///
+/// For each successive vertex the candidate `u` (and `v`) values are
+/// `u_raw + k · period` for `k ∈ {-1, 0, 1}` (only the `0` candidate is
+/// considered for non-periodic axes). The candidate that minimises the
+/// distance from the corresponding edge midpoint's parametric coordinate
+/// is selected — this places the midpoint on the linear path between
+/// the two endpoint `(u, v)` and resolves seam ambiguity without
+/// requiring per-edge geometric guards.
+fn unwrap_cycle_uv(
+    cycle: &[HalfEdgeId],
+    arr: &Arrangement,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    tol: Tolerance,
+) -> Option<Vec<(f64, f64)>> {
+    let n = cycle.len();
+    if n < 2 {
+        return None;
+    }
+
+    // Raw parametric coordinates at every cycle vertex.
+    let mut raw: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for &h in cycle {
+        let pos_arr = model.vertices.get_position(arr.get(h).origin)?;
+        let pos = Vector3::new(pos_arr[0], pos_arr[1], pos_arr[2]);
+        let uv = surface.closest_point(&pos, tol).ok()?;
+        raw.push(uv);
+    }
+
+    // Edge-midpoint parametric coordinates: midpoint of the edge that
+    // *starts* at the i-th cycle vertex (the edge represented by the
+    // i-th half-edge in walk order).
+    let mut mids: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for &h in cycle {
+        let he = arr.get(h);
+        let edge = model.edges.get(he.edge_id)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        // Edge t = 0.5 → curve t via edge orientation/parameter range.
+        let curve_t = edge.edge_to_curve_parameter(0.5);
+        let mid_pt = curve.point_at(curve_t).ok()?;
+        let uv = surface.closest_point(&mid_pt, tol).ok()?;
+        mids.push(uv);
+    }
+
+    let period_u = surface.period_u();
+    let period_v = surface.period_v();
+
+    // Anchor first vertex — its raw (u, v) is taken as-is. To match
+    // it against the first edge's midpoint we still allow the midpoint
+    // to be unwrapped relative to the anchor below.
+    let mut uvs: Vec<(f64, f64)> = Vec::with_capacity(n);
+    uvs.push(raw[0]);
+
+    for i in 1..n {
+        let prev = uvs[i - 1];
+        let mid_raw = mids[i - 1]; // midpoint of edge from vertex i-1 to vertex i
+        let cand_raw = raw[i];
+
+        // First, unwrap the midpoint relative to `prev`.
+        let mid_u = nearest_periodic(prev.0, mid_raw.0, period_u);
+        let mid_v = nearest_periodic(prev.1, mid_raw.1, period_v);
+
+        // Then, unwrap the next vertex relative to `mid` so that the
+        // midpoint sits on the linear path between prev and next.
+        let next_u = nearest_periodic(mid_u, cand_raw.0, period_u);
+        let next_v = nearest_periodic(mid_v, cand_raw.1, period_v);
+
+        uvs.push((next_u, next_v));
+    }
+
+    Some(uvs)
+}
+
+/// Return `value + k · period` for the `k ∈ {-1, 0, 1}` that minimises
+/// `|value + k · period - anchor|`. If `period` is `None` (surface is
+/// not periodic on this axis), `value` is returned unchanged.
+#[inline]
+fn nearest_periodic(anchor: f64, value: f64, period: Option<f64>) -> f64 {
+    match period {
+        None => value,
+        Some(p) if !(p > 0.0) => value,
+        Some(p) => {
+            let candidates = [value - p, value, value + p];
+            let mut best = candidates[0];
+            let mut best_d = (best - anchor).abs();
+            for &c in &candidates[1..] {
+                let d = (c - anchor).abs();
+                if d < best_d {
+                    best = c;
+                    best_d = d;
+                }
+            }
+            best
+        }
+    }
 }
 
 #[cfg(test)]
