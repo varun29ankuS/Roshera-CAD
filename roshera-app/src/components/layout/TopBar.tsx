@@ -22,8 +22,19 @@ import { exportSceneAs } from '@/lib/export-api'
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
 async function timelineAction(action: 'undo' | 'redo') {
+  // Backend `undo_operation` / `redo_operation` 400 without a
+  // `session_id` in the JSON body. Pull the live one from the WS
+  // store (seeded by the `Welcome` frame in `ws-bridge.ts`); if it
+  // hasn't arrived yet there is no session to undo against, so
+  // silently no-op rather than hit the backend with a malformed body.
+  const sessionId = useWSStore.getState().sessionId
+  if (!sessionId) return
   try {
-    await fetch(`${API_BASE}/api/timeline/${action}`, { method: 'POST' })
+    await fetch(`${API_BASE}/api/timeline/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    })
   } catch {
     // backend not running
   }
