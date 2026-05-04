@@ -4436,6 +4436,21 @@ fn classify_split_faces(
         classified_face.classification =
             classify_face_relative_to_solid(model, face, test_solid, &options.common.tolerance)?;
 
+        let surf_kind = model
+            .surfaces
+            .get(face.surface)
+            .map(|s| format!("{:?}", s.surface_type()))
+            .unwrap_or_else(|| "?".into());
+        tracing::debug!(
+            target: "geometry_engine::boolean",
+            "classify: orig={} surf={} type={} from_solid={} → {:?}",
+            face.original_face,
+            face.surface,
+            surf_kind,
+            face.from_solid,
+            classified_face.classification,
+        );
+
         classified.push(classified_face);
     }
 
@@ -5023,37 +5038,49 @@ fn select_faces_for_operation(
     solid_a: SolidId,
     solid_b: SolidId,
 ) -> Vec<SplitFace> {
-    classified_faces
-        .iter()
-        .filter(|face| {
-            let from_a = face.from_solid == solid_a;
-            let from_b = face.from_solid == solid_b;
+    let mut kept = Vec::new();
+    for face in classified_faces {
+        let from_a = face.from_solid == solid_a;
+        let from_b = face.from_solid == solid_b;
 
-            match operation {
-                // Union (A ∪ B): keep faces outside the other solid + shared boundary
-                BooleanOp::Union => match face.classification {
-                    FaceClassification::Outside => true,
-                    FaceClassification::OnBoundary => from_a, // avoid duplicates
-                    FaceClassification::Inside => false,
-                },
+        let keep = match operation {
+            // Union (A ∪ B): keep faces outside the other solid + shared boundary
+            BooleanOp::Union => match face.classification {
+                FaceClassification::Outside => true,
+                FaceClassification::OnBoundary => from_a, // avoid duplicates
+                FaceClassification::Inside => false,
+            },
 
-                // Intersection (A ∩ B): keep faces inside the other solid + shared boundary
-                BooleanOp::Intersection => match face.classification {
-                    FaceClassification::Inside => true,
-                    FaceClassification::OnBoundary => from_a, // avoid duplicates
-                    FaceClassification::Outside => false,
-                },
+            // Intersection (A ∩ B): keep faces inside the other solid + shared boundary
+            BooleanOp::Intersection => match face.classification {
+                FaceClassification::Inside => true,
+                FaceClassification::OnBoundary => from_a, // avoid duplicates
+                FaceClassification::Outside => false,
+            },
 
-                // Difference (A - B): keep A faces outside B, B faces inside A (flipped)
-                BooleanOp::Difference => match face.classification {
-                    FaceClassification::Outside => from_a,
-                    FaceClassification::Inside => from_b,
-                    FaceClassification::OnBoundary => false, // boundary faces cancel out
-                },
-            }
-        })
-        .cloned()
-        .collect()
+            // Difference (A - B): keep A faces outside B, B faces inside A (flipped)
+            BooleanOp::Difference => match face.classification {
+                FaceClassification::Outside => from_a,
+                FaceClassification::Inside => from_b,
+                FaceClassification::OnBoundary => false, // boundary faces cancel out
+            },
+        };
+
+        tracing::debug!(
+            target: "geometry_engine::boolean",
+            "select({:?}): orig={} from_solid={} class={:?} → {}",
+            operation,
+            face.original_face,
+            face.from_solid,
+            face.classification,
+            if keep { "KEEP" } else { "drop" },
+        );
+
+        if keep {
+            kept.push(face.clone());
+        }
+    }
+    kept
 }
 
 /// Reconstruct topology from selected faces
