@@ -116,6 +116,8 @@ impl BranchManager {
             events: Arc::new(DashMap::new()),
             state: BranchState::Active,
             metadata,
+            protected: false,
+            hidden: false,
         };
 
         // Add to collections
@@ -481,6 +483,8 @@ mod tests {
                 ai_context: None,
                 checkpoints: Vec::new(),
             },
+            protected: false,
+            hidden: false,
         };
 
         manager.branches.insert(BranchId::main(), main_branch);
@@ -536,6 +540,8 @@ mod tests {
                 ai_context: None,
                 checkpoints: Vec::new(),
             },
+            protected: false,
+            hidden: false,
         };
 
         manager.branches.insert(BranchId::main(), main_branch);
@@ -593,6 +599,8 @@ mod tests {
                 ai_context: None,
                 checkpoints: Vec::new(),
             },
+            protected: false,
+            hidden: false,
         };
 
         manager.branches.insert(BranchId::main(), main_branch);
