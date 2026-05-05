@@ -221,17 +221,24 @@ export function ExtrudeGizmo() {
         return
       }
 
-      void submitExtrude(drag.objectId, drag.faceId, finalDistance)
+      void submitExtrude(drag.objectId, drag.faceId, finalDistance, drag.axis)
     }
 
     const submitExtrude = async (
       objectId: string,
       faceId: number,
       finalDistance: number,
+      axis: THREE.Vector3,
     ) => {
       setSubmitting(true)
       try {
         const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+        // Pin the direction to the same vector the gizmo renders. Without
+        // this, the backend falls back to `face.normal_at(0.5, 0.5)` which
+        // for a closed curved face (cone lateral, cylinder side, sphere)
+        // gives a radial / perpendicular-to-slant normal that disagrees
+        // with the axial arrow the user sees, producing tilted side faces
+        // and a non-manifold shell.
         const resp = await fetch(`${API_BASE}/geometry/face/extrude`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -239,6 +246,7 @@ export function ExtrudeGizmo() {
             object_uuid: objectId,
             face_id: faceId,
             distance: finalDistance,
+            direction: [axis.x, axis.y, axis.z],
           }),
         })
         if (!resp.ok) {

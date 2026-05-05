@@ -1,0 +1,19 @@
+[package]
+name = "verdict-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Research harness for multi-agent verdict and coordination semantics over the timeline engine"
+
+[dependencies]
+shared-types    = { path = "../shared-types" }
+timeline-engine = { path = "../timeline-engine" }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+uuid            = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"
+
+[lints]
+workspace = true

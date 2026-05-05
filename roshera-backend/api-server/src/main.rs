@@ -3595,8 +3595,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/branches/{id}/merge", post(branches::merge_branch))
         // Datum endpoints (Origin, reference planes, reference axes).
-        // Read-only in Slice 1; user-authored datums arrive in Slice 3.
-        .route("/api/datums", get(handlers::datums::list_datums))
+        // Slice 1 surfaced read + visibility; slice 4a adds CRUD for
+        // user-authored datums (defaults remain unrenameable /
+        // unmodifiable / undeletable — `409 Conflict`).
+        .route(
+            "/api/datums",
+            get(handlers::datums::list_datums)
+                .post(handlers::datums::create_datum),
+        )
+        .route(
+            "/api/datums/{id}",
+            axum::routing::patch(handlers::datums::update_datum)
+                .delete(handlers::datums::delete_datum),
+        )
         .route(
             "/api/datums/{id}/visibility",
             axum::routing::patch(handlers::datums::set_datum_visibility),

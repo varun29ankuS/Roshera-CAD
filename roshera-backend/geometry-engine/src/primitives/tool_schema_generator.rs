@@ -476,12 +476,97 @@ pub fn builtin_primitive_schemas() -> Vec<ToolSchema> {
     ]
 }
 
+/// Tool schemas for datum authoring (slice 4a).
+///
+/// Datums are reference geometry — planes, axes, and points used as
+/// anchors for solids and as snap targets in the viewport. The AI
+/// surface accepts the natural `(origin, normal)` form for planes and
+/// the canonical `"x" | "y" | "z"` token for axis directions; the
+/// executor is responsible for assembling the kernel-side `Matrix4`
+/// when the dispatcher produces a `CreateDatum` command.
+pub fn builtin_datum_schemas() -> Vec<ToolSchema> {
+    vec![
+        ToolSchema {
+            name: "create_datum_plane".into(),
+            description: "Create a user-authored reference plane. The plane is defined by an origin point and a normal vector; the resulting datum is rendered in the model tree and can be used as a sketch anchor or solid reference.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Display name shown in the model tree (must be non-empty)",
+                    },
+                    "origin": {
+                        "type": "object",
+                        "description": "Point on the plane, world coordinates in mm",
+                        "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "z": {"type":"number"} },
+                        "required": ["x","y","z"],
+                    },
+                    "normal": {
+                        "type": "object",
+                        "description": "Plane normal direction (need not be unit length; the executor normalizes)",
+                        "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "z": {"type":"number"} },
+                        "required": ["x","y","z"],
+                    },
+                },
+                "required": ["name", "origin", "normal"],
+            }),
+        },
+        ToolSchema {
+            name: "create_datum_axis".into(),
+            description: "Create a user-authored reference axis along one of the canonical world directions (X, Y, or Z) anchored at the given origin.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Display name shown in the model tree (must be non-empty)",
+                    },
+                    "origin": {
+                        "type": "object",
+                        "description": "Anchor point of the axis in world coordinates (mm)",
+                        "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "z": {"type":"number"} },
+                        "required": ["x","y","z"],
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["x", "y", "z"],
+                        "description": "Canonical axis direction. Slice 4a restricts user axes to world X/Y/Z; arbitrary directions arrive in slice 4b's derived datums.",
+                    },
+                },
+                "required": ["name", "origin", "direction"],
+            }),
+        },
+        ToolSchema {
+            name: "create_datum_point".into(),
+            description: "Create a user-authored reference point at a fixed world-space position. Useful as a probe target or as the origin of a future derived datum.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Display name shown in the model tree (must be non-empty)",
+                    },
+                    "position": {
+                        "type": "object",
+                        "description": "Point position in world coordinates (mm)",
+                        "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "z": {"type":"number"} },
+                        "required": ["x","y","z"],
+                    },
+                },
+                "required": ["name", "position"],
+            }),
+        },
+    ]
+}
+
 /// Get all tool schemas for a given tier.
 ///
 /// Returns tool definitions formatted for the Anthropic API `tools` parameter.
 pub fn tiered_tool_schemas(tier: ToolTier) -> Vec<ToolSchema> {
     let primitives = builtin_primitive_schemas();
     let operations = builtin_operation_schemas();
+    let datums = builtin_datum_schemas();
 
     match tier {
         ToolTier::Tier1 => {
@@ -504,10 +589,15 @@ pub fn tiered_tool_schemas(tier: ToolTier) -> Vec<ToolSchema> {
                     )
                 })
                 .collect();
+            // Tier1 deliberately excludes datums — core flow stays
+            // pure-primitive so the LLM context stays small.
             [core_primitives, core_ops].concat()
         }
         ToolTier::Tier2 => {
-            // Tier1 + cone, torus + extrude, revolve, chamfer, fillet
+            // Tier1 + cone, torus + extrude, revolve, chamfer, fillet,
+            // and datum authoring (planes/axes/points). Datums sit in
+            // Tier2 because aligned/anchored geometry is the first
+            // thing an LLM reaches for past basic primitives.
             let tier2_primitives = primitives;
             let tier2_ops: Vec<_> = operations
                 .into_iter()
@@ -525,11 +615,12 @@ pub fn tiered_tool_schemas(tier: ToolTier) -> Vec<ToolSchema> {
                     )
                 })
                 .collect();
-            [tier2_primitives, tier2_ops].concat()
+            [tier2_primitives, tier2_ops, datums].concat()
         }
         ToolTier::Tier3 => {
-            // Everything
-            [primitives, operations].concat()
+            // Everything: every primitive, every operation, every
+            // datum authoring tool.
+            [primitives, operations, datums].concat()
         }
     }
 }
@@ -632,5 +723,80 @@ mod tests {
         assert!(op_enum.contains(&json!("union")));
         assert!(op_enum.contains(&json!("difference")));
         assert!(op_enum.contains(&json!("intersection")));
+    }
+
+    #[test]
+    fn test_datum_schemas_present() {
+        let schemas = builtin_datum_schemas();
+        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"create_datum_plane"));
+        assert!(names.contains(&"create_datum_axis"));
+        assert!(names.contains(&"create_datum_point"));
+    }
+
+    #[test]
+    fn test_datum_plane_schema_shape() {
+        let schemas = builtin_datum_schemas();
+        let plane = schemas
+            .iter()
+            .find(|s| s.name == "create_datum_plane")
+            .unwrap();
+        let props = &plane.input_schema["properties"];
+        assert!(props["name"].is_object());
+        assert!(props["origin"].is_object());
+        assert!(props["normal"].is_object());
+
+        let required = plane.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("name")));
+        assert!(required.contains(&json!("origin")));
+        assert!(required.contains(&json!("normal")));
+    }
+
+    #[test]
+    fn test_datum_axis_canonical_directions() {
+        let schemas = builtin_datum_schemas();
+        let axis = schemas
+            .iter()
+            .find(|s| s.name == "create_datum_axis")
+            .unwrap();
+        let dir_enum = axis.input_schema["properties"]["direction"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(dir_enum.contains(&json!("x")));
+        assert!(dir_enum.contains(&json!("y")));
+        assert!(dir_enum.contains(&json!("z")));
+        // Slice 4a contract: only canonical directions.
+        assert_eq!(dir_enum.len(), 3);
+    }
+
+    #[test]
+    fn test_tier1_excludes_datums() {
+        let names: Vec<String> = tiered_tool_schemas(ToolTier::Tier1)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!names.iter().any(|n| n.starts_with("create_datum_")));
+    }
+
+    #[test]
+    fn test_tier2_includes_datums() {
+        let names: Vec<String> = tiered_tool_schemas(ToolTier::Tier2)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "create_datum_plane"));
+        assert!(names.iter().any(|n| n == "create_datum_axis"));
+        assert!(names.iter().any(|n| n == "create_datum_point"));
+    }
+
+    #[test]
+    fn test_tier3_includes_datums() {
+        let names: Vec<String> = tiered_tool_schemas(ToolTier::Tier3)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "create_datum_plane"));
+        assert!(names.iter().any(|n| n == "create_datum_axis"));
+        assert!(names.iter().any(|n| n == "create_datum_point"));
     }
 }

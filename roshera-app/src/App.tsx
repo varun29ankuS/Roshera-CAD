@@ -12,7 +12,6 @@ import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
 import { ViewportBridge } from '@/lib/viewport-bridge'
-import { PanelLeftOpen } from 'lucide-react'
 
 const DEMOS_HASH = '#/demos'
 
@@ -64,21 +63,18 @@ export function App() {
           <CADViewport />
           <AIChatPanel />
 
-          {/* Browser (Model Tree) — floating, top-left, collapsible */}
-          {browserOpen ? (
-            <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] cad-panel border rounded shadow-md flex flex-col overflow-hidden bg-card/95 backdrop-blur-sm">
-              <ModelTree onCollapse={() => setBrowserOpen(false)} />
-            </div>
-          ) : (
-            <button
-              onClick={() => setBrowserOpen(true)}
-              className="cad-icon-btn cad-panel absolute top-2 left-2 z-10 h-7 w-7 border rounded shadow-md"
-              title="Show browser"
-              aria-label="Show browser"
-            >
-              <PanelLeftOpen size={14} />
-            </button>
-          )}
+          {/* Browser (Model Tree) — floating, top-left, collapsible.
+              The header chip is always visible and acts as the
+              collapse toggle; the tree content below renders only
+              when expanded. Only the header carries its own outline,
+              so the chip stays as an anchor even when the tree is
+              hidden. */}
+          <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] flex flex-col overflow-hidden">
+            <ModelTree
+              expanded={browserOpen}
+              onToggle={() => setBrowserOpen((open) => !open)}
+            />
+          </div>
         </div>
 
         {/* Right panel: Properties (conditional) */}
