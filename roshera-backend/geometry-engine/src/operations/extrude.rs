@@ -17,12 +17,13 @@ use super::deep_clone::deep_clone_faces;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
+    curve::{Arc, Circle, Curve},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
     shell::{Shell, ShellType},
     solid::{Solid, SolidId},
-    surface::Surface,
+    surface::{Cylinder, Surface},
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -827,12 +828,105 @@ fn create_ruled_surface(
         .get(top_edge_data.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Top curve not found".to_string()))?;
 
+    // Detect the canonical "extruded full-circle" case (e.g. extruding a
+    // cylinder cap, the bottom face of a cone, or any closed-disk profile)
+    // and emit a Cylinder primitive instead of a generic RuledSurface.
+    //
+    // Why: the 4-edge "cut rectangle" loop produced by `create_side_face_shared`
+    // for a closed-circle base (start_vertex == end_vertex, both vertical
+    // seam edges collapsed to the same EdgeId) matches `cylinder_primitive`'s
+    // lateral-face topology exactly. RuledSurface would route to
+    // `tessellate_generic_face`, whose UV-grid + winding-number test fails
+    // on closed-circle boundaries because the 2D loop projection wraps the
+    // parameter space — the side face emits zero triangles and the user
+    // sees the cone/disk caps but no cylindrical wall between them.
+    // Cylinder routes to `tessellate_cylindrical_face`, which knows the
+    // seam convention and tessellates correctly.
+    if let Some(cyl) = try_build_cylinder_from_circles(bottom_curve, top_curve) {
+        return Ok(Box::new(cyl));
+    }
+
     // Build a real ruled surface S(u,v) = (1-v)·C1(u) + v·C2(u) by cloning
     // both boundary curves. RuledSurface evaluates the linear interpolation
     // analytically — no NURBS approximation, no sampling error.
     use crate::primitives::surface::RuledSurface;
     let surface = RuledSurface::new(bottom_curve.clone_box(), top_curve.clone_box());
     Ok(Box::new(surface))
+}
+
+/// Extract `(center, axis, radius)` from a curve if it represents a full
+/// circle. Handles both `Circle` (which wraps `Arc` internally) and `Arc`
+/// with `sweep_angle ≈ 2π`. Returns None for partial arcs, lines, NURBS,
+/// or anything else.
+fn full_circle_params(curve: &dyn Curve) -> Option<(Point3, Vector3, f64)> {
+    use crate::math::consts;
+    let any = curve.as_any();
+    if let Some(c) = any.downcast_ref::<Circle>() {
+        return Some((c.center(), c.normal(), c.radius()));
+    }
+    if let Some(a) = any.downcast_ref::<Arc>() {
+        if (a.sweep_angle.abs() - consts::TWO_PI).abs() < 1e-9 {
+            return Some((a.center, a.normal, a.radius));
+        }
+    }
+    None
+}
+
+/// If the bottom and top curves are coaxial full circles of equal radius,
+/// build a finite `Cylinder` whose axis goes from the bottom center to
+/// the top center. Returns None if the geometry doesn't match — the
+/// caller falls back to a generic ruled surface.
+fn try_build_cylinder_from_circles(
+    bottom_curve: &dyn Curve,
+    top_curve: &dyn Curve,
+) -> Option<Cylinder> {
+    let (b_center, b_axis, b_radius) = full_circle_params(bottom_curve)?;
+    let (t_center, t_axis, t_radius) = full_circle_params(top_curve)?;
+
+    // Same radius (numerically). Different radii would be a cone, which
+    // we don't synthesise here — a generic ruled surface still draws
+    // correctly for cones because the cone tessellator isn't involved.
+    if (b_radius - t_radius).abs() > 1e-9 {
+        return None;
+    }
+
+    // Axes must be parallel (translation along axis is the only transform
+    // build_extrusion_loop_topology applies, so this is essentially
+    // always true for our caller — but verifying is cheap).
+    let b_axis_n = b_axis.normalize().ok()?;
+    let t_axis_n = t_axis.normalize().ok()?;
+    if b_axis_n.dot(&t_axis_n).abs() < 1.0 - 1e-9 {
+        return None;
+    }
+
+    // The line from bottom center to top center must be parallel to the
+    // axis. Otherwise the boundary circles aren't coaxial and a cylinder
+    // doesn't fit (e.g. an oblique extrusion of a circle).
+    let centers = t_center - b_center;
+    let centers_len = centers.magnitude();
+    if centers_len < 1e-12 {
+        // Degenerate (zero-height) extrusion — shouldn't happen because
+        // distance is validated upstream, but bail safely if it does.
+        return None;
+    }
+    let centers_n = centers.normalize().ok()?;
+    if centers_n.dot(&b_axis_n).abs() < 1.0 - 1e-9 {
+        return None;
+    }
+
+    // Height is the signed projection onto the cylinder axis. Negative
+    // distances are valid (the user pulled in -axis direction); the
+    // Cylinder's height_limits = [0, height] still bounds the lateral
+    // surface as long as height > 0 — flip when needed so the origin
+    // sits at whichever circle is "lower" along the axis.
+    let signed_height = centers.dot(&b_axis_n);
+    let (origin, height) = if signed_height >= 0.0 {
+        (b_center, signed_height)
+    } else {
+        (t_center, -signed_height)
+    };
+
+    Cylinder::new_finite(origin, b_axis_n, b_radius, height).ok()
 }
 
 /// Create a face from a closed wire profile

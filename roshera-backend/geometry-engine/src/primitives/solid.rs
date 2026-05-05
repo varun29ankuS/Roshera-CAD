@@ -224,8 +224,9 @@ pub struct SolidAnchor {
 
 impl SolidAnchor {
     /// Anchor at the world Origin (datum id 0) with no local offset.
-    /// Used as the default for legacy primitive creation paths that
-    /// pre-date Slice 2.
+    /// Used as the canonical default on every newly-constructed `Solid`
+    /// — anchoring is mandatory (slice 3a), so primitives that are not
+    /// explicitly placed against a datum land here.
     pub fn world_origin() -> Self {
         Self {
             datum_id: 0,
@@ -249,11 +250,13 @@ pub struct Solid {
     features: Arc<RwLock<HashMap<u32, Feature>>>,
     /// Attributes
     pub attributes: SolidAttributes,
-    /// Datum anchoring metadata (Slice 2). `None` for solids created
-    /// before this slice or produced by operations that derive a new
-    /// solid from existing geometry (booleans, extrudes), which are
-    /// not "placed" against a datum in the same sense as a primitive.
-    pub anchor: Option<SolidAnchor>,
+    /// Datum anchoring metadata. Every solid carries an anchor — solids
+    /// created without an explicit datum (legacy creators, derived
+    /// solids from booleans / extrudes) default to `SolidAnchor::world_origin()`
+    /// (datum id 0 + identity local transform). This guarantees agents
+    /// and downstream queries always have a reference frame to reason
+    /// against, never raw world coordinates.
+    pub anchor: SolidAnchor,
     /// Cached mass properties
     cached_mass_props: Option<SolidMassProperties>,
     /// Cached statistics
@@ -287,7 +290,7 @@ impl Solid {
             name: None,
             features: Arc::new(RwLock::new(HashMap::new())),
             attributes: SolidAttributes::default(),
-            anchor: None,
+            anchor: SolidAnchor::world_origin(),
             cached_mass_props: None,
             cached_stats: None,
             parent_assembly: None,

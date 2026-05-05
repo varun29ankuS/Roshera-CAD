@@ -74,11 +74,17 @@ pub fn dispatch_tool_call(tool_use: &ToolUseBlock) -> Result<DispatchResult, Pro
         "export_stl" => dispatch_export("stl", input),
         "export_obj" => dispatch_export("obj", input),
 
+        // --- Datum authoring (slice 4a) ---
+        "create_datum_plane" => dispatch_create_datum_plane(input),
+        "create_datum_axis" => dispatch_create_datum_axis(input),
+        "create_datum_point" => dispatch_create_datum_point(input),
+
         _ => Err(ProviderError::InvalidInput(format!(
             "Unknown tool: '{}'. Available tools depend on the active tier. \
              Core tools: create_box, create_cylinder, create_sphere, create_cone, \
              create_torus, boolean_union, boolean_difference, boolean_intersection, \
-             transform_object, query_geometry, export_stl",
+             transform_object, query_geometry, export_stl, \
+             create_datum_plane, create_datum_axis, create_datum_point",
             name
         ))),
     }
@@ -258,6 +264,166 @@ fn dispatch_query(query_type: &str, input: &Value) -> Result<DispatchResult, Pro
         original_text: query_type.to_string(),
         intent: CommandIntent::Query {
             target: query_type.to_string(),
+        },
+        parameters: params,
+        confidence: 1.0,
+        language: "en".to_string(),
+    }))
+}
+
+/// Validate and extract a non-empty string field.
+fn require_non_empty_string(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String, ProviderError> {
+    let val = obj.get(field).ok_or_else(|| {
+        ProviderError::InvalidInput(format!("Missing required parameter '{}'", field))
+    })?;
+    let s = val.as_str().ok_or_else(|| {
+        ProviderError::InvalidInput(format!(
+            "Parameter '{}' must be a string, got: {}",
+            field, val
+        ))
+    })?;
+    if s.trim().is_empty() {
+        return Err(ProviderError::InvalidInput(format!(
+            "Parameter '{}' must be a non-empty string",
+            field
+        )));
+    }
+    Ok(s.to_string())
+}
+
+/// Validate and extract a `{x, y, z}` numeric triple.
+fn require_xyz(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<[f64; 3], ProviderError> {
+    let val = obj.get(field).ok_or_else(|| {
+        ProviderError::InvalidInput(format!("Missing required parameter '{}'", field))
+    })?;
+    let inner = val.as_object().ok_or_else(|| {
+        ProviderError::InvalidInput(format!(
+            "Parameter '{}' must be an object with x/y/z fields",
+            field
+        ))
+    })?;
+    let mut out = [0.0_f64; 3];
+    for (i, axis) in ["x", "y", "z"].iter().enumerate() {
+        let v = inner.get(*axis).ok_or_else(|| {
+            ProviderError::InvalidInput(format!(
+                "Parameter '{}.{}' is required",
+                field, axis
+            ))
+        })?;
+        out[i] = v.as_f64().ok_or_else(|| {
+            ProviderError::InvalidInput(format!(
+                "Parameter '{}.{}' must be a number, got: {}",
+                field, axis, v
+            ))
+        })?;
+    }
+    Ok(out)
+}
+
+fn dispatch_create_datum_plane(input: &Value) -> Result<DispatchResult, ProviderError> {
+    let obj = input.as_object().ok_or_else(|| {
+        ProviderError::InvalidInput("Tool input must be a JSON object".to_string())
+    })?;
+
+    let name = require_non_empty_string(obj, "name")?;
+    let origin = require_xyz(obj, "origin")?;
+    let normal = require_xyz(obj, "normal")?;
+
+    // Reject zero-length normals — they cannot define a plane and the
+    // kernel would otherwise fall through into a NaN-producing path
+    // when the executor normalizes.
+    let normal_len_sq = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+    if normal_len_sq < f64::EPSILON {
+        return Err(ProviderError::InvalidInput(
+            "Parameter 'normal' must have non-zero length".to_string(),
+        ));
+    }
+
+    let mut params = HashMap::new();
+    params.insert("name".to_string(), Value::String(name));
+    params.insert(
+        "origin".to_string(),
+        serde_json::json!({ "x": origin[0], "y": origin[1], "z": origin[2] }),
+    );
+    params.insert(
+        "normal".to_string(),
+        serde_json::json!({ "x": normal[0], "y": normal[1], "z": normal[2] }),
+    );
+
+    Ok(DispatchResult::Command(ParsedCommand {
+        original_text: "create_datum_plane".to_string(),
+        intent: CommandIntent::Create {
+            object_type: "datum_plane".to_string(),
+            parameters: input.clone(),
+        },
+        parameters: params,
+        confidence: 1.0,
+        language: "en".to_string(),
+    }))
+}
+
+fn dispatch_create_datum_axis(input: &Value) -> Result<DispatchResult, ProviderError> {
+    let obj = input.as_object().ok_or_else(|| {
+        ProviderError::InvalidInput("Tool input must be a JSON object".to_string())
+    })?;
+
+    let name = require_non_empty_string(obj, "name")?;
+    let origin = require_xyz(obj, "origin")?;
+    let direction = require_non_empty_string(obj, "direction")?;
+    let direction_lc = direction.to_ascii_lowercase();
+    if !matches!(direction_lc.as_str(), "x" | "y" | "z") {
+        return Err(ProviderError::InvalidInput(format!(
+            "Parameter 'direction' must be one of \"x\", \"y\", \"z\"; got: {:?}",
+            direction
+        )));
+    }
+
+    let mut params = HashMap::new();
+    params.insert("name".to_string(), Value::String(name));
+    params.insert(
+        "origin".to_string(),
+        serde_json::json!({ "x": origin[0], "y": origin[1], "z": origin[2] }),
+    );
+    params.insert("direction".to_string(), Value::String(direction_lc));
+
+    Ok(DispatchResult::Command(ParsedCommand {
+        original_text: "create_datum_axis".to_string(),
+        intent: CommandIntent::Create {
+            object_type: "datum_axis".to_string(),
+            parameters: input.clone(),
+        },
+        parameters: params,
+        confidence: 1.0,
+        language: "en".to_string(),
+    }))
+}
+
+fn dispatch_create_datum_point(input: &Value) -> Result<DispatchResult, ProviderError> {
+    let obj = input.as_object().ok_or_else(|| {
+        ProviderError::InvalidInput("Tool input must be a JSON object".to_string())
+    })?;
+
+    let name = require_non_empty_string(obj, "name")?;
+    let position = require_xyz(obj, "position")?;
+
+    let mut params = HashMap::new();
+    params.insert("name".to_string(), Value::String(name));
+    params.insert(
+        "position".to_string(),
+        serde_json::json!({ "x": position[0], "y": position[1], "z": position[2] }),
+    );
+
+    Ok(DispatchResult::Command(ParsedCommand {
+        original_text: "create_datum_point".to_string(),
+        intent: CommandIntent::Create {
+            object_type: "datum_point".to_string(),
+            parameters: input.clone(),
         },
         parameters: params,
         confidence: 1.0,
@@ -467,6 +633,148 @@ mod tests {
             assert!(tool.get("description").is_some());
             assert!(tool.get("input_schema").is_some());
         }
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_plane() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_1".to_string(),
+            name: "create_datum_plane".to_string(),
+            input: json!({
+                "name": "TopRef",
+                "origin": { "x": 0.0, "y": 0.0, "z": 10.0 },
+                "normal": { "x": 0.0, "y": 0.0, "z": 1.0 },
+            }),
+        };
+
+        let result = dispatch_tool_call(&tool_use).unwrap();
+        match result {
+            DispatchResult::Command(cmd) => {
+                match &cmd.intent {
+                    CommandIntent::Create {
+                        object_type,
+                        parameters: _,
+                    } => assert_eq!(object_type, "datum_plane"),
+                    other => panic!("expected CommandIntent::Create, got {:?}", other),
+                }
+                assert_eq!(cmd.parameters["name"], json!("TopRef"));
+                assert_eq!(cmd.parameters["origin"]["z"], json!(10.0));
+                assert_eq!(cmd.parameters["normal"]["z"], json!(1.0));
+            }
+            _ => panic!("Expected Command dispatch"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_plane_rejects_zero_normal() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_2".to_string(),
+            name: "create_datum_plane".to_string(),
+            input: json!({
+                "name": "Bad",
+                "origin": { "x": 0.0, "y": 0.0, "z": 0.0 },
+                "normal": { "x": 0.0, "y": 0.0, "z": 0.0 },
+            }),
+        };
+        let err = dispatch_tool_call(&tool_use).unwrap_err().to_string();
+        assert!(err.contains("non-zero"));
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_plane_rejects_empty_name() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_3".to_string(),
+            name: "create_datum_plane".to_string(),
+            input: json!({
+                "name": "   ",
+                "origin": { "x": 0.0, "y": 0.0, "z": 0.0 },
+                "normal": { "x": 0.0, "y": 0.0, "z": 1.0 },
+            }),
+        };
+        let err = dispatch_tool_call(&tool_use).unwrap_err().to_string();
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_axis_canonical() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_4".to_string(),
+            name: "create_datum_axis".to_string(),
+            input: json!({
+                "name": "ProbeAxis",
+                "origin": { "x": 1.0, "y": 2.0, "z": 3.0 },
+                "direction": "Y",
+            }),
+        };
+        let result = dispatch_tool_call(&tool_use).unwrap();
+        match result {
+            DispatchResult::Command(cmd) => {
+                match &cmd.intent {
+                    CommandIntent::Create {
+                        object_type,
+                        parameters: _,
+                    } => assert_eq!(object_type, "datum_axis"),
+                    other => panic!("expected CommandIntent::Create, got {:?}", other),
+                }
+                // Direction is canonicalized to lowercase.
+                assert_eq!(cmd.parameters["direction"], json!("y"));
+                assert_eq!(cmd.parameters["origin"]["x"], json!(1.0));
+            }
+            _ => panic!("Expected Command dispatch"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_axis_rejects_non_canonical() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_5".to_string(),
+            name: "create_datum_axis".to_string(),
+            input: json!({
+                "name": "Diagonal",
+                "origin": { "x": 0.0, "y": 0.0, "z": 0.0 },
+                "direction": "diagonal",
+            }),
+        };
+        let err = dispatch_tool_call(&tool_use).unwrap_err().to_string();
+        assert!(err.contains("direction"));
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_point() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_6".to_string(),
+            name: "create_datum_point".to_string(),
+            input: json!({
+                "name": "P1",
+                "position": { "x": 4.0, "y": 5.0, "z": 6.0 },
+            }),
+        };
+        let result = dispatch_tool_call(&tool_use).unwrap();
+        match result {
+            DispatchResult::Command(cmd) => {
+                match &cmd.intent {
+                    CommandIntent::Create {
+                        object_type,
+                        parameters: _,
+                    } => assert_eq!(object_type, "datum_point"),
+                    other => panic!("expected CommandIntent::Create, got {:?}", other),
+                }
+                assert_eq!(cmd.parameters["name"], json!("P1"));
+                assert_eq!(cmd.parameters["position"]["y"], json!(5.0));
+            }
+            _ => panic!("Expected Command dispatch"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_create_datum_point_rejects_missing_position() {
+        let tool_use = ToolUseBlock {
+            id: "call_datum_7".to_string(),
+            name: "create_datum_point".to_string(),
+            input: json!({ "name": "P1" }),
+        };
+        let err = dispatch_tool_call(&tool_use).unwrap_err().to_string();
+        assert!(err.contains("position"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useThemeStore } from '@/stores/theme-store'
 
 /**
  * Kernel-driven datum visualisation. Replaces the old decorative
@@ -47,11 +48,17 @@ const AXIS_COLOR: Record<'x' | 'y' | 'z', string> = {
   z: '#3498db',
 }
 
-// All reference planes render as a uniform darker shade of the
-// viewport background — `#000000` over a light bg darkens it; over a
-// dark bg it darkens further. Per-axis color is communicated by the
-// axis lines themselves, so the planes don't need to repeat it.
-const PLANE_TINT = '#000000'
+// Reference planes render as a low-opacity tint over the viewport
+// background. On the cream "drafting paper" light theme we darken
+// with `#000000`. On the navy blueprint dark theme black-on-near-black
+// blends to invisibility, so we lift with a desaturated steel-blue
+// that reads as "blueprint paper" without the harshness of pure
+// white. Per-axis color is communicated by the axis lines themselves,
+// so the planes don't need to repeat it.
+const PLANE_TINT_LIGHT = '#000000'
+const PLANE_TINT_DARK = '#b8c5d6'
+const PLANE_OPACITY_LIGHT = 0.04
+const PLANE_OPACITY_DARK = 0.035
 
 /**
  * Rotation that takes Three.js's default XY-plane geometry (normal +Z)
@@ -73,6 +80,9 @@ function planeRotation(orient: 'xy' | 'xz' | 'yz' | 'custom'): [number, number, 
 
 export function Datums() {
   const [datums, setDatums] = useState<DatumDto[]>([])
+  const theme = useThemeStore((s) => s.theme)
+  const planeTint = theme === 'dark' ? PLANE_TINT_DARK : PLANE_TINT_LIGHT
+  const planeOpacity = theme === 'dark' ? PLANE_OPACITY_DARK : PLANE_OPACITY_LIGHT
 
   useEffect(() => {
     let cancelled = false
@@ -150,9 +160,9 @@ export function Datums() {
               <mesh>
                 <planeGeometry args={[size, size]} />
                 <meshBasicMaterial
-                  color={PLANE_TINT}
+                  color={planeTint}
                   transparent
-                  opacity={0.04}
+                  opacity={planeOpacity}
                   depthWrite={false}
                   side={2}
                 />

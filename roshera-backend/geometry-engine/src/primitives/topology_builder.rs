@@ -26,6 +26,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+/// Flatten a `Matrix4` to a 4×4 row-major nested array for JSON
+/// recording. Used by the slice 4a datum mediators so timeline replay
+/// and the API layer share the same wire shape.
+#[inline]
+fn matrix4_to_row_major(m: &Matrix4) -> [[f64; 4]; 4] {
+    [
+        [m.get(0, 0), m.get(0, 1), m.get(0, 2), m.get(0, 3)],
+        [m.get(1, 0), m.get(1, 1), m.get(1, 2), m.get(1, 3)],
+        [m.get(2, 0), m.get(2, 1), m.get(2, 2), m.get(2, 3)],
+        [m.get(3, 0), m.get(3, 1), m.get(3, 2), m.get(3, 3)],
+    ]
+}
+
 /// Tessellated mesh representation for visualization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TessellatedMesh {
@@ -257,6 +270,322 @@ impl BRepModel {
                 tracing::warn!("operation recorder returned error: {}", e);
             }
         }
+    }
+
+    // ───────────────────────────── Datum mediators ────────────────────────────
+    //
+    // Datum mutations route through `BRepModel` rather than directly into
+    // `DatumStore` so each user-driven change emits a `RecordedOperation`
+    // for replay / branch / audit. The seven default datums seeded at
+    // `BRepModel::new()` are an invariant of the baseline model and are
+    // therefore *not* recorded — replay starts from "model with seven
+    // defaults already present". Only user-driven mutations (visibility
+    // toggle today, create/rename/delete in slice 4) emit events.
+
+    /// Toggle a datum's visibility, recording the change.
+    ///
+    /// Returns `Some(previous_visible)` on success, or `None` when the
+    /// datum id is unknown — matches `DatumStore::set_visible`. The event
+    /// records `kind = "datum_set_visibility"` with the datum id in
+    /// `inputs` and `{datum_id, visible, previous_visible}` in
+    /// `parameters`.
+    pub fn set_datum_visibility(
+        &self,
+        id: crate::primitives::datum::DatumId,
+        visible: bool,
+    ) -> Option<bool> {
+        let previous = self.datums.set_visible(id, visible)?;
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_set_visibility")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "visible": visible,
+                    "previous_visible": previous,
+                }))
+                .with_inputs(vec![id as u64]),
+        );
+        Some(previous)
+    }
+
+    // Slice 4a: user-authored datum mediators. Each wraps the
+    // corresponding `DatumStore` method with a `RecordedOperation` so
+    // the timeline can replay the exact authoring history. The kernel
+    // takes the operation kind names from the slice plan in
+    // `memory/datum-system.md` (`datum_create`, `datum_rename`,
+    // `datum_set_transform`, `datum_delete`).
+
+    /// Create a user-authored plane datum and record `datum_create`.
+    pub fn create_datum_plane(
+        &self,
+        name: String,
+        transform: Matrix4,
+    ) -> Result<crate::primitives::datum::DatumId, crate::primitives::datum::DatumError> {
+        let id = self.datums.create_plane(name.clone(), transform)?;
+        let mat = matrix4_to_row_major(&transform);
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_create")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "kind": "plane",
+                    "name": name,
+                    "transform": mat,
+                }))
+                .with_outputs(vec![id as u64]),
+        );
+        Ok(id)
+    }
+
+    /// Create a user-authored axis datum and record `datum_create`.
+    pub fn create_datum_axis(
+        &self,
+        name: String,
+        origin: Point3,
+        direction: crate::primitives::datum::AxisDirection,
+    ) -> Result<crate::primitives::datum::DatumId, crate::primitives::datum::DatumError> {
+        let id = self
+            .datums
+            .create_axis(name.clone(), origin, direction)?;
+        let dir_label = match direction {
+            crate::primitives::datum::AxisDirection::X => "x",
+            crate::primitives::datum::AxisDirection::Y => "y",
+            crate::primitives::datum::AxisDirection::Z => "z",
+        };
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_create")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "kind": "axis",
+                    "name": name,
+                    "origin": [origin.x, origin.y, origin.z],
+                    "direction": dir_label,
+                }))
+                .with_outputs(vec![id as u64]),
+        );
+        Ok(id)
+    }
+
+    /// Create a user-authored point datum and record `datum_create`.
+    pub fn create_datum_point(
+        &self,
+        name: String,
+        position: Point3,
+    ) -> Result<crate::primitives::datum::DatumId, crate::primitives::datum::DatumError> {
+        let id = self.datums.create_point(name.clone(), position)?;
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_create")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "kind": "point",
+                    "name": name,
+                    "position": [position.x, position.y, position.z],
+                }))
+                .with_outputs(vec![id as u64]),
+        );
+        Ok(id)
+    }
+
+    /// Rename a user-authored datum and record `datum_rename`.
+    pub fn rename_datum(
+        &self,
+        id: crate::primitives::datum::DatumId,
+        name: String,
+    ) -> Result<String, crate::primitives::datum::DatumError> {
+        let previous = self.datums.rename(id, name.clone())?;
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_rename")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "name": name,
+                    "previous_name": previous,
+                }))
+                .with_inputs(vec![id as u64]),
+        );
+        Ok(previous)
+    }
+
+    /// Replace a user-authored datum's transform and record
+    /// `datum_set_transform`.
+    pub fn set_datum_transform(
+        &self,
+        id: crate::primitives::datum::DatumId,
+        transform: Matrix4,
+    ) -> Result<Matrix4, crate::primitives::datum::DatumError> {
+        let previous = self.datums.set_transform(id, transform)?;
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_set_transform")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "transform": matrix4_to_row_major(&transform),
+                    "previous_transform": matrix4_to_row_major(&previous),
+                }))
+                .with_inputs(vec![id as u64]),
+        );
+        Ok(previous)
+    }
+
+    /// Delete a user-authored datum and record `datum_delete`.
+    ///
+    /// Slice 4a deletion is shallow — anchored solids that referenced
+    /// this datum keep their `anchor.datum_id` pointing at a now-stale
+    /// id. The api-server validates dependents at the request layer
+    /// (409 unless `?cascade=detach`).
+    pub fn delete_datum(
+        &self,
+        id: crate::primitives::datum::DatumId,
+    ) -> Result<crate::primitives::datum::Datum, crate::primitives::datum::DatumError> {
+        let removed = self.datums.delete(id)?;
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_delete")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "name": removed.name.clone(),
+                }))
+                .with_inputs(vec![id as u64]),
+        );
+        Ok(removed)
+    }
+
+    // ─────────────────────────── Datum-relative queries ──────────────────────
+    //
+    // Slice 3b: agent-facing read API. Every solid has a mandatory anchor
+    // (slice 3a-i) and every datum carries an explicit `transform`
+    // (slice 3d), so we can answer "where is part X relative to datum Y?"
+    // without ad-hoc heuristics. These queries are O(faces × edges) over
+    // a solid's outer shell and allocate one short-lived `HashSet` per
+    // call; slice 5 will memoize per-solid descriptors in a `DashMap` and
+    // invalidate them on transform / anchor / topology changes.
+
+    /// World-space axis-aligned bounding box of the solid's outer-shell
+    /// vertices. Returns `None` if the solid id is unknown, or if the
+    /// shell has no reachable vertices (degenerate model).
+    ///
+    /// Anchored solids store geometry in world space (slice 2 invariant
+    /// — moving a datum does not currently move dependents; that is
+    /// slice 5's propagation graph), so this is exactly the world bbox.
+    pub fn solid_world_bbox(&self, id: SolidId) -> Option<crate::math::BBox> {
+        use std::collections::HashSet;
+        let solid = self.solids.get(id)?;
+        let shell = self.shells.get(solid.outer_shell)?;
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        let mut points: Vec<Point3> = Vec::with_capacity(shell.faces.len() * 4);
+        for &face_id in &shell.faces {
+            let Some(face) = self.faces.get(face_id) else {
+                continue;
+            };
+            let Some(outer) = self.loops.get(face.outer_loop) else {
+                continue;
+            };
+            for &edge_id in &outer.edges {
+                let Some(edge) = self.edges.get(edge_id) else {
+                    continue;
+                };
+                for vid in [edge.start_vertex, edge.end_vertex] {
+                    if seen.insert(vid) {
+                        if let Some(v) = self.vertices.get(vid) {
+                            points.push(Point3::new(
+                                v.position[0],
+                                v.position[1],
+                                v.position[2],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        crate::math::BBox::from_points(&points)
+    }
+
+    /// Bounding box of the solid expressed in the local frame of the
+    /// given datum. Computed by transforming the eight world-bbox
+    /// corners through `datum.transform.inverse()` and rebuilding the
+    /// AABB. The result is the *axis-aligned hull* of the rotated box,
+    /// so it is conservative — for non-axis-aligned datums the local
+    /// bbox is larger than a true OBB. Suitable for agent queries
+    /// ("how big is X measured along the FrontPlane axes?") and
+    /// containment tests.
+    ///
+    /// Returns `None` if the solid id is unknown, the datum id is
+    /// unknown, or the datum's transform is non-invertible (would
+    /// indicate a corrupt frame — never happens for the seven
+    /// defaults).
+    pub fn solid_bbox_in_frame(
+        &self,
+        id: SolidId,
+        datum_id: crate::primitives::datum::DatumId,
+    ) -> Option<crate::math::BBox> {
+        let world = self.solid_world_bbox(id)?;
+        let datum_frame = self.datums.frame(datum_id)?;
+        let inv = datum_frame.inverse().ok()?;
+        let local_corners: Vec<Point3> = world
+            .corners()
+            .iter()
+            .map(|p| inv.transform_point(p))
+            .collect();
+        crate::math::BBox::from_points(&local_corners)
+    }
+
+    /// Center-to-center Euclidean distance between two solids' world
+    /// bboxes. Returns `None` if either solid is unknown or has no
+    /// reachable vertices.
+    ///
+    /// Slice 3b ships the bbox-center approximation; slice 5 will add
+    /// surface-to-surface (`face_face_distance`) once the closest-point
+    /// machinery for non-planar surfaces stabilizes. Agents that need a
+    /// stricter measure should compose this with `solid_world_bbox` and
+    /// inspect the bbox extents themselves.
+    pub fn solid_distance(&self, a: SolidId, b: SolidId) -> Option<f64> {
+        let bb_a = self.solid_world_bbox(a)?;
+        let bb_b = self.solid_world_bbox(b)?;
+        Some((bb_a.center() - bb_b.center()).magnitude())
+    }
+
+    /// Compose a `LocationDescriptor` for a solid: the agent-facing
+    /// blob that summarizes where it lives, in what frame, and how big
+    /// it is.
+    ///
+    /// `signed_distance_{front,top,right}` are measured against the
+    /// canonical world planes (FrontPlane = XY / TopPlane = XZ /
+    /// RightPlane = YZ at the world origin), independent of whether
+    /// the matching default datums have been hidden, renamed, or
+    /// otherwise mutated by the user. This guarantees agents always
+    /// have a stable reference frame to reason in even when the user
+    /// has reorganized their datum tree.
+    ///
+    /// Returns `None` if the solid id is unknown, the solid's anchor
+    /// datum has been deleted (cannot happen today — defaults are
+    /// undeletable, slice 4a's `delete` will refuse `is_default`), or
+    /// the solid has no reachable vertices.
+    pub fn solid_location_descriptor(
+        &self,
+        id: SolidId,
+    ) -> Option<crate::primitives::datum::LocationDescriptor> {
+        let solid = self.solids.get(id)?;
+        let anchor_datum_id = solid.anchor.datum_id;
+        let anchor_datum = self.datums.get(anchor_datum_id)?;
+        let world_bbox = self.solid_world_bbox(id)?;
+        let world_center = world_bbox.center();
+        let world_size = world_bbox.size();
+
+        let local_center = anchor_datum
+            .transform
+            .inverse()
+            .ok()?
+            .transform_point(&world_center);
+
+        Some(crate::primitives::datum::LocationDescriptor {
+            solid_id: id,
+            anchor_datum_id,
+            anchor_datum_name: anchor_datum.name.clone(),
+            center_world: [world_center.x, world_center.y, world_center.z],
+            center_in_anchor_frame: [local_center.x, local_center.y, local_center.z],
+            dimensions_world: [world_size.x, world_size.y, world_size.z],
+            // FrontPlane = XY plane, normal +Z → signed distance is the z-coord.
+            signed_distance_front: world_center.z,
+            // TopPlane   = XZ plane, normal +Y → signed distance is the y-coord.
+            signed_distance_top: world_center.y,
+            // RightPlane = YZ plane, normal +X → signed distance is the x-coord.
+            signed_distance_right: world_center.x,
+        })
     }
 
     /// Compute bounding box of all geometry in the model
@@ -1664,10 +1993,10 @@ impl<'a> TopologyBuilder<'a> {
                     value: solid_id.to_string(),
                     constraint: "must reference an existing solid".to_string(),
                 })?;
-        solid.anchor = Some(crate::primitives::solid::SolidAnchor {
+        solid.anchor = crate::primitives::solid::SolidAnchor {
             datum_id,
             local_transform,
-        });
+        };
 
         Ok(())
     }
@@ -2800,6 +3129,718 @@ mod cascade_tests {
         for vid in v {
             assert!(model.vertices.get(vid).is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    //! Integration tests for Slice 2 datum anchoring.
+    //!
+    //! Each test creates a `BRepModel` (which seeds the canonical seven
+    //! default datums), then exercises the `create_*_anchored` builders
+    //! and verifies both:
+    //!
+    //! 1. `solid.anchor` metadata is stamped correctly (datum id +
+    //!    local transform), so downstream consumers can answer "what
+    //!    was this primitive placed against?".
+    //! 2. The geometry is actually transformed into world space —
+    //!    anchoring to a translated frame must shift vertex positions.
+    //!
+    //! Tests deliberately avoid asserting on rotation-specific vertex
+    //! positions to stay robust against `Matrix4` convention changes.
+    //! The bounding-box deltas verify the integration end-to-end.
+    use super::*;
+    use crate::math::Matrix4;
+    use crate::primitives::datum::DatumKind;
+    use crate::sketch2d::sketch_plane::PlaneOrientation;
+    use std::collections::HashSet;
+
+    /// Walk the solid's topology and return every unique vertex position.
+    fn collect_vertex_positions(model: &BRepModel, solid_id: SolidId) -> Vec<Point3> {
+        let solid = model
+            .solids
+            .get(solid_id)
+            .expect("solid exists for collect_vertex_positions");
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .expect("outer shell exists");
+
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        let mut positions = Vec::new();
+        for &face_id in &shell.faces {
+            let face = model.faces.get(face_id).expect("face exists");
+            let outer = model.loops.get(face.outer_loop).expect("loop exists");
+            for &edge_id in &outer.edges {
+                let edge = model.edges.get(edge_id).expect("edge exists");
+                for vid in [edge.start_vertex, edge.end_vertex] {
+                    if seen.insert(vid) {
+                        let v = model
+                            .vertices
+                            .get(vid)
+                            .expect("vertex exists for collected edge");
+                        positions.push(Point3::new(
+                            v.position[0],
+                            v.position[1],
+                            v.position[2],
+                        ));
+                    }
+                }
+            }
+        }
+        positions
+    }
+
+    /// Tight bounding box `(min, max)` from a list of points.
+    fn bbox_of(points: &[Point3]) -> (Point3, Point3) {
+        let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in points {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            min.z = min.z.min(p.z);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+            max.z = max.z.max(p.z);
+        }
+        (min, max)
+    }
+
+    /// Find the seeded `TopPlane` (XZ orientation) datum id. The seed
+    /// order is fixed by `DatumStore::seed_defaults`, but tests look up
+    /// by kind to stay decoupled from the seed's allocation order.
+    fn top_plane_id(model: &BRepModel) -> u32 {
+        model
+            .datums
+            .snapshot()
+            .into_iter()
+            .find(|d| matches!(d.kind, DatumKind::Plane(PlaneOrientation::XZ)))
+            .expect("default TopPlane is seeded by BRepModel::new")
+            .id
+    }
+
+    /// Find the seeded `Origin` datum id. Always 0 in current
+    /// `seed_defaults`, but resolved by kind for the same reason.
+    fn origin_id(model: &BRepModel) -> u32 {
+        model
+            .datums
+            .snapshot()
+            .into_iter()
+            .find(|d| matches!(d.kind, DatumKind::Origin))
+            .expect("default Origin is seeded by BRepModel::new")
+            .id
+    }
+
+    #[test]
+    fn anchor_metadata_recorded_for_top_plane() {
+        let mut model = BRepModel::new();
+        let datum_id = top_plane_id(&model);
+
+        let geo = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d_anchored(10.0, 10.0, 10.0, datum_id, Matrix4::identity())
+                .expect("anchored box creation succeeds")
+        };
+
+        let solid_id = match geo {
+            GeometryId::Solid(sid) => sid,
+            other => panic!("expected GeometryId::Solid, got {:?}", other),
+        };
+
+        let solid = model.solids.get(solid_id).expect("solid in store");
+        let anchor = &solid.anchor;
+        assert_eq!(anchor.datum_id, datum_id);
+        // Identity round-trip: every diagonal element 1, off-diagonals 0.
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!(
+                    (anchor.local_transform.get(r, c) - expected).abs() < 1e-12,
+                    "local_transform[{},{}] expected {}, got {}",
+                    r, c, expected, anchor.local_transform.get(r, c)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_with_identity_to_origin_matches_unanchored_geometry() {
+        // Anchoring to Origin with identity local transform is a no-op
+        // on geometry — the world transform composes to identity, the
+        // `transform_solid` call is skipped, and vertex positions
+        // should match the unanchored creator exactly.
+        let mut a = BRepModel::new();
+        let unanchored = {
+            let mut builder = TopologyBuilder::new(&mut a);
+            builder
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("unanchored box creation succeeds")
+        };
+        let unanchored_sid = match unanchored {
+            GeometryId::Solid(sid) => sid,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let unanchored_positions = collect_vertex_positions(&a, unanchored_sid);
+        let (a_min, a_max) = bbox_of(&unanchored_positions);
+
+        let mut b = BRepModel::new();
+        let datum_id = origin_id(&b);
+        let anchored = {
+            let mut builder = TopologyBuilder::new(&mut b);
+            builder
+                .create_box_3d_anchored(10.0, 10.0, 10.0, datum_id, Matrix4::identity())
+                .expect("anchored box creation succeeds")
+        };
+        let anchored_sid = match anchored {
+            GeometryId::Solid(sid) => sid,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let anchored_positions = collect_vertex_positions(&b, anchored_sid);
+        let (b_min, b_max) = bbox_of(&anchored_positions);
+
+        assert!(
+            (a_min.x - b_min.x).abs() < 1e-9
+                && (a_min.y - b_min.y).abs() < 1e-9
+                && (a_min.z - b_min.z).abs() < 1e-9,
+            "min mismatch: unanchored={:?} anchored={:?}",
+            a_min, b_min
+        );
+        assert!(
+            (a_max.x - b_max.x).abs() < 1e-9
+                && (a_max.y - b_max.y).abs() < 1e-9
+                && (a_max.z - b_max.z).abs() < 1e-9,
+            "max mismatch: unanchored={:?} anchored={:?}",
+            a_max, b_max
+        );
+
+        let solid = b.solids.get(anchored_sid).expect("anchored solid in store");
+        let anchor = &solid.anchor;
+        assert_eq!(anchor.datum_id, datum_id);
+    }
+
+    #[test]
+    fn anchored_translation_shifts_bbox_by_local_translation() {
+        // Compose a translation-only local transform on the Origin
+        // datum. Origin's frame is identity, so world_transform =
+        // local_transform = translation(10, 0, 0). The box's
+        // bounding-box min/max should be exactly 10mm shifted along +X
+        // relative to an unanchored box of the same dimensions.
+        let mut base = BRepModel::new();
+        let base_geo = {
+            let mut builder = TopologyBuilder::new(&mut base);
+            builder
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("unanchored box creation succeeds")
+        };
+        let base_sid = match base_geo {
+            GeometryId::Solid(sid) => sid,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let (base_min, base_max) = bbox_of(&collect_vertex_positions(&base, base_sid));
+
+        let mut shifted = BRepModel::new();
+        let datum_id = origin_id(&shifted);
+        let local = Matrix4::translation(10.0, 0.0, 0.0);
+        let shifted_geo = {
+            let mut builder = TopologyBuilder::new(&mut shifted);
+            builder
+                .create_box_3d_anchored(10.0, 10.0, 10.0, datum_id, local)
+                .expect("anchored box with translation succeeds")
+        };
+        let shifted_sid = match shifted_geo {
+            GeometryId::Solid(sid) => sid,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let (s_min, s_max) = bbox_of(&collect_vertex_positions(&shifted, shifted_sid));
+
+        // +10 on X, identical on Y and Z.
+        assert!((s_min.x - (base_min.x + 10.0)).abs() < 1e-9, "min.x not shifted: base={} shifted={}", base_min.x, s_min.x);
+        assert!((s_max.x - (base_max.x + 10.0)).abs() < 1e-9, "max.x not shifted: base={} shifted={}", base_max.x, s_max.x);
+        assert!((s_min.y - base_min.y).abs() < 1e-9, "min.y changed");
+        assert!((s_max.y - base_max.y).abs() < 1e-9, "max.y changed");
+        assert!((s_min.z - base_min.z).abs() < 1e-9, "min.z changed");
+        assert!((s_max.z - base_max.z).abs() < 1e-9, "max.z changed");
+
+        let solid = shifted
+            .solids
+            .get(shifted_sid)
+            .expect("shifted solid in store");
+        let anchor = &solid.anchor;
+        assert_eq!(anchor.datum_id, datum_id);
+        // Local transform round-trip: the (0,3) entry should be 10.0.
+        assert!(
+            (anchor.local_transform.get(0, 3) - 10.0).abs() < 1e-12,
+            "translation in local_transform should round-trip"
+        );
+    }
+
+    #[test]
+    fn unknown_datum_id_returns_invalid_parameters_error() {
+        let mut model = BRepModel::new();
+        let bogus_id = u32::MAX - 1;
+        let mut builder = TopologyBuilder::new(&mut model);
+        let result = builder.create_box_3d_anchored(10.0, 10.0, 10.0, bogus_id, Matrix4::identity());
+        match result {
+            Err(PrimitiveError::InvalidParameters { parameter, .. }) => {
+                assert_eq!(parameter, "datum_id");
+            }
+            other => panic!(
+                "expected InvalidParameters {{parameter: \"datum_id\"}}, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Slice 3a invariant: every solid carries an anchor — no `Option` —
+    /// and unanchored creators default to `SolidAnchor::world_origin()`.
+    /// Agents and downstream queries can therefore always read
+    /// `solid.anchor.datum_id` without first proving the anchor exists.
+    #[test]
+    fn default_creator_solid_carries_world_origin_anchor() {
+        let mut model = BRepModel::new();
+        let geo = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("box creation succeeds")
+        };
+        let sid = match geo {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let solid = model.solids.get(sid).expect("solid in store");
+        assert_eq!(
+            solid.anchor.datum_id, 0,
+            "unanchored creator must default to Origin (datum id 0)"
+        );
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!(
+                    (solid.anchor.local_transform.get(r, c) - expected).abs() < 1e-12,
+                    "default anchor's local_transform must be identity at [{},{}]",
+                    r, c
+                );
+            }
+        }
+    }
+
+    // ────────────────────────── 3c: datum recording ───────────────────────────
+
+    use crate::operations::recorder::{
+        OperationRecorder, RecordedOperation, RecorderError,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Test recorder that captures every event for inspection. Mirrors the
+    /// one in `operations/recorder.rs` tests but is reachable from this
+    /// module's `#[cfg(test)]` scope.
+    #[derive(Debug, Default)]
+    struct CaptureRecorder {
+        events: Mutex<Vec<RecordedOperation>>,
+    }
+
+    impl OperationRecorder for CaptureRecorder {
+        fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+            self.events
+                .lock()
+                .expect("CaptureRecorder mutex poisoned")
+                .push(operation);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn set_datum_visibility_records_event_when_recorder_attached() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        // Origin (id 0) starts visible. Hide it.
+        let prev = model
+            .set_datum_visibility(0, false)
+            .expect("origin id 0 exists");
+        assert!(prev, "origin starts visible");
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 1, "exactly one event recorded");
+        let ev = &events[0];
+        assert_eq!(ev.kind, "datum_set_visibility");
+        assert_eq!(ev.inputs, vec![0u64]);
+        assert_eq!(ev.parameters["datum_id"], 0);
+        assert_eq!(ev.parameters["visible"], false);
+        assert_eq!(ev.parameters["previous_visible"], true);
+    }
+
+    #[test]
+    fn set_datum_visibility_returns_none_for_unknown_id_and_skips_record() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let result = model.set_datum_visibility(9999, false);
+        assert!(result.is_none(), "unknown datum id returns None");
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert!(events.is_empty(), "no event recorded on lookup miss");
+    }
+
+    /// Default-seeded datums are an invariant of `BRepModel::new()` — they
+    /// are *not* recorded as `datum_create` events. Replay starts from
+    /// "model with seven defaults already present", so the recorder
+    /// should be empty immediately after construction even when attached.
+    #[test]
+    fn default_seed_does_not_emit_recorded_events() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        // Construction is already complete; attaching the recorder
+        // afterwards must not back-fill a seed event.
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert!(
+            events.is_empty(),
+            "default seeding is an invariant — must not be recorded"
+        );
+        assert_eq!(model.datums.len(), 7, "seven defaults are present");
+    }
+
+    // ─────────────────────────── 3b: query API ────────────────────────────────
+
+    /// Helper: build a 10×10×10 mm box at the world origin and return its id.
+    fn build_unit_box(model: &mut BRepModel) -> SolidId {
+        let geo = {
+            let mut builder = TopologyBuilder::new(model);
+            builder
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("box creation succeeds")
+        };
+        match geo {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected Solid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solid_world_bbox_matches_input_dimensions() {
+        let mut model = BRepModel::new();
+        let sid = build_unit_box(&mut model);
+        let bb = model
+            .solid_world_bbox(sid)
+            .expect("box has world bbox");
+        let size = bb.size();
+        // create_box_3d centers the box at the origin, so a 10×10×10 box
+        // spans (-5,-5,-5) → (+5,+5,+5).
+        assert!((size.x - 10.0).abs() < 1e-9, "x extent");
+        assert!((size.y - 10.0).abs() < 1e-9, "y extent");
+        assert!((size.z - 10.0).abs() < 1e-9, "z extent");
+        let center = bb.center();
+        assert!(center.x.abs() < 1e-9, "center x ≈ 0");
+        assert!(center.y.abs() < 1e-9, "center y ≈ 0");
+        assert!(center.z.abs() < 1e-9, "center z ≈ 0");
+    }
+
+    #[test]
+    fn solid_world_bbox_returns_none_for_unknown_id() {
+        let model = BRepModel::new();
+        assert!(model.solid_world_bbox(9999).is_none());
+    }
+
+    #[test]
+    fn solid_bbox_in_origin_frame_equals_world_bbox() {
+        // Origin datum has identity transform, so bbox-in-frame must
+        // match world bbox exactly.
+        let mut model = BRepModel::new();
+        let sid = build_unit_box(&mut model);
+        let world = model.solid_world_bbox(sid).expect("world bbox");
+        let local = model
+            .solid_bbox_in_frame(sid, 0)
+            .expect("bbox in origin frame");
+        let ws = world.size();
+        let ls = local.size();
+        assert!((ls.x - ws.x).abs() < 1e-9);
+        assert!((ls.y - ws.y).abs() < 1e-9);
+        assert!((ls.z - ws.z).abs() < 1e-9);
+        let wc = world.center();
+        let lc = local.center();
+        assert!((lc.x - wc.x).abs() < 1e-9);
+        assert!((lc.y - wc.y).abs() < 1e-9);
+        assert!((lc.z - wc.z).abs() < 1e-9);
+    }
+
+    #[test]
+    fn solid_bbox_in_frame_returns_none_for_unknown_datum() {
+        let mut model = BRepModel::new();
+        let sid = build_unit_box(&mut model);
+        assert!(model.solid_bbox_in_frame(sid, 9999).is_none());
+    }
+
+    #[test]
+    fn solid_distance_zero_for_coincident_solids() {
+        let mut model = BRepModel::new();
+        let a = build_unit_box(&mut model);
+        let b = build_unit_box(&mut model);
+        let d = model.solid_distance(a, b).expect("distance defined");
+        assert!(
+            d.abs() < 1e-9,
+            "two boxes built at the world origin have coincident centers, got {}",
+            d
+        );
+    }
+
+    #[test]
+    fn solid_distance_returns_none_for_unknown_id() {
+        let mut model = BRepModel::new();
+        let sid = build_unit_box(&mut model);
+        assert!(model.solid_distance(sid, 9999).is_none());
+        assert!(model.solid_distance(9999, sid).is_none());
+    }
+
+    #[test]
+    fn solid_location_descriptor_for_origin_box() {
+        let mut model = BRepModel::new();
+        let sid = build_unit_box(&mut model);
+        let desc = model
+            .solid_location_descriptor(sid)
+            .expect("location descriptor defined");
+        assert_eq!(desc.solid_id, sid);
+        // Default-anchored solid points at Origin (id 0).
+        assert_eq!(desc.anchor_datum_id, 0);
+        assert_eq!(desc.anchor_datum_name, "Origin");
+        assert!(desc.center_world.iter().all(|c| c.abs() < 1e-9));
+        assert!(desc
+            .center_in_anchor_frame
+            .iter()
+            .all(|c| c.abs() < 1e-9));
+        assert!((desc.dimensions_world[0] - 10.0).abs() < 1e-9);
+        assert!((desc.dimensions_world[1] - 10.0).abs() < 1e-9);
+        assert!((desc.dimensions_world[2] - 10.0).abs() < 1e-9);
+        // Box centered on origin → all three signed distances are zero.
+        assert!(desc.signed_distance_front.abs() < 1e-9);
+        assert!(desc.signed_distance_top.abs() < 1e-9);
+        assert!(desc.signed_distance_right.abs() < 1e-9);
+    }
+
+    #[test]
+    fn solid_location_descriptor_returns_none_for_unknown_id() {
+        let model = BRepModel::new();
+        assert!(model.solid_location_descriptor(9999).is_none());
+    }
+
+    // ──────────────────── 4a: user-authored datum mediators ──────────────────
+
+    #[test]
+    fn create_datum_plane_records_event() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let translation =
+            Matrix4::from_translation(&Vector3::new(1.0, 2.0, 3.0));
+        let id = model
+            .create_datum_plane("WorkPlane".to_string(), translation)
+            .expect("create succeeds");
+        assert_eq!(id, 7, "first user datum after seven defaults");
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, "datum_create");
+        assert_eq!(ev.outputs, vec![id as u64]);
+        assert_eq!(ev.parameters["kind"], "plane");
+        assert_eq!(ev.parameters["name"], "WorkPlane");
+        assert_eq!(ev.parameters["datum_id"], id);
+    }
+
+    #[test]
+    fn create_datum_axis_records_event_with_direction() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let id = model
+            .create_datum_axis(
+                "RefY".to_string(),
+                Point3::new(0.0, 5.0, 0.0),
+                crate::primitives::datum::AxisDirection::Y,
+            )
+            .expect("axis create succeeds");
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "datum_create");
+        assert_eq!(events[0].parameters["kind"], "axis");
+        assert_eq!(events[0].parameters["direction"], "y");
+        assert_eq!(events[0].outputs, vec![id as u64]);
+    }
+
+    #[test]
+    fn create_datum_point_records_event_with_position() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let id = model
+            .create_datum_point("Probe".to_string(), Point3::new(7.0, 8.0, 9.0))
+            .expect("point create succeeds");
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "datum_create");
+        assert_eq!(events[0].parameters["kind"], "point");
+        let pos = events[0].parameters["position"]
+            .as_array()
+            .expect("position is an array");
+        assert_eq!(pos[0].as_f64().unwrap_or_default(), 7.0);
+        assert_eq!(pos[1].as_f64().unwrap_or_default(), 8.0);
+        assert_eq!(pos[2].as_f64().unwrap_or_default(), 9.0);
+        assert_eq!(events[0].outputs, vec![id as u64]);
+    }
+
+    #[test]
+    fn create_datum_with_empty_name_returns_error_and_skips_record() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let err = model
+            .create_datum_point("".to_string(), Point3::ORIGIN)
+            .expect_err("empty name rejected");
+        assert!(matches!(
+            err,
+            crate::primitives::datum::DatumError::EmptyName
+        ));
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert!(events.is_empty(), "no event recorded on validation failure");
+    }
+
+    #[test]
+    fn rename_datum_records_event_and_refuses_defaults() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let id = model
+            .create_datum_point("Old".to_string(), Point3::ORIGIN)
+            .expect("created");
+        let prev = model
+            .rename_datum(id, "New".to_string())
+            .expect("rename succeeds");
+        assert_eq!(prev, "Old");
+
+        // Refuse rename of a default — this must not record.
+        let err = model
+            .rename_datum(0, "NotOrigin".to_string())
+            .expect_err("default rename rejected");
+        assert!(matches!(
+            err,
+            crate::primitives::datum::DatumError::DefaultDatumNotMutable(0)
+        ));
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        // Two: datum_create + datum_rename. The default-rename failure
+        // does NOT contribute an event.
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "datum_create");
+        assert_eq!(events[1].kind, "datum_rename");
+        assert_eq!(events[1].parameters["previous_name"], "Old");
+        assert_eq!(events[1].parameters["name"], "New");
+    }
+
+    #[test]
+    fn set_datum_transform_records_event_and_refuses_defaults() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let id = model
+            .create_datum_point("P".to_string(), Point3::ORIGIN)
+            .expect("created");
+        let new_t = Matrix4::from_translation(&Vector3::new(4.0, 5.0, 6.0));
+        let _prev = model
+            .set_datum_transform(id, new_t)
+            .expect("set succeeds");
+
+        // Default refusal.
+        let err = model
+            .set_datum_transform(0, new_t)
+            .expect_err("default refused");
+        assert!(matches!(
+            err,
+            crate::primitives::datum::DatumError::DefaultDatumNotMutable(0)
+        ));
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "datum_set_transform");
+        assert_eq!(events[1].inputs, vec![id as u64]);
+    }
+
+    #[test]
+    fn delete_datum_records_event_and_refuses_defaults() {
+        let mut model = BRepModel::new();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let id = model
+            .create_datum_point("Tmp".to_string(), Point3::ORIGIN)
+            .expect("created");
+        let removed = model.delete_datum(id).expect("delete succeeds");
+        assert_eq!(removed.id, id);
+        assert!(model.datums.get(id).is_none());
+
+        let err = model.delete_datum(0).expect_err("default refused");
+        assert!(matches!(
+            err,
+            crate::primitives::datum::DatumError::DefaultDatumNotMutable(0)
+        ));
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "datum_delete");
+        assert_eq!(events[1].parameters["name"], "Tmp");
     }
 }
 

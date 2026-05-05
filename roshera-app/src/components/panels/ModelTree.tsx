@@ -1,11 +1,12 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
-import { Eye, EyeOff, Trash2, Pencil } from 'lucide-react'
+import { Eye, EyeOff, Trash2, Pencil, Plus } from 'lucide-react'
 import { useSceneStore, isStandardPlane, type CADObject, type SketchPlane } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
+import { CreateDatumDialog } from '@/components/panels/CreateDatumDialog'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -171,6 +172,7 @@ function TreeItem({
   onToggleVisibility,
   onToggleLock,
   onContextMenu,
+  onAdd,
 }: {
   node: TreeNode
   isLast: boolean
@@ -180,6 +182,13 @@ function TreeItem({
   onToggleVisibility: (id: string) => void
   onToggleLock: (id: string) => void
   onContextMenu: (e: React.MouseEvent, node: TreeNode) => void
+  /**
+   * If supplied, render a "+" affordance on the row (hover-revealed).
+   * Currently used only for the datum group row to open the
+   * CreateDatumDialog. Returning `null` from the parent keeps the
+   * affordance off for every other row without adding props.
+   */
+  onAdd?: (node: TreeNode) => void
 }) {
   const [expanded, setExpanded] = useState(true)
   const isSelected = selectedIds.has(node.id)
@@ -248,6 +257,19 @@ function TreeItem({
 
         {/* Visibility / lock — hover-revealed unicode */}
         <div className="flex items-center gap-1 px-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity shrink-0">
+          {onAdd && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                onAdd(node)
+              }}
+              className="text-foreground/60 hover:text-foreground transition-colors w-3 flex items-center justify-center"
+              aria-label="Add"
+              title="New datum"
+            >
+              <Plus size={11} />
+            </button>
+          )}
           <button
             onClick={(e) => {
               e.stopPropagation()
@@ -295,6 +317,7 @@ function TreeItem({
               onToggleVisibility={onToggleVisibility}
               onToggleLock={onToggleLock}
               onContextMenu={onContextMenu}
+              onAdd={onAdd}
             />
           ))}
         </div>
@@ -513,7 +536,23 @@ interface TreeContextMenuState {
   node: TreeNode
 }
 
-export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
+export function ModelTree({
+  expanded = true,
+  onToggle,
+}: {
+  /**
+   * When `false`, the header chip is rendered but the tree content
+   * below is hidden. The chip itself stays as a permanent anchor so
+   * the user can re-expand without hunting for a separate launcher.
+   */
+  expanded?: boolean
+  /**
+   * Called when the header chip is activated. The parent owns the
+   * `expanded` state so the collapsed/expanded preference can be
+   * persisted alongside other layout state.
+   */
+  onToggle?: () => void
+} = {}) {
   const objects = useSceneStore((s) => s.objects)
   const objectOrder = useSceneStore((s) => s.objectOrder)
   const selectedIds = useSceneStore((s) => s.selectedIds)
@@ -526,11 +565,17 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
   const [backendNodes, setBackendNodes] = useState<TreeNode[] | null>(null)
   const [datums, setDatums] = useState<DatumDto[]>([])
   const [menu, setMenu] = useState<TreeContextMenuState | null>(null)
+  const [createDatumOpen, setCreateDatumOpen] = useState(false)
 
   const handleNodeContextMenu = useCallback(
     (e: React.MouseEvent, node: TreeNode) => {
       e.preventDefault()
       e.stopPropagation()
+      // The datum group row has no rename / delete semantics — its
+      // only mutable affordance is the hover-revealed "+" button.
+      // Open the context menu would surface all-disabled entries,
+      // which is just noise. Suppress it here.
+      if (node.id === 'datum:group') return
       setMenu({ x: e.clientX, y: e.clientY, node })
     },
     [],
@@ -702,45 +747,84 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
     [objects, updateObject],
   )
 
+  // Hover-revealed "+" affordance routes to the create-datum dialog when
+  // it's the datum group; no-op otherwise (currently only the datum
+  // group passes `onAdd`, but the type accepts any node so future
+  // group rows can wire their own creation flows).
+  const handleAdd = useCallback((node: TreeNode) => {
+    if (node.id === 'datum:group') {
+      setCreateDatumOpen(true)
+    }
+  }, [])
+
   return (
     <div className="flex flex-col h-full">
-      <div className="cad-panel-header flex items-center gap-1.5 font-mono">
+      {/* Header is the only element in the browser that carries panel
+          chrome — border, rounded corners, drop shadow, and the
+          background fill. The whole header is a button that toggles
+          the tree's expanded state. When collapsed, only this chip
+          remains visible. */}
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={expanded}
+        aria-controls="browser-tree"
+        title={expanded ? 'Collapse browser' : 'Expand browser'}
+        className={cn(
+          'cad-panel-header flex items-center gap-1.5 font-mono border border-border rounded shadow-md backdrop-blur-sm w-full text-left cursor-pointer',
+          expanded
+            ? 'bg-card/95 hover:bg-card'
+            // Slightly darker shade of the panel background when
+            // collapsed — uses the design-system `muted` token so the
+            // chip stays visually grouped with the rest of the UI
+            // while still standing out against the viewport.
+            : 'bg-muted/95 hover:bg-muted',
+        )}
+      >
         <span className="flex-1">browser</span>
-        {onCollapse && (
-          <button
-            onClick={onCollapse}
-            className="cad-icon-btn h-5 w-5"
-            title="Collapse browser"
-            aria-label="Collapse browser"
-          >
-            «
-          </button>
-        )}
-      </div>
-      <ScrollArea className="flex-1">
-        {treeNodes.length === 0 ? (
-          <div className="p-3 text-[13px] text-muted-foreground/60 text-center font-mono">
-            ∅ no objects in scene
-          </div>
-        ) : (
-          <div className="py-1 px-1">
-            {treeNodes.map((node, idx) => (
-              <TreeItem
-                key={node.id}
-                node={node}
-                isLast={idx === treeNodes.length - 1}
-                ancestorIsLast={[]}
-                selectedIds={selectedIds}
-                onSelect={selectObject}
-                onToggleVisibility={handleToggleVisibility}
-                onToggleLock={handleToggleLock}
-                onContextMenu={handleNodeContextMenu}
-              />
-            ))}
-          </div>
-        )}
-      </ScrollArea>
-      {menu && <TreeContextMenu menu={menu} onClose={closeMenu} />}
+        <span aria-hidden="true" className="text-muted-foreground/70">
+          {expanded ? '«' : '»'}
+        </span>
+      </button>
+      {expanded && (
+        <ScrollArea id="browser-tree" className="flex-1">
+          {treeNodes.length === 0 ? (
+            <div className="p-3 text-[13px] text-muted-foreground/60 text-center font-mono">
+              ∅ no objects in scene
+            </div>
+          ) : (
+            <div className="py-1 px-1">
+              {treeNodes.map((node, idx) => (
+                <TreeItem
+                  key={node.id}
+                  node={node}
+                  isLast={idx === treeNodes.length - 1}
+                  ancestorIsLast={[]}
+                  selectedIds={selectedIds}
+                  onSelect={selectObject}
+                  onToggleVisibility={handleToggleVisibility}
+                  onToggleLock={handleToggleLock}
+                  onContextMenu={handleNodeContextMenu}
+                  onAdd={node.id === 'datum:group' ? handleAdd : undefined}
+                />
+              ))}
+            </div>
+          )}
+        </ScrollArea>
+      )}
+      {menu && (
+        <TreeContextMenu
+          menu={menu}
+          datums={datums}
+          onClose={closeMenu}
+          onDatumsChanged={fetchDatums}
+        />
+      )}
+      <CreateDatumDialog
+        open={createDatumOpen}
+        onOpenChange={setCreateDatumOpen}
+        onCreated={fetchDatums}
+      />
     </div>
   )
 }
@@ -756,10 +840,24 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
 
 function TreeContextMenu({
   menu,
+  datums,
   onClose,
+  onDatumsChanged,
 }: {
   menu: TreeContextMenuState
+  /**
+   * Snapshot of the datum list at click time. Used by the datum-node
+   * branch so the menu knows whether the target is a default (locked)
+   * datum and can resolve its current name for the rename prompt
+   * default value.
+   */
+  datums: DatumDto[]
   onClose: () => void
+  /**
+   * Called after a successful PATCH/DELETE so the parent re-fetches
+   * the datum list and the tree updates immediately.
+   */
+  onDatumsChanged: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const updateObject = useSceneStore((s) => s.updateObject)
@@ -768,6 +866,26 @@ function TreeContextMenu({
   const isSketchNode = menu.node.type === 'sketch'
   const localObj = useSceneStore.getState().objects.get(menu.node.id)
   const isVisible = localObj?.visible ?? menu.node.visible ?? true
+
+  // ─── Datum branch ───────────────────────────────────────────────────
+  // Datum tree nodes use the `datum:<id>` prefix. The group row
+  // (`datum:group`) has its own "+" affordance and isn't a meaningful
+  // rename/delete target, so the menu is hidden for it. Individual
+  // default datums (Origin / FrontPlane / TopPlane / RightPlane / X /
+  // Y / Z axes) are locked at the kernel layer — `is_default = true`
+  // returns 409 from PATCH/DELETE — so we surface them as disabled
+  // entries rather than letting the user fire a request the backend
+  // will refuse anyway.
+  const isDatumNode = menu.node.id.startsWith('datum:')
+  const isDatumGroupNode = menu.node.id === 'datum:group'
+  const datumId = isDatumNode && !isDatumGroupNode
+    ? Number(menu.node.id.slice('datum:'.length))
+    : null
+  const datumRecord =
+    datumId !== null && Number.isFinite(datumId)
+      ? datums.find((d) => d.id === datumId)
+      : undefined
+  const isDefaultDatum = !!datumRecord?.is_default
 
   // Edge-aware positioning — flip the menu inward whenever the click
   // landed close enough to a viewport edge that the natural downward /
@@ -862,11 +980,108 @@ function TreeContextMenu({
     }
   }, [menu.node.id, onClose])
 
-  const handleDelete = isSketchNode ? handleDeleteSketch : handleDeleteObject
-  const handleEdit = isSketchNode ? handleEditSketch : handleRename
-  const editEnabled = isSketchNode || !!localObj
-  const visibilityEnabled = !isSketchNode && !!localObj
-  const editLabel = isSketchNode ? 'Edit sketch' : 'Rename'
+  const handleRenameDatum = useCallback(async () => {
+    onClose()
+    if (datumId === null || !datumRecord) return
+    const next = window.prompt('Rename datum', datumRecord.name)?.trim()
+    if (!next || next === datumRecord.name) return
+    try {
+      const resp = await fetch(`${API_BASE}/api/datums/${datumId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: next }),
+      })
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '')
+        console.error('[browser] datum rename failed:', resp.status, text)
+        return
+      }
+      onDatumsChanged()
+    } catch (err) {
+      console.error('[browser] datum rename error:', err)
+    }
+  }, [datumId, datumRecord, onClose, onDatumsChanged])
+
+  const handleDeleteDatum = useCallback(async () => {
+    onClose()
+    if (datumId === null || !datumRecord) return
+
+    // Two-pass delete:
+    //   1. Try DELETE without cascade — server returns 409 if there
+    //      are anchored solids (or if this datum is a default, but
+    //      we already gate that via `deleteEnabled` above).
+    //   2. On 409, ask the user to confirm a cascade detach. The
+    //      response of pass 2 carries `detached_solids` so we can
+    //      log the count for inspection.
+    // Probing first keeps the no-dependents path single-confirm and
+    // single-network, while still surfacing the cascade choice
+    // explicitly when it actually matters.
+    if (!window.confirm(`Delete datum "${datumRecord.name}"?`)) return
+
+    const baseUrl = `${API_BASE}/api/datums/${datumId}`
+    try {
+      const probe = await fetch(baseUrl, { method: 'DELETE' })
+      if (probe.ok) {
+        onDatumsChanged()
+        return
+      }
+      if (probe.status !== 409) {
+        const text = await probe.text().catch(() => '')
+        console.error('[browser] datum delete failed:', probe.status, text)
+        return
+      }
+      // 409 → either default (impossible here, gated) or has dependents.
+      const proceed = window.confirm(
+        `"${datumRecord.name}" has anchored solids. Re-anchor them to Origin and delete?`,
+      )
+      if (!proceed) return
+      const cascade = await fetch(`${baseUrl}?cascade=detach`, {
+        method: 'DELETE',
+      })
+      if (!cascade.ok) {
+        const text = await cascade.text().catch(() => '')
+        console.error('[browser] datum cascade delete failed:', cascade.status, text)
+        return
+      }
+      const result = await cascade.json().catch(() => null) as
+        | { datum_id: number; detached_solids: number[] }
+        | null
+      if (result && result.detached_solids.length > 0) {
+        console.info(
+          `[browser] detached ${result.detached_solids.length} solid(s) from datum ${datumId}`,
+        )
+      }
+      onDatumsChanged()
+    } catch (err) {
+      console.error('[browser] datum delete error:', err)
+    }
+  }, [datumId, datumRecord, onClose, onDatumsChanged])
+
+  const handleDelete = isDatumNode
+    ? handleDeleteDatum
+    : isSketchNode
+      ? handleDeleteSketch
+      : handleDeleteObject
+  const handleEdit = isDatumNode
+    ? handleRenameDatum
+    : isSketchNode
+      ? handleEditSketch
+      : handleRename
+  // Datum nodes always have a server-side record so editing is
+  // enabled iff the datum exists and isn't a default. Default datums
+  // and the group row see disabled entries with a tooltip-style hint.
+  const editEnabled = isDatumNode
+    ? !!datumRecord && !isDefaultDatum
+    : isSketchNode || !!localObj
+  const deleteEnabled = isDatumNode
+    ? !!datumRecord && !isDefaultDatum
+    : true
+  const visibilityEnabled = !isDatumNode && !isSketchNode && !!localObj
+  const editLabel = isDatumNode
+    ? 'Rename'
+    : isSketchNode
+      ? 'Edit sketch'
+      : 'Rename'
 
   // Render via portal so the menu escapes the model-tree panel's
   // containing block and clip region. The browser panel uses
@@ -896,7 +1111,7 @@ function TreeContextMenu({
         {isVisible ? 'Hide' : 'Show'}
       </TreeMenuItem>
       <div className="my-1 border-t border-border/50" />
-      <TreeMenuItem onClick={handleDelete} danger>
+      <TreeMenuItem onClick={handleDelete} danger disabled={!deleteEnabled}>
         <Trash2 size={13} />
         Delete
       </TreeMenuItem>

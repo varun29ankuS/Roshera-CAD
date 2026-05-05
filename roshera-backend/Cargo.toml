@@ -1,12 +1,13 @@
 [workspace]
 members = [
     "shared-types",
-    "geometry-engine", 
+    "geometry-engine",
     "session-manager",
     "timeline-engine",
     "api-server",
     "ai-integration",
-    "export-engine"
+    "export-engine",
+    "verdict-harness"
 ]
 resolver = "2"
 
