@@ -13,7 +13,7 @@ export function PropertiesPanel() {
 
   if (selectedIds.size === 0) {
     return (
-      <div className="w-56 cad-panel-elevated border-l flex flex-col">
+      <div className="w-56 cad-panel-elevated border-l flex flex-col min-h-0 overflow-hidden">
         <div className="cad-panel-header">Properties</div>
         <div className="flex-1 flex items-center justify-center p-4">
           <p className="text-xs text-muted-foreground text-center">
@@ -26,7 +26,7 @@ export function PropertiesPanel() {
 
   if (selectedIds.size > 1) {
     return (
-      <div className="w-56 cad-panel-elevated border-l flex flex-col">
+      <div className="w-56 cad-panel-elevated border-l flex flex-col min-h-0 overflow-hidden">
         <div className="cad-panel-header">Properties</div>
         <div className="p-3">
           <p className="text-xs text-muted-foreground">
@@ -44,10 +44,10 @@ export function PropertiesPanel() {
   const ag = obj.analyticalGeometry
 
   return (
-    <div className="w-56 border-l border-border bg-card/80 backdrop-blur-sm flex flex-col">
+    <div className="w-56 border-l border-border bg-card/80 backdrop-blur-sm flex flex-col min-h-0 overflow-hidden">
       <div className="cad-panel-header">Properties</div>
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1 min-h-0">
         <div className="p-3 space-y-3">
           {/* Name & Type */}
           <div>
@@ -84,28 +84,11 @@ export function PropertiesPanel() {
 
           <Separator />
 
-          {/* Transform */}
-          <div>
-            <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
-              Position
-            </p>
-            <div className="grid grid-cols-3 gap-1 text-[10px]">
-              <PropValue label="X" value={obj.position[0]} color="text-red-400" />
-              <PropValue label="Y" value={obj.position[1]} color="text-green-400" />
-              <PropValue label="Z" value={obj.position[2]} color="text-blue-400" />
-            </div>
-          </div>
-
-          <div>
-            <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
-              Scale
-            </p>
-            <div className="grid grid-cols-3 gap-1 text-[10px]">
-              <PropValue label="X" value={obj.scale[0]} />
-              <PropValue label="Y" value={obj.scale[1]} />
-              <PropValue label="Z" value={obj.scale[2]} />
-            </div>
-          </div>
+          {/* Transform — editable. Single source of truth for
+              Position / Rotation / Scale; read-only summary tiles
+              were removed because they duplicated this block and
+              pushed material controls below the fold. */}
+          <TransformEditor objectId={id} />
 
           {/* Analytical geometry params */}
           {ag && (
@@ -203,10 +186,6 @@ export function PropertiesPanel() {
           {/* Display Settings */}
           <Separator />
           <EdgeDisplayControls />
-
-          {/* Transform — editable */}
-          <Separator />
-          <TransformEditor objectId={id} />
         </div>
       </ScrollArea>
     </div>
@@ -328,23 +307,6 @@ function ColorPicker({
           </div>
         </div>
       </div>
-    </div>
-  )
-}
-
-function PropValue({
-  label,
-  value,
-  color,
-}: {
-  label: string
-  value: number
-  color?: string
-}) {
-  return (
-    <div className="flex flex-col items-center bg-background/50 rounded px-1 py-0.5">
-      <span className={`text-[9px] ${color || 'text-muted-foreground'}`}>{label}</span>
-      <span className="font-mono text-[10px]">{value.toFixed(1)}</span>
     </div>
   )
 }
