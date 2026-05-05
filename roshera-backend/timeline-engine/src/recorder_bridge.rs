@@ -20,9 +20,7 @@
 
 use std::sync::Arc;
 
-use geometry_engine::operations::recorder::{
-    OperationRecorder, RecordedOperation, RecorderError,
-};
+use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
 use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, RwLock};
 
@@ -110,10 +108,7 @@ impl TimelineRecorder {
                 // restarting the worker.
                 let target = *worker_branch.read();
                 let guard = worker_timeline.read().await;
-                if let Err(err) = guard
-                    .add_operation(op, worker_author.clone(), target)
-                    .await
-                {
+                if let Err(err) = guard.add_operation(op, worker_author.clone(), target).await {
                     tracing::warn!(
                         target: "timeline.recorder_bridge",
                         kind = %record.kind,
@@ -158,10 +153,7 @@ impl TimelineRecorder {
 impl OperationRecorder for TimelineRecorder {
     fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
         self.tx.send(operation).map_err(|e| {
-            RecorderError::Unavailable(format!(
-                "TimelineRecorder worker has shut down: {}",
-                e
-            ))
+            RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
         })
     }
 }
@@ -203,10 +195,7 @@ mod tests {
             } => {
                 assert_eq!(command_type, "extrude_face");
                 assert_eq!(parameters["params"]["distance"], 5.0);
-                assert_eq!(
-                    parameters["inputs"],
-                    serde_json::json!([1u64, 2u64, 3u64])
-                );
+                assert_eq!(parameters["inputs"], serde_json::json!([1u64, 2u64, 3u64]));
                 assert_eq!(parameters["outputs"], serde_json::json!([42u64]));
             }
             other => panic!("expected Operation::Generic, got {:?}", other),
@@ -215,12 +204,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_forwards_to_timeline() {
-        let timeline: SharedTimeline = Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
-        let recorder = TimelineRecorder::new(
-            Arc::clone(&timeline),
-            Author::System,
-            BranchId::main(),
-        );
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
 
         for i in 0..5u64 {
             recorder
@@ -272,7 +259,8 @@ mod tests {
     async fn cloned_recorder_shares_underlying_worker() {
         // A cloned TimelineRecorder shares the same MPSC sender, so events
         // from either clone flow into the same timeline in FIFO order.
-        let timeline: SharedTimeline = Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
         let recorder =
             TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
         let clone = recorder.clone();

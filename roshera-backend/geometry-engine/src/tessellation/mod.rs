@@ -612,10 +612,7 @@ mod watertight_tests {
         );
         // Average should point essentially +Z (both contributors were
         // symmetric around +Z).
-        assert!(
-            nv.z > 0.999,
-            "averaged normal should be ≈ +Z, got {nv:?}"
-        );
+        assert!(nv.z > 0.999, "averaged normal should be ≈ +Z, got {nv:?}");
         assert!(
             nv.x.abs() < 1e-9,
             "averaged normal x-component should cancel, got x = {}",
@@ -682,4 +679,3 @@ mod watertight_tests {
         );
     }
 }
-

@@ -378,8 +378,8 @@ fn validate_session_delta(
     session_id: &str,
     delta: &SessionDelta,
 ) -> std::result::Result<(), (StatusCode, &'static str)> {
-    let path_uuid = Uuid::parse_str(session_id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid session ID"))?;
+    let path_uuid =
+        Uuid::parse_str(session_id).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid session ID"))?;
 
     if delta.session_id != path_uuid {
         return Err((

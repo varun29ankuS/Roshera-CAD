@@ -137,10 +137,7 @@ impl SketchPlane {
     ///
     /// Returns `InvalidParameter` if the face is missing, its surface
     /// is missing, or the surface is non-planar.
-    pub fn from_face(
-        model: &BRepModel,
-        face_id: u32,
-    ) -> Result<Self, ApiError> {
+    pub fn from_face(model: &BRepModel, face_id: u32) -> Result<Self, ApiError> {
         let face = model.faces.get(face_id).ok_or_else(|| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
@@ -150,10 +147,7 @@ impl SketchPlane {
         let surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
-                format!(
-                    "surface {} for face {face_id} not found",
-                    face.surface_id
-                ),
+                format!("surface {} for face {face_id} not found", face.surface_id),
             )
         })?;
         let plane = surface.as_any().downcast_ref::<Plane>().ok_or_else(|| {
@@ -306,21 +300,14 @@ impl SketchManager {
     }
 
     pub fn list(&self) -> Vec<SketchSession> {
-        self.sessions
-            .iter()
-            .map(|e| e.value().clone())
-            .collect()
+        self.sessions.iter().map(|e| e.value().clone()).collect()
     }
 
     pub fn delete(&self, id: &Uuid) -> Option<SketchSession> {
         self.sessions.remove(id).map(|(_, v)| v)
     }
 
-    pub fn add_point(
-        &self,
-        id: &Uuid,
-        point: [f64; 2],
-    ) -> Result<SketchSession, SketchError> {
+    pub fn add_point(&self, id: &Uuid, point: [f64; 2]) -> Result<SketchSession, SketchError> {
         validate_point(point)?;
         self.mutate(id, |s| {
             s.points.push(point);
@@ -362,11 +349,7 @@ impl SketchManager {
         })
     }
 
-    pub fn set_plane(
-        &self,
-        id: &Uuid,
-        plane: SketchPlane,
-    ) -> Result<SketchSession, SketchError> {
+    pub fn set_plane(&self, id: &Uuid, plane: SketchPlane) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
             // A plane swap invalidates the existing in-plane points
             // because (u, v) means different world axes per plane.
@@ -379,11 +362,7 @@ impl SketchManager {
         })
     }
 
-    pub fn set_tool(
-        &self,
-        id: &Uuid,
-        tool: SketchTool,
-    ) -> Result<SketchSession, SketchError> {
+    pub fn set_tool(&self, id: &Uuid, tool: SketchTool) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
             // Tools have incompatible point semantics (polyline = N
             // vertices, rectangle = 2 anchors, circle = centre+edge).
@@ -515,10 +494,7 @@ fn materialise_rectangle(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, SketchErr
     ])
 }
 
-fn materialise_circle(
-    points: &[[f64; 2]],
-    segments: u32,
-) -> Result<Vec<[f64; 2]>, SketchError> {
+fn materialise_circle(points: &[[f64; 2]], segments: u32) -> Result<Vec<[f64; 2]>, SketchError> {
     if points.len() != 2 {
         return Err(SketchError::WrongPointCount {
             tool: "circle",
@@ -715,7 +691,9 @@ pub async fn delete_sketch(
     if removed.is_some() {
         broadcast_sketch_deleted(id);
     }
-    Ok(Json(serde_json::json!({ "ok": true, "removed": removed.is_some() })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "removed": removed.is_some() }),
+    ))
 }
 
 /// `POST /api/sketch/{id}/point` — append a point in click order.
@@ -872,9 +850,10 @@ pub async fn extrude_sketch(
         for i in 0..lifted.len() {
             let p_start = lifted[i];
             let p_end = lifted[(i + 1) % lifted.len()];
-            let v_start = model
-                .vertices
-                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
+            let v_start =
+                model
+                    .vertices
+                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
             let v_end = model
                 .vertices
                 .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());

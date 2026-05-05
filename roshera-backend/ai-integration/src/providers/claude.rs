@@ -204,10 +204,9 @@ impl LLMProvider for ClaudeProvider {
             .await
             .map_err(|e| ProviderError::InferenceError(format!("API request failed: {}", e)))?;
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::InferenceError(format!("Failed to parse response: {}", e)))?;
+        let body: Value = response.json().await.map_err(|e| {
+            ProviderError::InferenceError(format!("Failed to parse response: {}", e))
+        })?;
 
         extract_text_from_response(&body)
     }
@@ -665,5 +664,4 @@ mod tests {
         let texts: Vec<String> = collected.into_iter().filter_map(Result::ok).collect();
         assert_eq!(texts.join(""), "foo bar");
     }
-
 }

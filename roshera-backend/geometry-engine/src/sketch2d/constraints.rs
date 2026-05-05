@@ -343,10 +343,7 @@ impl ConstraintStore {
 
         // Update entity index
         for entity in &constraint.entities {
-            self.entity_constraints
-                .entry(*entity)
-                .or_default()
-                .push(id);
+            self.entity_constraints.entry(*entity).or_default().push(id);
         }
 
         // Store constraint

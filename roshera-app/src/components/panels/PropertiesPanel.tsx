@@ -102,7 +102,7 @@ export function PropertiesPanel() {
                   {Object.entries(ag.params).map(([key, val]) => (
                     <div key={key} className="flex justify-between text-[10px]">
                       <span className="text-muted-foreground">{key}</span>
-                      <span className="font-mono">{typeof val === 'number' ? val.toFixed(2) : val}</span>
+                      <span className="font-mono">{typeof val === 'number' ? val.toFixed(2) : String(val)}</span>
                     </div>
                   ))}
                 </div>

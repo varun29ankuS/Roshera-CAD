@@ -24,8 +24,8 @@ use crate::primitives::{
     surface::SurfaceStore,
     vertex::VertexStore,
 };
-use std::collections::{HashMap, HashSet};
 use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Solid ID type
@@ -817,11 +817,7 @@ fn compute_principal_inertia(inertia: &[[f64; 3]; 3]) -> (Vector3, [Vector3; 3])
     // Working copy of the symmetric matrix; eigenvalues end up on diag.
     let mut a = *inertia;
     // Eigenvector matrix accumulator, starts as identity.
-    let mut v = [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ];
+    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
     for _ in 0..MAX_SWEEPS {
         // Off-diagonal Frobenius norm squared.
@@ -1178,11 +1174,7 @@ mod inertia_tests {
     /// (off-diagonals already zero ⇒ no rotations applied).
     #[test]
     fn diagonal_tensor_returns_diagonal_eigenvalues_descending() {
-        let inertia = [
-            [3.0, 0.0, 0.0],
-            [0.0, 7.0, 0.0],
-            [0.0, 0.0, 5.0],
-        ];
+        let inertia = [[3.0, 0.0, 0.0], [0.0, 7.0, 0.0], [0.0, 0.0, 5.0]];
         let (moments, axes) = compute_principal_inertia(&inertia);
 
         // Sorted descending
@@ -1201,11 +1193,7 @@ mod inertia_tests {
     /// I ≈ V · diag(λ) · V^T for a non-trivially coupled symmetric matrix.
     #[test]
     fn jacobi_reconstructs_symmetric_matrix() {
-        let inertia = [
-            [4.0, 1.0, -2.0],
-            [1.0, 6.0, 0.5],
-            [-2.0, 0.5, 8.0],
-        ];
+        let inertia = [[4.0, 1.0, -2.0], [1.0, 6.0, 0.5], [-2.0, 0.5, 8.0]];
         let (moments, axes) = compute_principal_inertia(&inertia);
 
         let lambda = [moments.x, moments.y, moments.z];
@@ -1237,11 +1225,7 @@ mod inertia_tests {
     /// for symmetric input by construction, but the test pins it down).
     #[test]
     fn eigenvectors_form_orthonormal_frame() {
-        let inertia = [
-            [10.0, 3.0, 1.0],
-            [3.0, 5.0, -2.0],
-            [1.0, -2.0, 7.0],
-        ];
+        let inertia = [[10.0, 3.0, 1.0], [3.0, 5.0, -2.0], [1.0, -2.0, 7.0]];
         let (_, axes) = compute_principal_inertia(&inertia);
 
         for i in 0..3 {
@@ -1270,11 +1254,7 @@ mod inertia_tests {
         let integrals = VolumeIntegrals {
             volume: 1.0,
             first_moments: Vector3::new(2.0, 0.0, 0.0),
-            second_moments: [
-                [0.0, 0.0, 0.0],
-                [0.0, m * 4.0, 0.0],
-                [0.0, 0.0, m * 4.0],
-            ],
+            second_moments: [[0.0, 0.0, 0.0], [0.0, m * 4.0, 0.0], [0.0, 0.0, m * 4.0]],
         };
         let com = Point3::new(2.0, 0.0, 0.0);
         let i_com = integrals.compute_inertia_tensor(m, &com);

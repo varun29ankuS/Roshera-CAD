@@ -100,14 +100,9 @@ enum BridgeResponse {
         height: u32,
     },
     /// Plain acknowledgement for camera moves and other void commands.
-    Ack {
-        request_id: Uuid,
-    },
+    Ack { request_id: Uuid },
     /// Frontend reported a failure executing the command.
-    Error {
-        request_id: Uuid,
-        message: String,
-    },
+    Error { request_id: Uuid, message: String },
     /// Unsolicited frontend → server push: the scene mutated and the
     /// frontend grabbed a fresh snapshot. Backend writes it to a fixed
     /// path so dev tools (Claude) can `Read` the latest viewport state
@@ -163,9 +158,7 @@ impl ViewportBridge {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(request_id, tx);
 
-        sender
-            .send(cmd)
-            .map_err(|_| BridgeError::SendFailed)?;
+        sender.send(cmd).map_err(|_| BridgeError::SendFailed)?;
         // Drop the sender guard before awaiting so the WS task can use it.
         drop(sender_guard);
 
@@ -216,10 +209,7 @@ impl BridgeError {
 // ─── WebSocket handler ────────────────────────────────────────────────────
 
 /// Axum upgrade handler for `/ws/viewport-bridge`.
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     let bridge = state.viewport_bridge.clone();
     ws.on_upgrade(move |socket| async move {
         run_socket(socket, bridge).await;
@@ -370,9 +360,7 @@ fn persist_latest_snapshot(png_bytes: Vec<u8>, width: u32, height: u32) {
 }
 
 fn decode_png_data_url(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    let payload = data
-        .strip_prefix("data:image/png;base64,")
-        .unwrap_or(data);
+    let payload = data.strip_prefix("data:image/png;base64,").unwrap_or(data);
     base64::engine::general_purpose::STANDARD.decode(payload.trim())
 }
 
@@ -506,18 +494,16 @@ pub async fn load_stl(
 ) -> Result<Json<AckResponse>, (StatusCode, String)> {
     // Resolve and read the STL on the server, then base64-stream it via the
     // command. Cleaner than asking the frontend to fetch from disk.
-    let canonical = std::fs::canonicalize(&req.path)
-        .map_err(|e| into_http_err(BridgeError::Io(e)))?;
+    let canonical =
+        std::fs::canonicalize(&req.path).map_err(|e| into_http_err(BridgeError::Io(e)))?;
     let bytes = std::fs::read(&canonical).map_err(|e| into_http_err(BridgeError::Io(e)))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let name = req
-        .name
-        .unwrap_or_else(|| {
-            canonical
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "stl".to_string())
-        });
+    let name = req.name.unwrap_or_else(|| {
+        canonical
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "stl".to_string())
+    });
     let bridge = state.viewport_bridge.clone();
     let request_id = Uuid::new_v4();
     let value = bridge

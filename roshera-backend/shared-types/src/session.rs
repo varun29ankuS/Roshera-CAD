@@ -88,7 +88,6 @@ pub struct SketchState {
     pub active_tool: Option<String>,
 }
 
-
 /// Sketch plane information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchPlaneInfo {

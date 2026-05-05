@@ -131,10 +131,7 @@ pub struct ReplayOutcome {
 /// the duration of the replay so that re-executed operations do not
 /// double-record into the timeline; it is reattached before this
 /// function returns.
-pub fn rebuild_model_from_events(
-    model: &mut BRepModel,
-    events: &[TimelineEvent],
-) -> ReplayOutcome {
+pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]) -> ReplayOutcome {
     // Detach any attached recorder so replayed operations do not
     // double-record. We reattach unconditionally before returning so the
     // caller's recorder wiring is preserved.
@@ -211,8 +208,7 @@ fn dispatch_generic(
     // Translate a recorded ID into the live-model ID, falling back to
     // the original ID when no remap entry exists (first-reference case
     // where the recorder didn't observe the producer).
-    let remap_id =
-        |id: u64, remap: &HashMap<u64, u64>| -> u64 { *remap.get(&id).unwrap_or(&id) };
+    let remap_id = |id: u64, remap: &HashMap<u64, u64>| -> u64 { *remap.get(&id).unwrap_or(&id) };
 
     match kind {
         // ----------------------------------------------------------------
@@ -309,12 +305,7 @@ fn dispatch_generic(
             let h = num_field(params, "height", kind)?;
             let mut builder = TopologyBuilder::new(model);
             let id = builder
-                .create_cylinder_3d(
-                    Point3::new(bx, by, bz),
-                    Vector3::new(ax, ay, az),
-                    r,
-                    h,
-                )
+                .create_cylinder_3d(Point3::new(bx, by, bz), Vector3::new(ax, ay, az), r, h)
                 .map_err(|e| kernel_err(kind, &e))?;
             stamp_outputs(geometry_id_to_u64(id), &recorded_outputs, id_remap);
             Ok(())
@@ -332,13 +323,7 @@ fn dispatch_generic(
             let h = num_field(params, "height", kind)?;
             let mut builder = TopologyBuilder::new(model);
             let id = builder
-                .create_cone_3d(
-                    Point3::new(bx, by, bz),
-                    Vector3::new(ax, ay, az),
-                    br,
-                    tr,
-                    h,
-                )
+                .create_cone_3d(Point3::new(bx, by, bz), Vector3::new(ax, ay, az), br, tr, h)
                 .map_err(|e| kernel_err(kind, &e))?;
             stamp_outputs(geometry_id_to_u64(id), &recorded_outputs, id_remap);
             Ok(())
@@ -458,8 +443,8 @@ fn dispatch_generic(
                 fillet_type: FilletType::Constant(radius),
                 ..FilletOptions::default()
             };
-            let _faces = fillet_edges(model, solid, edge_ids, options)
-                .map_err(|e| kernel_err(kind, &e))?;
+            let _faces =
+                fillet_edges(model, solid, edge_ids, options).map_err(|e| kernel_err(kind, &e))?;
             // Fillet outputs are face IDs; downstream replay does not
             // currently reference fillet faces by recorded ID, so we
             // leave the remap untouched here.
@@ -498,8 +483,8 @@ fn dispatch_generic(
                 chamfer_type: ChamferType::EqualDistance(distance),
                 ..ChamferOptions::default()
             };
-            let _faces = chamfer_edges(model, solid, edge_ids, options)
-                .map_err(|e| kernel_err(kind, &e))?;
+            let _faces =
+                chamfer_edges(model, solid, edge_ids, options).map_err(|e| kernel_err(kind, &e))?;
             Ok(())
         }
 
@@ -569,8 +554,8 @@ fn dispatch_generic(
                 cap_ends,
                 ..RevolveOptions::default()
             };
-            let new_solid = revolve_face(model, face_id, options)
-                .map_err(|e| kernel_err(kind, &e))?;
+            let new_solid =
+                revolve_face(model, face_id, options).map_err(|e| kernel_err(kind, &e))?;
             stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
             Ok(())
         }
@@ -638,8 +623,8 @@ fn dispatch_generic(
                 quality,
                 ..SweepOptions::default()
             };
-            let new_solid = sweep_profile(model, profile, path, options)
-                .map_err(|e| kernel_err(kind, &e))?;
+            let new_solid =
+                sweep_profile(model, profile, path, options).map_err(|e| kernel_err(kind, &e))?;
             stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
             Ok(())
         }
@@ -692,7 +677,10 @@ fn dispatch_generic(
                 .and_then(|v| v.as_str())
                 .map(parse_loft_type)
                 .unwrap_or(LoftType::Linear);
-            let closed = inner.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+            let closed = inner
+                .get("closed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let create_solid = inner
                 .get("create_solid")
                 .and_then(|v| v.as_bool())
@@ -720,10 +708,7 @@ fn dispatch_generic(
 /// Pull the inner parameter object out of a `record_and_push`-style
 /// payload. The recorder serializes `TimelineOperation::CreateNd` as the
 /// externally tagged `{ "<Variant>": { "primitive_type": ..., "parameters": {...} } }`.
-fn extract_create_params<'a>(
-    inner: &'a Value,
-    variant: &str,
-) -> Result<&'a Value, ReplayError> {
+fn extract_create_params<'a>(inner: &'a Value, variant: &str) -> Result<&'a Value, ReplayError> {
     let v = inner
         .get(variant)
         .ok_or_else(|| ReplayError::InvalidParameters {

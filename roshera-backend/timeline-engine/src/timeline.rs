@@ -351,13 +351,9 @@ impl Timeline {
         let (min_seq, max_seq) = if branch_events.is_empty() {
             (0u64, 0u64)
         } else {
-            let mut keys: Vec<EventIndex> =
-                branch_events.iter().map(|e| *e.key()).collect();
+            let mut keys: Vec<EventIndex> = branch_events.iter().map(|e| *e.key()).collect();
             keys.sort_unstable();
-            (
-                *keys.first().unwrap_or(&0),
-                *keys.last().unwrap_or(&0),
-            )
+            (*keys.first().unwrap_or(&0), *keys.last().unwrap_or(&0))
         };
         drop(branch_events);
 
@@ -670,15 +666,12 @@ impl Timeline {
                 .branch_events
                 .get(&position.branch_id)
                 .ok_or(TimelineError::BranchNotFound(position.branch_id))?;
-            branch_events
-                .get(&target_key)
-                .map(|r| *r)
-                .ok_or_else(|| {
-                    TimelineError::Internal(format!(
-                        "branch {} lost event at key {} between key-snapshot and lookup",
-                        position.branch_id, target_key
-                    ))
-                })?
+            branch_events.get(&target_key).map(|r| *r).ok_or_else(|| {
+                TimelineError::Internal(format!(
+                    "branch {} lost event at key {} between key-snapshot and lookup",
+                    position.branch_id, target_key
+                ))
+            })?
         };
 
         // Move the session pointer one count back. Replay rebuilds the
@@ -722,15 +715,12 @@ impl Timeline {
                 .branch_events
                 .get(&position.branch_id)
                 .ok_or(TimelineError::BranchNotFound(position.branch_id))?;
-            branch_events
-                .get(&target_key)
-                .map(|r| *r)
-                .ok_or_else(|| {
-                    TimelineError::Internal(format!(
-                        "branch {} lost event at key {} between key-snapshot and lookup",
-                        position.branch_id, target_key
-                    ))
-                })?
+            branch_events.get(&target_key).map(|r| *r).ok_or_else(|| {
+                TimelineError::Internal(format!(
+                    "branch {} lost event at key {} between key-snapshot and lookup",
+                    position.branch_id, target_key
+                ))
+            })?
         };
 
         self.update_session_position(session, position.branch_id, position.event_index + 1)?;
@@ -750,10 +740,7 @@ impl Timeline {
     /// Branches are bounded in practice (10²–10³ events), and the call
     /// happens at most once per undo/redo/replay tick, so we don't
     /// cache.
-    fn branch_event_keys_sorted(
-        &self,
-        branch_id: &BranchId,
-    ) -> TimelineResult<Vec<EventIndex>> {
+    fn branch_event_keys_sorted(&self, branch_id: &BranchId) -> TimelineResult<Vec<EventIndex>> {
         let branch_events = self
             .branch_events
             .get(branch_id)
@@ -878,7 +865,10 @@ impl Timeline {
 
         // Already up-to-date: target already contains every event source has.
         if source_seq.len() <= target_seq.len()
-            && source_seq.iter().zip(target_seq.iter()).all(|(s, t)| s == t)
+            && source_seq
+                .iter()
+                .zip(target_seq.iter())
+                .all(|(s, t)| s == t)
         {
             // Mark source merged anyway — semantically it's "merged into
             // target", just with nothing new to copy.
@@ -904,8 +894,8 @@ impl Timeline {
         }
 
         // Fast-forward case: target_seq is a strict prefix of source_seq.
-        let ff = target_seq.len() < source_seq.len()
-            && source_seq[..target_seq.len()] == target_seq[..];
+        let ff =
+            target_seq.len() < source_seq.len() && source_seq[..target_seq.len()] == target_seq[..];
         if ff {
             // Copy source's suffix (events target doesn't yet have) into
             // target's branch_events. Sequence numbers are preserved —
@@ -1029,11 +1019,7 @@ impl Timeline {
     /// Linear scan over the branch's `(EventIndex → EventId)` map, which is
     /// cheap for the typical 10²–10³ events per branch. Returns `None` if
     /// the branch doesn't exist or the event isn't in this branch.
-    pub fn find_event_index(
-        &self,
-        branch_id: &BranchId,
-        event_id: EventId,
-    ) -> Option<EventIndex> {
+    pub fn find_event_index(&self, branch_id: &BranchId, event_id: EventId) -> Option<EventIndex> {
         let branch_events = self.branch_events.get(branch_id)?;
         // The `Iter` returned by DashMap holds a borrow into `branch_events`,
         // so its lifetime is tied to the local. Bind the result to a local
@@ -1313,10 +1299,7 @@ impl Timeline {
             if descendant == ancestor {
                 return true;
             }
-            let mut current = self
-                .branches
-                .get(&descendant)
-                .and_then(|b| b.parent);
+            let mut current = self.branches.get(&descendant).and_then(|b| b.parent);
             // Cap at 1024 hops to avoid pathological cycles.
             for _ in 0..1024 {
                 match current {
@@ -1337,13 +1320,12 @@ impl Timeline {
             for ev_entry in branch_entry.value().iter() {
                 let key = *ev_entry.key();
                 let event_id = *ev_entry.value();
-                let event = self
-                    .events
-                    .get(&event_id)
-                    .ok_or_else(|| TimelineError::Internal(format!(
+                let event = self.events.get(&event_id).ok_or_else(|| {
+                    TimelineError::Internal(format!(
                         "branch {} references missing event id {} at key {}",
                         host, event_id, key
-                    )))?;
+                    ))
+                })?;
                 if event.sequence_number != key {
                     return Err(TimelineError::Internal(format!(
                         "branch {} stores event {} under key {} but event.sequence_number={}",
@@ -1367,13 +1349,10 @@ impl Timeline {
                     // is a valid host. Cap at 1024 hops.
                     let mut cur = origin;
                     for _ in 0..1024 {
-                        let next = self
-                            .branches
-                            .get(&cur)
-                            .and_then(|b| match b.state {
-                                BranchState::Merged { into, .. } => Some(into),
-                                _ => None,
-                            });
+                        let next = self.branches.get(&cur).and_then(|b| match b.state {
+                            BranchState::Merged { into, .. } => Some(into),
+                            _ => None,
+                        });
                         match next {
                             Some(into) => {
                                 if is_descendant(host, into) {
@@ -1402,12 +1381,13 @@ impl Timeline {
             if b.id.is_main() {
                 continue;
             }
-            let parent = b.parent.ok_or_else(|| TimelineError::Internal(format!(
-                "non-main branch {} has no parent", b.id
-            )))?;
+            let parent = b.parent.ok_or_else(|| {
+                TimelineError::Internal(format!("non-main branch {} has no parent", b.id))
+            })?;
             if !self.branches.contains_key(&parent) {
                 return Err(TimelineError::Internal(format!(
-                    "branch {} parent {} does not exist", b.id, parent
+                    "branch {} parent {} does not exist",
+                    b.id, parent
                 )));
             }
             if b.fork_point.branch_id != parent {
@@ -1426,7 +1406,8 @@ impl Timeline {
             if !seen.insert(s) {
                 return Err(TimelineError::Internal(format!(
                     "duplicate sequence_number {} (event id {})",
-                    s, entry.value().id
+                    s,
+                    entry.value().id
                 )));
             }
         }
@@ -1438,14 +1419,20 @@ impl Timeline {
                 .branch_events
                 .get(&pos.branch_id)
                 .map(|m| m.len() as u64)
-                .ok_or_else(|| TimelineError::Internal(format!(
-                    "session {:?} points at non-existent branch {}",
-                    entry.key(), pos.branch_id
-                )))?;
+                .ok_or_else(|| {
+                    TimelineError::Internal(format!(
+                        "session {:?} points at non-existent branch {}",
+                        entry.key(),
+                        pos.branch_id
+                    ))
+                })?;
             if pos.event_index > len {
                 return Err(TimelineError::Internal(format!(
                     "session {:?} event_index {} exceeds branch {} length {}",
-                    entry.key(), pos.event_index, pos.branch_id, len
+                    entry.key(),
+                    pos.event_index,
+                    pos.branch_id,
+                    len
                 )));
             }
         }
@@ -1667,7 +1654,9 @@ mod tests {
             .add_operation(dummy_create_op(), Author::System, child)
             .await
             .unwrap();
-        timeline.validate().expect("populated timeline must validate");
+        timeline
+            .validate()
+            .expect("populated timeline must validate");
     }
 
     /// `add_operation` refuses to write to a merged branch — the
@@ -1708,7 +1697,9 @@ mod tests {
             TimelineError::InvalidOperation(_) => {}
             other => panic!("expected InvalidOperation, got {:?}", other),
         }
-        timeline.validate().expect("rejected append must not corrupt state");
+        timeline
+            .validate()
+            .expect("rejected append must not corrupt state");
     }
 
     /// Same contract for abandoned branches.
@@ -1736,7 +1727,9 @@ mod tests {
             .await
             .expect_err("must reject append to abandoned branch");
         assert!(matches!(err, TimelineError::InvalidOperation(_)));
-        timeline.validate().expect("rejected append must not corrupt state");
+        timeline
+            .validate()
+            .expect("rejected append must not corrupt state");
     }
 
     /// `update_session_position` must reject counts that exceed the
@@ -1796,7 +1789,10 @@ mod tests {
             .unwrap();
 
         let undone = timeline.undo(session_uuid).await.unwrap();
-        assert_eq!(undone, e1, "undo returns the most-recently applied event id");
+        assert_eq!(
+            undone, e1,
+            "undo returns the most-recently applied event id"
+        );
         assert_eq!(
             timeline
                 .get_session_position(session_uuid)
@@ -1861,9 +1857,7 @@ mod tests {
 
         let session_uuid = uuid::Uuid::new_v4();
         let session = SessionId::new(session_uuid.to_string());
-        timeline
-            .update_session_position(session, child, 3)
-            .unwrap();
+        timeline.update_session_position(session, child, 3).unwrap();
 
         // The 3rd applied event in branch order is the child's own
         // append (sorted_keys[2] == 3). A naive `branch_events.get(idx-1)`
@@ -1934,7 +1928,9 @@ mod tests {
         let pos = timeline.get_session_position(session_uuid).unwrap();
         assert_eq!(pos.event_index, 2, "session pointer clamped");
 
-        timeline.validate().expect("truncate must not corrupt state");
+        timeline
+            .validate()
+            .expect("truncate must not corrupt state");
     }
 
     /// `merge_branches` performs a fast-forward when the target's
@@ -1986,7 +1982,9 @@ mod tests {
             .expect_err("source branch must be Merged after FF");
         assert!(matches!(err, TimelineError::InvalidOperation(_)));
 
-        timeline.validate().expect("FF merge must not corrupt state");
+        timeline
+            .validate()
+            .expect("FF merge must not corrupt state");
     }
 
     /// `merge_branches` rejects divergent histories with a
@@ -2029,7 +2027,9 @@ mod tests {
         assert!(matches!(err, TimelineError::BranchConflict(_)));
         // Both branches still active — failed merge must not flip state.
         assert!(timeline.is_branch_active(&child));
-        timeline.validate().expect("rejected merge must not corrupt state");
+        timeline
+            .validate()
+            .expect("rejected merge must not corrupt state");
     }
 
     /// Self-merge is meaningless and must error.
@@ -2065,9 +2065,7 @@ mod tests {
             .await
             .unwrap();
         assert!(timeline.is_branch_active(&side));
-        timeline
-            .abandon_branch(side, "drop".to_string())
-            .unwrap();
+        timeline.abandon_branch(side, "drop".to_string()).unwrap();
         assert!(!timeline.is_branch_active(&side));
         // Unknown branch — also not active.
         assert!(!timeline.is_branch_active(&BranchId::new()));

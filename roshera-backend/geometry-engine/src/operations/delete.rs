@@ -721,9 +721,7 @@ fn is_shell_used(model: &BRepModel, shell_id: ShellId) -> bool {
 /// user.
 fn validate_model_after_deletion(model: &BRepModel) -> OperationResult<()> {
     fn dangling(kind: &str, id: u32, ref_kind: &str) -> OperationError {
-        OperationError::TopologyError(format!(
-            "{kind} {id} references missing {ref_kind}"
-        ))
+        OperationError::TopologyError(format!("{kind} {id} references missing {ref_kind}"))
     }
 
     // Edges → vertices, curves
@@ -786,4 +784,3 @@ fn validate_model_after_deletion(model: &BRepModel) -> OperationResult<()> {
 
     Ok(())
 }
-

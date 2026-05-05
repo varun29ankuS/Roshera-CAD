@@ -533,8 +533,7 @@ impl BSplineSurface {
                 };
 
                 for j in j1..=j2 {
-                    a[s2][j] =
-                        (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][rk as usize + j];
+                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][rk as usize + j];
                     d += a[s2][j] * ndu[rk as usize + j][pk as usize];
                 }
 

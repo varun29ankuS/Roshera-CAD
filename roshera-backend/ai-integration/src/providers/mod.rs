@@ -23,8 +23,7 @@ use thiserror::Error;
 /// upstream LLM at the cadence the provider receives them — for Claude
 /// Sonnet that is roughly 30 tokens/second over the SSE wire. Errors mid-
 /// stream surface as `Err(ProviderError)` and terminate the stream.
-pub type LLMTokenStream =
-    Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+pub type LLMTokenStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
 // Provider implementations — API-only (no local models).
 //
@@ -244,9 +243,7 @@ pub trait LLMProvider: Send + Sync + Debug {
         max_tokens: usize,
     ) -> Result<LLMTokenStream, ProviderError> {
         let full = self.generate(prompt, max_tokens).await?;
-        Ok(Box::pin(futures::stream::once(
-            async move { Ok(full) },
-        )))
+        Ok(Box::pin(futures::stream::once(async move { Ok(full) })))
     }
 
     /// Generate response based on command result

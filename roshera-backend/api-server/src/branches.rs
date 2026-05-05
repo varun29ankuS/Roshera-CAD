@@ -246,17 +246,12 @@ fn render_branch(branch: &timeline_engine::types::Branch, event_count: usize) ->
 /// Translate `TimelineError` to the structured `ApiError` catalog.
 fn map_timeline_err(e: TimelineError) -> ApiError {
     match e {
-        TimelineError::BranchNotFound(id) => ApiError::new(
-            ErrorCode::BranchNotFound,
-            format!("branch {id} not found"),
-        )
-        .with_details(serde_json::json!({ "branch_id": id.to_string() })),
-        TimelineError::InvalidOperation(msg) => {
-            ApiError::new(ErrorCode::BranchInvalidState, msg)
+        TimelineError::BranchNotFound(id) => {
+            ApiError::new(ErrorCode::BranchNotFound, format!("branch {id} not found"))
+                .with_details(serde_json::json!({ "branch_id": id.to_string() }))
         }
-        other => {
-            ApiError::new(ErrorCode::Internal, format!("timeline error: {other}"))
-        }
+        TimelineError::InvalidOperation(msg) => ApiError::new(ErrorCode::BranchInvalidState, msg),
+        other => ApiError::new(ErrorCode::Internal, format!("timeline error: {other}")),
     }
 }
 
@@ -285,10 +280,15 @@ pub async fn list_branches(
     // Stable order: main first, then by created_at ascending. Without
     // a stable order tests and orchestrator UIs flicker as DashMap
     // hashes branches.
-    views.sort_by(|a, b| match (a.id == BranchId::main().to_string(), b.id == BranchId::main().to_string()) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.created_at.cmp(&b.created_at),
+    views.sort_by(|a, b| {
+        match (
+            a.id == BranchId::main().to_string(),
+            b.id == BranchId::main().to_string(),
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.created_at.cmp(&b.created_at),
+        }
     });
     Ok(Json(views))
 }
@@ -479,9 +479,7 @@ pub async fn merge_branch(
                 ErrorCode::InvalidParameter,
                 format!("unknown merge strategy '{other}'"),
             )
-            .with_hint(
-                "Use one of 'fast-forward', 'three-way', or 'squash'.".to_string(),
-            ));
+            .with_hint("Use one of 'fast-forward', 'three-way', or 'squash'.".to_string()));
         }
     };
 
@@ -493,11 +491,7 @@ pub async fn merge_branch(
             .map_err(map_timeline_err)?
     };
 
-    let conflicts: Vec<String> = result
-        .conflicts
-        .iter()
-        .map(|c| format!("{c:?}"))
-        .collect();
+    let conflicts: Vec<String> = result.conflicts.iter().map(|c| format!("{c:?}")).collect();
     Ok(Json(MergeView {
         success: result.success && conflicts.is_empty(),
         merged_into: target.to_string(),

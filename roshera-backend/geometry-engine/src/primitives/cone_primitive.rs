@@ -172,11 +172,11 @@ impl ConePrimitive {
                 + ref_dir * (bottom_radius * end_angle.cos())
                 + y_dir * (bottom_radius * end_angle.sin());
 
-            bottom_vertices.push(model.vertices.add(
-                start_point.x,
-                start_point.y,
-                start_point.z,
-            ));
+            bottom_vertices.push(
+                model
+                    .vertices
+                    .add(start_point.x, start_point.y, start_point.z),
+            );
             bottom_vertices.push(model.vertices.add(end_point.x, end_point.y, end_point.z));
         }
 

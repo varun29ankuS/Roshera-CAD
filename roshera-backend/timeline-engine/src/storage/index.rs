@@ -388,9 +388,7 @@ impl StorageIndex {
                     // rmp-serde has no `serialized_size` equivalent, and
                     // this rebuild path is a recovery fallback, not a
                     // hot path).
-                    let event_size = rmp_serde::to_vec(&event)
-                        .map(|v| v.len())
-                        .unwrap_or(1024);
+                    let event_size = rmp_serde::to_vec(&event).map(|v| v.len()).unwrap_or(1024);
                     offset += event_size;
                 } else {
                     // Skip to next potential event boundary

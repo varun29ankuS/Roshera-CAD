@@ -616,10 +616,7 @@ fn history_entry_to_parsed_command(entry: &HistoryEntry) -> ParsedCommand {
         serde_json::to_value(&entry.command).unwrap_or(Value::Null),
     );
     if let Some(user) = &entry.user_id {
-        parameters.insert(
-            "user_id".to_string(),
-            Value::String(user.clone()),
-        );
+        parameters.insert("user_id".to_string(), Value::String(user.clone()));
     }
     parameters.insert(
         "timestamp".to_string(),

@@ -274,11 +274,8 @@ async fn replay_session_to_model(
 
     let tess_params = geometry_engine::tessellation::TessellationParams::default();
     for (solid_id, solid) in model_guard.solids.iter() {
-        let mesh = geometry_engine::tessellation::tessellate_solid(
-            solid,
-            &model_guard,
-            &tess_params,
-        );
+        let mesh =
+            geometry_engine::tessellation::tessellate_solid(solid, &model_guard, &tess_params);
         let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
         let uuid = state.create_uuid_for_local(solid_id);
         // No analytical-geometry envelope after replay: the kernel
@@ -651,8 +648,7 @@ pub async fn replay_events(
     let session_id = SessionId::new(request.session_id.clone());
 
     // We also need the session UUID for the kernel-side replay step.
-    let session_uuid =
-        Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Parse from_event if provided
     let from_event = if let Some(event_str) = request.from_event {
@@ -884,11 +880,9 @@ pub async fn truncate_history(
     State(state): State<AppState>,
     Json(request): Json<TruncateHistoryRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session_uuid =
-        Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let event_id = EventId(
-        Uuid::parse_str(&request.event_id).map_err(|_| StatusCode::BAD_REQUEST)?,
-    );
+    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let event_id =
+        EventId(Uuid::parse_str(&request.event_id).map_err(|_| StatusCode::BAD_REQUEST)?);
     let branch_id = match request.branch_id.as_deref() {
         Some(b) => resolve_branch_ref(b)?,
         None => BranchId::main(),

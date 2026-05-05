@@ -351,7 +351,6 @@ impl TorusPrimitive {
             + y_dir * (params.major_radius * sin_u);
 
         let radial_dir = ref_dir * cos_u + y_dir * sin_u;
-        
 
         major_point
             + radial_dir * (params.minor_radius * cos_v)
@@ -465,8 +464,7 @@ impl TorusPrimitive {
             return Err(PrimitiveError::InvalidTopology {
                 entity: "Solid".to_string(),
                 issue: format!("Torus solid {} not found", solid_id),
-                suggestion: "Verify the solid id before requesting an update"
-                    .to_string(),
+                suggestion: "Verify the solid id before requesting an update".to_string(),
             });
         }
         Err(PrimitiveError::GeometryError {

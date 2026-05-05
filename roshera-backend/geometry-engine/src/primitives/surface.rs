@@ -2202,7 +2202,6 @@ impl Cylinder {
             .expect("Failed to create ellipse NURBS curve"),
         )
     }
-
 }
 
 /// Spherical surface
@@ -4810,7 +4809,6 @@ impl SurfaceOfRevolution {
         };
         (height, radius, radial_dir)
     }
-
 }
 
 impl Surface for SurfaceOfRevolution {

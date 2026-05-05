@@ -29,8 +29,8 @@ use common::{header, model_summary, tess_and_write};
 const SUBDIR: &str = "booleans";
 
 const OPS: &[(BooleanOp, &str)] = &[
-    (BooleanOp::Union,        "union"),
-    (BooleanOp::Difference,   "diff"),
+    (BooleanOp::Union, "union"),
+    (BooleanOp::Difference, "diff"),
     (BooleanOp::Intersection, "inter"),
 ];
 
@@ -40,8 +40,8 @@ fn main() {
     let params = TessellationParams::default();
 
     // Each pair builds in its own model so failures in one don't poison others.
-    run_pair("box-sphere",      &params, build_box_sphere);
-    run_pair("box-cylinder",    &params, build_box_cylinder);
+    run_pair("box-sphere", &params, build_box_sphere);
+    run_pair("box-cylinder", &params, build_box_cylinder);
     run_pair("sphere-cylinder", &params, build_sphere_cylinder);
 
     println!("\nAll boolean outputs within acceptance bounds.");

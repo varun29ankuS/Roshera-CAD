@@ -564,7 +564,9 @@ fn create_curve_edge(model: &mut BRepModel, points: &[Point3]) -> OperationResul
     };
 
     // Create endpoint vertices
-    let v_start = model.vertices.add(first_point.x, first_point.y, first_point.z);
+    let v_start = model
+        .vertices
+        .add(first_point.x, first_point.y, first_point.z);
     let v_end = model.vertices.add(last_point.x, last_point.y, last_point.z);
 
     // Create edge

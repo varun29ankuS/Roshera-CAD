@@ -630,12 +630,10 @@ fn measure_blend_continuity(
     boundary2: &dyn Curve,
     tolerance: Tolerance,
 ) -> MathResult<BlendingQuality> {
-    let report1 = SurfaceContinuity::verify_g2_continuity_along_curve(
-        blend, surface1, boundary1, tolerance,
-    )?;
-    let report2 = SurfaceContinuity::verify_g2_continuity_along_curve(
-        blend, surface2, boundary2, tolerance,
-    )?;
+    let report1 =
+        SurfaceContinuity::verify_g2_continuity_along_curve(blend, surface1, boundary1, tolerance)?;
+    let report2 =
+        SurfaceContinuity::verify_g2_continuity_along_curve(blend, surface2, boundary2, tolerance)?;
 
     let g0_error = report1
         .worst_position_error

@@ -309,8 +309,7 @@ impl SnapshotManager {
         };
 
         // Deserialize
-        rmp_serde::from_slice(&data)
-            .map_err(|e| TimelineError::SerializationError(e.to_string()))
+        rmp_serde::from_slice(&data).map_err(|e| TimelineError::SerializationError(e.to_string()))
     }
 
     /// Get the latest snapshot for a branch

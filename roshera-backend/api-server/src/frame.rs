@@ -220,12 +220,8 @@ pub async fn get_frame(
     let png = render_png(&model, &camera, aspect, width, height);
     drop(model);
 
-    let png = png.map_err(|e| {
-        ApiError::new(
-            ErrorCode::Internal,
-            format!("frame render failed: {e}"),
-        )
-    })?;
+    let png =
+        png.map_err(|e| ApiError::new(ErrorCode::Internal, format!("frame render failed: {e}")))?;
 
     let mut resp = Response::new(Body::from(png));
     *resp.status_mut() = StatusCode::OK;
@@ -320,11 +316,7 @@ fn default_eye(view: Option<&str>, bounds: &SceneBounds, fov_deg: f64, w: u32, h
         .unwrap_or(Vector3::new(0.577, -0.577, 0.577));
 
     let c = bounds.center();
-    Point3::new(
-        c.x + dir.x * dist,
-        c.y + dir.y * dist,
-        c.z + dir.z * dist,
-    )
+    Point3::new(c.x + dir.x * dist, c.y + dir.y * dist, c.z + dir.z * dist)
 }
 
 /// Camera basis (right, up, forward) in world space. Used both to
@@ -339,12 +331,11 @@ struct Basis {
 }
 
 fn camera_basis(cam: &Camera) -> Basis {
-    let f = (cam.target - cam.eye).normalize().ok().unwrap_or(Vector3::Y);
-    let r = f
-        .cross(&cam.up)
+    let f = (cam.target - cam.eye)
         .normalize()
         .ok()
-        .unwrap_or(Vector3::X);
+        .unwrap_or(Vector3::Y);
+    let r = f.cross(&cam.up).normalize().ok().unwrap_or(Vector3::X);
     let u = r.cross(&f);
     Basis {
         right: r,
@@ -586,7 +577,11 @@ mod tests {
         b.extend(Point3::new(4.0, 5.0, 6.0));
         assert!(b.has_geometry);
         assert_eq!(b.center(), Point3::new(1.5, 1.5, 1.5));
-        assert!((b.radius() - 0.5 * ((5.0_f64).powi(2) + 7.0_f64.powi(2) + 9.0_f64.powi(2)).sqrt()).abs() < 1e-9);
+        assert!(
+            (b.radius() - 0.5 * ((5.0_f64).powi(2) + 7.0_f64.powi(2) + 9.0_f64.powi(2)).sqrt())
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
