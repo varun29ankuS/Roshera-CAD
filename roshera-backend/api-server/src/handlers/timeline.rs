@@ -141,6 +141,12 @@ async fn ensure_session_position_at_head(
     state: &AppState,
     session_uuid: Uuid,
 ) -> Result<(), String> {
+    // Drain in-flight recorder ops before reading branch length.
+    // Without this barrier, kernel ops enqueued microseconds earlier
+    // may not yet have been applied, so `head_count` undershoots and
+    // the planted position lands behind the actual head — the very
+    // next undo would then no-op or replay against a stale prefix.
+    let _ = state.timeline_recorder.flush().await;
     let timeline = state.timeline.read().await;
     if timeline.get_session_position(session_uuid).is_some() {
         return Ok(());
@@ -211,6 +217,11 @@ async fn replay_session_to_model(
     //    iterates a `DashMap` whose ordering is non-deterministic —
     //    replay correctness depends on monotonically increasing
     //    sequence application.
+    // Drain in-flight recorder ops before snapshotting branch events.
+    // Replay correctness depends on seeing every kernel op that's been
+    // recorded; an undrained MPSC means we'd rebuild the model against
+    // an incomplete event prefix.
+    let _ = state.timeline_recorder.flush().await;
     let (branch_id, events) = {
         let timeline = state.timeline.read().await;
         let position = timeline
@@ -440,6 +451,12 @@ pub async fn get_history(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
 ) -> Result<Json<Vec<EventSummary>>, StatusCode> {
+    // Drain in-flight recorder ops so the response reflects every
+    // kernel operation the client has issued, not just the ones the
+    // background worker happened to drain by the time the request
+    // arrived. Without this the Timeline panel can render empty
+    // immediately after creating a primitive.
+    let _ = state.timeline_recorder.flush().await;
     let timeline = state.timeline.read().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
 
