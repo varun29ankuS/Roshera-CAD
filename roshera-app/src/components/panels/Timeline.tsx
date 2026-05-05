@@ -258,18 +258,21 @@ function HeaderButton({
   onClick,
   title,
   ariaLabel,
+  disabled,
 }: {
   children: React.ReactNode
   onClick: () => void
   title: string
   ariaLabel: string
+  disabled?: boolean
 }) {
   return (
     <button
       onClick={onClick}
       title={title}
       aria-label={ariaLabel}
-      className="px-1.5 py-0.5 rounded text-foreground/70 hover:text-foreground hover:bg-accent/40 transition-colors"
+      disabled={disabled}
+      className="px-1.5 py-0.5 rounded text-foreground/70 hover:text-foreground hover:bg-accent/40 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-foreground/70"
     >
       {children}
     </button>
@@ -277,6 +280,15 @@ function HeaderButton({
 }
 
 // ─── Branch overview (minimap on the right edge of the strip) ──────
+
+interface ForkPointView {
+  /** Parent branch id — `"main"` (literal) or a UUIDv4 string. */
+  branch_id: string
+  /** Parent's head event index at fork time. 0 on `main`. */
+  event_index: number
+  /** ISO-8601 timestamp of the fork. */
+  timestamp: string
+}
 
 interface BranchView {
   id: string
@@ -286,8 +298,22 @@ interface BranchView {
   agent_id: string | null
   author: string
   purpose: string
+  /** Total events visible on this branch — includes events inherited
+   *  from the parent up to the fork point. Renderers should NOT use
+   *  this for plotting per-branch dots, otherwise inherited parent
+   *  events get drawn as phantom child events on the child lane. */
   event_count: number
+  /** Events recorded on this branch *strictly after* its fork point.
+   *  Use this for the per-branch dot count: a freshly-forked branch
+   *  with no new ops shows `events_since_fork === 0` and renders as
+   *  just a fork-elbow with no extra dots. Optional for back-compat
+   *  with backends that pre-date the field. */
+  events_since_fork?: number
   created_at: string
+  /** Optional for back-compat with persisted timelines that pre-date
+   *  the field. New backends always set it; renderers fall back to
+   *  `created_at` when absent. */
+  fork_point?: ForkPointView
 }
 
 const MAIN_BRANCH_ID = '00000000-0000-0000-0000-000000000000'
@@ -295,15 +321,21 @@ const MAIN_BRANCH_ID = '00000000-0000-0000-0000-000000000000'
 const MOCK_BRANCHES: BranchView[] = [
   { id: MAIN_BRANCH_ID, name: 'main', parent: null, state: 'active',
     agent_id: null, author: 'system', purpose: 'main',
-    event_count: MOCK_EVENTS.length, created_at: new Date(Date.now() - 600_000).toISOString() },
+    event_count: MOCK_EVENTS.length, created_at: new Date(Date.now() - 600_000).toISOString(),
+    fork_point: { branch_id: 'main', event_index: 0,
+      timestamp: new Date(Date.now() - 600_000).toISOString() } },
   { id: '11111111-1111-1111-1111-111111111111', name: 'claude/explore', parent: MAIN_BRANCH_ID,
     state: 'active', agent_id: 'claude-1', author: 'agent:claude',
     purpose: 'AIOptimization', event_count: 3,
-    created_at: new Date(Date.now() - 120_000).toISOString() },
+    created_at: new Date(Date.now() - 120_000).toISOString(),
+    fork_point: { branch_id: MAIN_BRANCH_ID, event_index: 4,
+      timestamp: new Date(Date.now() - 120_000).toISOString() } },
   { id: '22222222-2222-2222-2222-222222222222', name: 'feat/fillet', parent: MAIN_BRANCH_ID,
     state: 'merged', agent_id: null, author: 'user:varun',
     purpose: 'UserExploration', event_count: 2,
-    created_at: new Date(Date.now() - 60_000).toISOString() },
+    created_at: new Date(Date.now() - 60_000).toISOString(),
+    fork_point: { branch_id: MAIN_BRANCH_ID, event_index: 6,
+      timestamp: new Date(Date.now() - 60_000).toISOString() } },
 ]
 
 function shortBranchName(b: BranchView): string {
@@ -336,14 +368,20 @@ function shortBranchName(b: BranchView): string {
  *  - Non-active branches show `event_count` evenly spaced from their
  *    `created_at` to "now" — we don't fetch per-event histories for
  *    inactive branches (it would 3× the polling traffic).
- *  - Fork x-position uses `branch.created_at` so the elbow lines up
- *    with the moment the branch diverged from its parent.
+ *  - Fork x-position is anchored at the parent's Nth event-dot
+ *    (where N = `fork_point.event_index`), not at `branch.created_at`.
+ *    The wall-clock approach collapsed every fork to ~timeline start
+ *    on fresh sessions because the time between forks was tiny next
+ *    to the visible time-span. With event-index anchoring, a fork
+ *    that happened just after the parent's 5th op stays put even as
+ *    new ops land. Falls back to `created_at` for snapshots that
+ *    pre-date the `fork_point` field.
  *
  * Click anywhere on a lane → `onSelect(branch.id)` → POST
  * `/api/branches/active`, swapping where the kernel records new ops.
  */
 function TimelineOverview({
-  branches,
+  branches: rawBranches,
   events,
   activeBranchId,
   now,
@@ -356,6 +394,18 @@ function TimelineOverview({
   onSelect: (branchId: string) => void
 }) {
   const [hoveredId, setHoveredId] = useState<string | null>(null)
+
+  // Hide abandoned and merged branches from the graph. Both linger
+  // in the backend's branch list (abandon = soft-delete with events
+  // retained for restore; merge = source becomes `Merged` after a
+  // fast-forward fold-in) but visually they're "phantom timelines"
+  // that confuse the user. Keep them out of every position calc as
+  // well as the render passes below — the events they contributed
+  // already live on `main` (for merged) or are reachable via the
+  // restore flow (for abandoned).
+  const branches = rawBranches.filter(
+    (b) => b.state !== 'abandoned' && b.state !== 'merged',
+  )
 
   // ── DFS-order branches: main first, then each subtree depth-first
   //    sorted by created_at so siblings stack in chronological order.
@@ -437,6 +487,91 @@ function TimelineOverview({
   const activeIdx = idxOf[activeBranchId] ?? -1
   const activeBranch = activeIdx >= 0 ? ordered[activeIdx] : undefined
 
+  // ── Pre-compute lane left endpoints + per-branch dot positions ────
+  // We resolve in DFS order (parents before children) so a child's
+  // fork-x can read its parent's dot at `fork_point.event_index`.
+  // `xsByBranch[b.id]` is also the fork-elbow's x for non-main branches.
+  type LaneDot = {
+    x: number
+    isLatest: boolean
+    /** Only populated for the active branch, where we have the
+     *  per-event payload from `/api/timeline/history`. Lets the lane
+     *  renderer print the operation symbol/label above each dot so it
+     *  is clear what was done in this branch. */
+    event?: EventSummary
+  }
+  const xsByBranch: Record<string, number> = {}
+  const dotsByBranch: Record<string, LaneDot[]> = {}
+  ordered.forEach((b, i) => {
+    const isMain = b.id === MAIN_BRANCH_ID || b.parent === null
+    const isActive = i === activeIdx
+
+    let xs = xStart
+    if (!isMain) {
+      const parentId = b.parent ?? MAIN_BRANCH_ID
+      const parentDots = dotsByBranch[parentId]
+      const parentXs = xsByBranch[parentId]
+      // `fork_point.event_index` is the parent's *head sequence number*
+      // at fork time (0-based). For 1 inherited event it's 0, for 3
+      // it's 2. To anchor the fork-elbow under the corresponding dot
+      // we use it as a 0-based index into `parentDots` directly.
+      // `event_index === 0` is a real, valid fork (after the parent's
+      // first event); the only case where there is nothing to anchor
+      // on is when the parent has zero dots at all.
+      const forkIdx = b.fork_point?.event_index
+      const fx =
+        forkIdx !== undefined && parentDots && parentDots.length > 0
+          ? parentDots[Math.min(forkIdx, parentDots.length - 1)].x
+          : undefined
+      if (fx !== undefined) {
+        xs = fx
+      } else if (parentXs !== undefined) {
+        xs = parentXs
+      } else {
+        // Last-resort fallback for pre-fork_point snapshots.
+        const t = new Date(b.created_at).getTime()
+        if (!isNaN(t)) xs = scaleX(t)
+      }
+    }
+    xsByBranch[b.id] = xs
+
+    let dots: LaneDot[] = []
+    if (isActive && events.length > 0) {
+      // Distribute the active branch's events evenly across the lane
+      // and attach each event payload so we can label the dots. We
+      // deliberately do NOT use timestamp-based positioning: real
+      // edit sessions cluster many ops within seconds, which would
+      // collapse all dots to a single overlapping pile. Evenly-spaced
+      // matches what inactive lanes do, keeps ordering legible, and
+      // sidesteps the "everything is bunched at the right edge" bug.
+      const n = events.length
+      const span = Math.max(0, xEnd - xs)
+      dots = events.map((e, j) => ({
+        x: xs + (span * (j + 1)) / (n + 1),
+        isLatest: j === n - 1,
+        event: e,
+      }))
+    } else {
+      // For non-active branches we draw evenly-spaced dots representing
+      // ops on *this* branch since the fork. Use `events_since_fork`
+      // when the backend supplied it; fall back to `event_count` for
+      // pre-`events_since_fork` backends — the latter over-counts on
+      // child branches (it includes inherited parent events) but is
+      // the only signal those older payloads carry.
+      const n = b.events_since_fork ?? b.event_count
+      if (n > 0) {
+        const span = Math.max(0, xEnd - xs)
+        for (let j = 0; j < n; j++) {
+          dots.push({
+            x: xs + (span * (j + 1)) / (n + 1),
+            isLatest: j === n - 1,
+          })
+        }
+      }
+    }
+    dotsByBranch[b.id] = dots
+  })
+
   return (
     <div
       className="shrink-0 flex items-stretch gap-1 pl-1 select-none"
@@ -464,14 +599,13 @@ function TimelineOverview({
           }
         `}</style>
 
-        {/* ── Fork elbows: parent lane → child lane at child.created_at ── */}
+        {/* ── Fork elbows: parent's Nth event-dot → child lane ─────── */}
         {ordered.map((b, i) => {
           if (!b.parent) return null
           const pIdx = idxOf[b.parent]
           if (pIdx === undefined) return null
-          const t = new Date(b.created_at).getTime()
-          if (isNaN(t)) return null
-          const fx = scaleX(t)
+          const fx = xsByBranch[b.id]
+          if (fx === undefined) return null
           const py = laneY(pIdx)
           const cy = laneY(i)
           if (Math.abs(cy - py) < 0.5) return null
@@ -500,42 +634,15 @@ function TimelineOverview({
         {/* ── Lanes ──────────────────────────────────────────────────── */}
         {ordered.map((b, i) => {
           const y = laneY(i)
-          const isMain = b.id === MAIN_BRANCH_ID || b.parent === null
           const isActive = i === activeIdx
           const isHover = hoveredId === b.id
           const isMerged = b.state === 'merged'
           const isAbandoned = b.state === 'abandoned'
 
-          // Lane left endpoint: main spans the whole time axis; other
-          // branches start at their fork x.
-          let xs = xStart
-          if (!isMain) {
-            const t = new Date(b.created_at).getTime()
-            if (!isNaN(t)) xs = scaleX(t)
-          }
-
-          // Dot positions:
-          //  - Active branch uses real `events` timestamps.
-          //  - Inactive: even spacing from xs to xEnd by event_count.
-          let dots: { x: number; isLatest: boolean }[] = []
-          if (isActive && events.length > 0) {
-            dots = events.map((e, j) => {
-              const t = new Date(e.timestamp).getTime()
-              return {
-                x: isNaN(t) ? xs : scaleX(t),
-                isLatest: j === events.length - 1,
-              }
-            })
-          } else if (b.event_count > 0) {
-            const span = Math.max(0, xEnd - xs)
-            const n = b.event_count
-            for (let j = 0; j < n; j++) {
-              dots.push({
-                x: xs + (span * (j + 1)) / (n + 1),
-                isLatest: j === n - 1,
-              })
-            }
-          }
+          // Lane left endpoint + dots are computed in the DFS pass
+          // above so children can read their parent's dot positions.
+          const xs = xsByBranch[b.id] ?? xStart
+          const dots = dotsByBranch[b.id] ?? []
 
           const laneColor = isActive
             ? '#2ecc71'
@@ -557,14 +664,13 @@ function TimelineOverview({
                 ? 0.4
                 : 0.65
 
-          const labelStyle: React.CSSProperties = isActive
-            ? { fill: '#2ecc71' }
-            : {}
-          const labelClass = isActive
-            ? undefined
-            : isHover
-              ? 'fill-foreground/95'
-              : 'fill-foreground/70'
+          // Use explicit SVG fill + fillOpacity attributes rather than
+          // Tailwind `fill-foreground/NN` classes — Tailwind v4's JIT
+          // generates color-mix() values for those that don't always
+          // apply cleanly to SVG <text> across browsers, leaving labels
+          // invisible. Direct `fill="var(--foreground)"` is bulletproof.
+          const labelFill = isActive ? '#2ecc71' : 'var(--foreground)'
+          const labelFillOpacity = isActive ? 1 : isHover ? 0.95 : 0.7
 
           return (
             <g
@@ -590,11 +696,12 @@ function TimelineOverview({
                 x={xStart - 8}
                 y={y + 4}
                 textAnchor="end"
-                className={labelClass}
+                fill={labelFill}
+                fillOpacity={labelFillOpacity}
                 fontSize="12"
                 fontWeight={isActive ? 700 : 500}
                 letterSpacing="0.2"
-                style={{ fontFamily: 'inherit', ...labelStyle }}
+                style={{ fontFamily: 'inherit' }}
               >
                 {b.name && b.name.length > 0 ? b.name : shortBranchName(b)}
               </text>
@@ -623,38 +730,90 @@ function TimelineOverview({
                 →
               </text>
 
-              {/* Op dots. Latest dot on the active lane breathes. */}
+              {/* Op dots. Latest dot on the active lane breathes.
+                  Active-lane dots also carry their event payload, so
+                  we paint the op symbol just above and a 3-char short
+                  label just below — answers "what was done in this
+                  branch" at a glance without hovering. */}
               {dots.map((dot, j) => {
                 const r = isActive ? (dot.isLatest ? 4.5 : 3.5) : 3.0
                 const pulse = isActive && dot.isLatest
+                const ev = dot.event
+                // Hide labels when neighbor dots are closer than ~30px
+                // (short_label is up to ~5 chars × ~6px ≈ 30px at fs9).
+                // Latest dot always keeps its label so the user can see
+                // what was just done. Symbol-only when slightly tighter.
+                const prev = j > 0 ? dots[j - 1] : null
+                const next = j < dots.length - 1 ? dots[j + 1] : null
+                const minGap = Math.min(
+                  prev ? dot.x - prev.x : Infinity,
+                  next ? next.x - dot.x : Infinity,
+                )
+                const showLabel = !!ev && (dot.isLatest || minGap >= 30)
+                const showSymbol = !!ev && (dot.isLatest || minGap >= 16)
                 return (
-                  <circle
-                    key={j}
-                    cx={dot.x}
-                    cy={y}
-                    r={r}
-                    fill={laneColor}
-                    fillOpacity={dotOpacity}
-                    className={pulse ? 'rh-git-pulse' : undefined}
-                    filter={pulse ? 'url(#rh-git-glow)' : undefined}
-                  />
+                  <g key={j}>
+                    <circle
+                      cx={dot.x}
+                      cy={y}
+                      r={r}
+                      fill={laneColor}
+                      fillOpacity={dotOpacity}
+                      className={pulse ? 'rh-git-pulse' : undefined}
+                      filter={pulse ? 'url(#rh-git-glow)' : undefined}
+                    />
+                    {showSymbol && ev && (
+                      <text
+                        x={dot.x}
+                        y={y - r - 4}
+                        textAnchor="middle"
+                        fill="var(--foreground)"
+                        fillOpacity={dot.isLatest ? 0.95 : 0.75}
+                        fontSize="10"
+                        style={{ fontFamily: 'inherit' }}
+                      >
+                        {symbolForOperation(ev.operation_type)}
+                      </text>
+                    )}
+                    {showLabel && ev && (
+                      <text
+                        x={dot.x}
+                        y={y + r + 9}
+                        textAnchor="middle"
+                        fill="var(--foreground)"
+                        fillOpacity={dot.isLatest ? 0.85 : 0.55}
+                        fontSize="9"
+                        letterSpacing="0.2"
+                        style={{ fontFamily: 'inherit' }}
+                      >
+                        {shortLabel(ev.operation_type)}
+                      </text>
+                    )}
+                  </g>
                 )
               })}
 
               {/* Op count near the right end (idle lanes only — active
-                  shows live dots). */}
-              {!isActive && b.event_count > 0 && (
-                <text
-                  x={xEnd - 4}
-                  y={y - 6}
-                  textAnchor="end"
-                  className="fill-foreground/55"
-                  fontSize="10"
-                  style={{ fontFamily: 'inherit' }}
-                >
-                  {b.event_count} ops
-                </text>
-              )}
+                  shows live dots). Use `events_since_fork` so we show
+                  how many ops THIS branch contributed, not the inflated
+                  inherited-events total. */}
+              {(() => {
+                const idleOps = b.events_since_fork ?? b.event_count
+                if (isActive || idleOps <= 0) return null
+                return (
+                  <text
+                    x={xEnd - 4}
+                    y={y - 6}
+                    textAnchor="end"
+                    fill="var(--foreground)"
+                    fillOpacity={0.55}
+                    fontSize="10"
+                    style={{ fontFamily: 'inherit' }}
+                  >
+                    {idleOps} ops
+                  </text>
+                )
+              })()}
             </g>
           )
         })}
@@ -715,6 +874,10 @@ export function Timeline() {
         console.error('[timeline] set-active-branch failed:', resp.status)
         return
       }
+      // Clear events immediately so the strip + active lane don't
+      // briefly render the previous branch's history while the new
+      // fetch is in flight. fetchHistory will repopulate within ~50ms.
+      setEvents([])
       setActiveBranchId(branchId)
     } catch (err) {
       console.error('[timeline] set-active-branch threw:', err)
@@ -723,6 +886,15 @@ export function Timeline() {
   const [loading, setLoading] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const [menu, setMenu] = useState<EventContextMenuState | null>(null)
+  // Branch-naming picker: opens when the user clicks ⑂. Pre-populated
+  // with three suggestions from `/api/branches/name-suggestions` plus
+  // a free-text fallback. Closed via Esc, click-outside, or Cancel.
+  const [branchPickerOpen, setBranchPickerOpen] = useState(false)
+  const [nameSuggestions, setNameSuggestions] = useState<string[]>([])
+  const [nameInput, setNameInput] = useState('')
+  const [creatingBranch, setCreatingBranch] = useState(false)
+  const branchPickerRef = useRef<HTMLDivElement | null>(null)
+  const branchInputRef = useRef<HTMLInputElement | null>(null)
   const wsStatus = useWSStore((s) => s.status)
 
   const handleEventContextMenu = useCallback(
@@ -735,6 +907,13 @@ export function Timeline() {
   )
 
   const closeMenu = useCallback(() => setMenu(null), [])
+
+  const closeBranchPicker = useCallback(() => {
+    setBranchPickerOpen(false)
+    setNameSuggestions([])
+    setNameInput('')
+    setCreatingBranch(false)
+  }, [])
 
   // Tick relative-time labels every second
   useEffect(() => {
@@ -750,19 +929,34 @@ export function Timeline() {
         fetch(`/api/timeline/history/${activeBranchId}`),
         fetch('/api/branches'),
       ])
-      if (histResp.ok) {
-        const data = await histResp.json()
-        if (Array.isArray(data)) {
-          setEvents(data)
-        } else if (data.events && Array.isArray(data.events)) {
-          setEvents(data.events)
-        }
-      }
+      let branchList: BranchView[] | null = null
       if (branchResp.ok) {
         const data = await branchResp.json()
         if (Array.isArray(data)) {
-          setBranches(data as BranchView[])
+          branchList = data as BranchView[]
+          setBranches(branchList)
         }
+      }
+      if (histResp.ok) {
+        const data = await histResp.json()
+        const raw: EventSummary[] = Array.isArray(data)
+          ? data
+          : data.events && Array.isArray(data.events)
+            ? data.events
+            : []
+        // Filter out events inherited from the parent branch. The
+        // history endpoint returns the full lineage (events with
+        // sequence ≤ fork_point.event_index were copied from the
+        // parent at fork time); the strip should show only events
+        // this branch added post-fork. `main` (parent === null)
+        // shows everything.
+        const active = branchList?.find((b) => b.id === activeBranchId)
+        const isRoot = !active || active.parent == null
+        const forkIdx = active?.fork_point?.event_index ?? 0
+        const filtered = isRoot
+          ? raw
+          : raw.filter((e) => e.sequence_number > forkIdx)
+        setEvents(filtered)
       }
     } catch {
       // Backend not running
@@ -807,6 +1001,38 @@ export function Timeline() {
     }
   }, [fetchHistory])
 
+  // Dismiss the branch picker on Esc or click-outside. The popover
+  // ref is null while closed, which short-circuits the contains-check.
+  useEffect(() => {
+    if (!branchPickerOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        closeBranchPicker()
+      }
+    }
+    const onPointer = (e: MouseEvent) => {
+      const root = branchPickerRef.current
+      if (root && !root.contains(e.target as Node)) {
+        closeBranchPicker()
+      }
+    }
+    // Defer the pointer listener by one frame so the click that
+    // opened the picker doesn't immediately close it.
+    const id = window.setTimeout(() => {
+      document.addEventListener('mousedown', onPointer)
+    }, 0)
+    document.addEventListener('keydown', onKey)
+    // Focus the input once mounted.
+    branchInputRef.current?.focus()
+    branchInputRef.current?.select()
+    return () => {
+      window.clearTimeout(id)
+      document.removeEventListener('mousedown', onPointer)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [branchPickerOpen, closeBranchPicker])
+
   const handleUndo = async () => {
     // Backend `/api/timeline/undo` requires `session_id` in the body
     // (see handlers/timeline.rs::undo_operation). Without it the call
@@ -849,32 +1075,133 @@ export function Timeline() {
   }
 
   const handleBranch = async () => {
+    // Open the picker. We always fetch fresh suggestions because the
+    // backend's pool is pseudo-randomized per request — a stale set
+    // from minutes ago would feel un-alive.
+    if (branchPickerOpen) {
+      closeBranchPicker()
+      return
+    }
+    setBranchPickerOpen(true)
+    setCreatingBranch(false)
+    setNameSuggestions([])
+    setNameInput('')
+    try {
+      const resp = await fetch('/api/branches/name-suggestions?count=3')
+      if (resp.ok) {
+        const data = (await resp.json()) as { names?: string[] }
+        const names = Array.isArray(data.names) ? data.names : []
+        setNameSuggestions(names)
+        // Leave `nameInput` empty so the user still has to actively
+        // pick a chip or type a name — pre-filling the input made
+        // the first suggestion look like a branch already existed.
+      }
+    } catch {
+      // Backend not running — picker still works as a free-text input.
+    }
+  }
+
+  const submitBranchCreate = async () => {
+    const name = nameInput.trim()
+    if (!name) return
     // Hit `/api/branches` (timeline-backed) rather than the legacy
     // `/api/timeline/branch/create` route — the latter writes into a
     // separate `branch_manager` store that `GET /api/branches` (used
     // by the overview minimap) does not read from, so its branches
     // never show up in the UI.
+    setCreatingBranch(true)
     try {
-      const ts = new Date()
-      const stamp = `${ts.getHours().toString().padStart(2, '0')}:${ts
-        .getMinutes()
-        .toString()
-        .padStart(2, '0')}:${ts.getSeconds().toString().padStart(2, '0')}`
       const resp = await fetch('/api/branches', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: `branch-${stamp}`,
+          name,
           parent: activeBranchId,
           description: 'manual branch from timeline strip',
         }),
       })
       if (!resp.ok) {
         console.error('[timeline] branch create failed:', resp.status)
+        setCreatingBranch(false)
+        return
       }
+      // Creating a branch does NOT make it the recording target; the
+      // backend keeps the old active branch until `/api/branches/active`
+      // is hit. Without this swap, the very next primitive the user
+      // adds would still land on the parent branch — the exact bug the
+      // user just hit. Pull the new branch's id out of the response
+      // and activate it before refreshing history.
+      const created = (await resp.json()) as { id?: string }
+      if (created.id) {
+        const activeResp = await fetch('/api/branches/active', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ branch_id: created.id }),
+        })
+        if (activeResp.ok) {
+          setEvents([])
+          setActiveBranchId(created.id)
+        } else {
+          console.error('[timeline] activate-after-create failed:', activeResp.status)
+        }
+      }
+      closeBranchPicker()
       fetchHistory()
     } catch (err) {
       console.error('[timeline] branch threw:', err)
+      setCreatingBranch(false)
+    }
+  }
+
+  const handleMerge = async () => {
+    if (activeBranchId === MAIN_BRANCH_ID) return
+    const sourceName = activeBranch?.name || 'this branch'
+    const ok = window.confirm(
+      `Merge "${sourceName}" into main?\n\nMain will fast-forward to include every event added on this branch.`,
+    )
+    if (!ok) return
+    try {
+      const resp = await fetch(
+        `/api/branches/${encodeURIComponent(activeBranchId)}/merge`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: 'main', strategy: 'fast-forward' }),
+        },
+      )
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => '')
+        console.error('[timeline] merge failed:', resp.status, body)
+        window.alert(
+          `Merge failed (${resp.status}). The backend may have rejected a non-fast-forward merge — try squashing instead.`,
+        )
+        return
+      }
+      const result = (await resp.json()) as {
+        success: boolean
+        merged_into: string
+        conflicts: string[]
+      }
+      if (!result.success) {
+        window.alert(
+          `Merge produced conflicts:\n\n${result.conflicts.join('\n') || 'unknown conflict'}`,
+        )
+        return
+      }
+      // Switch the active recording target back to main so the next
+      // primitive lands on the merged trunk, not the now-merged source.
+      const activeResp = await fetch('/api/branches/active', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ branch_id: MAIN_BRANCH_ID }),
+      })
+      if (activeResp.ok) {
+        setEvents([])
+        setActiveBranchId(MAIN_BRANCH_ID)
+      }
+      fetchHistory()
+    } catch (err) {
+      console.error('[timeline] merge threw:', err)
     }
   }
 
@@ -882,10 +1209,80 @@ export function Timeline() {
   const activeBranchLabel = activeBranch
     ? activeBranch.name || (activeBranch.id === MAIN_BRANCH_ID ? 'main' : '…')
     : 'main'
-  const otherBranchCount = Math.max(0, branches.length - 1)
+  // Match the minimap's filter — abandoned branches are hidden
+  // there, so the "+N" indicator should not count them either.
+  const visibleBranchCount = branches.filter(
+    (b) => b.state !== 'abandoned' && b.state !== 'merged',
+  ).length
+  const otherBranchCount = Math.max(0, visibleBranchCount - 1)
 
   return (
-    <div className="font-mono flex flex-col border-t border-border bg-card shrink-0">
+    <div className="relative font-mono flex flex-col border-t border-border bg-card shrink-0">
+      {branchPickerOpen && (
+        <div
+          ref={branchPickerRef}
+          className="absolute left-3 bottom-full mb-1 z-50 flex flex-col gap-2 px-3 py-2 rounded-md border border-border bg-card shadow-lg text-[12px]"
+          style={{ minWidth: 280 }}
+        >
+          <div className="text-foreground/70">
+            new branch from{' '}
+            <span className="text-foreground/90">{activeBranchLabel}</span>
+          </div>
+          {nameSuggestions.length > 0 && (
+            <div className="flex items-center gap-1 flex-wrap">
+              {nameSuggestions.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => {
+                    setNameInput(s)
+                    branchInputRef.current?.focus()
+                  }}
+                  className={
+                    'px-2 py-0.5 rounded border transition-colors ' +
+                    (nameInput === s
+                      ? 'border-[#2ecc71] text-foreground bg-[#2ecc71]/15'
+                      : 'border-border text-foreground/80 hover:bg-accent/40')
+                  }
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="flex items-center gap-1.5">
+            <input
+              ref={branchInputRef}
+              type="text"
+              value={nameInput}
+              onChange={(e) => setNameInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void submitBranchCreate()
+                }
+              }}
+              placeholder="branch name"
+              className="flex-1 min-w-0 px-2 py-1 rounded border border-border bg-background text-foreground placeholder:text-foreground/40 outline-none focus:border-[#2ecc71]"
+            />
+            <button
+              type="button"
+              onClick={() => void submitBranchCreate()}
+              disabled={creatingBranch || !nameInput.trim()}
+              className="px-2 py-1 rounded text-foreground bg-[#2ecc71]/20 hover:bg-[#2ecc71]/30 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {creatingBranch ? 'creating…' : 'create'}
+            </button>
+            <button
+              type="button"
+              onClick={closeBranchPicker}
+              className="px-2 py-1 rounded text-foreground/60 hover:bg-accent/40"
+            >
+              cancel
+            </button>
+          </div>
+        </div>
+      )}
       {/* Expanded panel: full git-style graph. Sits above the strip
           and only renders when the user clicks ▾. Horizontal scroll
           if the SVG is wider than the viewport. */}
@@ -909,6 +1306,16 @@ export function Timeline() {
           <HeaderButton onClick={handleRedo} title="Redo (Ctrl+Shift+Z)" ariaLabel="Redo">↷</HeaderButton>
           <HeaderButton onClick={handleCheckpoint} title="Checkpoint" ariaLabel="Create checkpoint">◈</HeaderButton>
           <HeaderButton onClick={handleBranch} title="Branch" ariaLabel="Create branch">⑂</HeaderButton>
+          <HeaderButton
+            onClick={handleMerge}
+            title={
+              activeBranchId === MAIN_BRANCH_ID
+                ? 'Merge into main (active branch is already main)'
+                : `Merge ${activeBranchLabel} into main`
+            }
+            ariaLabel="Merge into main"
+            disabled={activeBranchId === MAIN_BRANCH_ID}
+          >⊕</HeaderButton>
         </div>
 
         <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
@@ -989,6 +1396,28 @@ export function Timeline() {
               })
               if (!resp.ok) {
                 console.error('[timeline] truncate failed:', resp.status)
+              } else {
+                // Truncate can cascade-abandon child branches whose
+                // fork point landed in the discarded range. If the
+                // user was sitting on one of those branches, keeping
+                // them there leaves the recorder writing to a dead
+                // branch. Snap back to main so subsequent ops have a
+                // valid home and the strip reflects "the new world".
+                if (activeBranchId !== MAIN_BRANCH_ID) {
+                  try {
+                    const activeResp = await fetch('/api/branches/active', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ branch_id: MAIN_BRANCH_ID }),
+                    })
+                    if (activeResp.ok) {
+                      setEvents([])
+                      setActiveBranchId(MAIN_BRANCH_ID)
+                    }
+                  } catch {
+                    // Best-effort; the next fetchHistory will refresh.
+                  }
+                }
               }
             } catch (err) {
               console.error('[timeline] truncate threw:', err)

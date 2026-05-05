@@ -161,6 +161,25 @@ export function PropertiesPanel() {
                   className="w-full h-1 accent-primary"
                 />
               </div>
+              <div>
+                <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+                  <span>Opacity</span>
+                  <span className="font-mono">{obj.material.opacity.toFixed(2)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={obj.material.opacity}
+                  onChange={(e) =>
+                    updateObject(id, {
+                      material: { ...obj.material, opacity: Number(e.target.value) },
+                    })
+                  }
+                  className="w-full h-1 accent-primary"
+                />
+              </div>
             </div>
           </div>
 

@@ -22,10 +22,21 @@ use std::sync::Arc;
 
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
 use parking_lot::RwLock as PlRwLock;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::timeline::Timeline;
 use crate::types::{Author, BranchId, Operation};
+
+/// Internal command type for the recorder worker. The kernel only ever
+/// sends `Op`; `Flush` is reserved for the api-server to drain in-flight
+/// events before observing timeline head (e.g. so a freshly-clicked
+/// fork lands at the parent's *actual* most-recent event, not at a
+/// stale head from before the kernel's last few ops were drained).
+#[derive(Debug)]
+enum RecorderCmd {
+    Op(RecordedOperation),
+    Flush(oneshot::Sender<()>),
+}
 
 /// Shared, lock-protected handle to a [`Timeline`].
 ///
@@ -67,7 +78,7 @@ pub type SharedTimeline = Arc<RwLock<Timeline>>;
 /// that preserves every byte the kernel emitted.
 #[derive(Debug, Clone)]
 pub struct TimelineRecorder {
-    tx: mpsc::UnboundedSender<RecordedOperation>,
+    tx: mpsc::UnboundedSender<RecorderCmd>,
     author: Author,
     /// The branch every event is appended to. Wrapped in an
     /// `Arc<parking_lot::RwLock>` so the api-server can swap it in
@@ -94,27 +105,43 @@ impl TimelineRecorder {
     /// * `branch_id` — the initial branch events are appended to. May
     ///   be changed at any time via [`set_branch_id`](Self::set_branch_id).
     pub fn new(timeline: SharedTimeline, author: Author, branch_id: BranchId) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<RecordedOperation>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RecorderCmd>();
         let branch_id = Arc::new(PlRwLock::new(branch_id));
 
         let worker_author = author.clone();
         let worker_branch = Arc::clone(&branch_id);
         let worker_timeline = timeline;
         tokio::spawn(async move {
-            while let Some(record) = rx.recv().await {
-                let op = to_timeline_operation(&record);
-                // Snapshot the active branch *per event* so a swap via
-                // `set_branch_id` takes effect on the next op without
-                // restarting the worker.
-                let target = *worker_branch.read();
-                let guard = worker_timeline.read().await;
-                if let Err(err) = guard.add_operation(op, worker_author.clone(), target).await {
-                    tracing::warn!(
-                        target: "timeline.recorder_bridge",
-                        kind = %record.kind,
-                        error = %err,
-                        "timeline.add_operation failed — event dropped"
-                    );
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    RecorderCmd::Op(record) => {
+                        let op = to_timeline_operation(&record);
+                        // Snapshot the active branch *per event* so a swap via
+                        // `set_branch_id` takes effect on the next op without
+                        // restarting the worker.
+                        let target = *worker_branch.read();
+                        let guard = worker_timeline.read().await;
+                        if let Err(err) =
+                            guard.add_operation(op, worker_author.clone(), target).await
+                        {
+                            tracing::warn!(
+                                target: "timeline.recorder_bridge",
+                                kind = %record.kind,
+                                error = %err,
+                                "timeline.add_operation failed — event dropped"
+                            );
+                        }
+                    }
+                    RecorderCmd::Flush(resp) => {
+                        // FIFO ordering on the MPSC guarantees that every
+                        // `Op` enqueued before this `Flush` has already
+                        // been drained and applied above. Signalling now
+                        // lets the caller observe a fully-up-to-date
+                        // timeline head. We ignore send failures: the
+                        // caller's oneshot rx may have been dropped if
+                        // they timed out, which is safe to swallow.
+                        let _ = resp.send(());
+                    }
                 }
             }
             tracing::debug!(
@@ -148,11 +175,42 @@ impl TimelineRecorder {
     pub fn set_branch_id(&self, branch_id: BranchId) {
         *self.branch_id.write() = branch_id;
     }
+
+    /// Block until every `Op` enqueued *before* this call has been
+    /// applied to the timeline.
+    ///
+    /// The kernel's `record()` is fire-and-forget — it pushes into the
+    /// MPSC channel and returns immediately, leaving a background worker
+    /// to apply the event to the timeline asynchronously. Most callers
+    /// don't care, but a few API-server paths need a barrier:
+    ///
+    /// * `POST /api/branches` — the new branch's fork point must anchor
+    ///   to the parent branch's *actual* most-recent event. Without a
+    ///   flush, ops enqueued microseconds earlier may not yet have been
+    ///   drained, and `Timeline::create_branch` would read a stale head.
+    ///
+    /// Implementation: enqueue a `Flush` sentinel and await the
+    /// oneshot. FIFO ordering on the MPSC guarantees every prior `Op`
+    /// has already been applied by the worker before it dequeues the
+    /// sentinel.
+    pub async fn flush(&self) -> Result<(), RecorderError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx.send(RecorderCmd::Flush(resp_tx)).map_err(|e| {
+            RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
+        })?;
+        resp_rx.await.map_err(|e| {
+            RecorderError::Unavailable(format!(
+                "TimelineRecorder flush response lost: {}",
+                e
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 impl OperationRecorder for TimelineRecorder {
     fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
-        self.tx.send(operation).map_err(|e| {
+        self.tx.send(RecorderCmd::Op(operation)).map_err(|e| {
             RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
         })
     }

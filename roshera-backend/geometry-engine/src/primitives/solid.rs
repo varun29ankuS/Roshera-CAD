@@ -199,6 +199,41 @@ pub struct HistoryNode {
     pub timestamp: std::time::SystemTime,
 }
 
+/// Anchoring metadata that records *which* datum a primitive was placed
+/// against and the local-frame transform applied on top of that datum's
+/// frame.
+///
+/// Geometry is still stored in world coordinates — the anchor does not
+/// change vertex positions. It is bookkeeping that lets the kernel,
+/// the API, and downstream LLM-readable surfaces answer the question
+/// "what was this solid placed against?" without re-deriving it from
+/// raw vertex coordinates.
+///
+/// The composed world transform applied to the primitive's vertices at
+/// creation time is `datum.frame() * local_transform`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolidAnchor {
+    /// Id of the datum this solid is anchored to. Default-seeded model
+    /// guarantees `0` is the world Origin.
+    pub datum_id: u32,
+    /// Local-frame placement on top of the datum's frame. Identity
+    /// means "placed at the datum's origin, axes aligned with the
+    /// datum's axes".
+    pub local_transform: Matrix4,
+}
+
+impl SolidAnchor {
+    /// Anchor at the world Origin (datum id 0) with no local offset.
+    /// Used as the default for legacy primitive creation paths that
+    /// pre-date Slice 2.
+    pub fn world_origin() -> Self {
+        Self {
+            datum_id: 0,
+            local_transform: Matrix4::identity(),
+        }
+    }
+}
+
 /// Solid representation
 #[derive(Debug, Clone)]
 pub struct Solid {
@@ -214,6 +249,11 @@ pub struct Solid {
     features: Arc<RwLock<HashMap<u32, Feature>>>,
     /// Attributes
     pub attributes: SolidAttributes,
+    /// Datum anchoring metadata (Slice 2). `None` for solids created
+    /// before this slice or produced by operations that derive a new
+    /// solid from existing geometry (booleans, extrudes), which are
+    /// not "placed" against a datum in the same sense as a primitive.
+    pub anchor: Option<SolidAnchor>,
     /// Cached mass properties
     cached_mass_props: Option<SolidMassProperties>,
     /// Cached statistics
@@ -247,6 +287,7 @@ impl Solid {
             name: None,
             features: Arc::new(RwLock::new(HashMap::new())),
             attributes: SolidAttributes::default(),
+            anchor: None,
             cached_mass_props: None,
             cached_stats: None,
             parent_assembly: None,

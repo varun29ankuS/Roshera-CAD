@@ -185,6 +185,10 @@ pub struct BRepModel {
     pub solids: SolidStore,
     /// Sketch plane storage
     pub sketch_planes: DashMap<String, SketchPlane>,
+    /// Datum storage (Origin, reference planes, reference axes, plus
+    /// future user-authored datums). Seeded with the canonical seven on
+    /// model construction; see `crate::primitives::datum`.
+    pub datums: crate::primitives::datum::DatumStore,
     /// Optional recorder receiving one event per successful operation.
     /// `None` by default — tests and unattached models incur zero overhead.
     /// Attached via `attach_recorder` by the orchestration layer
@@ -204,6 +208,12 @@ impl BRepModel {
         let (vertex_capacity, edge_capacity, face_capacity, shell_capacity, solid_capacity) =
             complexity.estimate_topology_requirements();
 
+        let datums = crate::primitives::datum::DatumStore::new();
+        // Every model starts with the canonical seven default datums
+        // (Origin + 3 planes + 3 axes). User datums (Slice 3) are added
+        // on top of these.
+        datums.seed_defaults();
+
         Self {
             vertices: VertexStore::with_capacity_and_tolerance(vertex_capacity, 1e-12),
             curves: CurveStore::new(),
@@ -214,6 +224,7 @@ impl BRepModel {
             shells: ShellStore::with_capacity(shell_capacity),
             solids: SolidStore::with_capacity(solid_capacity),
             sketch_planes: DashMap::new(),
+            datums,
             recorder: None,
         }
     }
@@ -965,6 +976,24 @@ impl std::fmt::Display for GeometryId {
 /// preserved in the returned u64 — callers relying on round-trip identity
 /// must consult the accompanying `RecordedOperation::parameters` payload,
 /// which serializes the original `TimelineOperation` in full.
+/// Whether `m` is within `eps` of the 4×4 identity, element-wise.
+///
+/// Used by datum-anchored primitive creators to skip the inner
+/// `transform_solid` call (and its timeline event) when the composed
+/// world transform is a no-op — the most common case being anchoring
+/// to the world Origin with an identity local transform.
+fn is_approx_identity(m: &Matrix4, eps: f64) -> bool {
+    for r in 0..4 {
+        for c in 0..4 {
+            let expected = if r == c { 1.0 } else { 0.0 };
+            if (m.get(r, c) - expected).abs() > eps {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn geometry_id_to_u64(id: GeometryId) -> u64 {
     match id {
         GeometryId::Face(i)
@@ -1576,6 +1605,171 @@ impl<'a> TopologyBuilder<'a> {
         self.record_and_push(operation, vec![solid_id as u64]);
 
         Ok(GeometryId::Solid(solid_id))
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Datum-anchored primitive creation (Slice 2)
+    //
+    // Each `create_*_anchored` runs the existing world-origin creator
+    // and then composes the datum's reference frame with the caller's
+    // local transform to position the freshly-created solid. The anchor
+    // metadata is stamped on the solid so downstream consumers (REST,
+    // model tree, LLM-readable surfaces) can answer "what was this
+    // primitive placed against?" without re-deriving it from vertex
+    // coordinates.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Apply datum-anchoring to an already-created solid: composes the
+    /// datum's local-to-world frame with the caller's local transform,
+    /// transforms the solid's geometry into world space, and stamps
+    /// `SolidAnchor` metadata so the placement can be queried later.
+    ///
+    /// Identity world transforms are skipped — anchoring to the world
+    /// Origin with identity local transform is a no-op on geometry but
+    /// still records the anchor metadata.
+    pub fn anchor_solid(
+        &mut self,
+        solid_id: SolidId,
+        datum_id: u32,
+        local_transform: Matrix4,
+    ) -> Result<(), PrimitiveError> {
+        let frame = self.model.datums.frame(datum_id).ok_or_else(|| {
+            PrimitiveError::InvalidParameters {
+                parameter: "datum_id".to_string(),
+                value: datum_id.to_string(),
+                constraint: "must reference an existing datum".to_string(),
+            }
+        })?;
+        let world_transform = frame * local_transform;
+
+        if !is_approx_identity(&world_transform, 1e-12) {
+            crate::operations::transform::transform_solid(
+                self.model,
+                solid_id,
+                world_transform,
+                crate::operations::transform::TransformOptions::default(),
+            )
+            .map_err(|e| PrimitiveError::GeometryError {
+                operation: "anchor_solid".to_string(),
+                details: format!("{:?}", e),
+            })?;
+        }
+
+        let solid =
+            self.model
+                .solids
+                .get_mut(solid_id)
+                .ok_or_else(|| PrimitiveError::InvalidParameters {
+                    parameter: "solid_id".to_string(),
+                    value: solid_id.to_string(),
+                    constraint: "must reference an existing solid".to_string(),
+                })?;
+        solid.anchor = Some(crate::primitives::solid::SolidAnchor {
+            datum_id,
+            local_transform,
+        });
+
+        Ok(())
+    }
+
+    /// Create a 3D box anchored to a datum.
+    ///
+    /// `local_transform` is applied on top of the datum's frame.
+    /// `Matrix4::identity()` places the box centred on the datum's
+    /// origin with axes aligned to the datum's frame.
+    pub fn create_box_3d_anchored(
+        &mut self,
+        width: f64,
+        height: f64,
+        depth: f64,
+        datum_id: u32,
+        local_transform: Matrix4,
+    ) -> Result<GeometryId, PrimitiveError> {
+        let geo = self.create_box_3d(width, height, depth)?;
+        if let GeometryId::Solid(sid) = geo {
+            self.anchor_solid(sid, datum_id, local_transform)?;
+        }
+        Ok(geo)
+    }
+
+    /// Create a 3D sphere anchored to a datum.
+    pub fn create_sphere_3d_anchored(
+        &mut self,
+        radius: f64,
+        datum_id: u32,
+        local_transform: Matrix4,
+    ) -> Result<GeometryId, PrimitiveError> {
+        let geo = self.create_sphere_3d(Point3::ORIGIN, radius)?;
+        if let GeometryId::Solid(sid) = geo {
+            self.anchor_solid(sid, datum_id, local_transform)?;
+        }
+        Ok(geo)
+    }
+
+    /// Create a 3D cylinder anchored to a datum. The cylinder axis is
+    /// the datum frame's local +Z; the caller's `local_transform` can
+    /// re-orient or offset it further.
+    pub fn create_cylinder_3d_anchored(
+        &mut self,
+        radius: f64,
+        height: f64,
+        datum_id: u32,
+        local_transform: Matrix4,
+    ) -> Result<GeometryId, PrimitiveError> {
+        let geo = self.create_cylinder_3d(
+            Point3::ORIGIN,
+            Vector3::Z,
+            radius,
+            height,
+        )?;
+        if let GeometryId::Solid(sid) = geo {
+            self.anchor_solid(sid, datum_id, local_transform)?;
+        }
+        Ok(geo)
+    }
+
+    /// Create a 3D cone (frustum) anchored to a datum. Axis is the
+    /// datum frame's local +Z.
+    pub fn create_cone_3d_anchored(
+        &mut self,
+        base_radius: f64,
+        top_radius: f64,
+        height: f64,
+        datum_id: u32,
+        local_transform: Matrix4,
+    ) -> Result<GeometryId, PrimitiveError> {
+        let geo = self.create_cone_3d(
+            Point3::ORIGIN,
+            Vector3::Z,
+            base_radius,
+            top_radius,
+            height,
+        )?;
+        if let GeometryId::Solid(sid) = geo {
+            self.anchor_solid(sid, datum_id, local_transform)?;
+        }
+        Ok(geo)
+    }
+
+    /// Create a 3D torus anchored to a datum. Axis is the datum
+    /// frame's local +Z.
+    pub fn create_torus_3d_anchored(
+        &mut self,
+        major_radius: f64,
+        minor_radius: f64,
+        datum_id: u32,
+        local_transform: Matrix4,
+    ) -> Result<GeometryId, PrimitiveError> {
+        let geo = self.create_torus_3d(
+            Point3::ORIGIN,
+            Vector3::Z,
+            major_radius,
+            minor_radius,
+        )?;
+        if let GeometryId::Solid(sid) = geo {
+            self.anchor_solid(sid, datum_id, local_transform)?;
+        }
+        Ok(geo)
     }
 
     /// Create a plane primitive as a thin box

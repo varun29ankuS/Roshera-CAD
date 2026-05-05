@@ -1,6 +1,7 @@
 // Core topology modules
 pub mod blending_surfaces;
 pub mod curve;
+pub mod datum;
 pub mod edge;
 pub mod face;
 pub mod fillet_surfaces;

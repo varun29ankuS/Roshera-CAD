@@ -16,7 +16,7 @@ use std::sync::Arc;
 use timeline_engine::{
     rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId,
     EventMetadata, Operation, OperationInputs, ReplayOutcome, SessionId, Timeline, TimelineError,
-    TimelineEvent, TimelineRecorder,
+    TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -225,15 +225,20 @@ async fn replay_session_to_model(
         (position.branch_id, events)
     };
 
-    // 2. Replace the live model with a fresh one and reattach a recorder
-    //    so post-replay kernel ops continue to be timeline-recorded.
+    // 2. Replace the live model with a fresh one and reattach the
+    //    shared recorder so post-replay kernel ops continue to be
+    //    timeline-recorded against the *current* active branch.
+    //
+    //    CRITICAL: reuse `state.timeline_recorder` (the same Arc that
+    //    `set_active_branch` mutates via `set_branch_id`). Constructing
+    //    a fresh `TimelineRecorder` here would detach the active-branch
+    //    handle and silently route every subsequent kernel op to
+    //    whatever branch this fresh recorder was hardcoded with —
+    //    which was the source of "post-undo/redo/truncate ops land on
+    //    main instead of the user's active branch".
     let mut model_guard = state.model.write().await;
     *model_guard = BRepModel::new();
-    let recorder: Arc<dyn OperationRecorder> = Arc::new(TimelineRecorder::new(
-        Arc::clone(&state.timeline),
-        Author::System,
-        BranchId::main(),
-    ));
+    let recorder: Arc<dyn OperationRecorder> = state.timeline_recorder.clone();
     model_guard.attach_recorder(Some(recorder));
 
     // 3. Replay. `rebuild_model_from_events` detaches the recorder for

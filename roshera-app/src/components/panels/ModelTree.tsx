@@ -100,8 +100,64 @@ function symbolForType(type: string): string {
     case 'pattern': return '▦'
     case 'hole': return '⊙'
     case 'part': return '◆'
+    case 'datumgroup': return '⌖'
+    case 'datumorigin': return '⊕'
+    case 'datumplane': return '▱'
+    case 'datumaxis': return '↔'
     default: return '•'
   }
+}
+
+// ─── Datum DTO (GET /api/datums) ────────────────────────────────────
+
+interface DatumDto {
+  id: number
+  name: string
+  kind: 'origin' | 'plane' | 'axis'
+  plane_orientation?: string
+  axis_direction?: string
+  origin: [number, number, number]
+  visible: boolean
+  is_default: boolean
+}
+
+interface DatumListResponse {
+  datums: DatumDto[]
+}
+
+/**
+ * Build a tree node for the Datums group from the backend snapshot.
+ * Tree-node ids use the `datum:<numeric-id>` prefix so the visibility
+ * toggle handler can route the click back to `PATCH /api/datums/:id/...`
+ * instead of mutating the local scene-store.
+ */
+function datumsToNodes(datums: DatumDto[]): TreeNode[] {
+  if (datums.length === 0) return []
+  const children: TreeNode[] = datums.map((d) => {
+    const subtype =
+      d.kind === 'origin' ? 'datumorigin' :
+      d.kind === 'plane' ? 'datumplane' :
+      'datumaxis'
+    return {
+      id: `datum:${d.id}`,
+      name: d.name,
+      type: subtype,
+      symbol: symbolForType(subtype),
+      visible: d.visible,
+      locked: d.is_default,
+    }
+  })
+  return [
+    {
+      id: 'datum:group',
+      name: 'datums',
+      type: 'datumgroup',
+      symbol: symbolForType('datumgroup'),
+      visible: children.some((c) => c.visible),
+      locked: true,
+      children,
+    },
+  ]
 }
 
 // ─── Tree row (terminal lineage style) ──────────────────────────────
@@ -468,6 +524,7 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
   const sessionId = useWSStore((s) => s.sessionId)
 
   const [backendNodes, setBackendNodes] = useState<TreeNode[] | null>(null)
+  const [datums, setDatums] = useState<DatumDto[]>([])
   const [menu, setMenu] = useState<TreeContextMenuState | null>(null)
 
   const handleNodeContextMenu = useCallback(
@@ -499,12 +556,33 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
     setBackendNodes(null)
   }, [sessionId])
 
+  // Fetch the canonical datum list (Origin + reference planes + axes,
+  // plus user-authored datums in Slice 3). Same poll cadence as the
+  // hierarchy fetch — datums are tens-of-bytes per row, so polling is
+  // cheap and we get visibility-flag sync for free.
+  const fetchDatums = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/datums`)
+      if (resp.ok) {
+        const data: DatumListResponse = await resp.json()
+        if (Array.isArray(data.datums)) {
+          setDatums(data.datums)
+          return
+        }
+      }
+    } catch {
+      // Backend not running — leave datums as-is rather than clearing,
+      // so the tree doesn't flicker on transient network errors.
+    }
+  }, [])
+
   useEffect(() => {
     if (wsStatus === 'connected') {
       // Fetch on connect — async to avoid synchronous setState in effect
       void Promise.resolve().then(fetchHierarchy)
+      void Promise.resolve().then(fetchDatums)
     }
-  }, [wsStatus, fetchHierarchy])
+  }, [wsStatus, fetchHierarchy, fetchDatums])
 
   // Poll for hierarchy updates (pause when tab is hidden)
   useEffect(() => {
@@ -512,7 +590,10 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
 
     function startPolling() {
       stopPolling()
-      timer = setInterval(fetchHierarchy, 5000)
+      timer = setInterval(() => {
+        fetchHierarchy()
+        fetchDatums()
+      }, 5000)
     }
 
     function stopPolling() {
@@ -522,6 +603,7 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
     function handleVisibility() {
       if (document.visibilityState === 'visible') {
         fetchHierarchy()
+        fetchDatums()
         startPolling()
       } else {
         stopPolling()
@@ -534,7 +616,7 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
       stopPolling()
       document.removeEventListener('visibilitychange', handleVisibility)
     }
-  }, [fetchHierarchy])
+  }, [fetchHierarchy, fetchDatums])
 
   // Preview mode short-circuits to mock data; otherwise use backend hierarchy
   // if available *and non-empty*, falling back to the local scene store.
@@ -561,14 +643,55 @@ export function ModelTree({ onCollapse }: { onCollapse?: () => void } = {}) {
   const objectNodes = isPreviewMode()
     ? MOCK_TREE_NODES
     : (backendNodes && backendNodes.length > 0 ? backendNodes : localNodes)
-  const treeNodes = [...sketchNodes, ...objectNodes]
+  // Datums sit at the very top of the tree — they're the canonical
+  // reference frame everything else is positioned against, so listing
+  // them first matches the mental model "place primitives relative to
+  // these references".
+  const datumNodes = datumsToNodes(datums)
+  const treeNodes = [...datumNodes, ...sketchNodes, ...objectNodes]
 
   const handleToggleVisibility = useCallback(
     (id: string) => {
+      // Datum ids carry the `datum:` prefix; route them back to the
+      // kernel via PATCH so the visibility flag persists across reloads
+      // and is shared across collaborators.
+      if (id.startsWith('datum:')) {
+        const tail = id.slice('datum:'.length)
+        if (tail === 'group') {
+          // Toggling the group flips every default datum to the
+          // inverse of the group's current "any visible" indicator.
+          const anyVisible = datums.some((d) => d.visible)
+          const next = !anyVisible
+          for (const d of datums) {
+            void fetch(`${API_BASE}/api/datums/${d.id}/visibility`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ visible: next }),
+            })
+          }
+          // Optimistic local update; the next poll will reconcile.
+          setDatums((prev) => prev.map((d) => ({ ...d, visible: next })))
+          return
+        }
+        const numericId = Number(tail)
+        if (!Number.isFinite(numericId)) return
+        const target = datums.find((d) => d.id === numericId)
+        if (!target) return
+        const next = !target.visible
+        void fetch(`${API_BASE}/api/datums/${numericId}/visibility`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ visible: next }),
+        })
+        setDatums((prev) =>
+          prev.map((d) => (d.id === numericId ? { ...d, visible: next } : d)),
+        )
+        return
+      }
       const obj = objects.get(id)
       if (obj) updateObject(id, { visible: !obj.visible })
     },
-    [objects, updateObject],
+    [datums, objects, updateObject],
   )
 
   const handleToggleLock = useCallback(
