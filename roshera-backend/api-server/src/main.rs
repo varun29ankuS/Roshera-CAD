@@ -3521,6 +3521,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Switch the kernel's currently-recording branch. Must precede
         // the `{id}` route so axum doesn't treat "active" as a UUID.
         .route("/api/branches/active", post(branches::set_active_branch))
+        // Curated branch-name suggestions. Same precedence reason —
+        // must come before `/api/branches/{id}`.
+        .route(
+            "/api/branches/name-suggestions",
+            get(branches::suggest_names),
+        )
         .route(
             "/api/branches/{id}",
             get(branches::get_branch).delete(branches::delete_branch),

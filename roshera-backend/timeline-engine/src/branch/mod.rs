@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 pub mod conflict;
 mod merge;
+pub mod name_pool;
 mod strategy;
 
 pub use conflict::ConflictResolver;
@@ -21,6 +22,7 @@ pub use merge::{
     ConflictResolution, ConflictStrategy, MergeConflict, MergeResult, MergeStatistics,
     MergeStrategy,
 };
+pub use name_pool::{suggest_branch_names, BRANCH_NAME_POOL};
 pub use strategy::{BranchingStrategy, ExplorationStrategy};
 
 /// Branch manager for the timeline system
