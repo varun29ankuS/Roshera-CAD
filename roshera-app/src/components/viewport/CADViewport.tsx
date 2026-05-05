@@ -5,7 +5,7 @@ import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'
 import { CameraController } from './CameraController'
-import { ReferencePlanes } from './ReferencePlanes'
+import { Datums } from './Datums'
 import { SceneObjects } from './SceneObjects'
 import { TransformGizmo } from './TransformGizmo'
 import { ExtrudeGizmo } from './ExtrudeGizmo'
@@ -79,7 +79,7 @@ export function CADViewport() {
         <CameraController />
         <SceneLighting />
         <CADGrid />
-        <ReferencePlanes />
+        <Datums />
         <GizmoNav />
         <SceneObjects />
         <TransformGizmo />

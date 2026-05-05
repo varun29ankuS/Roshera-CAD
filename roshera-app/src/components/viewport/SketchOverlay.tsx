@@ -112,10 +112,25 @@ function planeMeshQuaternion(plane: SketchPlane): THREE.Quaternion {
   return q
 }
 
-/** Snap a value to the nearest `step` (no snap when step ≤ 0). */
-function snap(value: number, step: number): number {
-  if (step <= 0) return value
-  return Math.round(value / step) * step
+/**
+ * Snap a (u, v) sketch-plane coordinate, with magnetic attraction to
+ * the plane's origin (0, 0) and to its two axes (u = 0 and v = 0).
+ * Datums are the canonical reference frame everything in a design is
+ * positioned against; without origin / axis snap there's no way to
+ * reliably anchor a sketch to (0, 0). The axis-snap radius is half a
+ * grid step (or 0.25 mm when grid snap is off) so the attractor feels
+ * like a "notch" at the axis rather than fighting the grid.
+ */
+function snapUV(uv: [number, number], step: number): [number, number] {
+  let [u, v] = uv
+  const axisRadius = step > 0 ? step * 0.5 : 0.25
+  if (Math.abs(u) < axisRadius) u = 0
+  if (Math.abs(v) < axisRadius) v = 0
+  if (step > 0) {
+    u = Math.round(u / step) * step
+    v = Math.round(v / step) * step
+  }
+  return [u, v]
 }
 
 /** Pretty-print a length: 4 sig figs, mm suffix, no trailing zeros. */
@@ -147,7 +162,7 @@ export function SketchOverlay() {
       if (!sketch.active) return
       e.stopPropagation()
       const uv = pointToPlaneUV(e.point, sketch.plane)
-      setSketchHover([snap(uv[0], snapStep), snap(uv[1], snapStep)])
+      setSketchHover(snapUV(uv, snapStep))
     },
     [sketch.active, sketch.plane, setSketchHover, snapStep],
   )
@@ -167,10 +182,7 @@ export function SketchOverlay() {
       // un-routed so OrbitControls / future menus stay free.
       if (native.button !== 0) return
       const uv = pointToPlaneUV(e.point, sketch.plane)
-      const snapped: [number, number] = [
-        snap(uv[0], snapStep),
-        snap(uv[1], snapStep),
-      ]
+      const snapped: [number, number] = snapUV(uv, snapStep)
 
       // Tool-specific termination: rectangle = 2 corners, circle =
       // center + radius point. For polyline the panel's "Finish"

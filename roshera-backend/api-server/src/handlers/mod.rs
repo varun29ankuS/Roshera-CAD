@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod cache;
 pub mod capabilities;
+pub mod datums;
 pub mod export;
 pub mod geometry;
 pub mod hierarchy;

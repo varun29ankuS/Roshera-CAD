@@ -80,6 +80,23 @@ pub struct CreateBranchBody {
     pub description: Option<String>,
 }
 
+/// Where a branch diverged from its parent. Mirrors
+/// `timeline_engine::types::ForkPoint` on the wire so the UI can
+/// anchor a fork's elbow at the parent's exact Nth event-dot — using
+/// `created_at` (wall-clock) for that role collapses every fork to
+/// near-zero on a freshly-created timeline. `branch_id` is the parent
+/// branch (`"main"` or UUID) and `event_index` is the parent's head
+/// event index at the moment of fork.
+#[derive(Debug, Serialize)]
+pub struct ForkPointView {
+    /// Parent branch id — `"main"` or a UUIDv4 string.
+    pub branch_id: String,
+    /// Parent branch's head event index at fork time. Zero on `main`.
+    pub event_index: u64,
+    /// ISO-8601 timestamp of the fork.
+    pub timestamp: String,
+}
+
 /// One branch's public projection. Same shape on every endpoint that
 /// returns a branch so agents can reuse a single deserializer.
 #[derive(Debug, Serialize)]
@@ -100,8 +117,21 @@ pub struct BranchView {
     pub purpose: String,
     /// Number of events recorded against this branch.
     pub event_count: usize,
+    /// Number of events on this branch *strictly after* its fork point —
+    /// i.e. ops recorded against this branch since it diverged. For
+    /// `main` this equals `event_count`. For a child branch with no
+    /// new ops past the fork this is `0` (the lane should render with
+    /// just the fork-elbow and no per-branch dots — without this, the
+    /// UI was painting `event_count` evenly spaced phantom dots that
+    /// were really inherited parent events).
+    pub events_since_fork: usize,
     /// ISO-8601 timestamp of branch creation.
     pub created_at: String,
+    /// Parent + event index at the moment this branch diverged. The
+    /// timeline UI uses `fork_point.event_index` to anchor the fork
+    /// elbow at the parent's Nth event-dot. Always present (even on
+    /// `main`, where `branch_id == "main"` and `event_index == 0`).
+    pub fork_point: ForkPointView,
 }
 
 /// `POST /api/branches/active` body.
@@ -226,10 +256,15 @@ fn extract_agent_id(branch: &timeline_engine::types::Branch) -> Option<String> {
         })
 }
 
-/// Build a `BranchView` from a timeline `Branch`. `event_count` is
-/// passed in separately because counting events requires a separate
-/// timeline lookup the caller has already done.
-fn render_branch(branch: &timeline_engine::types::Branch, event_count: usize) -> BranchView {
+/// Build a `BranchView` from a timeline `Branch`. `event_count` and
+/// `events_since_fork` are passed in separately because computing them
+/// requires a timeline lookup the caller has already done (and avoids
+/// re-acquiring the read guard inside the renderer).
+fn render_branch(
+    branch: &timeline_engine::types::Branch,
+    event_count: usize,
+    events_since_fork: usize,
+) -> BranchView {
     BranchView {
         id: branch.id.to_string(),
         name: branch.name.clone(),
@@ -239,8 +274,38 @@ fn render_branch(branch: &timeline_engine::types::Branch, event_count: usize) ->
         author: author_label(&branch.metadata.created_by),
         purpose: purpose_label(&branch.metadata.purpose),
         event_count,
+        events_since_fork,
         created_at: branch.metadata.created_at.to_rfc3339(),
+        fork_point: ForkPointView {
+            branch_id: branch.fork_point.branch_id.to_string(),
+            event_index: branch.fork_point.event_index,
+            timestamp: branch.fork_point.timestamp.to_rfc3339(),
+        },
     }
+}
+
+/// Count events on `branch` whose sequence number is strictly greater
+/// than its `fork_point.event_index` — i.e. ops that this branch added
+/// *after* it diverged from its parent.
+///
+/// For root branches (`parent.is_none()`, e.g. `main`) every event is
+/// post-fork by definition. For non-root branches, the inherited
+/// events have sequence numbers ≤ `fork_idx` (the parent's head at
+/// fork time); only events with sequence > `fork_idx` are this
+/// branch's own additions.
+fn count_events_since_fork(
+    timeline: &timeline_engine::Timeline,
+    branch: &timeline_engine::types::Branch,
+    event_count: usize,
+) -> usize {
+    if branch.parent.is_none() {
+        return event_count;
+    }
+    let fork_idx = branch.fork_point.event_index;
+    timeline
+        .get_branch_events(&branch.id, Some(fork_idx + 1), None)
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 /// Translate `TimelineError` to the structured `ApiError` catalog.
@@ -274,7 +339,8 @@ pub async fn list_branches(
                 .get_branch_events(&b.id, None, None)
                 .map(|v| v.len())
                 .unwrap_or(0);
-            render_branch(b, count)
+            let since_fork = count_events_since_fork(&timeline, b, count);
+            render_branch(b, count, since_fork)
         })
         .collect();
     // Stable order: main first, then by created_at ascending. Without
@@ -337,6 +403,19 @@ pub async fn create_branch(
         ),
     };
 
+    // Drain in-flight kernel events first. The recorder is sync-fire-
+    // and-forget on the kernel side: every successful geometry op
+    // pushes a `RecordedOperation` into an MPSC channel, and a
+    // background worker applies them to the timeline asynchronously.
+    // If the user clicks "branch" right after creating ops, those ops
+    // may still be queued — without the flush, `Timeline::create_branch`
+    // would compute the fork point against a stale parent head and the
+    // new branch would visually fork off an earlier event. Flushing here
+    // gives the fork point the parent's *actual* most-recent event.
+    // Failure is non-fatal: the worker may have shut down, in which
+    // case there is nothing in flight to drain anyway.
+    let _ = state.timeline_recorder.flush().await;
+
     // Acquire the timeline write lock for the smallest possible window:
     // create_branch reads parent existence then inserts. Drop before
     // the read-side render to avoid contending with concurrent reads.
@@ -356,7 +435,8 @@ pub async fn create_branch(
         .get_branch_events(&new_id, None, None)
         .map(|v| v.len())
         .unwrap_or(0);
-    Ok(Json(render_branch(&branch, count)))
+    let since_fork = count_events_since_fork(&timeline, &branch, count);
+    Ok(Json(render_branch(&branch, count, since_fork)))
 }
 
 /// `GET /api/branches/{id}` — single-branch detail.
@@ -374,7 +454,8 @@ pub async fn get_branch(
         .get_branch_events(&bid, None, None)
         .map(|v| v.len())
         .unwrap_or(0);
-    Ok(Json(render_branch(&branch, count)))
+    let since_fork = count_events_since_fork(&timeline, &branch, count);
+    Ok(Json(render_branch(&branch, count, since_fork)))
 }
 
 /// `DELETE /api/branches/{id}` — abandon a branch.

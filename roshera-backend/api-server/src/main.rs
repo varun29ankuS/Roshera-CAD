@@ -386,6 +386,7 @@ async fn create_geometry(
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use geometry_engine::math::Matrix4;
     use geometry_engine::primitives::topology_builder::{
         GeometryId as KernelGeometryId, TopologyBuilder,
     };
@@ -468,6 +469,42 @@ async fn create_geometry(
             .ok_or_else(|| error_catalog::ApiError::missing_parameter(k))
     };
 
+    // Optional datum anchoring (Slice 2). Shape:
+    //   "anchor": {
+    //     "datum_id": <u32>,                 // required when anchor is present
+    //     "translation":   [x, y, z],        // optional, defaults to [0,0,0]
+    //     "rotation_euler":[rx,ry,rz]        // optional XYZ-Euler radians
+    //   }
+    // When `anchor` is absent the legacy non-anchored creators are used,
+    // which keeps every existing client working unchanged.
+    let anchor: Option<(u32, Matrix4)> = match parameters.get("anchor") {
+        None => None,
+        Some(node) => {
+            let datum_id = node
+                .get("datum_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| error_catalog::ApiError::missing_parameter("anchor.datum_id"))?
+                as u32;
+            let read_triple = |key: &str, default: [f64; 3]| -> [f64; 3] {
+                node.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        [
+                            arr.first().and_then(|x| x.as_f64()).unwrap_or(default[0]),
+                            arr.get(1).and_then(|x| x.as_f64()).unwrap_or(default[1]),
+                            arr.get(2).and_then(|x| x.as_f64()).unwrap_or(default[2]),
+                        ]
+                    })
+                    .unwrap_or(default)
+            };
+            let t = read_triple("translation", [0.0, 0.0, 0.0]);
+            let r = read_triple("rotation_euler", [0.0, 0.0, 0.0]);
+            let local = Matrix4::translation(t[0], t[1], t[2])
+                * Matrix4::from_euler_xyz(r[0], r[1], r[2]);
+            Some((datum_id, local))
+        }
+    };
+
     // Drive the kernel. The model is the single source of truth — every
     // call funnels through TopologyBuilder so the timeline records the op.
     //
@@ -484,22 +521,37 @@ async fn create_geometry(
                 let w = require("width")?;
                 let h = require("height")?;
                 let d = require("depth")?;
-                builder.create_box_3d(w, h, d)
+                match anchor {
+                    Some((datum_id, local)) => {
+                        builder.create_box_3d_anchored(w, h, d, datum_id, local)
+                    }
+                    None => builder.create_box_3d(w, h, d),
+                }
             }
             "sphere" => {
                 let r = require("radius")?;
-                builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r)
+                match anchor {
+                    Some((datum_id, local)) => {
+                        builder.create_sphere_3d_anchored(r, datum_id, local)
+                    }
+                    None => builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r),
+                }
             }
             "cylinder" => {
                 let r = require("radius")?;
                 let h = require("height")?;
                 tracing::info!(radius = r, height = h, "create_cylinder_3d entry");
-                let res = builder.create_cylinder_3d(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Vector3::new(0.0, 0.0, 1.0),
-                    r,
-                    h,
-                );
+                let res = match anchor {
+                    Some((datum_id, local)) => {
+                        builder.create_cylinder_3d_anchored(r, h, datum_id, local)
+                    }
+                    None => builder.create_cylinder_3d(
+                        Point3::new(0.0, 0.0, 0.0),
+                        Vector3::new(0.0, 0.0, 1.0),
+                        r,
+                        h,
+                    ),
+                };
                 tracing::info!(result = ?res, "create_cylinder_3d returned");
                 res
             }
@@ -509,23 +561,33 @@ async fn create_geometry(
                 // True cone: base radius `r`, apex (top_radius = 0).
                 // `create_cone_3d` accepts a frustum signature; passing 0.0
                 // for the top radius collapses it to a single-apex cone.
-                builder.create_cone_3d(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Vector3::new(0.0, 0.0, 1.0),
-                    r,
-                    0.0,
-                    h,
-                )
+                match anchor {
+                    Some((datum_id, local)) => {
+                        builder.create_cone_3d_anchored(r, 0.0, h, datum_id, local)
+                    }
+                    None => builder.create_cone_3d(
+                        Point3::new(0.0, 0.0, 0.0),
+                        Vector3::new(0.0, 0.0, 1.0),
+                        r,
+                        0.0,
+                        h,
+                    ),
+                }
             }
             "torus" => {
                 let major = require("major_radius")?;
                 let minor = require("minor_radius")?;
-                builder.create_torus_3d(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Vector3::new(0.0, 0.0, 1.0),
-                    major,
-                    minor,
-                )
+                match anchor {
+                    Some((datum_id, local)) => {
+                        builder.create_torus_3d_anchored(major, minor, datum_id, local)
+                    }
+                    None => builder.create_torus_3d(
+                        Point3::new(0.0, 0.0, 0.0),
+                        Vector3::new(0.0, 0.0, 1.0),
+                        major,
+                        minor,
+                    ),
+                }
             }
             other => {
                 return Err(error_catalog::ApiError::unknown_shape_type(other).into());
@@ -3532,6 +3594,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(branches::get_branch).delete(branches::delete_branch),
         )
         .route("/api/branches/{id}/merge", post(branches::merge_branch))
+        // Datum endpoints (Origin, reference planes, reference axes).
+        // Read-only in Slice 1; user-authored datums arrive in Slice 3.
+        .route("/api/datums", get(handlers::datums::list_datums))
+        .route(
+            "/api/datums/{id}/visibility",
+            axum::routing::patch(handlers::datums::set_datum_visibility),
+        )
+        // Slice 2 — anchor metadata for an existing solid. 404 when the
+        // solid doesn't exist or was created before anchoring landed.
+        .route(
+            "/api/solids/{id}/anchor",
+            get(handlers::datums::get_solid_anchor),
+        )
         // Real mass properties (volume, COG, inertia tensor) for a single solid
         .route(
             "/api/geometry/{id}/properties",
