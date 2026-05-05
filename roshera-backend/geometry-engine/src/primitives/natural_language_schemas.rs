@@ -700,5 +700,4 @@ impl SchemaGenerator {
             }],
         }
     }
-
 }

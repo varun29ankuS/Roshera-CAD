@@ -11,9 +11,9 @@ mod auth_middleware;
 mod branches;
 mod delta_handlers;
 mod error_catalog;
+mod frame;
 mod handlers;
 mod handlers_impl;
-mod frame;
 mod idempotency;
 mod kernel_state;
 mod metrics;
@@ -21,7 +21,7 @@ mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transpo
 mod sketch;
 mod transactions;
 mod viewport_bridge;
-              // Using core geometry-engine directly
+// Using core geometry-engine directly
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -110,6 +110,11 @@ pub struct AppState {
 
     // Timeline and collaboration
     timeline: Arc<RwLock<Timeline>>,
+    /// The kernel's `OperationRecorder`, kept as a concrete type so the
+    /// `POST /api/branches/active` handler can swap which branch new
+    /// kernel operations are recorded against. The same Arc is also
+    /// attached to the `BRepModel` as `Arc<dyn OperationRecorder>`.
+    pub timeline_recorder: Arc<timeline_engine::TimelineRecorder>,
     branch_manager: Arc<BranchManager>,
     hierarchy_manager: Arc<HierarchyManager>,
 
@@ -381,7 +386,9 @@ async fn create_geometry(
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    use geometry_engine::primitives::topology_builder::{GeometryId as KernelGeometryId, TopologyBuilder};
+    use geometry_engine::primitives::topology_builder::{
+        GeometryId as KernelGeometryId, TopologyBuilder,
+    };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -406,13 +413,12 @@ async fn create_geometry(
     // Pre-flight: if a transaction was named, fail fast when it is
     // missing or terminal so we never create a solid we cannot track.
     if let Some(id) = tx_id {
-        let view = state
-            .transactions
-            .view(id)
-            .ok_or_else(|| error_catalog::ApiError::new(
+        let view = state.transactions.view(id).ok_or_else(|| {
+            error_catalog::ApiError::new(
                 error_catalog::ErrorCode::TransactionNotFound,
                 format!("transaction {id} is unknown or has been pruned"),
-            ))?;
+            )
+        })?;
         if view.status != transactions::TxStatus::Active {
             return Err(error_catalog::ApiError::new(
                 error_catalog::ErrorCode::TransactionNotActive,
@@ -586,11 +592,9 @@ async fn create_geometry(
     };
 
     if tri_mesh.triangles.is_empty() {
-        return Err(error_catalog::ApiError::tessellation_empty(
-            solid_id,
-            tri_mesh.vertices.len(),
-        )
-        .into());
+        return Err(
+            error_catalog::ApiError::tessellation_empty(solid_id, tri_mesh.vertices.len()).into(),
+        );
     }
 
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
@@ -846,8 +850,14 @@ async fn boolean_operation(
     // concurrent writers aren't blocked on geometry that's already built.
     let result_solid_id = {
         let mut model = state.model.write().await;
-        kernel_boolean(&mut model, solid_a, solid_b, operation, BooleanOptions::default())
-            .map_err(ApiError::kernel_error)?
+        kernel_boolean(
+            &mut model,
+            solid_a,
+            solid_b,
+            operation,
+            BooleanOptions::default(),
+        )
+        .map_err(ApiError::kernel_error)?
         // model write guard drops here
     };
 
@@ -1055,9 +1065,10 @@ async fn create_extrude(
         for i in 0..points.len() {
             let p_start = points[i];
             let p_end = points[(i + 1) % points.len()];
-            let v_start = model
-                .vertices
-                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
+            let v_start =
+                model
+                    .vertices
+                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
             let v_end = model
                 .vertices
                 .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
@@ -1204,8 +1215,7 @@ async fn extrude_face_endpoint(
     let face_id = payload
         .get("face_id")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| ApiError::missing_field("face_id"))?
-        as u32;
+        .ok_or_else(|| ApiError::missing_field("face_id"))? as u32;
     let distance = payload
         .get("distance")
         .and_then(|v| v.as_f64())
@@ -2195,17 +2205,15 @@ async fn process_ai_command_stream(
     // pattern-match on `error_code`; the wire shape matches what
     // POST /api/ai/command would have returned as a 503.
     if !state.ai_configured {
-        let payload = serde_json::to_value(
-            &crate::error_catalog::ApiError::ai_not_configured(),
-        )
-        .unwrap_or_else(|_| {
-            serde_json::json!({
-                "success": false,
-                "error_code": "ai_not_configured",
-                "error": "AI provider not configured",
-                "retryable": false,
-            })
-        });
+        let payload = serde_json::to_value(&crate::error_catalog::ApiError::ai_not_configured())
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "success": false,
+                    "error_code": "ai_not_configured",
+                    "error": "AI provider not configured",
+                    "retryable": false,
+                })
+            });
         tokio::spawn(async move {
             let _ = tx
                 .send(Ok(axum::response::sse::Event::default()
@@ -3319,13 +3327,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hit `None` and silently no-op, leaving the timeline empty regardless
     // of what the user does. See timeline-engine/src/recorder_bridge.rs
     // for the sync→async bridge implementation.
+    let timeline_recorder = Arc::new(timeline_engine::TimelineRecorder::new(
+        Arc::clone(&timeline),
+        timeline_engine::Author::System,
+        timeline_engine::BranchId::main(),
+    ));
     {
+        // Attach the same recorder twice: once to the kernel (as a
+        // trait object) so it gets called on every successful op, and
+        // keep a concrete Arc in `AppState` so the
+        // `POST /api/branches/active` handler can swap its target
+        // branch without restarting the worker.
         let recorder: Arc<dyn geometry_engine::operations::recorder::OperationRecorder> =
-            Arc::new(timeline_engine::TimelineRecorder::new(
-                Arc::clone(&timeline),
-                timeline_engine::Author::System,
-                timeline_engine::BranchId::main(),
-            ));
+            timeline_recorder.clone();
         let mut model_guard = model.write().await;
         model_guard.attach_recorder(Some(recorder));
         tracing::info!(
@@ -3365,6 +3379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         permission_manager,
         cache_manager,
         timeline,
+        timeline_recorder,
         branch_manager,
         hierarchy_manager,
         database,
@@ -3390,8 +3405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transactions = state.transactions.clone();
         let model = state.model.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
             // Skip the immediate first tick; first sweep happens one
             // interval after startup, never at startup itself.
             interval.tick().await;
@@ -3401,8 +3415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if expired.is_empty() {
                     continue;
                 }
-                let solids_removed: usize =
-                    expired.iter().map(|(_, s)| s.len()).sum();
+                let solids_removed: usize = expired.iter().map(|(_, s)| s.len()).sum();
                 {
                     let mut model = model.write().await;
                     for (_, solids) in &expired {
@@ -3476,14 +3489,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             put(sketch::set_sketch_circle_segments),
         )
         .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
-        .route(
-            "/api/sketch/plane-from-face",
-            post(sketch::plane_from_face),
-        )
+        .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.
-        .route("/api/capabilities", get(handlers::capabilities::capabilities))
+        .route(
+            "/api/capabilities",
+            get(handlers::capabilities::capabilities),
+        )
         // Atomic transactions: agents wrap multi-step plans in a tx so a
         // mid-plan failure doesn't pollute the model. The tx_id from
         // /begin is quoted in the X-Roshera-Tx-Id header on subsequent
@@ -3504,6 +3517,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/branches",
             get(branches::list_branches).post(branches::create_branch),
+        )
+        // Switch the kernel's currently-recording branch. Must precede
+        // the `{id}` route so axum doesn't treat "active" as a UUID.
+        .route("/api/branches/active", post(branches::set_active_branch))
+        // Curated branch-name suggestions. Same precedence reason —
+        // must come before `/api/branches/{id}`.
+        .route(
+            "/api/branches/name-suggestions",
+            get(branches::suggest_names),
         )
         .route(
             "/api/branches/{id}",
@@ -3591,10 +3613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/hierarchy/{session_id}/command",
             post(execute_hierarchy_command),
         )
-        .route(
-            "/api/hierarchy/{session_id}/parts",
-            post(create_part),
-        )
+        .route("/api/hierarchy/{session_id}/parts", post(create_part))
         .route(
             "/api/hierarchy/{session_id}/assemblies/{assembly_id}/parts",
             post(add_part_to_assembly),
@@ -3612,24 +3631,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "viewport bridge: ENABLED (ROSHERA_DEV_BRIDGE=1) — mounting /ws/viewport-bridge + /api/viewport/*"
         );
         app = app
-            .route(
-                "/ws/viewport-bridge",
-                get(viewport_bridge::ws_handler),
-            )
-            .route(
-                "/api/viewport/snapshot",
-                post(viewport_bridge::snapshot),
-            )
+            .route("/ws/viewport-bridge", get(viewport_bridge::ws_handler))
+            .route("/api/viewport/snapshot", post(viewport_bridge::snapshot))
             .route("/api/viewport/camera", post(viewport_bridge::set_camera))
             .route("/api/viewport/load_stl", post(viewport_bridge::load_stl))
-            .route(
-                "/api/viewport/shading",
-                post(viewport_bridge::set_shading),
-            )
-            .route(
-                "/api/viewport/clear",
-                post(viewport_bridge::clear_scene),
-            )
+            .route("/api/viewport/shading", post(viewport_bridge::set_shading))
+            .route("/api/viewport/clear", post(viewport_bridge::clear_scene))
             .route("/api/viewport/status", get(viewport_bridge::status));
     }
 

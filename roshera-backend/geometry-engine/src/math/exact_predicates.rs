@@ -116,7 +116,6 @@ fn orient2d_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
 
     // Compute determinant with exact arithmetic
     let (det, det_tail) = two_sum(detleft, -detright);
-    
 
     det + (detleft_tail - detright_tail + det_tail)
 }

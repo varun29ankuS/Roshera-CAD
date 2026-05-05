@@ -24,8 +24,8 @@ use crate::primitives::{
     surface::SurfaceStore,
     vertex::VertexStore,
 };
-use std::collections::{HashMap, HashSet};
 use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Shell ID type

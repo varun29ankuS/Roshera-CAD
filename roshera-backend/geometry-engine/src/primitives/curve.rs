@@ -1895,13 +1895,8 @@ impl NurbsCurve {
         weights: Vec<f64>,
         knots: Vec<f64>,
     ) -> MathResult<Self> {
-        let m = crate::math::nurbs::NurbsCurve::new(
-            control_points,
-            weights,
-            knots,
-            degree,
-        )
-        .map_err(|e| MathError::InvalidParameter(e.to_string()))?;
+        let m = crate::math::nurbs::NurbsCurve::new(control_points, weights, knots, degree)
+            .map_err(|e| MathError::InvalidParameter(e.to_string()))?;
         Self::from_math_curve(m)
     }
 
@@ -2073,7 +2068,10 @@ impl Curve for NurbsCurve {
         // existing infallible Curve::reversed contract.
         match self
             .to_math_curve()
-            .and_then(|m| m.reversed().map_err(|e| MathError::InvalidParameter(e.to_string())))
+            .and_then(|m| {
+                m.reversed()
+                    .map_err(|e| MathError::InvalidParameter(e.to_string()))
+            })
             .and_then(Self::from_math_curve)
         {
             Ok(rev) => Box::new(rev),
@@ -2124,7 +2122,9 @@ impl Curve for NurbsCurve {
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, Point3)> {
         // Delegate to math-layer closest-point solver: 20-sample coarse
         // search + bounded Newton-Raphson on f(u) = (C(u) - P) · C'(u).
-        Ok(self.to_math_curve()?.closest_point(point, tolerance.distance()))
+        Ok(self
+            .to_math_curve()?
+            .closest_point(point, tolerance.distance()))
     }
 
     fn parameters_at_point(&self, point: &Point3, tolerance: Tolerance) -> Vec<f64> {
@@ -3304,12 +3304,7 @@ impl NurbsCurve {
         // Equal weights for rational curve
         let weights = vec![1.0; n];
 
-        NurbsCurve::new(
-            actual_degree,
-            points.to_vec(),
-            weights,
-            knots,
-        )
+        NurbsCurve::new(actual_degree, points.to_vec(), weights, knots)
     }
 }
 

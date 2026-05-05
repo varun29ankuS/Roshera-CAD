@@ -91,8 +91,7 @@ pub fn loft_profiles(
     validate_loft_inputs(model, &profiles, &options)?;
 
     // Capture profile edges (flattened) before they're consumed, for recording.
-    let profile_edges_for_record: Vec<u64> =
-        profiles.iter().flatten().map(|&e| e as u64).collect();
+    let profile_edges_for_record: Vec<u64> = profiles.iter().flatten().map(|&e| e as u64).collect();
     let profile_count = profiles.len();
 
     // Convert edge profiles to face profiles if needed
@@ -165,11 +164,8 @@ fn create_linear_loft(
     };
 
     for (i, j) in profile_pairs {
-        let lateral_faces = create_ruled_surfaces_between_profiles(
-            model,
-            &correspondence[i],
-            &correspondence[j],
-        )?;
+        let lateral_faces =
+            create_ruled_surfaces_between_profiles(model, &correspondence[i], &correspondence[j])?;
         shell_faces.extend(lateral_faces);
     }
 
@@ -1204,8 +1200,7 @@ fn densify_correspondence(
         let per_edge = target / n_edges;
         let extra = target - per_edge * n_edges;
 
-        let mut samples: Vec<(crate::primitives::curve::CurveId, f64)> =
-            Vec::with_capacity(target);
+        let mut samples: Vec<(crate::primitives::curve::CurveId, f64)> = Vec::with_capacity(target);
         for (j, &edge_id) in loop_data.edges.iter().enumerate() {
             let edge = model
                 .edges
@@ -1229,9 +1224,10 @@ fn densify_correspondence(
         // Evaluate curves and create vertices.
         let mut new_verts: Vec<VertexId> = Vec::with_capacity(samples.len());
         for (curve_id, t) in samples {
-            let curve = model.curves.get(curve_id).ok_or_else(|| {
-                OperationError::InvalidGeometry("Curve not found".to_string())
-            })?;
+            let curve = model
+                .curves
+                .get(curve_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
             let cp = curve.evaluate(t).map_err(|e| {
                 OperationError::NumericalError(format!(
                     "Curve evaluation failed during loft densification: {:?}",

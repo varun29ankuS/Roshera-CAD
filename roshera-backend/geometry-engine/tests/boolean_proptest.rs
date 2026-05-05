@@ -34,9 +34,7 @@
 //!   tier as the kernel hardens.
 
 use geometry_engine::math::{Point3, Vector3};
-use geometry_engine::operations::{
-    boolean_operation, BooleanOp, BooleanOptions, OperationError,
-};
+use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions, OperationError};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 

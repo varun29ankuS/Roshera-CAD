@@ -214,8 +214,7 @@ impl OperationsRegistry {
         model: &mut BRepModel,
     ) -> OperationResult<AIOperationResult> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         let command = registry.parse_operation_command(text)?;
         registry.execute_operation(command, model)
@@ -486,8 +485,7 @@ impl OperationsRegistry {
             "pattern" => self.execute_pattern(&command, model),
             other => Err(OperationError::InvalidInput {
                 parameter: "operation_type".to_string(),
-                expected: "boolean | fillet | chamfer | extrude | revolve | pattern"
-                    .to_string(),
+                expected: "boolean | fillet | chamfer | extrude | revolve | pattern".to_string(),
                 received: other.to_string(),
             }),
         }?;
@@ -1426,8 +1424,7 @@ impl OperationsRegistry {
     /// Get operation catalog for AI discovery
     pub fn get_operations_catalog() -> serde_json::Value {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         // Build operations JSON manually without requiring Serialize trait
         let mut operations_json = serde_json::Map::new();
@@ -1504,8 +1501,7 @@ impl OperationsRegistry {
         model: &mut BRepModel,
     ) -> Vec<OperationResult<AIOperationResult>> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         commands
             .into_iter()
@@ -1519,8 +1515,7 @@ impl OperationsRegistry {
     /// Get performance hints based on usage
     pub fn get_performance_hints() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         let mut hints = vec![];
 

@@ -280,12 +280,10 @@ fn transform_vertices(
             }
         };
         let transformed = transform.transform_point(&pos);
-        if !model.vertices.set_position(
-            vertex_id,
-            transformed.x,
-            transformed.y,
-            transformed.z,
-        ) {
+        if !model
+            .vertices
+            .set_position(vertex_id, transformed.x, transformed.y, transformed.z)
+        {
             return Err(OperationError::InvalidGeometry(format!(
                 "Failed to update vertex {vertex_id}"
             )));

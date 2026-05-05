@@ -652,16 +652,9 @@ impl Face {
             // grid lets us preserve the trim-mask resolution from the
             // earlier midpoint version while getting near-spectral
             // convergence inside untrimmed cells.
-            const GL3_NODES: [f64; 3] = [
-                -0.7745966692414834,
-                0.0,
-                0.7745966692414834,
-            ];
-            const GL3_WEIGHTS: [f64; 3] = [
-                0.5555555555555556,
-                0.8888888888888888,
-                0.5555555555555556,
-            ];
+            const GL3_NODES: [f64; 3] = [-0.7745966692414834, 0.0, 0.7745966692414834];
+            const GL3_WEIGHTS: [f64; 3] =
+                [0.5555555555555556, 0.8888888888888888, 0.5555555555555556];
 
             let n_u = 20;
             let n_v = 20;
@@ -1176,10 +1169,7 @@ impl FaceStore {
             .push(face.id);
 
         for &loop_id in &face.all_loops() {
-            self.loop_to_faces
-                .entry(loop_id)
-                .or_default()
-                .push(face.id);
+            self.loop_to_faces.entry(loop_id).or_default().push(face.id);
         }
 
         self.faces.push(face);

@@ -631,13 +631,7 @@ fn intersect_line_arc_inner(
         .into_iter()
         .map(|h| {
             build_line_arc_point(
-                h.position,
-                line_edge,
-                h.s,
-                arc_edge,
-                h.t_arc,
-                line_first,
-                h.exact,
+                h.position, line_edge, h.s, arc_edge, h.t_arc, line_first, h.exact,
             )
         })
         .collect();
@@ -745,8 +739,10 @@ fn intersect_arc_arc(
         // Perpendicular in the 2D plane.
         let px = -uy;
         let py = ux;
-        let candidates_2d = [(ax * ux + h * px, ax * uy + h * py),
-                             (ax * ux - h * px, ax * uy - h * py)];
+        let candidates_2d = [
+            (ax * ux + h * px, ax * uy + h * py),
+            (ax * ux - h * px, ax * uy - h * py),
+        ];
 
         let tangential = h < tolerance.distance();
         for (i, (x2d, y2d)) in candidates_2d.iter().enumerate() {
@@ -1175,11 +1171,7 @@ fn edge_param_from_line_local(edge: &Edge, t_local: f64) -> f64 {
 /// surface. Falls back to `(0.0, 0.0)` if the projection fails so callers
 /// retain the analytical 3D hit even when parameterization is degenerate.
 #[inline]
-fn surface_uv_for_point(
-    surface: &dyn Surface,
-    point: &Point3,
-    tolerance: Tolerance,
-) -> (f64, f64) {
+fn surface_uv_for_point(surface: &dyn Surface, point: &Point3, tolerance: Tolerance) -> (f64, f64) {
     surface
         .closest_point(point, tolerance)
         .unwrap_or((0.0, 0.0))
@@ -1306,7 +1298,9 @@ fn intersect_line_cylinder_analytical(
     // Mark coincident roots (tangent contact) as Tangent rather than
     // Transverse. This is detected by a zero discriminant earlier, which
     // produces a single root in `solve_real_quadratic`.
-    if intersections.len() == 1 && intersections[0].intersection_type == PointIntersectionType::Transverse {
+    if intersections.len() == 1
+        && intersections[0].intersection_type == PointIntersectionType::Transverse
+    {
         let disc = b * b - 4.0 * a * c;
         if disc.abs() <= tol_d {
             intersections[0].intersection_type = PointIntersectionType::Tangent;
@@ -1504,13 +1498,7 @@ fn intersect_curve_general_surface(
     let mut raw_hits: Vec<IntersectionPoint> = Vec::new();
     for (t_seed, uv_seed) in seeds {
         if let Some(hit) = newton_refine_curve_surface(
-            curve,
-            surface,
-            edge,
-            t_seed,
-            uv_seed.0,
-            uv_seed.1,
-            tolerance,
+            curve, surface, edge, t_seed, uv_seed.0, uv_seed.1, tolerance,
         ) {
             raw_hits.push(hit);
         }
@@ -1845,14 +1833,16 @@ mod tests {
         let line = Line::new(Point3::new(-5.0, 0.0, 0.0), Point3::new(5.0, 0.0, 0.0));
         let edge = unit_edge();
         let tol = Tolerance::from_distance(1e-9);
-        let result =
-            intersect_line_arc(&line as &dyn Curve, &arc as &dyn Curve, &edge, &edge, tol)
-                .expect("dispatch");
+        let result = intersect_line_arc(&line as &dyn Curve, &arc as &dyn Curve, &edge, &edge, tol)
+            .expect("dispatch");
         match result {
             IntersectionResult::Points(pts) => {
                 assert_eq!(pts.len(), 2);
                 for p in &pts {
-                    assert!(matches!(p.intersection_type, PointIntersectionType::Transverse));
+                    assert!(matches!(
+                        p.intersection_type,
+                        PointIntersectionType::Transverse
+                    ));
                 }
             }
             other => panic!("unexpected result: {:?}", other),

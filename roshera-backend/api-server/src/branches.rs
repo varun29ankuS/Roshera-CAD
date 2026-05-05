@@ -104,6 +104,29 @@ pub struct BranchView {
     pub created_at: String,
 }
 
+/// `POST /api/branches/active` body.
+///
+/// Switches which branch the kernel's `OperationRecorder` writes
+/// subsequent operations to. The active branch is process-global —
+/// there is exactly one "current branch" at any moment, by design,
+/// matching the single live `BRepModel` the kernel holds. Per-branch
+/// model isolation (copy-on-write snapshots / replay-on-read) is a
+/// separate concern; this endpoint is the minimum needed so that the
+/// timeline strip and the kernel agree on where new events land.
+#[derive(Debug, Deserialize)]
+pub struct SetActiveBranchBody {
+    /// `"main"` or a UUIDv4 string. Must reference a branch that
+    /// already exists in the timeline.
+    pub branch_id: String,
+}
+
+/// `POST /api/branches/active` response — echoes the now-active branch
+/// id so the client can confirm the swap landed.
+#[derive(Debug, Serialize)]
+pub struct ActiveBranchView {
+    pub branch_id: String,
+}
+
 /// `POST /api/branches/{id}/merge` body.
 #[derive(Debug, Deserialize)]
 pub struct MergeBody {
@@ -223,17 +246,12 @@ fn render_branch(branch: &timeline_engine::types::Branch, event_count: usize) ->
 /// Translate `TimelineError` to the structured `ApiError` catalog.
 fn map_timeline_err(e: TimelineError) -> ApiError {
     match e {
-        TimelineError::BranchNotFound(id) => ApiError::new(
-            ErrorCode::BranchNotFound,
-            format!("branch {id} not found"),
-        )
-        .with_details(serde_json::json!({ "branch_id": id.to_string() })),
-        TimelineError::InvalidOperation(msg) => {
-            ApiError::new(ErrorCode::BranchInvalidState, msg)
+        TimelineError::BranchNotFound(id) => {
+            ApiError::new(ErrorCode::BranchNotFound, format!("branch {id} not found"))
+                .with_details(serde_json::json!({ "branch_id": id.to_string() }))
         }
-        other => {
-            ApiError::new(ErrorCode::Internal, format!("timeline error: {other}"))
-        }
+        TimelineError::InvalidOperation(msg) => ApiError::new(ErrorCode::BranchInvalidState, msg),
+        other => ApiError::new(ErrorCode::Internal, format!("timeline error: {other}")),
     }
 }
 
@@ -262,10 +280,15 @@ pub async fn list_branches(
     // Stable order: main first, then by created_at ascending. Without
     // a stable order tests and orchestrator UIs flicker as DashMap
     // hashes branches.
-    views.sort_by(|a, b| match (a.id == BranchId::main().to_string(), b.id == BranchId::main().to_string()) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.created_at.cmp(&b.created_at),
+    views.sort_by(|a, b| {
+        match (
+            a.id == BranchId::main().to_string(),
+            b.id == BranchId::main().to_string(),
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.created_at.cmp(&b.created_at),
+        }
     });
     Ok(Json(views))
 }
@@ -379,6 +402,92 @@ pub async fn delete_branch(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/branches/active` — set the kernel's recording branch.
+///
+/// Validates that the branch exists, then swaps the
+/// `TimelineRecorder`'s target. Subsequent kernel ops are recorded
+/// against the new branch on the very next call; in-flight events
+/// already queued in the recorder's MPSC channel will also use the
+/// new branch (there is exactly one active branch per recorder, by
+/// design).
+pub async fn set_active_branch(
+    State(state): State<AppState>,
+    Json(body): Json<SetActiveBranchBody>,
+) -> Result<Json<ActiveBranchView>, ApiError> {
+    let bid = parse_branch_id(&body.branch_id)?;
+    {
+        let timeline = state.timeline.read().await;
+        if timeline.get_branch(&bid).is_none() {
+            return Err(ApiError::new(
+                ErrorCode::BranchNotFound,
+                format!("branch {bid} not found"),
+            )
+            .with_details(serde_json::json!({ "branch_id": bid.to_string() })));
+        }
+    }
+    state.timeline_recorder.set_branch_id(bid);
+    tracing::info!(
+        target: "branches",
+        branch_id = %bid,
+        "active recording branch switched"
+    );
+    Ok(Json(ActiveBranchView {
+        branch_id: bid.to_string(),
+    }))
+}
+
+/// `GET /api/branches/name-suggestions?count=N` response.
+///
+/// Echoes the requested count and returns up to that many memorable
+/// branch names from the curated pop-culture / branching-narrative
+/// pool that aren't already in use on the timeline. The list may be
+/// shorter than `count` (or empty) if every pool entry is taken.
+#[derive(Debug, Serialize)]
+pub struct NameSuggestionsView {
+    /// Count actually requested after clamping (1..=20).
+    pub requested: usize,
+    /// Suggested names, in priority order. The caller picks any one;
+    /// they are *not* reservations — two callers asking simultaneously
+    /// can both see the same suggestion. The conflict (if any) is
+    /// resolved at `POST /api/branches` time via the existing name
+    /// uniqueness check.
+    pub names: Vec<String>,
+}
+
+/// `GET /api/branches/name-suggestions?count=N` query parameters.
+#[derive(Debug, Deserialize)]
+pub struct NameSuggestionsQuery {
+    /// How many candidates to return. Defaults to 3, clamped to 1..=20.
+    #[serde(default)]
+    pub count: Option<usize>,
+}
+
+/// `GET /api/branches/name-suggestions` — return up to N memorable
+/// branch names that aren't already used on this timeline.
+///
+/// Both humans and agents call this when they want a default fork
+/// name. The list is in stable priority order — pick any one. The
+/// suggestion is advisory: the actual name is only locked in by
+/// `POST /api/branches`, which still runs the uniqueness check.
+pub async fn suggest_names(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<NameSuggestionsQuery>,
+) -> Result<Json<NameSuggestionsView>, ApiError> {
+    let pool_size = timeline_engine::BRANCH_NAME_POOL.len();
+    let requested = q.count.unwrap_or(3).clamp(1, pool_size);
+
+    let timeline = state.timeline.read().await;
+    let used: Vec<String> = timeline
+        .get_all_branches()
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+    drop(timeline);
+
+    let names = timeline_engine::suggest_branch_names(requested, &used);
+    Ok(Json(NameSuggestionsView { requested, names }))
+}
+
 /// `POST /api/branches/{id}/merge` — fold a branch's events into a target.
 ///
 /// `id` is the source branch; the target defaults to `main` and can
@@ -422,9 +531,7 @@ pub async fn merge_branch(
                 ErrorCode::InvalidParameter,
                 format!("unknown merge strategy '{other}'"),
             )
-            .with_hint(
-                "Use one of 'fast-forward', 'three-way', or 'squash'.".to_string(),
-            ));
+            .with_hint("Use one of 'fast-forward', 'three-way', or 'squash'.".to_string()));
         }
     };
 
@@ -436,11 +543,7 @@ pub async fn merge_branch(
             .map_err(map_timeline_err)?
     };
 
-    let conflicts: Vec<String> = result
-        .conflicts
-        .iter()
-        .map(|c| format!("{c:?}"))
-        .collect();
+    let conflicts: Vec<String> = result.conflicts.iter().map(|c| format!("{c:?}")).collect();
     Ok(Json(MergeView {
         success: result.success && conflicts.is_empty(),
         merged_into: target.to_string(),

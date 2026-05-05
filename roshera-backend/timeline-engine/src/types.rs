@@ -714,6 +714,20 @@ pub struct Branch {
 
     /// Metadata about the branch
     pub metadata: BranchMetadata,
+
+    /// Branch protection: when true, destructive ops (truncate, abandon)
+    /// require an explicit `force = true`. `BranchId::main()` is
+    /// protected by default. Default `false` for serde back-compat with
+    /// snapshots that pre-date this field.
+    #[serde(default)]
+    pub protected: bool,
+
+    /// Sapling-style hidden flag, orthogonal to `state`. Hidden
+    /// branches are filtered from default listings but still reachable
+    /// by id (and still validate). Use to declutter the UI without
+    /// destroying history. Default `false` for serde back-compat.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// Where a branch forked from

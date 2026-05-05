@@ -17,8 +17,8 @@ use super::polyline2d::ParametricPolyline2d;
 use super::rectangle2d::ParametricRectangle2d;
 use super::spline2d::{BSpline2d, ParametricSpline2d};
 use super::{
-    Arc2d, Arc2dId, Circle2d, Circle2dId, Constraint, ConstraintId, Ellipse2d, Ellipse2dId,
-    Line2d, Line2dId, LineSegment2d, Point2d, Point2dId, Polyline2d, Polyline2dId, Rectangle2d,
+    Arc2d, Arc2dId, Circle2d, Circle2dId, Constraint, ConstraintId, Ellipse2d, Ellipse2dId, Line2d,
+    Line2dId, LineSegment2d, Point2d, Point2dId, Polyline2d, Polyline2dId, Rectangle2d,
     Rectangle2dId, Sketch2dError, Sketch2dResult, SketchPlane, Spline2d, Spline2dId, Tolerance2d,
     Vector2d,
 };
@@ -1117,10 +1117,7 @@ impl Sketch {
 
         for x in min_grid_x..=max_grid_x {
             for y in min_grid_y..=max_grid_y {
-                self.spatial_index
-                    .entry((x, y))
-                    .or_default()
-                    .push(entity);
+                self.spatial_index.entry((x, y)).or_default().push(entity);
             }
         }
     }

@@ -2077,20 +2077,11 @@ async fn send_collaborators_update(
 ///
 /// Returns either a typed `SubElementResult` frame or an `Error`
 /// frame (kept on the same path so the bridge can surface it).
-async fn handle_subelement_pick(
-    state: &AppState,
-    pick: &serde_json::Value,
-) -> serde_json::Value {
+async fn handle_subelement_pick(state: &AppState, pick: &serde_json::Value) -> serde_json::Value {
     use geometry_engine::math::{Point3, Tolerance};
 
-    let object_id_str = pick
-        .get("object_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let mode = pick
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("face");
+    let object_id_str = pick.get("object_id").and_then(|v| v.as_str()).unwrap_or("");
+    let mode = pick.get("mode").and_then(|v| v.as_str()).unwrap_or("face");
     let face_index = pick
         .get("face_index")
         .and_then(|v| v.as_u64())
@@ -2110,10 +2101,7 @@ async fn handle_subelement_pick(
     let object_uuid = match Uuid::parse_str(object_id_str) {
         Ok(u) => u,
         Err(_) => {
-            return subelement_error(
-                object_id_str,
-                "invalid object_id (not a UUID)",
-            );
+            return subelement_error(object_id_str, "invalid object_id (not a UUID)");
         }
     };
 
@@ -2156,18 +2144,14 @@ async fn handle_subelement_pick(
             let idx = match face_index {
                 Some(i) => i,
                 None => {
-                    return subelement_error(
-                        object_id_str,
-                        "face_index missing for face mode",
-                    );
+                    return subelement_error(object_id_str, "face_index missing for face mode");
                 }
             };
             serde_json::json!({ "type": "face", "index": idx })
         }
         "edge" => {
             let mut best: Option<(u32, f64)> = None;
-            let mut seen_edges: std::collections::HashSet<u32> =
-                std::collections::HashSet::new();
+            let mut seen_edges: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for &fid in &face_ids {
                 let face = match model.faces.get(fid) {
                     Some(f) => f,
@@ -2207,17 +2191,13 @@ async fn handle_subelement_pick(
             match best {
                 Some((eid, _)) => serde_json::json!({ "type": "edge", "index": eid }),
                 None => {
-                    return subelement_error(
-                        object_id_str,
-                        "no edges reachable from solid",
-                    );
+                    return subelement_error(object_id_str, "no edges reachable from solid");
                 }
             }
         }
         "vertex" => {
             let mut best: Option<(u32, f64)> = None;
-            let mut seen_verts: std::collections::HashSet<u32> =
-                std::collections::HashSet::new();
+            let mut seen_verts: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for &fid in &face_ids {
                 let face = match model.faces.get(fid) {
                     Some(f) => f,
@@ -2258,18 +2238,12 @@ async fn handle_subelement_pick(
             match best {
                 Some((vid, _)) => serde_json::json!({ "type": "vertex", "index": vid }),
                 None => {
-                    return subelement_error(
-                        object_id_str,
-                        "no vertices reachable from solid",
-                    );
+                    return subelement_error(object_id_str, "no vertices reachable from solid");
                 }
             }
         }
         other => {
-            return subelement_error(
-                object_id_str,
-                &format!("unknown pick mode: {}", other),
-            );
+            return subelement_error(object_id_str, &format!("unknown pick mode: {}", other));
         }
     };
 

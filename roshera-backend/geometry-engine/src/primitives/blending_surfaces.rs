@@ -162,7 +162,7 @@ fn newton_refine_closest_point(
             Err(_) => return (u, v),
         };
         let r = sp.position - *target; // residual vector S(u,v) - P
-        // Gradient of f(u,v) = 0.5 |r|² is (r·S_u, r·S_v).
+                                       // Gradient of f(u,v) = 0.5 |r|² is (r·S_u, r·S_v).
         let g_u = r.dot(&sp.du);
         let g_v = r.dot(&sp.dv);
 
@@ -761,8 +761,7 @@ impl Surface for G2BlendingSurface {
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         let samples = sample_density_for_tolerance(tolerance.distance());
-        let nurbs =
-            approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
+        let nurbs = approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
         Ok(Box::new(nurbs))
     }
 
@@ -973,8 +972,7 @@ impl Surface for CubicG2Blend {
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         let samples = sample_density_for_tolerance(tolerance.distance());
-        let nurbs =
-            approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
+        let nurbs = approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
         Ok(Box::new(nurbs))
     }
 
@@ -1168,8 +1166,7 @@ impl Surface for QuarticG2Blend {
         tolerance: Tolerance,
     ) -> MathResult<Box<dyn Surface>> {
         let samples = sample_density_for_tolerance(tolerance.distance());
-        let nurbs =
-            approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
+        let nurbs = approximate_surface_offset_to_nurbs(self, &*distance_fn, samples, samples)?;
         Ok(Box::new(nurbs))
     }
 

@@ -169,8 +169,7 @@ impl StorageEngine {
             compressed
         };
 
-        rmp_serde::from_slice(&data)
-            .map_err(|e| TimelineError::SerializationError(e.to_string()))
+        rmp_serde::from_slice(&data).map_err(|e| TimelineError::SerializationError(e.to_string()))
     }
 
     /// Persist a checkpoint

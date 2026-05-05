@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 pub mod conflict;
 mod merge;
+pub mod name_pool;
 mod strategy;
 
 pub use conflict::ConflictResolver;
@@ -21,6 +22,7 @@ pub use merge::{
     ConflictResolution, ConflictStrategy, MergeConflict, MergeResult, MergeStatistics,
     MergeStrategy,
 };
+pub use name_pool::{suggest_branch_names, BRANCH_NAME_POOL};
 pub use strategy::{BranchingStrategy, ExplorationStrategy};
 
 /// Branch manager for the timeline system
@@ -116,6 +118,8 @@ impl BranchManager {
             events: Arc::new(DashMap::new()),
             state: BranchState::Active,
             metadata,
+            protected: false,
+            hidden: false,
         };
 
         // Add to collections
@@ -481,6 +485,8 @@ mod tests {
                 ai_context: None,
                 checkpoints: Vec::new(),
             },
+            protected: false,
+            hidden: false,
         };
 
         manager.branches.insert(BranchId::main(), main_branch);
@@ -536,6 +542,8 @@ mod tests {
                 ai_context: None,
                 checkpoints: Vec::new(),
             },
+            protected: false,
+            hidden: false,
         };
 
         manager.branches.insert(BranchId::main(), main_branch);
@@ -593,6 +601,8 @@ mod tests {
                 ai_context: None,
                 checkpoints: Vec::new(),
             },
+            protected: false,
+            hidden: false,
         };
 
         manager.branches.insert(BranchId::main(), main_branch);

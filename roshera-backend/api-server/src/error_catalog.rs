@@ -138,6 +138,7 @@ pub enum ErrorCode {
 
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
+    #[serde(rename = "internal_error")]
     Internal,
 }
 
@@ -289,6 +290,7 @@ impl ErrorCode {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiError {
     /// Stable identifier — agents pattern-match on this.
+    #[serde(rename = "error_code")]
     pub code: ErrorCode,
     /// Human-readable description. May be tweaked between releases;
     /// agents must not parse it.
@@ -445,8 +447,7 @@ impl ApiError {
     pub fn ai_not_configured() -> Self {
         Self::new(
             ErrorCode::AiNotConfigured,
-            "AI provider not configured: no LLM API key found at server start"
-                .to_string(),
+            "AI provider not configured: no LLM API key found at server start".to_string(),
         )
         .with_hint(
             "Set ANTHROPIC_API_KEY (or another supported provider key) in \
@@ -551,10 +552,7 @@ mod tests {
         // Every code must answer `retryable()` consistently with the
         // semantic group it belongs to. This test catches accidental
         // moves between groups during refactors.
-        let non_retryable_count = ErrorCode::all()
-            .iter()
-            .filter(|c| !c.retryable())
-            .count();
+        let non_retryable_count = ErrorCode::all().iter().filter(|c| !c.retryable()).count();
         let retryable_count = ErrorCode::all().iter().filter(|c| c.retryable()).count();
         assert_eq!(
             non_retryable_count + retryable_count,

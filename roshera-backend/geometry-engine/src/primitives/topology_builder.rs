@@ -38,8 +38,7 @@ pub struct TessellatedMesh {
 }
 
 /// Global timeline operations cache for high-performance parametric updates
-static TIMELINE_CACHE: LazyLock<DashMap<u64, Vec<TimelineOperation>>> =
-    LazyLock::new(DashMap::new);
+static TIMELINE_CACHE: LazyLock<DashMap<u64, Vec<TimelineOperation>>> = LazyLock::new(DashMap::new);
 
 /// Global geometry parameter cache for fast parameter updates
 static GEOMETRY_PARAMETERS: LazyLock<DashMap<GeometryId, DashMap<String, f64>>> =
@@ -425,7 +424,9 @@ impl BRepModel {
                 let edge = self.edges.get(edge_id)?;
 
                 // Process start vertex
-                if let std::collections::hash_map::Entry::Vacant(e) = vertex_index_map.entry(edge.start_vertex) {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    vertex_index_map.entry(edge.start_vertex)
+                {
                     if let Some(vertex) = self.vertices.get(edge.start_vertex) {
                         let point = vertex.point();
                         let idx = vertices.len() as u32;
@@ -437,7 +438,9 @@ impl BRepModel {
                 }
 
                 // Process end vertex
-                if let std::collections::hash_map::Entry::Vacant(e) = vertex_index_map.entry(edge.end_vertex) {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    vertex_index_map.entry(edge.end_vertex)
+                {
                     if let Some(vertex) = self.vertices.get(edge.end_vertex) {
                         let point = vertex.point();
                         let idx = vertices.len() as u32;
@@ -1083,10 +1086,7 @@ impl<'a> TopologyBuilder<'a> {
         let parameters = match serde_json::to_value(&operation) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    "failed to serialize TimelineOperation for recorder: {}",
-                    e
-                );
+                tracing::warn!("failed to serialize TimelineOperation for recorder: {}", e);
                 serde_json::Value::Null
             }
         };
@@ -2424,7 +2424,6 @@ impl<'a> TopologyBuilder<'a> {
                 + (GEOMETRY_PARAMETERS.len() * std::mem::size_of::<DashMap<String, f64>>()),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -2509,7 +2508,14 @@ mod cascade_tests {
         shell.add_face(face_id);
         let shell_id = model.shells.add(shell);
 
-        (model, [v1, v2, v3], [e1, e2, e3], loop_id, face_id, shell_id)
+        (
+            model,
+            [v1, v2, v3],
+            [e1, e2, e3],
+            loop_id,
+            face_id,
+            shell_id,
+        )
     }
 
     #[test]

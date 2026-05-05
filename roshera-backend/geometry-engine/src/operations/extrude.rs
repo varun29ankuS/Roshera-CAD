@@ -78,9 +78,10 @@ fn build_extrusion_loop_topology(
             if top_vertex.contains_key(&bv) {
                 continue;
             }
-            let v = model.vertices.get(bv).ok_or_else(|| {
-                OperationError::InvalidGeometry("Vertex not found".to_string())
-            })?;
+            let v = model
+                .vertices
+                .get(bv)
+                .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
             let pos = Point3::from(v.position) + translation;
             let tv = model.vertices.add(pos.x, pos.y, pos.z);
             top_vertex.insert(bv, tv);
@@ -103,9 +104,10 @@ fn build_extrusion_loop_topology(
     let translation_matrix = Matrix4::from_translation(&translation);
     let mut top_edges: Vec<EdgeId> = Vec::with_capacity(snapshot.len());
     for edge in &snapshot {
-        let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
-            OperationError::InvalidGeometry("Curve not found".to_string())
-        })?;
+        let curve = model
+            .curves
+            .get(edge.curve_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
         let translated_curve = curve.transform(&translation_matrix);
         let new_curve_id = model.curves.add(translated_curve);
 
@@ -185,9 +187,10 @@ fn create_top_face_shared(
     direction: Vector3,
     distance: f64,
 ) -> OperationResult<FaceId> {
-    let original_surface = model.surfaces.get(base_face.surface_id).ok_or_else(|| {
-        OperationError::InvalidGeometry("Surface not found".to_string())
-    })?;
+    let original_surface = model
+        .surfaces
+        .get(base_face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
     let translated_surface =
         original_surface.transform(&Matrix4::from_translation(&(direction * distance)));
     let new_surface_id = model.surfaces.add(translated_surface);
@@ -1361,4 +1364,3 @@ fn create_planar_surface_from_vertices(
         .map_err(|e| OperationError::NumericalError(format!("Plane creation failed: {:?}", e)))?;
     Ok(Box::new(plane))
 }
-

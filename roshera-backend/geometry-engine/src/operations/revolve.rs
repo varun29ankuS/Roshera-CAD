@@ -241,27 +241,33 @@ fn create_helical_sweep(
             let edge = model
                 .edges
                 .get(edge_id)
-                .ok_or_else(|| OperationError::InvalidGeometry(format!(
-                    "revolve: edge {} (profile slot {}) not found",
-                    edge_id, i
-                )))?
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!(
+                        "revolve: edge {} (profile slot {}) not found",
+                        edge_id, i
+                    ))
+                })?
                 .clone();
 
             // Get edge endpoints and transform them
             let ps_arr = model
                 .vertices
                 .get_position(edge.start_vertex)
-                .ok_or_else(|| OperationError::InvalidGeometry(format!(
-                    "revolve: start vertex {} of edge {} (profile slot {}) not found",
-                    edge.start_vertex, edge_id, i
-                )))?;
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!(
+                        "revolve: start vertex {} of edge {} (profile slot {}) not found",
+                        edge.start_vertex, edge_id, i
+                    ))
+                })?;
             let pe_arr = model
                 .vertices
                 .get_position(edge.end_vertex)
-                .ok_or_else(|| OperationError::InvalidGeometry(format!(
-                    "revolve: end vertex {} of edge {} (profile slot {}) not found",
-                    edge.end_vertex, edge_id, i
-                )))?;
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!(
+                        "revolve: end vertex {} of edge {} (profile slot {}) not found",
+                        edge.end_vertex, edge_id, i
+                    ))
+                })?;
             let p_start = Vector3::new(ps_arr[0], ps_arr[1], ps_arr[2]);
             let p_end = Vector3::new(pe_arr[0], pe_arr[1], pe_arr[2]);
 
@@ -789,9 +795,7 @@ fn face_intersects_axis(
     use crate::primitives::surface::Plane;
 
     let tolerance = 1e-6;
-    let axis_dir = axis_direction
-        .normalize()
-        .unwrap_or(axis_direction);
+    let axis_dir = axis_direction.normalize().unwrap_or(axis_direction);
 
     let loop_data = model
         .loops
@@ -800,7 +804,8 @@ fn face_intersects_axis(
 
     // Helper: radial offset of a point from the infinite axis line.
     let radial_offset = |p: Point3| -> Vector3 {
-        let to_p = Vector3::new(p.x, p.y, p.z) - Vector3::new(axis_origin.x, axis_origin.y, axis_origin.z);
+        let to_p =
+            Vector3::new(p.x, p.y, p.z) - Vector3::new(axis_origin.x, axis_origin.y, axis_origin.z);
         to_p - axis_dir * to_p.dot(&axis_dir)
     };
 
@@ -818,11 +823,7 @@ fn face_intersects_axis(
                 .vertices
                 .get(vertex_id)
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
-            let point = Point3::new(
-                vertex.position[0],
-                vertex.position[1],
-                vertex.position[2],
-            );
+            let point = Point3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
             let r = radial_offset(point);
             if r.magnitude() < tolerance {
                 return Ok(true);
@@ -866,10 +867,8 @@ fn face_intersects_axis(
             let denom = n.dot(&axis_dir);
             if denom.abs() > 1e-12 {
                 // Axis is not parallel to plane → unique intersection point.
-                let plane_origin_v =
-                    Vector3::new(plane.origin.x, plane.origin.y, plane.origin.z);
-                let axis_origin_v =
-                    Vector3::new(axis_origin.x, axis_origin.y, axis_origin.z);
+                let plane_origin_v = Vector3::new(plane.origin.x, plane.origin.y, plane.origin.z);
+                let axis_origin_v = Vector3::new(axis_origin.x, axis_origin.y, axis_origin.z);
                 let t = n.dot(&(plane_origin_v - axis_origin_v)) / denom;
                 let pierce = Point3::new(
                     axis_origin.x + axis_dir.x * t,

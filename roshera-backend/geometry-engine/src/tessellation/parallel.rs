@@ -9,8 +9,8 @@
 
 use super::{surface, TessellationParams, ThreeJsMesh, TriangleMesh};
 use crate::primitives::{face::Face, shell::Shell, solid::Solid, topology_builder::BRepModel};
-use rayon::prelude::*;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Parallel tessellation of a solid
@@ -302,4 +302,3 @@ pub fn optimize_mesh_parallel(mesh: &mut ThreeJsMesh) {
         mesh.colors = Some(new_colors);
     }
 }
-

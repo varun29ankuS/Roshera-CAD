@@ -378,7 +378,10 @@ pub async fn logout(
     };
 
     auth_manager.revoke_token(&claims.jti, "user_logout", &claims.sub);
-    info!("Logout successful — token {} revoked for user {}", claims.jti, claims.sub);
+    info!(
+        "Logout successful — token {} revoked for user {}",
+        claims.jti, claims.sub
+    );
 
     Ok(Json(LogoutResponse {
         success: true,

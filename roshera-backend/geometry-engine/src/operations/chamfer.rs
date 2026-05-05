@@ -540,9 +540,8 @@ fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationRes
     // 3+ points: fit a clamped NURBS curve. Tolerance is informational for
     // `fit_to_points`; we pass the kernel default.
     let tolerance = crate::math::Tolerance::default();
-    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
-        OperationError::NumericalError(format!("offset curve fit failed: {:?}", e))
-    })?;
+    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance())
+        .map_err(|e| OperationError::NumericalError(format!("offset curve fit failed: {:?}", e)))?;
     Ok(model.curves.add(Box::new(nurbs)))
 }
 
@@ -814,9 +813,10 @@ fn propagate_by_continuity(
                 if t_n.magnitude() < 1e-12 {
                     continue;
                 }
-                let cos = t_seed.normalize().unwrap_or(Vector3::X).dot(
-                    &t_n.normalize().unwrap_or(Vector3::X),
-                );
+                let cos = t_seed
+                    .normalize()
+                    .unwrap_or(Vector3::X)
+                    .dot(&t_n.normalize().unwrap_or(Vector3::X));
                 // Accept either co-directional or anti-directional
                 // tangent (edges may be oriented oppositely at the
                 // shared vertex).
@@ -842,11 +842,7 @@ fn propagate_by_continuity(
 /// Curve tangent of `edge` evaluated at the curve parameter
 /// corresponding to vertex `v`. Returns `None` if the curve cannot be
 /// evaluated.
-fn edge_tangent_at_vertex(
-    model: &BRepModel,
-    edge: &Edge,
-    v: VertexId,
-) -> Option<Vector3> {
+fn edge_tangent_at_vertex(model: &BRepModel, edge: &Edge, v: VertexId) -> Option<Vector3> {
     let curve = model.curves.get(edge.curve_id)?;
     let t = if v == edge.start_vertex {
         edge.param_range.start

@@ -38,12 +38,7 @@ fn main() {
 /// 100×50 rectangle extruded 50 mm in +Z → simple rectangular block.
 fn extrude_rectangle(params: &TessellationParams) {
     let mut model = BRepModel::new();
-    let profile = make_rectangle_profile(
-        &mut model,
-        Point3::new(0.0, 0.0, 0.0),
-        100.0,
-        50.0,
-    );
+    let profile = make_rectangle_profile(&mut model, Point3::new(0.0, 0.0, 0.0), 100.0, 50.0);
 
     let t = Instant::now();
     let id = extrude_profile(
@@ -73,12 +68,12 @@ fn extrude_l_shape(params: &TessellationParams) {
 
     // L-shape outline (CCW, all in XY at z=0):
     //   (0,0) -> (60,0) -> (60,20) -> (20,20) -> (20,40) -> (0,40) -> (0,0)
-    let v0 = model.vertices.add( 0.0,  0.0, 0.0);
-    let v1 = model.vertices.add(60.0,  0.0, 0.0);
+    let v0 = model.vertices.add(0.0, 0.0, 0.0);
+    let v1 = model.vertices.add(60.0, 0.0, 0.0);
     let v2 = model.vertices.add(60.0, 20.0, 0.0);
     let v3 = model.vertices.add(20.0, 20.0, 0.0);
     let v4 = model.vertices.add(20.0, 40.0, 0.0);
-    let v5 = model.vertices.add( 0.0, 40.0, 0.0);
+    let v5 = model.vertices.add(0.0, 40.0, 0.0);
     let profile = vec![
         add_line_edge(&mut model, v0, v1),
         add_line_edge(&mut model, v1, v2),
@@ -115,8 +110,8 @@ fn revolve_rectangle(params: &TessellationParams) {
     let mut model = BRepModel::new();
 
     // Profile lives in XZ plane, x ∈ [20, 30], z ∈ [0, 10] (at y = 0).
-    let v0 = model.vertices.add(20.0, 0.0,  0.0);
-    let v1 = model.vertices.add(30.0, 0.0,  0.0);
+    let v0 = model.vertices.add(20.0, 0.0, 0.0);
+    let v1 = model.vertices.add(30.0, 0.0, 0.0);
     let v2 = model.vertices.add(30.0, 0.0, 10.0);
     let v3 = model.vertices.add(20.0, 0.0, 10.0);
     let profile = vec![

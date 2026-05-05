@@ -84,12 +84,8 @@ fn loft_circle_square_circle(params: &TessellationParams) {
         25.0,
     );
 
-    let square_mid = make_rectangle_profile(
-        &mut model,
-        Point3::new(-20.0, -20.0, 50.0),
-        40.0,
-        40.0,
-    );
+    let square_mid =
+        make_rectangle_profile(&mut model, Point3::new(-20.0, -20.0, 50.0), 40.0, 40.0);
 
     let circle_top = make_circle_profile(
         &mut model,

@@ -26,7 +26,9 @@ pub mod replay;
 pub mod storage;
 
 // Re-export commonly used types
-pub use branch::{BranchManager, MergeResult, MergeStrategy};
+pub use branch::{
+    suggest_branch_names, BranchManager, MergeResult, MergeStrategy, BRANCH_NAME_POOL,
+};
 pub use cache::{CacheConfig, CacheManager};
 pub use dependency_graph::DependencyGraph;
 pub use error::{TimelineError, TimelineResult};

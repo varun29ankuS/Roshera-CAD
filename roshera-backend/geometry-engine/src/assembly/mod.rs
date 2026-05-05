@@ -330,10 +330,7 @@ impl Assembly {
             self.components.insert(sub_id, sub_component);
 
             // Update tree structure
-            self.tree
-                .entry(parent_id)
-                .or_default()
-                .push(sub_id);
+            self.tree.entry(parent_id).or_default().push(sub_id);
         }
 
         // Add all mates from the sub-assembly
@@ -436,9 +433,7 @@ impl Assembly {
         // Copy persistent gear-neutral transforms (frozen at mate
         // creation, never overwritten by solve passes).
         for entry in self.gear_neutrals.iter() {
-            solver
-                .gear_neutrals
-                .insert(*entry.key(), *entry.value());
+            solver.gear_neutrals.insert(*entry.key(), *entry.value());
         }
 
         // Register active mates with pre-resolved local-frame references.
@@ -932,24 +927,17 @@ impl ConstraintSolver {
         // Compute the correction transform (in world space) that, when
         // pre-multiplied onto the movable component's current transform,
         // brings it into compliance with the constraint.
-        let correction = match compute_correction(
-            c,
-            &t1,
-            &t2,
-            ref1,
-            ref2,
-            movable,
-            &self.gear_neutrals,
-        ) {
-            Ok(Some(delta)) => delta,
-            Ok(None) => {
-                return ConstraintOutcome::Satisfied {
-                    translation_delta: 0.0,
-                    rotation_delta: 0.0,
-                };
-            }
-            Err(msg) => return ConstraintOutcome::Unresolvable(msg),
-        };
+        let correction =
+            match compute_correction(c, &t1, &t2, ref1, ref2, movable, &self.gear_neutrals) {
+                Ok(Some(delta)) => delta,
+                Ok(None) => {
+                    return ConstraintOutcome::Satisfied {
+                        translation_delta: 0.0,
+                        rotation_delta: 0.0,
+                    };
+                }
+                Err(msg) => return ConstraintOutcome::Unresolvable(msg),
+            };
 
         // Measure the correction magnitude for convergence.
         let translation_delta = correction.translation.magnitude();
@@ -1015,9 +1003,7 @@ impl RigidCorrection {
     /// Expand to a 4×4 world-frame transform:
     ///   M = T(translation) · T(pivot) · R(axis, angle) · T(-pivot)
     fn to_matrix(&self) -> Matrix4 {
-        let rot = if self.rotation_angle.abs() < 1e-14
-            || self.rotation_axis.magnitude() < 1e-14
-        {
+        let rot = if self.rotation_angle.abs() < 1e-14 || self.rotation_axis.magnitude() < 1e-14 {
             Matrix4::IDENTITY
         } else {
             let q = match Quaternion::from_axis_angle(&self.rotation_axis, self.rotation_angle) {
@@ -1292,8 +1278,7 @@ fn align_directions(
         Vector3::new(anchor_n.x * sign, anchor_n.y * sign, anchor_n.z * sign)
     };
 
-    let q = Quaternion::from_rotation_between(&movable_n, &target)
-        .map_err(|e| e.to_string())?;
+    let q = Quaternion::from_rotation_between(&movable_n, &target).map_err(|e| e.to_string())?;
 
     // Convert quaternion to axis-angle.
     let w = q.w.clamp(-1.0, 1.0);
@@ -1327,11 +1312,7 @@ fn perpendicular_correction(
     // Project out the parallel component:
     // target = normalize(mn - d·an). This is the closest unit vector to
     // mn that is perpendicular to an.
-    let target = Vector3::new(
-        mn.x - d * an.x,
-        mn.y - d * an.y,
-        mn.z - d * an.z,
-    );
+    let target = Vector3::new(mn.x - d * an.x, mn.y - d * an.y, mn.z - d * an.z);
     if target.magnitude() < 1e-12 {
         // mn is parallel to an — rotate by pi/2 about any perpendicular.
         let axis = an.perpendicular();
@@ -1540,12 +1521,10 @@ fn symmetric_correction(
     anchor_origin: Option<Point3>,
     movable_origin: Option<Point3>,
 ) -> Result<Option<RigidCorrection>, String> {
-    let ao = anchor_origin.ok_or_else(|| {
-        "Symmetric mate requires an origin on the anchor reference".to_string()
-    })?;
-    let mo = movable_origin.ok_or_else(|| {
-        "Symmetric mate requires an origin on the movable reference".to_string()
-    })?;
+    let ao = anchor_origin
+        .ok_or_else(|| "Symmetric mate requires an origin on the anchor reference".to_string())?;
+    let mo = movable_origin
+        .ok_or_else(|| "Symmetric mate requires an origin on the movable reference".to_string())?;
     let target = Point3::new(ao.x, ao.y, -ao.z);
     let t = Vector3::new(target.x - mo.x, target.y - mo.y, target.z - mo.z);
     if t.magnitude() < 1e-14 {
@@ -1566,15 +1545,12 @@ fn tangent_correction(
     anchor_dir: Option<Vector3>,
     movable_origin: Option<Point3>,
 ) -> Result<Option<RigidCorrection>, String> {
-    let ao = anchor_origin.ok_or_else(|| {
-        "Tangent mate requires an origin on the anchor reference".to_string()
-    })?;
-    let ad = anchor_dir.ok_or_else(|| {
-        "Tangent mate requires a direction on the anchor reference".to_string()
-    })?;
-    let mo = movable_origin.ok_or_else(|| {
-        "Tangent mate requires an origin on the movable reference".to_string()
-    })?;
+    let ao = anchor_origin
+        .ok_or_else(|| "Tangent mate requires an origin on the anchor reference".to_string())?;
+    let ad = anchor_dir
+        .ok_or_else(|| "Tangent mate requires a direction on the anchor reference".to_string())?;
+    let mo = movable_origin
+        .ok_or_else(|| "Tangent mate requires an origin on the movable reference".to_string())?;
     let an = ad.normalize().map_err(|e| e.to_string())?;
     let diff = Vector3::new(mo.x - ao.x, mo.y - ao.y, mo.z - ao.z);
     let signed_dist = diff.dot(&an);
@@ -1614,15 +1590,12 @@ fn path_correction(
     anchor_dir: Option<Vector3>,
     movable_origin: Option<Point3>,
 ) -> Result<Option<RigidCorrection>, String> {
-    let ao = anchor_origin.ok_or_else(|| {
-        "Path mate requires an origin on the anchor reference".to_string()
-    })?;
-    let ad = anchor_dir.ok_or_else(|| {
-        "Path mate requires a direction on the anchor reference".to_string()
-    })?;
-    let mo = movable_origin.ok_or_else(|| {
-        "Path mate requires an origin on the movable reference".to_string()
-    })?;
+    let ao = anchor_origin
+        .ok_or_else(|| "Path mate requires an origin on the anchor reference".to_string())?;
+    let ad = anchor_dir
+        .ok_or_else(|| "Path mate requires a direction on the anchor reference".to_string())?;
+    let mo = movable_origin
+        .ok_or_else(|| "Path mate requires an origin on the movable reference".to_string())?;
     let an = ad.normalize().map_err(|e| e.to_string())?;
     let diff = Vector3::new(mo.x - ao.x, mo.y - ao.y, mo.z - ao.z);
     let parallel = diff.dot(&an);
@@ -1687,18 +1660,14 @@ fn gear_correction(
 
     let (ao_opt, ad_opt) = world_origin_direction(anchor_ref, anchor_t);
     let (mo_opt, md_opt) = world_origin_direction(movable_ref, movable_t);
-    let _ao = ao_opt.ok_or_else(|| {
-        "Gear mate requires an origin on the anchor reference".to_string()
-    })?;
-    let ad = ad_opt.ok_or_else(|| {
-        "Gear mate requires a direction on the anchor reference".to_string()
-    })?;
-    let mo = mo_opt.ok_or_else(|| {
-        "Gear mate requires an origin on the movable reference".to_string()
-    })?;
-    let md = md_opt.ok_or_else(|| {
-        "Gear mate requires a direction on the movable reference".to_string()
-    })?;
+    let _ao =
+        ao_opt.ok_or_else(|| "Gear mate requires an origin on the anchor reference".to_string())?;
+    let ad = ad_opt
+        .ok_or_else(|| "Gear mate requires a direction on the anchor reference".to_string())?;
+    let mo = mo_opt
+        .ok_or_else(|| "Gear mate requires an origin on the movable reference".to_string())?;
+    let md = md_opt
+        .ok_or_else(|| "Gear mate requires a direction on the movable reference".to_string())?;
 
     // The "neutral" axis directions live in the neutral world frame.
     // Since each component's axis rotates with the component, we
@@ -1733,12 +1702,12 @@ fn gear_correction(
     // Compute delta = t_current * t_initial^-1 — the world-frame rigid
     // motion that takes the component from its neutral position to its
     // current position.
-    let anchor_initial_inv = anchor_initial.inverse().map_err(|_| {
-        "Gear mate: anchor initial transform is non-invertible".to_string()
-    })?;
-    let movable_initial_inv = movable_initial.inverse().map_err(|_| {
-        "Gear mate: movable initial transform is non-invertible".to_string()
-    })?;
+    let anchor_initial_inv = anchor_initial
+        .inverse()
+        .map_err(|_| "Gear mate: anchor initial transform is non-invertible".to_string())?;
+    let movable_initial_inv = movable_initial
+        .inverse()
+        .map_err(|_| "Gear mate: movable initial transform is non-invertible".to_string())?;
     let anchor_delta = *anchor_t * anchor_initial_inv;
     let movable_delta = *movable_t * movable_initial_inv;
 
@@ -1768,7 +1737,9 @@ fn gear_correction(
     // not the initial axis — the component may have translated.
     let axis_world = md.normalize().map_err(|e| e.to_string())?;
     let _ = ad; // anchor axis only needed to verify presence above
-    Ok(Some(RigidCorrection::pure_rotation(axis_world, wrapped, mo)))
+    Ok(Some(RigidCorrection::pure_rotation(
+        axis_world, wrapped, mo,
+    )))
 }
 
 /// Extract the signed scalar rotation of a rigid motion about a given
@@ -1778,10 +1749,7 @@ fn gear_correction(
 ///
 /// Returns 0 for pure translations or when the rotation has no
 /// component about the requested axis.
-fn signed_rotation_about_axis(
-    delta: &Matrix4,
-    axis: Vector3,
-) -> Result<f64, String> {
+fn signed_rotation_about_axis(delta: &Matrix4, axis: Vector3) -> Result<f64, String> {
     let axis_n = axis.normalize().map_err(|e| e.to_string())?;
     // Pick any unit vector perpendicular to axis.
     let r = axis_n.perpendicular();
@@ -1871,12 +1839,13 @@ mod tests {
 
         assert!(mate_result.is_ok());
         let mate_id = mate_result.unwrap();
-        let mate = assembly
-            .mates
-            .get(&mate_id)
-            .expect("mate registered");
+        let mate = assembly.mates.get(&mate_id).expect("mate registered");
         assert!(!mate.solved);
-        assert!(mate.error.as_deref().unwrap_or("").contains("not registered"));
+        assert!(mate
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not registered"));
     }
 
     fn register_plane_reference(
@@ -1890,10 +1859,8 @@ mod tests {
             .components
             .get_mut(&component)
             .expect("component exists");
-        comp.mate_references.insert(
-            name.to_string(),
-            MateReference::Plane { origin, normal },
-        );
+        comp.mate_references
+            .insert(name.to_string(), MateReference::Plane { origin, normal });
     }
 
     fn register_axis_reference(
@@ -1907,10 +1874,8 @@ mod tests {
             .components
             .get_mut(&component)
             .expect("component exists");
-        comp.mate_references.insert(
-            name.to_string(),
-            MateReference::Axis { origin, direction },
-        );
+        comp.mate_references
+            .insert(name.to_string(), MateReference::Axis { origin, direction });
     }
 
     #[test]

@@ -276,6 +276,407 @@ function HeaderButton({
   )
 }
 
+// ─── Branch overview (minimap on the right edge of the strip) ──────
+
+interface BranchView {
+  id: string
+  name: string
+  parent: string | null
+  state: string
+  agent_id: string | null
+  author: string
+  purpose: string
+  event_count: number
+  created_at: string
+}
+
+const MAIN_BRANCH_ID = '00000000-0000-0000-0000-000000000000'
+
+const MOCK_BRANCHES: BranchView[] = [
+  { id: MAIN_BRANCH_ID, name: 'main', parent: null, state: 'active',
+    agent_id: null, author: 'system', purpose: 'main',
+    event_count: MOCK_EVENTS.length, created_at: new Date(Date.now() - 600_000).toISOString() },
+  { id: '11111111-1111-1111-1111-111111111111', name: 'claude/explore', parent: MAIN_BRANCH_ID,
+    state: 'active', agent_id: 'claude-1', author: 'agent:claude',
+    purpose: 'AIOptimization', event_count: 3,
+    created_at: new Date(Date.now() - 120_000).toISOString() },
+  { id: '22222222-2222-2222-2222-222222222222', name: 'feat/fillet', parent: MAIN_BRANCH_ID,
+    state: 'merged', agent_id: null, author: 'user:varun',
+    purpose: 'UserExploration', event_count: 2,
+    created_at: new Date(Date.now() - 60_000).toISOString() },
+]
+
+function shortBranchName(b: BranchView): string {
+  if (b.id === MAIN_BRANCH_ID) return 'main'
+  return b.name.length > 10 ? `${b.name.slice(0, 9)}…` : b.name
+}
+
+/**
+ * Git-style branch graph.
+ *
+ * Mental model: time flows left → right. Each branch is its own
+ * horizontal lane. Operations are dots on the lane in time order. A
+ * fork drops as an L-elbow from the parent's lane down (or up) to the
+ * child's lane at the moment the child was created.
+ *
+ *   main:    ●─●─●─●─●─●─●─●─●─●─●─●  →
+ *                  └─\
+ *   claude:           ●─●─●─●  →
+ *                       └─\
+ *   fix/bug:               ●─●  →
+ *
+ * Active branch + label render in gizmo Y-axis green (`#2ecc71`); the
+ * latest dot pulses to confirm "this is where the next op will land".
+ * All other strokes/fills use `var(--foreground)` so the graph
+ * naturally inverts with the theme (navy lines on light card / light
+ * lines on navy card).
+ *
+ * Source of truth:
+ *  - Active branch's dots come from `events` (real timestamps).
+ *  - Non-active branches show `event_count` evenly spaced from their
+ *    `created_at` to "now" — we don't fetch per-event histories for
+ *    inactive branches (it would 3× the polling traffic).
+ *  - Fork x-position uses `branch.created_at` so the elbow lines up
+ *    with the moment the branch diverged from its parent.
+ *
+ * Click anywhere on a lane → `onSelect(branch.id)` → POST
+ * `/api/branches/active`, swapping where the kernel records new ops.
+ */
+function TimelineOverview({
+  branches,
+  events,
+  activeBranchId,
+  now,
+  onSelect,
+}: {
+  branches: BranchView[]
+  events: EventSummary[]
+  activeBranchId: string
+  now: number
+  onSelect: (branchId: string) => void
+}) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null)
+
+  // ── DFS-order branches: main first, then each subtree depth-first
+  //    sorted by created_at so siblings stack in chronological order.
+  const childrenMap: Record<string, BranchView[]> = {}
+  branches.forEach((b) => {
+    const key = b.parent ?? '__root__'
+    if (!childrenMap[key]) childrenMap[key] = []
+    childrenMap[key].push(b)
+  })
+  Object.values(childrenMap).forEach((arr) =>
+    arr.sort((a, b) => a.created_at.localeCompare(b.created_at)),
+  )
+  const ordered: BranchView[] = []
+  const seen = new Set<string>()
+  function visit(parentKey: string) {
+    const kids = childrenMap[parentKey] ?? []
+    for (const k of kids) {
+      if (seen.has(k.id)) continue
+      seen.add(k.id)
+      ordered.push(k)
+      visit(k.id)
+    }
+  }
+  const main =
+    branches.find((b) => b.id === MAIN_BRANCH_ID) ??
+    branches.find((b) => b.parent === null)
+  if (main && !seen.has(main.id)) {
+    seen.add(main.id)
+    ordered.push(main)
+    visit(main.id)
+  }
+  // Anything orphaned (parent not in `branches`) — append at the end.
+  branches.forEach((b) => {
+    if (!seen.has(b.id)) {
+      seen.add(b.id)
+      ordered.push(b)
+    }
+  })
+
+  // ── Canvas dimensions ───────────────────────────────────────────────
+  // Sized for the *expanded* timeline panel — roomy enough for ~6
+  // branches at 36-px lane height with 11-pt labels. Container scrolls
+  // horizontally if the SVG outgrows the viewport.
+  const nLanes = Math.max(ordered.length, 1)
+  const laneH = 36
+  const padT = 14
+  const padB = 18
+  const padL = 12
+  const padR = 28
+  const width = 880
+  const height = padT + padB + nLanes * laneH
+  // Left-side gutter reserved for the branch-name label.
+  const labelW = 130
+  const xStart = padL + labelW
+  const xEnd = width - padR
+
+  // ── Time scale: linear from earliest activity to "now" ─────────────
+  const tCreate = branches
+    .map((b) => new Date(b.created_at).getTime())
+    .filter((t) => !isNaN(t))
+  const tEvents = events
+    .map((e) => new Date(e.timestamp).getTime())
+    .filter((t) => !isNaN(t))
+  const fallbackMin = now - 60_000
+  const tMinCandidates = [...tCreate, ...tEvents]
+  const tMin = tMinCandidates.length > 0 ? Math.min(...tMinCandidates) : fallbackMin
+  const tMax = Math.max(now, ...tEvents, tMin + 1000)
+  const tSpan = Math.max(1, tMax - tMin)
+  const scaleX = (t: number): number =>
+    xStart + ((t - tMin) / tSpan) * (xEnd - xStart)
+
+  // ── Lane Y per branch ───────────────────────────────────────────────
+  const laneY = (i: number): number => padT + (i + 0.5) * laneH
+
+  const idxOf: Record<string, number> = {}
+  ordered.forEach((b, i) => {
+    idxOf[b.id] = i
+  })
+  const activeIdx = idxOf[activeBranchId] ?? -1
+  const activeBranch = activeIdx >= 0 ? ordered[activeIdx] : undefined
+
+  return (
+    <div
+      className="shrink-0 flex items-stretch gap-1 pl-1 select-none"
+      title="Branch graph — click a lane to switch active branch"
+    >
+      <svg width={width} height={height} style={{ display: 'block' }}>
+        <defs>
+          <filter id="rh-git-glow" x="-80%" y="-80%" width="260%" height="260%">
+            <feGaussianBlur stdDeviation="1.4" result="blur" />
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+        </defs>
+        <style>{`
+          @keyframes rh-git-pulse {
+            0%, 100% { opacity: 1;    transform: scale(1); }
+            50%      { opacity: 0.65; transform: scale(1.35); }
+          }
+          .rh-git-pulse {
+            transform-origin: center;
+            transform-box: fill-box;
+            animation: rh-git-pulse 1.8s ease-in-out infinite;
+          }
+        `}</style>
+
+        {/* ── Fork elbows: parent lane → child lane at child.created_at ── */}
+        {ordered.map((b, i) => {
+          if (!b.parent) return null
+          const pIdx = idxOf[b.parent]
+          if (pIdx === undefined) return null
+          const t = new Date(b.created_at).getTime()
+          if (isNaN(t)) return null
+          const fx = scaleX(t)
+          const py = laneY(pIdx)
+          const cy = laneY(i)
+          if (Math.abs(cy - py) < 0.5) return null
+          // L-elbow with a small rounded corner where it meets child lane.
+          const dy = cy - py
+          const r = Math.min(5, Math.abs(dy) / 2)
+          const sgn = dy > 0 ? 1 : -1
+          const d =
+            `M ${fx} ${py} ` +
+            `L ${fx} ${cy - sgn * r} ` +
+            `Q ${fx} ${cy} ${fx + r} ${cy}`
+          const onActivePath = i === activeIdx || pIdx === activeIdx
+          return (
+            <path
+              key={`fork-${b.id}`}
+              d={d}
+              fill="none"
+              stroke={onActivePath ? '#2ecc71' : 'var(--foreground)'}
+              strokeOpacity={onActivePath ? 0.85 : 0.4}
+              strokeWidth={onActivePath ? 1.4 : 1.0}
+              strokeLinecap="round"
+            />
+          )
+        })}
+
+        {/* ── Lanes ──────────────────────────────────────────────────── */}
+        {ordered.map((b, i) => {
+          const y = laneY(i)
+          const isMain = b.id === MAIN_BRANCH_ID || b.parent === null
+          const isActive = i === activeIdx
+          const isHover = hoveredId === b.id
+          const isMerged = b.state === 'merged'
+          const isAbandoned = b.state === 'abandoned'
+
+          // Lane left endpoint: main spans the whole time axis; other
+          // branches start at their fork x.
+          let xs = xStart
+          if (!isMain) {
+            const t = new Date(b.created_at).getTime()
+            if (!isNaN(t)) xs = scaleX(t)
+          }
+
+          // Dot positions:
+          //  - Active branch uses real `events` timestamps.
+          //  - Inactive: even spacing from xs to xEnd by event_count.
+          let dots: { x: number; isLatest: boolean }[] = []
+          if (isActive && events.length > 0) {
+            dots = events.map((e, j) => {
+              const t = new Date(e.timestamp).getTime()
+              return {
+                x: isNaN(t) ? xs : scaleX(t),
+                isLatest: j === events.length - 1,
+              }
+            })
+          } else if (b.event_count > 0) {
+            const span = Math.max(0, xEnd - xs)
+            const n = b.event_count
+            for (let j = 0; j < n; j++) {
+              dots.push({
+                x: xs + (span * (j + 1)) / (n + 1),
+                isLatest: j === n - 1,
+              })
+            }
+          }
+
+          const laneColor = isActive
+            ? '#2ecc71'
+            : isAbandoned
+              ? 'rgba(251,146,60,0.85)'
+              : 'var(--foreground)'
+          const laneOpacity = isActive
+            ? 0.9
+            : isHover
+              ? 0.7
+              : isMerged
+                ? 0.32
+                : 0.55
+          const dotOpacity = isActive
+            ? 1
+            : isHover
+              ? 0.95
+              : isMerged
+                ? 0.4
+                : 0.65
+
+          const labelStyle: React.CSSProperties = isActive
+            ? { fill: '#2ecc71' }
+            : {}
+          const labelClass = isActive
+            ? undefined
+            : isHover
+              ? 'fill-foreground/95'
+              : 'fill-foreground/70'
+
+          return (
+            <g
+              key={`lane-${b.id}`}
+              onClick={() => onSelect(b.id)}
+              onPointerEnter={() => setHoveredId(b.id)}
+              onPointerLeave={() =>
+                setHoveredId((id) => (id === b.id ? null : id))
+              }
+              style={{ cursor: 'pointer' }}
+            >
+              {/* Hit area: full lane height, full width. */}
+              <rect
+                x={padL}
+                y={y - laneH / 2}
+                width={width - padL}
+                height={laneH}
+                fill="transparent"
+              />
+
+              {/* Branch name in left gutter, right-aligned at xStart. */}
+              <text
+                x={xStart - 8}
+                y={y + 4}
+                textAnchor="end"
+                className={labelClass}
+                fontSize="12"
+                fontWeight={isActive ? 700 : 500}
+                letterSpacing="0.2"
+                style={{ fontFamily: 'inherit', ...labelStyle }}
+              >
+                {b.name && b.name.length > 0 ? b.name : shortBranchName(b)}
+              </text>
+
+              {/* Lane line. */}
+              <line
+                x1={xs}
+                y1={y}
+                x2={xEnd}
+                y2={y}
+                stroke={laneColor}
+                strokeOpacity={laneOpacity}
+                strokeWidth={isActive ? 1.5 : 1.0}
+                strokeLinecap="round"
+              />
+
+              {/* Right-edge arrow head. */}
+              <text
+                x={xEnd + 4}
+                y={y + 4}
+                fontSize="12"
+                fill={isActive ? '#2ecc71' : 'var(--foreground)'}
+                fillOpacity={isActive ? 0.95 : 0.45}
+                style={{ fontFamily: 'inherit' }}
+              >
+                →
+              </text>
+
+              {/* Op dots. Latest dot on the active lane breathes. */}
+              {dots.map((dot, j) => {
+                const r = isActive ? (dot.isLatest ? 4.5 : 3.5) : 3.0
+                const pulse = isActive && dot.isLatest
+                return (
+                  <circle
+                    key={j}
+                    cx={dot.x}
+                    cy={y}
+                    r={r}
+                    fill={laneColor}
+                    fillOpacity={dotOpacity}
+                    className={pulse ? 'rh-git-pulse' : undefined}
+                    filter={pulse ? 'url(#rh-git-glow)' : undefined}
+                  />
+                )
+              })}
+
+              {/* Op count near the right end (idle lanes only — active
+                  shows live dots). */}
+              {!isActive && b.event_count > 0 && (
+                <text
+                  x={xEnd - 4}
+                  y={y - 6}
+                  textAnchor="end"
+                  className="fill-foreground/55"
+                  fontSize="10"
+                  style={{ fontFamily: 'inherit' }}
+                >
+                  {b.event_count} ops
+                </text>
+              )}
+            </g>
+          )
+        })}
+
+        {/* Footer status — confirms which branch is live. */}
+        <text
+          x={padL + 4}
+          y={height - 4}
+          fontSize="10"
+          letterSpacing="0.4"
+          style={{ fontFamily: 'inherit', fill: '#2ecc71' }}
+          fillOpacity={0.85}
+        >
+          {activeBranch
+            ? `▶ active: ${activeBranch.name || shortBranchName(activeBranch)}`
+            : '▶ —'}
+        </text>
+      </svg>
+    </div>
+  )
+}
+
 // ─── Main strip ─────────────────────────────────────────────────────
 
 interface EventContextMenuState {
@@ -287,6 +688,38 @@ interface EventContextMenuState {
 export function Timeline() {
   const previewMode = isPreviewMode()
   const [events, setEvents] = useState<EventSummary[]>(previewMode ? MOCK_EVENTS : [])
+  const [branches, setBranches] = useState<BranchView[]>(previewMode ? MOCK_BRANCHES : [])
+  // Active branch = the one whose events are shown in the strip AND
+  // the one the kernel records new operations against. The minimap
+  // calls `selectBranch(id)` when the user clicks a node; we POST
+  // `/api/branches/active` first so the backend's TimelineRecorder
+  // swaps its target before we update local state and re-fetch.
+  // Without this round-trip, new operations would keep landing on
+  // `main` regardless of UI state — the bug Varun was hitting.
+  const [activeBranchId, setActiveBranchId] = useState<string>(MAIN_BRANCH_ID)
+  // Collapsed = linear strip of the active branch only (the default).
+  // Expanded = drops down a roomy git-style graph panel above the
+  // strip showing every branch + fork structure. The graph is heavy
+  // visually and adds little when you're focused on a single branch,
+  // so it stays out of the way until you ask for it.
+  const [overviewExpanded, setOverviewExpanded] = useState(false)
+  const selectBranch = useCallback(async (branchId: string) => {
+    if (branchId === activeBranchId) return
+    try {
+      const resp = await fetch('/api/branches/active', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ branch_id: branchId }),
+      })
+      if (!resp.ok) {
+        console.error('[timeline] set-active-branch failed:', resp.status)
+        return
+      }
+      setActiveBranchId(branchId)
+    } catch (err) {
+      console.error('[timeline] set-active-branch threw:', err)
+    }
+  }, [activeBranchId])
   const [loading, setLoading] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const [menu, setMenu] = useState<EventContextMenuState | null>(null)
@@ -313,13 +746,22 @@ export function Timeline() {
     if (previewMode) return // hold the mock data steady in preview mode
     try {
       setLoading(true)
-      const resp = await fetch('/api/timeline/history/main')
-      if (resp.ok) {
-        const data = await resp.json()
+      const [histResp, branchResp] = await Promise.all([
+        fetch(`/api/timeline/history/${activeBranchId}`),
+        fetch('/api/branches'),
+      ])
+      if (histResp.ok) {
+        const data = await histResp.json()
         if (Array.isArray(data)) {
           setEvents(data)
         } else if (data.events && Array.isArray(data.events)) {
           setEvents(data.events)
+        }
+      }
+      if (branchResp.ok) {
+        const data = await branchResp.json()
+        if (Array.isArray(data)) {
+          setBranches(data as BranchView[])
         }
       }
     } catch {
@@ -327,7 +769,7 @@ export function Timeline() {
     } finally {
       setLoading(false)
     }
-  }, [previewMode])
+  }, [previewMode, activeBranchId])
 
   useEffect(() => {
     if (wsStatus === 'connected') {
@@ -407,50 +849,122 @@ export function Timeline() {
   }
 
   const handleBranch = async () => {
+    // Hit `/api/branches` (timeline-backed) rather than the legacy
+    // `/api/timeline/branch/create` route — the latter writes into a
+    // separate `branch_manager` store that `GET /api/branches` (used
+    // by the overview minimap) does not read from, so its branches
+    // never show up in the UI.
     try {
-      await fetch('/api/timeline/branch/create', {
+      const ts = new Date()
+      const stamp = `${ts.getHours().toString().padStart(2, '0')}:${ts
+        .getMinutes()
+        .toString()
+        .padStart(2, '0')}:${ts.getSeconds().toString().padStart(2, '0')}`
+      const resp = await fetch('/api/branches', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `Branch ${Date.now()}` }),
+        body: JSON.stringify({
+          name: `branch-${stamp}`,
+          parent: activeBranchId,
+          description: 'manual branch from timeline strip',
+        }),
       })
-    } catch { /* backend not running */ }
+      if (!resp.ok) {
+        console.error('[timeline] branch create failed:', resp.status)
+      }
+      fetchHistory()
+    } catch (err) {
+      console.error('[timeline] branch threw:', err)
+    }
   }
 
+  const activeBranch = branches.find((b) => b.id === activeBranchId)
+  const activeBranchLabel = activeBranch
+    ? activeBranch.name || (activeBranch.id === MAIN_BRANCH_ID ? 'main' : '…')
+    : 'main'
+  const otherBranchCount = Math.max(0, branches.length - 1)
+
   return (
-    <div className="font-mono flex items-center gap-2 px-3 py-1.5 border-t border-border bg-card h-[80px] shrink-0">
-      {/* Header: title + glyph actions */}
-      <div className="flex items-center gap-0.5 shrink-0 text-[13px]">
-        <span className="text-foreground/80 mr-1">timeline</span>
-        <HeaderButton onClick={handleUndo} title="Undo (Ctrl+Z)" ariaLabel="Undo">↶</HeaderButton>
-        <HeaderButton onClick={handleRedo} title="Redo (Ctrl+Shift+Z)" ariaLabel="Redo">↷</HeaderButton>
-        <HeaderButton onClick={handleCheckpoint} title="Checkpoint" ariaLabel="Create checkpoint">◈</HeaderButton>
-        <HeaderButton onClick={handleBranch} title="Branch" ariaLabel="Create branch">⑂</HeaderButton>
-      </div>
+    <div className="font-mono flex flex-col border-t border-border bg-card shrink-0">
+      {/* Expanded panel: full git-style graph. Sits above the strip
+          and only renders when the user clicks ▾. Horizontal scroll
+          if the SVG is wider than the viewport. */}
+      {overviewExpanded && (
+        <div className="border-b border-border bg-card/80 overflow-x-auto overflow-y-auto max-h-[320px]">
+          <TimelineOverview
+            branches={branches}
+            events={events}
+            activeBranchId={activeBranchId}
+            now={now}
+            onSelect={selectBranch}
+          />
+        </div>
+      )}
 
-      <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
+      <div className="flex items-center gap-2 px-3 py-1.5 h-[80px]">
+        {/* Header: title + glyph actions */}
+        <div className="flex items-center gap-0.5 shrink-0 text-[13px]">
+          <span className="text-foreground/80 mr-1">timeline</span>
+          <HeaderButton onClick={handleUndo} title="Undo (Ctrl+Z)" ariaLabel="Undo">↶</HeaderButton>
+          <HeaderButton onClick={handleRedo} title="Redo (Ctrl+Shift+Z)" ariaLabel="Redo">↷</HeaderButton>
+          <HeaderButton onClick={handleCheckpoint} title="Checkpoint" ariaLabel="Create checkpoint">◈</HeaderButton>
+          <HeaderButton onClick={handleBranch} title="Branch" ariaLabel="Create branch">⑂</HeaderButton>
+        </div>
 
-      {/* Event stream with terminal-style connectors */}
-      <div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden">
-        {events.length === 0 ? (
-          <div className="text-[12px] text-muted-foreground/60 px-2 py-3">
-            {loading ? '⋯ loading' : '∅ no operations yet'}
-          </div>
-        ) : (
-          <div className="flex items-start gap-0 whitespace-nowrap">
-            {events.map((event, i) => (
-              <Fragment key={event.id}>
-                {i > 0 && <Connector />}
-                <EventNode
-                  event={event}
-                  isLatest={i === events.length - 1}
-                  now={now}
-                  onContextMenu={handleEventContextMenu}
-                />
-              </Fragment>
-            ))}
-            <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">→</span>
-          </div>
-        )}
+        <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
+
+        {/* Event stream with terminal-style connectors */}
+        <div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden">
+          {events.length === 0 ? (
+            <div className="text-[12px] text-muted-foreground/60 px-2 py-3">
+              {loading ? '⋯ loading' : '∅ no operations yet'}
+            </div>
+          ) : (
+            <div className="flex items-start gap-0 whitespace-nowrap">
+              {events.map((event, i) => (
+                <Fragment key={event.id}>
+                  {i > 0 && <Connector />}
+                  <EventNode
+                    event={event}
+                    isLatest={i === events.length - 1}
+                    now={now}
+                    onContextMenu={handleEventContextMenu}
+                  />
+                </Fragment>
+              ))}
+              <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">→</span>
+            </div>
+          )}
+        </div>
+
+        {/* Right side: branch chip (active branch + count of others)
+            and the expand/collapse toggle. Click anywhere on the chip
+            to expand. */}
+        <button
+          type="button"
+          onClick={() => setOverviewExpanded((v) => !v)}
+          title={
+            overviewExpanded
+              ? 'Hide branch graph'
+              : `Show branch graph (${branches.length} branch${branches.length === 1 ? '' : 'es'})`
+          }
+          className="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded text-[12px] hover:bg-accent/40 transition-colors"
+        >
+          <span
+            aria-hidden
+            className="inline-block w-1.5 h-1.5 rounded-full"
+            style={{ backgroundColor: '#2ecc71' }}
+          />
+          <span className="text-foreground/90 font-medium">
+            {activeBranchLabel}
+          </span>
+          {otherBranchCount > 0 && (
+            <span className="text-foreground/50">+{otherBranchCount}</span>
+          )}
+          <span className="text-foreground/60 ml-0.5">
+            {overviewExpanded ? '▴' : '▾'}
+          </span>
+        </button>
       </div>
 
       {menu && (

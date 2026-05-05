@@ -59,8 +59,7 @@ fn main() {
         .expect("cyl params")
         .with_axis(Vector3::new(0.0, 0.0, 1.0))
         .expect("cyl axis");
-    let cyl_id =
-        CylinderPrimitive::create(cyl_params, &mut model).expect("cyl create");
+    let cyl_id = CylinderPrimitive::create(cyl_params, &mut model).expect("cyl create");
     println!(
         "[3] cylinder r=15 h=80 axis=Z  -> solid #{cyl_id}  (built in {:.2} ms)",
         t.elapsed().as_secs_f64() * 1e3
@@ -99,21 +98,28 @@ fn main() {
     println!("\n=== STL outputs ===");
     println!(
         "  {:<14} {:>8} verts  {:>8} tris  {:>8.2} ms",
-        "box",       box_stats.verts, box_stats.tris, box_stats.tess_ms
+        "box", box_stats.verts, box_stats.tris, box_stats.tess_ms
     );
     println!(
         "  {:<14} {:>8} verts  {:>8} tris  {:>8.2} ms",
-        "sphere",    sphere_stats.verts, sphere_stats.tris, sphere_stats.tess_ms
+        "sphere", sphere_stats.verts, sphere_stats.tris, sphere_stats.tess_ms
     );
     println!(
         "  {:<14} {:>8} verts  {:>8} tris  {:>8.2} ms",
-        "cylinder",  cyl_stats.verts, cyl_stats.tris, cyl_stats.tess_ms
+        "cylinder", cyl_stats.verts, cyl_stats.tris, cyl_stats.tess_ms
     );
     if let Some(s) = bool_stats {
         println!(
             "  {:<14} {:>8} verts  {:>8} tris  {:>8.2} ms  {}",
-            "boolean diff", s.verts, s.tris, s.tess_ms,
-            if s.tris == 0 { "<-- known gap: trimmed faces not triangulated" } else { "" }
+            "boolean diff",
+            s.verts,
+            s.tris,
+            s.tess_ms,
+            if s.tris == 0 {
+                "<-- known gap: trimmed faces not triangulated"
+            } else {
+                ""
+            }
         );
     }
 
@@ -211,7 +217,11 @@ fn write_stl_binary(mesh: &TriangleMesh, path: &Path) -> std::io::Result<Duratio
             w.write_all(&f.to_le_bytes())?;
         }
         for v in [v0, v1, v2] {
-            for f in [v.position.x as f32, v.position.y as f32, v.position.z as f32] {
+            for f in [
+                v.position.x as f32,
+                v.position.y as f32,
+                v.position.z as f32,
+            ] {
                 w.write_all(&f.to_le_bytes())?;
             }
         }
