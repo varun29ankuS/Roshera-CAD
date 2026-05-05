@@ -342,9 +342,7 @@ impl BRepModel {
         origin: Point3,
         direction: crate::primitives::datum::AxisDirection,
     ) -> Result<crate::primitives::datum::DatumId, crate::primitives::datum::DatumError> {
-        let id = self
-            .datums
-            .create_axis(name.clone(), origin, direction)?;
+        let id = self.datums.create_axis(name.clone(), origin, direction)?;
         let dir_label = match direction {
             crate::primitives::datum::AxisDirection::X => "x",
             crate::primitives::datum::AxisDirection::Y => "y",
@@ -482,11 +480,7 @@ impl BRepModel {
                 for vid in [edge.start_vertex, edge.end_vertex] {
                     if seen.insert(vid) {
                         if let Some(v) = self.vertices.get(vid) {
-                            points.push(Point3::new(
-                                v.position[0],
-                                v.position[1],
-                                v.position[2],
-                            ));
+                            points.push(Point3::new(v.position[0], v.position[1], v.position[2]));
                         }
                     }
                 }
@@ -1962,13 +1956,15 @@ impl<'a> TopologyBuilder<'a> {
         datum_id: u32,
         local_transform: Matrix4,
     ) -> Result<(), PrimitiveError> {
-        let frame = self.model.datums.frame(datum_id).ok_or_else(|| {
-            PrimitiveError::InvalidParameters {
-                parameter: "datum_id".to_string(),
-                value: datum_id.to_string(),
-                constraint: "must reference an existing datum".to_string(),
-            }
-        })?;
+        let frame =
+            self.model
+                .datums
+                .frame(datum_id)
+                .ok_or_else(|| PrimitiveError::InvalidParameters {
+                    parameter: "datum_id".to_string(),
+                    value: datum_id.to_string(),
+                    constraint: "must reference an existing datum".to_string(),
+                })?;
         let world_transform = frame * local_transform;
 
         if !is_approx_identity(&world_transform, 1e-12) {
@@ -1984,15 +1980,13 @@ impl<'a> TopologyBuilder<'a> {
             })?;
         }
 
-        let solid =
-            self.model
-                .solids
-                .get_mut(solid_id)
-                .ok_or_else(|| PrimitiveError::InvalidParameters {
-                    parameter: "solid_id".to_string(),
-                    value: solid_id.to_string(),
-                    constraint: "must reference an existing solid".to_string(),
-                })?;
+        let solid = self.model.solids.get_mut(solid_id).ok_or_else(|| {
+            PrimitiveError::InvalidParameters {
+                parameter: "solid_id".to_string(),
+                value: solid_id.to_string(),
+                constraint: "must reference an existing solid".to_string(),
+            }
+        })?;
         solid.anchor = crate::primitives::solid::SolidAnchor {
             datum_id,
             local_transform,
@@ -2045,12 +2039,7 @@ impl<'a> TopologyBuilder<'a> {
         datum_id: u32,
         local_transform: Matrix4,
     ) -> Result<GeometryId, PrimitiveError> {
-        let geo = self.create_cylinder_3d(
-            Point3::ORIGIN,
-            Vector3::Z,
-            radius,
-            height,
-        )?;
+        let geo = self.create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)?;
         if let GeometryId::Solid(sid) = geo {
             self.anchor_solid(sid, datum_id, local_transform)?;
         }
@@ -2067,13 +2056,8 @@ impl<'a> TopologyBuilder<'a> {
         datum_id: u32,
         local_transform: Matrix4,
     ) -> Result<GeometryId, PrimitiveError> {
-        let geo = self.create_cone_3d(
-            Point3::ORIGIN,
-            Vector3::Z,
-            base_radius,
-            top_radius,
-            height,
-        )?;
+        let geo =
+            self.create_cone_3d(Point3::ORIGIN, Vector3::Z, base_radius, top_radius, height)?;
         if let GeometryId::Solid(sid) = geo {
             self.anchor_solid(sid, datum_id, local_transform)?;
         }
@@ -2089,12 +2073,7 @@ impl<'a> TopologyBuilder<'a> {
         datum_id: u32,
         local_transform: Matrix4,
     ) -> Result<GeometryId, PrimitiveError> {
-        let geo = self.create_torus_3d(
-            Point3::ORIGIN,
-            Vector3::Z,
-            major_radius,
-            minor_radius,
-        )?;
+        let geo = self.create_torus_3d(Point3::ORIGIN, Vector3::Z, major_radius, minor_radius)?;
         if let GeometryId::Solid(sid) = geo {
             self.anchor_solid(sid, datum_id, local_transform)?;
         }
@@ -3179,11 +3158,7 @@ mod anchor_tests {
                             .vertices
                             .get(vid)
                             .expect("vertex exists for collected edge");
-                        positions.push(Point3::new(
-                            v.position[0],
-                            v.position[1],
-                            v.position[2],
-                        ));
+                        positions.push(Point3::new(v.position[0], v.position[1], v.position[2]));
                     }
                 }
             }
@@ -3258,7 +3233,10 @@ mod anchor_tests {
                 assert!(
                     (anchor.local_transform.get(r, c) - expected).abs() < 1e-12,
                     "local_transform[{},{}] expected {}, got {}",
-                    r, c, expected, anchor.local_transform.get(r, c)
+                    r,
+                    c,
+                    expected,
+                    anchor.local_transform.get(r, c)
                 );
             }
         }
@@ -3304,14 +3282,16 @@ mod anchor_tests {
                 && (a_min.y - b_min.y).abs() < 1e-9
                 && (a_min.z - b_min.z).abs() < 1e-9,
             "min mismatch: unanchored={:?} anchored={:?}",
-            a_min, b_min
+            a_min,
+            b_min
         );
         assert!(
             (a_max.x - b_max.x).abs() < 1e-9
                 && (a_max.y - b_max.y).abs() < 1e-9
                 && (a_max.z - b_max.z).abs() < 1e-9,
             "max mismatch: unanchored={:?} anchored={:?}",
-            a_max, b_max
+            a_max,
+            b_max
         );
 
         let solid = b.solids.get(anchored_sid).expect("anchored solid in store");
@@ -3355,8 +3335,18 @@ mod anchor_tests {
         let (s_min, s_max) = bbox_of(&collect_vertex_positions(&shifted, shifted_sid));
 
         // +10 on X, identical on Y and Z.
-        assert!((s_min.x - (base_min.x + 10.0)).abs() < 1e-9, "min.x not shifted: base={} shifted={}", base_min.x, s_min.x);
-        assert!((s_max.x - (base_max.x + 10.0)).abs() < 1e-9, "max.x not shifted: base={} shifted={}", base_max.x, s_max.x);
+        assert!(
+            (s_min.x - (base_min.x + 10.0)).abs() < 1e-9,
+            "min.x not shifted: base={} shifted={}",
+            base_min.x,
+            s_min.x
+        );
+        assert!(
+            (s_max.x - (base_max.x + 10.0)).abs() < 1e-9,
+            "max.x not shifted: base={} shifted={}",
+            base_max.x,
+            s_max.x
+        );
         assert!((s_min.y - base_min.y).abs() < 1e-9, "min.y changed");
         assert!((s_max.y - base_max.y).abs() < 1e-9, "max.y changed");
         assert!((s_min.z - base_min.z).abs() < 1e-9, "min.z changed");
@@ -3380,7 +3370,8 @@ mod anchor_tests {
         let mut model = BRepModel::new();
         let bogus_id = u32::MAX - 1;
         let mut builder = TopologyBuilder::new(&mut model);
-        let result = builder.create_box_3d_anchored(10.0, 10.0, 10.0, bogus_id, Matrix4::identity());
+        let result =
+            builder.create_box_3d_anchored(10.0, 10.0, 10.0, bogus_id, Matrix4::identity());
         match result {
             Err(PrimitiveError::InvalidParameters { parameter, .. }) => {
                 assert_eq!(parameter, "datum_id");
@@ -3420,7 +3411,8 @@ mod anchor_tests {
                 assert!(
                     (solid.anchor.local_transform.get(r, c) - expected).abs() < 1e-12,
                     "default anchor's local_transform must be identity at [{},{}]",
-                    r, c
+                    r,
+                    c
                 );
             }
         }
@@ -3428,9 +3420,7 @@ mod anchor_tests {
 
     // ────────────────────────── 3c: datum recording ───────────────────────────
 
-    use crate::operations::recorder::{
-        OperationRecorder, RecordedOperation, RecorderError,
-    };
+    use crate::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
     use std::sync::{Arc, Mutex};
 
     /// Test recorder that captures every event for inspection. Mirrors the
@@ -3538,9 +3528,7 @@ mod anchor_tests {
     fn solid_world_bbox_matches_input_dimensions() {
         let mut model = BRepModel::new();
         let sid = build_unit_box(&mut model);
-        let bb = model
-            .solid_world_bbox(sid)
-            .expect("box has world bbox");
+        let bb = model.solid_world_bbox(sid).expect("box has world bbox");
         let size = bb.size();
         // create_box_3d centers the box at the origin, so a 10×10×10 box
         // spans (-5,-5,-5) → (+5,+5,+5).
@@ -3621,10 +3609,7 @@ mod anchor_tests {
         assert_eq!(desc.anchor_datum_id, 0);
         assert_eq!(desc.anchor_datum_name, "Origin");
         assert!(desc.center_world.iter().all(|c| c.abs() < 1e-9));
-        assert!(desc
-            .center_in_anchor_frame
-            .iter()
-            .all(|c| c.abs() < 1e-9));
+        assert!(desc.center_in_anchor_frame.iter().all(|c| c.abs() < 1e-9));
         assert!((desc.dimensions_world[0] - 10.0).abs() < 1e-9);
         assert!((desc.dimensions_world[1] - 10.0).abs() < 1e-9);
         assert!((desc.dimensions_world[2] - 10.0).abs() < 1e-9);
@@ -3648,8 +3633,7 @@ mod anchor_tests {
         let recorder = Arc::new(CaptureRecorder::default());
         model.attach_recorder(Some(recorder.clone()));
 
-        let translation =
-            Matrix4::from_translation(&Vector3::new(1.0, 2.0, 3.0));
+        let translation = Matrix4::from_translation(&Vector3::new(1.0, 2.0, 3.0));
         let id = model
             .create_datum_plane("WorkPlane".to_string(), translation)
             .expect("create succeeds");
@@ -3791,9 +3775,7 @@ mod anchor_tests {
             .create_datum_point("P".to_string(), Point3::ORIGIN)
             .expect("created");
         let new_t = Matrix4::from_translation(&Vector3::new(4.0, 5.0, 6.0));
-        let _prev = model
-            .set_datum_transform(id, new_t)
-            .expect("set succeeds");
+        let _prev = model.set_datum_transform(id, new_t).expect("set succeeds");
 
         // Default refusal.
         let err = model

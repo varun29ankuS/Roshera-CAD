@@ -5,7 +5,7 @@
 <h1 align="center">Roshera</h1>
 
 <p align="center">
-  A B-Rep geometry kernel written in Rust, with an LLM-driven CAD workflow on top.
+  An agent runtime for geometry — a native Rust B-Rep kernel with a semantic surface AI can query, reason about, and act on.
 </p>
 
 <p align="center">
@@ -15,7 +15,9 @@
 
 ---
 
-Roshera is an experimental CAD system. The kernel is written from scratch in Rust (no wrapper around OpenCASCADE or Parasolid) and there's a React/Three.js frontend that talks to it over REST + WebSocket. Many things work, many things don't — see [Status](#status) for what's actually usable today.
+Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine (no wrapper around OpenCASCADE or Parasolid) whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
+
+The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. Many things work, many things don't — see [Status](#status) for what's actually usable today.
 
 | Dark Mode | Light Mode |
 |-----------|------------|

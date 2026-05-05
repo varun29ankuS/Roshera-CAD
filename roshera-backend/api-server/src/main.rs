@@ -499,8 +499,8 @@ async fn create_geometry(
             };
             let t = read_triple("translation", [0.0, 0.0, 0.0]);
             let r = read_triple("rotation_euler", [0.0, 0.0, 0.0]);
-            let local = Matrix4::translation(t[0], t[1], t[2])
-                * Matrix4::from_euler_xyz(r[0], r[1], r[2]);
+            let local =
+                Matrix4::translation(t[0], t[1], t[2]) * Matrix4::from_euler_xyz(r[0], r[1], r[2]);
             Some((datum_id, local))
         }
     };
@@ -3600,8 +3600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // unmodifiable / undeletable — `409 Conflict`).
         .route(
             "/api/datums",
-            get(handlers::datums::list_datums)
-                .post(handlers::datums::create_datum),
+            get(handlers::datums::list_datums).post(handlers::datums::create_datum),
         )
         .route(
             "/api/datums/{id}",

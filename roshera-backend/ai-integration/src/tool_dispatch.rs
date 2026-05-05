@@ -311,10 +311,7 @@ fn require_xyz(
     let mut out = [0.0_f64; 3];
     for (i, axis) in ["x", "y", "z"].iter().enumerate() {
         let v = inner.get(*axis).ok_or_else(|| {
-            ProviderError::InvalidInput(format!(
-                "Parameter '{}.{}' is required",
-                field, axis
-            ))
+            ProviderError::InvalidInput(format!("Parameter '{}.{}' is required", field, axis))
         })?;
         out[i] = v.as_f64().ok_or_else(|| {
             ProviderError::InvalidInput(format!(

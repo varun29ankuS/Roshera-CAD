@@ -16,9 +16,7 @@ use axum::{
     Json,
 };
 use geometry_engine::math::{Matrix4, Point3};
-use geometry_engine::primitives::datum::{
-    AxisDirection, Datum, DatumError, DatumKind,
-};
+use geometry_engine::primitives::datum::{AxisDirection, Datum, DatumError, DatumKind};
 use geometry_engine::primitives::solid::SolidAnchor;
 use geometry_engine::sketch2d::sketch_plane::PlaneOrientation;
 use serde::{Deserialize, Serialize};
@@ -288,9 +286,7 @@ pub async fn create_datum(
     let id = match req {
         CreateDatumRequest::Plane { name, transform } => {
             let m = Matrix4::from_rows_array(transform);
-            model
-                .create_datum_plane(name, m)
-                .map_err(map_datum_error)?
+            model.create_datum_plane(name, m).map_err(map_datum_error)?
         }
         CreateDatumRequest::Axis {
             name,
@@ -302,10 +298,7 @@ pub async fn create_datum(
                 "y" => AxisDirection::Y,
                 "z" => AxisDirection::Z,
                 other => {
-                    tracing::warn!(
-                        "create_datum: unrecognized axis direction {:?}",
-                        other
-                    );
+                    tracing::warn!("create_datum: unrecognized axis direction {:?}", other);
                     return Err(StatusCode::BAD_REQUEST);
                 }
             };
@@ -355,9 +348,7 @@ pub async fn update_datum(
     }
     if let Some(transform) = req.transform {
         let m = Matrix4::from_rows_array(transform);
-        model
-            .set_datum_transform(id, m)
-            .map_err(map_datum_error)?;
+        model.set_datum_transform(id, m).map_err(map_datum_error)?;
     }
 
     let datum = model.datums.get(id).ok_or(StatusCode::NOT_FOUND)?;
@@ -387,10 +378,7 @@ pub async fn delete_datum(
     // Default + existence checks happen inside `delete_datum`, but we
     // need to enumerate dependents first so the 409 path returns
     // useful detail.
-    let datum = model
-        .datums
-        .get(id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let datum = model.datums.get(id).ok_or(StatusCode::NOT_FOUND)?;
     if datum.is_default {
         return Err(StatusCode::CONFLICT);
     }
