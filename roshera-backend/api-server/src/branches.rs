@@ -436,6 +436,58 @@ pub async fn set_active_branch(
     }))
 }
 
+/// `GET /api/branches/name-suggestions?count=N` response.
+///
+/// Echoes the requested count and returns up to that many memorable
+/// branch names from the curated pop-culture / branching-narrative
+/// pool that aren't already in use on the timeline. The list may be
+/// shorter than `count` (or empty) if every pool entry is taken.
+#[derive(Debug, Serialize)]
+pub struct NameSuggestionsView {
+    /// Count actually requested after clamping (1..=20).
+    pub requested: usize,
+    /// Suggested names, in priority order. The caller picks any one;
+    /// they are *not* reservations — two callers asking simultaneously
+    /// can both see the same suggestion. The conflict (if any) is
+    /// resolved at `POST /api/branches` time via the existing name
+    /// uniqueness check.
+    pub names: Vec<String>,
+}
+
+/// `GET /api/branches/name-suggestions?count=N` query parameters.
+#[derive(Debug, Deserialize)]
+pub struct NameSuggestionsQuery {
+    /// How many candidates to return. Defaults to 3, clamped to 1..=20.
+    #[serde(default)]
+    pub count: Option<usize>,
+}
+
+/// `GET /api/branches/name-suggestions` — return up to N memorable
+/// branch names that aren't already used on this timeline.
+///
+/// Both humans and agents call this when they want a default fork
+/// name. The list is in stable priority order — pick any one. The
+/// suggestion is advisory: the actual name is only locked in by
+/// `POST /api/branches`, which still runs the uniqueness check.
+pub async fn suggest_names(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<NameSuggestionsQuery>,
+) -> Result<Json<NameSuggestionsView>, ApiError> {
+    let pool_size = timeline_engine::BRANCH_NAME_POOL.len();
+    let requested = q.count.unwrap_or(3).clamp(1, pool_size);
+
+    let timeline = state.timeline.read().await;
+    let used: Vec<String> = timeline
+        .get_all_branches()
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+    drop(timeline);
+
+    let names = timeline_engine::suggest_branch_names(requested, &used);
+    Ok(Json(NameSuggestionsView { requested, names }))
+}
+
 /// `POST /api/branches/{id}/merge` — fold a branch's events into a target.
 ///
 /// `id` is the source branch; the target defaults to `main` and can
