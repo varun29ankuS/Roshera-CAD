@@ -329,12 +329,10 @@ fn move_vertex(
 
     // Apply the actual position update via VertexStore::set_position.
     // The store also updates its spatial index internally.
-    if !model.vertices.set_position(
-        vertex_id,
-        new_position.x,
-        new_position.y,
-        new_position.z,
-    ) {
+    if !model
+        .vertices
+        .set_position(vertex_id, new_position.x, new_position.y, new_position.z)
+    {
         return Err(OperationError::InvalidGeometry(format!(
             "Vertex {} could not be updated",
             vertex_id
@@ -417,10 +415,7 @@ fn replace_edge_curve(
             }
             let circle =
                 crate::primitives::curve::Circle::new(center, normal, radius).map_err(|e| {
-                    OperationError::InvalidGeometry(format!(
-                        "Circle construction failed: {:?}",
-                        e
-                    ))
+                    OperationError::InvalidGeometry(format!("Circle construction failed: {:?}", e))
                 })?;
             Box::new(circle)
         }
@@ -462,15 +457,14 @@ fn replace_edge_curve(
     // Sample endpoints from the new curve so we can snap the edge's vertices
     // and stay topologically consistent.
     let (start_vertex_id, end_vertex_id) = {
-        let edge =
-            model
-                .edges
-                .get(edge_id)
-                .ok_or_else(|| OperationError::InvalidInput {
-                    parameter: "edge_id".to_string(),
-                    expected: "existing edge".to_string(),
-                    received: format!("{}", edge_id),
-                })?;
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "edge_id".to_string(),
+                expected: "existing edge".to_string(),
+                received: format!("{}", edge_id),
+            })?;
         (edge.start_vertex, edge.end_vertex)
     };
 
@@ -486,15 +480,14 @@ fn replace_edge_curve(
     })?;
 
     // Now rewrite the edge.
-    let edge_mut =
-        model
-            .edges
-            .get_mut(edge_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "edge_id".to_string(),
-                expected: "existing edge".to_string(),
-                received: format!("{}", edge_id),
-            })?;
+    let edge_mut = model
+        .edges
+        .get_mut(edge_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "edge_id".to_string(),
+            expected: "existing edge".to_string(),
+            received: format!("{}", edge_id),
+        })?;
     edge_mut.curve_id = new_curve_id;
     edge_mut.param_range = ParameterRange::new(new_range.start, new_range.end);
 
@@ -543,23 +536,28 @@ fn modify_face_surface(
         .surface_type
     {
         SurfaceType::BSpline | SurfaceType::NURBS => {
-            let degree_u = surface_params.u_degree.ok_or_else(|| OperationError::InvalidInput {
-                parameter: "u_degree".to_string(),
-                expected: "Some(degree)".to_string(),
-                received: "None".to_string(),
-            })? as usize;
-            let degree_v = surface_params.v_degree.ok_or_else(|| OperationError::InvalidInput {
-                parameter: "v_degree".to_string(),
-                expected: "Some(degree)".to_string(),
-                received: "None".to_string(),
-            })? as usize;
-            let control_points = surface_params.control_points.ok_or_else(|| {
-                OperationError::InvalidInput {
-                    parameter: "control_points".to_string(),
-                    expected: "Some(grid)".to_string(),
+            let degree_u = surface_params
+                .u_degree
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "u_degree".to_string(),
+                    expected: "Some(degree)".to_string(),
                     received: "None".to_string(),
-                }
-            })?;
+                })? as usize;
+            let degree_v = surface_params
+                .v_degree
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "v_degree".to_string(),
+                    expected: "Some(degree)".to_string(),
+                    received: "None".to_string(),
+                })? as usize;
+            let control_points =
+                surface_params
+                    .control_points
+                    .ok_or_else(|| OperationError::InvalidInput {
+                        parameter: "control_points".to_string(),
+                        expected: "Some(grid)".to_string(),
+                        received: "None".to_string(),
+                    })?;
 
             let n_u = control_points.len();
             if n_u < degree_u + 1 {
@@ -622,10 +620,7 @@ fn modify_face_surface(
             Box::new(GeneralNurbsSurface { nurbs })
         }
 
-        SurfaceType::Plane
-        | SurfaceType::Cylinder
-        | SurfaceType::Sphere
-        | SurfaceType::Torus => {
+        SurfaceType::Plane | SurfaceType::Cylinder | SurfaceType::Sphere | SurfaceType::Torus => {
             return Err(OperationError::InvalidInput {
                 parameter: "surface_params".to_string(),
                 expected: "BSpline or NURBS (control-point-driven surface)".to_string(),
@@ -714,14 +709,15 @@ fn change_loop_orientation(
     reverse: bool,
 ) -> OperationResult<()> {
     if reverse {
-        let loop_mut = model
-            .loops
-            .get_mut(loop_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "loop_id".to_string(),
-                expected: "existing loop".to_string(),
-                received: format!("{}", loop_id),
-            })?;
+        let loop_mut =
+            model
+                .loops
+                .get_mut(loop_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "loop_id".to_string(),
+                    expected: "existing loop".to_string(),
+                    received: format!("{}", loop_id),
+                })?;
         loop_mut.reverse();
     } else {
         // Validate loop exists even when no work is requested.

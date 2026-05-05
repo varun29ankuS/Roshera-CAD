@@ -529,10 +529,7 @@ impl Ellipse2dStore {
 
         for x in min_grid_x..=max_grid_x {
             for y in min_grid_y..=max_grid_y {
-                self.spatial_index
-                    .entry((x, y))
-                    .or_default()
-                    .push(id);
+                self.spatial_index.entry((x, y)).or_default().push(id);
             }
         }
     }

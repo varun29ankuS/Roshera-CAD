@@ -421,8 +421,14 @@ mod tests {
     fn runtime_ai_configured_reflects_state() {
         let on = build_capabilities(true);
         let off = build_capabilities(false);
-        assert_eq!(on["runtime"]["ai_configured"], serde_json::Value::Bool(true));
-        assert_eq!(off["runtime"]["ai_configured"], serde_json::Value::Bool(false));
+        assert_eq!(
+            on["runtime"]["ai_configured"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            off["runtime"]["ai_configured"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     /// Lock in the exact required parameter keys for each primitive so

@@ -4,10 +4,10 @@
 
 use super::{TessellationParams, ThreeJsMesh};
 use crate::primitives::{face::FaceId, shell::ShellId, solid::SolidId};
+use parking_lot::RwLock;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// Cache key for tessellation results

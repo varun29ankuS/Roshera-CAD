@@ -306,11 +306,6 @@ const MOCK_BRANCHES: BranchView[] = [
     created_at: new Date(Date.now() - 60_000).toISOString() },
 ]
 
-function isCheckpointEvent(op: string): boolean {
-  const k = normalizeKind(op).toLowerCase()
-  return k.includes('checkpoint')
-}
-
 function shortBranchName(b: BranchView): string {
   if (b.id === MAIN_BRANCH_ID) return 'main'
   return b.name.length > 10 ? `${b.name.slice(0, 9)}…` : b.name

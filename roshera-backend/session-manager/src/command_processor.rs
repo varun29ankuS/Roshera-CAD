@@ -208,14 +208,14 @@ impl CommandProcessor {
                         // rather than fabricating a nil-UUID placeholder
                         // (which would advance the timeline with an
                         // operation pointing at a non-existent entity).
-                        let (target, tools) =
-                            operand_ids.split_first().map(|(h, t)| (*h, t.to_vec())).ok_or_else(
-                                || SessionError::InvalidInput {
-                                    field: "BooleanOperation::target_objects (Difference \
+                        let (target, tools) = operand_ids
+                            .split_first()
+                            .map(|(h, t)| (*h, t.to_vec()))
+                            .ok_or_else(|| SessionError::InvalidInput {
+                                field: "BooleanOperation::target_objects (Difference \
                                             requires at least one operand)"
-                                        .to_string(),
-                                },
-                            )?;
+                                    .to_string(),
+                            })?;
                         Operation::BooleanDifference { target, tools }
                     }
                 }

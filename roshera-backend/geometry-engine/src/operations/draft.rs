@@ -500,10 +500,22 @@ fn create_draft_transform_matrix(draft_direction: Vector3, draft_angle: f64) -> 
     let k = scale_factor - 1.0;
     let (x, y, z) = (dir.x, dir.y, dir.z);
     Matrix4::new(
-        1.0 + k * x * x, k * x * y,       k * x * z,       0.0,
-        k * y * x,       1.0 + k * y * y, k * y * z,       0.0,
-        k * z * x,       k * z * y,       1.0 + k * z * z, 0.0,
-        0.0,             0.0,             0.0,             1.0,
+        1.0 + k * x * x,
+        k * x * y,
+        k * x * z,
+        0.0,
+        k * y * x,
+        1.0 + k * y * y,
+        k * y * z,
+        0.0,
+        k * z * x,
+        k * z * y,
+        1.0 + k * z * z,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
     )
 }
 
@@ -601,13 +613,17 @@ fn create_drafted_edge(
             let ab_len2 = ab.magnitude_squared();
             if ab_len2 < 1e-20 {
                 let d2 = (p - a).magnitude_squared();
-                if d2 < min_d2 { min_d2 = d2; }
+                if d2 < min_d2 {
+                    min_d2 = d2;
+                }
                 continue;
             }
             let t = ((p - a).dot(&ab) / ab_len2).clamp(0.0, 1.0);
             let proj = a + ab * t;
             let d2 = (p - proj).magnitude_squared();
-            if d2 < min_d2 { min_d2 = d2; }
+            if d2 < min_d2 {
+                min_d2 = d2;
+            }
         }
         min_d2 < neutral_eps * neutral_eps
     };
@@ -1403,8 +1419,16 @@ fn compute_surface_intersection(
         }
 
         // Plane equations: n1·p = d1, n2·p = d2
-        let d1 = n1.dot(&Vector3::new(plane1.origin.x, plane1.origin.y, plane1.origin.z));
-        let d2 = n2.dot(&Vector3::new(plane2.origin.x, plane2.origin.y, plane2.origin.z));
+        let d1 = n1.dot(&Vector3::new(
+            plane1.origin.x,
+            plane1.origin.y,
+            plane1.origin.z,
+        ));
+        let d2 = n2.dot(&Vector3::new(
+            plane2.origin.x,
+            plane2.origin.y,
+            plane2.origin.z,
+        ));
 
         // Express base point as p = c1*n1 + c2*n2. Solving:
         //   (n1·n1) c1 + (n1·n2) c2 = d1

@@ -38,7 +38,7 @@ struct Bounds {
 
 const BOX: Bounds = Bounds {
     name: "box",
-    min_tris: 12,        // 6 faces × 2 tris minimum
+    min_tris: 12, // 6 faces × 2 tris minimum
     max_tris: 5_000,
 };
 const SPHERE: Bounds = Bounds {
@@ -48,8 +48,8 @@ const SPHERE: Bounds = Bounds {
 };
 const CYLINDER: Bounds = Bounds {
     name: "cylinder",
-    min_tris: 60,        // ~16 segments × ~2 tris × 2 faces + caps
-    max_tris: 100_000,   // hard ceiling — Phase 2.2 must hold this
+    min_tris: 60,      // ~16 segments × ~2 tris × 2 faces + caps
+    max_tris: 100_000, // hard ceiling — Phase 2.2 must hold this
 };
 const CONE: Bounds = Bounds {
     name: "cone",
@@ -68,28 +68,28 @@ fn main() {
     let mut model = BRepModel::new();
     let params = TessellationParams::default();
 
-    let box_stats   = make_box(&mut model, &params);
+    let box_stats = make_box(&mut model, &params);
     let sphere_stats = make_sphere(&mut model, &params);
-    let cyl_stats   = make_cylinder(&mut model, &params);
-    let cone_stats  = make_cone(&mut model, &params);
+    let cyl_stats = make_cylinder(&mut model, &params);
+    let cone_stats = make_cone(&mut model, &params);
     let torus_stats = make_torus(&mut model, &params);
 
     println!("\n=== STL outputs ===");
-    print_row(&BOX,      &box_stats);
-    print_row(&SPHERE,   &sphere_stats);
+    print_row(&BOX, &box_stats);
+    print_row(&SPHERE, &sphere_stats);
     print_row(&CYLINDER, &cyl_stats);
-    print_row(&CONE,     &cone_stats);
-    print_row(&TORUS,    &torus_stats);
+    print_row(&CONE, &cone_stats);
+    print_row(&TORUS, &torus_stats);
 
     model_summary(&model);
 
     // Assertions — failing any of these means a regression. CI picks them up
     // as a non-zero exit when this demo is run via `cargo test --examples`.
-    check(&BOX,      &box_stats);
-    check(&SPHERE,   &sphere_stats);
+    check(&BOX, &box_stats);
+    check(&SPHERE, &sphere_stats);
     check(&CYLINDER, &cyl_stats);
-    check(&CONE,     &cone_stats);
-    check(&TORUS,    &torus_stats);
+    check(&CONE, &cone_stats);
+    check(&TORUS, &torus_stats);
 
     println!("\nAll primitives within acceptance bounds.");
 }

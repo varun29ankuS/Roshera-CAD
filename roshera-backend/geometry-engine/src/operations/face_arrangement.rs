@@ -536,10 +536,7 @@ fn signed_area_of_cycle(
     // matches all of the existing planar-boolean tests.
     if surface.surface_type() == SurfaceType::Plane {
         let n = positions.len() as f64;
-        let centroid = positions
-            .iter()
-            .fold(Vector3::ZERO, |acc, p| acc + *p)
-            / n;
+        let centroid = positions.iter().fold(Vector3::ZERO, |acc, p| acc + *p) / n;
         let (e1, e2) = match tangent_frame_at(surface, &centroid, tol) {
             Some(f) => f,
             None => return 0.0,
@@ -709,12 +706,7 @@ mod tests {
     fn strip_keeps_clean_cycle() {
         // Four half-edges none of which are each other's twins.
         let arr = make_stub(&[(0, 99), (1, 99), (2, 99), (3, 99)]);
-        let cycle = vec![
-            HalfEdgeId(0),
-            HalfEdgeId(1),
-            HalfEdgeId(2),
-            HalfEdgeId(3),
-        ];
+        let cycle = vec![HalfEdgeId(0), HalfEdgeId(1), HalfEdgeId(2), HalfEdgeId(3)];
         let out = strip_dangling_pairs(&cycle, &arr);
         assert_eq!(out.len(), 4);
     }
@@ -723,12 +715,7 @@ mod tests {
     fn strip_removes_consecutive_twin_pair() {
         // he 1 and he 2 are each other's twins (simulate dangling).
         let arr = make_stub(&[(0, 99), (1, 2), (2, 1), (3, 99)]);
-        let cycle = vec![
-            HalfEdgeId(0),
-            HalfEdgeId(1),
-            HalfEdgeId(2),
-            HalfEdgeId(3),
-        ];
+        let cycle = vec![HalfEdgeId(0), HalfEdgeId(1), HalfEdgeId(2), HalfEdgeId(3)];
         let out = strip_dangling_pairs(&cycle, &arr);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], HalfEdgeId(0));

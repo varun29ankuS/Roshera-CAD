@@ -756,9 +756,7 @@ fn is_radius_constant(data: &RollingBallData) -> bool {
 }
 
 /// Create cylindrical fillet surface
-fn create_cylindrical_fillet_surface(
-    data: &RollingBallData,
-) -> OperationResult<Box<dyn Surface>> {
+fn create_cylindrical_fillet_surface(data: &RollingBallData) -> OperationResult<Box<dyn Surface>> {
     // Create spine curve from edge centers
     let spine = create_spine_curve_from_points(&data.centers)?;
 
@@ -774,9 +772,7 @@ fn create_cylindrical_fillet_surface(
 }
 
 /// Create toroidal fillet surface
-fn create_toroidal_fillet_surface(
-    data: &RollingBallData,
-) -> OperationResult<Box<dyn Surface>> {
+fn create_toroidal_fillet_surface(data: &RollingBallData) -> OperationResult<Box<dyn Surface>> {
     // Create center curve
     let center_curve = create_spine_curve_from_points(&data.centers)?;
 
@@ -793,9 +789,7 @@ fn create_toroidal_fillet_surface(
 }
 
 /// Create NURBS fillet surface for variable radius
-fn create_nurbs_fillet_surface(
-    data: &RollingBallData,
-) -> OperationResult<Box<dyn Surface>> {
+fn create_nurbs_fillet_surface(data: &RollingBallData) -> OperationResult<Box<dyn Surface>> {
     // Create spine curve
     let spine = create_spine_curve_from_points(&data.centers)?;
 
@@ -840,9 +834,8 @@ fn create_curve_from_points(points: &[Point3]) -> OperationResult<Box<dyn Curve>
     }
 
     let tolerance = Tolerance::default();
-    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance()).map_err(|e| {
-        OperationError::NumericalError(format!("fillet curve fit failed: {:?}", e))
-    })?;
+    let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance())
+        .map_err(|e| OperationError::NumericalError(format!("fillet curve fit failed: {:?}", e)))?;
     Ok(Box::new(nurbs))
 }
 
@@ -858,7 +851,6 @@ fn compute_fillet_trim_curves(
     face1_id: FaceId,
     face2_id: FaceId,
 ) -> OperationResult<(Vec<Point3>, Vec<Point3>)> {
-
     // For trim curve computation, we use the contact curves from the rolling ball data
     // The actual fillet surface is created separately
 
@@ -1895,4 +1887,3 @@ fn validate_fillet_parameters(
 
     Ok(())
 }
-

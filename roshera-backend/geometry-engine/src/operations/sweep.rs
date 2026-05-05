@@ -709,7 +709,11 @@ fn get_section_vertex_ring(
                 }
             }
         } else {
-            let v = if forward { edge.start_vertex } else { edge.end_vertex };
+            let v = if forward {
+                edge.start_vertex
+            } else {
+                edge.end_vertex
+            };
             if ring.last() != Some(&v) {
                 ring.push(v);
             }
@@ -904,17 +908,19 @@ fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationRe
             .get(edge_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
-        let v_start = model.vertices.get(edge.start_vertex).ok_or_else(|| {
-            OperationError::InvalidGeometry("Start vertex not found".to_string())
-        })?;
+        let v_start = model
+            .vertices
+            .get(edge.start_vertex)
+            .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
         points.push(Point3::from(v_start.position));
 
         // Sample mid-curve and quarter points to capture closed/curved edges
         // whose start and end vertices coincide.
         if edge.start_vertex == edge.end_vertex {
-            let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
-                OperationError::InvalidGeometry("Curve not found".to_string())
-            })?;
+            let curve = model
+                .curves
+                .get(edge.curve_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
             let lo = edge.param_range.start;
             let hi = edge.param_range.end;
             for frac in [0.25, 0.5, 0.75] {

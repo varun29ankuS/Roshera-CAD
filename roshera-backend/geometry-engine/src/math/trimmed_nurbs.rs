@@ -167,10 +167,12 @@ impl TrimmedNurbsSurface {
     #[allow(clippy::expect_used)] // literal degree-1 knot vectors and corner curves are validated
     fn create_default_boundary(_surface: &NurbsSurface) -> TrimLoop {
         // Create four linear curves for the boundary
-        let corners = [Point2::new(0.0, 0.0),
+        let corners = [
+            Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
             Point2::new(1.0, 1.0),
-            Point2::new(0.0, 1.0)];
+            Point2::new(0.0, 1.0),
+        ];
 
         let mut curves = Vec::new();
         for i in 0..4 {
@@ -263,7 +265,6 @@ impl TrimmedNurbsSurface {
 
         Ok(points)
     }
-
 }
 
 // Implementation for NurbsCurve2D

@@ -220,8 +220,7 @@ pub fn boolean_operation(
     let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
 
     // Step 2: Split faces along intersection curves
-    let split_faces =
-        split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
+    let split_faces = split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
 
     // Step 3: Classify split faces (inside/outside/on boundary)
     let classified_faces = classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
@@ -2371,17 +2370,17 @@ fn split_face_by_curves(
     // `extract_regions` needs `&dyn Surface`. We borrow the surface for
     // exactly as long as `extract_regions` runs, so that `model` is free
     // for the split-face creation loop below.
-    let arrangement =
-        super::face_arrangement::build_arrangement(&graph, model, surface_id)?;
+    let arrangement = super::face_arrangement::build_arrangement(&graph, model, surface_id)?;
     let loops = {
-        let surface = model
-            .surfaces
-            .get(surface_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "surface_id".to_string(),
-                expected: "valid surface ID".to_string(),
-                received: format!("{surface_id:?}"),
-            })?;
+        let surface =
+            model
+                .surfaces
+                .get(surface_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{surface_id:?}"),
+                })?;
         super::face_arrangement::extract_regions(&arrangement, model, surface)
     };
 
@@ -2969,10 +2968,7 @@ enum CircleClipOutcome {
     /// Trimmed to an arc of `sweep_angle` radians starting at `start_angle`.
     /// Angles measured in the circle's intrinsic frame
     /// (`x_axis_3d = (P(0) - C)/r`, `y_axis_3d = (P(0.25) - C)/r`).
-    Arc {
-        start_angle: f64,
-        sweep_angle: f64,
-    },
+    Arc { start_angle: f64, sweep_angle: f64 },
     /// Face is non-planar, has non-line boundaries, the circle is not
     /// coplanar, or the intersection is too complex (4+ boundary crossings).
     /// Caller should pass the cutting curve through unchanged.
@@ -3400,8 +3396,7 @@ fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
         let (xi, yi) = poly[i];
         let (xj, yj) = poly[j];
         // Standard ray-cast with the classic half-open edge convention.
-        let intersects = ((yi > py) != (yj > py))
-            && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+        let intersects = ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
         if intersects {
             inside = !inside;
         }
@@ -3458,8 +3453,7 @@ fn clip_surface_intersection_curve_to_faces(
     };
 
     // If both faces are NotApplicable, return the curve unchanged.
-    if matches!(clip_a, ClipOutcome::NotApplicable)
-        && matches!(clip_b, ClipOutcome::NotApplicable)
+    if matches!(clip_a, ClipOutcome::NotApplicable) && matches!(clip_b, ClipOutcome::NotApplicable)
     {
         return Ok(Some(curve));
     }
@@ -3489,10 +3483,22 @@ fn clip_surface_intersection_curve_to_faces(
     // Rewrap parametric curves. For plane-plane the on-surface uv maps
     // linearly along the 3D line, so the endpoint uv samples fully
     // characterize the trimmed segment.
-    let (ua0, va0) = ((curve.on_surface_a.u_of_t)(t_min), (curve.on_surface_a.v_of_t)(t_min));
-    let (ua1, va1) = ((curve.on_surface_a.u_of_t)(t_max), (curve.on_surface_a.v_of_t)(t_max));
-    let (ub0, vb0) = ((curve.on_surface_b.u_of_t)(t_min), (curve.on_surface_b.v_of_t)(t_min));
-    let (ub1, vb1) = ((curve.on_surface_b.u_of_t)(t_max), (curve.on_surface_b.v_of_t)(t_max));
+    let (ua0, va0) = (
+        (curve.on_surface_a.u_of_t)(t_min),
+        (curve.on_surface_a.v_of_t)(t_min),
+    );
+    let (ua1, va1) = (
+        (curve.on_surface_a.u_of_t)(t_max),
+        (curve.on_surface_a.v_of_t)(t_max),
+    );
+    let (ub0, vb0) = (
+        (curve.on_surface_b.u_of_t)(t_min),
+        (curve.on_surface_b.v_of_t)(t_min),
+    );
+    let (ub1, vb1) = (
+        (curve.on_surface_b.u_of_t)(t_max),
+        (curve.on_surface_b.v_of_t)(t_max),
+    );
 
     let on_surface_a = create_parametric_curve(&[(ua0, va0), (ua1, va1)]);
     let on_surface_b = create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]);
@@ -3601,9 +3607,14 @@ fn apply_circle_clip_to_faces(
     // `start_angle + sweep_angle·t'` in the same intrinsic frame as
     // the original Circle (since Arc::new derives the canonical
     // x_axis from the normal direction the same way Circle::new does).
-    let trimmed_arc =
-        Arc::new(circle.center(), circle.normal(), circle.radius(), start_angle, sweep_angle)
-            .map_err(|e| OperationError::NumericalError(format!("{:?}", e)))?;
+    let trimmed_arc = Arc::new(
+        circle.center(),
+        circle.normal(),
+        circle.radius(),
+        start_angle,
+        sweep_angle,
+    )
+    .map_err(|e| OperationError::NumericalError(format!("{:?}", e)))?;
 
     // Remap parametric curves: the original on_surface_{a,b} accept the
     // full-circle parameter `t ∈ [0,1]` mapping to angle `2π·t`. The
@@ -3746,9 +3757,7 @@ fn presplit_closed_loop_edges(
         .edges
         .iter()
         .filter_map(|(&eid, ge)| {
-            if ge.start_vertex != u32::MAX
-                && ge.start_vertex == ge.end_vertex
-            {
+            if ge.start_vertex != u32::MAX && ge.start_vertex == ge.end_vertex {
                 Some((eid, ge.edge_type))
             } else {
                 None
@@ -4016,12 +4025,9 @@ pub(super) fn compute_edge_intersections(
         }
 
         // Register vertex in node map
-        let node = graph
-            .nodes
-            .entry(vid)
-            .or_insert_with(|| GraphNode {
-                incident_edges: HashSet::new(),
-            });
+        let node = graph.nodes.entry(vid).or_insert_with(|| GraphNode {
+            incident_edges: HashSet::new(),
+        });
         node.incident_edges.insert(*eid_a);
         node.incident_edges.insert(*eid_b);
     }
@@ -4109,9 +4115,7 @@ pub(super) fn compute_edge_intersections(
                 let dz = pos[2] - split_pos[2];
                 dx * dx + dy * dy + dz * dz < merge_radius * merge_radius
             };
-            if coincident(remaining_edge.start_vertex)
-                || coincident(remaining_edge.end_vertex)
-            {
+            if coincident(remaining_edge.start_vertex) || coincident(remaining_edge.end_vertex) {
                 continue;
             }
 
@@ -4130,7 +4134,7 @@ pub(super) fn compute_edge_intersections(
                     .map(|e| e.start_vertex)
                     .unwrap_or(u32::MAX),
                 end_vertex: *split_vid,
-                };
+            };
             graph.edges.insert(first_id, first_ge);
 
             // Update node incidence
@@ -5188,8 +5192,7 @@ fn build_shells_from_faces(
                 .get(f.surface)
                 .map(|s| format!("{:?}", s.surface_type()))
                 .unwrap_or_else(|| "?".to_string());
-            let edge_ids: Vec<EdgeId> =
-                f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
+            let edge_ids: Vec<EdgeId> = f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
             tracing::debug!(
                 "build_shells: comp={} face_idx={} orig={} surf={} type={} edges={:?}",
                 i,
@@ -5956,12 +5959,9 @@ mod tests {
         ONCE.call_once(|| {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| {
-                            tracing_subscriber::EnvFilter::new(
-                                "geometry_engine::boolean=debug",
-                            )
-                        }),
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        tracing_subscriber::EnvFilter::new("geometry_engine::boolean=debug")
+                    }),
                 )
                 .with_test_writer()
                 .try_init();
@@ -6290,16 +6290,20 @@ mod tests {
         };
         let solid = match model.solids.get(solid_id) {
             Some(s) => s,
-            None => return Err(TestCaseError::fail(format!(
-                "{operation:?} returned Ok({solid_id}) but solid is missing from model",
-            ))),
+            None => {
+                return Err(TestCaseError::fail(format!(
+                    "{operation:?} returned Ok({solid_id}) but solid is missing from model",
+                )))
+            }
         };
         let shell = match model.shells.get(solid.outer_shell) {
             Some(s) => s,
-            None => return Err(TestCaseError::fail(format!(
-                "{operation:?} solid {solid_id} outer_shell {} missing from shell store",
-                solid.outer_shell,
-            ))),
+            None => {
+                return Err(TestCaseError::fail(format!(
+                    "{operation:?} solid {solid_id} outer_shell {} missing from shell store",
+                    solid.outer_shell,
+                )))
+            }
         };
         if shell.faces.is_empty() {
             return Err(TestCaseError::fail(format!(
@@ -6309,9 +6313,11 @@ mod tests {
         for &face_id in &shell.faces {
             let face = match model.faces.get(face_id) {
                 Some(f) => f,
-                None => return Err(TestCaseError::fail(format!(
-                    "{operation:?} face {face_id} referenced by shell missing from face store",
-                ))),
+                None => {
+                    return Err(TestCaseError::fail(format!(
+                        "{operation:?} face {face_id} referenced by shell missing from face store",
+                    )))
+                }
             };
             if model.loops.get(face.outer_loop).is_none() {
                 return Err(TestCaseError::fail(format!(
@@ -6523,8 +6529,7 @@ mod tests {
         // Cylinder of radius 5, height 10, axis +Z, base at origin →
         // height_limits = [0, 10].
         let mut model = BRepModel::new();
-        let cyl_face =
-            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+        let cyl_face = cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
 
         // Cutting circle at z = 5 (mid-cylinder), perpendicular to axis,
         // radius matching the cylinder. This is the canonical
@@ -6546,8 +6551,7 @@ mod tests {
         // Same cylinder, cutting circle at z = 50 — well above
         // height_limits = [0, 10].
         let mut model = BRepModel::new();
-        let cyl_face =
-            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+        let cyl_face = cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
 
         use crate::primitives::curve::Circle;
         let circle = Circle::new(Point3::new(0.0, 0.0, 50.0), Vector3::Z, 5.0).unwrap();
@@ -6564,8 +6568,7 @@ mod tests {
     #[test]
     fn clip_circle_below_finite_cylinder_misses() {
         let mut model = BRepModel::new();
-        let cyl_face =
-            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+        let cyl_face = cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
 
         // z = -50 — below height_limits = [0, 10].
         use crate::primitives::curve::Circle;
@@ -6586,8 +6589,7 @@ mod tests {
         // check should reject and return NotApplicable, deferring
         // to the DCEL splitter.
         let mut model = BRepModel::new();
-        let cyl_face =
-            cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
+        let cyl_face = cylinder_lateral_face(&mut model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
 
         use crate::primitives::curve::Circle;
         let circle = Circle::new(Point3::new(2.0, 0.0, 5.0), Vector3::Z, 5.0).unwrap();
@@ -6614,7 +6616,11 @@ mod tests {
         };
         let solid = expect_solid(geom);
         let faces = get_solid_faces(&model, solid).expect("solid has faces");
-        assert_eq!(faces.len(), 3, "cylinder must have 3 faces (2 caps + lateral)");
+        assert_eq!(
+            faces.len(),
+            3,
+            "cylinder must have 3 faces (2 caps + lateral)"
+        );
 
         // Exactly one cylindrical face, exactly two planar caps.
         let mut planar = 0usize;
@@ -6708,7 +6714,9 @@ mod tests {
             ..
         } = model;
         let solid = solids.get_mut(solid_id)?;
-        solid.bounding_box(shells, faces, loops, vertices, edges).ok()
+        solid
+            .bounding_box(shells, faces, loops, vertices, edges)
+            .ok()
     }
 
     /// Floating-point slack for bbox comparisons. Boolean reconstruction
@@ -6717,11 +6725,7 @@ mod tests {
     /// still far below any geometrically meaningful shift.
     const BBOX_EPS: f64 = 1e-6;
 
-    fn bbox_contains(
-        outer: (Point3, Point3),
-        inner: (Point3, Point3),
-        eps: f64,
-    ) -> bool {
+    fn bbox_contains(outer: (Point3, Point3), inner: (Point3, Point3), eps: f64) -> bool {
         let (o_min, o_max) = outer;
         let (i_min, i_max) = inner;
         o_min.x <= i_min.x + eps
@@ -7275,9 +7279,7 @@ mod tests {
         // (1e-3). Must merge with the existing vertex, not duplicate.
         let probe = Point3::new(2.0e-4, 0.0, 0.0);
         let tol = Tolerance::default();
-        let merged = find_or_create_intersection_vertex(
-            &mut model, &graph, probe, &tol, 0.0,
-        );
+        let merged = find_or_create_intersection_vertex(&mut model, &graph, probe, &tol, 0.0);
         assert_eq!(
             merged, existing,
             "per-vertex tolerance sphere must absorb hits inside it"
@@ -7286,9 +7288,7 @@ mod tests {
         // A new intersection 5e-3 away — outside even the widened
         // sphere — must create a fresh vertex.
         let far = Point3::new(5.0e-3, 0.0, 0.0);
-        let fresh = find_or_create_intersection_vertex(
-            &mut model, &graph, far, &tol, 0.0,
-        );
+        let fresh = find_or_create_intersection_vertex(&mut model, &graph, far, &tol, 0.0);
         assert_ne!(
             fresh, existing,
             "hits outside every tolerance sphere must create a new vertex"
@@ -7311,9 +7311,7 @@ mod tests {
         let residual = 7.5e-5;
         let probe = Point3::new(1.0, 2.0, 3.0);
 
-        let vid = find_or_create_intersection_vertex(
-            &mut model, &graph, probe, &tol, residual,
-        );
+        let vid = find_or_create_intersection_vertex(&mut model, &graph, probe, &tol, residual);
 
         let stamped = model
             .vertices

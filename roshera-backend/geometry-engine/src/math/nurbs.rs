@@ -331,8 +331,7 @@ impl NurbsCurve {
 
             if let (Some(d1), Some(d2)) = (result.derivative1, result.derivative2) {
                 result.derivative3 = Some(
-                    (a3 - d2 * (3.0 * dw1) - d1 * (3.0 * dw2)
-                        - result.point.to_vec() * dw3)
+                    (a3 - d2 * (3.0 * dw1) - d1 * (3.0 * dw2) - result.point.to_vec() * dw3)
                         / weight_sum,
                 );
             }
@@ -1607,14 +1606,7 @@ impl NurbsCurve {
         self.arc_length_between(u_min, u_max, tolerance_distance)
     }
 
-    fn adaptive_simpson(
-        &self,
-        a: f64,
-        b: f64,
-        tolerance: f64,
-        whole: f64,
-        depth: u32,
-    ) -> f64 {
+    fn adaptive_simpson(&self, a: f64, b: f64, tolerance: f64, whole: f64, depth: u32) -> f64 {
         let m = (a + b) * 0.5;
         let fa = self.speed(a);
         let fm = self.speed(m);
@@ -1961,15 +1953,15 @@ impl NurbsSurface {
             if du_order >= 2 {
                 let p_minus = self.evaluate(u - h2, v).point;
                 let p_plus = self.evaluate(u + h2, v).point;
-                let acc = (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec())
-                    / (h2 * h2);
+                let acc =
+                    (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec()) / (h2 * h2);
                 result.duu = Some(acc);
             }
             if dv_order >= 2 {
                 let p_minus = self.evaluate(u, v - h2).point;
                 let p_plus = self.evaluate(u, v + h2).point;
-                let acc = (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec())
-                    / (h2 * h2);
+                let acc =
+                    (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec()) / (h2 * h2);
                 result.dvv = Some(acc);
             }
             // Mixed partial only meaningful when both directions
@@ -1979,8 +1971,8 @@ impl NurbsSurface {
                 let pm = self.evaluate(u + h2, v - h2).point;
                 let mp = self.evaluate(u - h2, v + h2).point;
                 let mm = self.evaluate(u - h2, v - h2).point;
-                let mixed = (pp.to_vec() - pm.to_vec() - mp.to_vec() + mm.to_vec())
-                    / (4.0 * h2 * h2);
+                let mixed =
+                    (pp.to_vec() - pm.to_vec() - mp.to_vec() + mm.to_vec()) / (4.0 * h2 * h2);
                 result.duv = Some(mixed);
             }
         }
@@ -3116,14 +3108,8 @@ mod tests {
     #[test]
     fn test_arc_length_of_quarter_circle_matches_pi_over_2() {
         // A 90-degree unit-radius arc has length π/2.
-        let arc = NurbsCurve::circular_arc(
-            Point3::ORIGIN,
-            1.0,
-            0.0,
-            consts::PI / 2.0,
-            Vector3::Z,
-        )
-        .unwrap();
+        let arc = NurbsCurve::circular_arc(Point3::ORIGIN, 1.0, 0.0, consts::PI / 2.0, Vector3::Z)
+            .unwrap();
         let length = arc.arc_length(1e-8);
         let expected = consts::PI / 2.0;
         assert!(
@@ -3136,14 +3122,8 @@ mod tests {
 
     #[test]
     fn test_parameter_at_length_round_trips() {
-        let arc = NurbsCurve::circular_arc(
-            Point3::ORIGIN,
-            1.0,
-            0.0,
-            consts::PI / 2.0,
-            Vector3::Z,
-        )
-        .unwrap();
+        let arc = NurbsCurve::circular_arc(Point3::ORIGIN, 1.0, 0.0, consts::PI / 2.0, Vector3::Z)
+            .unwrap();
         let total = arc.arc_length(1e-8);
         let u_half = arc.parameter_at_length(total * 0.5, 1e-6);
         let measured = arc.arc_length_between(0.0, u_half, 1e-8);

@@ -220,17 +220,16 @@ fn find_intersection_seeds(
         let hi = if hi.is_finite() { hi } else { INF_CLAMP };
         (lo, hi)
     };
-    let bounds1 = (clamp(raw_bounds.0 .0, raw_bounds.0 .1), clamp(raw_bounds.1 .0, raw_bounds.1 .1));
+    let bounds1 = (
+        clamp(raw_bounds.0 .0, raw_bounds.0 .1),
+        clamp(raw_bounds.1 .0, raw_bounds.1 .1),
+    );
 
     // Characteristic world-space scale of a single grid cell on surface1 —
     // used to size the seeding pre-filter so that cells that *straddle* the
     // intersection still admit their nearest-sample as a candidate.
-    let corner_ll = surface1
-        .evaluate_full(bounds1.0 .0, bounds1.1 .0)?
-        .position;
-    let corner_ur = surface1
-        .evaluate_full(bounds1.0 .1, bounds1.1 .1)?
-        .position;
+    let corner_ll = surface1.evaluate_full(bounds1.0 .0, bounds1.1 .0)?.position;
+    let corner_ur = surface1.evaluate_full(bounds1.0 .1, bounds1.1 .1)?.position;
     let world_diag = (corner_ur - corner_ll).magnitude();
     let cell_scale = world_diag / grid_size as f64;
     let seed_prefilter = (cell_scale * 2.0).max(tolerance.distance() * 1e4);
@@ -261,12 +260,8 @@ fn find_intersection_seeds(
                 continue;
             };
 
-            let tangent = compute_intersection_tangent(
-                surface1,
-                surface2,
-                converged.uv1,
-                converged.uv2,
-            )?;
+            let tangent =
+                compute_intersection_tangent(surface1, surface2, converged.uv1, converged.uv2)?;
             seeds.push(IntersectionPoint {
                 position: converged.position,
                 uv1: converged.uv1,
@@ -369,10 +364,26 @@ fn find_closest_point_on_surface_from(
 ) -> MathResult<ClosestPoint> {
     let raw_bounds = surface.parameter_bounds();
     const INF_CLAMP: f64 = 1.0e3;
-    let u_lo = if raw_bounds.0 .0.is_finite() { raw_bounds.0 .0 } else { -INF_CLAMP };
-    let u_hi = if raw_bounds.0 .1.is_finite() { raw_bounds.0 .1 } else { INF_CLAMP };
-    let v_lo = if raw_bounds.1 .0.is_finite() { raw_bounds.1 .0 } else { -INF_CLAMP };
-    let v_hi = if raw_bounds.1 .1.is_finite() { raw_bounds.1 .1 } else { INF_CLAMP };
+    let u_lo = if raw_bounds.0 .0.is_finite() {
+        raw_bounds.0 .0
+    } else {
+        -INF_CLAMP
+    };
+    let u_hi = if raw_bounds.0 .1.is_finite() {
+        raw_bounds.0 .1
+    } else {
+        INF_CLAMP
+    };
+    let v_lo = if raw_bounds.1 .0.is_finite() {
+        raw_bounds.1 .0
+    } else {
+        -INF_CLAMP
+    };
+    let v_hi = if raw_bounds.1 .1.is_finite() {
+        raw_bounds.1 .1
+    } else {
+        INF_CLAMP
+    };
     let (mut u, mut v) = match initial_guess {
         Some((gu, gv)) => (gu.clamp(u_lo, u_hi), gv.clamp(v_lo, v_hi)),
         None => ((u_lo + u_hi) * 0.5, (v_lo + v_hi) * 0.5),
@@ -767,8 +778,7 @@ mod tests {
     #[test]
     fn plane_cylinder_axial_cut_yields_curve() {
         // Cylinder along Z axis, radius 1, intersected with plane z = 0.
-        let cyl =
-            Cylinder::new(Point3::new(0.0, 0.0, -2.0), Vector3::Z, 1.0).expect("cyl");
+        let cyl = Cylinder::new(Point3::new(0.0, 0.0, -2.0), Vector3::Z, 1.0).expect("cyl");
         let plane = Plane::xy(0.0);
         let t = tol();
         let curves = intersect_surfaces(&cyl, &plane, &t).expect("ssi");
@@ -823,10 +833,8 @@ mod tests {
         // Two unit cylinders whose axes cross at the origin at a right angle
         // (Z-axis and X-axis). The marching algorithm should find at least one
         // traced curve whose samples lie on both surfaces within tolerance.
-        let cyl_z =
-            Cylinder::new(Point3::new(0.0, 0.0, -3.0), Vector3::Z, 1.0).expect("cyl_z");
-        let cyl_x =
-            Cylinder::new(Point3::new(-3.0, 0.0, 0.0), Vector3::X, 1.0).expect("cyl_x");
+        let cyl_z = Cylinder::new(Point3::new(0.0, 0.0, -3.0), Vector3::Z, 1.0).expect("cyl_z");
+        let cyl_x = Cylinder::new(Point3::new(-3.0, 0.0, 0.0), Vector3::X, 1.0).expect("cyl_x");
         let t = tol();
         let curves = intersect_surfaces(&cyl_z, &cyl_x, &t).expect("ssi");
         assert!(
@@ -865,11 +873,7 @@ mod tests {
         let expected_radius = (3.0_f64).sqrt() / 2.0;
         for c in &curves {
             for p in &c.points {
-                assert!(
-                    (p.x - 0.5).abs() < 5e-2,
-                    "sample x = {} not near 0.5",
-                    p.x
-                );
+                assert!((p.x - 0.5).abs() < 5e-2, "sample x = {} not near 0.5", p.x);
                 let r = (p.y * p.y + p.z * p.z).sqrt();
                 assert!(
                     (r - expected_radius).abs() < 5e-2,

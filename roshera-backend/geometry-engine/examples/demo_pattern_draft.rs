@@ -166,10 +166,7 @@ fn draft_box_face(params: &TessellationParams) {
         target,
         DraftOptions {
             draft_type: DraftType::Angle(5.0_f64.to_radians()),
-            neutral: NeutralElement::Plane(
-                Point3::new(0.0, 0.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
-            ),
+            neutral: NeutralElement::Plane(Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
             pull_direction: Vector3::new(0.0, 0.0, 1.0),
             ..Default::default()
         },

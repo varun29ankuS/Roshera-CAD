@@ -896,7 +896,6 @@ pub mod analysis_tools {
         Conflicted,
     }
 
-
     /// Sketch analysis engine
     pub struct SketchAnalyzer;
 

@@ -93,11 +93,7 @@ async fn record_persist_load_replay_round_trip() {
     // ── 1. RECORD ────────────────────────────────────────────────────────
     let timeline: Arc<RwLock<Timeline>> =
         Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
-    let recorder = TimelineRecorder::new(
-        Arc::clone(&timeline),
-        Author::System,
-        BranchId::main(),
-    );
+    let recorder = TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
     let recorder_arc: Arc<dyn OperationRecorder> = Arc::new(recorder);
 
     let mut model = BRepModel::new();
@@ -180,7 +176,8 @@ async fn record_persist_load_replay_round_trip() {
 
     // ── 6. VERIFY ────────────────────────────────────────────────────────
     assert_eq!(
-        outcome.events_skipped, 0,
+        outcome.events_skipped,
+        0,
         "no event should fail replay; skipped: {}, total: {}",
         outcome.events_skipped,
         loaded.len()

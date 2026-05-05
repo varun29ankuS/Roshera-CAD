@@ -405,7 +405,9 @@ fn ray_plane_intersection(
     // surface's exact closest-point query. For an unbounded plane this
     // is the orthogonal projection and is exact in a single Newton step.
     let tolerance = crate::math::Tolerance::default();
-    let (u, v) = plane.closest_point(&position, tolerance).unwrap_or((0.0, 0.0));
+    let (u, v) = plane
+        .closest_point(&position, tolerance)
+        .unwrap_or((0.0, 0.0));
 
     Ok(Some(ProjectedPoint {
         position,
@@ -554,7 +556,9 @@ fn ray_sphere_intersection(
 
     let position = origin + direction * best_t;
     let tolerance = crate::math::Tolerance::default();
-    let (u, v) = sphere.closest_point(&position, tolerance).unwrap_or((0.0, 0.0));
+    let (u, v) = sphere
+        .closest_point(&position, tolerance)
+        .unwrap_or((0.0, 0.0));
     let normal = sphere
         .normal_at(u, v)
         .or_else(|_| (position - sph.center).normalize())

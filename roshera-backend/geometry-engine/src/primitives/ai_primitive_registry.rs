@@ -28,9 +28,9 @@ use crate::primitives::{
     vertex::VertexId,
 };
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -492,8 +492,7 @@ impl PrimitiveRegistry {
         model: &mut BRepModel,
     ) -> Result<AIResponse, PrimitiveError> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         // Parse the natural language command
         let command = registry.parse_natural_language(description)?;
@@ -882,8 +881,7 @@ impl PrimitiveRegistry {
             success: validation.is_valid,
             geometry_id: Some(geometry_id),
             description: self.generate_description(&command, &validation),
-            technical_info: self
-                .extract_technical_info(geometry_id, model, &command, &validation),
+            technical_info: self.extract_technical_info(geometry_id, model, &command, &validation),
             next_suggestions: self.generate_next_suggestions(&command),
             warnings: self.generate_warnings(&validation),
             metrics: AIPerformanceMetrics {
@@ -1060,7 +1058,8 @@ impl PrimitiveRegistry {
         let mut edge_ids: HashSet<EdgeId> = HashSet::new();
         let mut vertex_ids: HashSet<VertexId> = HashSet::new();
 
-        let shell_ids = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        let shell_ids =
+            std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
 
         for shell_id in shell_ids {
             let Some(shell) = model.shells.get(shell_id) else {
@@ -1168,7 +1167,12 @@ impl PrimitiveRegistry {
         let counts = self.walk_solid_topology(geometry_id, &*model);
 
         let (vertex_count, edge_count, face_count, extents) = match &counts {
-            Some(c) => (c.vertex_count, c.edge_count, c.face_count, c.extents.clone()),
+            Some(c) => (
+                c.vertex_count,
+                c.edge_count,
+                c.face_count,
+                c.extents.clone(),
+            ),
             None => (0, 0, 0, None),
         };
 
@@ -1429,8 +1433,7 @@ impl PrimitiveRegistry {
     /// Get the full AI catalog with all available primitives
     pub fn get_full_catalog() -> serde_json::Value {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         // Serialize DashMap entries into a JSON object
         let mut json_obj = serde_json::Map::new();
@@ -1446,8 +1449,7 @@ impl PrimitiveRegistry {
     /// List all primitive names for AI discovery
     pub fn list_all_primitives() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
         registry
             .primitives
             .iter()
@@ -1458,8 +1460,7 @@ impl PrimitiveRegistry {
     /// Get examples for a specific primitive
     pub fn get_examples(primitive_type: &str) -> Vec<serde_json::Value> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
 
         registry
             .primitives
@@ -1692,8 +1693,7 @@ impl PrimitiveRegistry {
     /// Get AI optimization hints based on usage patterns (production implementation)
     pub fn get_optimization_hints() -> Vec<String> {
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
         let mut hints = Vec::new();
 
         // Analyze usage patterns using DashMap
@@ -1740,8 +1740,7 @@ impl PrimitiveRegistry {
 
         // Parse command with time tracking
         let registry = Self::global();
-        let registry = registry
-            .lock();
+        let registry = registry.lock();
         let parsed = registry.parse_natural_language(command)?;
 
         // Check if we're approaching timeout

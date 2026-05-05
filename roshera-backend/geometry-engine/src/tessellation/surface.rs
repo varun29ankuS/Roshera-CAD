@@ -542,8 +542,7 @@ fn bridge_hole_into_outer(
         }
         let angle = (v.1 - m.1).atan2(v.0 - m.0).abs();
         let dist2 = (v.0 - m.0).powi(2) + (v.1 - m.1).powi(2);
-        if angle < best_angle - 1e-14
-            || ((angle - best_angle).abs() <= 1e-14 && dist2 < best_dist2)
+        if angle < best_angle - 1e-14 || ((angle - best_angle).abs() <= 1e-14 && dist2 < best_dist2)
         {
             p_pos = i;
             p_pt = v;
@@ -1427,10 +1426,7 @@ fn tessellate_toroidal_face(
         } else {
             params.min_segments
         };
-        from_chord
-            .max(from_angle)
-            .max(params.min_segments)
-            .min(cap)
+        from_chord.max(from_angle).max(params.min_segments).min(cap)
     };
 
     let u_steps = steps_for(u_span, major_radius, params.max_segments);
@@ -1672,7 +1668,11 @@ fn tessellate_generic_face(
             }
             span = (u_hi - u_lo).max(v_hi - v_lo);
         }
-        if span > 0.0 { span } else { 1.0 }
+        if span > 0.0 {
+            span
+        } else {
+            1.0
+        }
     };
     let boundary_tol = polygon_span * 1e-9;
     let boundary_tol_sq = boundary_tol * boundary_tol;
@@ -1720,11 +1720,8 @@ fn tessellate_generic_face(
         // outer polygon's edges is on the face boundary and must be
         // emitted, regardless of how atan2 cancellation rules its
         // winding number.
-        let on_outer_boundary =
-            point_to_polygon_distance_sq(p, &outer_polygon) <= boundary_tol_sq;
-        if !on_outer_boundary
-            && calculate_winding_number(&p, &outer_polygon).abs() < 0.5
-        {
+        let on_outer_boundary = point_to_polygon_distance_sq(p, &outer_polygon) <= boundary_tol_sq;
+        if !on_outer_boundary && calculate_winding_number(&p, &outer_polygon).abs() < 0.5 {
             return false;
         }
         for hole in &inner_polygons {
@@ -2648,8 +2645,7 @@ pub(crate) fn weld_mesh_watertight_range(
         )
     };
 
-    let mut spatial_hash: HashMap<(i32, i32, i32), Vec<u32>> =
-        HashMap::with_capacity(n - v_start);
+    let mut spatial_hash: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::with_capacity(n - v_start);
     for i in v_start..n {
         spatial_hash
             .entry(to_cell(mesh.vertices[i].position))
@@ -2874,10 +2870,8 @@ mod tests {
     #[test]
     fn planar_face_simple_quad_ccw() {
         // 1x1 unit square, CCW. Must produce ≥ 2 tris totalling area 1.
-        let (verts, loops) = build_planar_loops(
-            &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
-            &[],
-        );
+        let (verts, loops) =
+            build_planar_loops(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], &[]);
         let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
         assert!(tris.len() >= 2, "expected ≥2 tris, got {}", tris.len());
         let area = total_tri_area_xy(&verts, &tris);
@@ -2891,10 +2885,8 @@ mod tests {
     fn planar_face_simple_quad_cw_input_is_auto_corrected() {
         // Same square, but CW. Algorithm must shoelace-correct to CCW
         // before ear-clipping rather than return zero triangles.
-        let (verts, loops) = build_planar_loops(
-            &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
-            &[],
-        );
+        let (verts, loops) =
+            build_planar_loops(&[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)], &[]);
         let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
         assert!(tris.len() >= 2, "expected ≥2 tris, got {}", tris.len());
         let area = total_tri_area_xy(&verts, &tris);

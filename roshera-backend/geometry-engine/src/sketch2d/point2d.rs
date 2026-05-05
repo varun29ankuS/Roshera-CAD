@@ -390,10 +390,7 @@ impl Point2dStore {
         let grid_key = self.grid_key(&point.position);
 
         // Add to spatial index
-        self.spatial_index
-            .entry(grid_key)
-            .or_default()
-            .push(id);
+        self.spatial_index.entry(grid_key).or_default().push(id);
 
         // Add to main storage
         self.points.insert(id, point);
@@ -426,10 +423,7 @@ impl Point2dStore {
             }
 
             // Add to new spatial index
-            self.spatial_index
-                .entry(new_key)
-                .or_default()
-                .push(*id);
+            self.spatial_index.entry(new_key).or_default().push(*id);
         }
 
         // Update position
@@ -492,7 +486,12 @@ impl Point2dStore {
             None => self
                 .points
                 .iter()
-                .map(|entry| (*entry.key(), entry.value().position.distance_squared_to(pos)))
+                .map(|entry| {
+                    (
+                        *entry.key(),
+                        entry.value().position.distance_squared_to(pos),
+                    )
+                })
                 .min_by(|(_, d1), (_, d2)| d1.partial_cmp(d2).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(id, _)| id),
         }

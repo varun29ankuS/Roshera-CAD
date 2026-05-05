@@ -77,7 +77,10 @@ pub async fn export_mesh(
         };
         let tri_mesh = tessellate_solid(solid, &model, &tess_params);
         if tri_mesh.triangles.is_empty() {
-            tracing::warn!(solid_id, "export: solid tessellated to zero triangles, skipping");
+            tracing::warn!(
+                solid_id,
+                "export: solid tessellated to zero triangles, skipping"
+            );
             continue;
         }
         for v in &tri_mesh.vertices {

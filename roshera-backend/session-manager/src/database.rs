@@ -19,7 +19,10 @@ fn role_from_str(s: &str) -> Role {
         // shape and recover the discriminant; fall through to Viewer on a
         // parse failure so authorization defaults to the least-privileged role.
         other => {
-            if let Some(rest) = other.strip_prefix("Custom(").and_then(|s| s.strip_suffix(")")) {
+            if let Some(rest) = other
+                .strip_prefix("Custom(")
+                .and_then(|s| s.strip_suffix(")"))
+            {
                 if let Ok(n) = rest.parse::<u32>() {
                     return Role::Custom(n);
                 }

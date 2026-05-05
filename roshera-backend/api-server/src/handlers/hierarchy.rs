@@ -19,7 +19,12 @@ pub async fn get_hierarchy(
     // demand rather than 404.
     let hierarchy = match state.hierarchy_manager.get_hierarchy(&session_id).await {
         Some(h) => h,
-        None => state.hierarchy_manager.create_session(session_id.clone()).await,
+        None => {
+            state
+                .hierarchy_manager
+                .create_session(session_id.clone())
+                .await
+        }
     };
     let workflow_state = state
         .hierarchy_manager

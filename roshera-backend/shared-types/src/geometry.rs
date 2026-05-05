@@ -767,7 +767,6 @@ impl Default for MaterialProperties {
 }
 
 impl MaterialProperties {
-
     /// Create steel material
     pub fn steel() -> Self {
         Self {
@@ -960,9 +959,7 @@ impl Mesh {
         let mut max = [f32::NEG_INFINITY; 3];
 
         for chunk in self.vertices.chunks_exact(3) {
-            for ((min_c, max_c), &v) in
-                min.iter_mut().zip(max.iter_mut()).zip(chunk.iter())
-            {
+            for ((min_c, max_c), &v) in min.iter_mut().zip(max.iter_mut()).zip(chunk.iter()) {
                 *min_c = min_c.min(v);
                 *max_c = max_c.max(v);
             }
@@ -1116,9 +1113,7 @@ impl Mesh {
         let mut max = [f32::MIN; 3];
 
         for chunk in self.vertices.chunks_exact(3) {
-            for ((min_c, max_c), &v) in
-                min.iter_mut().zip(max.iter_mut()).zip(chunk.iter())
-            {
+            for ((min_c, max_c), &v) in min.iter_mut().zip(max.iter_mut()).zip(chunk.iter()) {
                 *min_c = min_c.min(v);
                 *max_c = max_c.max(v);
             }

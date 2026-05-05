@@ -393,10 +393,12 @@ fn create_offset_edge(
     let edge = model
         .edges
         .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry(format!(
-            "create_offset_edge: edge {} not found",
-            edge_id
-        )))?
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_offset_edge: edge {} not found",
+                edge_id
+            ))
+        })?
         .clone();
 
     // Get edge curve
@@ -522,10 +524,12 @@ fn create_shell_walls(
     let outer_shell_faces: std::collections::HashSet<FaceId> = model
         .shells
         .get(solid.outer_shell)
-        .ok_or_else(|| OperationError::InvalidGeometry(format!(
-            "create_shell_walls: outer shell {} of solid {} not found",
-            solid.outer_shell, solid.id
-        )))?
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_shell_walls: outer shell {} of solid {} not found",
+                solid.outer_shell, solid.id
+            ))
+        })?
         .faces
         .iter()
         .copied()

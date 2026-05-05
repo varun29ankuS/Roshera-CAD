@@ -412,7 +412,10 @@ fn replay(cached: CachedResponse) -> Response {
         builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
     }
     builder
-        .header(IDEMPOTENCY_REPLAYED_HEADER, HeaderValue::from_static("true"))
+        .header(
+            IDEMPOTENCY_REPLAYED_HEADER,
+            HeaderValue::from_static("true"),
+        )
         .body(Body::from(cached.body))
         // The builder only fails on programmer errors (invalid header
         // names we control); falling back to a structured 500 is fine.
@@ -584,7 +587,11 @@ mod tests {
             axum::extract::State(c): axum::extract::State<Arc<AtomicUsize>>,
         ) -> Response {
             let n = c.fetch_add(1, Ordering::SeqCst) + 1;
-            (StatusCode::OK, axum::Json(serde_json::json!({ "calls": n }))).into_response()
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "calls": n })),
+            )
+                .into_response()
         }
         let app = Router::new()
             .route("/r", axum::routing::get(handler))

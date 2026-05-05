@@ -516,7 +516,6 @@ mod tests {
         let avg_ns = total_operations / performance_data.len() as u128;
         println!("    Average:  {}ns", avg_ns);
 
-
         // Verify all integrations successful
         assert_eq!(model.edges.len(), 3);
         assert_eq!(model.curves.len(), 3);
@@ -642,7 +641,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Edge creation:  {}ns (4 edges)", edge_ns);
         println!("    Loop creation:  {}ns (Target: <100μs)", loop_ns);
-
 
         // Performance assertions
         assert!(
@@ -1151,7 +1149,6 @@ mod tests {
         println!("    Face creation:    {}ns (Target: <50ns)", face_ns);
         println!("    Total time:       {}ns", total_ns);
 
-
         // Performance assertions (realistic targets based on actual results)
         assert!(
             face_ns < 50_000,
@@ -1462,7 +1459,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Area computation: {}ns (Target: <10μs)", area_ns);
 
-
         // Performance assertion - realistic target based on debug build overhead
         // In release mode this would be much faster (< 10μs)
         assert!(
@@ -1638,7 +1634,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Avg per test:     {}ns (Target: <1μs)", avg_test_ns);
 
-
         // Performance assertion
         assert!(
             avg_test_ns < 10_000,
@@ -1786,7 +1781,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Shell creation:   {}ns (Target: <1ms)", creation_ns);
 
-
         // Performance assertion
         assert!(
             creation_ns < 2_000_000,
@@ -1909,7 +1903,6 @@ mod tests {
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Validation:       {}ns (Target: <500μs)", validation_ns);
 
-
         // Performance assertion
         assert!(
             validation_ns < 1_000_000,
@@ -2020,7 +2013,6 @@ mod tests {
         let creation_ns = creation_time.as_nanos();
         println!("  📊 PERFORMANCE METRICS:");
         println!("    Complex shell:    {}ns (Target: <2ms)", creation_ns);
-
 
         // Performance assertion
         assert!(
@@ -3563,7 +3555,8 @@ mod tests {
                 sorted.len(),
                 4,
                 "face {:?} has duplicate vertices in its outer loop: {:?}",
-                face_id, vertex_ids
+                face_id,
+                vertex_ids
             );
 
             // Resolve positions.
@@ -3616,7 +3609,10 @@ mod tests {
                 dot > 0.99,
                 "face {:?} loop winding disagrees with outward surface normal \
                  (loop_normal={:?}, surface_normal={:?}, dot={})",
-                face_id, loop_unit, surf_normal, dot
+                face_id,
+                loop_unit,
+                surf_normal,
+                dot
             );
         }
     }

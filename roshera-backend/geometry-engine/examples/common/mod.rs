@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::builder::BRepModel;
 use geometry_engine::primitives::curve::{Circle, Line, ParameterRange};
-use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::edge::EdgeId;
+use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::vertex::VertexId;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
@@ -79,9 +79,11 @@ fn manifest_upsert(root: &Path, entry: DemoManifestEntry) {
         .demos
         .retain(|e| !(e.category == entry.category && e.filename == entry.filename));
     manifest.demos.push(entry);
-    manifest
-        .demos
-        .sort_by(|a, b| a.category.cmp(&b.category).then(a.filename.cmp(&b.filename)));
+    manifest.demos.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then(a.filename.cmp(&b.filename))
+    });
 
     if let Ok(s) = serde_json::to_string_pretty(&manifest) {
         let _ = fs::write(&path, s);
@@ -192,7 +194,11 @@ pub fn write_stl_binary(mesh: &TriangleMesh, path: &Path) -> std::io::Result<Dur
             w.write_all(&f.to_le_bytes())?;
         }
         for v in [v0, v1, v2] {
-            for f in [v.position.x as f32, v.position.y as f32, v.position.z as f32] {
+            for f in [
+                v.position.x as f32,
+                v.position.y as f32,
+                v.position.z as f32,
+            ] {
                 w.write_all(&f.to_le_bytes())?;
             }
         }
@@ -231,10 +237,10 @@ pub fn make_rectangle_profile(
     height: f64,
 ) -> Vec<EdgeId> {
     let z = origin.z;
-    let v0 = model.vertices.add(origin.x,           origin.y,           z);
-    let v1 = model.vertices.add(origin.x + width,   origin.y,           z);
-    let v2 = model.vertices.add(origin.x + width,   origin.y + height,  z);
-    let v3 = model.vertices.add(origin.x,           origin.y + height,  z);
+    let v0 = model.vertices.add(origin.x, origin.y, z);
+    let v1 = model.vertices.add(origin.x + width, origin.y, z);
+    let v2 = model.vertices.add(origin.x + width, origin.y + height, z);
+    let v3 = model.vertices.add(origin.x, origin.y + height, z);
     vec![
         add_line_edge(model, v0, v1),
         add_line_edge(model, v1, v2),
@@ -261,7 +267,14 @@ pub fn make_circle_profile(
     let v = model.vertices.add_or_find(seam.x, seam.y, seam.z, 1e-6);
     let circle = Circle::new(center, axis, radius).expect("circle params");
     let curve_id = model.curves.add(Box::new(circle));
-    let edge = Edge::new(0, v, v, curve_id, EdgeOrientation::Forward, ParameterRange::unit());
+    let edge = Edge::new(
+        0,
+        v,
+        v,
+        curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
+    );
     vec![model.edges.add(edge)]
 }
 

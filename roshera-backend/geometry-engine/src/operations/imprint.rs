@@ -122,13 +122,15 @@ pub fn imprint_curves_on_face(
 
     let tolerance = options.common.tolerance;
     {
-        let surface = model.surfaces.get(surface_id).ok_or_else(|| {
-            OperationError::InvalidInput {
-                parameter: "surface_id".to_string(),
-                expected: "valid surface ID".to_string(),
-                received: format!("{surface_id:?}"),
-            }
-        })?;
+        let surface =
+            model
+                .surfaces
+                .get(surface_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{surface_id:?}"),
+                })?;
         for &cid in &curves {
             let curve = model
                 .curves
@@ -172,13 +174,15 @@ pub fn imprint_curves_on_face(
     // ------------------------------------------------------------------
     let arrangement = build_arrangement(&graph, model, surface_id)?;
     let regions = {
-        let surface = model.surfaces.get(surface_id).ok_or_else(|| {
-            OperationError::InvalidInput {
-                parameter: "surface_id".to_string(),
-                expected: "valid surface ID".to_string(),
-                received: format!("{surface_id:?}"),
-            }
-        })?;
+        let surface =
+            model
+                .surfaces
+                .get(surface_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{surface_id:?}"),
+                })?;
         extract_regions(&arrangement, model, surface)
     };
 
@@ -360,18 +364,34 @@ mod tests {
             Point3::new(0.0, 0.0, 0.0),
         )));
 
-        let e0 = model
-            .edges
-            .add(Edge::new_auto_range(0, v0, v1, c0, EdgeOrientation::Forward));
-        let e1 = model
-            .edges
-            .add(Edge::new_auto_range(0, v1, v2, c1, EdgeOrientation::Forward));
-        let e2 = model
-            .edges
-            .add(Edge::new_auto_range(0, v2, v3, c2, EdgeOrientation::Forward));
-        let e3 = model
-            .edges
-            .add(Edge::new_auto_range(0, v3, v0, c3, EdgeOrientation::Forward));
+        let e0 = model.edges.add(Edge::new_auto_range(
+            0,
+            v0,
+            v1,
+            c0,
+            EdgeOrientation::Forward,
+        ));
+        let e1 = model.edges.add(Edge::new_auto_range(
+            0,
+            v1,
+            v2,
+            c1,
+            EdgeOrientation::Forward,
+        ));
+        let e2 = model.edges.add(Edge::new_auto_range(
+            0,
+            v2,
+            v3,
+            c2,
+            EdgeOrientation::Forward,
+        ));
+        let e3 = model.edges.add(Edge::new_auto_range(
+            0,
+            v3,
+            v0,
+            c3,
+            EdgeOrientation::Forward,
+        ));
 
         let mut outer = Loop::new(0, LoopType::Outer);
         outer.add_edge(e0, true);

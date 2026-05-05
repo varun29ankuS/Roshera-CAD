@@ -305,7 +305,7 @@ export function SketchPanel() {
           ))}
           <button
             type="button"
-            onClick={exitSketch}
+            onClick={() => exitSketch()}
             className="ml-1 p-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border transition-colors"
             title="Cancel sketch (Esc)"
             aria-label="Cancel sketch"

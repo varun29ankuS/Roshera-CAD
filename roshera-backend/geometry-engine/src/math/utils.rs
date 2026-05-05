@@ -570,8 +570,7 @@ where
             let fa_fb = fa - fb;
             let fa_fc = fa - fc;
             let fb_fc = fb - fc;
-            s = a * fb * fc / (fa_fb * fa_fc)
-                - b * fa * fc / (fa_fb * fb_fc)
+            s = a * fb * fc / (fa_fb * fa_fc) - b * fa * fc / (fa_fb * fb_fc)
                 + c * fa * fb / (fa_fc * fb_fc);
         } else {
             // Secant between a and b.

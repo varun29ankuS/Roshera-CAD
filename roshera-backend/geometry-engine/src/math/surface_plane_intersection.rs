@@ -356,8 +356,7 @@ fn maybe_add_seed(
     if sum_abs < 1e-30 {
         let u_seed = 0.5 * (u_a + u_b);
         let v_seed = 0.5 * (v_a + v_b);
-        if let Some(refined) =
-            newton_correct(surface, normal, plane_origin, u_seed, v_seed, config)
+        if let Some(refined) = newton_correct(surface, normal, plane_origin, u_seed, v_seed, config)
         {
             seeds.push(refined);
         } else if let Ok(pos) = surface.point_at(u_seed, v_seed) {

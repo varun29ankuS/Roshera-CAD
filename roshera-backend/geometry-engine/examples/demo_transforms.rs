@@ -56,9 +56,15 @@ fn main() {
     .expect("box create");
 
     let identity_bbox = bbox_of(&model, id, &params);
-    println!("[0] identity bbox: min={:?} max={:?}", identity_bbox.min, identity_bbox.max);
+    println!(
+        "[0] identity bbox: min={:?} max={:?}",
+        identity_bbox.min, identity_bbox.max
+    );
     let stats0 = tess_and_write(&model, id, &params, SUBDIR, "identity.stl");
-    assert!(stats0.tris > 0, "identity box produced 0 triangles — planar-face defect");
+    assert!(
+        stats0.tris > 0,
+        "identity box produced 0 triangles — planar-face defect"
+    );
 
     // Translate by (100, 50, 25): bbox shifts by the same amount; dims unchanged.
     let dir = Vector3::new(100.0, 50.0, 25.0);
@@ -79,12 +85,36 @@ fn main() {
     );
     let stats1 = tess_and_write(&model, id, &params, SUBDIR, "translated.stl");
     assert!(stats1.tris > 0, "translated box produced 0 triangles");
-    expect_close(translated_bbox.min[0] - identity_bbox.min[0], 100.0, "translate x");
-    expect_close(translated_bbox.min[1] - identity_bbox.min[1],  50.0, "translate y");
-    expect_close(translated_bbox.min[2] - identity_bbox.min[2],  25.0, "translate z");
-    expect_close(translated_bbox.dims()[0], identity_bbox.dims()[0], "dims x preserved");
-    expect_close(translated_bbox.dims()[1], identity_bbox.dims()[1], "dims y preserved");
-    expect_close(translated_bbox.dims()[2], identity_bbox.dims()[2], "dims z preserved");
+    expect_close(
+        translated_bbox.min[0] - identity_bbox.min[0],
+        100.0,
+        "translate x",
+    );
+    expect_close(
+        translated_bbox.min[1] - identity_bbox.min[1],
+        50.0,
+        "translate y",
+    );
+    expect_close(
+        translated_bbox.min[2] - identity_bbox.min[2],
+        25.0,
+        "translate z",
+    );
+    expect_close(
+        translated_bbox.dims()[0],
+        identity_bbox.dims()[0],
+        "dims x preserved",
+    );
+    expect_close(
+        translated_bbox.dims()[1],
+        identity_bbox.dims()[1],
+        "dims y preserved",
+    );
+    expect_close(
+        translated_bbox.dims()[2],
+        identity_bbox.dims()[2],
+        "dims z preserved",
+    );
 
     // Rotate 90° about world Z (origin). For a 50³ box already at (100, 50, 25),
     // we just confirm tessellation still works and the dims permute appropriately.
@@ -105,9 +135,21 @@ fn main() {
     let stats2 = tess_and_write(&model, id, &params, SUBDIR, "rotated.stl");
     assert!(stats2.tris > 0, "rotated box produced 0 triangles");
     // 90° about Z swaps x/y extents (50 mm cube remains a 50 mm cube).
-    expect_close(rotated_bbox.dims()[0], identity_bbox.dims()[1], "rotated dim x = orig dim y");
-    expect_close(rotated_bbox.dims()[1], identity_bbox.dims()[0], "rotated dim y = orig dim x");
-    expect_close(rotated_bbox.dims()[2], identity_bbox.dims()[2], "rotated dim z preserved");
+    expect_close(
+        rotated_bbox.dims()[0],
+        identity_bbox.dims()[1],
+        "rotated dim x = orig dim y",
+    );
+    expect_close(
+        rotated_bbox.dims()[1],
+        identity_bbox.dims()[0],
+        "rotated dim y = orig dim x",
+    );
+    expect_close(
+        rotated_bbox.dims()[2],
+        identity_bbox.dims()[2],
+        "rotated dim z preserved",
+    );
 
     // Scale 2× about origin: dims double.
     scale(
@@ -125,9 +167,21 @@ fn main() {
     );
     let stats3 = tess_and_write(&model, id, &params, SUBDIR, "scaled.stl");
     assert!(stats3.tris > 0, "scaled box produced 0 triangles");
-    expect_close(scaled_bbox.dims()[0], 2.0 * rotated_bbox.dims()[0], "scaled dim x");
-    expect_close(scaled_bbox.dims()[1], 2.0 * rotated_bbox.dims()[1], "scaled dim y");
-    expect_close(scaled_bbox.dims()[2], 2.0 * rotated_bbox.dims()[2], "scaled dim z");
+    expect_close(
+        scaled_bbox.dims()[0],
+        2.0 * rotated_bbox.dims()[0],
+        "scaled dim x",
+    );
+    expect_close(
+        scaled_bbox.dims()[1],
+        2.0 * rotated_bbox.dims()[1],
+        "scaled dim y",
+    );
+    expect_close(
+        scaled_bbox.dims()[2],
+        2.0 * rotated_bbox.dims()[2],
+        "scaled dim z",
+    );
 
     model_summary(&model);
     println!("\nAll transform invariants satisfied.");
@@ -139,7 +193,10 @@ fn bbox_of(model: &BRepModel, id: SolidId, params: &TessellationParams) -> Bbox 
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     for v in &mesh.vertices {
-        for (i, coord) in [v.position.x, v.position.y, v.position.z].iter().enumerate() {
+        for (i, coord) in [v.position.x, v.position.y, v.position.z]
+            .iter()
+            .enumerate()
+        {
             if *coord < min[i] {
                 min[i] = *coord;
             }

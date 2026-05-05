@@ -27,10 +27,10 @@ use crate::primitives::{
     surface::SurfaceStore,
     vertex::{VertexId, VertexStore},
 };
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
 /// Enhanced topological query context with caching
@@ -454,10 +454,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
             .entry(start_v)
             .or_default()
             .insert(edge_id);
-        info.vertex_edges
-            .entry(end_v)
-            .or_default()
-            .insert(edge_id);
+        info.vertex_edges.entry(end_v).or_default().insert(edge_id);
 
         info.vertex_vertices
             .entry(start_v)
@@ -505,10 +502,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
         info.face_edges.insert(face_id, edges.clone());
 
         for &edge_id in &edges {
-            info.edge_faces
-                .entry(edge_id)
-                .or_default()
-                .insert(face_id);
+            info.edge_faces.entry(edge_id).or_default().insert(face_id);
         }
 
         for &vertex_id in &vertices {
@@ -1049,7 +1043,9 @@ pub fn find_edge_cycles(adjacency: &AdjacencyInfo, max_length: Option<usize>) ->
                         }
                     }
                     if ok {
-                        if let Some(e_close) = edge_between(*cycle_vertices.last().expect("non-empty"), n) {
+                        if let Some(e_close) =
+                            edge_between(*cycle_vertices.last().expect("non-empty"), n)
+                        {
                             cycle_edges.push(e_close);
                             cycles.push(cycle_edges);
                         }

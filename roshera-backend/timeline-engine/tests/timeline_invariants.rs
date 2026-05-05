@@ -175,7 +175,11 @@ async fn truncate_cascades_immediate_child() {
 
     h.assert_inactive(child);
     h.assert_state_kind(child, StateKind::Abandoned);
-    assert_eq!(h.session_count(&session), Some(2), "session pointer clamped");
+    assert_eq!(
+        h.session_count(&session),
+        Some(2),
+        "session pointer clamped"
+    );
     h.assert_valid();
 }
 
@@ -268,10 +272,7 @@ async fn harness_threads_custom_author() {
 
     // Same goes for forks.
     let child = h.fork(main, "child").await;
-    let branch = h
-        .timeline()
-        .get_branch(&child)
-        .expect("child must exist");
+    let branch = h.timeline().get_branch(&child).expect("child must exist");
     match branch.metadata.created_by {
         Author::User { id, .. } => assert_eq!(id, "user-42"),
         other => panic!("expected User created_by, got {:?}", other),
@@ -285,10 +286,7 @@ async fn harness_threads_custom_author() {
 async fn fork_preserves_purpose_description() {
     let h = TimelineHarness::new();
     let child = h.fork(BranchId::main(), "alpha").await;
-    let branch = h
-        .timeline()
-        .get_branch(&child)
-        .expect("branch must exist");
+    let branch = h.timeline().get_branch(&child).expect("branch must exist");
     match branch.metadata.purpose {
         BranchPurpose::UserExploration { description } => {
             assert_eq!(description, "alpha");

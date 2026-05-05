@@ -1032,8 +1032,8 @@ impl VariableRadiusFillet {
             // directions; clamp to (0, π) for numerical safety.
             let raw_y = c2_point - spine_point;
             let y_in_plane = raw_y - z_axis * raw_y.dot(&z_axis);
-            let cos_sweep = (x_axis.dot(&y_in_plane) / y_in_plane.magnitude().max(1e-12))
-                .clamp(-1.0, 1.0);
+            let cos_sweep =
+                (x_axis.dot(&y_in_plane) / y_in_plane.magnitude().max(1e-12)).clamp(-1.0, 1.0);
             let sweep = cos_sweep.acos().clamp(1e-6, std::f64::consts::PI);
 
             for j in 0..num_v {
