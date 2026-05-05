@@ -1747,7 +1747,11 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             }
                                         }
                                         super::protocol::WSQueryType::GetTimelineState => {
-                                            // Get current timeline state
+                                            // Drain in-flight recorder ops so the event count
+                                            // reflects every kernel op issued so far. Without
+                                            // this, GetTimelineState fired on the heels of a
+                                            // primitive create can return event_count=0.
+                                            let _ = state.timeline_recorder.flush().await;
                                             let timeline = state.timeline.read().await;
                                             let event_count = timeline.get_stats().total_events;
 
@@ -1802,7 +1806,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             }
                                         }
                                         super::protocol::WSQueryType::GetSystemStatus => {
-                                            // Get system status
+                                            // Drain in-flight recorder ops so timeline_events
+                                            // in the status payload matches the client's view.
+                                            let _ = state.timeline_recorder.flush().await;
                                             let model = state.model.read().await;
                                             let timeline = state.timeline.read().await;
                                             let metrics = state.request_metrics.clone();
