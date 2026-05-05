@@ -114,7 +114,10 @@ impl RoomSimulator {
     pub fn vote(&mut self, proposal_id: ProposalId, vote: Vote) -> Result<(), VerdictError> {
         match self.pending.get_mut(&proposal_id) {
             Some((_, votes)) => {
-                if let Some(slot) = votes.iter_mut().find(|v| agents_match(&v.agent, &vote.agent)) {
+                if let Some(slot) = votes
+                    .iter_mut()
+                    .find(|v| agents_match(&v.agent, &vote.agent))
+                {
                     *slot = vote;
                 } else {
                     votes.push(vote);
@@ -224,9 +227,7 @@ impl RoomSimulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::{
-        AuthorityResolver, DeterministicResolver, QuorumResolver, VetoResolver,
-    };
+    use crate::resolver::{AuthorityResolver, DeterministicResolver, QuorumResolver, VetoResolver};
     use crate::types::VoteDecision;
     use serde_json::json;
     use timeline_engine::Author;
@@ -295,7 +296,10 @@ mod tests {
             .expect("known proposal");
         let records = room.tick();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0].outcome, VerdictOutcome::Resolved { .. }));
+        assert!(matches!(
+            records[0].outcome,
+            VerdictOutcome::Resolved { .. }
+        ));
         assert_eq!(room.canonical().len(), 1);
         assert_eq!(room.pending_len(), 0);
     }
@@ -305,7 +309,8 @@ mod tests {
         let resolver = QuorumResolver::new(2, 3).expect("valid quorum config");
         let mut room = RoomSimulator::new(Box::new(resolver));
         let _id = room.propose(user("alice"), json!({}), ProposalTarget::Global);
-        room.vote(_id, approve(user("bob"))).expect("known proposal");
+        room.vote(_id, approve(user("bob")))
+            .expect("known proposal");
 
         let first = room.tick();
         assert_eq!(first.len(), 1, "first tick records the Pending transition");
@@ -319,11 +324,7 @@ mod tests {
             third.is_empty(),
             "third tick with no state change must not re-record Pending"
         );
-        assert_eq!(
-            room.history().len(),
-            1,
-            "history grows only on transitions"
-        );
+        assert_eq!(room.history().len(), 1, "history grows only on transitions");
     }
 
     #[test]
@@ -360,10 +361,14 @@ mod tests {
         // Final approval from a third agent flips Pending → Resolved, which
         // IS a transition: one record must land and the canonical stream
         // gains one entry.
-        room.vote(id, approve(user("dave"))).expect("known proposal");
+        room.vote(id, approve(user("dave")))
+            .expect("known proposal");
         let records = room.tick();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0].outcome, VerdictOutcome::Resolved { .. }));
+        assert!(matches!(
+            records[0].outcome,
+            VerdictOutcome::Resolved { .. }
+        ));
         assert_eq!(room.canonical().len(), 1);
     }
 
@@ -423,7 +428,10 @@ mod tests {
         room.vote(id, approve(lead)).expect("known proposal");
         let records = room.tick();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0].outcome, VerdictOutcome::Resolved { .. }));
+        assert!(matches!(
+            records[0].outcome,
+            VerdictOutcome::Resolved { .. }
+        ));
         assert_eq!(room.canonical().len(), 1);
     }
 

@@ -199,10 +199,7 @@ impl TimelineRecorder {
             RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
         })?;
         resp_rx.await.map_err(|e| {
-            RecorderError::Unavailable(format!(
-                "TimelineRecorder flush response lost: {}",
-                e
-            ))
+            RecorderError::Unavailable(format!("TimelineRecorder flush response lost: {}", e))
         })?;
         Ok(())
     }

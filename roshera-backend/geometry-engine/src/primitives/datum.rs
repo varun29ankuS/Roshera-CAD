@@ -14,10 +14,10 @@
 
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::sketch2d::sketch_plane::PlaneOrientation;
-use std::f64::consts::FRAC_PI_2;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::f64::consts::FRAC_PI_2;
 use thiserror::Error;
 
 /// Errors raised by `DatumStore` mutation methods.
@@ -149,8 +149,7 @@ impl Datum {
     ///                           user-authored custom planes whose
     ///                           orientation is supplied directly).
     pub fn canonical_transform(origin: Point3, kind: DatumKind) -> Matrix4 {
-        let translation =
-            Matrix4::from_translation(&Vector3::new(origin.x, origin.y, origin.z));
+        let translation = Matrix4::from_translation(&Vector3::new(origin.x, origin.y, origin.z));
         let rotation = match kind {
             DatumKind::Origin => Matrix4::identity(),
             DatumKind::Plane(orient) => match orient {
@@ -417,11 +416,7 @@ impl DatumStore {
     ///
     /// The denormalized `origin` field is kept in sync with the
     /// translation column of the new transform.
-    pub fn set_transform(
-        &self,
-        id: DatumId,
-        transform: Matrix4,
-    ) -> Result<Matrix4, DatumError> {
+    pub fn set_transform(&self, id: DatumId, transform: Matrix4) -> Result<Matrix4, DatumError> {
         let mut entry = self.datums.get_mut(&id).ok_or(DatumError::UnknownId(id))?;
         if entry.is_default {
             return Err(DatumError::DefaultDatumNotMutable(id));
@@ -454,10 +449,7 @@ impl DatumStore {
                 return Err(DatumError::DefaultDatumNotMutable(id));
             }
         }
-        let (_id, removed) = self
-            .datums
-            .remove(&id)
-            .ok_or(DatumError::UnknownId(id))?;
+        let (_id, removed) = self.datums.remove(&id).ok_or(DatumError::UnknownId(id))?;
         Ok(removed)
     }
 
@@ -570,12 +562,14 @@ mod tests {
     fn create_plane_assigns_id_and_keeps_origin_in_sync() {
         let store = DatumStore::new();
         store.seed_defaults();
-        let translation =
-            Matrix4::from_translation(&Vector3::new(10.0, 20.0, 30.0));
+        let translation = Matrix4::from_translation(&Vector3::new(10.0, 20.0, 30.0));
         let id = store
             .create_plane("CustomPlane".to_string(), translation)
             .expect("plane creation succeeds");
-        assert_eq!(id, 7, "first user datum gets the next id after seven defaults");
+        assert_eq!(
+            id, 7,
+            "first user datum gets the next id after seven defaults"
+        );
         let datum = store.get(id).expect("created datum present");
         assert_eq!(datum.name, "CustomPlane");
         assert!(matches!(
@@ -677,10 +671,7 @@ mod tests {
         let id = store
             .create_point("P".to_string(), Point3::ORIGIN)
             .expect("created");
-        assert_eq!(
-            store.rename(id, "".to_string()),
-            Err(DatumError::EmptyName)
-        );
+        assert_eq!(store.rename(id, "".to_string()), Err(DatumError::EmptyName));
     }
 
     #[test]
