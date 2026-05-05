@@ -110,6 +110,11 @@ pub struct AppState {
 
     // Timeline and collaboration
     timeline: Arc<RwLock<Timeline>>,
+    /// The kernel's `OperationRecorder`, kept as a concrete type so the
+    /// `POST /api/branches/active` handler can swap which branch new
+    /// kernel operations are recorded against. The same Arc is also
+    /// attached to the `BRepModel` as `Arc<dyn OperationRecorder>`.
+    pub timeline_recorder: Arc<timeline_engine::TimelineRecorder>,
     branch_manager: Arc<BranchManager>,
     hierarchy_manager: Arc<HierarchyManager>,
 
@@ -3319,13 +3324,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hit `None` and silently no-op, leaving the timeline empty regardless
     // of what the user does. See timeline-engine/src/recorder_bridge.rs
     // for the sync→async bridge implementation.
+    let timeline_recorder = Arc::new(timeline_engine::TimelineRecorder::new(
+        Arc::clone(&timeline),
+        timeline_engine::Author::System,
+        timeline_engine::BranchId::main(),
+    ));
     {
+        // Attach the same recorder twice: once to the kernel (as a
+        // trait object) so it gets called on every successful op, and
+        // keep a concrete Arc in `AppState` so the
+        // `POST /api/branches/active` handler can swap its target
+        // branch without restarting the worker.
         let recorder: Arc<dyn geometry_engine::operations::recorder::OperationRecorder> =
-            Arc::new(timeline_engine::TimelineRecorder::new(
-                Arc::clone(&timeline),
-                timeline_engine::Author::System,
-                timeline_engine::BranchId::main(),
-            ));
+            timeline_recorder.clone();
         let mut model_guard = model.write().await;
         model_guard.attach_recorder(Some(recorder));
         tracing::info!(
@@ -3365,6 +3376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         permission_manager,
         cache_manager,
         timeline,
+        timeline_recorder,
         branch_manager,
         hierarchy_manager,
         database,
@@ -3505,6 +3517,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/branches",
             get(branches::list_branches).post(branches::create_branch),
         )
+        // Switch the kernel's currently-recording branch. Must precede
+        // the `{id}` route so axum doesn't treat "active" as a UUID.
+        .route("/api/branches/active", post(branches::set_active_branch))
         .route(
             "/api/branches/{id}",
             get(branches::get_branch).delete(branches::delete_branch),

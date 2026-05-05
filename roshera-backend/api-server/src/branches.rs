@@ -104,6 +104,29 @@ pub struct BranchView {
     pub created_at: String,
 }
 
+/// `POST /api/branches/active` body.
+///
+/// Switches which branch the kernel's `OperationRecorder` writes
+/// subsequent operations to. The active branch is process-global —
+/// there is exactly one "current branch" at any moment, by design,
+/// matching the single live `BRepModel` the kernel holds. Per-branch
+/// model isolation (copy-on-write snapshots / replay-on-read) is a
+/// separate concern; this endpoint is the minimum needed so that the
+/// timeline strip and the kernel agree on where new events land.
+#[derive(Debug, Deserialize)]
+pub struct SetActiveBranchBody {
+    /// `"main"` or a UUIDv4 string. Must reference a branch that
+    /// already exists in the timeline.
+    pub branch_id: String,
+}
+
+/// `POST /api/branches/active` response — echoes the now-active branch
+/// id so the client can confirm the swap landed.
+#[derive(Debug, Serialize)]
+pub struct ActiveBranchView {
+    pub branch_id: String,
+}
+
 /// `POST /api/branches/{id}/merge` body.
 #[derive(Debug, Deserialize)]
 pub struct MergeBody {
@@ -377,6 +400,40 @@ pub async fn delete_branch(
         .abandon_branch(bid, "abandoned via DELETE /api/branches".to_string())
         .map_err(map_timeline_err)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/branches/active` — set the kernel's recording branch.
+///
+/// Validates that the branch exists, then swaps the
+/// `TimelineRecorder`'s target. Subsequent kernel ops are recorded
+/// against the new branch on the very next call; in-flight events
+/// already queued in the recorder's MPSC channel will also use the
+/// new branch (there is exactly one active branch per recorder, by
+/// design).
+pub async fn set_active_branch(
+    State(state): State<AppState>,
+    Json(body): Json<SetActiveBranchBody>,
+) -> Result<Json<ActiveBranchView>, ApiError> {
+    let bid = parse_branch_id(&body.branch_id)?;
+    {
+        let timeline = state.timeline.read().await;
+        if timeline.get_branch(&bid).is_none() {
+            return Err(ApiError::new(
+                ErrorCode::BranchNotFound,
+                format!("branch {bid} not found"),
+            )
+            .with_details(serde_json::json!({ "branch_id": bid.to_string() })));
+        }
+    }
+    state.timeline_recorder.set_branch_id(bid);
+    tracing::info!(
+        target: "branches",
+        branch_id = %bid,
+        "active recording branch switched"
+    );
+    Ok(Json(ActiveBranchView {
+        branch_id: bid.to_string(),
+    }))
 }
 
 /// `POST /api/branches/{id}/merge` — fold a branch's events into a target.

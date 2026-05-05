@@ -23,6 +23,7 @@ use std::sync::Arc;
 use geometry_engine::operations::recorder::{
     OperationRecorder, RecordedOperation, RecorderError,
 };
+use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::timeline::Timeline;
@@ -70,7 +71,13 @@ pub type SharedTimeline = Arc<RwLock<Timeline>>;
 pub struct TimelineRecorder {
     tx: mpsc::UnboundedSender<RecordedOperation>,
     author: Author,
-    branch_id: BranchId,
+    /// The branch every event is appended to. Wrapped in an
+    /// `Arc<parking_lot::RwLock>` so the api-server can swap it in
+    /// response to `POST /api/branches/active` without rebuilding the
+    /// recorder or restarting the worker. The worker reads the current
+    /// value once per event, so a swap takes effect on the very next
+    /// kernel operation.
+    branch_id: Arc<PlRwLock<BranchId>>,
 }
 
 impl TimelineRecorder {
@@ -86,19 +93,25 @@ impl TimelineRecorder {
     ///   plus the api-server's own write-lock callers (`undo`, `redo`,
     ///   `switch_branch`, `merge_branches`) all coexist correctly.
     /// * `author` — attributed to every event this recorder emits.
-    /// * `branch_id` — the branch every event is appended to.
+    /// * `branch_id` — the initial branch events are appended to. May
+    ///   be changed at any time via [`set_branch_id`](Self::set_branch_id).
     pub fn new(timeline: SharedTimeline, author: Author, branch_id: BranchId) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<RecordedOperation>();
+        let branch_id = Arc::new(PlRwLock::new(branch_id));
 
         let worker_author = author.clone();
-        let worker_branch = branch_id;
+        let worker_branch = Arc::clone(&branch_id);
         let worker_timeline = timeline;
         tokio::spawn(async move {
             while let Some(record) = rx.recv().await {
                 let op = to_timeline_operation(&record);
+                // Snapshot the active branch *per event* so a swap via
+                // `set_branch_id` takes effect on the next op without
+                // restarting the worker.
+                let target = *worker_branch.read();
                 let guard = worker_timeline.read().await;
                 if let Err(err) = guard
-                    .add_operation(op, worker_author.clone(), worker_branch)
+                    .add_operation(op, worker_author.clone(), target)
                     .await
                 {
                     tracing::warn!(
@@ -127,9 +140,18 @@ impl TimelineRecorder {
         &self.author
     }
 
-    /// The branch this recorder writes events to.
+    /// The branch this recorder is currently writing events to.
     pub fn branch_id(&self) -> BranchId {
-        self.branch_id
+        *self.branch_id.read()
+    }
+
+    /// Switch the active branch. Subsequent kernel operations will be
+    /// recorded against `branch_id`. In-flight events that have already
+    /// been queued (but not yet drained by the worker) will use the new
+    /// branch — there is exactly one "active branch" for this recorder
+    /// at any moment, by design.
+    pub fn set_branch_id(&self, branch_id: BranchId) {
+        *self.branch_id.write() = branch_id;
     }
 }
 
