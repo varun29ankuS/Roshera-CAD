@@ -28,7 +28,9 @@ import {
   useSceneStore,
   type SketchPlane,
   type SketchTool,
+  type ServerSketchShape,
 } from '@/stores/scene-store'
+import { buildProfile2D } from '@/lib/sketch-extrude'
 
 const PLANE_SIZE = 400 // world units; large enough that the user
                        // cannot click off-plane in normal use.
@@ -243,7 +245,63 @@ export function SketchOverlay() {
         transparent
       />
 
+      {/* Committed (non-active) shapes — render as faint coloured
+          loops behind the active drawing so the user sees the bracket
+          outline while laying out hole circles inside it. */}
+      <CommittedShapesGuides />
+
       <SketchPreview showMeasure={showMeasure} />
+    </group>
+  )
+}
+
+// ─── Committed-shape guides ──────────────────────────────────────────
+
+/**
+ * Render the closed polygon of every shape EXCEPT the last (active)
+ * one. Outer shapes draw in faint emerald, Holes in faint rose, so
+ * the user can tell at a glance which loop subtracts on extrude.
+ *
+ * Shapes that don't yet materialise to a valid polygon (too few
+ * points, degenerate radius, etc.) are skipped silently.
+ */
+function CommittedShapesGuides() {
+  const shapes = useSceneStore((s) => s.sketch.shapes)
+  const plane = useSceneStore((s) => s.sketch.plane)
+  const circleSegments = useSceneStore((s) => s.sketch.circleSegments)
+
+  const committed = useMemo(
+    () => shapes.slice(0, Math.max(0, shapes.length - 1)),
+    [shapes],
+  )
+
+  const loops = useMemo(() => {
+    return committed
+      .map((shape: ServerSketchShape, idx: number) => {
+        const profile = buildProfile2D(shape.tool, shape.points, circleSegments)
+        if (!profile || profile.length < 3) return null
+        const world = profile.map((p) => uvToWorld(p, plane))
+        // Close the loop visually by duplicating the first point.
+        world.push(world[0])
+        return { idx, role: shape.role, points: world }
+      })
+      .filter((l): l is { idx: number; role: 'outer' | 'hole'; points: THREE.Vector3[] } => l !== null)
+  }, [committed, plane, circleSegments])
+
+  if (loops.length === 0) return null
+
+  return (
+    <group name="sketch-committed-shapes">
+      {loops.map((l) => (
+        <Line
+          key={`committed-${l.idx}`}
+          points={l.points}
+          color={l.role === 'outer' ? '#10b981' : '#f43f5e'}
+          lineWidth={1.5}
+          opacity={0.55}
+          transparent
+        />
+      ))}
     </group>
   )
 }

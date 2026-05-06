@@ -3552,6 +3552,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
         .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
+        // Multi-shape control — a sketch session may carry multiple
+        // shapes (one Outer + N Hole shapes for a bracket-with-holes
+        // pattern, etc.). Legacy `/point` and `/tool` routes target
+        // the active (last) shape; the routes below are the explicit
+        // form for adding, addressing, and re-tagging shapes by index.
+        .route("/api/sketch/{id}/shape", post(sketch::add_sketch_shape))
+        .route(
+            "/api/sketch/{id}/shape/{idx}",
+            delete(sketch::delete_sketch_shape),
+        )
+        .route(
+            "/api/sketch/{id}/shape/{idx}/role",
+            put(sketch::set_sketch_shape_role),
+        )
+        .route(
+            "/api/sketch/{id}/shape/{idx}/tool",
+            put(sketch::set_sketch_shape_tool),
+        )
+        .route(
+            "/api/sketch/{id}/shape/{idx}/point",
+            post(sketch::add_sketch_shape_point),
+        )
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.

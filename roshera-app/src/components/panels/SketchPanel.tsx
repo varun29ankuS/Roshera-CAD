@@ -29,6 +29,9 @@ import {
   Trash2,
   Check,
   X,
+  Plus,
+  Square as SquareIcon,
+  CircleDot,
 } from 'lucide-react'
 import {
   isStandardPlane,
@@ -36,6 +39,7 @@ import {
   type SketchPlane,
   type SketchTool,
   type StandardPlane,
+  type ShapeRole,
 } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import {
@@ -82,6 +86,11 @@ export function SketchPanel() {
   const exitSketch = useSceneStore((s) => s.exitSketch)
   const setSketchView = useSceneStore((s) => s.setSketchView)
   const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
+  const addNewSketchShape = useSceneStore((s) => s.addNewSketchShape)
+  const deleteSketchShape = useSceneStore((s) => s.deleteSketchShape)
+  const setActiveSketchShapeRole = useSceneStore(
+    (s) => s.setActiveSketchShapeRole,
+  )
 
   const [busy, setBusy] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -97,13 +106,22 @@ export function SketchPanel() {
   const handleFinish = useCallback(async () => {
     if (busy) return
     setError(null)
-    const profile = buildProfile2D(
-      sketch.tool,
-      sketch.points,
-      sketch.circleSegments,
-    )
-    if (!profile) {
-      setError('Need more points')
+    // Local guard 1: every shape must materialise to a valid polygon.
+    // Backend re-validates per shape (the source of truth), so this
+    // is just to surface "shape #2 has only 1 point" as a panel error
+    // before the round-trip rather than after.
+    for (let i = 0; i < sketch.shapes.length; i += 1) {
+      const s = sketch.shapes[i]
+      const profile = buildProfile2D(s.tool, s.points, sketch.circleSegments)
+      if (!profile) {
+        setError(`Shape ${i + 1} needs more points`)
+        return
+      }
+    }
+    // Local guard 2: at least one Outer shape (also enforced by
+    // backend, but again — fail fast in the panel).
+    if (!sketch.shapes.some((s) => s.role === 'outer')) {
+      setError('Need at least one Outer shape')
       return
     }
     if (!sketch.serverId) {
@@ -192,6 +210,7 @@ export function SketchPanel() {
     sketch.plane,
     sketch.points,
     sketch.serverId,
+    sketch.shapes,
     sketch.thickness,
     sketch.tool,
   ])
@@ -372,6 +391,22 @@ export function SketchPanel() {
         </div>
       </div>
 
+      {/* Multi-shape strip: per-shape pill row + Add Shape buttons.
+          Lets the user lay down a bracket outline as Outer, then add
+          one or more Hole shapes to be subtracted on extrude. The
+          active (last) shape is highlighted; clicking earlier shapes
+          is not supported yet — editing past shapes requires
+          deleting and redrawing. */}
+      <ShapeStrip
+        shapes={sketch.shapes}
+        activeRole={sketch.activeRole}
+        currentTool={sketch.tool}
+        currentPoints={sketch.points}
+        onSetActiveRole={setActiveSketchShapeRole}
+        onAddShape={(role) => addNewSketchShape(role, sketch.tool)}
+        onDeleteShape={(idx) => deleteSketchShape(idx)}
+      />
+
       {/* Per-tool dimension inputs — type exact lengths instead of
           (or in addition to) clicking. Visible once enough points
           exist for the dimensions to be meaningful. */}
@@ -410,7 +445,13 @@ export function SketchPanel() {
         <button
           type="button"
           onClick={() => void handleFinish()}
-          disabled={busy || sketch.points.length < 2}
+          disabled={
+            busy ||
+            // Active shape must have at least 2 points (the minimum
+            // any of our tools accepts). Other shapes are validated
+            // inside `handleFinish` before the round-trip.
+            sketch.points.length < 2
+          }
           className={cn(
             'ml-auto flex items-center gap-1.5 px-3 py-1 border text-[10px] font-semibold transition-colors',
             busy
@@ -603,6 +644,175 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
           />
         ))}
       </div>
+    </div>
+  )
+}
+
+// ─── Multi-shape strip ────────────────────────────────────────────────
+
+interface ShapeStripProps {
+  shapes: Array<{ id: string; tool: SketchTool; role: ShapeRole; points: Array<[number, number]> }>
+  activeRole: ShapeRole
+  currentTool: SketchTool
+  currentPoints: Array<[number, number]>
+  onSetActiveRole: (role: ShapeRole) => void
+  onAddShape: (role: ShapeRole) => void
+  onDeleteShape: (idx: number) => void
+}
+
+/**
+ * Compact pill row showing every shape in the session, plus the
+ * "Add Outer" / "Add Hole" buttons that commit the current drawing
+ * and start a fresh shape with the chosen role.
+ *
+ * Hidden when there's only one shape and no points placed yet (the
+ * fresh-sketch case) — the panel is already busy with the first
+ * tool selector and showing a single-pill strip would just be noise.
+ */
+function ShapeStrip({
+  shapes,
+  activeRole,
+  currentTool,
+  currentPoints,
+  onSetActiveRole,
+  onAddShape,
+  onDeleteShape,
+}: ShapeStripProps) {
+  // Hide entirely until the user has either placed at least one
+  // point on shape 1, or there's already > 1 shape in the session.
+  if (shapes.length <= 1 && currentPoints.length === 0) return null
+
+  // The active shape's `points` may lag the live `currentPoints`
+  // (the store updates both, but a single re-render may show a
+  // mismatch). Trust the prop-passed `currentPoints` for the active
+  // shape so the count is always live.
+  const activeIdx = shapes.length - 1
+  const canAddShape = currentPoints.length >= 2
+
+  return (
+    <div className="flex flex-col gap-1.5 pt-1 border-t border-border/30">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-muted-foreground text-[10px]">Shapes</span>
+        {shapes.map((s, i) => {
+          const isActive = i === activeIdx
+          const points =
+            isActive ? currentPoints.length : s.points.length
+          const ToolIcon =
+            s.tool === 'rectangle'
+              ? SquareIcon
+              : s.tool === 'circle'
+                ? CircleDot
+                : PenTool
+          return (
+            <div
+              key={s.id}
+              className={cn(
+                'flex items-center gap-1 px-1.5 py-0.5 border text-[10px] font-mono',
+                isActive
+                  ? 'border-border text-foreground bg-foreground/10'
+                  : 'border-border/40 text-muted-foreground',
+              )}
+              title={
+                isActive
+                  ? `Active shape #${i + 1} · ${s.role} · ${s.tool} · ${points} pts`
+                  : `Shape #${i + 1} · ${s.role} · ${s.tool} · ${points} pts`
+              }
+            >
+              <span className="text-muted-foreground/70">#{i + 1}</span>
+              <ToolIcon className="w-2.5 h-2.5" />
+              <span
+                className={cn(
+                  'px-1 border text-[9px] uppercase tracking-wider',
+                  s.role === 'outer'
+                    ? 'border-emerald-400/60 text-emerald-300'
+                    : 'border-rose-400/60 text-rose-300',
+                )}
+              >
+                {s.role}
+              </span>
+              <span className="text-muted-foreground/70">{points}</span>
+              {shapes.length > 1 && !isActive && (
+                <button
+                  type="button"
+                  onClick={() => onDeleteShape(i)}
+                  className="ml-0.5 text-muted-foreground/60 hover:text-rose-400"
+                  title={`Delete shape #${i + 1}`}
+                  aria-label={`Delete shape ${i + 1}`}
+                >
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-muted-foreground text-[10px]">Active role</span>
+        <div className="flex items-center">
+          {(['outer', 'hole'] as ShapeRole[]).map((r) => (
+            <button
+              key={r}
+              type="button"
+              onClick={() => onSetActiveRole(r)}
+              className={cn(
+                'px-2 py-0.5 border text-[10px] uppercase tracking-wider transition-colors',
+                activeRole === r
+                  ? r === 'outer'
+                    ? 'border-emerald-400/60 text-emerald-300 bg-emerald-500/10'
+                    : 'border-rose-400/60 text-rose-300 bg-rose-500/10'
+                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+              )}
+              title={
+                r === 'outer'
+                  ? 'Active shape adds material on extrude (Union)'
+                  : 'Active shape subtracts material on extrude (Difference)'
+              }
+              aria-pressed={activeRole === r}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => onAddShape('outer')}
+            disabled={!canAddShape}
+            className={cn(
+              'flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
+              canAddShape
+                ? 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10'
+                : 'border-border/40 text-muted-foreground/60',
+            )}
+            title="Commit current shape and start a new Outer shape"
+          >
+            <Plus className="w-2.5 h-2.5" />
+            <span>Outer</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onAddShape('hole')}
+            disabled={!canAddShape}
+            className={cn(
+              'flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
+              canAddShape
+                ? 'border-rose-400/60 text-rose-300 hover:bg-rose-500/10'
+                : 'border-border/40 text-muted-foreground/60',
+            )}
+            title="Commit current shape and start a new Hole shape"
+          >
+            <Plus className="w-2.5 h-2.5" />
+            <span>Hole</span>
+          </button>
+        </div>
+      </div>
+      {/* Reference to currentTool so it's marked used (the icon is
+          visible per-shape in the row above; we don't render the
+          current-tool icon separately since the main tool selector
+          already shows it). */}
+      <span className="hidden">{currentTool}</span>
     </div>
   )
 }

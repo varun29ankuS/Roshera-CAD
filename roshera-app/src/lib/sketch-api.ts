@@ -7,18 +7,34 @@
  * Wire shape mirrors `roshera-backend/api-server/src/sketch.rs`
  * `SketchSession` (snake_case `circle_segments`, `created_at`,
  * `updated_at`). The store translates to its camelCase view.
+ *
+ * Multi-shape model (Slice 1+2 of the multi-shape plan): a session
+ * carries `shapes: SketchShape[]`, each with its own tool / role /
+ * points. The active (in-progress) shape is invariantly the *last*
+ * element. Legacy point/tool/clear endpoints target the active shape;
+ * `/shape/{idx}/...` endpoints address shapes explicitly.
  */
 
 import type { SketchPlane, SketchTool } from '@/stores/scene-store'
 
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
 
+/** Role of a sketch shape — Outer adds material, Hole subtracts. */
+export type ShapeRole = 'outer' | 'hole'
+
+/** Backend `SketchShape` wire shape. */
+export interface ServerSketchShape {
+  id: string
+  tool: SketchTool
+  role: ShapeRole
+  points: Array<[number, number]>
+}
+
 /** Backend `SketchSession` wire shape — snake_case as serialised. */
 export interface ServerSketchSession {
   id: string
   plane: SketchPlane
-  tool: SketchTool
-  points: Array<[number, number]>
+  shapes: ServerSketchShape[]
   circle_segments: number
   created_at: number
   updated_at: number
@@ -71,12 +87,15 @@ export const sketchApi = {
   delete(id: string): Promise<{ ok: boolean; removed: boolean }> {
     return request('DELETE', `/sketch/${id}`)
   },
+  /** Append a point to the active (last) shape. */
   addPoint(id: string, point: [number, number]): Promise<ServerSketchSession> {
     return request('POST', `/sketch/${id}/point`, { point })
   },
+  /** Pop the last point of the active shape. */
   popPoint(id: string): Promise<ServerSketchSession> {
     return request('DELETE', `/sketch/${id}/point/last`)
   },
+  /** Replace a single point on the active shape. */
   setPoint(
     id: string,
     index: number,
@@ -84,6 +103,7 @@ export const sketchApi = {
   ): Promise<ServerSketchSession> {
     return request('PUT', `/sketch/${id}/point/${index}`, { point })
   },
+  /** Clear all points on the active shape. */
   clearPoints(id: string): Promise<ServerSketchSession> {
     return request('DELETE', `/sketch/${id}/points`)
   },
@@ -107,6 +127,7 @@ export const sketchApi = {
       face_id: faceId,
     })
   },
+  /** Set the tool of the active (last) shape. Clears its points. */
   setTool(id: string, tool: SketchTool): Promise<ServerSketchSession> {
     return request('PUT', `/sketch/${id}/tool`, { tool })
   },
@@ -114,10 +135,49 @@ export const sketchApi = {
     return request('PUT', `/sketch/${id}/circle-segments`, { segments })
   },
   /**
-   * Finalise a sketch into a solid. Backend materialises the polygon,
-   * lifts to the plane, and runs the same `extrude_profile` pipeline
-   * as `/api/geometry/extrude`. The resulting solid is broadcast as
-   * `ObjectCreated`; the sketch is then dropped (unless
+   * Append a fresh empty shape with the given tool + role; it becomes
+   * the new active (last) shape. Used by the multi-shape UI flow when
+   * the user has finished an outline and wants to start a hole inside.
+   */
+  addShape(
+    id: string,
+    body: { tool: SketchTool; role?: ShapeRole },
+  ): Promise<ServerSketchSession> {
+    return request('POST', `/sketch/${id}/shape`, body)
+  },
+  /**
+   * Drop the shape at `idx`. Backend refuses to remove the last
+   * remaining shape so the session invariant (≥1 shape) holds.
+   */
+  deleteShape(id: string, idx: number): Promise<ServerSketchSession> {
+    return request('DELETE', `/sketch/${id}/shape/${idx}`)
+  },
+  setShapeRole(
+    id: string,
+    idx: number,
+    role: ShapeRole,
+  ): Promise<ServerSketchSession> {
+    return request('PUT', `/sketch/${id}/shape/${idx}/role`, { role })
+  },
+  setShapeTool(
+    id: string,
+    idx: number,
+    tool: SketchTool,
+  ): Promise<ServerSketchSession> {
+    return request('PUT', `/sketch/${id}/shape/${idx}/tool`, { tool })
+  },
+  addPointToShape(
+    id: string,
+    idx: number,
+    point: [number, number],
+  ): Promise<ServerSketchSession> {
+    return request('POST', `/sketch/${id}/shape/${idx}/point`, { point })
+  },
+  /**
+   * Finalise a sketch into a solid. Backend extrudes every shape
+   * independently and folds via boolean (Outer→Union, Hole→Difference)
+   * starting from the first Outer. The resulting solid is broadcast
+   * as `ObjectCreated`; the sketch is then dropped (unless
    * `consume: false` is passed).
    */
   extrude(
