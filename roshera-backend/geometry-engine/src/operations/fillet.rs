@@ -1887,3 +1887,558 @@ fn validate_fillet_parameters(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::Line;
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    /// Build a 1m × 1m × 1m box and return its solid id.
+    fn build_unit_box(model: &mut BRepModel) -> SolidId {
+        let mut builder = TopologyBuilder::new(model);
+        match builder.create_box_3d(1.0, 1.0, 1.0).expect("box") {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {other:?}"),
+        }
+    }
+
+    /// Add a line edge between two new vertices and return its id along
+    /// with both vertex ids.
+    fn add_simple_edge(
+        model: &mut BRepModel,
+        from: Point3,
+        to: Point3,
+    ) -> (EdgeId, VertexId, VertexId) {
+        let v0 = model.vertices.add(from.x, from.y, from.z);
+        let v1 = model.vertices.add(to.x, to.y, to.z);
+        let line = Line::new(from, to);
+        let curve_id = model.curves.add(Box::new(line));
+        let edge = Edge::new_auto_range(0, v0, v1, curve_id, EdgeOrientation::Forward);
+        let edge_id = model.edges.add(edge);
+        (edge_id, v0, v1)
+    }
+
+    // -------------------------------------------------------------------
+    // FilletOptions / FilletType / PropagationMode / FilletQuality
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fillet_options_default_radius_is_five() {
+        let opts = FilletOptions::default();
+        assert!((opts.radius - 5.0).abs() < 1e-12);
+        assert!(matches!(opts.fillet_type, FilletType::Constant(r) if (r - 5.0).abs() < 1e-12));
+        assert_eq!(opts.propagation, PropagationMode::Tangent);
+        assert!(opts.preserve_edges);
+        assert_eq!(opts.quality, FilletQuality::Standard);
+    }
+
+    #[test]
+    fn fillet_type_function_clone_falls_back_to_constant_five() {
+        let f = FilletType::Function(Box::new(|t: f64| 1.0 + t));
+        let cloned = f.clone();
+        match cloned {
+            FilletType::Constant(r) => assert!((r - 5.0).abs() < 1e-12),
+            other => panic!("expected Constant fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fillet_type_constant_clone_round_trips() {
+        let f = FilletType::Constant(2.5);
+        if let FilletType::Constant(r) = f.clone() {
+            assert!((r - 2.5).abs() < 1e-12);
+        } else {
+            panic!("clone changed variant");
+        }
+    }
+
+    #[test]
+    fn fillet_type_variable_clone_round_trips() {
+        let f = FilletType::Variable(1.0, 3.0);
+        if let FilletType::Variable(a, b) = f.clone() {
+            assert!((a - 1.0).abs() < 1e-12);
+            assert!((b - 3.0).abs() < 1e-12);
+        } else {
+            panic!("clone changed variant");
+        }
+    }
+
+    #[test]
+    fn fillet_type_chord_clone_round_trips() {
+        let f = FilletType::Chord(0.7);
+        if let FilletType::Chord(c) = f.clone() {
+            assert!((c - 0.7).abs() < 1e-12);
+        } else {
+            panic!("clone changed variant");
+        }
+    }
+
+    #[test]
+    fn fillet_type_debug_format_includes_value() {
+        let s = format!("{:?}", FilletType::Constant(2.0));
+        assert!(s.contains("Constant"));
+        let s = format!("{:?}", FilletType::Function(Box::new(|_| 0.0)));
+        assert!(s.contains("Function"));
+    }
+
+    #[test]
+    fn propagation_mode_variants_distinct() {
+        assert_ne!(PropagationMode::None, PropagationMode::Tangent);
+        assert_ne!(PropagationMode::Tangent, PropagationMode::Smooth);
+        assert_ne!(PropagationMode::Smooth, PropagationMode::All);
+    }
+
+    #[test]
+    fn fillet_quality_variants_distinct() {
+        assert_ne!(FilletQuality::Draft, FilletQuality::Standard);
+        assert_ne!(FilletQuality::Standard, FilletQuality::High);
+    }
+
+    // -------------------------------------------------------------------
+    // validate_fillet_inputs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_fillet_inputs_rejects_unknown_solid() {
+        let model = BRepModel::new();
+        let opts = FilletOptions::default();
+        let result = validate_fillet_inputs(&model, 99_999, &[0], &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_fillet_inputs_rejects_empty_edge_list() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let opts = FilletOptions::default();
+        let result = validate_fillet_inputs(&model, solid_id, &[], &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_fillet_inputs_rejects_unknown_edge() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let opts = FilletOptions::default();
+        let result = validate_fillet_inputs(&model, solid_id, &[99_999], &opts);
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(msg.contains("edge"), "msg = {msg}");
+            }
+            other => panic!("expected InvalidGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_fillet_inputs_rejects_radius_below_tolerance() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let opts = FilletOptions {
+            radius: 1e-15, // below default tolerance
+            fillet_type: FilletType::Constant(1e-15),
+            ..Default::default()
+        };
+        let result = validate_fillet_inputs(&model, solid_id, &[edge_id], &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_fillet_inputs_rejects_non_finite_radius() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let opts = FilletOptions {
+            radius: f64::NAN,
+            fillet_type: FilletType::Constant(0.5),
+            ..Default::default()
+        };
+        let result = validate_fillet_inputs(&model, solid_id, &[edge_id], &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_fillet_inputs_accepts_valid_constant_radius() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(2.0, 0.0, 0.0));
+        let opts = FilletOptions {
+            radius: 0.1,
+            fillet_type: FilletType::Constant(0.1),
+            ..Default::default()
+        };
+        assert!(validate_fillet_inputs(&model, solid_id, &[edge_id], &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_fillet_inputs_accepts_chord_variant_with_valid_options_radius() {
+        // Variant-specific (non-Constant) types skip the inner radius
+        // check; only the outer options.radius must clear tolerance.
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(2.0, 0.0, 0.0));
+        let opts = FilletOptions {
+            radius: 0.5,
+            fillet_type: FilletType::Chord(0.3),
+            ..Default::default()
+        };
+        assert!(validate_fillet_inputs(&model, solid_id, &[edge_id], &opts).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_vertex_fillet_inputs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_vertex_fillet_inputs_rejects_unknown_solid() {
+        let model = BRepModel::new();
+        let result = validate_vertex_fillet_inputs(&model, 99_999, &[0], 1.0);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_vertex_fillet_inputs_rejects_unknown_vertex() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let result = validate_vertex_fillet_inputs(&model, solid_id, &[99_999], 1.0);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_vertex_fillet_inputs_rejects_zero_radius() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let v = model.vertices.add(0.0, 0.0, 0.0);
+        let result = validate_vertex_fillet_inputs(&model, solid_id, &[v], 0.0);
+        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
+    }
+
+    #[test]
+    fn validate_vertex_fillet_inputs_rejects_negative_radius() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let v = model.vertices.add(0.0, 0.0, 0.0);
+        let result = validate_vertex_fillet_inputs(&model, solid_id, &[v], -0.1);
+        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
+    }
+
+    #[test]
+    fn validate_vertex_fillet_inputs_accepts_valid_input() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let v = model.vertices.add(0.0, 0.0, 0.0);
+        assert!(validate_vertex_fillet_inputs(&model, solid_id, &[v], 0.5).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_fillet_parameters
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_fillet_parameters_rejects_negative_radius() {
+        let mut model = BRepModel::new();
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let tol = Tolerance::default();
+        let result = validate_fillet_parameters(&model, edge_id, -1.0, &tol);
+        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
+    }
+
+    #[test]
+    fn validate_fillet_parameters_rejects_zero_radius() {
+        let mut model = BRepModel::new();
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let tol = Tolerance::default();
+        let result = validate_fillet_parameters(&model, edge_id, 0.0, &tol);
+        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
+    }
+
+    #[test]
+    fn validate_fillet_parameters_rejects_unknown_edge() {
+        let model = BRepModel::new();
+        let tol = Tolerance::default();
+        let result = validate_fillet_parameters(&model, 99_999, 1.0, &tol);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_fillet_parameters_rejects_radius_above_half_edge_length() {
+        let mut model = BRepModel::new();
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(2.0, 0.0, 0.0));
+        let tol = Tolerance::default();
+        // edge length = 2, half = 1. radius = 1.5 > 1 must fail.
+        let result = validate_fillet_parameters(&model, edge_id, 1.5, &tol);
+        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
+    }
+
+    #[test]
+    fn validate_fillet_parameters_accepts_radius_below_half_edge_length() {
+        let mut model = BRepModel::new();
+        let (edge_id, _, _) =
+            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(10.0, 0.0, 0.0));
+        let tol = Tolerance::default();
+        assert!(validate_fillet_parameters(&model, edge_id, 1.0, &tol).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // group_edges_into_chains
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn group_edges_into_chains_empty_input_yields_empty_output() {
+        let model = BRepModel::new();
+        let chains = group_edges_into_chains(&model, &[]).expect("group");
+        assert!(chains.is_empty());
+    }
+
+    #[test]
+    fn group_edges_into_chains_single_edge_yields_single_chain() {
+        let mut model = BRepModel::new();
+        let (e, _, _) = add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let chains = group_edges_into_chains(&model, &[e]).expect("group");
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0], vec![e]);
+    }
+
+    #[test]
+    fn group_edges_into_chains_disconnected_pair_yields_two_chains() {
+        let mut model = BRepModel::new();
+        let (e1, _, _) = add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let (e2, _, _) = add_simple_edge(
+            &mut model,
+            Point3::new(10.0, 10.0, 0.0),
+            Point3::new(11.0, 10.0, 0.0),
+        );
+        let chains = group_edges_into_chains(&model, &[e1, e2]).expect("group");
+        assert_eq!(chains.len(), 2);
+    }
+
+    #[test]
+    fn group_edges_into_chains_three_connected_edges_yields_one_chain() {
+        // Build a 3-edge connected chain v0-v1-v2-v3 sharing vertices.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(2.0, 0.0, 0.0);
+        let v3 = model.vertices.add(3.0, 0.0, 0.0);
+        let l1 = Line::new(Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let l2 = Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0));
+        let l3 = Line::new(Point3::new(2.0, 0.0, 0.0), Point3::new(3.0, 0.0, 0.0));
+        let c1 = model.curves.add(Box::new(l1));
+        let c2 = model.curves.add(Box::new(l2));
+        let c3 = model.curves.add(Box::new(l3));
+        let e1 = model
+            .edges
+            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
+        let e2 = model
+            .edges
+            .add(Edge::new_auto_range(0, v1, v2, c2, EdgeOrientation::Forward));
+        let e3 = model
+            .edges
+            .add(Edge::new_auto_range(0, v2, v3, c3, EdgeOrientation::Forward));
+        let chains = group_edges_into_chains(&model, &[e1, e2, e3]).expect("group");
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].len(), 3);
+    }
+
+    #[test]
+    fn group_edges_into_chains_rejects_unknown_edge() {
+        let model = BRepModel::new();
+        let result = group_edges_into_chains(&model, &[99_999]);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // are_edges_tangent
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn are_edges_tangent_collinear_edges_are_tangent() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(2.0, 0.0, 0.0);
+        let l1 = Line::new(Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let l2 = Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0));
+        let c1 = model.curves.add(Box::new(l1));
+        let c2 = model.curves.add(Box::new(l2));
+        let e1 = model
+            .edges
+            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
+        let e2 = model
+            .edges
+            .add(Edge::new_auto_range(0, v1, v2, c2, EdgeOrientation::Forward));
+        assert!(are_edges_tangent(&model, e1, e2).expect("tangent"));
+    }
+
+    #[test]
+    fn are_edges_tangent_orthogonal_edges_are_not_tangent() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 1.0, 0.0);
+        let l1 = Line::new(Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let l2 = Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0));
+        let c1 = model.curves.add(Box::new(l1));
+        let c2 = model.curves.add(Box::new(l2));
+        let e1 = model
+            .edges
+            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
+        let e2 = model
+            .edges
+            .add(Edge::new_auto_range(0, v1, v2, c2, EdgeOrientation::Forward));
+        assert!(!are_edges_tangent(&model, e1, e2).expect("tangent"));
+    }
+
+    #[test]
+    fn are_edges_tangent_disconnected_edges_are_not_tangent() {
+        let mut model = BRepModel::new();
+        let (e1, _, _) = add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let (e2, _, _) = add_simple_edge(
+            &mut model,
+            Point3::new(10.0, 10.0, 0.0),
+            Point3::new(11.0, 10.0, 0.0),
+        );
+        assert!(!are_edges_tangent(&model, e1, e2).expect("tangent"));
+    }
+
+    #[test]
+    fn are_edges_tangent_rejects_unknown_first_edge() {
+        let mut model = BRepModel::new();
+        let (e2, _, _) = add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let result = are_edges_tangent(&model, 99_999, e2);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // find_edges_at_vertex
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn find_edges_at_vertex_returns_incident_edges() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(0.0, 1.0, 0.0);
+        let l1 = Line::new(Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let l2 = Line::new(Point3::ORIGIN, Point3::new(0.0, 1.0, 0.0));
+        let c1 = model.curves.add(Box::new(l1));
+        let c2 = model.curves.add(Box::new(l2));
+        let e1 = model
+            .edges
+            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
+        let e2 = model
+            .edges
+            .add(Edge::new_auto_range(0, v0, v2, c2, EdgeOrientation::Forward));
+        let edges = find_edges_at_vertex(&model, v0).expect("edges");
+        assert!(edges.contains(&e1));
+        assert!(edges.contains(&e2));
+    }
+
+    #[test]
+    fn find_edges_at_vertex_returns_empty_for_isolated_vertex() {
+        let mut model = BRepModel::new();
+        let v = model.vertices.add(0.0, 0.0, 0.0);
+        let edges = find_edges_at_vertex(&model, v).expect("edges");
+        assert!(edges.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // face_contains_edge
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn face_contains_edge_returns_true_for_edge_in_outer_loop() {
+        // Use a unit-box face — pick one of its edges.
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        let face_id = *shell.faces.first().expect("face");
+        let face = model.faces.get(face_id).expect("face data").clone();
+        let outer_loop = model.loops.get(face.outer_loop).expect("loop");
+        let edge_in_face = *outer_loop.edges.first().expect("edge");
+        assert!(face_contains_edge(&model, &face, edge_in_face).expect("contains"));
+    }
+
+    #[test]
+    fn face_contains_edge_returns_false_for_unrelated_edge() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        let face_id = *shell.faces.first().expect("face");
+        let face = model.faces.get(face_id).expect("face data").clone();
+        // Synthesise a fresh edge unrelated to the box.
+        let (foreign_edge, _, _) = add_simple_edge(
+            &mut model,
+            Point3::new(50.0, 50.0, 50.0),
+            Point3::new(51.0, 50.0, 50.0),
+        );
+        assert!(!face_contains_edge(&model, &face, foreign_edge).expect("contains"));
+    }
+
+    // -------------------------------------------------------------------
+    // get_adjacent_faces / get_adjacent_faces_safe
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn get_adjacent_faces_returns_two_faces_for_box_edge() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let solid = model.solids.get(solid_id).expect("solid").clone();
+        let shell = model.shells.get(solid.outer_shell).expect("shell").clone();
+        let face = model.faces.get(shell.faces[0]).expect("face").clone();
+        let outer_loop = model.loops.get(face.outer_loop).expect("loop");
+        let edge = outer_loop.edges[0];
+        let (a, b) = get_adjacent_faces(&model, solid_id, edge).expect("adjacent");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn get_adjacent_faces_safe_returns_two_for_interior_box_edge() {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let solid = model.solids.get(solid_id).expect("solid").clone();
+        let shell = model.shells.get(solid.outer_shell).expect("shell").clone();
+        let face = model.faces.get(shell.faces[0]).expect("face").clone();
+        let outer_loop = model.loops.get(face.outer_loop).expect("loop");
+        let edge = outer_loop.edges[0];
+        let result = get_adjacent_faces_safe(&model, edge);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn get_adjacent_faces_safe_errors_for_orphan_edge() {
+        let mut model = BRepModel::new();
+        let _ = build_unit_box(&mut model);
+        let (foreign, _, _) = add_simple_edge(
+            &mut model,
+            Point3::new(99.0, 99.0, 99.0),
+            Point3::new(100.0, 99.0, 99.0),
+        );
+        let result = get_adjacent_faces_safe(&model, foreign);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // propagate_edge_selection - PropagationMode::None passthrough
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn propagate_edge_selection_none_returns_input_unchanged() {
+        let mut model = BRepModel::new();
+        let (e1, _, _) = add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let result =
+            propagate_edge_selection(&model, vec![e1], PropagationMode::None).expect("propagate");
+        assert_eq!(result, vec![e1]);
+    }
+}
+

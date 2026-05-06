@@ -644,3 +644,431 @@ impl VertexStore {
         self.flags.reserve(additional);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::Matrix4;
+
+    // ---- Vertex unit tests --------------------------------------------------
+
+    #[test]
+    fn vertex_new_records_position_and_nan_uv_params() {
+        let v = Vertex::new(7, 1.0, 2.0, 3.0);
+        assert_eq!(v.id, 7);
+        assert_eq!(v.position, [1.0, 2.0, 3.0]);
+        assert!(v.params[0].is_nan() && v.params[1].is_nan());
+        assert_eq!(v.flags, 0);
+        assert!((v.tolerance - 1e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn vertex_new_with_params_sets_on_face_flag() {
+        let v = Vertex::new_with_params(0, 0.0, 0.0, 0.0, 0.25, 0.75);
+        assert_eq!(v.params, [0.25, 0.75]);
+        assert!(v.has_flag(VertexFlags::ON_FACE));
+    }
+
+    #[test]
+    fn vertex_point_round_trips_position() {
+        let v = Vertex::new(0, 1.5, -2.5, 3.5);
+        let p = v.point();
+        assert!((p.x - 1.5).abs() < 1e-15);
+        assert!((p.y + 2.5).abs() < 1e-15);
+        assert!((p.z - 3.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn vertex_set_flag_supports_set_and_clear() {
+        let mut v = Vertex::new(0, 0.0, 0.0, 0.0);
+        v.set_flag(VertexFlags::BOUNDARY, true);
+        assert!(v.is_boundary());
+        v.set_flag(VertexFlags::BOUNDARY, false);
+        assert!(!v.is_boundary());
+    }
+
+    #[test]
+    fn vertex_set_flag_does_not_disturb_other_bits() {
+        let mut v = Vertex::new(0, 0.0, 0.0, 0.0);
+        v.set_flag(VertexFlags::BOUNDARY, true);
+        v.set_flag(VertexFlags::MANIFOLD, true);
+        v.set_flag(VertexFlags::BOUNDARY, false);
+        assert!(!v.is_boundary());
+        assert!(v.is_manifold());
+    }
+
+    #[test]
+    fn vertex_flag_helpers_match_underlying_bits() {
+        let mut v = Vertex::new(0, 0.0, 0.0, 0.0);
+        v.flags = VertexFlags::BOUNDARY | VertexFlags::MANIFOLD;
+        assert!(v.is_boundary());
+        assert!(v.is_manifold());
+        assert!(!v.has_flag(VertexFlags::ON_EDGE));
+    }
+
+    #[test]
+    fn vertex_tolerance_get_set_round_trip() {
+        let mut v = Vertex::new(0, 0.0, 0.0, 0.0);
+        assert!((v.get_tolerance() - 1e-6).abs() < 1e-15);
+        v.set_tolerance(1e-9);
+        assert!((v.get_tolerance() - 1e-9).abs() < 1e-15);
+    }
+
+    // ---- VertexStore add / get ---------------------------------------------
+
+    #[test]
+    fn store_add_unchecked_assigns_sequential_ids() {
+        let mut s = VertexStore::with_capacity_no_dedup(8);
+        let a = s.add_unchecked(0.0, 0.0, 0.0);
+        let b = s.add_unchecked(1.0, 0.0, 0.0);
+        let c = s.add_unchecked(2.0, 0.0, 0.0);
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(c, 2);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.stats.total_created, 3);
+    }
+
+    #[test]
+    fn store_get_returns_inserted_position() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let id = s.add(2.5, -3.0, 4.25);
+        let v = s.get(id).expect("vertex should be retrievable");
+        assert_eq!(v.position, [2.5, -3.0, 4.25]);
+        assert_eq!(v.id, id);
+    }
+
+    #[test]
+    fn store_get_returns_none_for_out_of_range_id() {
+        let s = VertexStore::with_capacity_no_dedup(4);
+        assert!(s.get(0).is_none());
+        assert!(s.get(99).is_none());
+    }
+
+    #[test]
+    fn store_get_position_returns_inserted_coordinates() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let id = s.add(1.0, 2.0, 3.0);
+        assert_eq!(s.get_position(id), Some([1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn store_get_position_returns_none_for_unknown_id() {
+        let s = VertexStore::with_capacity_no_dedup(2);
+        assert_eq!(s.get_position(42), None);
+    }
+
+    #[test]
+    fn store_add_with_params_stores_uv_and_sets_on_face() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let id = s.add_with_params(0.0, 0.0, 0.0, 0.5, 0.25);
+        let v = s.get(id).expect("vertex");
+        assert_eq!(v.params, [0.5, 0.25]);
+        assert!(v.has_flag(VertexFlags::ON_FACE));
+    }
+
+    #[test]
+    fn store_default_add_has_nan_uv_params() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let id = s.add(0.0, 0.0, 0.0);
+        let v = s.get(id).expect("vertex");
+        assert!(v.params[0].is_nan() && v.params[1].is_nan());
+    }
+
+    // ---- Deduplication ------------------------------------------------------
+
+    #[test]
+    fn store_add_or_find_returns_existing_within_tolerance() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-6);
+        let a = s.add_or_find(1.0, 2.0, 3.0, 1e-6);
+        let b = s.add_or_find(1.0 + 1e-9, 2.0, 3.0, 1e-6);
+        assert_eq!(a, b, "near-duplicate within tolerance must reuse id");
+        assert_eq!(s.stats.duplicates_found, 1);
+    }
+
+    #[test]
+    fn store_add_or_find_creates_new_when_outside_tolerance() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-6);
+        let a = s.add_or_find(0.0, 0.0, 0.0, 1e-6);
+        let b = s.add_or_find(1.0, 0.0, 0.0, 1e-6);
+        assert_ne!(a, b);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn store_add_or_find_uses_squared_distance_threshold() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-3);
+        let a = s.add_or_find(0.0, 0.0, 0.0, 1e-3);
+        // ~0.0007 distance — strictly inside the 1e-3 ball.
+        let b = s.add_or_find(4e-4, 4e-4, 4e-4, 1e-3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn store_add_or_find_with_dedup_disabled_when_tolerance_too_tight() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-12);
+        let a = s.add_or_find_with_dedup(0.0, 0.0, 0.0, 1e-12);
+        let b = s.add_or_find_with_dedup(0.0, 0.0, 0.0, 1e-12);
+        assert_ne!(a, b, "tolerance < 1e-10 disables dedup path");
+    }
+
+    #[test]
+    fn store_add_or_find_with_dedup_finds_via_spatial_hash() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-3);
+        let a = s.add_or_find_with_dedup(0.0, 0.0, 0.0, 1e-3);
+        let b = s.add_or_find_with_dedup(1e-7, -1e-7, 0.0, 1e-3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn store_add_or_find_batch_dedups_consecutive_inserts() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-3);
+        let positions = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)];
+        let ids = s.add_or_find_batch(&positions, 1e-3);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2]);
+    }
+
+    #[test]
+    fn store_add_or_find_skips_deleted_vertices() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-3);
+        let a = s.add_or_find(0.0, 0.0, 0.0, 1e-3);
+        assert!(s.remove(a));
+        let b = s.add_or_find(0.0, 0.0, 0.0, 1e-3);
+        assert_ne!(a, b, "after delete, the slot must not be reused as a hit");
+    }
+
+    // ---- Tolerance accessors ------------------------------------------------
+
+    #[test]
+    fn store_set_tolerance_persists_per_vertex() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let id = s.add(0.0, 0.0, 0.0);
+        assert!(s.set_tolerance(id, 5e-9));
+        assert!((s.get_tolerance(id).expect("tol") - 5e-9).abs() < 1e-20);
+    }
+
+    #[test]
+    fn store_set_tolerance_returns_false_for_unknown_id() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        assert!(!s.set_tolerance(42, 1e-9));
+    }
+
+    #[test]
+    fn store_get_tolerance_none_for_out_of_range_id() {
+        let s = VertexStore::with_capacity_no_dedup(4);
+        assert!(s.get_tolerance(0).is_none());
+    }
+
+    // ---- Spatial queries ----------------------------------------------------
+
+    #[test]
+    fn store_find_in_box_returns_only_contained_vertices() {
+        let mut s = VertexStore::with_capacity_no_dedup(8);
+        let inside = s.add(0.5, 0.5, 0.5);
+        let _outside = s.add(2.0, 2.0, 2.0);
+        let on_min_corner = s.add(0.0, 0.0, 0.0);
+        let on_max_corner = s.add(1.0, 1.0, 1.0);
+        let hits = s.find_in_box(&Point3::new(0.0, 0.0, 0.0), &Point3::new(1.0, 1.0, 1.0));
+        assert!(hits.contains(&inside));
+        assert!(hits.contains(&on_min_corner));
+        assert!(hits.contains(&on_max_corner));
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn store_find_in_box_empty_for_disjoint_query() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        s.add(10.0, 10.0, 10.0);
+        let hits = s.find_in_box(&Point3::new(0.0, 0.0, 0.0), &Point3::new(1.0, 1.0, 1.0));
+        assert!(hits.is_empty());
+    }
+
+    // ---- transform_batch ----------------------------------------------------
+
+    #[test]
+    fn store_transform_batch_applies_translation() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let a = s.add(1.0, 2.0, 3.0);
+        let b = s.add(0.0, 0.0, 0.0);
+        let m = Matrix4::translation(10.0, 20.0, 30.0);
+        s.transform_batch(&[a, b], &m);
+        assert_eq!(s.get_position(a), Some([11.0, 22.0, 33.0]));
+        assert_eq!(s.get_position(b), Some([10.0, 20.0, 30.0]));
+    }
+
+    #[test]
+    fn store_set_position_marks_modified_flag() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let id = s.add(0.0, 0.0, 0.0);
+        assert!(s.set_position(id, 1.0, 2.0, 3.0));
+        let v = s.get(id).expect("vertex");
+        assert_eq!(v.position, [1.0, 2.0, 3.0]);
+        assert!(v.has_flag(VertexFlags::MODIFIED));
+    }
+
+    #[test]
+    fn store_set_position_returns_false_for_unknown_id() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        assert!(!s.set_position(99, 0.0, 0.0, 0.0));
+    }
+
+    // ---- merge / remove / compact ------------------------------------------
+
+    #[test]
+    fn store_merge_vertices_marks_remove_as_deleted() {
+        let mut s = VertexStore::with_capacity_and_tolerance(4, 1e-3);
+        let keep = s.add_or_find_with_dedup(0.0, 0.0, 0.0, 1e-3);
+        let remove = s.add_or_find_with_dedup(1.0, 0.0, 0.0, 1e-3);
+        assert!(s.merge_vertices(keep, remove));
+        assert!(s.get(remove).is_none(), "removed vertex must not be retrievable");
+        assert!(s.get(keep).is_some());
+    }
+
+    #[test]
+    fn store_merge_vertices_returns_false_for_invalid_ids() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let v = s.add(0.0, 0.0, 0.0);
+        assert!(!s.merge_vertices(v, 99));
+        assert!(!s.merge_vertices(99, v));
+    }
+
+    #[test]
+    fn store_remove_marks_deleted_and_excludes_from_iter() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let a = s.add(0.0, 0.0, 0.0);
+        let b = s.add(1.0, 0.0, 0.0);
+        let c = s.add(2.0, 0.0, 0.0);
+        assert!(s.remove(b));
+        let live: Vec<_> = s.iter().map(|(id, _)| id).collect();
+        assert!(live.contains(&a));
+        assert!(!live.contains(&b));
+        assert!(live.contains(&c));
+    }
+
+    #[test]
+    fn store_remove_returns_false_for_unknown_id() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        assert!(!s.remove(99));
+    }
+
+    #[test]
+    fn store_compact_removes_deleted_and_returns_remap() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-3);
+        let a = s.add(0.0, 0.0, 0.0);
+        let b = s.add(1.0, 0.0, 0.0);
+        let c = s.add(2.0, 0.0, 0.0);
+        s.remove(b);
+        let remap = s.compact();
+        // Live vertices remap to dense indices.
+        assert_eq!(remap.get(&a).map(|r| *r), Some(0));
+        assert_eq!(remap.get(&c).map(|r| *r), Some(1));
+        // Deleted vertex has no remap entry.
+        assert!(remap.get(&b).is_none());
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn store_compact_preserves_position_under_remap() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let a = s.add(7.0, 8.0, 9.0);
+        let b = s.add(1.0, 2.0, 3.0);
+        s.remove(a);
+        let remap = s.compact();
+        let new_b = *remap.get(&b).expect("b must remap");
+        assert_eq!(s.get_position(new_b), Some([1.0, 2.0, 3.0]));
+    }
+
+    // ---- iter / len / is_empty ---------------------------------------------
+
+    #[test]
+    fn store_len_excludes_deleted() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let a = s.add(0.0, 0.0, 0.0);
+        let _b = s.add(1.0, 0.0, 0.0);
+        s.remove(a);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn store_is_empty_initially_and_after_full_deletion() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        assert!(s.is_empty());
+        let id = s.add(0.0, 0.0, 0.0);
+        assert!(!s.is_empty());
+        s.remove(id);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn store_iter_visits_each_live_vertex_once() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        s.add(0.0, 0.0, 0.0);
+        s.add(1.0, 0.0, 0.0);
+        s.add(2.0, 0.0, 0.0);
+        assert_eq!(s.iter().count(), 3);
+    }
+
+    // ---- Attributes ---------------------------------------------------------
+
+    #[test]
+    fn store_attributes_round_trip() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let id = s.add(0.0, 0.0, 0.0);
+        let attrs = vec![
+            VertexAttribute::Color([1.0, 0.5, 0.25, 1.0]),
+            VertexAttribute::Selected(true),
+        ];
+        s.set_attributes(id, attrs.clone());
+        let got = s.get_attributes(id).expect("attrs");
+        assert_eq!(got, attrs);
+    }
+
+    #[test]
+    fn store_attributes_none_for_unknown_vertex() {
+        let s = VertexStore::with_capacity_no_dedup(2);
+        assert!(s.get_attributes(99).is_none());
+    }
+
+    // ---- Spatial-hash key ---------------------------------------------------
+
+    #[test]
+    fn spatial_hash_key_collides_within_grid_cell() {
+        let k1 = SpatialHashKey::from_position(0.1, 0.1, 0.1, 1.0);
+        let k2 = SpatialHashKey::from_position(0.4, -0.4, 0.49, 1.0);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn spatial_hash_key_differs_across_cells() {
+        let k1 = SpatialHashKey::from_position(0.0, 0.0, 0.0, 1.0);
+        let k2 = SpatialHashKey::from_position(1.0, 0.0, 0.0, 1.0);
+        assert_ne!(k1, k2);
+    }
+
+    // ---- Edge / numerical sanity -------------------------------------------
+
+    #[test]
+    fn store_handles_negative_zero_as_zero() {
+        let mut s = VertexStore::with_capacity_and_tolerance(2, 1e-9);
+        let a = s.add_or_find(0.0, 0.0, 0.0, 1e-9);
+        let b = s.add_or_find(-0.0, -0.0, -0.0, 1e-9);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn store_handles_very_large_coordinates() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let id = s.add(1e15, -1e15, 1e15);
+        assert_eq!(s.get_position(id), Some([1e15, -1e15, 1e15]));
+    }
+
+    #[test]
+    fn store_reserve_does_not_change_len() {
+        let mut s = VertexStore::with_capacity_no_dedup(0);
+        s.reserve(128);
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+    }
+}

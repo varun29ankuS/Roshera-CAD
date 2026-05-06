@@ -870,3 +870,603 @@ pub struct EdgeValidation {
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::{Arc, Line};
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    // ---- EdgeOrientation ----------------------------------------------------
+
+    #[test]
+    fn orientation_forward_is_forward_and_positive() {
+        assert!(EdgeOrientation::Forward.is_forward());
+        assert_eq!(EdgeOrientation::Forward.sign(), 1.0);
+    }
+
+    #[test]
+    fn orientation_backward_is_not_forward_and_negative() {
+        assert!(!EdgeOrientation::Backward.is_forward());
+        assert_eq!(EdgeOrientation::Backward.sign(), -1.0);
+    }
+
+    #[test]
+    fn orientation_flipped_swaps_direction() {
+        assert_eq!(EdgeOrientation::Forward.flipped(), EdgeOrientation::Backward);
+        assert_eq!(EdgeOrientation::Backward.flipped(), EdgeOrientation::Forward);
+    }
+
+    #[test]
+    fn orientation_double_flip_is_identity() {
+        assert_eq!(
+            EdgeOrientation::Forward.flipped().flipped(),
+            EdgeOrientation::Forward
+        );
+    }
+
+    // ---- EdgeAttributes -----------------------------------------------------
+
+    #[test]
+    fn edge_attributes_default_is_unknown_and_smooth() {
+        let attrs = EdgeAttributes::default();
+        assert!(matches!(attrs.start_continuity, Continuity::Unknown));
+        assert!(matches!(attrs.end_continuity, Continuity::Unknown));
+        assert_eq!(attrs.convexity, 0);
+        assert_eq!(attrs.sharpness, 0.0);
+        assert_eq!(attrs.weight, 1.0);
+        assert!(attrs.user_data.is_none());
+    }
+
+    // ---- Edge construction --------------------------------------------------
+
+    fn make_edge(orientation: EdgeOrientation, range: ParameterRange) -> Edge {
+        Edge::new(0, 1, 2, 0, orientation, range)
+    }
+
+    #[test]
+    fn edge_new_stores_all_supplied_fields() {
+        let e = Edge::new(
+            10,
+            5,
+            7,
+            3,
+            EdgeOrientation::Backward,
+            ParameterRange::new(0.25, 0.75),
+        );
+        assert_eq!(e.id, 10);
+        assert_eq!(e.start_vertex, 5);
+        assert_eq!(e.end_vertex, 7);
+        assert_eq!(e.curve_id, 3);
+        assert_eq!(e.orientation, EdgeOrientation::Backward);
+        assert_eq!(e.param_range.start, 0.25);
+        assert_eq!(e.param_range.end, 0.75);
+        assert!(e.cached_length.is_nan());
+        assert!((e.tolerance - 1e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn edge_new_auto_range_yields_unit_range() {
+        let e = Edge::new_auto_range(0, 1, 2, 0, EdgeOrientation::Forward);
+        assert_eq!(e.param_range.start, 0.0);
+        assert_eq!(e.param_range.end, 1.0);
+    }
+
+    // ---- Predicates ---------------------------------------------------------
+
+    #[test]
+    fn edge_is_loop_when_start_equals_end() {
+        let e = Edge::new(0, 4, 4, 0, EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(e.is_loop());
+    }
+
+    #[test]
+    fn edge_is_not_loop_when_distinct_vertices() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(!e.is_loop());
+    }
+
+    #[test]
+    fn edge_is_degenerate_when_param_span_below_tolerance() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::new(0.5, 0.5));
+        assert!(e.is_degenerate(1e-6));
+    }
+
+    #[test]
+    fn edge_is_not_degenerate_for_unit_range() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(!e.is_degenerate(1e-6));
+    }
+
+    #[test]
+    fn edge_other_vertex_at_start_returns_end() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::unit());
+        assert_eq!(e.other_vertex(1), Some(2));
+    }
+
+    #[test]
+    fn edge_other_vertex_at_end_returns_start() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::unit());
+        assert_eq!(e.other_vertex(2), Some(1));
+    }
+
+    #[test]
+    fn edge_other_vertex_unknown_returns_none() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(e.other_vertex(99).is_none());
+    }
+
+    // ---- Parameter mapping --------------------------------------------------
+
+    #[test]
+    fn edge_to_curve_parameter_forward_denormalizes() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::new(0.2, 0.8));
+        // t=0 → 0.2, t=1 → 0.8, t=0.5 → 0.5
+        assert!((e.edge_to_curve_parameter(0.0) - 0.2).abs() < 1e-15);
+        assert!((e.edge_to_curve_parameter(1.0) - 0.8).abs() < 1e-15);
+        assert!((e.edge_to_curve_parameter(0.5) - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn edge_to_curve_parameter_backward_reverses() {
+        let e = make_edge(EdgeOrientation::Backward, ParameterRange::new(0.2, 0.8));
+        assert!((e.edge_to_curve_parameter(0.0) - 0.8).abs() < 1e-15);
+        assert!((e.edge_to_curve_parameter(1.0) - 0.2).abs() < 1e-15);
+    }
+
+    #[test]
+    fn curve_to_edge_parameter_inverts_edge_to_curve_forward() {
+        let e = make_edge(EdgeOrientation::Forward, ParameterRange::new(0.2, 0.8));
+        for &t in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+            let u = e.edge_to_curve_parameter(t);
+            let round_trip = e.curve_to_edge_parameter(u);
+            assert!((round_trip - t).abs() < 1e-12, "t={} round trip={}", t, round_trip);
+        }
+    }
+
+    #[test]
+    fn curve_to_edge_parameter_inverts_edge_to_curve_backward() {
+        let e = make_edge(EdgeOrientation::Backward, ParameterRange::new(0.1, 0.9));
+        for &t in &[0.0, 0.3, 0.6, 1.0] {
+            let u = e.edge_to_curve_parameter(t);
+            let round_trip = e.curve_to_edge_parameter(u);
+            assert!((round_trip - t).abs() < 1e-12);
+        }
+    }
+
+    // ---- Evaluation against real curves ------------------------------------
+
+    fn line_store(start: Point3, end: Point3) -> (CurveStore, CurveId) {
+        let mut s = CurveStore::new();
+        let id = s.add(Box::new(Line::new(start, end)));
+        (s, id)
+    }
+
+    #[test]
+    fn edge_evaluate_forward_line_matches_lerp() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let p_start = e.evaluate(0.0, &cs).expect("eval");
+        let p_mid = e.evaluate(0.5, &cs).expect("eval");
+        let p_end = e.evaluate(1.0, &cs).expect("eval");
+        assert!((p_start.x - 0.0).abs() < 1e-12);
+        assert!((p_mid.x - 5.0).abs() < 1e-12);
+        assert!((p_end.x - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn edge_evaluate_backward_line_reverses_endpoints() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Backward, ParameterRange::unit());
+        let p0 = e.evaluate(0.0, &cs).expect("eval");
+        let p1 = e.evaluate(1.0, &cs).expect("eval");
+        assert!((p0.x - 10.0).abs() < 1e-12);
+        assert!((p1.x - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn edge_evaluate_returns_err_for_invalid_curve_id() {
+        let cs = CurveStore::new();
+        let e = Edge::new(0, 1, 2, 99, EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(e.evaluate(0.5, &cs).is_err());
+    }
+
+    #[test]
+    fn edge_tangent_at_forward_line_points_along_direction() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let tan = e.tangent_at(0.5, &cs).expect("tan");
+        // Curve::tangent_at returns the unit tangent of the underlying curve.
+        // Line is along +x, so unit tangent = (1, 0, 0).
+        assert!((tan.x - 1.0).abs() < 1e-12, "got {}", tan.x);
+        assert!(tan.y.abs() < 1e-12);
+        assert!(tan.z.abs() < 1e-12);
+    }
+
+    #[test]
+    fn edge_tangent_at_backward_line_reverses_sign() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Backward, ParameterRange::unit());
+        let tan = e.tangent_at(0.5, &cs).expect("tan");
+        assert!((tan.x + 1.0).abs() < 1e-12, "got {}", tan.x);
+    }
+
+    // ---- length / compute_arc_length ---------------------------------------
+
+    #[test]
+    fn edge_length_of_unit_line_segment_is_segment_length() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(3.0, 4.0, 0.0));
+        let mut e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let len = e.length(&cs, Tolerance::from_distance(1e-6)).expect("len");
+        assert!((len - 5.0).abs() < 1e-6, "got {}", len);
+    }
+
+    #[test]
+    fn edge_length_caches_result() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0));
+        let mut e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let _ = e.length(&cs, Tolerance::from_distance(1e-6)).expect("len");
+        // After first call, cached_length should be non-NaN.
+        assert!(!e.cached_length.is_nan());
+        // Second call returns cached value (mutating the store would not
+        // invalidate the cache — we don't; the cache is the contract).
+        let len2 = e.length(&cs, Tolerance::from_distance(1e-6)).expect("len");
+        assert!((len2 - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edge_compute_arc_length_quarter_circle_is_pi_over_two() {
+        let arc = Arc::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            FRAC_PI_2,
+        )
+        .expect("arc");
+        let mut cs = CurveStore::new();
+        let cid = cs.add(Box::new(arc));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let arc_len = e
+            .compute_arc_length(&cs, Tolerance::from_distance(1e-6))
+            .expect("arc len");
+        assert!((arc_len - FRAC_PI_2).abs() < 1e-3, "got {}", arc_len);
+    }
+
+    #[test]
+    fn edge_compute_arc_length_full_circle_is_two_pi() {
+        let circle = Arc::circle(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            1.0,
+        )
+        .expect("circle");
+        let mut cs = CurveStore::new();
+        let cid = cs.add(Box::new(circle));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let len = e
+            .compute_arc_length(&cs, Tolerance::from_distance(1e-6))
+            .expect("len");
+        assert!((len - 2.0 * PI).abs() < 1e-3, "got {}", len);
+    }
+
+    #[test]
+    fn edge_compute_arc_length_zero_for_collapsed_range() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.5, 0.5),
+        );
+        let len = e
+            .compute_arc_length(&cs, Tolerance::from_distance(1e-6))
+            .expect("len");
+        assert_eq!(len, 0.0);
+    }
+
+    // ---- split_at -----------------------------------------------------------
+
+    #[test]
+    fn edge_split_at_partitions_param_range() {
+        let e = Edge::new(
+            5,
+            1,
+            2,
+            7,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.2, 0.8),
+        );
+        let (left, right) = e.split_at(0.5);
+        // Left preserves id and start vertex; loses end vertex (callers fill in).
+        assert_eq!(left.id, 5);
+        assert_eq!(left.start_vertex, 1);
+        assert_eq!(left.end_vertex, INVALID_VERTEX_ID);
+        assert_eq!(left.curve_id, 7);
+        assert!((left.param_range.start - 0.2).abs() < 1e-15);
+        assert!((left.param_range.end - 0.5).abs() < 1e-15);
+        // Right gets fresh placeholder ids; preserves end vertex.
+        assert_eq!(right.id, INVALID_EDGE_ID);
+        assert_eq!(right.start_vertex, INVALID_VERTEX_ID);
+        assert_eq!(right.end_vertex, 2);
+        assert!((right.param_range.start - 0.5).abs() < 1e-15);
+        assert!((right.param_range.end - 0.8).abs() < 1e-15);
+    }
+
+    #[test]
+    fn edge_split_at_with_backward_orientation_partitions_in_curve_space() {
+        let e = Edge::new(
+            5,
+            1,
+            2,
+            7,
+            EdgeOrientation::Backward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        // edge_to_curve_parameter(0.5) for Backward range[0,1] = 1 - 0.5 = 0.5.
+        let (left, right) = e.split_at(0.5);
+        assert!((left.param_range.start - 0.0).abs() < 1e-15);
+        assert!((left.param_range.end - 0.5).abs() < 1e-15);
+        assert!((right.param_range.start - 0.5).abs() < 1e-15);
+        assert!((right.param_range.end - 1.0).abs() < 1e-15);
+    }
+
+    // ---- tessellation -------------------------------------------------------
+
+    #[test]
+    fn edge_tessellate_line_returns_two_endpoints() {
+        let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let pts = e
+            .tessellate(&cs, Tolerance::from_distance(1e-3), FRAC_PI_2)
+            .expect("tess");
+        assert!(pts.len() >= 2, "tessellation must produce at least the endpoints");
+        assert!((pts.first().expect("first").x - 0.0).abs() < 1e-6);
+        assert!((pts.last().expect("last").x - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edge_tessellate_arc_subdivides_for_curvature() {
+        let arc = Arc::circle(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            1.0,
+        )
+        .expect("circle");
+        let mut cs = CurveStore::new();
+        let cid = cs.add(Box::new(arc));
+        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let pts = e
+            .tessellate(&cs, Tolerance::from_distance(1e-2), 0.1)
+            .expect("tess");
+        // Tight angle tolerance forces many subdivisions.
+        assert!(pts.len() > 8, "expected multi-segment circle tessellation, got {}", pts.len());
+    }
+
+    // ---- compute_continuity ------------------------------------------------
+
+    #[test]
+    fn compute_continuity_returns_unknown_for_unknown_curve_ids() {
+        let cs = CurveStore::new();
+        let a = Edge::new(0, 1, 2, 99, EdgeOrientation::Forward, ParameterRange::unit());
+        let b = Edge::new(1, 2, 3, 99, EdgeOrientation::Forward, ParameterRange::unit());
+        let c = a.compute_continuity(&b, 2, &cs, Tolerance::from_distance(1e-6));
+        assert!(matches!(c, Continuity::Unknown));
+    }
+
+    #[test]
+    fn compute_continuity_g0_at_sharp_corner_between_two_lines() {
+        // Two line edges meeting at the origin at right angles.
+        let mut cs = CurveStore::new();
+        let cid_a = cs.add(Box::new(Line::new(
+            Point3::new(-1.0, 0.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        )));
+        let cid_b = cs.add(Box::new(Line::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        )));
+        let a = Edge::new(0, 1, 2, cid_a, EdgeOrientation::Forward, ParameterRange::unit());
+        let b = Edge::new(1, 2, 3, cid_b, EdgeOrientation::Forward, ParameterRange::unit());
+        // Shared vertex = vertex 2; edge a ends at it, edge b starts at it.
+        let c = a.compute_continuity(&b, 2, &cs, Tolerance::new(1e-6, 1e-3));
+        assert!(matches!(c, Continuity::G0), "got {:?}", c);
+    }
+
+    // ---- EdgeStore ---------------------------------------------------------
+
+    #[test]
+    fn edge_store_new_is_empty() {
+        let s = EdgeStore::new();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn edge_store_add_assigns_sequential_ids() {
+        let mut s = EdgeStore::new();
+        let a = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let b = s.add(Edge::new(0, 2, 3, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.stats.total_created, 2);
+    }
+
+    #[test]
+    fn edge_store_get_returns_added_edge() {
+        let mut s = EdgeStore::new();
+        let id = s.add(Edge::new(0, 5, 7, 11, EdgeOrientation::Backward, ParameterRange::unit()));
+        let e = s.get(id).expect("edge");
+        assert_eq!(e.start_vertex, 5);
+        assert_eq!(e.end_vertex, 7);
+        assert_eq!(e.curve_id, 11);
+        assert_eq!(e.orientation, EdgeOrientation::Backward);
+    }
+
+    #[test]
+    fn edge_store_get_returns_none_for_unknown_id() {
+        let s = EdgeStore::new();
+        assert!(s.get(0).is_none());
+    }
+
+    #[test]
+    fn edge_store_get_mut_allows_mutation() {
+        let mut s = EdgeStore::new();
+        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        if let Some(e) = s.get_mut(id) {
+            e.tolerance = 5e-9;
+        }
+        assert!((s.get(id).expect("edge").tolerance - 5e-9).abs() < 1e-20);
+    }
+
+    #[test]
+    fn edge_store_with_indexing_populates_vertex_to_edges() {
+        let mut s = EdgeStore::new();
+        let id = s.add_with_indexing(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let edges_at_5 = s.edges_at_vertex(5);
+        let edges_at_7 = s.edges_at_vertex(7);
+        assert!(edges_at_5.contains(&id));
+        assert!(edges_at_7.contains(&id));
+    }
+
+    #[test]
+    fn edge_store_find_edge_between_returns_id_when_indexed() {
+        let mut s = EdgeStore::new();
+        let id = s.add_with_indexing(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        assert_eq!(s.find_edge_between(5, 7), Some(id));
+        // Symmetric — order independent.
+        assert_eq!(s.find_edge_between(7, 5), Some(id));
+    }
+
+    #[test]
+    fn edge_store_find_edge_between_none_for_unindexed() {
+        let mut s = EdgeStore::new();
+        // add() bypasses indexing, so cache is empty.
+        s.add(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert_eq!(s.find_edge_between(5, 7), None);
+    }
+
+    #[test]
+    fn edge_store_add_or_find_dedups_on_same_vertex_pair() {
+        let mut s = EdgeStore::new();
+        let a = s.add_or_find(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        // Reverse vertex order also matches.
+        let b = s.add_or_find(Edge::new(0, 7, 5, 0, EdgeOrientation::Backward, ParameterRange::unit()));
+        assert_eq!(a, b);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn edge_store_add_or_find_creates_new_for_distinct_pair() {
+        let mut s = EdgeStore::new();
+        let a = s.add_or_find(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let b = s.add_or_find(Edge::new(0, 5, 9, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert_ne!(a, b);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn edge_store_remove_marks_invalid_and_returns_clone() {
+        let mut s = EdgeStore::new();
+        let id = s.add_with_indexing(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let removed = s.remove(id).expect("removed edge");
+        assert_eq!(removed.start_vertex, 5);
+        // After removal, get returns the marker placeholder (id == INVALID_EDGE_ID).
+        let stub = s.get(id).expect("placeholder still indexed");
+        assert_eq!(stub.id, INVALID_EDGE_ID);
+        // Vertex index is cleared.
+        assert!(!s.edges_at_vertex(5).contains(&id));
+        // find_edge_between cache cleared.
+        assert!(s.find_edge_between(5, 7).is_none());
+        assert_eq!(s.stats.total_deleted, 1);
+    }
+
+    #[test]
+    fn edge_store_remove_returns_none_for_unknown_id() {
+        let mut s = EdgeStore::new();
+        assert!(s.remove(99).is_none());
+    }
+
+    #[test]
+    fn edge_store_iter_skips_removed_edges() {
+        let mut s = EdgeStore::new();
+        let a = s.add_with_indexing(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let b = s.add_with_indexing(Edge::new(0, 2, 3, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let _c = s.add_with_indexing(Edge::new(0, 3, 4, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        s.remove(b);
+        let live: Vec<EdgeId> = s.iter().map(|(_, e)| e.id).collect();
+        assert!(live.contains(&a));
+        assert!(!live.contains(&b));
+        assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn edge_store_edges_on_curve_indexed() {
+        let mut s = EdgeStore::new();
+        let a = s.add_with_indexing(Edge::new(0, 1, 2, 7, EdgeOrientation::Forward, ParameterRange::unit()));
+        let b = s.add_with_indexing(Edge::new(0, 2, 3, 7, EdgeOrientation::Forward, ParameterRange::unit()));
+        let edges = s.edges_on_curve(7);
+        assert!(edges.contains(&a));
+        assert!(edges.contains(&b));
+    }
+
+    #[test]
+    fn edge_store_edges_on_curve_empty_for_unknown() {
+        let s = EdgeStore::new();
+        assert!(s.edges_on_curve(99).is_empty());
+    }
+
+    #[test]
+    fn edge_store_set_tolerance_persists() {
+        let mut s = EdgeStore::new();
+        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert!(s.set_tolerance(id, 1e-10));
+        assert!((s.get(id).expect("edge").tolerance - 1e-10).abs() < 1e-22);
+    }
+
+    #[test]
+    fn edge_store_set_tolerance_returns_false_for_unknown() {
+        let mut s = EdgeStore::new();
+        assert!(!s.set_tolerance(99, 1e-10));
+    }
+
+    #[test]
+    fn edge_store_default_constructs_empty_store() {
+        let s = EdgeStore::default();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn edge_store_edges_at_vertex_falls_back_to_linear_scan() {
+        let mut s = EdgeStore::new();
+        // Use add() which skips indexing.
+        let a = s.add(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let _b = s.add(Edge::new(0, 8, 9, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let hits = s.edges_at_vertex(5);
+        assert_eq!(hits, vec![a]);
+    }
+}
