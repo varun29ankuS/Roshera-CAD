@@ -6,8 +6,12 @@ import { useSceneStore } from '@/stores/scene-store'
  * user hovers an extruded body. Reads `analyticalGeometry.params`
  * (populated by `extrude_sketch` on the backend) and shows the
  * authoring intent — sketch plane, push distance, and the per-shape
- * role/tool roster — so the user can answer "what am I looking at?"
+ * tool roster — so the user can answer "what am I looking at?"
  * without opening the timeline or properties panel.
+ *
+ * Outer-vs-hole classification is decided geometrically at extrude
+ * time via point-in-polygon containment, not stored on shapes, so
+ * the tooltip simply lists the closed loops the user drew.
  *
  * Lives outside the R3F canvas: tracks raw window pointer position so
  * orbit / pan camera motion doesn't desync the panel from the cursor.
@@ -87,13 +91,6 @@ export function ExtrudeHoverTooltip() {
                 <span className="text-muted-foreground tabular-nums">
                   #{i + 1}
                 </span>
-                <span
-                  className={
-                    s.role === 'hole' ? 'text-rose-300' : 'text-emerald-300'
-                  }
-                >
-                  {s.role}
-                </span>
                 <span className="text-foreground/80">{s.tool}</span>
                 <span className="text-muted-foreground tabular-nums">
                   {s.pointCount} pt
@@ -120,14 +117,13 @@ function Row({ label, value }: { label: string; value: string }) {
 
 interface ShapeSummary {
   id: string
-  role: 'outer' | 'hole'
   tool: string
   pointCount: number
 }
 
 /**
  * Read the multi-shape descriptor produced by `extrude_sketch`. Each
- * entry on the wire is `{id, role, tool, polygon: [[x,y],…]}`.
+ * entry on the wire is `{id, tool, polygon: [[x,y],…]}`.
  *
  * Falls back to the legacy single-shape encoding (top-level `polygon`
  * + `tool`) for bodies extruded before Slice 1, so older sessions
@@ -147,7 +143,6 @@ function readShapes(params: Record<string, unknown>): ShapeSummary[] {
     return [
       {
         id: 'legacy',
-        role: 'outer',
         tool,
         pointCount: polygon.length,
       },
@@ -160,11 +155,10 @@ function parseShapeEntry(entry: unknown): ShapeSummary | null {
   if (!entry || typeof entry !== 'object') return null
   const o = entry as Record<string, unknown>
   const id = typeof o.id === 'string' ? o.id : ''
-  const role = o.role === 'hole' ? 'hole' : 'outer'
   const tool = typeof o.tool === 'string' ? o.tool : 'unknown'
   const polygon = o.polygon
   const pointCount = Array.isArray(polygon) ? polygon.length : 0
-  return { id, role, tool, pointCount }
+  return { id, tool, pointCount }
 }
 
 /**

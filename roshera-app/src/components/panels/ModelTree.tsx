@@ -390,13 +390,21 @@ function sketchesToNodes(sketches: Map<string, ServerSketchSession>): TreeNode[]
     .sort((a, b) => a.created_at - b.created_at)
     .map((s, idx) => {
       const planeLabel = sketchPlaneLabel(s.plane)
-      const totalPoints = s.shapes.reduce(
-        (sum, shape) => sum + shape.points.length,
+      // Defensive: a session deserialised from an older format (or a
+      // partial WS frame the bridge let through) may be missing
+      // `shapes` entirely. Reading `.reduce` on `undefined` here used
+      // to throw and tear down the entire ModelTree render — same
+      // failure mode the `sketchPlaneLabel` defense above guards
+      // against. Treat a missing/invalid shapes array as zero shapes.
+      const shapes = Array.isArray(s.shapes) ? s.shapes : []
+      const totalPoints = shapes.reduce(
+        (sum, shape) =>
+          sum + (Array.isArray(shape?.points) ? shape.points.length : 0),
         0,
       )
       const ptSuffix = totalPoints === 1 ? 'pt' : 'pts'
       const shapeSuffix =
-        s.shapes.length > 1 ? ` · ${s.shapes.length} shapes` : ''
+        shapes.length > 1 ? ` · ${shapes.length} shapes` : ''
       return {
         id: s.id,
         name: `Sketch ${idx + 1} (${planeLabel} · ${totalPoints} ${ptSuffix}${shapeSuffix})`,

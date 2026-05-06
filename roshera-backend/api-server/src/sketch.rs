@@ -202,42 +202,26 @@ pub enum SketchTool {
     Circle,
 }
 
-/// Role a shape plays in the sketch's final extrusion. `Outer` is
-/// solid material; `Hole` is a void carved out of an outer shape that
-/// contains it. The kernel's topology analyser is what actually
-/// resolves nesting at extrude time (see Slice 2 of the multi-shape
-/// plan); the role tag is the user's stated intent and is what the
-/// analyser uses to pick orientation when the geometric containment
-/// alone is ambiguous (e.g., concentric shapes both drawn CCW).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ShapeRole {
-    #[default]
-    Outer,
-    Hole,
-}
-
-/// A single drawn shape inside a sketch session. The session may carry
-/// many of these — e.g., one `Outer` rectangle plus several `Hole`
-/// circles for a bracket with mounting holes — and the multi-loop
-/// extrude pipeline lifts every shape onto the same plane to build a
-/// face with `outer_loop + inner_loops`.
+/// A single drawn shape inside a sketch session. The session may
+/// carry many of these — e.g., one rectangle plus several circles
+/// inside it. Roles (which loop is an outer boundary, which is a
+/// hole) are *not* tagged at draw time: they are derived geometrically
+/// at extrude time by `detect_regions`, mirroring the SolidWorks /
+/// Fusion convention. A shape is just curves on the plane; the
+/// extrude step decides what they mean.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchShape {
     pub id: Uuid,
     pub tool: SketchTool,
-    #[serde(default)]
-    pub role: ShapeRole,
     /// Confirmed in-plane (u, v) points in click order.
     pub points: Vec<[f64; 2]>,
 }
 
 impl SketchShape {
-    fn new(tool: SketchTool, role: ShapeRole) -> Self {
+    fn new(tool: SketchTool) -> Self {
         Self {
             id: Uuid::new_v4(),
             tool,
-            role,
             points: Vec::new(),
         }
     }
@@ -276,7 +260,7 @@ impl SketchSession {
         Self {
             id: Uuid::new_v4(),
             plane,
-            shapes: vec![SketchShape::new(tool, ShapeRole::Outer)],
+            shapes: vec![SketchShape::new(tool)],
             circle_segments: 64,
             created_at: now,
             updated_at: now,
@@ -479,10 +463,9 @@ impl SketchManager {
         &self,
         id: &Uuid,
         tool: SketchTool,
-        role: ShapeRole,
     ) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
-            s.shapes.push(SketchShape::new(tool, role));
+            s.shapes.push(SketchShape::new(tool));
             Ok(())
         })
     }
@@ -503,29 +486,6 @@ impl SketchManager {
                 return Err(SketchError::CannotDeleteLastShape(session_id));
             }
             s.shapes.remove(index);
-            Ok(())
-        })
-    }
-
-    /// Re-tag a shape's role (Outer ↔ Hole). Points are preserved.
-    pub fn set_shape_role(
-        &self,
-        id: &Uuid,
-        index: usize,
-        role: ShapeRole,
-    ) -> Result<SketchSession, SketchError> {
-        let session_id = *id;
-        self.mutate(id, |s| {
-            let len = s.shapes.len();
-            let shape =
-                s.shapes
-                    .get_mut(index)
-                    .ok_or(SketchError::ShapeIndexOutOfRange {
-                        id: session_id,
-                        index,
-                        len,
-                    })?;
-            shape.role = role;
             Ok(())
         })
     }
@@ -734,6 +694,187 @@ fn materialise_circle(points: &[[f64; 2]], segments: u32) -> Result<Vec<[f64; 2]
     Ok(polygon)
 }
 
+// ─── Region detection ───────────────────────────────────────────────
+//
+// Geometric outer/hole classification, SolidWorks-style: the user
+// draws closed loops on the plane, and the system decides which is a
+// boundary and which is a hole based on point-in-polygon containment.
+//
+// Algorithm (Even–odd / Jordan–curve depth):
+//   1. Compute |signed area| for each polygon (for ordering by size
+//      and reporting).
+//   2. For each polygon i, find its smallest containing parent j —
+//      the polygon with the smallest area among those that contain
+//      polygon i (any single representative vertex suffices because
+//      simple closed polygons in the same plane either fully contain
+//      or fully exclude another simple polygon).
+//   3. Depth = length of the parent chain to the root. Even depth →
+//      outer (Region.outer_shape_idx); odd depth → hole, attached to
+//      the immediately containing even-depth ancestor (always its
+//      direct parent).
+//   4. Polygons strictly nested deeper than 1 (an island inside a
+//      hole inside an outer) are rejected as a usability error: the
+//      single extrude pipeline can't represent re-entrant nesting in
+//      one pass and the user is much better served by extruding the
+//      outer body, then drawing a second sketch on its top face.
+
+#[derive(Debug, Clone)]
+pub struct Region {
+    pub outer_shape_idx: usize,
+    pub hole_shape_idxs: Vec<usize>,
+    pub area: f64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegionError {
+    #[error("shape {0} polygon has fewer than 3 vertices")]
+    PolygonTooShort(usize),
+    #[error(
+        "shape {hole} is nested {depth} levels deep — extrude pipeline \
+         supports only outer→hole (depth 1); draw the inner body on a \
+         second sketch on the parent's top face"
+    )]
+    NestingTooDeep { hole: usize, depth: usize },
+}
+
+/// Detect outer regions and their direct holes from a set of closed
+/// 2D polygons, one per sketch shape (input order is preserved as the
+/// shape index).
+pub fn detect_regions(polygons: &[&Vec<[f64; 2]>]) -> Result<Vec<Region>, RegionError> {
+    let n = polygons.len();
+    for (i, p) in polygons.iter().enumerate() {
+        if p.len() < 3 {
+            return Err(RegionError::PolygonTooShort(i));
+        }
+    }
+    let areas: Vec<f64> = polygons.iter().map(|p| polygon_signed_area(p).abs()).collect();
+
+    // Smallest-containing-parent: for each i, j such that polygon j
+    // contains polygon i and has the smallest area among such j.
+    // Containment test uses a single representative vertex of i —
+    // valid because the polygons are simple and non-overlapping in
+    // typical sketch input. Same-area ties (two polygons claiming
+    // mutual containment under the rep-vertex test) are broken by
+    // demanding strict size separation: a polygon is its own parent
+    // only if it is strictly smaller than the candidate.
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let rep = polygons[i][0];
+        let mut best: Option<(usize, f64)> = None;
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            if areas[j] <= areas[i] {
+                continue;
+            }
+            if !point_in_polygon(rep, polygons[j]) {
+                continue;
+            }
+            match best {
+                None => best = Some((j, areas[j])),
+                Some((_, a)) if areas[j] < a => best = Some((j, areas[j])),
+                _ => {}
+            }
+        }
+        parent[i] = best.map(|(j, _)| j);
+    }
+
+    // Depth-of-nesting via parent chain.
+    let mut depth = vec![0usize; n];
+    for i in 0..n {
+        let mut d = 0usize;
+        let mut cur = parent[i];
+        while let Some(p) = cur {
+            d += 1;
+            cur = parent[p];
+            if d > n {
+                // Cycle defence: parent chain longer than n means a
+                // cycle in `parent`, which can't happen with strict
+                // area decrease, but treat as too-deep rather than
+                // looping forever.
+                return Err(RegionError::NestingTooDeep { hole: i, depth: d });
+            }
+        }
+        depth[i] = d;
+        if d > 1 {
+            return Err(RegionError::NestingTooDeep { hole: i, depth: d });
+        }
+    }
+
+    // Outer = depth 0; hole = depth 1, attached to its direct parent.
+    let mut regions: Vec<Region> = (0..n)
+        .filter(|&i| depth[i] == 0)
+        .map(|i| Region {
+            outer_shape_idx: i,
+            hole_shape_idxs: Vec::new(),
+            area: areas[i],
+        })
+        .collect();
+    for i in 0..n {
+        if depth[i] == 1 {
+            let p = parent[i].expect("depth-1 polygon must have a parent by construction");
+            if let Some(r) = regions.iter_mut().find(|r| r.outer_shape_idx == p) {
+                r.hole_shape_idxs.push(i);
+            }
+        }
+    }
+    Ok(regions)
+}
+
+/// Signed area of a closed polygon (CCW positive). Used both for
+/// region size ordering and for containment-tie-breaking.
+fn polygon_signed_area(polygon: &[[f64; 2]]) -> f64 {
+    let n = polygon.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0_f64;
+    for i in 0..n {
+        let p = polygon[i];
+        let q = polygon[(i + 1) % n];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    a * 0.5
+}
+
+/// Ray-casting point-in-polygon (Sunday's algorithm). Returns true
+/// when `point` is strictly inside `polygon`. Boundary points are
+/// undefined-but-stable: in practice the shapes are non-overlapping
+/// in the user's drawing and the representative vertex is never
+/// on another polygon's edge.
+fn point_in_polygon(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let (px, py) = (point[0], point[1]);
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (polygon[i][0], polygon[i][1]);
+        let (xj, yj) = (polygon[j][0], polygon[j][1]);
+        let crosses = (yi > py) != (yj > py)
+            && {
+                // Avoid divide-by-zero when yi == yj — that case is
+                // already excluded by the != predicate above, but be
+                // defensive against degenerate input.
+                let denom = yj - yi;
+                if denom.abs() < f64::EPSILON {
+                    false
+                } else {
+                    let x_intersect = (xj - xi) * (py - yi) / denom + xi;
+                    px < x_intersect
+                }
+            };
+        if crosses {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Reverse the polygon in-place if the signed area is negative, so the
 /// caller can rely on CCW orientation.
 fn ensure_ccw(polygon: &mut [[f64; 2]]) {
@@ -865,20 +1006,12 @@ fn default_consume() -> bool {
 
 /// `POST /api/sketch/{id}/shape` body. Adds a fresh shape to the
 /// session. The new shape becomes the active one (last in the vec)
-/// and starts with no points; `role` defaults to `Outer` when the
-/// client doesn't specify it (the most common case — the user only
-/// flips a shape to `Hole` after they've drawn it inside an outer).
+/// and starts with no points. There is no role field — outer/hole
+/// classification is done geometrically at extrude time, not by
+/// per-shape tagging.
 #[derive(Debug, Deserialize)]
 pub struct AddShapeBody {
     pub tool: SketchTool,
-    #[serde(default)]
-    pub role: ShapeRole,
-}
-
-/// `PUT /api/sketch/{id}/shape/{idx}/role` body.
-#[derive(Debug, Deserialize)]
-pub struct SetShapeRoleBody {
-    pub role: ShapeRole,
 }
 
 /// `PUT /api/sketch/{id}/shape/{idx}/tool` body.
@@ -1071,24 +1204,10 @@ pub async fn extrude_sketch(
 
     if session.shapes.is_empty() {
         // Defensive: SketchSession invariantly carries ≥1 shape (the
-        // constructor seeds one Outer; delete_shape refuses to remove
-        // the last). If we ever observe an empty `shapes`, that's an
+        // constructor seeds one; delete_shape refuses to remove the
+        // last). If we ever observe an empty `shapes`, that's an
         // internal invariant violation, not user input.
         return Err(ApiError::from(SketchError::NoShapes(session.id)));
-    }
-
-    // The session must contain at least one Outer shape: it's what we
-    // start the boolean fold from. A session of pure Holes would have
-    // no body to subtract from and is meaningless to extrude.
-    if !session
-        .shapes
-        .iter()
-        .any(|s| s.role == ShapeRole::Outer)
-    {
-        return Err(ApiError::new(
-            ErrorCode::InvalidParameter,
-            "sketch must contain at least one Outer shape to extrude".to_string(),
-        ));
     }
 
     // Direction defaults to the plane normal so a user drawing on XY
@@ -1114,12 +1233,30 @@ pub async fn extrude_sketch(
     // collinear circle, …) fails the request before we touch the
     // BRepModel — keeping the kernel free of orphan vertices/edges
     // from a partial pipeline.
-    let mut shape_polygons: Vec<(ShapeRole, Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
+    let mut shape_polygons: Vec<(Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
         Vec::with_capacity(session.shapes.len());
     for shape in &session.shapes {
         let polygon_2d = materialise_shape(shape, session.circle_segments)?;
         let lifted = lift_polygon(&session, &polygon_2d);
-        shape_polygons.push((shape.role, shape.id, shape.tool, polygon_2d, lifted));
+        shape_polygons.push((shape.id, shape.tool, polygon_2d, lifted));
+    }
+
+    // Geometric region detection (SolidWorks/Fusion model): the user
+    // draws closed loops and the system decides which is an outer
+    // boundary and which is a hole based on point-in-polygon
+    // containment. Even-depth polygons are outer; the odd-depth
+    // polygons directly inside them are their holes. Disjoint outers
+    // produce independent regions that are unioned at the end.
+    let polygons_2d: Vec<&Vec<[f64; 2]>> =
+        shape_polygons.iter().map(|(_, _, p, _)| p).collect();
+    let regions = detect_regions(&polygons_2d).map_err(|e| {
+        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+    })?;
+    if regions.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch must contain at least one closed outer region to extrude".to_string(),
+        ));
     }
 
     let result_solid_id = {
@@ -1130,11 +1267,12 @@ pub async fn extrude_sketch(
         // inner_loops on the side-face / top-cap walks, so we don't
         // try to build a multi-loop profile here. Instead we fold
         // separately-extruded solids via `boolean_operation`:
-        // Outer-after-base → Union, Hole → Difference. This produces
-        // the correct trimmed body (e.g. bracket-with-holes) using
-        // the well-tested boolean pipeline.
-        let mut shape_solids: Vec<(ShapeRole, u32)> = Vec::with_capacity(shape_polygons.len());
-        for (shape_idx, (role, _shape_id, _tool, _polygon_2d, lifted)) in
+        // per-region the outer is unioned into the accumulator, then
+        // each of its holes is subtracted; finally regions are
+        // unioned. This produces the correct trimmed body (e.g.
+        // bracket-with-holes) using the well-tested boolean pipeline.
+        let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
+        for (shape_idx, (_shape_id, _tool, _polygon_2d, lifted)) in
             shape_polygons.iter().enumerate()
         {
             let mut profile_edges = Vec::with_capacity(lifted.len());
@@ -1181,33 +1319,36 @@ pub async fn extrude_sketch(
             };
             let solid_id = extrude_profile(&mut model, profile_edges, options)
                 .map_err(ApiError::kernel_error)?;
-            shape_solids.push((*role, solid_id));
+            shape_solids.push(solid_id);
         }
 
-        // Pick the first Outer solid as the fold base; merge every
-        // subsequent shape into it. The single-Outer-no-Holes case
-        // naturally skips the loop and returns the lone solid.
-        let base_idx = shape_solids
-            .iter()
-            .position(|(role, _)| *role == ShapeRole::Outer)
-            .ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    "sketch must contain at least one Outer shape to extrude".to_string(),
+        // Build per-region trimmed solids: outer minus its holes.
+        // Then union all regions to form the final body.
+        let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
+        for region in &regions {
+            let mut acc = shape_solids[region.outer_shape_idx];
+            for &hole_idx in &region.hole_shape_idxs {
+                acc = boolean_operation(
+                    &mut model,
+                    acc,
+                    shape_solids[hole_idx],
+                    BooleanOp::Difference,
+                    BooleanOptions::default(),
                 )
-            })?;
-        let mut accumulator = shape_solids[base_idx].1;
-        for (i, (role, sid)) in shape_solids.iter().enumerate() {
-            if i == base_idx {
-                continue;
+                .map_err(ApiError::kernel_error)?;
             }
-            let op = match role {
-                ShapeRole::Outer => BooleanOp::Union,
-                ShapeRole::Hole => BooleanOp::Difference,
-            };
-            accumulator =
-                boolean_operation(&mut model, accumulator, *sid, op, BooleanOptions::default())
-                    .map_err(ApiError::kernel_error)?;
+            region_solids.push(acc);
+        }
+        let mut accumulator = region_solids[0];
+        for &sid in &region_solids[1..] {
+            accumulator = boolean_operation(
+                &mut model,
+                accumulator,
+                sid,
+                BooleanOp::Union,
+                BooleanOptions::default(),
+            )
+            .map_err(ApiError::kernel_error)?;
         }
         accumulator
     };
@@ -1243,17 +1384,41 @@ pub async fn extrude_sketch(
 
     // Build the multi-shape descriptor that powers the frontend's
     // "what is being extruded" hover tooltip. Each entry carries the
-    // shape id, role (outer/hole), tool, and the materialised plane-
-    // local polygon — enough for the UI to label the body and render
-    // a thumbnail without re-querying the backend.
+    // shape id, tool, and the materialised plane-local polygon —
+    // enough for the UI to label the body and render a thumbnail
+    // without re-querying the backend. Roles are no longer carried:
+    // outer-vs-hole is decided geometrically at extrude time, so
+    // shape ordering / role mapping is not stable across edits.
     let shapes_descriptor: Vec<serde_json::Value> = shape_polygons
         .iter()
-        .map(|(role, shape_id, tool, polygon_2d, _lifted)| {
+        .map(|(shape_id, tool, polygon_2d, _lifted)| {
             serde_json::json!({
                 "id":      shape_id.to_string(),
-                "role":    role,
                 "tool":    tool,
                 "polygon": polygon_2d,
+            })
+        })
+        .collect();
+
+    // Region descriptor: one entry per detected outer region, with the
+    // shape ids of the outer loop and any holes nested inside it. The
+    // frontend uses this for the "what is being extruded" tooltip and
+    // the timeline summary; downstream agents can reconstruct the
+    // per-region (outer minus holes) topology without touching the
+    // kernel.
+    let regions_descriptor: Vec<serde_json::Value> = regions
+        .iter()
+        .map(|r| {
+            let outer_id = shape_polygons[r.outer_shape_idx].0.to_string();
+            let hole_ids: Vec<String> = r
+                .hole_shape_idxs
+                .iter()
+                .map(|&i| shape_polygons[i].0.to_string())
+                .collect();
+            serde_json::json!({
+                "outer":  outer_id,
+                "holes":  hole_ids,
+                "area":   r.area,
             })
         })
         .collect();
@@ -1265,13 +1430,7 @@ pub async fn extrude_sketch(
     // Reason: invariant — we already returned NoShapes above if
     // `session.shapes` was empty, and `shape_polygons` is built
     // 1:1 from `session.shapes`. `last()` therefore cannot be None.
-    let (
-        _active_role,
-        active_shape_id,
-        active_tool,
-        active_polygon,
-        _active_lifted,
-    ) = shape_polygons
+    let (active_shape_id, active_tool, active_polygon, _active_lifted) = shape_polygons
         .last()
         .expect("shape_polygons non-empty by SketchSession invariant");
 
@@ -1282,6 +1441,7 @@ pub async fn extrude_sketch(
         "shape_id":       active_shape_id.to_string(),
         "polygon":        active_polygon,
         "shapes":         shapes_descriptor,
+        "regions":        regions_descriptor,
         "direction":      [direction.x, direction.y, direction.z],
         "distance":       body.distance,
     });
@@ -1347,7 +1507,7 @@ pub async fn add_sketch_shape(
     Json(body): Json<AddShapeBody>,
 ) -> Result<Json<SketchSession>, ApiError> {
     let id = parse_uuid(&id)?;
-    let session = state.sketches.add_shape(&id, body.tool, body.role)?;
+    let session = state.sketches.add_shape(&id, body.tool)?;
     broadcast_sketch_updated(&session);
     Ok(Json(session))
 }
@@ -1361,19 +1521,6 @@ pub async fn delete_sketch_shape(
 ) -> Result<Json<SketchSession>, ApiError> {
     let id = parse_uuid(&id)?;
     let session = state.sketches.delete_shape(&id, idx)?;
-    broadcast_sketch_updated(&session);
-    Ok(Json(session))
-}
-
-/// `PUT /api/sketch/{id}/shape/{idx}/role` — flip a shape between
-/// `Outer` and `Hole` without redrawing it.
-pub async fn set_sketch_shape_role(
-    State(state): State<AppState>,
-    Path((id, idx)): Path<(String, usize)>,
-    Json(body): Json<SetShapeRoleBody>,
-) -> Result<Json<SketchSession>, ApiError> {
-    let id = parse_uuid(&id)?;
-    let session = state.sketches.set_shape_role(&id, idx, body.role)?;
     broadcast_sketch_updated(&session);
     Ok(Json(session))
 }
@@ -1481,10 +1628,10 @@ fn broadcast_sketch_deleted(id: Uuid) {
 /// sketch in the timeline panel.
 ///
 /// The frame carries the full `shapes` descriptor (one entry per
-/// SketchShape: id, role, tool, point count) so the timeline /
-/// inspector UI can render a multi-shape summary without needing a
-/// second round-trip to fetch the (now-deleted, if `consume=true`)
-/// sketch session.
+/// SketchShape: id, tool, point count) so the timeline / inspector UI
+/// can render a multi-shape summary without needing a second
+/// round-trip to fetch the (now-deleted, if `consume=true`) sketch
+/// session.
 fn broadcast_sketch_extruded(session: &SketchSession, object_id: &str, solid_id: u32) {
     let active_tool = session.active_shape().map(|s| s.tool);
     let shapes: Vec<serde_json::Value> = session
@@ -1493,7 +1640,6 @@ fn broadcast_sketch_extruded(session: &SketchSession, object_id: &str, solid_id:
         .map(|s| {
             serde_json::json!({
                 "id":          s.id.to_string(),
-                "role":        s.role,
                 "tool":        s.tool,
                 "point_count": s.points.len(),
             })
@@ -1543,7 +1689,6 @@ mod tests {
             shapes: vec![SketchShape {
                 id: Uuid::new_v4(),
                 tool,
-                role: ShapeRole::Outer,
                 points,
             }],
             circle_segments: 64,
@@ -1624,12 +1769,11 @@ mod tests {
     }
 
     #[test]
-    fn create_seeds_one_outer_shape() {
+    fn create_seeds_one_shape() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         assert_eq!(s.shapes.len(), 1);
         assert_eq!(s.shapes[0].tool, SketchTool::Polyline);
-        assert_eq!(s.shapes[0].role, ShapeRole::Outer);
         assert!(s.shapes[0].points.is_empty());
     }
 
@@ -1664,7 +1808,7 @@ mod tests {
         mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
         // Add a second shape with its own points so we can prove the
         // plane swap clears all of them, not just the active one.
-        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+        mgr.add_shape(&s.id, SketchTool::Circle)
             .expect("add shape");
         mgr.add_point(&s.id, [0.0, 0.0]).expect("centre");
         mgr.add_point(&s.id, [1.0, 0.0]).expect("edge");
@@ -1704,11 +1848,10 @@ mod tests {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         let after = mgr
-            .add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+            .add_shape(&s.id, SketchTool::Circle)
             .expect("add shape");
         assert_eq!(after.shapes.len(), 2);
         assert_eq!(after.shapes[1].tool, SketchTool::Circle);
-        assert_eq!(after.shapes[1].role, ShapeRole::Hole);
         // Active = last; legacy /point now flows to the new circle.
         let with_centre = mgr.add_point(&s.id, [0.0, 0.0]).expect("centre");
         assert_eq!(with_centre.shapes[0].points.len(), 0);
@@ -1727,10 +1870,8 @@ mod tests {
     fn delete_shape_removes_at_index_when_multiple_remain() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
-        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
-            .expect("hole");
-        mgr.add_shape(&s.id, SketchTool::Rectangle, ShapeRole::Hole)
-            .expect("rect");
+        mgr.add_shape(&s.id, SketchTool::Circle).expect("hole");
+        mgr.add_shape(&s.id, SketchTool::Rectangle).expect("rect");
         let after = mgr.delete_shape(&s.id, 1).expect("delete middle");
         assert_eq!(after.shapes.len(), 2);
         assert_eq!(after.shapes[0].tool, SketchTool::Polyline);
@@ -1741,25 +1882,9 @@ mod tests {
     fn delete_shape_rejects_out_of_range() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
-        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
-            .expect("hole");
+        mgr.add_shape(&s.id, SketchTool::Circle).expect("hole");
         let err = mgr.delete_shape(&s.id, 7).expect_err("oob");
         assert!(matches!(err, SketchError::ShapeIndexOutOfRange { .. }));
-    }
-
-    #[test]
-    fn set_shape_role_flips_outer_to_hole_without_clearing() {
-        let mgr = SketchManager::new();
-        let s = mgr.create(SketchPlane::XY, SketchTool::Rectangle);
-        mgr.add_point(&s.id, [0.0, 0.0]).expect("a");
-        mgr.add_point(&s.id, [1.0, 1.0]).expect("b");
-        let after = mgr
-            .set_shape_role(&s.id, 0, ShapeRole::Hole)
-            .expect("flip");
-        assert_eq!(after.shapes[0].role, ShapeRole::Hole);
-        // Points must be preserved across a role flip — only tool
-        // changes invalidate them.
-        assert_eq!(after.shapes[0].points.len(), 2);
     }
 
     #[test]
@@ -1767,8 +1892,7 @@ mod tests {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Rectangle);
         mgr.add_point(&s.id, [0.0, 0.0]).expect("a");
-        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
-            .expect("hole");
+        mgr.add_shape(&s.id, SketchTool::Circle).expect("hole");
         mgr.add_point(&s.id, [3.0, 3.0]).expect("centre");
         // Swap shape 0's tool — only its points should clear.
         let after = mgr
@@ -1782,8 +1906,7 @@ mod tests {
     fn add_point_to_shape_targets_specific_index() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
-        mgr.add_shape(&s.id, SketchTool::Polyline, ShapeRole::Hole)
-            .expect("hole");
+        mgr.add_shape(&s.id, SketchTool::Polyline).expect("hole");
         // Append into shape 0 explicitly even though shape 1 is active.
         let after = mgr
             .add_point_to_shape(&s.id, 0, [9.0, 9.0])
@@ -1802,32 +1925,97 @@ mod tests {
         assert!(matches!(err, SketchError::ShapeIndexOutOfRange { .. }));
     }
 
-    #[test]
-    fn shape_role_round_trips_through_serde() {
-        for role in [ShapeRole::Outer, ShapeRole::Hole] {
-            let s = serde_json::to_string(&role).expect("ser");
-            let back: ShapeRole = serde_json::from_str(&s).expect("de");
-            assert_eq!(role, back);
-        }
-        // Wire format is the lowercase variant name.
-        assert_eq!(
-            serde_json::to_value(ShapeRole::Outer).expect("v"),
-            serde_json::json!("outer")
-        );
-        assert_eq!(
-            serde_json::to_value(ShapeRole::Hole).expect("v"),
-            serde_json::json!("hole")
-        );
+    // ─── Region detection ──────────────────────────────────────────
+
+    fn square(cx: f64, cy: f64, half: f64) -> Vec<[f64; 2]> {
+        vec![
+            [cx - half, cy - half],
+            [cx + half, cy - half],
+            [cx + half, cy + half],
+            [cx - half, cy + half],
+        ]
     }
 
     #[test]
-    fn shape_role_defaults_to_outer_when_missing_in_payload() {
-        // The `role` field has #[serde(default)] so older clients
-        // (and the AddShapeBody when role is omitted) get Outer.
-        let raw = r#"{"id":"00000000-0000-0000-0000-000000000000",
-                       "tool":"polyline","points":[]}"#;
-        let shape: SketchShape = serde_json::from_str(raw).expect("de");
-        assert_eq!(shape.role, ShapeRole::Outer);
+    fn detect_regions_single_outer_no_holes() {
+        let p = square(0.0, 0.0, 5.0);
+        let polys = vec![&p];
+        let r = detect_regions(&polys).expect("ok");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].outer_shape_idx, 0);
+        assert!(r[0].hole_shape_idxs.is_empty());
+    }
+
+    #[test]
+    fn detect_regions_outer_with_one_hole() {
+        let outer = square(0.0, 0.0, 10.0);
+        let hole = square(0.0, 0.0, 2.0);
+        let polys = vec![&outer, &hole];
+        let r = detect_regions(&polys).expect("ok");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].outer_shape_idx, 0);
+        assert_eq!(r[0].hole_shape_idxs, vec![1]);
+    }
+
+    #[test]
+    fn detect_regions_disjoint_outers_each_independent() {
+        let a = square(-20.0, 0.0, 3.0);
+        let b = square(20.0, 0.0, 3.0);
+        let polys = vec![&a, &b];
+        let r = detect_regions(&polys).expect("ok");
+        assert_eq!(r.len(), 2);
+        for region in &r {
+            assert!(region.hole_shape_idxs.is_empty());
+        }
+    }
+
+    #[test]
+    fn detect_regions_hole_attaches_to_smallest_containing_outer() {
+        // Two concentric outers (large, medium) and a hole inside the
+        // medium one. The hole must attach to the medium outer, not
+        // the large one — but two nested outers is itself depth > 1
+        // so we expect rejection. Use disjoint outers instead.
+        let big = square(-10.0, 0.0, 5.0);
+        let small = square(10.0, 0.0, 5.0);
+        let hole = square(10.0, 0.0, 1.0);
+        let polys = vec![&big, &small, &hole];
+        let r = detect_regions(&polys).expect("ok");
+        assert_eq!(r.len(), 2);
+        let with_hole = r
+            .iter()
+            .find(|r| r.outer_shape_idx == 1)
+            .expect("small outer present");
+        assert_eq!(with_hole.hole_shape_idxs, vec![2]);
+        let no_hole = r
+            .iter()
+            .find(|r| r.outer_shape_idx == 0)
+            .expect("big outer present");
+        assert!(no_hole.hole_shape_idxs.is_empty());
+    }
+
+    #[test]
+    fn detect_regions_rejects_island_in_hole() {
+        let outer = square(0.0, 0.0, 10.0);
+        let hole = square(0.0, 0.0, 5.0);
+        let island = square(0.0, 0.0, 1.0);
+        let polys = vec![&outer, &hole, &island];
+        let err = detect_regions(&polys).expect_err("must reject");
+        assert!(matches!(err, RegionError::NestingTooDeep { .. }));
+    }
+
+    #[test]
+    fn detect_regions_rejects_too_short_polygon() {
+        let p = vec![[0.0, 0.0], [1.0, 0.0]];
+        let polys = vec![&p];
+        let err = detect_regions(&polys).expect_err("must reject");
+        assert!(matches!(err, RegionError::PolygonTooShort(0)));
+    }
+
+    #[test]
+    fn point_in_polygon_basics() {
+        let sq = square(0.0, 0.0, 1.0);
+        assert!(point_in_polygon([0.0, 0.0], &sq));
+        assert!(!point_in_polygon([5.0, 5.0], &sq));
     }
 
     #[test]

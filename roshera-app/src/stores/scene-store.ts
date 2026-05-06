@@ -5,13 +5,12 @@ import {
   sketchApi,
   type ServerSketchSession,
   type ServerSketchShape,
-  type ShapeRole,
 } from '@/lib/sketch-api'
 
-// Re-exported so consumers (panels, overlays) can import the role
-// enum from the same module they import the rest of the sketch
-// types from.
-export type { ShapeRole, ServerSketchShape } from '@/lib/sketch-api'
+// Re-exported so consumers (panels, overlays) can import the
+// SketchShape wire type from the same module they import the rest
+// of the sketch types from.
+export type { ServerSketchShape } from '@/lib/sketch-api'
 
 // ─── Selection granularity ───────────────────────────────────────────
 export type SelectionMode = 'object' | 'face' | 'edge' | 'vertex'
@@ -233,23 +232,18 @@ export interface SketchState {
   plane: SketchPlane
   /**
    * Mirror of the backend `SketchSession.shapes` (list of
-   * `{id, tool, role, points}`). Invariantly non-empty: the *last*
-   * element is the active (in-progress) shape — its `tool`/`role`/
-   * `points` are also surfaced as top-level convenience fields
-   * (`tool`, `activeRole`, `points`) so the existing panel + overlay
-   * code that only ever cared about the in-progress drawing keeps
-   * working unchanged. Earlier entries are committed shapes the
-   * overlay renders as faint guides while the user lays out a new
-   * shape inside / next to them.
+   * `{id, tool, points}`). Invariantly non-empty: the *last* element
+   * is the active (in-progress) shape — its `tool` and `points` are
+   * also surfaced as top-level convenience fields (`tool`, `points`)
+   * so the existing panel + overlay code that only ever cared about
+   * the in-progress drawing keeps working unchanged. Earlier entries
+   * are committed shapes the overlay renders as faint guides while
+   * the user lays out a new shape inside / next to them. Outer-vs-
+   * hole classification is decided geometrically at extrude time, so
+   * shapes carry no role tag.
    */
   shapes: ServerSketchShape[]
   tool: SketchTool
-  /**
-   * Role of the active (last) shape. Drives the role tag in the
-   * shape list and the default role applied when the user clicks
-   * "Add shape".
-   */
-  activeRole: ShapeRole
   /** Confirmed sketch points in plane-local (u, v) coordinates. */
   points: Array<[number, number]>
   /**
@@ -429,20 +423,18 @@ interface SceneState {
   ) => void
   /**
    * Commit the active shape and append a fresh empty shape with the
-   * given role + tool to draw next. The new shape becomes active. If
-   * the active shape currently has no points, this is a no-op (no
-   * point committing an empty shape, the user would just end up with
-   * two empty shapes in a row).
+   * given tool to draw next. The new shape becomes active. If the
+   * active shape currently has no points, this is a no-op (no point
+   * committing an empty shape, the user would just end up with two
+   * empty shapes in a row).
    */
-  addNewSketchShape: (role: ShapeRole, tool?: SketchTool) => void
+  addNewSketchShape: (tool?: SketchTool) => void
   /**
    * Drop the shape at `idx`. Refuses to remove the last remaining
    * shape (matches the backend invariant). When the active shape is
    * deleted, the new last entry becomes active.
    */
   deleteSketchShape: (idx: number) => void
-  /** Set the role (Outer / Hole) of the active shape. */
-  setActiveSketchShapeRole: (role: ShapeRole) => void
   /**
    * Reconcile a server `SketchSession` snapshot into the local store.
    * Called by `ws-bridge` on every `SketchCreated` / `SketchUpdated`
@@ -518,7 +510,6 @@ export const useSceneStore = create<SceneState>()(
       plane: 'xy',
       shapes: [],
       tool: 'polyline',
-      activeRole: 'outer',
       points: [],
       hover: null,
       circleSegments: 64,
@@ -711,19 +702,17 @@ export const useSceneStore = create<SceneState>()(
           active: true,
           serverId: null,
           plane: targetPlane,
-          // Seed a single Outer shape locally so the overlay /
-          // dimension-input code paths that read `shapes[last]` have
-          // an entry before the backend snapshot lands.
+          // Seed a single shape locally so the overlay / dimension-
+          // input code paths that read `shapes[last]` have an entry
+          // before the backend snapshot lands.
           shapes: [
             {
               id: 'pending',
               tool: targetTool,
-              role: 'outer',
               points: [],
             },
           ],
           tool: targetTool,
-          activeRole: 'outer',
           points: [],
           hover: null,
           // Fresh sketch from the toolbar — not editing an existing
@@ -932,7 +921,7 @@ export const useSceneStore = create<SceneState>()(
       // session has no equivalent fields, so this stays purely local.
       set((state) => ({ sketch: { ...state.sketch, ...patch } })),
 
-    addNewSketchShape: (role, tool) => {
+    addNewSketchShape: (tool) => {
       const cur = useSceneStore.getState().sketch
       const id = cur.serverId
       // No-op when the active shape has no points: we'd just be
@@ -946,7 +935,6 @@ export const useSceneStore = create<SceneState>()(
         const newShape: ServerSketchShape = {
           id: `pending-${Date.now()}`,
           tool: nextTool,
-          role,
           points: [],
         }
         // Snapshot the active shape's current state into `shapes`
@@ -955,7 +943,6 @@ export const useSceneStore = create<SceneState>()(
         const committed = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
           ...s,
           tool: state.sketch.tool,
-          role: state.sketch.activeRole,
           points: state.sketch.points,
         }))
         return {
@@ -963,7 +950,6 @@ export const useSceneStore = create<SceneState>()(
             ...state.sketch,
             shapes: [...committed, newShape],
             tool: nextTool,
-            activeRole: role,
             points: [],
             hover: null,
           },
@@ -971,7 +957,7 @@ export const useSceneStore = create<SceneState>()(
       })
       if (id) {
         sketchApi
-          .addShape(id, { tool: nextTool, role })
+          .addShape(id, { tool: nextTool })
           .then((session) => {
             useSceneStore.getState().applyServerSketchSnapshot(session)
           })
@@ -998,10 +984,9 @@ export const useSceneStore = create<SceneState>()(
           sketch: {
             ...state.sketch,
             shapes: next,
-            // The new active shape's tool/role/points become the
-            // top-level convenience view.
+            // The new active shape's tool/points become the top-
+            // level convenience view.
             tool: last.tool,
-            activeRole: last.role,
             points: last.points,
             hover: null,
           },
@@ -1016,27 +1001,6 @@ export const useSceneStore = create<SceneState>()(
           .catch((err) => {
             console.error('[sketch] deleteShape failed:', err)
           })
-      }
-    },
-
-    setActiveSketchShapeRole: (role) => {
-      const cur = useSceneStore.getState().sketch
-      const id = cur.serverId
-      if (cur.shapes.length === 0) return
-      const idx = cur.shapes.length - 1
-      set((state) => {
-        const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          role,
-        }))
-        return {
-          sketch: { ...state.sketch, shapes, activeRole: role },
-        }
-      })
-      if (id) {
-        sketchApi.setShapeRole(id, idx, role).catch((err) => {
-          console.error('[sketch] setShapeRole failed:', err)
-        })
       }
     },
 
@@ -1057,7 +1021,7 @@ export const useSceneStore = create<SceneState>()(
         }
         // First snapshot for an in-progress local sketch: stamp the
         // id and accept the server's view of shapes/plane. Active
-        // shape = last entry; promote its tool/role/points to the
+        // shape = last entry; promote its tool/points to the
         // convenience view so existing UI keeps working.
         const shapes = session.shapes
         const last = shapes[shapes.length - 1]
@@ -1069,7 +1033,6 @@ export const useSceneStore = create<SceneState>()(
             plane: session.plane,
             shapes,
             tool: last ? last.tool : state.sketch.tool,
-            activeRole: last ? last.role : state.sketch.activeRole,
             points: last ? last.points : [],
             circleSegments: session.circle_segments,
           },
@@ -1174,7 +1137,6 @@ export const useSceneStore = create<SceneState>()(
           plane: session!.plane,
           shapes,
           tool: last ? last.tool : state.sketch.tool,
-          activeRole: last ? last.role : 'outer',
           points: last ? last.points : [],
           circleSegments: session!.circle_segments,
           hover: null,

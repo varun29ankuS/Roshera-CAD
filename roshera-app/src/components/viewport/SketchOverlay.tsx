@@ -259,8 +259,9 @@ export function SketchOverlay() {
 
 /**
  * Render the closed polygon of every shape EXCEPT the last (active)
- * one. Outer shapes draw in faint emerald, Holes in faint rose, so
- * the user can tell at a glance which loop subtracts on extrude.
+ * one. All committed loops draw in a faint neutral colour — outer-vs-
+ * hole classification is decided geometrically at extrude time, so
+ * tinting per-shape would lie about a state that doesn't exist yet.
  *
  * Shapes that don't yet materialise to a valid polygon (too few
  * points, degenerate radius, etc.) are skipped silently.
@@ -283,9 +284,9 @@ function CommittedShapesGuides() {
         const world = profile.map((p) => uvToWorld(p, plane))
         // Close the loop visually by duplicating the first point.
         world.push(world[0])
-        return { idx, role: shape.role, points: world }
+        return { idx, points: world }
       })
-      .filter((l): l is { idx: number; role: 'outer' | 'hole'; points: THREE.Vector3[] } => l !== null)
+      .filter((l): l is { idx: number; points: THREE.Vector3[] } => l !== null)
   }, [committed, plane, circleSegments])
 
   if (loops.length === 0) return null
@@ -296,7 +297,7 @@ function CommittedShapesGuides() {
         <Line
           key={`committed-${l.idx}`}
           points={l.points}
-          color={l.role === 'outer' ? '#10b981' : '#f43f5e'}
+          color="#a1a1aa"
           lineWidth={1.5}
           opacity={0.55}
           transparent
