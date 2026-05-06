@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 shared-types = { path = "../shared-types" }
 geometry-engine = { path = "../geometry-engine" }
+timeline-engine = { path = "../timeline-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
