@@ -13,6 +13,9 @@
 //! (named planes, axes, points) are introduced in Slice 3.
 
 use crate::math::{Matrix4, Point3, Vector3};
+use crate::primitives::edge::EdgeId;
+use crate::primitives::face::FaceId;
+use crate::primitives::vertex::VertexId;
 use crate::sketch2d::sketch_plane::PlaneOrientation;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -40,6 +43,26 @@ pub enum DatumError {
     /// A user-supplied name was empty or whitespace-only.
     #[error("datum name must not be empty")]
     EmptyName,
+    /// A `DatumSource` referenced a vertex / edge / face / datum that
+    /// could not be resolved against the current model. Carries the
+    /// reference category and id for diagnostics.
+    #[error("datum source references unknown {kind} id {id}")]
+    UnknownReference {
+        /// Category of the missing reference (`"vertex"`, `"edge"`,
+        /// `"face"`, `"datum"`).
+        kind: &'static str,
+        /// Numeric id of the missing reference.
+        id: u64,
+    },
+    /// A `DatumSource` resolved its inputs but the resulting geometry
+    /// is degenerate (e.g. three collinear points, two coincident
+    /// points for an axis, zero-length edge tangent).
+    #[error("datum source produced degenerate geometry: {0}")]
+    DegenerateSource(&'static str),
+    /// A geometry evaluation needed by a `DatumSource` (face normal,
+    /// edge tangent, …) returned a numerical error from the kernel.
+    #[error("datum source evaluation failed: {0}")]
+    EvaluationFailed(String),
 }
 
 /// Stable identifier for a datum within a `DatumStore`.
@@ -49,6 +72,14 @@ pub type DatumId = u32;
 pub const INVALID_DATUM_ID: DatumId = u32::MAX;
 
 /// Direction of a reference axis datum.
+///
+/// `X / Y / Z` cover the three canonical world axes used by the seeded
+/// defaults and slice 4a manual axis authoring. `Custom` is reserved for
+/// slice 4b derived axes (`EdgeAxis`, `TwoPointsAxis`, `NormalAxis`) whose
+/// direction is recovered from referenced geometry rather than declared
+/// up-front; the canonical direction is then carried by the datum's
+/// `transform` (local +Z) and the variant tag is `Custom` so the API
+/// surface and UI know they are looking at a derived axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AxisDirection {
     /// World +X axis.
@@ -57,15 +88,26 @@ pub enum AxisDirection {
     Y,
     /// World +Z axis.
     Z,
+    /// Direction not aligned with a world axis. The actual direction is
+    /// the local +Z column of the datum's `transform` field — kept off
+    /// the enum so two derived axes with slightly different directions
+    /// remain distinct datums without expanding the enum to carry
+    /// floating-point payload.
+    Custom,
 }
 
 impl AxisDirection {
-    /// Unit vector for this axis in world space.
+    /// Unit vector for this axis in world space. `Custom` returns
+    /// `Vector3::Z` as a safe placeholder — derived axes carry their
+    /// actual direction in `Datum::transform`'s local +Z column, so
+    /// this value is only ever used by the canonical seeding path
+    /// (which never produces `Custom`).
     pub fn unit_vector(self) -> Vector3 {
         match self {
             AxisDirection::X => Vector3::X,
             AxisDirection::Y => Vector3::Y,
             AxisDirection::Z => Vector3::Z,
+            AxisDirection::Custom => Vector3::Z,
         }
     }
 }
@@ -84,6 +126,196 @@ pub enum DatumKind {
     Plane(PlaneOrientation),
     /// An axis datum aligned with X, Y, or Z.
     Axis(AxisDirection),
+}
+
+/// Recipe describing where a datum's `transform` came from.
+///
+/// Slice 4a (manual authoring) only ever produces `Manual` sources — the
+/// transform is supplied directly by the user. Slice 4b adds derived
+/// sources whose `transform` is recomputed from referenced model
+/// geometry: when a referenced vertex moves, face splits, or edge gets
+/// swallowed by a Boolean, the propagation graph in slice 5 walks the
+/// dependents, calls `BRepModel::evaluate_datum_source`, and writes the
+/// fresh transform back via `set_datum_transform`.
+///
+/// The variants are exhaustive over the recipes the UI can build by
+/// inspecting a single user selection (vertex / edge / face / datum
+/// combinations); arbitrary scripted constructions go through
+/// `Manual` with a pre-computed `Matrix4`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DatumSource {
+    /// Transform supplied directly. The slice 4a authoring path
+    /// (`create_plane / create_axis / create_point`) and the seven
+    /// seeded defaults all carry this variant.
+    Manual { transform: [[f64; 4]; 4] },
+    /// Plane parallel to `base`, translated `distance` along `base`'s
+    /// local +Z (the plane normal). Negative `distance` flips the
+    /// offset side.
+    OffsetPlane { base: DatumId, distance: f64 },
+    /// Plane through `base`'s origin, rotated by `angle` radians around
+    /// `axis`. `axis` must be an `Axis(_)` datum; `base` must be a
+    /// `Plane(_)` datum.
+    AnglePlane {
+        base: DatumId,
+        axis: DatumId,
+        angle: f64,
+    },
+    /// Plane through three vertices. Origin is `p0`; local +X points
+    /// toward `p1`; local +Z is the cross product of `(p1 - p0)` and
+    /// `(p2 - p0)` (right-hand rule). Degenerate (collinear) triples
+    /// raise [`DatumError::DegenerateSource`].
+    ThreePoints {
+        p0: VertexId,
+        p1: VertexId,
+        p2: VertexId,
+    },
+    /// Plane whose origin is the face's loop centroid and whose
+    /// normal matches the face's surface normal at that centroid.
+    PlaneFromFace { face: FaceId },
+    /// Plane bisecting two parent planes. Origin is the midpoint of
+    /// their origins; normal is the unit average of their normals.
+    /// Antiparallel parent normals raise
+    /// [`DatumError::DegenerateSource`].
+    MidPlane { a: DatumId, b: DatumId },
+    /// Axis along an edge. Origin is the edge midpoint
+    /// (`edge.point_at(0.5)`); direction is the tangent at that
+    /// parameter.
+    EdgeAxis { edge: EdgeId },
+    /// Axis through two vertices. Origin is the midpoint; direction
+    /// is `(p1 - p0).normalize()`. Coincident vertices raise
+    /// [`DatumError::DegenerateSource`].
+    TwoPointsAxis { p0: VertexId, p1: VertexId },
+    /// Axis perpendicular to a plane datum, passing through a vertex.
+    /// Origin is the vertex position; direction is the plane's normal.
+    NormalAxis {
+        plane: DatumId,
+        point: VertexId,
+    },
+    /// Point datum at a vertex.
+    VertexPoint { vertex: VertexId },
+    /// Point datum at the midpoint of an edge.
+    CurveMidpoint { edge: EdgeId },
+    /// Point datum at the centroid of a face's outer loop.
+    FaceCentroid { face: FaceId },
+}
+
+impl DatumSource {
+    /// Pack a `Matrix4` into the `[[f64;4];4]` layout used in the
+    /// serialized `Manual` variant. Row-major (matches
+    /// `Matrix4::get(row, col)`).
+    pub fn pack_matrix(m: Matrix4) -> [[f64; 4]; 4] {
+        [
+            [m.get(0, 0), m.get(0, 1), m.get(0, 2), m.get(0, 3)],
+            [m.get(1, 0), m.get(1, 1), m.get(1, 2), m.get(1, 3)],
+            [m.get(2, 0), m.get(2, 1), m.get(2, 2), m.get(2, 3)],
+            [m.get(3, 0), m.get(3, 1), m.get(3, 2), m.get(3, 3)],
+        ]
+    }
+
+    /// Inverse of [`DatumSource::pack_matrix`]: reconstruct a
+    /// `Matrix4` from the row-major payload.
+    pub fn unpack_matrix(rows: [[f64; 4]; 4]) -> Matrix4 {
+        Matrix4::from_rows_array(rows)
+    }
+
+    /// Build a `Manual` source from a `Matrix4`. Convenience wrapper
+    /// over `pack_matrix`.
+    pub fn manual(transform: Matrix4) -> Self {
+        DatumSource::Manual {
+            transform: Self::pack_matrix(transform),
+        }
+    }
+
+    /// Whether evaluation needs access to model geometry beyond the
+    /// `DatumStore`. `false` for `Manual / OffsetPlane / AnglePlane /
+    /// MidPlane`; `true` for the vertex / edge / face variants.
+    pub fn requires_geometry(&self) -> bool {
+        !matches!(
+            self,
+            DatumSource::Manual { .. }
+                | DatumSource::OffsetPlane { .. }
+                | DatumSource::AnglePlane { .. }
+                | DatumSource::MidPlane { .. }
+        )
+    }
+
+    /// Canonical [`DatumKind`] for each source variant — the kind a
+    /// derived datum should be tagged with after evaluation.
+    /// `Manual` collapses to `Plane(Custom)` because the kind cannot
+    /// be inferred from a bare transform; manual authoring should
+    /// instead go through `BRepModel::create_datum_{plane,axis,point}`
+    /// which set the kind explicitly.
+    pub fn default_kind(&self) -> DatumKind {
+        match self {
+            DatumSource::Manual { .. } => DatumKind::Plane(PlaneOrientation::Custom),
+            DatumSource::OffsetPlane { .. }
+            | DatumSource::AnglePlane { .. }
+            | DatumSource::ThreePoints { .. }
+            | DatumSource::PlaneFromFace { .. }
+            | DatumSource::MidPlane { .. } => DatumKind::Plane(PlaneOrientation::Custom),
+            DatumSource::EdgeAxis { .. }
+            | DatumSource::TwoPointsAxis { .. }
+            | DatumSource::NormalAxis { .. } => DatumKind::Axis(AxisDirection::Custom),
+            DatumSource::VertexPoint { .. }
+            | DatumSource::CurveMidpoint { .. }
+            | DatumSource::FaceCentroid { .. } => DatumKind::Origin,
+        }
+    }
+}
+
+/// Build a local-to-world `Matrix4` from an origin and a desired
+/// local +Z direction, using a deterministic Gram-Schmidt completion to
+/// pick an orthonormal +X / +Y basis.
+///
+/// The +X column is the projection of either `Vector3::X` or
+/// `Vector3::Y` (whichever is more orthogonal to `z_dir`) onto the
+/// plane perpendicular to `z_dir`, then normalized; +Y is `z × x` so
+/// the basis stays right-handed. This matches the convention used by
+/// `Datum::canonical_transform` for the seeded defaults (their +X /
+/// +Y columns are world basis vectors orthogonal to +Z).
+///
+/// Returns [`DatumError::DegenerateSource`] when `z_dir` is too small
+/// to normalize, when the chosen reference vector is parallel to
+/// `z_dir`, or when the resulting +X is degenerate.
+pub fn frame_from_origin_and_z(origin: Point3, z_dir: Vector3) -> Result<Matrix4, DatumError> {
+    let z = z_dir
+        .normalize()
+        .map_err(|_| DatumError::DegenerateSource("zero-length normal direction"))?;
+    // Pick whichever world basis vector is least parallel to z to keep
+    // the cross-product numerically stable.
+    let world_ref = if z.x.abs() < 0.9 {
+        Vector3::X
+    } else {
+        Vector3::Y
+    };
+    let x = world_ref
+        .cross(&z)
+        .normalize()
+        .map_err(|_| DatumError::DegenerateSource("could not derive +X basis from +Z"))?;
+    let y = z.cross(&x);
+    // Row-major: column 0 = x, column 1 = y, column 2 = z, column 3 = origin.
+    Ok(Matrix4::from_rows_array([
+        [x.x, y.x, z.x, origin.x],
+        [x.y, y.y, z.y, origin.y],
+        [x.z, y.z, z.z, origin.z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]))
+}
+
+/// Extract the local +Z basis vector (column 2) from a 4×4 transform.
+/// Used by derived plane / axis evaluation to read a parent datum's
+/// "out" direction without unpacking the full matrix.
+#[inline]
+pub fn frame_z_axis(transform: &Matrix4) -> Vector3 {
+    Vector3::new(transform.get(0, 2), transform.get(1, 2), transform.get(2, 2))
+}
+
+/// Extract the translation (column 3) of a 4×4 transform as a
+/// `Point3`. Mirrors the denormalized `Datum::origin` field.
+#[inline]
+pub fn frame_origin(transform: &Matrix4) -> Point3 {
+    Point3::new(transform.get(0, 3), transform.get(1, 3), transform.get(2, 3))
 }
 
 /// A first-class reference entity in the kernel.
@@ -119,6 +351,12 @@ pub struct Datum {
     /// Default datums cannot be deleted (they can be hidden via
     /// `visible = false`); user-authored datums carry `is_default = false`.
     pub is_default: bool,
+    /// Recipe describing how `transform` was produced. `Manual` for
+    /// the seven seeded defaults, slice 4a manual datums, and any
+    /// scripted construction; the other variants describe geometry
+    /// dependencies that the slice 5 propagation graph walks on
+    /// re-evaluation.
+    pub source: DatumSource,
 }
 
 impl Datum {
@@ -162,6 +400,12 @@ impl Datum {
                 AxisDirection::X => Matrix4::rotation_y(FRAC_PI_2),
                 AxisDirection::Y => Matrix4::rotation_x(-FRAC_PI_2),
                 AxisDirection::Z => Matrix4::identity(),
+                // `Custom` is never produced by the seeded path; if a
+                // caller pushes it through this helper the safe answer
+                // is the +Z identity rotation — derived axes always
+                // overwrite the resulting transform with a frame
+                // computed from referenced geometry anyway.
+                AxisDirection::Custom => Matrix4::identity(),
             },
         };
         translation * rotation
@@ -252,14 +496,16 @@ impl DatumStore {
     fn insert_default(&self, name: &str, kind: DatumKind) -> DatumId {
         let id = self.allocate_id();
         let origin = Point3::ORIGIN;
+        let transform = Datum::canonical_transform(origin, kind);
         let datum = Datum {
             id,
             name: name.to_string(),
             kind,
             origin,
-            transform: Datum::canonical_transform(origin, kind),
+            transform,
             visible: true,
             is_default: true,
+            source: DatumSource::manual(transform),
         };
         self.datums.insert(id, datum);
         id
@@ -335,6 +581,7 @@ impl DatumStore {
             transform,
             visible: true,
             is_default: false,
+            source: DatumSource::manual(transform),
         };
         self.datums.insert(id, datum);
         Ok(id)
@@ -360,14 +607,16 @@ impl DatumStore {
         }
         let id = self.allocate_id();
         let kind = DatumKind::Axis(direction);
+        let transform = Datum::canonical_transform(origin, kind);
         let datum = Datum {
             id,
             name,
             kind,
             origin,
-            transform: Datum::canonical_transform(origin, kind),
+            transform,
             visible: true,
             is_default: false,
+            source: DatumSource::manual(transform),
         };
         self.datums.insert(id, datum);
         Ok(id)
@@ -381,14 +630,16 @@ impl DatumStore {
             return Err(DatumError::EmptyName);
         }
         let id = self.allocate_id();
+        let transform = Datum::canonical_transform(position, DatumKind::Origin);
         let datum = Datum {
             id,
             name,
             kind: DatumKind::Origin,
             origin: position,
-            transform: Datum::canonical_transform(position, DatumKind::Origin),
+            transform,
             visible: true,
             is_default: false,
+            source: DatumSource::manual(transform),
         };
         self.datums.insert(id, datum);
         Ok(id)
@@ -428,7 +679,80 @@ impl DatumStore {
             transform.get(1, 3),
             transform.get(2, 3),
         );
+        // A manual `set_transform` overrides whatever recipe was
+        // previously in place — this is the user explicitly committing
+        // to a hand-set frame. Derived re-evaluation (slice 5) calls
+        // a separate `refresh_derived_transform` that preserves the
+        // existing source.
+        entry.source = DatumSource::manual(transform);
         Ok(prev)
+    }
+
+    /// Refresh a datum's `transform` from a freshly-evaluated derived
+    /// source, preserving the existing `source` recipe. Used by the
+    /// slice 5 propagation graph; not exposed to user mediator paths.
+    /// Returns the previous transform on success.
+    ///
+    /// Refuses defaults (their transform is an invariant) but does
+    /// *not* refuse to refresh a `Manual` source — re-evaluating a
+    /// manual source is a no-op semantically (the source already
+    /// carries the transform), and forbidding it would force callers
+    /// to special-case Manual at every refresh site.
+    pub fn refresh_derived_transform(
+        &self,
+        id: DatumId,
+        transform: Matrix4,
+    ) -> Result<Matrix4, DatumError> {
+        let mut entry = self.datums.get_mut(&id).ok_or(DatumError::UnknownId(id))?;
+        if entry.is_default {
+            return Err(DatumError::DefaultDatumNotMutable(id));
+        }
+        let prev = entry.transform;
+        entry.transform = transform;
+        entry.origin = Point3::new(
+            transform.get(0, 3),
+            transform.get(1, 3),
+            transform.get(2, 3),
+        );
+        // Source recipe is intentionally unchanged.
+        Ok(prev)
+    }
+
+    /// Insert a datum produced by a derived `DatumSource` recipe.
+    /// `transform` is the freshly-evaluated frame (caller is
+    /// responsible for evaluating the source); `source` is recorded so
+    /// the propagation graph can re-evaluate later.
+    ///
+    /// Used by `BRepModel::create_derived_datum`; tests can call it
+    /// directly to exercise edge cases without recorder wiring.
+    pub fn create_derived(
+        &self,
+        name: String,
+        kind: DatumKind,
+        transform: Matrix4,
+        source: DatumSource,
+    ) -> Result<DatumId, DatumError> {
+        if name.trim().is_empty() {
+            return Err(DatumError::EmptyName);
+        }
+        let id = self.allocate_id();
+        let origin = Point3::new(
+            transform.get(0, 3),
+            transform.get(1, 3),
+            transform.get(2, 3),
+        );
+        let datum = Datum {
+            id,
+            name,
+            kind,
+            origin,
+            transform,
+            visible: true,
+            is_default: false,
+            source,
+        };
+        self.datums.insert(id, datum);
+        Ok(id)
     }
 
     /// Remove a user-authored datum from the store, returning the

@@ -73,6 +73,7 @@ impl From<Datum> for DatumDto {
                     AxisDirection::X => "x",
                     AxisDirection::Y => "y",
                     AxisDirection::Z => "z",
+                    AxisDirection::Custom => "custom",
                 };
                 (DatumKindWire::Axis, None, Some(label.to_string()))
             }
@@ -265,11 +266,21 @@ pub struct DeleteDatumResponse {
 /// Map a kernel `DatumError` to an HTTP status. `EmptyName` and
 /// invalid-input errors that originate from the kernel layer are 400;
 /// `UnknownId` is 404; `DefaultDatumNotMutable` is 409.
+///
+/// Slice 4b derived-datum errors:
+/// - `UnknownReference` is 404 (the request named a vertex / edge /
+///   face / datum the kernel can't resolve);
+/// - `DegenerateSource` is 422 (the geometry resolved but is not
+///   admissible — collinear triple, zero-length axis, …);
+/// - `EvaluationFailed` is 422 (numerical error during evaluation).
 fn map_datum_error(err: DatumError) -> StatusCode {
     match err {
         DatumError::EmptyName => StatusCode::BAD_REQUEST,
         DatumError::UnknownId(_) => StatusCode::NOT_FOUND,
         DatumError::DefaultDatumNotMutable(_) => StatusCode::CONFLICT,
+        DatumError::UnknownReference { .. } => StatusCode::NOT_FOUND,
+        DatumError::DegenerateSource(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        DatumError::EvaluationFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
