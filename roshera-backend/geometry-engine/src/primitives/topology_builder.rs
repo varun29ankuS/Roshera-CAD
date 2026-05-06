@@ -254,6 +254,16 @@ pub struct BRepModel {
     /// future user-authored datums). Seeded with the canonical seven on
     /// model construction; see `crate::primitives::datum`.
     pub datums: crate::primitives::datum::DatumStore,
+    /// Slice 5 forward dependency graph: derived-datum sources and
+    /// solid anchors. Mutated as a side effect of `create_derived_datum`,
+    /// `delete_datum`, and `anchor_solid`; read by
+    /// `propagate_datum_change` and the geometry-mutation notifiers.
+    pub datum_graph: crate::primitives::datum::DatumGraph,
+    /// Slice 5 per-solid `LocationDescriptor` cache. Populated lazily
+    /// by `solid_location_descriptor_cached`; invalidated on transform,
+    /// anchor reassignment, and datum moves that walk the graph back
+    /// to an anchored solid.
+    pub location_cache: crate::primitives::datum::LocationDescriptorCache,
     /// Optional recorder receiving one event per successful operation.
     /// `None` by default — tests and unattached models incur zero overhead.
     /// Attached via `attach_recorder` by the orchestration layer
@@ -290,6 +300,8 @@ impl BRepModel {
             solids: SolidStore::with_capacity(solid_capacity),
             sketch_planes: DashMap::new(),
             datums,
+            datum_graph: crate::primitives::datum::DatumGraph::new(),
+            location_cache: crate::primitives::datum::LocationDescriptorCache::new(),
             recorder: None,
         }
     }
@@ -456,12 +468,37 @@ impl BRepModel {
 
     /// Replace a user-authored datum's transform and record
     /// `datum_set_transform`.
+    ///
+    /// Slice 5: propagates the change to every derived datum whose
+    /// source recipe references this datum (transitively, with cycle
+    /// detection) by re-evaluating each dependent's source against
+    /// the current model and writing the fresh transform back via
+    /// [`crate::primitives::datum::DatumStore::refresh_derived_transform`].
+    /// `LocationDescriptor` cache entries for any solid anchored to
+    /// the changed datum (or to a refreshed dependent) are also
+    /// invalidated.
+    ///
+    /// Auto-transforming the geometry of solids anchored to the
+    /// changed datum is *not* part of this slice — that requires a
+    /// `&mut self` lock to call `operations::transform::transform_solid`
+    /// and is queued for a follow-up that takes the api-server lock
+    /// upgrade. Today the cache is invalidated and the next
+    /// descriptor read returns up-to-date `anchor_datum_name` /
+    /// frame-relative center fields, but raw vertex positions stay
+    /// where they were when the solid was first anchored.
     pub fn set_datum_transform(
         &self,
         id: crate::primitives::datum::DatumId,
         transform: Matrix4,
     ) -> Result<Matrix4, crate::primitives::datum::DatumError> {
         let previous = self.datums.set_transform(id, transform)?;
+        // `DatumStore::set_transform` overrides the source to
+        // `Manual`, severing any derived links this datum may have
+        // had. Drop the stale forward-edges so future moves of the
+        // old parents do not trigger no-op re-evaluations on this
+        // (now-Manual) datum.
+        self.datum_graph.unregister_dependent(id);
+        self.propagate_datum_change(id);
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("datum_set_transform")
                 .with_parameters(serde_json::json!({
@@ -472,6 +509,147 @@ impl BRepModel {
                 .with_inputs(vec![id as u64]),
         );
         Ok(previous)
+    }
+
+    // ───────────────────────────── Slice 5 propagation ────────────────────────
+    //
+    // `propagate_datum_change` is the single re-evaluation entry
+    // point. It walks forward edges from the changed datum, refreshes
+    // each derived dependent's transform, and invalidates the
+    // location cache for any solid whose anchor datum sits anywhere
+    // on the propagated subtree.
+    //
+    // The `*_changed` notifiers below are the geometry-side
+    // counterparts: a topology mutator that moves a vertex / splits
+    // a face / re-routes an edge calls them so derived datums whose
+    // source references that geometry get refreshed too. They are
+    // intentionally explicit (not auto-wired into every kernel
+    // mutator) — slice 5's scope is the propagation infrastructure;
+    // wiring every mutator to call them is the slice 6 readable-
+    // surface task once we know which mutators land in the agent
+    // surface.
+
+    /// Re-evaluate every derived datum that transitively depends on
+    /// `changed` and invalidate the location cache for affected
+    /// solids. Cycle-safe via a visited set; no-ops on unknown id.
+    pub fn propagate_datum_change(&self, changed: crate::primitives::datum::DatumId) {
+        use std::collections::{HashSet, VecDeque};
+        let mut visited: HashSet<crate::primitives::datum::DatumId> = HashSet::new();
+        let mut queue: VecDeque<crate::primitives::datum::DatumId> = VecDeque::new();
+        queue.push_back(changed);
+        visited.insert(changed);
+
+        // Invalidate cache for solids anchored to the changed datum
+        // up-front — even if no derived dependents exist, the
+        // anchor's `transform` (and therefore the descriptor's
+        // `anchor_datum_name` / `center_in_anchor_frame`) is stale.
+        for solid_id in self.datum_graph.solids_dependent_on_datum(changed) {
+            self.location_cache.invalidate(solid_id);
+        }
+        // Also invalidate any solid whose anchor.datum_id is
+        // currently `changed` — covers solids anchored before the
+        // graph was populated (legacy creation paths) and solids
+        // that wrote their anchor through `Solid::new` directly.
+        for (sid, solid) in self.solids.iter() {
+            if solid.anchor.datum_id == changed {
+                self.location_cache.invalidate(sid);
+            }
+        }
+
+        while let Some(parent) = queue.pop_front() {
+            for dep in self.datum_graph.datums_dependent_on_datum(parent) {
+                if !visited.insert(dep) {
+                    continue;
+                }
+                self.refresh_dependent_datum(dep);
+                // Also invalidate cache for solids anchored to this
+                // refreshed datum.
+                for solid_id in self.datum_graph.solids_dependent_on_datum(dep) {
+                    self.location_cache.invalidate(solid_id);
+                }
+                queue.push_back(dep);
+            }
+        }
+    }
+
+    /// Notify the propagation graph that vertex `vid`'s position
+    /// changed. Re-evaluates derived datums whose source references
+    /// this vertex and invalidates affected location cache entries.
+    pub fn vertex_changed(&self, vid: crate::primitives::vertex::VertexId) {
+        for dep in self.datum_graph.datums_dependent_on_vertex(vid) {
+            self.refresh_dependent_datum(dep);
+            self.propagate_datum_change(dep);
+        }
+    }
+
+    /// Notify the propagation graph that edge `eid` was modified
+    /// (curve replaced, vertices reassigned). Re-evaluates derived
+    /// datums whose source references this edge.
+    pub fn edge_changed(&self, eid: crate::primitives::edge::EdgeId) {
+        for dep in self.datum_graph.datums_dependent_on_edge(eid) {
+            self.refresh_dependent_datum(dep);
+            self.propagate_datum_change(dep);
+        }
+    }
+
+    /// Notify the propagation graph that face `fid` was modified
+    /// (surface replaced, loop edges changed). Re-evaluates derived
+    /// datums whose source references this face.
+    pub fn face_changed(&self, fid: crate::primitives::face::FaceId) {
+        for dep in self.datum_graph.datums_dependent_on_face(fid) {
+            self.refresh_dependent_datum(dep);
+            self.propagate_datum_change(dep);
+        }
+    }
+
+    /// Re-evaluate one derived datum's source against the current
+    /// model and write the fresh transform back via
+    /// `refresh_derived_transform`. On evaluation error logs at
+    /// `tracing::warn` and leaves the stale transform in place — a
+    /// missing reference (parent datum deleted, vertex consumed by
+    /// a Boolean) should not abort the whole propagation walk.
+    fn refresh_dependent_datum(&self, id: crate::primitives::datum::DatumId) {
+        let Some(d) = self.datums.get(id) else {
+            return;
+        };
+        match self.evaluate_datum_source(&d.source) {
+            Ok(fresh) => {
+                if let Err(e) = self.datums.refresh_derived_transform(id, fresh) {
+                    tracing::warn!(
+                        "datum {} refresh_derived_transform rejected: {}",
+                        id,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "datum {} re-evaluation failed during propagation: {}",
+                    id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Cached `LocationDescriptor` for the solid. On miss falls
+    /// through to `solid_location_descriptor`, populates the cache
+    /// with the result, and returns it.
+    ///
+    /// Cache-coherence is the caller's responsibility for direct
+    /// geometry edits; `set_datum_transform`, `delete_datum`, and
+    /// `transform_solid` already call `location_cache.invalidate`
+    /// (or `invalidate_all` for broad-impact ops).
+    pub fn solid_location_descriptor_cached(
+        &self,
+        id: SolidId,
+    ) -> Option<crate::primitives::datum::LocationDescriptor> {
+        if let Some(hit) = self.location_cache.get(id) {
+            return Some(hit);
+        }
+        let fresh = self.solid_location_descriptor(id)?;
+        self.location_cache.insert(fresh.clone());
+        Some(fresh)
     }
 
     /// Delete a user-authored datum and record `datum_delete`.
@@ -485,6 +663,30 @@ impl BRepModel {
         id: crate::primitives::datum::DatumId,
     ) -> Result<crate::primitives::datum::Datum, crate::primitives::datum::DatumError> {
         let removed = self.datums.delete(id)?;
+        // Slice 5: tear down both directions of edges in the
+        // dependency graph. The (parent → this datum) edges are gone
+        // because the dependent no longer exists; the (this datum →
+        // dependent) edges are gone because the upstream is gone and
+        // any remaining listings would point at a stale id. The
+        // api-server cascade-detach path is responsible for
+        // re-binding orphaned dependents to the world Origin.
+        self.datum_graph.unregister_dependent(id);
+        self.datum_graph.unregister_upstream_datum(id);
+        // Drop any cached descriptors for solids that were anchored
+        // to this datum — their `anchor_datum_name` is now stale.
+        for solid_id in self
+            .datum_graph
+            .solids_dependent_on_datum(id)
+            .into_iter()
+            .chain(
+                self.solids
+                    .iter()
+                    .filter(|(_, s)| s.anchor.datum_id == id)
+                    .map(|(sid, _)| sid),
+            )
+        {
+            self.location_cache.invalidate(solid_id);
+        }
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("datum_delete")
                 .with_parameters(serde_json::json!({
@@ -731,6 +933,10 @@ impl BRepModel {
         let id = self
             .datums
             .create_derived(name.clone(), kind, transform, source)?;
+        // Slice 5: register forward edges from each parent referenced
+        // by the source onto this newly-derived datum so subsequent
+        // moves of the parents propagate.
+        self.datum_graph.register_source(id, &source);
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("datum_create_derived")
                 .with_parameters(serde_json::json!({
@@ -2288,10 +2494,26 @@ impl<'a> TopologyBuilder<'a> {
                 constraint: "must reference an existing solid".to_string(),
             }
         })?;
+        let prev_datum = solid.anchor.datum_id;
         solid.anchor = crate::primitives::solid::SolidAnchor {
             datum_id,
             local_transform,
         };
+        // Slice 5: keep the propagation graph in sync. Drop the old
+        // anchor edge (if any) and register the new one so future
+        // datum moves invalidate this solid's cached descriptor.
+        if prev_datum != datum_id {
+            self.model
+                .datum_graph
+                .unregister_solid_anchor(solid_id, prev_datum);
+        }
+        self.model
+            .datum_graph
+            .register_solid_anchor(solid_id, datum_id);
+        // Anchor reassignment alters the descriptor's
+        // `anchor_datum_name` and `center_in_anchor_frame`, plus the
+        // geometry was just transformed — flush the cache.
+        self.model.location_cache.invalidate(solid_id);
 
         Ok(())
     }
@@ -4508,6 +4730,411 @@ mod anchor_tests {
             .create_derived_datum("".to_string(), source)
             .expect_err("empty name");
         assert!(matches!(err, DatumError::EmptyName));
+    }
+
+    // ──────────────────── Slice 5: propagation graph + cache ────────────────
+
+    #[test]
+    fn create_derived_datum_registers_parent_datum_edges() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        // OffsetPlane has one parent: base = 1 (FrontPlane).
+        let _id = model
+            .create_derived_datum(
+                "Off".to_string(),
+                DatumSource::OffsetPlane {
+                    base: 1,
+                    distance: 5.0,
+                },
+            )
+            .expect("offset plane");
+        assert_eq!(
+            model.datum_graph.datum_edge_count(),
+            1,
+            "OffsetPlane registers 1 edge from FrontPlane"
+        );
+        let deps = model.datum_graph.datums_dependent_on_datum(1);
+        assert_eq!(deps.len(), 1, "FrontPlane has one dependent");
+    }
+
+    #[test]
+    fn create_derived_datum_registers_all_parents_for_angle_plane() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        // AnglePlane has two datum parents: base + axis.
+        let _id = model
+            .create_derived_datum(
+                "Tilted".to_string(),
+                DatumSource::AnglePlane {
+                    base: 1,
+                    axis: 4,
+                    angle: 0.5,
+                },
+            )
+            .expect("angle plane");
+        assert_eq!(model.datum_graph.datum_edge_count(), 2);
+        assert_eq!(model.datum_graph.datums_dependent_on_datum(1).len(), 1);
+        assert_eq!(model.datum_graph.datums_dependent_on_datum(4).len(), 1);
+    }
+
+    #[test]
+    fn create_derived_datum_registers_geometry_references() {
+        let (model, _sid) = box_with_seeded_datums();
+        // 2×2×2 box is centered at origin, so corners are at ±1.0.
+        let v0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
+        let v1 = vertex_at(&model, [1.0, -1.0, -1.0]);
+        let v2 = vertex_at(&model, [-1.0, 1.0, -1.0]);
+        let _id = model
+            .create_derived_datum(
+                "ThreePts".to_string(),
+                DatumSource::ThreePoints {
+                    p0: v0,
+                    p1: v1,
+                    p2: v2,
+                },
+            )
+            .expect("three points plane");
+        assert_eq!(
+            model.datum_graph.datums_dependent_on_vertex(v0).len(),
+            1,
+            "vertex v0 has one dependent datum"
+        );
+        assert_eq!(model.datum_graph.datums_dependent_on_vertex(v1).len(), 1);
+        assert_eq!(model.datum_graph.datums_dependent_on_vertex(v2).len(), 1);
+    }
+
+    #[test]
+    fn delete_datum_removes_dependency_edges() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let derived = model
+            .create_derived_datum(
+                "Off".to_string(),
+                DatumSource::OffsetPlane {
+                    base: 1,
+                    distance: 5.0,
+                },
+            )
+            .expect("offset plane");
+        assert_eq!(model.datum_graph.datum_edge_count(), 1);
+        model.delete_datum(derived).expect("delete");
+        assert_eq!(
+            model.datum_graph.datum_edge_count(),
+            0,
+            "deleting the dependent drops the (parent → dependent) edge"
+        );
+    }
+
+    #[test]
+    fn set_datum_transform_propagates_to_offset_plane_dependent() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        // Create a custom plane base (id 7) we are allowed to move
+        // (defaults refuse `set_transform`).
+        let base = model
+            .create_datum_plane(
+                "MovableBase".to_string(),
+                Matrix4::from_translation(&Vector3::new(0.0, 0.0, 0.0)),
+            )
+            .expect("base plane");
+        let derived = model
+            .create_derived_datum(
+                "Off10".to_string(),
+                DatumSource::OffsetPlane {
+                    base,
+                    distance: 10.0,
+                },
+            )
+            .expect("offset plane");
+        // Initial: derived plane sits at z = 10 (base at origin + 10
+        // along base +Z).
+        let before = model.datums.get(derived).expect("derived").transform;
+        assert!((before.get(2, 3) - 10.0).abs() < 1e-9);
+        // Move base by +Z = 5. Expected: derived now at z = 15.
+        model
+            .set_datum_transform(
+                base,
+                Matrix4::from_translation(&Vector3::new(0.0, 0.0, 5.0)),
+            )
+            .expect("move base");
+        let after = model.datums.get(derived).expect("derived").transform;
+        assert!(
+            (after.get(2, 3) - 15.0).abs() < 1e-9,
+            "derived datum followed parent: expected z=15, got {}",
+            after.get(2, 3)
+        );
+    }
+
+    #[test]
+    fn propagate_walks_multi_level_chain() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let a = model
+            .create_datum_plane("A".to_string(), Matrix4::identity())
+            .expect("A");
+        let b = model
+            .create_derived_datum(
+                "B".to_string(),
+                DatumSource::OffsetPlane {
+                    base: a,
+                    distance: 1.0,
+                },
+            )
+            .expect("B");
+        let c = model
+            .create_derived_datum(
+                "C".to_string(),
+                DatumSource::OffsetPlane {
+                    base: b,
+                    distance: 2.0,
+                },
+            )
+            .expect("C");
+        // Initial chain offsets: B at z=1, C at z=3.
+        assert!((model.datums.get(c).expect("C").transform.get(2, 3) - 3.0).abs() < 1e-9);
+        // Move A by +Z=10. Expected: B at z=11, C at z=13.
+        model
+            .set_datum_transform(
+                a,
+                Matrix4::from_translation(&Vector3::new(0.0, 0.0, 10.0)),
+            )
+            .expect("move A");
+        let b_after = model.datums.get(b).expect("B").transform;
+        let c_after = model.datums.get(c).expect("C").transform;
+        assert!((b_after.get(2, 3) - 11.0).abs() < 1e-9);
+        assert!((c_after.get(2, 3) - 13.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn propagate_terminates_on_cycle() {
+        // The graph cannot organically contain cycles (a derived
+        // source is fixed at creation and can only reference earlier
+        // datums by id), but if a future op or a malformed timeline
+        // replay produced one, propagate must not hang.
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let a = model
+            .create_datum_plane("A".to_string(), Matrix4::identity())
+            .expect("A");
+        let b = model
+            .create_derived_datum(
+                "B".to_string(),
+                DatumSource::OffsetPlane {
+                    base: a,
+                    distance: 1.0,
+                },
+            )
+            .expect("B");
+        // Manually inject the back-edge B → A so the graph reads
+        // "moving A invalidates B; moving B invalidates A". The
+        // visited-set guard inside propagate_datum_change keeps the
+        // walk finite.
+        model.datum_graph.register_solid_anchor(0, b); // unrelated edge to keep graph non-empty
+        // Use the public push helper indirectly via a fake source —
+        // we just need a (b → a) edge in datum_to_datums:
+        let fake_source = DatumSource::OffsetPlane {
+            base: b,
+            distance: 0.0,
+        };
+        model.datum_graph.register_source(a, &fake_source);
+        // If the cycle wasn't detected, this would loop until stack
+        // overflow / hang the test. Bound the test by panicking via
+        // a thread join in a real harness; here the test just
+        // returning is the success condition (cargo test default
+        // timeout is on the order of seconds).
+        model.set_datum_transform(a, Matrix4::identity()).expect("move A");
+    }
+
+    #[test]
+    fn set_datum_transform_severs_derived_link() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let base = model
+            .create_datum_plane("Base".to_string(), Matrix4::identity())
+            .expect("base");
+        let derived = model
+            .create_derived_datum(
+                "Off".to_string(),
+                DatumSource::OffsetPlane {
+                    base,
+                    distance: 5.0,
+                },
+            )
+            .expect("derived");
+        assert_eq!(model.datum_graph.datums_dependent_on_datum(base).len(), 1);
+        // User pins the derived datum with an explicit transform —
+        // this overrides the source to Manual and severs the link.
+        model
+            .set_datum_transform(
+                derived,
+                Matrix4::from_translation(&Vector3::new(99.0, 0.0, 0.0)),
+            )
+            .expect("pin");
+        assert_eq!(
+            model.datum_graph.datums_dependent_on_datum(base).len(),
+            0,
+            "derived datum no longer listed as dependent of base"
+        );
+        // Moving base now leaves the pinned datum untouched.
+        model
+            .set_datum_transform(
+                base,
+                Matrix4::from_translation(&Vector3::new(0.0, 0.0, 50.0)),
+            )
+            .expect("move base");
+        let pinned = model.datums.get(derived).expect("derived").transform;
+        assert!((pinned.get(0, 3) - 99.0).abs() < 1e-9);
+        assert!(pinned.get(2, 3).abs() < 1e-9);
+    }
+
+    // ─────────────────── Slice 5: LocationDescriptor cache ──────────────────
+
+    #[test]
+    fn cached_descriptor_matches_uncached_first_read() {
+        let (model, sid) = box_with_seeded_datums();
+        assert!(model.location_cache.is_empty());
+        let cached = model
+            .solid_location_descriptor_cached(sid)
+            .expect("descriptor");
+        assert_eq!(model.location_cache.len(), 1, "cache populated on miss");
+        let direct = model.solid_location_descriptor(sid).expect("uncached");
+        assert_eq!(cached.dimensions_world, direct.dimensions_world);
+        assert_eq!(cached.center_world, direct.center_world);
+        // Second read hits the cache and returns identical bytes.
+        let again = model.solid_location_descriptor_cached(sid).expect("hit");
+        assert_eq!(again.dimensions_world, cached.dimensions_world);
+    }
+
+    #[test]
+    fn cache_invalidates_on_transform_solid() {
+        let (mut model, sid) = box_with_seeded_datums();
+        let _ = model
+            .solid_location_descriptor_cached(sid)
+            .expect("warm cache");
+        assert_eq!(model.location_cache.len(), 1);
+        let t = Matrix4::from_translation(&Vector3::new(7.0, 0.0, 0.0));
+        crate::operations::transform::transform_solid(
+            &mut model,
+            sid,
+            t,
+            crate::operations::transform::TransformOptions::default(),
+        )
+        .expect("transform");
+        assert_eq!(
+            model.location_cache.len(),
+            0,
+            "transform_solid invalidates the cached descriptor"
+        );
+        // Subsequent read recomputes against the moved geometry.
+        let after = model
+            .solid_location_descriptor_cached(sid)
+            .expect("post-transform");
+        assert!((after.center_world[0] - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_invalidates_on_anchor_reassignment() {
+        let (mut model, sid) = box_with_seeded_datums();
+        let _ = model.solid_location_descriptor_cached(sid).expect("warm");
+        assert_eq!(model.location_cache.len(), 1);
+        let custom = model
+            .create_datum_plane(
+                "Anchor".to_string(),
+                Matrix4::from_translation(&Vector3::new(0.0, 0.0, 0.0)),
+            )
+            .expect("custom");
+        {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .anchor_solid(sid, custom, Matrix4::identity())
+                .expect("anchor");
+        }
+        assert_eq!(
+            model.location_cache.len(),
+            0,
+            "anchor_solid invalidates the cache"
+        );
+        let solid = model.solids.get(sid).expect("solid still present");
+        assert_eq!(solid.anchor.datum_id, custom);
+        // Graph edge is in place.
+        assert!(model
+            .datum_graph
+            .solids_dependent_on_datum(custom)
+            .contains(&sid));
+    }
+
+    #[test]
+    fn set_datum_transform_invalidates_cache_for_anchored_solid() {
+        let (mut model, sid) = box_with_seeded_datums();
+        let custom = model
+            .create_datum_plane("Anchor".to_string(), Matrix4::identity())
+            .expect("custom");
+        {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .anchor_solid(sid, custom, Matrix4::identity())
+                .expect("anchor");
+        }
+        let _ = model.solid_location_descriptor_cached(sid).expect("warm");
+        assert_eq!(model.location_cache.len(), 1);
+        model
+            .set_datum_transform(
+                custom,
+                Matrix4::from_translation(&Vector3::new(3.0, 0.0, 0.0)),
+            )
+            .expect("move anchor datum");
+        assert_eq!(
+            model.location_cache.len(),
+            0,
+            "anchor datum move invalidates the descriptor cache"
+        );
+    }
+
+    #[test]
+    fn delete_datum_invalidates_cache_for_anchored_solid() {
+        let (mut model, sid) = box_with_seeded_datums();
+        let custom = model
+            .create_datum_plane("Anchor".to_string(), Matrix4::identity())
+            .expect("custom");
+        {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .anchor_solid(sid, custom, Matrix4::identity())
+                .expect("anchor");
+        }
+        let _ = model.solid_location_descriptor_cached(sid).expect("warm");
+        assert_eq!(model.location_cache.len(), 1);
+        model.delete_datum(custom).expect("delete anchor datum");
+        assert_eq!(
+            model.location_cache.len(),
+            0,
+            "deleting the anchor datum invalidates the cache for dependents"
+        );
+    }
+
+    #[test]
+    fn vertex_changed_refreshes_dependent_datum() {
+        let mut model = BRepModel::new();
+        model.datums.seed_defaults();
+        let _ = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(2.0, 2.0, 2.0)
+                .expect("box creation succeeds")
+        };
+        // 2×2×2 box centered at origin.
+        let v = vertex_at(&model, [1.0, -1.0, -1.0]);
+        let derived = model
+            .create_derived_datum("Vp".to_string(), DatumSource::VertexPoint { vertex: v })
+            .expect("vertex point");
+        let before = model.datums.get(derived).expect("derived").transform;
+        assert!((before.get(0, 3) - 1.0).abs() < 1e-9);
+        // Move the vertex via the store, then notify.
+        assert!(model.vertices.set_position(v, 9.0, 5.0, 0.0));
+        model.vertex_changed(v);
+        let after = model.datums.get(derived).expect("derived").transform;
+        assert!((after.get(0, 3) - 9.0).abs() < 1e-9);
+        assert!((after.get(1, 3) - 5.0).abs() < 1e-9);
     }
 }
 

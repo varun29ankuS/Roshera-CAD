@@ -240,6 +240,55 @@ impl DatumSource {
         )
     }
 
+    /// Datum ids this source depends on (parent datums whose
+    /// transforms feed into this datum's evaluation). Used by
+    /// [`DatumGraph`] to register forward-edges so a later
+    /// `set_datum_transform` on a parent can find this dependent.
+    pub fn referenced_datums(&self) -> Vec<DatumId> {
+        match *self {
+            DatumSource::Manual { .. }
+            | DatumSource::ThreePoints { .. }
+            | DatumSource::PlaneFromFace { .. }
+            | DatumSource::EdgeAxis { .. }
+            | DatumSource::TwoPointsAxis { .. }
+            | DatumSource::VertexPoint { .. }
+            | DatumSource::CurveMidpoint { .. }
+            | DatumSource::FaceCentroid { .. } => Vec::new(),
+            DatumSource::OffsetPlane { base, .. } => vec![base],
+            DatumSource::AnglePlane { base, axis, .. } => vec![base, axis],
+            DatumSource::MidPlane { a, b } => vec![a, b],
+            DatumSource::NormalAxis { plane, .. } => vec![plane],
+        }
+    }
+
+    /// Vertex ids this source depends on. Slice 5 propagation invalidates
+    /// derived datums whose listed vertex moves (`VertexStore::set_position`).
+    pub fn referenced_vertices(&self) -> Vec<VertexId> {
+        match *self {
+            DatumSource::ThreePoints { p0, p1, p2 } => vec![p0, p1, p2],
+            DatumSource::TwoPointsAxis { p0, p1 } => vec![p0, p1],
+            DatumSource::NormalAxis { point, .. } => vec![point],
+            DatumSource::VertexPoint { vertex } => vec![vertex],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Edge ids this source depends on.
+    pub fn referenced_edges(&self) -> Vec<EdgeId> {
+        match *self {
+            DatumSource::EdgeAxis { edge } | DatumSource::CurveMidpoint { edge } => vec![edge],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Face ids this source depends on.
+    pub fn referenced_faces(&self) -> Vec<FaceId> {
+        match *self {
+            DatumSource::PlaneFromFace { face } | DatumSource::FaceCentroid { face } => vec![face],
+            _ => Vec::new(),
+        }
+    }
+
     /// Canonical [`DatumKind`] for each source variant — the kind a
     /// derived datum should be tagged with after evaluation.
     /// `Manual` collapses to `Plane(Custom)` because the kind cannot
@@ -794,6 +843,249 @@ impl DatumStore {
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.datums.is_empty()
+    }
+}
+
+// ────────────────────────────── Slice 5 ─────────────────────────────────────
+//
+// Forward dependency graph + per-solid LocationDescriptor cache. The
+// graph tracks "if upstream X changes, which downstream entities need
+// re-evaluation / cache invalidation"; the cache memoizes the
+// agent-facing descriptor blob so repeated reads don't walk the outer
+// shell every time.
+//
+// Both structures use `DashMap` for shared-state concurrency per
+// CLAUDE.md hard rule #9. Mutation methods take `&self` so they
+// compose with the rest of the kernel's `&self` mediator surface.
+
+/// Forward dependency graph keyed by upstream entity id.
+///
+/// Edges describe "if X changes, the listed dependents need to be
+/// re-evaluated / invalidated":
+///
+/// - `datum_to_datums[d]`: derived datums whose [`DatumSource`]
+///   references datum `d` (parent-datum edges).
+/// - `datum_to_solids[d]`: solids whose [`crate::primitives::solid::SolidAnchor::datum_id`]
+///   is `d` (anchor edges; slice 5 invalidates the location cache for
+///   these on a parent move; auto-transform of the solid geometry is
+///   deferred to a later sub-slice that takes a `&mut self` lock).
+/// - `vertex_to_datums[v]` / `edge_to_datums[e]` / `face_to_datums[f]`:
+///   derived datums whose source recipe references geometry. Used by
+///   the `vertex_moved` / `edge_changed` / `face_changed` notifiers
+///   the topology mutators call after an in-place geometry edit.
+///
+/// All edge maps allow many-to-many relationships — a single derived
+/// datum can list multiple parent datums (e.g. `AnglePlane`) and a
+/// single parent can have many dependents.
+#[derive(Debug, Default)]
+pub struct DatumGraph {
+    datum_to_datums: DashMap<DatumId, Vec<DatumId>>,
+    datum_to_solids: DashMap<DatumId, Vec<u32>>,
+    vertex_to_datums: DashMap<VertexId, Vec<DatumId>>,
+    edge_to_datums: DashMap<EdgeId, Vec<DatumId>>,
+    face_to_datums: DashMap<FaceId, Vec<DatumId>>,
+}
+
+impl DatumGraph {
+    /// Empty graph. `BRepModel::new()` constructs a fresh graph next
+    /// to its [`DatumStore`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register that `datum_id`'s evaluation depends on every entity
+    /// referenced by `source`. Idempotent per (upstream, downstream)
+    /// pair: re-registering the same edge does nothing.
+    ///
+    /// Called by `BRepModel::create_derived_datum` after a successful
+    /// `DatumStore::create_derived` insertion.
+    pub fn register_source(&self, datum_id: DatumId, source: &DatumSource) {
+        for parent in source.referenced_datums() {
+            push_unique(&self.datum_to_datums, parent, datum_id);
+        }
+        for v in source.referenced_vertices() {
+            push_unique(&self.vertex_to_datums, v, datum_id);
+        }
+        for e in source.referenced_edges() {
+            push_unique(&self.edge_to_datums, e, datum_id);
+        }
+        for f in source.referenced_faces() {
+            push_unique(&self.face_to_datums, f, datum_id);
+        }
+    }
+
+    /// Remove every edge that lists `datum_id` as a dependent — i.e.
+    /// "this datum no longer depends on anything". Inverse of
+    /// `register_source`. Used when a derived datum's source changes
+    /// (caller must `register_source` afterwards) and on
+    /// `BRepModel::delete_datum`.
+    ///
+    /// Cost: O(parents × siblings) per upstream, but the typical
+    /// derived datum has 1–3 parents and each parent has handful of
+    /// dependents — well below any concern for model sizes we target.
+    pub fn unregister_dependent(&self, datum_id: DatumId) {
+        remove_value_from_all(&self.datum_to_datums, datum_id);
+        remove_value_from_all(&self.vertex_to_datums, datum_id);
+        remove_value_from_all(&self.edge_to_datums, datum_id);
+        remove_value_from_all(&self.face_to_datums, datum_id);
+    }
+
+    /// Remove every dependent edge whose upstream is `datum_id`
+    /// (other datums or solids that depend on this datum). Used when
+    /// a datum is deleted — the dependents are now stale references
+    /// and the api-server's cascade-detach path will rebind them to
+    /// the world Origin.
+    pub fn unregister_upstream_datum(&self, datum_id: DatumId) {
+        self.datum_to_datums.remove(&datum_id);
+        self.datum_to_solids.remove(&datum_id);
+    }
+
+    /// Register that `solid_id` is anchored to `datum_id`. Edge is
+    /// idempotent.
+    pub fn register_solid_anchor(&self, solid_id: u32, datum_id: DatumId) {
+        push_unique(&self.datum_to_solids, datum_id, solid_id);
+    }
+
+    /// Remove the (datum → solid) edge. Used when a solid's anchor
+    /// is reassigned to a different datum or the solid is deleted.
+    pub fn unregister_solid_anchor(&self, solid_id: u32, datum_id: DatumId) {
+        if let Some(mut list) = self.datum_to_solids.get_mut(&datum_id) {
+            list.retain(|&s| s != solid_id);
+        }
+    }
+
+    /// Datums whose source recipe references the given parent datum.
+    /// Returns an owned `Vec` — typical lengths are 0-4 so the clone
+    /// is cheaper than holding a `DashMap` ref guard across the
+    /// re-evaluation walk.
+    pub fn datums_dependent_on_datum(&self, id: DatumId) -> Vec<DatumId> {
+        self.datum_to_datums
+            .get(&id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Solids anchored to the given datum.
+    pub fn solids_dependent_on_datum(&self, id: DatumId) -> Vec<u32> {
+        self.datum_to_solids
+            .get(&id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Datums whose source recipe references the given vertex.
+    pub fn datums_dependent_on_vertex(&self, id: VertexId) -> Vec<DatumId> {
+        self.vertex_to_datums
+            .get(&id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Datums whose source recipe references the given edge.
+    pub fn datums_dependent_on_edge(&self, id: EdgeId) -> Vec<DatumId> {
+        self.edge_to_datums
+            .get(&id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Datums whose source recipe references the given face.
+    pub fn datums_dependent_on_face(&self, id: FaceId) -> Vec<DatumId> {
+        self.face_to_datums
+            .get(&id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Number of (parent-datum, dependent-datum) edges. Test helper.
+    pub fn datum_edge_count(&self) -> usize {
+        self.datum_to_datums.iter().map(|e| e.value().len()).sum()
+    }
+
+    /// Number of (parent-datum, dependent-solid) edges. Test helper.
+    pub fn solid_edge_count(&self) -> usize {
+        self.datum_to_solids.iter().map(|e| e.value().len()).sum()
+    }
+}
+
+fn push_unique<K: Eq + std::hash::Hash + Clone, V: Eq + Copy>(
+    map: &DashMap<K, Vec<V>>,
+    key: K,
+    value: V,
+) {
+    let mut entry = map.entry(key).or_default();
+    if !entry.contains(&value) {
+        entry.push(value);
+    }
+}
+
+fn remove_value_from_all<K: Eq + std::hash::Hash + Clone, V: Eq + Copy>(
+    map: &DashMap<K, Vec<V>>,
+    target: V,
+) {
+    map.iter_mut().for_each(|mut entry| {
+        entry.value_mut().retain(|&v| v != target);
+    });
+    // Drop now-empty buckets to keep the map size proportional to
+    // active dependencies. `retain` accepts FnMut(&K, &mut V) -> bool.
+    map.retain(|_, v| !v.is_empty());
+}
+
+/// Per-solid memoization of [`LocationDescriptor`].
+///
+/// Entries are populated lazily by
+/// `BRepModel::solid_location_descriptor_cached`: cache miss recomputes
+/// via the existing `solid_location_descriptor` walker, cache hit
+/// returns a clone (descriptors are ~96 B). Invalidation is explicit —
+/// any kernel mutator that affects a solid's bbox or anchor (transforms,
+/// boolean ops, anchor reassignment, datum moves on the anchor datum,
+/// derived-datum chain that ends at the anchor) must call
+/// `invalidate(solid_id)` so the next read reads fresh state.
+///
+/// Conservative policy: when in doubt, invalidate. The recompute is
+/// O(faces × edges) over the outer shell, not catastrophic.
+#[derive(Debug, Default)]
+pub struct LocationDescriptorCache {
+    entries: DashMap<u32, LocationDescriptor>,
+}
+
+impl LocationDescriptorCache {
+    /// Empty cache. `BRepModel::new()` constructs a fresh cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cached descriptor for `solid_id`, or `None` on miss.
+    pub fn get(&self, solid_id: u32) -> Option<LocationDescriptor> {
+        self.entries.get(&solid_id).map(|e| e.value().clone())
+    }
+
+    /// Insert or replace the descriptor for the solid id carried in
+    /// `descriptor.solid_id`.
+    pub fn insert(&self, descriptor: LocationDescriptor) {
+        self.entries.insert(descriptor.solid_id, descriptor);
+    }
+
+    /// Drop the cached entry for `solid_id`. Safe to call on a miss.
+    pub fn invalidate(&self, solid_id: u32) {
+        self.entries.remove(&solid_id);
+    }
+
+    /// Drop every cached entry. Used after broad-impact ops (full
+    /// model transforms, replay reset) where tracking individual
+    /// solids would be more bookkeeping than the recompute is worth.
+    pub fn invalidate_all(&self) {
+        self.entries.clear();
+    }
+
+    /// Number of cached entries. Test helper.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

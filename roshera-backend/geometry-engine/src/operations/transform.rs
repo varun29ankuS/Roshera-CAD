@@ -75,6 +75,10 @@ pub fn transform_solid(
         validate_transformed_solid(model, solid)?;
     }
 
+    // Slice 5: vertices moved → solid bbox changed → location
+    // descriptor stale.
+    model.location_cache.invalidate(solid_id);
+
     // Record the operation for timeline / event-sourcing consumers.
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("transform_solid")
