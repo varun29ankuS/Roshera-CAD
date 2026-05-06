@@ -390,10 +390,16 @@ function sketchesToNodes(sketches: Map<string, ServerSketchSession>): TreeNode[]
     .sort((a, b) => a.created_at - b.created_at)
     .map((s, idx) => {
       const planeLabel = sketchPlaneLabel(s.plane)
-      const ptSuffix = s.points.length === 1 ? 'pt' : 'pts'
+      const totalPoints = s.shapes.reduce(
+        (sum, shape) => sum + shape.points.length,
+        0,
+      )
+      const ptSuffix = totalPoints === 1 ? 'pt' : 'pts'
+      const shapeSuffix =
+        s.shapes.length > 1 ? ` · ${s.shapes.length} shapes` : ''
       return {
         id: s.id,
-        name: `Sketch ${idx + 1} (${planeLabel} · ${s.points.length} ${ptSuffix})`,
+        name: `Sketch ${idx + 1} (${planeLabel} · ${totalPoints} ${ptSuffix}${shapeSuffix})`,
         type: 'sketch',
         symbol: symbolForType('sketch'),
         visible: true,

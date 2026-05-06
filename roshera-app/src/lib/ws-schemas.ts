@@ -98,11 +98,40 @@ const subElementSchema = z.object({
 
 // Backend `SketchSession` wire shape (snake_case as serialised by serde).
 // Mirrors `roshera-backend/api-server/src/sketch.rs::SketchSession`.
+//
+// Multi-shape model: a session carries `shapes: SketchShape[]`, each
+// with its own tool / role / points. The active (in-progress) shape
+// is invariantly the last element of `shapes`. The wire `plane` is
+// either a standard string (`"xy"|"xz"|"yz"`) or a `CustomPlane`
+// object — the latter is accepted via `z.unknown()` here because the
+// store's `SketchPlane` type is a discriminated TS union the Zod
+// schema doesn't try to validate structurally (any well-formed
+// session sent by our backend will deserialize).
+const sketchShapeSchema = z.object({
+  id: z.string(),
+  tool: z.enum(['polyline', 'rectangle', 'circle']),
+  role: z.enum(['outer', 'hole']),
+  points: z.array(z.tuple([z.number(), z.number()])),
+})
+
+// `plane` is either a standard-plane string (`"xy"|"xz"|"yz"`) or a
+// face-anchored custom plane object `{origin, u_axis, v_axis}`. Zod
+// can't elegantly carry the `SketchPlane` discriminated union from
+// the store, so we accept either shape and downstream consumers
+// type-assert via the `ServerSketchSession` interface.
+const sketchPlaneSchema = z.union([
+  z.enum(['xy', 'xz', 'yz']),
+  z.object({
+    origin: z.tuple([z.number(), z.number(), z.number()]),
+    u_axis: z.tuple([z.number(), z.number(), z.number()]),
+    v_axis: z.tuple([z.number(), z.number(), z.number()]),
+  }),
+])
+
 export const sketchSessionSchema = z.object({
   id: z.string(),
-  plane: z.enum(['xy', 'xz', 'yz']),
-  tool: z.enum(['polyline', 'rectangle', 'circle']),
-  points: z.array(z.tuple([z.number(), z.number()])),
+  plane: sketchPlaneSchema,
+  shapes: z.array(sketchShapeSchema),
   circle_segments: z.number(),
   created_at: z.number(),
   updated_at: z.number(),

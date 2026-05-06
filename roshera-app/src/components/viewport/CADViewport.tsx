@@ -12,6 +12,7 @@ import { ExtrudeGizmo } from './ExtrudeGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { SubElementHighlight } from './SubElementHighlight'
 import { ViewportContextMenu } from './ViewportContextMenu'
+import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { SketchOverlay } from './SketchOverlay'
 import { SketchPanel } from '@/components/panels/SketchPanel'
 import { useSceneStore } from '@/stores/scene-store'
@@ -95,6 +96,7 @@ export function CADViewport() {
       <ViewportHints />
       <ModeBanner />
       <ViewportContextMenu />
+      <ExtrudeHoverTooltip />
       <SketchPanel />
     </div>
   )

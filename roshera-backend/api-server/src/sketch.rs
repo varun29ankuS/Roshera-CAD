@@ -9,18 +9,20 @@
 //! sketch becomes a constrained 2D system — but the click-to-place
 //! workflow the frontend exposes today is much narrower:
 //!
-//!   * pick a plane (xy / xz / yz)
-//!   * pick a tool (polyline / rectangle / circle)
-//!   * drop an ordered list of (u, v) points on the plane
-//!   * finalise → polygon → extrude
+//!   * pick a plane (xy / xz / yz / face-derived)
+//!   * draw one or more shapes, each with its own tool
+//!     (polyline / rectangle / circle) and role (outer / hole)
+//!   * finalise → polygon (single shape) or face-with-holes (multi
+//!     shape, Slice 2) → extrude
 //!
 //! Modelling that as a `SketchSession` keyed by `Uuid` in api-server
 //! state keeps the entity boundary clean: no constraint-solver state
-//! bleeding into the request lifecycle, no UX-only concept (tool tag)
-//! bleeding into the kernel. Once the user finalises, we materialise
-//! the session into a closed 3D polygon and call the existing
-//! `extrude_profile` pipeline. The session itself never mutates the
-//! BRepModel — only the finalising extrude does.
+//! bleeding into the request lifecycle, no UX-only concept (tool tag,
+//! shape role) bleeding into the kernel. Once the user finalises, we
+//! materialise the session into a closed 3D polygon (or, in Slice 2,
+//! into multiple loops fed to the kernel's topology analyser) and
+//! call the existing `extrude_profile` pipeline. The session itself
+//! never mutates the BRepModel — only the finalising extrude does.
 //!
 //! # Concurrency
 //!
@@ -200,18 +202,66 @@ pub enum SketchTool {
     Circle,
 }
 
+/// Role a shape plays in the sketch's final extrusion. `Outer` is
+/// solid material; `Hole` is a void carved out of an outer shape that
+/// contains it. The kernel's topology analyser is what actually
+/// resolves nesting at extrude time (see Slice 2 of the multi-shape
+/// plan); the role tag is the user's stated intent and is what the
+/// analyser uses to pick orientation when the geometric containment
+/// alone is ambiguous (e.g., concentric shapes both drawn CCW).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShapeRole {
+    #[default]
+    Outer,
+    Hole,
+}
+
+/// A single drawn shape inside a sketch session. The session may carry
+/// many of these — e.g., one `Outer` rectangle plus several `Hole`
+/// circles for a bracket with mounting holes — and the multi-loop
+/// extrude pipeline lifts every shape onto the same plane to build a
+/// face with `outer_loop + inner_loops`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SketchShape {
+    pub id: Uuid,
+    pub tool: SketchTool,
+    #[serde(default)]
+    pub role: ShapeRole,
+    /// Confirmed in-plane (u, v) points in click order.
+    pub points: Vec<[f64; 2]>,
+}
+
+impl SketchShape {
+    fn new(tool: SketchTool, role: ShapeRole) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            tool,
+            role,
+            points: Vec::new(),
+        }
+    }
+}
+
 /// One in-progress sketch session. Serialised as the REST + WS payload
 /// directly — the wire format is the in-memory layout.
+///
+/// A session carries an ordered list of `shapes`; the **active** shape
+/// (the last in the vec) is the one legacy single-shape endpoints
+/// (`/point`, `/tool`, …) implicitly target. Multi-shape callers use
+/// the `/shape` endpoints to add, remove, or address shapes by index.
+/// The `shapes` vec is invariantly non-empty — the constructor seeds
+/// an initial shape and `delete_shape` refuses to remove the last.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchSession {
     pub id: Uuid,
     pub plane: SketchPlane,
-    pub tool: SketchTool,
-    /// Confirmed in-plane (u, v) points in click order.
-    pub points: Vec<[f64; 2]>,
-    /// Tessellation count for the circle tool. 64 by default; a value
-    /// below 8 is rejected on update because it produces a polygon
-    /// the kernel will struggle to extrude into a sealed solid.
+    /// Ordered list of drawn shapes. Always non-empty.
+    pub shapes: Vec<SketchShape>,
+    /// Default tessellation count for any `Circle` shape on this
+    /// session. 64 by default; a value below 8 is rejected on update
+    /// because it produces a polygon the kernel will struggle to
+    /// extrude into a sealed solid.
     pub circle_segments: u32,
     /// Wall-clock seconds since UNIX_EPOCH when the session was created.
     /// Falls back to `0` if the system clock is set before 1970.
@@ -226,12 +276,29 @@ impl SketchSession {
         Self {
             id: Uuid::new_v4(),
             plane,
-            tool,
-            points: Vec::new(),
+            shapes: vec![SketchShape::new(tool, ShapeRole::Outer)],
             circle_segments: 64,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Index of the currently-active shape — the one legacy
+    /// single-shape endpoints implicitly target. `None` only if the
+    /// session invariant has been violated.
+    pub fn active_shape_idx(&self) -> Option<usize> {
+        self.shapes.len().checked_sub(1)
+    }
+
+    pub fn active_shape(&self) -> Option<&SketchShape> {
+        self.shapes.last()
+    }
+
+    fn require_active_shape_mut(&mut self) -> Result<&mut SketchShape, SketchError> {
+        let session_id = self.id;
+        self.shapes
+            .last_mut()
+            .ok_or(SketchError::NoShapes(session_id))
     }
 }
 
@@ -272,6 +339,12 @@ pub enum SketchError {
          real number"
     )]
     NonFinitePoint { u: f64, v: f64 },
+    #[error("shape index {index} out of range for sketch {id} (len {len})")]
+    ShapeIndexOutOfRange { id: Uuid, index: usize, len: usize },
+    #[error("sketch {0} must contain at least one shape; cannot delete the last")]
+    CannotDeleteLastShape(Uuid),
+    #[error("sketch {0} has no shapes — session invariant violated")]
+    NoShapes(Uuid),
 }
 
 /// Thread-safe registry of in-progress sketches. Stored as a field on
@@ -310,14 +383,14 @@ impl SketchManager {
     pub fn add_point(&self, id: &Uuid, point: [f64; 2]) -> Result<SketchSession, SketchError> {
         validate_point(point)?;
         self.mutate(id, |s| {
-            s.points.push(point);
+            s.require_active_shape_mut()?.points.push(point);
             Ok(())
         })
     }
 
     pub fn pop_point(&self, id: &Uuid) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
-            s.points.pop();
+            s.require_active_shape_mut()?.points.pop();
             Ok(())
         })
     }
@@ -329,34 +402,41 @@ impl SketchManager {
         point: [f64; 2],
     ) -> Result<SketchSession, SketchError> {
         validate_point(point)?;
+        let session_id = *id;
         self.mutate(id, |s| {
-            if index >= s.points.len() {
+            let shape = s.require_active_shape_mut()?;
+            if index >= shape.points.len() {
                 return Err(SketchError::PointIndexOutOfRange {
-                    id: *id,
+                    id: session_id,
                     index,
-                    len: s.points.len(),
+                    len: shape.points.len(),
                 });
             }
-            s.points[index] = point;
+            shape.points[index] = point;
             Ok(())
         })
     }
 
     pub fn clear_points(&self, id: &Uuid) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
-            s.points.clear();
+            s.require_active_shape_mut()?.points.clear();
             Ok(())
         })
     }
 
     pub fn set_plane(&self, id: &Uuid, plane: SketchPlane) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
-            // A plane swap invalidates the existing in-plane points
-            // because (u, v) means different world axes per plane.
-            // Wipe them so the client knows to redraw on the new face.
+            // A plane swap invalidates every shape's (u, v) buffer
+            // because plane-local coordinates mean different world
+            // axes per plane. Wipe each shape's points so the client
+            // knows to redraw on the new face. Shapes themselves are
+            // preserved (tool + role survive) so the user keeps their
+            // structural plan when re-anchoring to a new face.
             if s.plane != plane {
                 s.plane = plane;
-                s.points.clear();
+                for shape in s.shapes.iter_mut() {
+                    shape.points.clear();
+                }
             }
             Ok(())
         })
@@ -366,10 +446,12 @@ impl SketchManager {
         self.mutate(id, |s| {
             // Tools have incompatible point semantics (polyline = N
             // vertices, rectangle = 2 anchors, circle = centre+edge).
-            // Reset the buffer so the new tool starts clean.
-            if s.tool != tool {
-                s.tool = tool;
-                s.points.clear();
+            // Reset only the active shape's buffer so the new tool
+            // starts clean while sibling shapes are untouched.
+            let shape = s.require_active_shape_mut()?;
+            if shape.tool != tool {
+                shape.tool = tool;
+                shape.points.clear();
             }
             Ok(())
         })
@@ -385,6 +467,119 @@ impl SketchManager {
         }
         self.mutate(id, |s| {
             s.circle_segments = segments;
+            Ok(())
+        })
+    }
+
+    /// Append a fresh shape to the session and make it the active one.
+    /// The new shape starts with no points; clients then drop points
+    /// onto it via the legacy `/point` endpoint (which targets the
+    /// active shape) or via the explicit `/shape/{idx}/point` route.
+    pub fn add_shape(
+        &self,
+        id: &Uuid,
+        tool: SketchTool,
+        role: ShapeRole,
+    ) -> Result<SketchSession, SketchError> {
+        self.mutate(id, |s| {
+            s.shapes.push(SketchShape::new(tool, role));
+            Ok(())
+        })
+    }
+
+    /// Remove the shape at `index`. Refuses to delete the last shape so
+    /// the session invariant (`shapes` non-empty) holds.
+    pub fn delete_shape(&self, id: &Uuid, index: usize) -> Result<SketchSession, SketchError> {
+        let session_id = *id;
+        self.mutate(id, |s| {
+            if index >= s.shapes.len() {
+                return Err(SketchError::ShapeIndexOutOfRange {
+                    id: session_id,
+                    index,
+                    len: s.shapes.len(),
+                });
+            }
+            if s.shapes.len() <= 1 {
+                return Err(SketchError::CannotDeleteLastShape(session_id));
+            }
+            s.shapes.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Re-tag a shape's role (Outer ↔ Hole). Points are preserved.
+    pub fn set_shape_role(
+        &self,
+        id: &Uuid,
+        index: usize,
+        role: ShapeRole,
+    ) -> Result<SketchSession, SketchError> {
+        let session_id = *id;
+        self.mutate(id, |s| {
+            let len = s.shapes.len();
+            let shape =
+                s.shapes
+                    .get_mut(index)
+                    .ok_or(SketchError::ShapeIndexOutOfRange {
+                        id: session_id,
+                        index,
+                        len,
+                    })?;
+            shape.role = role;
+            Ok(())
+        })
+    }
+
+    /// Change a specific shape's tool. Resets its points because tools
+    /// have incompatible point semantics.
+    pub fn set_shape_tool(
+        &self,
+        id: &Uuid,
+        index: usize,
+        tool: SketchTool,
+    ) -> Result<SketchSession, SketchError> {
+        let session_id = *id;
+        self.mutate(id, |s| {
+            let len = s.shapes.len();
+            let shape =
+                s.shapes
+                    .get_mut(index)
+                    .ok_or(SketchError::ShapeIndexOutOfRange {
+                        id: session_id,
+                        index,
+                        len,
+                    })?;
+            if shape.tool != tool {
+                shape.tool = tool;
+                shape.points.clear();
+            }
+            Ok(())
+        })
+    }
+
+    /// Append a point to a specific shape, addressed by index. The
+    /// legacy `/point` endpoint always targets the active shape; this
+    /// is the explicit form that lets clients edit a non-active shape
+    /// without making it active first.
+    pub fn add_point_to_shape(
+        &self,
+        id: &Uuid,
+        index: usize,
+        point: [f64; 2],
+    ) -> Result<SketchSession, SketchError> {
+        validate_point(point)?;
+        let session_id = *id;
+        self.mutate(id, |s| {
+            let len = s.shapes.len();
+            let shape =
+                s.shapes
+                    .get_mut(index)
+                    .ok_or(SketchError::ShapeIndexOutOfRange {
+                        id: session_id,
+                        index,
+                        len,
+                    })?;
+            shape.points.push(point);
             Ok(())
         })
     }
@@ -418,20 +613,33 @@ fn validate_point(point: [f64; 2]) -> Result<(), SketchError> {
 
 // ─── Polygon materialisation ────────────────────────────────────────
 
-/// Build the closed 2D polygon (in CCW orientation) implied by the
-/// session's tool + points. Returned in plane-local (u, v) coordinates;
-/// the caller lifts them onto the chosen plane.
+/// Build the closed 2D polygon (in CCW orientation) implied by a
+/// single shape's tool + points. Returned in plane-local (u, v)
+/// coordinates; the caller lifts them onto the chosen plane.
 ///
 /// Tolerance for the coincident-point check is hard-coded to `1e-9`.
 /// That is comfortably below the kernel's default vertex-merge
 /// tolerance, so any pair the kernel will collapse is also rejected
 /// here with a clearer error.
-pub fn materialise_polygon(session: &SketchSession) -> Result<Vec<[f64; 2]>, SketchError> {
-    match session.tool {
-        SketchTool::Polyline => materialise_polyline(&session.points),
-        SketchTool::Rectangle => materialise_rectangle(&session.points),
-        SketchTool::Circle => materialise_circle(&session.points, session.circle_segments),
+pub fn materialise_shape(
+    shape: &SketchShape,
+    circle_segments: u32,
+) -> Result<Vec<[f64; 2]>, SketchError> {
+    match shape.tool {
+        SketchTool::Polyline => materialise_polyline(&shape.points),
+        SketchTool::Rectangle => materialise_rectangle(&shape.points),
+        SketchTool::Circle => materialise_circle(&shape.points, circle_segments),
     }
+}
+
+/// Materialise the active (last) shape on the session. Used by the
+/// single-shape extrude path. Multi-loop callers walk `session.shapes`
+/// directly and call `materialise_shape` per entry.
+pub fn materialise_polygon(session: &SketchSession) -> Result<Vec<[f64; 2]>, SketchError> {
+    let shape = session
+        .active_shape()
+        .ok_or(SketchError::NoShapes(session.id))?;
+    materialise_shape(shape, session.circle_segments)
 }
 
 /// Lift a 2D polygon onto the session's plane.
@@ -561,9 +769,15 @@ impl From<SketchError> for ApiError {
             | SketchError::PolylineTooShort(_)
             | SketchError::DegenerateCircle { .. }
             | SketchError::DegenerateRectangle { .. }
-            | SketchError::NonFinitePoint { .. } => {
+            | SketchError::NonFinitePoint { .. }
+            | SketchError::ShapeIndexOutOfRange { .. }
+            | SketchError::CannotDeleteLastShape(_) => {
                 ApiError::new(ErrorCode::InvalidParameter, e.to_string())
             }
+            // NoShapes is an invariant violation — the constructor seeds
+            // an initial shape and `delete_shape` refuses the last one,
+            // so reaching this path means corrupted state.
+            SketchError::NoShapes(_) => ApiError::new(ErrorCode::Internal, e.to_string()),
         }
     }
 }
@@ -647,6 +861,38 @@ pub struct ExtrudeSketchBody {
 
 fn default_consume() -> bool {
     false
+}
+
+/// `POST /api/sketch/{id}/shape` body. Adds a fresh shape to the
+/// session. The new shape becomes the active one (last in the vec)
+/// and starts with no points; `role` defaults to `Outer` when the
+/// client doesn't specify it (the most common case — the user only
+/// flips a shape to `Hole` after they've drawn it inside an outer).
+#[derive(Debug, Deserialize)]
+pub struct AddShapeBody {
+    pub tool: SketchTool,
+    #[serde(default)]
+    pub role: ShapeRole,
+}
+
+/// `PUT /api/sketch/{id}/shape/{idx}/role` body.
+#[derive(Debug, Deserialize)]
+pub struct SetShapeRoleBody {
+    pub role: ShapeRole,
+}
+
+/// `PUT /api/sketch/{id}/shape/{idx}/tool` body.
+#[derive(Debug, Deserialize)]
+pub struct SetShapeToolBody {
+    pub tool: SketchTool,
+}
+
+/// `POST /api/sketch/{id}/shape/{idx}/point` body. Explicit per-shape
+/// point append, for clients that want to edit a non-active shape
+/// without making it active first.
+#[derive(Debug, Deserialize)]
+pub struct AddShapePointBody {
+    pub point: [f64; 2],
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -799,6 +1045,9 @@ pub async fn extrude_sketch(
     Json(body): Json<ExtrudeSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
+    use geometry_engine::operations::boolean::{
+        boolean_operation, BooleanOp, BooleanOptions,
+    };
     use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
     use geometry_engine::primitives::curve::{Line, ParameterRange};
     use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
@@ -820,11 +1069,27 @@ pub async fn extrude_sketch(
         .get(&id)
         .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
 
-    // Materialise the planar polygon (plane-local (u, v)) and lift it
-    // to world space. Validation lives in materialise_polygon — too
-    // few points, degenerate radius, etc.
-    let polygon_2d = materialise_polygon(&session)?;
-    let lifted = lift_polygon(&session, &polygon_2d);
+    if session.shapes.is_empty() {
+        // Defensive: SketchSession invariantly carries ≥1 shape (the
+        // constructor seeds one Outer; delete_shape refuses to remove
+        // the last). If we ever observe an empty `shapes`, that's an
+        // internal invariant violation, not user input.
+        return Err(ApiError::from(SketchError::NoShapes(session.id)));
+    }
+
+    // The session must contain at least one Outer shape: it's what we
+    // start the boolean fold from. A session of pure Holes would have
+    // no body to subtract from and is meaningless to extrude.
+    if !session
+        .shapes
+        .iter()
+        .any(|s| s.role == ShapeRole::Outer)
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch must contain at least one Outer shape to extrude".to_string(),
+        ));
+    }
 
     // Direction defaults to the plane normal so a user drawing on XY
     // who hits "extrude 5" gets a +Z prism without needing to specify.
@@ -844,49 +1109,107 @@ pub async fn extrude_sketch(
 
     let tolerance = Tolerance::default();
 
+    // Materialise every shape up-front (no kernel mutation yet) so
+    // any user-input error (degenerate rectangle, too-few points,
+    // collinear circle, …) fails the request before we touch the
+    // BRepModel — keeping the kernel free of orphan vertices/edges
+    // from a partial pipeline.
+    let mut shape_polygons: Vec<(ShapeRole, Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
+        Vec::with_capacity(session.shapes.len());
+    for shape in &session.shapes {
+        let polygon_2d = materialise_shape(shape, session.circle_segments)?;
+        let lifted = lift_polygon(&session, &polygon_2d);
+        shape_polygons.push((shape.role, shape.id, shape.tool, polygon_2d, lifted));
+    }
+
     let result_solid_id = {
         let mut model = state.model.write().await;
-        let mut profile_edges = Vec::with_capacity(lifted.len());
-        for i in 0..lifted.len() {
-            let p_start = lifted[i];
-            let p_end = lifted[(i + 1) % lifted.len()];
-            let v_start =
-                model
+
+        // Extrude each shape independently into its own solid. The
+        // kernel's `create_fresh_extrusion` does not honor a face's
+        // inner_loops on the side-face / top-cap walks, so we don't
+        // try to build a multi-loop profile here. Instead we fold
+        // separately-extruded solids via `boolean_operation`:
+        // Outer-after-base → Union, Hole → Difference. This produces
+        // the correct trimmed body (e.g. bracket-with-holes) using
+        // the well-tested boolean pipeline.
+        let mut shape_solids: Vec<(ShapeRole, u32)> = Vec::with_capacity(shape_polygons.len());
+        for (shape_idx, (role, _shape_id, _tool, _polygon_2d, lifted)) in
+            shape_polygons.iter().enumerate()
+        {
+            let mut profile_edges = Vec::with_capacity(lifted.len());
+            for i in 0..lifted.len() {
+                let p_start = lifted[i];
+                let p_end = lifted[(i + 1) % lifted.len()];
+                let v_start = model.vertices.add_or_find(
+                    p_start.x,
+                    p_start.y,
+                    p_start.z,
+                    tolerance.distance(),
+                );
+                let v_end = model
                     .vertices
-                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
-            let v_end = model
-                .vertices
-                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
-            if v_start == v_end {
-                return Err(ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!(
-                        "polygon[{i}] and polygon[{}] collapse to the same vertex \
-                         under tolerance {}",
-                        (i + 1) % lifted.len(),
-                        tolerance.distance()
-                    ),
-                ));
+                    .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
+                if v_start == v_end {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!(
+                            "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
+                             to the same vertex under tolerance {}",
+                            (i + 1) % lifted.len(),
+                            tolerance.distance()
+                        ),
+                    ));
+                }
+                let line = Line::new(p_start, p_end);
+                let curve_id = model.curves.add(Box::new(line));
+                let edge = Edge::new(
+                    0,
+                    v_start,
+                    v_end,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                );
+                let edge_id = model.edges.add(edge);
+                profile_edges.push(edge_id);
             }
-            let line = Line::new(p_start, p_end);
-            let curve_id = model.curves.add(Box::new(line));
-            let edge = Edge::new(
-                0,
-                v_start,
-                v_end,
-                curve_id,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            let edge_id = model.edges.add(edge);
-            profile_edges.push(edge_id);
+            let options = ExtrudeOptions {
+                direction,
+                distance: body.distance,
+                ..ExtrudeOptions::default()
+            };
+            let solid_id = extrude_profile(&mut model, profile_edges, options)
+                .map_err(ApiError::kernel_error)?;
+            shape_solids.push((*role, solid_id));
         }
-        let options = ExtrudeOptions {
-            direction,
-            distance: body.distance,
-            ..ExtrudeOptions::default()
-        };
-        extrude_profile(&mut model, profile_edges, options).map_err(ApiError::kernel_error)?
+
+        // Pick the first Outer solid as the fold base; merge every
+        // subsequent shape into it. The single-Outer-no-Holes case
+        // naturally skips the loop and returns the lone solid.
+        let base_idx = shape_solids
+            .iter()
+            .position(|(role, _)| *role == ShapeRole::Outer)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "sketch must contain at least one Outer shape to extrude".to_string(),
+                )
+            })?;
+        let mut accumulator = shape_solids[base_idx].1;
+        for (i, (role, sid)) in shape_solids.iter().enumerate() {
+            if i == base_idx {
+                continue;
+            }
+            let op = match role {
+                ShapeRole::Outer => BooleanOp::Union,
+                ShapeRole::Hole => BooleanOp::Difference,
+            };
+            accumulator =
+                boolean_operation(&mut model, accumulator, *sid, op, BooleanOptions::default())
+                    .map_err(ApiError::kernel_error)?;
+        }
+        accumulator
     };
 
     let (tri_mesh, tessellation_ms) = {
@@ -917,11 +1240,48 @@ pub async fn extrude_sketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("Sketch {result_solid_id}"));
+
+    // Build the multi-shape descriptor that powers the frontend's
+    // "what is being extruded" hover tooltip. Each entry carries the
+    // shape id, role (outer/hole), tool, and the materialised plane-
+    // local polygon — enough for the UI to label the body and render
+    // a thumbnail without re-querying the backend.
+    let shapes_descriptor: Vec<serde_json::Value> = shape_polygons
+        .iter()
+        .map(|(role, shape_id, tool, polygon_2d, _lifted)| {
+            serde_json::json!({
+                "id":      shape_id.to_string(),
+                "role":    role,
+                "tool":    tool,
+                "polygon": polygon_2d,
+            })
+        })
+        .collect();
+
+    // Active-shape (last) is preserved as a top-level convenience
+    // for legacy clients that haven't been updated to walk `shapes`
+    // yet. New code should prefer `shapes`.
+    #[allow(clippy::expect_used)]
+    // Reason: invariant — we already returned NoShapes above if
+    // `session.shapes` was empty, and `shape_polygons` is built
+    // 1:1 from `session.shapes`. `last()` therefore cannot be None.
+    let (
+        _active_role,
+        active_shape_id,
+        active_tool,
+        active_polygon,
+        _active_lifted,
+    ) = shape_polygons
+        .last()
+        .expect("shape_polygons non-empty by SketchSession invariant");
+
     let parameters = serde_json::json!({
         "sketch_id":      session.id.to_string(),
         "plane":          session.plane,
-        "tool":           session.tool,
-        "polygon":        polygon_2d,
+        "tool":           active_tool,
+        "shape_id":       active_shape_id.to_string(),
+        "polygon":        active_polygon,
+        "shapes":         shapes_descriptor,
         "direction":      [direction.x, direction.y, direction.z],
         "distance":       body.distance,
     });
@@ -975,6 +1335,74 @@ pub async fn extrude_sketch(
             "tessellation_ms": tessellation_ms,
         }
     })))
+}
+
+/// `POST /api/sketch/{id}/shape` — append a new shape to the session.
+/// The new shape becomes the active one. Used by the multi-shape UI
+/// flow: user draws a bracket outline, hits "Add shape", drops a
+/// circle inside it, marks it as a hole, repeats.
+pub async fn add_sketch_shape(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AddShapeBody>,
+) -> Result<Json<SketchSession>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state.sketches.add_shape(&id, body.tool, body.role)?;
+    broadcast_sketch_updated(&session);
+    Ok(Json(session))
+}
+
+/// `DELETE /api/sketch/{id}/shape/{idx}` — drop a shape. Refuses to
+/// delete the last remaining shape so the session invariant
+/// (`shapes` non-empty) holds.
+pub async fn delete_sketch_shape(
+    State(state): State<AppState>,
+    Path((id, idx)): Path<(String, usize)>,
+) -> Result<Json<SketchSession>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state.sketches.delete_shape(&id, idx)?;
+    broadcast_sketch_updated(&session);
+    Ok(Json(session))
+}
+
+/// `PUT /api/sketch/{id}/shape/{idx}/role` — flip a shape between
+/// `Outer` and `Hole` without redrawing it.
+pub async fn set_sketch_shape_role(
+    State(state): State<AppState>,
+    Path((id, idx)): Path<(String, usize)>,
+    Json(body): Json<SetShapeRoleBody>,
+) -> Result<Json<SketchSession>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state.sketches.set_shape_role(&id, idx, body.role)?;
+    broadcast_sketch_updated(&session);
+    Ok(Json(session))
+}
+
+/// `PUT /api/sketch/{id}/shape/{idx}/tool` — swap a specific shape's
+/// tool. Resets that shape's points (incompatible point semantics).
+pub async fn set_sketch_shape_tool(
+    State(state): State<AppState>,
+    Path((id, idx)): Path<(String, usize)>,
+    Json(body): Json<SetShapeToolBody>,
+) -> Result<Json<SketchSession>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state.sketches.set_shape_tool(&id, idx, body.tool)?;
+    broadcast_sketch_updated(&session);
+    Ok(Json(session))
+}
+
+/// `POST /api/sketch/{id}/shape/{idx}/point` — append a point to a
+/// specific shape, addressed by index. The legacy `/point` endpoint
+/// always targets the active shape; this is the explicit form.
+pub async fn add_sketch_shape_point(
+    State(state): State<AppState>,
+    Path((id, idx)): Path<(String, usize)>,
+    Json(body): Json<AddShapePointBody>,
+) -> Result<Json<SketchSession>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state.sketches.add_point_to_shape(&id, idx, body.point)?;
+    broadcast_sketch_updated(&session);
+    Ok(Json(session))
 }
 
 /// `POST /api/sketch/plane-from-face` — derive a `SketchPlane::Custom`
@@ -1051,7 +1479,26 @@ fn broadcast_sketch_deleted(id: Uuid) {
 /// Push a `SketchExtruded` frame linking a sketch session to the solid
 /// it produced. Frontends use this to attribute the solid back to the
 /// sketch in the timeline panel.
+///
+/// The frame carries the full `shapes` descriptor (one entry per
+/// SketchShape: id, role, tool, point count) so the timeline /
+/// inspector UI can render a multi-shape summary without needing a
+/// second round-trip to fetch the (now-deleted, if `consume=true`)
+/// sketch session.
 fn broadcast_sketch_extruded(session: &SketchSession, object_id: &str, solid_id: u32) {
+    let active_tool = session.active_shape().map(|s| s.tool);
+    let shapes: Vec<serde_json::Value> = session
+        .shapes
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id":          s.id.to_string(),
+                "role":        s.role,
+                "tool":        s.tool,
+                "point_count": s.points.len(),
+            })
+        })
+        .collect();
     publish_sketch_frame(
         "SketchExtruded",
         Some(serde_json::json!({
@@ -1059,7 +1506,8 @@ fn broadcast_sketch_extruded(session: &SketchSession, object_id: &str, solid_id:
             "object_id": object_id,
             "solid_id":  solid_id,
             "plane":     session.plane,
-            "tool":      session.tool,
+            "tool":      active_tool,
+            "shapes":    shapes,
         })),
     );
 }
@@ -1085,17 +1533,32 @@ fn publish_sketch_frame(kind: &str, payload: Option<serde_json::Value>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rectangle_materialises_to_four_ccw_corners() {
-        let session = SketchSession {
+    /// Shorthand for building a session with a single shape carrying
+    /// the supplied tool + points. Mirrors the old struct-literal
+    /// pattern most tests used before the multi-shape rewrite.
+    fn session_with(plane: SketchPlane, tool: SketchTool, points: Vec<[f64; 2]>) -> SketchSession {
+        SketchSession {
             id: Uuid::new_v4(),
-            plane: SketchPlane::XY,
-            tool: SketchTool::Rectangle,
-            points: vec![[2.0, 1.0], [-3.0, -4.0]],
+            plane,
+            shapes: vec![SketchShape {
+                id: Uuid::new_v4(),
+                tool,
+                role: ShapeRole::Outer,
+                points,
+            }],
             circle_segments: 64,
             created_at: 0,
             updated_at: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn rectangle_materialises_to_four_ccw_corners() {
+        let session = session_with(
+            SketchPlane::XY,
+            SketchTool::Rectangle,
+            vec![[2.0, 1.0], [-3.0, -4.0]],
+        );
         let polygon = materialise_polygon(&session).expect("rectangle materialises");
         assert_eq!(polygon.len(), 4);
         // Min-min corner should be first.
@@ -1112,15 +1575,12 @@ mod tests {
 
     #[test]
     fn circle_materialises_n_samples_around_radius() {
-        let session = SketchSession {
-            id: Uuid::new_v4(),
-            plane: SketchPlane::XY,
-            tool: SketchTool::Circle,
-            points: vec![[0.0, 0.0], [5.0, 0.0]],
-            circle_segments: 16,
-            created_at: 0,
-            updated_at: 0,
-        };
+        let mut session = session_with(
+            SketchPlane::XY,
+            SketchTool::Circle,
+            vec![[0.0, 0.0], [5.0, 0.0]],
+        );
+        session.circle_segments = 16;
         let polygon = materialise_polygon(&session).expect("circle materialises");
         assert_eq!(polygon.len(), 16);
         for p in &polygon {
@@ -1131,15 +1591,11 @@ mod tests {
 
     #[test]
     fn rectangle_rejects_degenerate_width() {
-        let session = SketchSession {
-            id: Uuid::new_v4(),
-            plane: SketchPlane::XY,
-            tool: SketchTool::Rectangle,
-            points: vec![[1.0, 0.0], [1.0, 5.0]],
-            circle_segments: 64,
-            created_at: 0,
-            updated_at: 0,
-        };
+        let session = session_with(
+            SketchPlane::XY,
+            SketchTool::Rectangle,
+            vec![[1.0, 0.0], [1.0, 5.0]],
+        );
         assert!(matches!(
             materialise_polygon(&session),
             Err(SketchError::DegenerateRectangle { .. })
@@ -1148,15 +1604,11 @@ mod tests {
 
     #[test]
     fn polyline_strips_repeated_terminal_point() {
-        let session = SketchSession {
-            id: Uuid::new_v4(),
-            plane: SketchPlane::XY,
-            tool: SketchTool::Polyline,
-            points: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]],
-            circle_segments: 64,
-            created_at: 0,
-            updated_at: 0,
-        };
+        let session = session_with(
+            SketchPlane::XY,
+            SketchTool::Polyline,
+            vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]],
+        );
         let polygon = materialise_polygon(&session).expect("polyline materialises");
         assert_eq!(polygon.len(), 3);
     }
@@ -1172,63 +1624,210 @@ mod tests {
     }
 
     #[test]
-    fn add_pop_set_point_update_session_state() {
+    fn create_seeds_one_outer_shape() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
-        let s1 = mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
-        assert_eq!(s1.points, vec![[1.0, 2.0]]);
-        let s2 = mgr.add_point(&s.id, [3.0, 4.0]).expect("add");
-        assert_eq!(s2.points.len(), 2);
-        let s3 = mgr.set_point(&s.id, 0, [7.0, 8.0]).expect("set");
-        assert_eq!(s3.points[0], [7.0, 8.0]);
-        let s4 = mgr.pop_point(&s.id).expect("pop");
-        assert_eq!(s4.points.len(), 1);
+        assert_eq!(s.shapes.len(), 1);
+        assert_eq!(s.shapes[0].tool, SketchTool::Polyline);
+        assert_eq!(s.shapes[0].role, ShapeRole::Outer);
+        assert!(s.shapes[0].points.is_empty());
     }
 
     #[test]
-    fn set_tool_clears_points_when_tool_changes() {
+    fn add_pop_set_point_update_active_shape() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        let s1 = mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
+        assert_eq!(s1.shapes[0].points, vec![[1.0, 2.0]]);
+        let s2 = mgr.add_point(&s.id, [3.0, 4.0]).expect("add");
+        assert_eq!(s2.shapes[0].points.len(), 2);
+        let s3 = mgr.set_point(&s.id, 0, [7.0, 8.0]).expect("set");
+        assert_eq!(s3.shapes[0].points[0], [7.0, 8.0]);
+        let s4 = mgr.pop_point(&s.id).expect("pop");
+        assert_eq!(s4.shapes[0].points.len(), 1);
+    }
+
+    #[test]
+    fn set_tool_clears_active_shape_points_when_tool_changes() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
         let after = mgr.set_tool(&s.id, SketchTool::Rectangle).expect("tool");
-        assert!(after.points.is_empty());
+        assert!(after.shapes[0].points.is_empty());
+        assert_eq!(after.shapes[0].tool, SketchTool::Rectangle);
     }
 
     #[test]
-    fn set_plane_clears_points_when_plane_changes() {
+    fn set_plane_clears_every_shapes_points() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
+        // Add a second shape with its own points so we can prove the
+        // plane swap clears all of them, not just the active one.
+        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+            .expect("add shape");
+        mgr.add_point(&s.id, [0.0, 0.0]).expect("centre");
+        mgr.add_point(&s.id, [1.0, 0.0]).expect("edge");
         let after = mgr.set_plane(&s.id, SketchPlane::YZ).expect("plane");
-        assert!(after.points.is_empty());
         assert_eq!(after.plane, SketchPlane::YZ);
+        for shape in &after.shapes {
+            assert!(shape.points.is_empty());
+        }
     }
 
     #[test]
     fn lift_polygon_routes_uv_to_world_axes() {
-        let session = SketchSession {
-            id: Uuid::new_v4(),
-            plane: SketchPlane::YZ,
-            tool: SketchTool::Rectangle,
-            points: vec![[0.0, 0.0], [2.0, 3.0]],
-            circle_segments: 64,
-            created_at: 0,
-            updated_at: 0,
-        };
+        let session = session_with(
+            SketchPlane::YZ,
+            SketchTool::Rectangle,
+            vec![[0.0, 0.0], [2.0, 3.0]],
+        );
         let polygon = materialise_polygon(&session).expect("yz rect");
         let lifted = lift_polygon(&session, &polygon);
-        // Yz plane: u → world Y, v → world Z, X = 0.
+        // YZ plane: u → world Y, v → world Z, X = 0.
         for p in &lifted {
             assert_eq!(p.x, 0.0);
         }
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)] // Test code: failure is the assertion.
     fn add_point_rejects_non_finite() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
         let err = mgr.add_point(&s.id, [f64::NAN, 0.0]).unwrap_err();
         assert!(matches!(err, SketchError::NonFinitePoint { .. }));
+    }
+
+    #[test]
+    fn add_shape_appends_and_makes_active() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        let after = mgr
+            .add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+            .expect("add shape");
+        assert_eq!(after.shapes.len(), 2);
+        assert_eq!(after.shapes[1].tool, SketchTool::Circle);
+        assert_eq!(after.shapes[1].role, ShapeRole::Hole);
+        // Active = last; legacy /point now flows to the new circle.
+        let with_centre = mgr.add_point(&s.id, [0.0, 0.0]).expect("centre");
+        assert_eq!(with_centre.shapes[0].points.len(), 0);
+        assert_eq!(with_centre.shapes[1].points, vec![[0.0, 0.0]]);
+    }
+
+    #[test]
+    fn delete_shape_refuses_to_remove_last() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        let err = mgr.delete_shape(&s.id, 0).expect_err("must reject");
+        assert!(matches!(err, SketchError::CannotDeleteLastShape(_)));
+    }
+
+    #[test]
+    fn delete_shape_removes_at_index_when_multiple_remain() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+            .expect("hole");
+        mgr.add_shape(&s.id, SketchTool::Rectangle, ShapeRole::Hole)
+            .expect("rect");
+        let after = mgr.delete_shape(&s.id, 1).expect("delete middle");
+        assert_eq!(after.shapes.len(), 2);
+        assert_eq!(after.shapes[0].tool, SketchTool::Polyline);
+        assert_eq!(after.shapes[1].tool, SketchTool::Rectangle);
+    }
+
+    #[test]
+    fn delete_shape_rejects_out_of_range() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+            .expect("hole");
+        let err = mgr.delete_shape(&s.id, 7).expect_err("oob");
+        assert!(matches!(err, SketchError::ShapeIndexOutOfRange { .. }));
+    }
+
+    #[test]
+    fn set_shape_role_flips_outer_to_hole_without_clearing() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Rectangle);
+        mgr.add_point(&s.id, [0.0, 0.0]).expect("a");
+        mgr.add_point(&s.id, [1.0, 1.0]).expect("b");
+        let after = mgr
+            .set_shape_role(&s.id, 0, ShapeRole::Hole)
+            .expect("flip");
+        assert_eq!(after.shapes[0].role, ShapeRole::Hole);
+        // Points must be preserved across a role flip — only tool
+        // changes invalidate them.
+        assert_eq!(after.shapes[0].points.len(), 2);
+    }
+
+    #[test]
+    fn set_shape_tool_clears_points_only_for_target_index() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Rectangle);
+        mgr.add_point(&s.id, [0.0, 0.0]).expect("a");
+        mgr.add_shape(&s.id, SketchTool::Circle, ShapeRole::Hole)
+            .expect("hole");
+        mgr.add_point(&s.id, [3.0, 3.0]).expect("centre");
+        // Swap shape 0's tool — only its points should clear.
+        let after = mgr
+            .set_shape_tool(&s.id, 0, SketchTool::Polyline)
+            .expect("swap");
+        assert!(after.shapes[0].points.is_empty());
+        assert_eq!(after.shapes[1].points, vec![[3.0, 3.0]]);
+    }
+
+    #[test]
+    fn add_point_to_shape_targets_specific_index() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        mgr.add_shape(&s.id, SketchTool::Polyline, ShapeRole::Hole)
+            .expect("hole");
+        // Append into shape 0 explicitly even though shape 1 is active.
+        let after = mgr
+            .add_point_to_shape(&s.id, 0, [9.0, 9.0])
+            .expect("explicit");
+        assert_eq!(after.shapes[0].points, vec![[9.0, 9.0]]);
+        assert!(after.shapes[1].points.is_empty());
+    }
+
+    #[test]
+    fn add_point_to_shape_rejects_oob() {
+        let mgr = SketchManager::new();
+        let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
+        let err = mgr
+            .add_point_to_shape(&s.id, 5, [0.0, 0.0])
+            .expect_err("oob");
+        assert!(matches!(err, SketchError::ShapeIndexOutOfRange { .. }));
+    }
+
+    #[test]
+    fn shape_role_round_trips_through_serde() {
+        for role in [ShapeRole::Outer, ShapeRole::Hole] {
+            let s = serde_json::to_string(&role).expect("ser");
+            let back: ShapeRole = serde_json::from_str(&s).expect("de");
+            assert_eq!(role, back);
+        }
+        // Wire format is the lowercase variant name.
+        assert_eq!(
+            serde_json::to_value(ShapeRole::Outer).expect("v"),
+            serde_json::json!("outer")
+        );
+        assert_eq!(
+            serde_json::to_value(ShapeRole::Hole).expect("v"),
+            serde_json::json!("hole")
+        );
+    }
+
+    #[test]
+    fn shape_role_defaults_to_outer_when_missing_in_payload() {
+        // The `role` field has #[serde(default)] so older clients
+        // (and the AddShapeBody when role is omitted) get Outer.
+        let raw = r#"{"id":"00000000-0000-0000-0000-000000000000",
+                       "tool":"polyline","points":[]}"#;
+        let shape: SketchShape = serde_json::from_str(raw).expect("de");
+        assert_eq!(shape.role, ShapeRole::Outer);
     }
 
     #[test]
@@ -1291,4 +1890,5 @@ mod tests {
             assert_eq!(plane, back);
         }
     }
+
 }
