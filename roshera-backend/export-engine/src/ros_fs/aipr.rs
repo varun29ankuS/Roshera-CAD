@@ -51,7 +51,14 @@ impl TrackingLevel {
     }
 }
 
-/// Privacy settings for tracking
+/// Privacy settings for tracking.
+///
+/// Model identity is carried by the opaque `[u8; 32]` `model_id` on
+/// each `AICommand`. A name-based `allowed_models` whitelist used to
+/// live here, but with no resolution path from the 32-byte hash to a
+/// human name the field could not actually gate writes — it has been
+/// removed. Re-introduce a model-identity gate at the AI integration
+/// layer if and when one is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivacySettings {
     pub anonymize_prompts: bool,
@@ -59,7 +66,6 @@ pub struct PrivacySettings {
     pub exclude_responses: bool,
     pub local_only: bool,
     pub retention_days: u32,
-    pub allowed_models: Option<Vec<String>>,
     pub pii_detection: bool,
 }
 
@@ -70,8 +76,7 @@ impl Default for PrivacySettings {
             hash_only_mode: false,
             exclude_responses: false,
             local_only: false,
-            retention_days: 0,    // 0 = no automatic deletion
-            allowed_models: None, // None = all models allowed
+            retention_days: 0, // 0 = no automatic deletion
             pii_detection: true,
         }
     }
@@ -86,7 +91,6 @@ impl PrivacySettings {
             exclude_responses: true,
             local_only: true,
             retention_days: 30,
-            allowed_models: Some(vec!["approved_model_v1".to_string()]),
             pii_detection: true,
         }
     }
@@ -99,7 +103,6 @@ impl PrivacySettings {
             exclude_responses: false,
             local_only: false,
             retention_days: 365, // 1 year retention
-            allowed_models: None,
             pii_detection: true,
         }
     }
@@ -414,17 +417,6 @@ impl AICommandTracker {
         compute_time_ms: u32,
         parameters: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<[u8; 16]> {
-        // Check if model is allowed
-        if let Some(ref allowed) = self.header.privacy_settings.allowed_models {
-            let model_name = format!("{:?}", model_id); // In production, use proper model name lookup
-            if !allowed.iter().any(|m| m == &model_name) {
-                return Err(RosFileError::Other {
-                    message: "Model not in allowed list".to_string(),
-                    source: None,
-                });
-            }
-        }
-
         // Get sequence number for this session
         let sequence_num = self
             .sessions

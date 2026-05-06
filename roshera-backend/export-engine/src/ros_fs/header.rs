@@ -50,7 +50,17 @@ impl Endianness {
     }
 }
 
-/// Feature flags as per v3 spec
+/// Feature flags as per v3 spec.
+///
+/// Only four bits are exposed as public API today: signature (0),
+/// encryption (4), ai_provenance (5), and timestamped (9) — the file
+/// modification time, not RFC 3161. Bits 1, 2, 3, 6, 7, 8, 10, 11 are
+/// reserved in the on-disk layout; the format previously exposed
+/// thumbnails / extended-precision / animation / blockchain / multisig
+/// / HSM-signed / redacted / collaborative builders, all of which were
+/// scaffolding for features Roshera does not ship. Re-add a builder
+/// here when (and only when) the corresponding feature is actually
+/// implemented in the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FeatureFlags(u64);
 
@@ -63,55 +73,19 @@ impl FeatureFlags {
     pub fn has_signature(&self) -> bool {
         self.0 & (1 << 0) != 0
     }
-    pub fn has_thumbnails(&self) -> bool {
-        self.0 & (1 << 1) != 0
-    }
-    pub fn extended_precision(&self) -> bool {
-        self.0 & (1 << 2) != 0
-    }
-    pub fn animation_data(&self) -> bool {
-        self.0 & (1 << 3) != 0
-    }
     pub fn encrypted(&self) -> bool {
         self.0 & (1 << 4) != 0
     }
     pub fn ai_provenance(&self) -> bool {
         self.0 & (1 << 5) != 0
     }
-    pub fn blockchain(&self) -> bool {
-        self.0 & (1 << 6) != 0
-    }
-    pub fn multisig(&self) -> bool {
-        self.0 & (1 << 7) != 0
-    }
-    pub fn hsm_signed(&self) -> bool {
-        self.0 & (1 << 8) != 0
-    }
     pub fn timestamped(&self) -> bool {
         self.0 & (1 << 9) != 0
-    }
-    pub fn redacted(&self) -> bool {
-        self.0 & (1 << 10) != 0
-    }
-    pub fn collaborative(&self) -> bool {
-        self.0 & (1 << 11) != 0
     }
 
     // Setters (builder pattern)
     pub fn with_signature(mut self) -> Self {
         self.0 |= 1 << 0;
-        self
-    }
-    pub fn with_thumbnails(mut self) -> Self {
-        self.0 |= 1 << 1;
-        self
-    }
-    pub fn with_extended_precision(mut self) -> Self {
-        self.0 |= 1 << 2;
-        self
-    }
-    pub fn with_animation_data(mut self) -> Self {
-        self.0 |= 1 << 3;
         self
     }
     pub fn with_encryption(mut self) -> Self {
@@ -122,28 +96,8 @@ impl FeatureFlags {
         self.0 |= 1 << 5;
         self
     }
-    pub fn with_blockchain(mut self) -> Self {
-        self.0 |= 1 << 6;
-        self
-    }
-    pub fn with_multisig(mut self) -> Self {
-        self.0 |= 1 << 7;
-        self
-    }
-    pub fn with_hsm_signed(mut self) -> Self {
-        self.0 |= 1 << 8;
-        self
-    }
     pub fn with_timestamped(mut self) -> Self {
         self.0 |= 1 << 9;
-        self
-    }
-    pub fn with_redacted(mut self) -> Self {
-        self.0 |= 1 << 10;
-        self
-    }
-    pub fn with_collaborative(mut self) -> Self {
-        self.0 |= 1 << 11;
         self
     }
 
@@ -182,7 +136,7 @@ pub struct FileHeader {
     // Security features (32 bytes)
     pub encryption_algo: u8, // 0=none, 1=AES, 2=ChaCha
     pub kdf_algo: u8,        // 0=none, 1=PBKDF2, 2=Argon2
-    pub signature_algo: u8,  // 0=none, 1=Ed25519, 2=ECDSA
+    pub signature_algo: u8,  // 0=none, 1=Ed25519 (no other algorithms accepted)
     pub ai_tracking: u8,     // 0=none, 1=basic, 2=detailed, 3=forensic
     pub kdf_iterations: u32,
     pub kdf_salt: [u8; 16],
@@ -622,7 +576,28 @@ mod tests {
         assert!(flags.encrypted());
         assert!(flags.ai_provenance());
         assert!(flags.has_signature());
-        assert!(!flags.blockchain());
+        assert!(!flags.timestamped());
+    }
+
+    #[test]
+    fn test_reserved_bits_round_trip_unchanged() {
+        // The on-disk layout reserves bits 1, 2, 3, 6, 7, 8, 10, 11 even
+        // though the public API does not expose them. A header carrying
+        // those raw bits (e.g. produced by a future writer) must
+        // round-trip unmodified through the read/write path so that
+        // forward-compat behaviour stays intact.
+        let raw_reserved: u64 = (1 << 1) | (1 << 2) | (1 << 6) | (1 << 11);
+        let header = FileHeader::builder()
+            .with_feature_flags(FeatureFlags::from(raw_reserved))
+            .build();
+
+        let mut buffer = Cursor::new(vec![0u8; HEADER_SIZE]);
+        let mut h = header.clone();
+        h.write_to(&mut buffer).unwrap();
+
+        buffer.seek(SeekFrom::Start(0)).unwrap();
+        let read_header = FileHeader::read_from(&mut buffer).unwrap();
+        assert_eq!(read_header.feature_flags.as_u64(), raw_reserved);
     }
 
     #[test]
