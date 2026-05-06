@@ -102,14 +102,18 @@ impl Principal {
     }
 }
 
-/// Access constraints
+/// Access constraints.
+///
+/// Time windows and MFA-required gates are the only constraints whose
+/// semantics are unambiguous at the file-format level. IP-range,
+/// geographic location, and device-type constraints belong to the
+/// network / identity layer that owns the request, not to the .ros
+/// chunk that grants access — they were dropped together with the
+/// CIDR-matching placeholder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Constraint {
     TimeWindow { start: u64, end: u64 },
-    IpRange { ranges: Vec<String> },
     MfaRequired,
-    Location { allowed_regions: Vec<String> },
-    DeviceType { allowed_types: Vec<String> },
 }
 
 impl Constraint {
@@ -118,24 +122,8 @@ impl Constraint {
             Constraint::TimeWindow { start, end } => {
                 ctx.timestamp >= *start && ctx.timestamp <= *end
             }
-            Constraint::IpRange { ranges } => ranges
-                .iter()
-                .any(|range| self.ip_in_range(&ctx.ip_address, range)),
             Constraint::MfaRequired => ctx.user.mfa_verified,
-            Constraint::Location { allowed_regions } => ctx
-                .location
-                .as_ref()
-                .map_or(false, |loc| allowed_regions.contains(loc)),
-            Constraint::DeviceType { allowed_types } => ctx
-                .device_type
-                .as_ref()
-                .map_or(false, |dev| allowed_types.contains(dev)),
         }
-    }
-
-    fn ip_in_range(&self, ip: &str, range: &str) -> bool {
-        // Simple implementation - in production use proper CIDR matching
-        ip.starts_with(range.trim_end_matches("*"))
     }
 }
 
@@ -179,8 +167,6 @@ pub struct AccessContext {
     pub user: UserContext,
     pub timestamp: u64,
     pub ip_address: String,
-    pub location: Option<String>,
-    pub device_type: Option<String>,
     pub request_id: String,
 }
 
@@ -190,8 +176,6 @@ impl AccessContext {
             user,
             timestamp: current_time_ms(),
             ip_address,
-            location: None,
-            device_type: None,
             request_id: crate::ros_fs::util::format_uuid(&crate::ros_fs::util::random_16()),
         }
     }

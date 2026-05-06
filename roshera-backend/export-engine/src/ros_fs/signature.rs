@@ -2,19 +2,25 @@
 
 //! Digital Signature & Verification (.ros v3 SIGN chunk)
 //!
-//! Core functionality for file signing with Ed25519 and multi-signature support
+//! One Ed25519 signature per file, full stop. M-of-N multisig and
+//! ECDSA were scaffolding for enterprise-CAD scenarios Roshera does
+//! not target; the file format reserves the on-disk SIGN chunk shape
+//! but the public API now signs and verifies a single record.
 
 use crate::ros_fs::util::{current_time_ms, sha256, to_hex};
 use crate::ros_fs::{Result, SignatureError};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-/// Supported signature algorithms
+/// Supported signature algorithms.
+///
+/// Ed25519 is the only signing algorithm Roshera accepts. The `None`
+/// variant exists so an unsigned file can be represented in the on-disk
+/// header byte (`signature_algo = 0`) without forcing an `Option<…>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignatureAlgorithm {
     None = 0,
     Ed25519 = 1,
-    Ecdsa = 2,
 }
 
 /// File signature metadata
@@ -44,30 +50,17 @@ pub struct SignatureRecord {
     pub public_key: Vec<u8>,
     pub signature: Vec<u8>,
     pub metadata: FileSignatureMetadata,
-    pub certificate_hash: Option<[u8; 32]>, // SHA-256 of certificate if present
 }
 
-/// The .ros v3 SIGN chunk
+/// The .ros v3 SIGN chunk — exactly one Ed25519 signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureChunk {
-    pub signers: Vec<SignatureRecord>,
-    pub multisig_threshold: Option<u8>, // M-of-N threshold
+    pub signer: SignatureRecord,
 }
 
 impl SignatureChunk {
-    pub fn new() -> Self {
-        SignatureChunk {
-            signers: Vec::new(),
-            multisig_threshold: None,
-        }
-    }
-
-    pub fn add_signature(&mut self, record: SignatureRecord) {
-        self.signers.push(record);
-    }
-
-    pub fn set_threshold(&mut self, threshold: u8) {
-        self.multisig_threshold = Some(threshold);
+    pub fn new(signer: SignatureRecord) -> Self {
+        SignatureChunk { signer }
     }
 
     /// Serialize to bytes
@@ -120,7 +113,6 @@ impl FileSigner {
             public_key: self.verifying_key.as_bytes().to_vec(),
             signature: signature.to_bytes().to_vec(),
             metadata: FileSignatureMetadata::new(file_id, self.signer_id),
-            certificate_hash: None,
         })
     }
 
@@ -133,7 +125,7 @@ impl FileSigner {
 pub struct SignatureVerifier;
 
 impl SignatureVerifier {
-    /// Verify a single signature
+    /// Verify a single signature record against file data.
     pub fn verify_signature(file_data: &[u8], record: &SignatureRecord) -> Result<bool> {
         if record.algorithm != SignatureAlgorithm::Ed25519 {
             return Err(SignatureError::InvalidSignature {
@@ -169,50 +161,9 @@ impl SignatureVerifier {
         Ok(verifying_key.verify(&data_hash, &signature).is_ok())
     }
 
-    /// Verify all signatures in a chunk
-    pub fn verify_chunk(file_data: &[u8], chunk: &SignatureChunk) -> Result<(usize, bool)> {
-        let mut valid_count = 0;
-
-        for record in &chunk.signers {
-            if Self::verify_signature(file_data, record)? {
-                valid_count += 1;
-            }
-        }
-
-        let threshold_met = match chunk.multisig_threshold {
-            Some(threshold) => valid_count >= threshold as usize,
-            None => valid_count == chunk.signers.len(),
-        };
-
-        Ok((valid_count, threshold_met))
-    }
-}
-
-/// Multi-signature builder
-pub struct MultiSigBuilder {
-    chunk: SignatureChunk,
-}
-
-impl MultiSigBuilder {
-    pub fn new(threshold: Option<u8>) -> Self {
-        let mut chunk = SignatureChunk::new();
-        chunk.multisig_threshold = threshold;
-        MultiSigBuilder { chunk }
-    }
-
-    pub fn add_signer(
-        mut self,
-        signer: &FileSigner,
-        file_data: &[u8],
-        file_id: [u8; 16],
-    ) -> Result<Self> {
-        let record = signer.sign_file(file_data, file_id)?;
-        self.chunk.add_signature(record);
-        Ok(self)
-    }
-
-    pub fn build(self) -> SignatureChunk {
-        self.chunk
+    /// Verify the single Ed25519 signature carried by a SIGN chunk.
+    pub fn verify_chunk(file_data: &[u8], chunk: &SignatureChunk) -> Result<bool> {
+        Self::verify_signature(file_data, &chunk.signer)
     }
 }
 
@@ -237,36 +188,18 @@ mod tests {
     }
 
     #[test]
-    fn test_multisig() {
-        let signer1 = FileSigner::new(SigningKey::generate(&mut OsRng), [1u8; 16]);
-        let signer2 = FileSigner::new(SigningKey::generate(&mut OsRng), [2u8; 16]);
+    fn test_chunk_round_trip() {
+        let signer = FileSigner::new(SigningKey::generate(&mut OsRng), [7u8; 16]);
+        let data = b"chunk payload";
+        let file_id = [11u8; 16];
 
-        let data = b"Multi-signed file";
-        let file_id = [99u8; 16];
-
-        // Build 2-of-2 multisig
-        let chunk = MultiSigBuilder::new(Some(2))
-            .add_signer(&signer1, data, file_id)
-            .unwrap()
-            .add_signer(&signer2, data, file_id)
-            .unwrap()
-            .build();
-
-        let (valid, threshold_met) = SignatureVerifier::verify_chunk(data, &chunk).unwrap();
-        assert_eq!(valid, 2);
-        assert!(threshold_met);
-    }
-
-    #[test]
-    fn test_serialization() {
-        let chunk = SignatureChunk {
-            signers: vec![],
-            multisig_threshold: Some(3),
-        };
+        let record = signer.sign_file(data, file_id).unwrap();
+        let chunk = SignatureChunk::new(record);
 
         let serialized = chunk.serialize();
         let deserialized = SignatureChunk::deserialize(&serialized).unwrap();
 
-        assert_eq!(deserialized.multisig_threshold, Some(3));
+        assert!(SignatureVerifier::verify_chunk(data, &deserialized).unwrap());
+        assert!(!SignatureVerifier::verify_chunk(b"tampered", &deserialized).unwrap());
     }
 }

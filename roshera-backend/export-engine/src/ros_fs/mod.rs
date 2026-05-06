@@ -3,21 +3,12 @@
 //! Cryptographically robust storage, audit, and IP protection for AI-driven CAD.
 //!
 //! ## Key Features
-//! - **Full .ros v3 read/write support** (auto-detects v2)
-//! - **AI provenance tracking**: Every AI/design event can be logged and audited
-//! - **Enterprise-grade encryption**: Per-chunk, streaming, hardware-ready
-//! - **Digital signatures and timestamp authority (TSA)**: Provenance and public proof—**no blockchain required**
+//! - **.ros v3 read/write support** (v3 only; no v2 compatibility shim)
+//! - **AI provenance tracking**: every AI / design event is logged and auditable
+//! - **Per-chunk encryption**: streaming, hardware-ready
+//! - **Single Ed25519 signature per file**: provenance via signature + file mtime
 //! - **Audit logs with tamper-evident chaining**
-//! - **Fine-grained, multi-level access control (ABAC/ACL)**  
-//!
-//! ## Legal/Compliance Provenance — Recommended Workflow
-//! 1. Digitally sign your file (Ed25519/ECDSA)  
-//! 2. (Optional but recommended) Obtain a timestamp authority (RFC 3161) token for your file hash  
-//! 3. Store or publish the signature/timestamp for future public/legal proof
-//! 4. Use the audit log for tamper-proof action history  
-//!
-//! > **No blockchain is required**.  
-//! > All legal and public proof needs are handled with signatures + TSA.
+//! - **Fine-grained access control (ABAC/ACL)** with time window + MFA constraints
 //!
 //! ## Module Overview
 //! - [`header`] — File headers, UUIDs, versioning
@@ -26,9 +17,8 @@
 //! - [`keys`] — Encryption key management
 //! - [`encryption`] — Chunk/file encryption and decryption
 //! - [`access`] — Access control, roles, ABAC, constraints
-//! - [`signature`] — Digital signatures, X.509, timestamp authority
+//! - [`signature`] — Ed25519 digital signatures
 //! - [`audit`] — Security/compliance audit logs
-//! - [`compat`] — v2/v3 compatibility/migration
 //! - [`error`] — All error types (for Result use)
 //! - [`util`] — Low-level crypto, time, random, memory
 
@@ -36,7 +26,6 @@ pub mod access;
 pub mod aipr;
 pub mod audit;
 pub mod chunk;
-pub mod compat;
 pub mod encryption;
 pub mod error;
 pub mod header;
@@ -50,7 +39,6 @@ pub use access::*;
 pub use aipr::*;
 pub use audit::*;
 pub use chunk::*;
-pub use compat::*;
 pub use encryption::*;
 pub use error::{
     AccessError, AuditError, EncryptionError, FormatError, KeyManagementError, ProvenanceError,

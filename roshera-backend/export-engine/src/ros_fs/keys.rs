@@ -6,7 +6,6 @@
 //! - Multiple KDF algorithms (PBKDF2, Argon2)
 //! - Hierarchical key derivation
 //! - Key rotation support
-//! - Hardware security module abstraction
 
 use crate::ros_fs::util::{format_uuid, random_16, secure_zero, sha256};
 use crate::ros_fs::{KeyManagementError, Result};
@@ -437,24 +436,6 @@ impl KeyManager for SoftwareKeyManager {
 
         Ok(())
     }
-}
-
-/// Hardware Security Module key manager trait
-pub trait HsmKeyManager: KeyManager {
-    /// Get HSM identifier
-    fn hsm_id(&self) -> String;
-
-    /// Initialize HSM session
-    fn init_session(&self) -> Result<()>;
-
-    /// Close HSM session
-    fn close_session(&self) -> Result<()>;
-
-    /// Generate key in HSM
-    fn generate_key_in_hsm(&self, algorithm: KeyAlgorithm) -> Result<[u8; 16]>;
-
-    /// Export key from HSM (if allowed)
-    fn export_key(&self, key_id: &[u8; 16]) -> Result<SecureKey>;
 }
 
 /// Key escrow service for backup/recovery
