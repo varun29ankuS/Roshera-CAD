@@ -17,7 +17,6 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use crate::math::tolerance::Tolerance;
 use crate::primitives::{
     box_primitive::{BoxParameters, BoxPrimitive},
     edge::EdgeId,
@@ -1232,11 +1231,12 @@ impl PrimitiveRegistry {
         // as `None`. `compute_mass_properties` caches on the solid, so repeat
         // queries are O(1). Disjoint-field borrows of `model.{solids, shells,
         // faces, loops}` are valid because the borrow checker treats them as
-        // independent paths.
-        let tolerance = Tolerance::default();
+        // independent paths. Volume / surface_area / center_of_mass all come
+        // out of the same call so they can never disagree about which kernel
+        // state they were measured on.
         let (volume, surface_area, center_of_mass_pt) =
             if let Some(solid) = model.solids.get_mut(geometry_id) {
-                let (vol, com) = match solid.compute_mass_properties(
+                match solid.compute_mass_properties(
                     &mut model.shells,
                     &mut model.faces,
                     &mut model.loops,
@@ -1245,21 +1245,13 @@ impl PrimitiveRegistry {
                     &model.curves,
                     &model.surfaces,
                 ) {
-                    Ok(mp) => (Some(mp.volume), Some(mp.center_of_mass)),
-                    Err(_) => (None, None),
-                };
-                let area = solid
-                    .surface_area(
-                        &mut model.shells,
-                        &mut model.faces,
-                        &mut model.loops,
-                        &model.vertices,
-                        &model.edges,
-                        &model.surfaces,
-                        tolerance,
-                    )
-                    .ok();
-                (vol, area, com)
+                    Ok(mp) => (
+                        Some(mp.volume),
+                        Some(mp.surface_area),
+                        Some(mp.center_of_mass),
+                    ),
+                    Err(_) => (None, None, None),
+                }
             } else {
                 (None, None, None)
             };

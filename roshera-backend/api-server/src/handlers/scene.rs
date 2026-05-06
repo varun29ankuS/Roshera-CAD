@@ -547,39 +547,14 @@ fn calculate_mass_properties(
     solid_id: u32,
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
 ) -> Option<MassProperties> {
-    use geometry_engine::math::Tolerance;
-
     // Disjoint-field borrows: the kernel's mass-property API requires a
     // mutable borrow on the solid plus mutable borrows on the shell, face,
     // and loop stores, plus immutable borrows on the rest of the model.
     // Splitting the model reference field-by-field is the only way to
     // satisfy that signature without restructuring the kernel.
     //
-    // Compute surface area first (also mutates) so the mass-prop call can
-    // run on top of cached intermediates.
-    let surface_area = {
-        let solid = model.solids.get_mut(solid_id)?;
-        match solid.surface_area(
-            &mut model.shells,
-            &mut model.faces,
-            &mut model.loops,
-            &model.vertices,
-            &model.edges,
-            &model.surfaces,
-            Tolerance::default(),
-        ) {
-            Ok(area) => area,
-            Err(err) => {
-                tracing::warn!(
-                    "surface_area failed for solid {}: {} — omitting mass properties",
-                    solid_id,
-                    err
-                );
-                return None;
-            }
-        }
-    };
-
+    // Surface area now lives on `SolidMassProperties`, so a single
+    // `compute_mass_properties` call yields both volume and area.
     let solid = model.solids.get_mut(solid_id)?;
     let props = match solid.compute_mass_properties(
         &mut model.shells,
@@ -603,7 +578,7 @@ fn calculate_mass_properties(
 
     Some(MassProperties {
         volume: props.volume as f32,
-        surface_area: surface_area as f32,
+        surface_area: props.surface_area as f32,
         center_of_mass: [
             props.center_of_mass.x as f32,
             props.center_of_mass.y as f32,

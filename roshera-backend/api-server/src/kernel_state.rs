@@ -360,40 +360,16 @@ pub async fn solid_properties(
         }
     };
 
-    // Surface area first — uses immutable surfaces but mutable shells/faces/loops.
-    let surface_area = {
-        let solid = model
-            .solids
-            .get_mut(solid_id)
-            .expect("solid existed two lines up; nothing has dropped it");
-        match solid.surface_area(
-            &mut model.shells,
-            &mut model.faces,
-            &mut model.loops,
-            &model.vertices,
-            &model.edges,
-            &model.surfaces,
-            geometry_engine::math::Tolerance::default(),
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": "failed to compute surface area",
-                        "details": e.to_string(),
-                        "solid_id": solid_id,
-                    })),
-                ));
-            }
-        }
-    };
-
-    // Mass properties.
+    // Mass properties — single call now produces volume + surface_area
+    // + COM + inertia from the same divergence-theorem face traversal,
+    // so the numbers in PropertiesResponse can never disagree about
+    // which kernel state they were measured against. Previously this
+    // ran a separate `surface_area` call before `compute_mass_properties`,
+    // which traversed the topology twice and could (in principle) drift.
     let solid = model
         .solids
         .get_mut(solid_id)
-        .expect("solid still alive in the same write lock");
+        .expect("solid existed two lines up; nothing has dropped it");
     let props = match solid.compute_mass_properties(
         &mut model.shells,
         &mut model.faces,
@@ -420,7 +396,7 @@ pub async fn solid_properties(
         solid_id,
         solid_uuid,
         volume: props.volume,
-        surface_area,
+        surface_area: props.surface_area,
         mass: props.mass,
         center_of_mass: [
             props.center_of_mass.x,

@@ -374,9 +374,15 @@ impl BRepModel {
             .ok()?
             .clone();
 
-        let surface_area = self
-            .calculate_solid_surface_area(solid_id)
-            .unwrap_or(0.0);
+        // Surface area now lives on `SolidMassProperties` itself — read
+        // from the same cached struct as volume / COM / inertia so the
+        // numbers are guaranteed to come from the same kernel state
+        // and never drift relative to each other. Previously this
+        // called `calculate_solid_surface_area` separately, traversing
+        // the topology a second time and (in principle) able to
+        // disagree with the divergence-theorem face traversal that
+        // produced the rest of the report.
+        let surface_area = props.surface_area;
 
         // Principal moments come back as a Vector3; principal axes as
         // [Vector3; 3]. We surface them as fixed-size arrays for the
