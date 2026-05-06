@@ -8,8 +8,8 @@
 //! - Forensic-level detail options
 //! - Compliance and audit support
 
-use crate::ros_fs::util::{current_time_ms, sha256};
-use crate::ros_fs::{ProvenanceError, Result, RosFileError};
+use crate::util::{current_time_ms, sha256};
+use crate::{ProvenanceError, Result, RosFileError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -234,7 +234,7 @@ impl AICommand {
         sequence_num: u32,
     ) -> Self {
         AICommand {
-            id: crate::ros_fs::util::random_16(),
+            id: crate::util::random_16(),
             timestamp: current_time_ms(),
             session_id,
             sequence_num,

@@ -7,8 +7,8 @@
 //! - Hierarchical key derivation
 //! - Key rotation support
 
-use crate::ros_fs::util::{format_uuid, random_16, secure_zero, sha256};
-use crate::ros_fs::{KeyManagementError, Result};
+use crate::util::{format_uuid, random_16, secure_zero, sha256};
+use crate::{KeyManagementError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -194,7 +194,7 @@ impl SecureKey {
         }
 
         let id = random_16();
-        let material = crate::ros_fs::util::random_bytes(size);
+        let material = crate::util::random_bytes(size);
         Ok(SecureKey { id, material })
     }
 }
@@ -468,7 +468,7 @@ impl KeyEscrowService {
             }
         })?;
 
-        let nonce_bytes = crate::ros_fs::util::random_bytes(12);
+        let nonce_bytes = crate::util::random_bytes(12);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher.encrypt(nonce, serialized.as_ref()).map_err(|_| {

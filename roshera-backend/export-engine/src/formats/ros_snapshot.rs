@@ -214,8 +214,8 @@ impl BRepSnapshot {
             shells: Vec::new(),
             solids: Vec::new(),
             metadata: BRepMetadata {
-                created_at: crate::ros_fs::current_time_ms(),
-                modified_at: crate::ros_fs::current_time_ms(),
+                created_at: ros_format::current_time_ms(),
+                modified_at: ros_format::current_time_ms(),
                 units: "millimeters".to_string(),
                 tolerance: 1e-6,
                 properties: HashMap::new(),

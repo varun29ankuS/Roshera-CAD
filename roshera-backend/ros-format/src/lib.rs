@@ -1,29 +1,29 @@
-//! # roshera_fs — Secure, AI-Native File System for Roshera (.ros v3.1)
+//! # ros-format — Roshera .ros v3.1 file format core
 //!
-//! Cryptographically robust storage, audit, and IP protection for AI-driven CAD.
+//! Geometry-free building blocks for the .ros file format: header,
+//! chunk table, encryption, key management, signatures, audit log,
+//! merkle tree, access control, and AI provenance (PROV) chunk.
 //!
-//! ## Key Features
-//! - **.ros v3.1 read/write** (slice 2 layout: timeline + provenance co-equal)
-//! - **Mandatory HIST + PROV chunks** — every file carries timeline events
-//!   and an AI provenance record; GEOM is optional cache.
-//! - **AI provenance tracking**: every AI / design event is logged and auditable
-//! - **Per-chunk encryption**: streaming, hardware-ready
-//! - **Single Ed25519 signature per file**: provenance via signature + file mtime
-//! - **Audit logs with tamper-evident chaining**
-//! - **Fine-grained access control (ABAC/ACL)** with time window + MFA constraints
+//! Lifted out of `export-engine` in slice 4 so bridge/SDK consumers
+//! can read or write .ros files (or just AIPR-only audit logs)
+//! without dragging in the geometry kernel. The HIST chunk that
+//! carries `timeline_engine::TimelineEvent` lives in `export-engine`
+//! because it depends on the kernel-coupled timeline crate.
 //!
 //! ## Module Overview
 //! - [`header`] — File headers, UUIDs, versioning
 //! - [`chunk`] — Chunk table and in-memory chunk objects
-//! - [`timeline_chunk`] — HIST chunk (events + branch manifest)
 //! - [`aipr`] — AI provenance (PROV chunk + command tracking)
 //! - [`keys`] — Encryption key management
 //! - [`encryption`] — Chunk/file encryption and decryption
 //! - [`access`] — Access control, roles, ABAC, constraints
 //! - [`signature`] — Ed25519 digital signatures
 //! - [`audit`] — Security/compliance audit logs
+//! - [`merkle`] — Tamper-evident hash trees
 //! - [`error`] — All error types (for Result use)
 //! - [`util`] — Low-level crypto, time, random, memory
+
+#![forbid(unsafe_code)]
 
 pub mod access;
 pub mod aipr;
@@ -35,7 +35,6 @@ pub mod header;
 pub mod keys;
 pub mod merkle;
 pub mod signature;
-pub mod timeline_chunk;
 pub mod util;
 
 // Main re-exports for easy access
@@ -51,5 +50,4 @@ pub use error::{
 pub use header::*;
 pub use keys::*;
 pub use signature::*;
-pub use timeline_chunk::*;
 pub use util::*;

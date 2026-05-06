@@ -7,8 +7,8 @@
 //! not target; the file format reserves the on-disk SIGN chunk shape
 //! but the public API now signs and verifies a single record.
 
-use crate::ros_fs::util::{current_time_ms, sha256, to_hex};
-use crate::ros_fs::{Result, SignatureError};
+use crate::util::{current_time_ms, sha256, to_hex};
+use crate::{Result, SignatureError};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 

@@ -8,9 +8,9 @@
 //! - Authenticated encryption with additional data (AEAD)
 
 // Add this line to bring the trait into scope
-use crate::ros_fs::keys::{KeySet, SecureKey};
-use crate::ros_fs::util::constant_time_eq;
-use crate::ros_fs::{EncryptionError, Result};
+use crate::keys::{KeySet, SecureKey};
+use crate::util::constant_time_eq;
+use crate::{EncryptionError, Result};
 use aes_gcm::{
     aead::{Aead, Payload},
     Aes256Gcm, KeyInit, Nonce as AesNonce,
@@ -570,8 +570,8 @@ pub fn verify_auth_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ros_fs::keys::{KeyManager, SoftwareKeyManager};
-    use crate::ros_fs::util::{random_16, random_bytes};
+    use crate::keys::{KeyManager, SoftwareKeyManager};
+    use crate::util::{random_16, random_bytes};
     use std::io::Cursor;
 
     // Helper for fast key generation in tests
@@ -727,7 +727,7 @@ mod tests {
         let result = encryptor.encrypt_chunk(b"XXXX", b"data", 0, None);
         assert!(matches!(
             result,
-            Err(crate::ros_fs::RosFileError::Encryption(
+            Err(crate::RosFileError::Encryption(
                 EncryptionError::MissingKey { .. }
             ))
         ));
@@ -736,7 +736,7 @@ mod tests {
         let result = encryptor.decrypt_chunk(b"GEOM", b"short", 0, None);
         assert!(matches!(
             result,
-            Err(crate::ros_fs::RosFileError::Encryption(
+            Err(crate::RosFileError::Encryption(
                 EncryptionError::CorruptedData { .. }
             ))
         ));

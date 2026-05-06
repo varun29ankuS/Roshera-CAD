@@ -8,8 +8,8 @@
 //! - Tree serialization
 //! - Multiple hash algorithm support
 
-use crate::ros_fs::util::to_hex;
-use crate::ros_fs::{Result, RosFileError};
+use crate::util::to_hex;
+use crate::{Result, RosFileError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
