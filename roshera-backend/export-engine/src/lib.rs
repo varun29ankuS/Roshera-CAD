@@ -7,7 +7,6 @@
 
 pub mod engine;
 pub mod formats;
-pub mod ros_fs;
 pub mod validation;
 
 pub use engine::*;

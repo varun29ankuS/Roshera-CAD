@@ -16,11 +16,12 @@
 //! ```
 
 use crate::formats::ros_snapshot::BRepSnapshot;
-use crate::ros_fs::keys::{KeyManager, SoftwareKeyManager};
-use crate::ros_fs::util::current_time_ms;
-use crate::ros_fs::{
-    self, AICommandTracker, BranchManifest, Chunk, ChunkType, HistChunk, PrivacySettings,
-    ProvChunk, TrackingLevel, CHUNK_INDEX_ENTRY_SIZE,
+use crate::formats::timeline_chunk::{BranchManifest, HistChunk};
+use ros_format::keys::{KeyManager, SoftwareKeyManager};
+use ros_format::util::current_time_ms;
+use ros_format::{
+    self, AICommandTracker, Chunk, ChunkType, PrivacySettings, ProvChunk, TrackingLevel,
+    CHUNK_INDEX_ENTRY_SIZE,
 };
 use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
@@ -30,12 +31,13 @@ use timeline_engine::TimelineEvent;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Convert `RosFileError` to `ExportError`.
-impl From<ros_fs::error::RosFileError> for ExportError {
-    fn from(err: ros_fs::error::RosFileError) -> Self {
-        ExportError::ExportFailed {
-            reason: format!("ROS file error: {}", err),
-        }
+/// Convert `ros_format::RosFileError` to `shared_types::ExportError`.
+///
+/// Both types live in foreign crates so the orphan rule prevents an
+/// `impl From<…> for …`; callers `.map_err(ros_err)` instead.
+fn ros_err(err: ros_format::error::RosFileError) -> ExportError {
+    ExportError::ExportFailed {
+        reason: format!("ROS file error: {}", err),
     }
 }
 
@@ -153,9 +155,9 @@ pub async fn export_brep_to_ros(
                 reason: "Password required for encryption".to_string(),
             })?;
 
-        let salt = ros_fs::random_16();
+        let salt = ros_format::random_16();
         let file_iv: [u8; 8] =
-            ros_fs::random_bytes(8)
+            ros_format::random_bytes(8)
                 .try_into()
                 .map_err(|_| ExportError::ExportFailed {
                     reason: "random_bytes(8) did not return 8 bytes".to_string(),
@@ -172,7 +174,7 @@ pub async fn export_brep_to_ros(
     };
 
     // Header -----------------------------------------------------------
-    let mut header = ros_fs::FileHeader::builder();
+    let mut header = ros_format::FileHeader::builder();
     if encrypt {
         header = header.with_encryption(1, 2, 10_000, salt, file_iv);
     }
@@ -209,7 +211,7 @@ pub async fn export_brep_to_ros(
     };
     let hist_bytes = hist_chunk
         .serialize()
-        .map_err(ExportError::from)?;
+        .map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::HIST, hist_bytes),
         key_set.as_ref(),
@@ -224,7 +226,7 @@ pub async fn export_brep_to_ros(
     };
     let prov_bytes = prov_chunk
         .serialize()
-        .map_err(ExportError::from)?;
+        .map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::PROV, prov_bytes),
         key_set.as_ref(),
@@ -297,13 +299,13 @@ pub async fn export_brep_to_ros(
 /// Encrypt a chunk in place when a key set is supplied.
 fn encrypt_if_enabled(
     mut chunk: Chunk,
-    key_set: Option<&ros_fs::KeySet>,
+    key_set: Option<&ros_format::KeySet>,
     file_iv: [u8; 8],
     chunk_index: usize,
 ) -> Result<Chunk, ExportError> {
     if let Some(keys) = key_set {
-        let encryptor = ros_fs::ChunkEncryptor::new(
-            ros_fs::EncryptionAlgorithm::AES256GCM,
+        let encryptor = ros_format::ChunkEncryptor::new(
+            ros_format::EncryptionAlgorithm::AES256GCM,
             keys.clone(),
             file_iv,
         );
@@ -341,7 +343,7 @@ pub async fn import_ros(
 
     let mut cursor = Cursor::new(buffer);
     let header =
-        ros_fs::FileHeader::read_from(&mut cursor).map_err(|e| ExportError::ExportFailed {
+        ros_format::FileHeader::read_from(&mut cursor).map_err(|e| ExportError::ExportFailed {
             reason: format!("Failed to read header: {}", e),
         })?;
 
@@ -360,7 +362,7 @@ pub async fn import_ros(
         None
     };
 
-    let chunk_table = crate::ros_fs::chunk::ChunkTable::read_from(
+    let chunk_table = ros_format::chunk::ChunkTable::read_from(
         &mut cursor,
         header.index_offset,
         header.index_entry_count,
@@ -426,12 +428,12 @@ pub async fn import_ros_to_brep(
 
     let mut model = BRepModel::new();
     let outcome = timeline_engine::rebuild_model_from_events(&mut model, &import.timeline);
-    if !outcome.failures.is_empty() {
+    if outcome.events_skipped > 0 {
         return Err(ExportError::ExportFailed {
             reason: format!(
-                "Failed to rebuild geometry from {} HIST events: {} failure(s)",
+                "Failed to rebuild geometry from {} HIST events: {} skipped",
                 import.timeline.len(),
-                outcome.failures.len()
+                outcome.events_skipped
             ),
         });
     }
@@ -441,9 +443,9 @@ pub async fn import_ros_to_brep(
 /// Read + decrypt + deserialize a single chunk payload.
 fn read_chunk_payload<T: serde::de::DeserializeOwned>(
     cursor: &mut Cursor<Vec<u8>>,
-    table: &crate::ros_fs::chunk::ChunkTable,
+    table: &ros_format::chunk::ChunkTable,
     chunk_type: ChunkType,
-    key_set: Option<&ros_fs::KeySet>,
+    key_set: Option<&ros_format::KeySet>,
     file_iv: [u8; 8],
 ) -> Result<T, ExportError> {
     let entry = table
@@ -469,7 +471,7 @@ fn read_chunk_payload<T: serde::de::DeserializeOwned>(
                 chunk_type.as_str()
             ),
         })?;
-        let algo = ros_fs::EncryptionAlgorithm::from_id(entry.enc_algo).map_err(|_| {
+        let algo = ros_format::EncryptionAlgorithm::from_id(entry.enc_algo).map_err(|_| {
             ExportError::ExportFailed {
                 reason: format!(
                     "Unknown encryption algorithm id {} on {} chunk",
@@ -482,7 +484,7 @@ fn read_chunk_payload<T: serde::de::DeserializeOwned>(
             .iter()
             .position(|e| e.chunk_type == entry.chunk_type)
             .unwrap_or(0) as u32;
-        let decryptor = ros_fs::ChunkEncryptor::new(algo, keys.clone(), file_iv);
+        let decryptor = ros_format::ChunkEncryptor::new(algo, keys.clone(), file_iv);
         data = decryptor
             .decrypt_chunk(&entry.chunk_type, &data, chunk_index, None)
             .map_err(|e| ExportError::ExportFailed {

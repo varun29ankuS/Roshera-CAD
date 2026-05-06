@@ -5,3 +5,4 @@ pub mod ros;
 pub mod ros_snapshot;
 pub mod step;
 pub mod stl;
+pub mod timeline_chunk;

@@ -8,9 +8,8 @@
 use export_engine::formats::ros::{
     export_brep_to_ros, import_ros, HistData, RosExportOptions, RosExportPayload,
 };
-use export_engine::ros_fs::{
-    AICommandTracker, BranchManifest, ChunkType, FileHeader, PrivacySettings, TrackingLevel,
-};
+use export_engine::formats::timeline_chunk::BranchManifest;
+use ros_format::{AICommandTracker, ChunkType, FileHeader, PrivacySettings, TrackingLevel};
 use export_engine::ExportEngine;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use std::io::Cursor;
@@ -304,7 +303,7 @@ async fn test_ros_v31_optional_geom_omitted() {
         .unwrap();
     let mut cursor = Cursor::new(bytes);
     let header = FileHeader::read_from(&mut cursor).expect("header read");
-    let table = export_engine::ros_fs::chunk::ChunkTable::read_from(
+    let table = ros_format::chunk::ChunkTable::read_from(
         &mut cursor,
         header.index_offset,
         header.index_entry_count,

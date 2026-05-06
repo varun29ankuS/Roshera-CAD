@@ -5,8 +5,8 @@
 //! This module defines the Roshera v3 file header struct and parsing/writing logic.
 //! Uses safe serialization instead of packed structs to avoid undefined behavior.
 
-use crate::ros_fs::util::{crc32, current_time_ms, generate_uuid_v4};
-use crate::ros_fs::{FormatError, Result, VersionError};
+use crate::util::{crc32, current_time_ms, generate_uuid_v4};
+use crate::{FormatError, Result, VersionError};
 use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -538,7 +538,7 @@ impl FileHeaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ros_fs::RosFileError;
+    use crate::RosFileError;
     use std::io::Cursor;
 
     #[test]

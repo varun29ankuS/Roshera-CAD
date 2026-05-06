@@ -7,8 +7,8 @@
 //! - FourCC: chunk type codes
 //! - Safe serialization without packed structs
 
-use crate::ros_fs::util::{crc32, is_all_zeros};
-use crate::ros_fs::{FormatError, Result, RosFileError};
+use crate::util::{crc32, is_all_zeros};
+use crate::{FormatError, Result, RosFileError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};

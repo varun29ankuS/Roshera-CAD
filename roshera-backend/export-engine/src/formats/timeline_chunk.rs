@@ -19,7 +19,7 @@ use timeline_engine::{
     BranchId, BranchMetadata, BranchState, EventIndex, ForkPoint, TimelineEvent,
 };
 
-use crate::ros_fs::{RosFileError, Result};
+use ros_format::{RosFileError, Result};
 
 /// Compact branch manifest — everything the on-disk format needs to
 /// reconstruct a branch's identity without the runtime event map.

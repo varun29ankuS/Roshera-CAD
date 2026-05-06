@@ -1,0 +1,39 @@
+[package]
+name = "ros-format"
+version = "0.1.0"
+edition = "2021"
+description = "Roshera .ros v3.1 file format core — header, chunks, crypto, audit. Geometry-free; suitable for bridge/SDK consumers."
+license = "Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+thiserror = { workspace = true }
+
+# Format / serialization
+rmp-serde = "1"
+bincode = "2.0.1"
+byteorder = "1.5"
+crc32fast = "1"
+sha2 = "0.10"
+chrono = "0.4"
+
+# Cryptography
+rand = "0.8"
+getrandom = "0.3.3"
+ring = "0.17"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+hkdf = "0.12"
+subtle = "2.5"
+zeroize = { version = "1", features = ["derive"] }
+
+# Validation patterns shared across access / audit / aipr
+regex = "1"
+lazy_static = "1.4"
+
+[lints]
+workspace = true

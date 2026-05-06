@@ -4,8 +4,8 @@
 //!
 //! Provides multi-level permissions with role and attribute-based policies
 
-use crate::ros_fs::util::current_time_ms;
-use crate::ros_fs::{AccessError, Result};
+use crate::util::current_time_ms;
+use crate::{AccessError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -176,7 +176,7 @@ impl AccessContext {
             user,
             timestamp: current_time_ms(),
             ip_address,
-            request_id: crate::ros_fs::util::format_uuid(&crate::ros_fs::util::random_16()),
+            request_id: crate::util::format_uuid(&crate::util::random_16()),
         }
     }
 }

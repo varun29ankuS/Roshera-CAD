@@ -4,8 +4,8 @@
 //!
 //! Provides tamper-evident audit trails for security and compliance
 
-use crate::ros_fs::util::{current_time_ms, sha256, to_hex};
-use crate::ros_fs::{AuditError, Result};
+use crate::util::{current_time_ms, sha256, to_hex};
+use crate::{AuditError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -121,7 +121,7 @@ impl AuditEntry {
     pub fn new(event: AuditEvent) -> Self {
         let severity = event.severity();
         AuditEntry {
-            id: crate::ros_fs::util::random_16(),
+            id: crate::util::random_16(),
             timestamp: current_time_ms(),
             event,
             severity,
