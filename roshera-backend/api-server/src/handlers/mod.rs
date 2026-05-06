@@ -3,6 +3,7 @@
 //! This module contains all the HTTP handler implementations for different
 //! functionalities of the Roshera CAD system.
 
+pub mod agent;
 pub mod auth;
 pub mod cache;
 pub mod capabilities;

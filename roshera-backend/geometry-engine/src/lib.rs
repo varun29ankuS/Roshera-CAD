@@ -7,6 +7,7 @@ pub mod math;
 pub mod operations;
 pub mod performance;
 pub mod primitives;
+pub mod readable;
 pub mod sketch2d;
 pub mod tessellation;
 
@@ -32,6 +33,9 @@ pub mod prelude {
     pub use crate::primitives::{
         edge::EdgeId, face::FaceId, shell::ShellId, solid::SolidId, topology_builder::BRepModel,
         vertex::VertexId,
+    };
+    pub use crate::readable::{
+        format_location_oneliner, DistanceReport, PartProximity, PartReport, PartSummary,
     };
     pub use crate::tessellation::{
         tessellate_solid, TessellationParams, ThreeJsMesh, TriangleMesh,
