@@ -62,13 +62,23 @@ export interface ExportResult {
 export async function exportSceneAs(format: string): Promise<ExportResult> {
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
   try {
+    // Schema match: shared-types `ExportOptions` requires
+    // `binary`, `include_colors`, `include_normals` as plain bools
+    // (no serde defaults). Sending mismatched fields yields a 422
+    // "missing field include_colors" from axum's JSON extractor.
+    // `filename`, `units`, `tolerance` are Option<T> on the backend
+    // and stay omitted unless we have a reason to set them.
     const exportResp = await fetch(`${API_HOST}/api/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         format,
         objects: selectedIds,
-        options: { binary: true, include_materials: true, merge_objects: false },
+        options: {
+          binary: true,
+          include_colors: false,
+          include_normals: true,
+        },
       }),
     })
     if (!exportResp.ok) {
