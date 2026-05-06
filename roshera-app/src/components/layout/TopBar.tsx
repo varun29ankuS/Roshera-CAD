@@ -18,6 +18,7 @@ import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
 import { wsClient } from '@/lib/ws-client'
 import { exportSceneAs } from '@/lib/export-api'
+import { useChatStore } from '@/stores/chat-store'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -43,12 +44,26 @@ async function timelineAction(action: 'undo' | 'redo') {
 // Two-step export (POST /api/export → GET /api/download/:filename) is
 // implemented in `lib/export-api.ts` and shared with the ToolBar Export
 // flyout. Both surfaces hit the kernel directly so a missing AI key
-// can't 5xx a deterministic export.
+// can't 5xx a deterministic export. Both success and failure post a
+// chat-panel message so the user always gets visible feedback — a
+// silent `console.error` was misread as "click does nothing" because
+// the user had no reason to crack open DevTools.
 async function exportGeometry(format: string) {
+  const { addMessage } = useChatStore.getState()
+  addMessage({ role: 'user', content: `Export scene as ${format}` })
   const result = await exportSceneAs(format)
-  if (!result.ok && result.error) {
-    // eslint-disable-next-line no-console
-    console.error('Export error:', result.error)
+  if (result.ok) {
+    addMessage({
+      role: 'assistant',
+      content: result.filename
+        ? `Exported as ${result.filename}.`
+        : `Export ready.`,
+    })
+  } else {
+    addMessage({
+      role: 'assistant',
+      content: `Export failed: ${result.error ?? 'unknown error'}`,
+    })
   }
 }
 

@@ -1259,8 +1259,15 @@ export const useSceneStore = create<SceneState>()(
         // id and accept the server's view of shapes/plane. Active
         // shape = last entry; promote its tool/points to the
         // convenience view so existing UI keeps working.
-        const shapes = session.shapes
-        const last = shapes[shapes.length - 1]
+        //
+        // Defensive: a session deserialised from an older format (or
+        // a partial WS frame the bridge let through) may be missing
+        // `shapes` entirely. Reading `.length` on `undefined` throws
+        // and the rejection propagates through `awaitSketchReady` as
+        // "Sketch session unavailable: can't access property length".
+        // Mirrors the same defense in `ModelTree.tsx:399`.
+        const shapes = Array.isArray(session.shapes) ? session.shapes : []
+        const last = shapes.length > 0 ? shapes[shapes.length - 1] : undefined
         return {
           serverSketches,
           sketch: {
