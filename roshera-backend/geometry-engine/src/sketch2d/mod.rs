@@ -70,7 +70,7 @@ pub use constraints::{
     DimensionalConstraint, GeometricConstraint,
 };
 
-pub use sketch::{Sketch, SketchId};
+pub use sketch::{Sketch, SketchAnchor, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 
 // Error types for 2D operations
