@@ -13,7 +13,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-/// Four-character chunk type code (e.g. 'GEOM', 'AIPR')
+/// Four-character chunk type code (e.g. 'GEOM', 'PROV')
 pub type FourCC = [u8; 4];
 
 /// Chunk index entry size (fixed at 96 bytes)
@@ -22,15 +22,22 @@ pub const CHUNK_INDEX_ENTRY_SIZE: usize = 96;
 /// Maximum chunk size (1GB)
 pub const MAX_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
-/// Known chunk types (.ros v3, see spec §5)
+/// Known chunk types (.ros v3.1)
+///
+/// Slice 2 (2026-05-06) makes HIST and PROV mandatory first-class
+/// chunks alongside META; GEOM is now optional cache. The on-disk
+/// FourCC for AI provenance was renamed `AIPR` → `PROV` to reflect its
+/// status as the canonical provenance container rather than an AI-only
+/// audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChunkType {
     META,
+    HIST,
+    PROV,
     GEOM,
     TOPO,
     FEAT,
     CONS,
-    AIPR,
     KEYS,
     BCHN,
     ACLS,
@@ -42,11 +49,12 @@ impl ChunkType {
     pub fn from_fourcc(code: FourCC) -> Self {
         match &code {
             b"META" => ChunkType::META,
+            b"HIST" => ChunkType::HIST,
+            b"PROV" => ChunkType::PROV,
             b"GEOM" => ChunkType::GEOM,
             b"TOPO" => ChunkType::TOPO,
             b"FEAT" => ChunkType::FEAT,
             b"CONS" => ChunkType::CONS,
-            b"AIPR" => ChunkType::AIPR,
             b"KEYS" => ChunkType::KEYS,
             b"BCHN" => ChunkType::BCHN,
             b"ACLS" => ChunkType::ACLS,
@@ -58,11 +66,12 @@ impl ChunkType {
     pub fn as_fourcc(&self) -> FourCC {
         match self {
             ChunkType::META => *b"META",
+            ChunkType::HIST => *b"HIST",
+            ChunkType::PROV => *b"PROV",
             ChunkType::GEOM => *b"GEOM",
             ChunkType::TOPO => *b"TOPO",
             ChunkType::FEAT => *b"FEAT",
             ChunkType::CONS => *b"CONS",
-            ChunkType::AIPR => *b"AIPR",
             ChunkType::KEYS => *b"KEYS",
             ChunkType::BCHN => *b"BCHN",
             ChunkType::ACLS => *b"ACLS",
@@ -76,16 +85,23 @@ impl ChunkType {
         String::from_utf8_lossy(&fourcc).to_string()
     }
 
-    /// Check if this is a required chunk type
+    /// Check if this is a required chunk type per .ros v3.1.
+    ///
+    /// META + HIST + PROV are mandatory. GEOM is optional cache —
+    /// readers may regenerate from HIST when absent.
     pub fn is_required(&self) -> bool {
-        matches!(self, ChunkType::META | ChunkType::GEOM)
+        matches!(self, ChunkType::META | ChunkType::HIST | ChunkType::PROV)
     }
 
     /// Check if this chunk type should be encrypted by default
     pub fn should_encrypt(&self) -> bool {
         matches!(
             self,
-            ChunkType::GEOM | ChunkType::TOPO | ChunkType::FEAT | ChunkType::AIPR
+            ChunkType::GEOM
+                | ChunkType::TOPO
+                | ChunkType::FEAT
+                | ChunkType::HIST
+                | ChunkType::PROV
         )
     }
 }
@@ -472,24 +488,18 @@ impl ChunkTable {
         Ok(())
     }
 
-    /// Validate all entries
+    /// Validate all entries.
+    ///
+    /// .ros v3.1 requires META + HIST + PROV. GEOM is optional cache;
+    /// when omitted, readers must rebuild geometry from HIST events.
     pub fn validate(&self) -> Result<()> {
-        // Check for required chunks
-        let has_meta = self.find_by_type(ChunkType::META).is_some();
-        let has_geom = self.find_by_type(ChunkType::GEOM).is_some();
-
-        if !has_meta {
-            return Err(FormatError::MissingRequiredChunk {
-                chunk_type: "META".to_string(),
+        for required in [ChunkType::META, ChunkType::HIST, ChunkType::PROV] {
+            if self.find_by_type(required).is_none() {
+                return Err(FormatError::MissingRequiredChunk {
+                    chunk_type: required.as_str(),
+                }
+                .into());
             }
-            .into());
-        }
-
-        if !has_geom {
-            return Err(FormatError::MissingRequiredChunk {
-                chunk_type: "GEOM".to_string(),
-            }
-            .into());
         }
 
         // Validate each entry
@@ -534,11 +544,21 @@ mod tests {
         assert_eq!(chunk_type.as_fourcc(), *b"GEOM");
         assert_eq!(chunk_type.as_str(), "GEOM");
         assert!(chunk_type.should_encrypt());
-        assert!(chunk_type.is_required());
+        // GEOM is no longer required as of .ros v3.1 (slice 2): rebuilders
+        // can recover geometry from the mandatory HIST chunk.
+        assert!(!chunk_type.is_required());
 
         let custom = ChunkType::CUSTOM(*b"CUST");
         assert_eq!(custom.as_fourcc(), *b"CUST");
         assert!(!custom.is_required());
+
+        let hist = ChunkType::HIST;
+        assert_eq!(hist.as_fourcc(), *b"HIST");
+        assert!(hist.is_required());
+
+        let prov = ChunkType::PROV;
+        assert_eq!(prov.as_fourcc(), *b"PROV");
+        assert!(prov.is_required());
     }
 
     #[test]
@@ -593,57 +613,69 @@ mod tests {
         let mut table = ChunkTable::new();
 
         let meta = ChunkIndexEntry::new(ChunkType::META.as_fourcc());
-        let geom = ChunkIndexEntry::new(ChunkType::GEOM.as_fourcc());
-        let aipr = ChunkIndexEntry::new(ChunkType::AIPR.as_fourcc());
+        let hist = ChunkIndexEntry::new(ChunkType::HIST.as_fourcc());
+        let prov = ChunkIndexEntry::new(ChunkType::PROV.as_fourcc());
 
         table.add(meta);
-        table.add(geom);
-        table.add(aipr);
+        table.add(hist);
+        table.add(prov);
 
         assert_eq!(table.len(), 3);
         assert!(table.find_by_type(ChunkType::META).is_some());
+        assert!(table.find_by_type(ChunkType::HIST).is_some());
+        assert!(table.find_by_type(ChunkType::PROV).is_some());
         assert!(table.find_by_type(ChunkType::KEYS).is_none());
-
-        let geom_chunks = table.find_all_by_type(ChunkType::GEOM);
-        assert_eq!(geom_chunks.len(), 1);
     }
 
     #[test]
-    fn test_chunk_table_validation() {
+    fn test_chunk_table_validation_requires_meta_hist_prov() {
         let mut table = ChunkTable::new();
 
-        // Missing required chunks
+        // Empty table fails
         assert!(table.validate().is_err());
 
-        // Add required chunks
+        // META alone is not enough
         let mut meta = ChunkIndexEntry::new(ChunkType::META.as_fourcc());
         meta.offset = 1000;
         meta.uncompressed_size = 100;
-
-        let mut geom = ChunkIndexEntry::new(ChunkType::GEOM.as_fourcc());
-        geom.offset = 1100;
-        geom.uncompressed_size = 200;
-
         table.add(meta);
-        table.add(geom);
+        assert!(table.validate().is_err());
 
+        // META + HIST still missing PROV
+        let mut hist = ChunkIndexEntry::new(ChunkType::HIST.as_fourcc());
+        hist.offset = 1100;
+        hist.uncompressed_size = 100;
+        table.add(hist);
+        assert!(table.validate().is_err());
+
+        // META + HIST + PROV passes (no GEOM required)
+        let mut prov = ChunkIndexEntry::new(ChunkType::PROV.as_fourcc());
+        prov.offset = 1200;
+        prov.uncompressed_size = 100;
+        table.add(prov);
         assert!(table.validate().is_ok());
 
-        // Test overlapping chunks
-        let mut overlap = ChunkIndexEntry::new(ChunkType::AIPR.as_fourcc());
-        overlap.offset = 1150; // Overlaps with GEOM
+        // Optional GEOM still allowed
+        let mut geom = ChunkIndexEntry::new(ChunkType::GEOM.as_fourcc());
+        geom.offset = 1300;
+        geom.uncompressed_size = 200;
+        table.add(geom);
+        assert!(table.validate().is_ok());
+
+        // Overlap detection still works
+        let mut overlap = ChunkIndexEntry::new(ChunkType::CONS.as_fourcc());
+        overlap.offset = 1350; // Overlaps with GEOM
         overlap.uncompressed_size = 100;
         table.add(overlap);
-
         assert!(table.validate().is_err());
     }
 
     #[test]
     fn test_chunk_creation() {
         let data = vec![1, 2, 3, 4, 5];
-        let chunk = Chunk::new(ChunkType::AIPR, data.clone());
+        let chunk = Chunk::new(ChunkType::PROV, data.clone());
 
-        assert_eq!(chunk.chunk_type(), ChunkType::AIPR);
+        assert_eq!(chunk.chunk_type(), ChunkType::PROV);
         assert_eq!(chunk.size(), 5);
         assert!(chunk.verify_crc());
 
@@ -655,5 +687,17 @@ mod tests {
         // Update CRC
         bad_chunk.update_crc();
         assert!(bad_chunk.verify_crc());
+    }
+
+    #[test]
+    fn test_geom_optional_required_set() {
+        // Per .ros v3.1 GEOM is no longer required.
+        assert!(!ChunkType::GEOM.is_required());
+        assert!(ChunkType::META.is_required());
+        assert!(ChunkType::HIST.is_required());
+        assert!(ChunkType::PROV.is_required());
+        // Both HIST and PROV are encryption-by-default candidates.
+        assert!(ChunkType::HIST.should_encrypt());
+        assert!(ChunkType::PROV.should_encrypt());
     }
 }

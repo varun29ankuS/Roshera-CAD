@@ -14,8 +14,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 pub const ROSHERA_MAGIC: &[u8; 8] = b"ROSHERA\0";
 
 /// Current format version
+///
+/// **3.1.0** (slice 2, 2026-05-06): HIST + PROV chunks are mandatory
+/// first-class chunks; GEOM is now optional cache. Old v3.0 readers
+/// (none in the wild) cannot consume v3.1 files because the required
+/// chunk set changed; this is an additive minor bump on purpose.
 pub const CURRENT_MAJOR_VERSION: u8 = 3;
-pub const CURRENT_MINOR_VERSION: u8 = 0;
+pub const CURRENT_MINOR_VERSION: u8 = 1;
 pub const CURRENT_PATCH_VERSION: u8 = 0;
 
 /// Header size is always 128 bytes

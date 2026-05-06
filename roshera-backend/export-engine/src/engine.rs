@@ -1,6 +1,8 @@
 //! Main export engine implementation
 
-use crate::formats::ros::{export_brep_to_ros, import_ros_to_brep, RosExportOptions};
+use crate::formats::ros::{
+    export_brep_to_ros, import_ros_to_brep, RosExportOptions, RosExportPayload,
+};
 use crate::formats::step::{export_brep_to_step, import_step_to_brep};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
@@ -104,8 +106,16 @@ impl ExportEngine {
         let filename = format!("{}.ros", name);
         let filepath = self.output_dir.join(&filename);
 
-        // Export to ROS format
-        export_brep_to_ros(model, &filepath, options).await?;
+        // Export to .ros v3.1. The engine-level wrapper writes an empty
+        // HIST + PROV manifest; richer callers that own a Timeline /
+        // AICommandTracker should call `export_brep_to_ros` directly
+        // with a populated `RosExportPayload`.
+        let payload = RosExportPayload {
+            model,
+            history: None,
+            aipr: None,
+        };
+        export_brep_to_ros(payload, &filepath, options).await?;
 
         Ok(filename)
     }

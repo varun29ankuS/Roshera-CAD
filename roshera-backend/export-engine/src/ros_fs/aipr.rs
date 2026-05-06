@@ -616,6 +616,84 @@ pub struct ComplianceExport {
     pub total_compute_time_ms: u64,
 }
 
+/// .ros v3.1 PROV chunk — canonical AI provenance container.
+///
+/// `commands` may be empty (no AI has authored anything yet) but the
+/// chunk itself is mandatory in every v3.1 file. The `session` field
+/// captures the active session id at write time so post-hoc
+/// reconciliation against an external session manager is possible
+/// without scanning the full command list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvChunk {
+    /// On-disk schema version of the PROV body.
+    pub schema_version: u32,
+    /// Active session id at write time.
+    pub session: u64,
+    /// AI commands recorded so far. May be empty.
+    pub commands: Vec<AICommand>,
+    /// Privacy settings governing the recorded commands.
+    pub privacy: PrivacySettings,
+    /// Tracking level used by the writer.
+    pub tracking_level: TrackingLevel,
+    /// Sessions present in the writer's tracker.
+    pub sessions: HashMap<u64, SessionInfo>,
+    /// Provenance header (counts/timestamps).
+    pub header: AIProvenanceHeader,
+}
+
+impl ProvChunk {
+    /// Current PROV schema version.
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    /// Build an empty PROV chunk with the given tracking level + privacy.
+    ///
+    /// Generates a fresh session id so the chunk is well-formed even
+    /// when no AI activity has been recorded.
+    pub fn empty(tracking_level: TrackingLevel, privacy: PrivacySettings) -> Self {
+        let tracker = AICommandTracker::new(tracking_level, privacy.clone(), None);
+        Self::from_tracker(&tracker)
+    }
+
+    /// Build a PROV chunk that mirrors a live `AICommandTracker`.
+    pub fn from_tracker(tracker: &AICommandTracker) -> Self {
+        ProvChunk {
+            schema_version: Self::SCHEMA_VERSION,
+            session: tracker.current_session,
+            commands: tracker.commands.clone(),
+            privacy: tracker.header.privacy_settings.clone(),
+            tracking_level: tracker.header.tracking_level,
+            sessions: tracker.sessions.clone(),
+            header: tracker.header.clone(),
+        }
+    }
+
+    /// Reconstruct an `AICommandTracker` from a PROV chunk.
+    pub fn into_tracker(self) -> AICommandTracker {
+        AICommandTracker {
+            header: self.header,
+            commands: self.commands,
+            current_session: self.session,
+            sessions: self.sessions,
+        }
+    }
+
+    /// Encode to MessagePack.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        rmp_serde::to_vec_named(self).map_err(|e| RosFileError::Other {
+            message: format!("Failed to serialize PROV chunk: {}", e),
+            source: None,
+        })
+    }
+
+    /// Decode from MessagePack.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        rmp_serde::from_slice(bytes).map_err(|e| RosFileError::Other {
+            message: format!("Failed to deserialize PROV chunk: {}", e),
+            source: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
