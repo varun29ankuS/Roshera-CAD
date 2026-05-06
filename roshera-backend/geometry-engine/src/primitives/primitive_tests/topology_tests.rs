@@ -3653,4 +3653,79 @@ mod tests {
 
         assert_box_face_normals_match_loop_winding(&model, solid_id);
     }
+
+    /// Mass-properties unification (#41): `volume` and `surface_area` must
+    /// come out of the same `compute_mass_properties` call, agree with
+    /// closed-form values for a known 2×4×6 box (V=48, A=88), and survive
+    /// the cache so a second call is a no-op.
+    #[test]
+    fn test_compute_mass_properties_unit_box_volume_and_surface_area() {
+        use crate::primitives::box_primitive::{BoxParameters, BoxPrimitive};
+        use crate::primitives::primitive_traits::Primitive;
+
+        let mut model = BRepModel::new();
+        let params = BoxParameters::new(2.0, 4.0, 6.0).expect("valid box dimensions");
+        let solid_id =
+            BoxPrimitive::create(params, &mut model).expect("box primitive should construct");
+
+        let solid = model
+            .solids
+            .get_mut(solid_id)
+            .expect("solid must exist after construction");
+        let props = solid
+            .compute_mass_properties(
+                &mut model.shells,
+                &mut model.faces,
+                &mut model.loops,
+                &model.vertices,
+                &model.edges,
+                &model.curves,
+                &model.surfaces,
+            )
+            .expect("mass properties should compute for a closed box")
+            .clone();
+
+        // Closed-form: V = 2 * 4 * 6 = 48
+        assert!(
+            (props.volume - 48.0).abs() < 1e-9,
+            "volume mismatch: expected 48.0, got {}",
+            props.volume,
+        );
+
+        // Closed-form: A = 2 * (2*4 + 2*6 + 4*6) = 2 * 44 = 88
+        assert!(
+            (props.surface_area - 88.0).abs() < 1e-9,
+            "surface area mismatch: expected 88.0, got {}",
+            props.surface_area,
+        );
+
+        // Mass = volume × density. Default material is Steel (7850 kg/m³)
+        // per the readable-surface contract; we just verify the relation
+        // here without pinning the density value.
+        let expected_mass = props.volume * solid.attributes.material.density;
+        assert!(
+            (props.mass - expected_mass).abs() < 1e-9,
+            "mass should equal volume × density: got {}, expected {}",
+            props.mass,
+            expected_mass,
+        );
+
+        // Second call must hit the cache and produce byte-identical numbers
+        // — proves the unification did not regress determinism.
+        let second = solid
+            .compute_mass_properties(
+                &mut model.shells,
+                &mut model.faces,
+                &mut model.loops,
+                &model.vertices,
+                &model.edges,
+                &model.curves,
+                &model.surfaces,
+            )
+            .expect("cached mass properties should re-fetch")
+            .clone();
+        assert_eq!(props.volume, second.volume);
+        assert_eq!(props.surface_area, second.surface_area);
+        assert_eq!(props.mass, second.mass);
+    }
 }

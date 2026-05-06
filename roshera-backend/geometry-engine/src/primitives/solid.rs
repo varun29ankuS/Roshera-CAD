@@ -137,6 +137,10 @@ impl Default for SolidAttributes {
 pub struct SolidMassProperties {
     /// Volume
     pub volume: f64,
+    /// Total surface area (outer shell + inner shells; inner-shell faces
+    /// contribute their full area because they bound the solid's interior
+    /// voids).
+    pub surface_area: f64,
     /// Mass (using material density)
     pub mass: f64,
     /// Center of mass
@@ -490,6 +494,7 @@ impl Solid {
         if self.cached_mass_props.is_none() {
             // Calculate volume using divergence theorem
             let mut volume = 0.0;
+            let mut surface_area = 0.0;
             let mut center = Vector3::ZERO;
             let mut volume_integrals = VolumeIntegrals::default();
 
@@ -512,6 +517,9 @@ impl Solid {
                     // Add to volume integrals
                     volume_integrals.add_shell_contribution(shell_props, 1.0);
                 }
+                // Surface area always accumulates positively — the outer
+                // shell's faces bound the solid from outside.
+                surface_area += shell_props.surface_area;
             }
 
             // Subtract inner shells
@@ -534,6 +542,11 @@ impl Solid {
                         // Subtract from volume integrals
                         volume_integrals.add_shell_contribution(shell_props, -1.0);
                     }
+                    // Inner-shell faces also bound the solid (from inside,
+                    // around voids) — they add to total surface area, not
+                    // subtract. A hollow box has more surface area than a
+                    // solid box of the same outer dimensions.
+                    surface_area += shell_props.surface_area;
                 }
             }
 
@@ -567,6 +580,7 @@ impl Solid {
 
             self.cached_mass_props = Some(SolidMassProperties {
                 volume,
+                surface_area,
                 mass,
                 center_of_mass,
                 inertia_tensor,
@@ -721,32 +735,35 @@ impl Solid {
         Ok(props.volume)
     }
 
+    /// Total surface area (outer shell + inner-shell void boundaries).
+    ///
+    /// Delegates to [`Self::compute_mass_properties`] so the result is
+    /// served from the same cache as `volume` / `mass` / `inertia` and
+    /// never diverges from them. The `tolerance` parameter is retained
+    /// for API stability but no longer consulted — surface area is
+    /// derived from the same divergence-theorem face traversal that
+    /// computes the rest of the mass properties.
     pub fn surface_area(
-        &self,
+        &mut self,
         shell_store: &mut ShellStore,
         face_store: &mut FaceStore,
         loop_store: &mut LoopStore,
         vertex_store: &VertexStore,
         edge_store: &EdgeStore,
+        curve_store: &CurveStore,
         surface_store: &SurfaceStore,
-        tolerance: Tolerance,
+        _tolerance: Tolerance,
     ) -> MathResult<f64> {
-        let mut total_area = 0.0;
-
-        for &shell_id in &self.all_shells() {
-            if let Some(shell) = shell_store.get_mut(shell_id) {
-                total_area += shell.surface_area(
-                    face_store,
-                    loop_store,
-                    vertex_store,
-                    edge_store,
-                    surface_store,
-                    tolerance,
-                )?;
-            }
-        }
-
-        Ok(total_area)
+        let props = self.compute_mass_properties(
+            shell_store,
+            face_store,
+            loop_store,
+            vertex_store,
+            edge_store,
+            curve_store,
+            surface_store,
+        )?;
+        Ok(props.surface_area)
     }
 
     pub fn bounding_box(
