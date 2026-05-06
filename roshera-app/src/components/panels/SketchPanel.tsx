@@ -87,6 +87,7 @@ export function SketchPanel() {
   const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
   const addNewSketchShape = useSceneStore((s) => s.addNewSketchShape)
   const deleteSketchShape = useSceneStore((s) => s.deleteSketchShape)
+  const awaitSketchReady = useSceneStore((s) => s.awaitSketchReady)
 
   const [busy, setBusy] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -114,15 +115,23 @@ export function SketchPanel() {
         return
       }
     }
-    if (!sketch.serverId) {
-      // The backend create round-trip hasn't landed yet. The user can
-      // retry in a moment; we don't fall back to the legacy
-      // frontend-driven extrude because that would silently drop the
-      // session lifecycle frames the timeline panel depends on.
-      setError('Preparing sketch session — try again in a moment')
+    setBusy(true)
+    let serverId: string
+    try {
+      // Wait for the backend create round-trip to land and the
+      // pending-op queue to drain. Resolves immediately if serverId
+      // is already set; otherwise blocks until `enterSketch`'s create
+      // promise resolves (and any operations the user fired in that
+      // window have replayed in order). This is the "Preparing sketch
+      // session" race fix — a fast user can no longer hit Finish
+      // before the session exists.
+      serverId = await awaitSketchReady()
+    } catch (err) {
+      setBusy(false)
+      const msg = err instanceof Error ? err.message : String(err)
+      setError(`Sketch session unavailable: ${msg}`)
       return
     }
-    setBusy(true)
     try {
       // Re-edit replace semantics: when this Finish is closing out an
       // edit pass on an existing feature (sketch was opened via "Edit
@@ -162,7 +171,7 @@ export function SketchPanel() {
       // the same profile. Without this, the backend deletes the
       // session (default behaviour) and re-edit silently fails because
       // there's nothing to load.
-      const result = await sketchApi.extrude(sketch.serverId, {
+      const result = await sketchApi.extrude(serverId, {
         distance: sketch.thickness,
         name: `${sketch.tool}-extrude`,
         consume: false,
@@ -193,13 +202,13 @@ export function SketchPanel() {
       setBusy(false)
     }
   }, [
+    awaitSketchReady,
     busy,
     exitSketch,
     sketch.circleSegments,
     sketch.editingSourceObjectId,
     sketch.plane,
     sketch.points,
-    sketch.serverId,
     sketch.shapes,
     sketch.thickness,
     sketch.tool,
