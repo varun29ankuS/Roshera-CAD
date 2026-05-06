@@ -39,6 +39,58 @@ fn matrix4_to_row_major(m: &Matrix4) -> [[f64; 4]; 4] {
     ]
 }
 
+/// Average position of every unique vertex referenced by `loop_id`'s
+/// edges, in the model's vertex store. Used by slice 4b derived datum
+/// evaluation as a curve-store-free substitute for `Loop::centroid`
+/// (which currently passes an empty `CurveStore` to its underlying
+/// `compute_stats` and therefore fails on any non-trivial loop).
+///
+/// Returns `DatumError::UnknownReference` if the loop or any of its
+/// referenced edges / vertices cannot be resolved, and
+/// `DatumError::DegenerateSource` if the loop has no edges.
+fn loop_vertex_centroid(
+    model: &BRepModel,
+    loop_id: crate::primitives::r#loop::LoopId,
+) -> Result<Point3, crate::primitives::datum::DatumError> {
+    use crate::primitives::datum::DatumError;
+    let lp = model.loops.get(loop_id).ok_or(DatumError::UnknownReference {
+        kind: "loop",
+        id: loop_id as u64,
+    })?;
+    if lp.edges.is_empty() {
+        return Err(DatumError::DegenerateSource("loop has no edges"));
+    }
+    // Collect each edge's start vertex; for a closed loop the start
+    // vertices already form the unique vertex set without
+    // double-counting.
+    let mut sx = 0.0_f64;
+    let mut sy = 0.0_f64;
+    let mut sz = 0.0_f64;
+    let mut count: usize = 0;
+    for &edge_id in &lp.edges {
+        let edge = model.edges.get(edge_id).ok_or(DatumError::UnknownReference {
+            kind: "edge",
+            id: edge_id as u64,
+        })?;
+        let v = model
+            .vertices
+            .get(edge.start_vertex)
+            .ok_or(DatumError::UnknownReference {
+                kind: "vertex",
+                id: edge.start_vertex as u64,
+            })?;
+        sx += v.position[0];
+        sy += v.position[1];
+        sz += v.position[2];
+        count += 1;
+    }
+    if count == 0 {
+        return Err(DatumError::DegenerateSource("loop has no resolvable vertices"));
+    }
+    let inv = 1.0 / count as f64;
+    Ok(Point3::new(sx * inv, sy * inv, sz * inv))
+}
+
 /// Tessellated mesh representation for visualization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TessellatedMesh {
@@ -347,6 +399,7 @@ impl BRepModel {
             crate::primitives::datum::AxisDirection::X => "x",
             crate::primitives::datum::AxisDirection::Y => "y",
             crate::primitives::datum::AxisDirection::Z => "z",
+            crate::primitives::datum::AxisDirection::Custom => "custom",
         };
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("datum_create")
@@ -441,6 +494,254 @@ impl BRepModel {
                 .with_inputs(vec![id as u64]),
         );
         Ok(removed)
+    }
+
+    // ──────────────────── 4b: derived datum evaluation + authoring ───────────
+    //
+    // `evaluate_datum_source` is the single entry point that turns a
+    // `DatumSource` recipe into a concrete `Matrix4` by reading vertex
+    // positions, edge tangents, and face normals out of the kernel
+    // stores. `create_derived_datum` is the recorder mediator: it
+    // evaluates the source, inserts the datum via
+    // `DatumStore::create_derived`, and emits a `datum_create_derived`
+    // event so timeline replay reconstructs the same recipe — not the
+    // baked transform, which is the slice 5 propagation invariant.
+    //
+    // This block is intentionally placed before the slice 3b queries so
+    // the read APIs remain at the bottom of the impl, and so the
+    // derived datum mediators sit next to the slice 4a authoring
+    // mediators they extend.
+    pub fn evaluate_datum_source(
+        &self,
+        source: &crate::primitives::datum::DatumSource,
+    ) -> Result<Matrix4, crate::primitives::datum::DatumError> {
+        use crate::primitives::datum::{
+            frame_from_origin_and_z, frame_z_axis, DatumError, DatumSource,
+        };
+        match *source {
+            DatumSource::Manual { transform } => Ok(DatumSource::unpack_matrix(transform)),
+            DatumSource::OffsetPlane { base, distance } => {
+                let base_d = self
+                    .datums
+                    .get(base)
+                    .ok_or(DatumError::UnknownReference {
+                        kind: "datum",
+                        id: base as u64,
+                    })?;
+                let normal = frame_z_axis(&base_d.transform);
+                // Translate base origin along its +Z by `distance`.
+                let new_origin = Point3::new(
+                    base_d.origin.x + normal.x * distance,
+                    base_d.origin.y + normal.y * distance,
+                    base_d.origin.z + normal.z * distance,
+                );
+                frame_from_origin_and_z(new_origin, normal)
+            }
+            DatumSource::AnglePlane { base, axis, angle } => {
+                let base_d = self
+                    .datums
+                    .get(base)
+                    .ok_or(DatumError::UnknownReference {
+                        kind: "datum",
+                        id: base as u64,
+                    })?;
+                let axis_d = self
+                    .datums
+                    .get(axis)
+                    .ok_or(DatumError::UnknownReference {
+                        kind: "datum",
+                        id: axis as u64,
+                    })?;
+                let axis_dir = frame_z_axis(&axis_d.transform);
+                let base_normal = frame_z_axis(&base_d.transform);
+                let rotation = Matrix4::from_axis_angle(&axis_dir, angle).map_err(|e| {
+                    DatumError::EvaluationFailed(format!("angle-plane axis-angle: {e}"))
+                })?;
+                let rotated_normal =
+                    rotation.transform_vector(&base_normal).normalize().map_err(|e| {
+                        DatumError::EvaluationFailed(format!("angle-plane normal: {e}"))
+                    })?;
+                frame_from_origin_and_z(base_d.origin, rotated_normal)
+            }
+            DatumSource::ThreePoints { p0, p1, p2 } => {
+                let v0 = self.vertices.get(p0).ok_or(DatumError::UnknownReference {
+                    kind: "vertex",
+                    id: p0 as u64,
+                })?;
+                let v1 = self.vertices.get(p1).ok_or(DatumError::UnknownReference {
+                    kind: "vertex",
+                    id: p1 as u64,
+                })?;
+                let v2 = self.vertices.get(p2).ok_or(DatumError::UnknownReference {
+                    kind: "vertex",
+                    id: p2 as u64,
+                })?;
+                let p0p = Point3::new(v0.position[0], v0.position[1], v0.position[2]);
+                let p1p = Point3::new(v1.position[0], v1.position[1], v1.position[2]);
+                let p2p = Point3::new(v2.position[0], v2.position[1], v2.position[2]);
+                let e1 = Vector3::new(p1p.x - p0p.x, p1p.y - p0p.y, p1p.z - p0p.z);
+                let e2 = Vector3::new(p2p.x - p0p.x, p2p.y - p0p.y, p2p.z - p0p.z);
+                let normal = e1.cross(&e2);
+                if normal.magnitude_squared() < f64::EPSILON * f64::EPSILON {
+                    return Err(DatumError::DegenerateSource(
+                        "three-points plane: collinear vertices",
+                    ));
+                }
+                frame_from_origin_and_z(p0p, normal)
+            }
+            DatumSource::PlaneFromFace { face } => {
+                let face_data = self.faces.get(face).ok_or(DatumError::UnknownReference {
+                    kind: "face",
+                    id: face as u64,
+                })?;
+                let centroid = loop_vertex_centroid(self, face_data.outer_loop)?;
+                let u_mid = 0.5 * (face_data.uv_bounds[0] + face_data.uv_bounds[1]);
+                let v_mid = 0.5 * (face_data.uv_bounds[2] + face_data.uv_bounds[3]);
+                let normal = face_data
+                    .normal_at(u_mid, v_mid, &self.surfaces)
+                    .map_err(|e| DatumError::EvaluationFailed(format!("face normal: {e}")))?;
+                frame_from_origin_and_z(centroid, normal)
+            }
+            DatumSource::MidPlane { a, b } => {
+                let a_d = self.datums.get(a).ok_or(DatumError::UnknownReference {
+                    kind: "datum",
+                    id: a as u64,
+                })?;
+                let b_d = self.datums.get(b).ok_or(DatumError::UnknownReference {
+                    kind: "datum",
+                    id: b as u64,
+                })?;
+                let na = frame_z_axis(&a_d.transform);
+                let nb = frame_z_axis(&b_d.transform);
+                let avg = Vector3::new(na.x + nb.x, na.y + nb.y, na.z + nb.z);
+                if avg.magnitude_squared() < f64::EPSILON * f64::EPSILON {
+                    return Err(DatumError::DegenerateSource(
+                        "mid-plane: parent normals are antiparallel",
+                    ));
+                }
+                let mid = Point3::new(
+                    0.5 * (a_d.origin.x + b_d.origin.x),
+                    0.5 * (a_d.origin.y + b_d.origin.y),
+                    0.5 * (a_d.origin.z + b_d.origin.z),
+                );
+                frame_from_origin_and_z(mid, avg)
+            }
+            DatumSource::EdgeAxis { edge } => {
+                let edge_data = self.edges.get(edge).ok_or(DatumError::UnknownReference {
+                    kind: "edge",
+                    id: edge as u64,
+                })?;
+                let mid = edge_data
+                    .evaluate(0.5, &self.curves)
+                    .map_err(|e| DatumError::EvaluationFailed(format!("edge midpoint: {e}")))?;
+                let tangent = edge_data
+                    .tangent_at(0.5, &self.curves)
+                    .map_err(|e| DatumError::EvaluationFailed(format!("edge tangent: {e}")))?;
+                frame_from_origin_and_z(mid, tangent)
+            }
+            DatumSource::TwoPointsAxis { p0, p1 } => {
+                let v0 = self.vertices.get(p0).ok_or(DatumError::UnknownReference {
+                    kind: "vertex",
+                    id: p0 as u64,
+                })?;
+                let v1 = self.vertices.get(p1).ok_or(DatumError::UnknownReference {
+                    kind: "vertex",
+                    id: p1 as u64,
+                })?;
+                let p0p = Point3::new(v0.position[0], v0.position[1], v0.position[2]);
+                let p1p = Point3::new(v1.position[0], v1.position[1], v1.position[2]);
+                let dir = Vector3::new(p1p.x - p0p.x, p1p.y - p0p.y, p1p.z - p0p.z);
+                if dir.magnitude_squared() < f64::EPSILON * f64::EPSILON {
+                    return Err(DatumError::DegenerateSource(
+                        "two-points axis: coincident vertices",
+                    ));
+                }
+                let mid = Point3::new(
+                    0.5 * (p0p.x + p1p.x),
+                    0.5 * (p0p.y + p1p.y),
+                    0.5 * (p0p.z + p1p.z),
+                );
+                frame_from_origin_and_z(mid, dir)
+            }
+            DatumSource::NormalAxis { plane, point } => {
+                let plane_d = self.datums.get(plane).ok_or(DatumError::UnknownReference {
+                    kind: "datum",
+                    id: plane as u64,
+                })?;
+                let v = self
+                    .vertices
+                    .get(point)
+                    .ok_or(DatumError::UnknownReference {
+                        kind: "vertex",
+                        id: point as u64,
+                    })?;
+                let pos = Point3::new(v.position[0], v.position[1], v.position[2]);
+                let dir = frame_z_axis(&plane_d.transform);
+                frame_from_origin_and_z(pos, dir)
+            }
+            DatumSource::VertexPoint { vertex } => {
+                let v = self
+                    .vertices
+                    .get(vertex)
+                    .ok_or(DatumError::UnknownReference {
+                        kind: "vertex",
+                        id: vertex as u64,
+                    })?;
+                let pos = Point3::new(v.position[0], v.position[1], v.position[2]);
+                Ok(Matrix4::from_translation(&Vector3::new(pos.x, pos.y, pos.z)))
+            }
+            DatumSource::CurveMidpoint { edge } => {
+                let edge_data = self.edges.get(edge).ok_or(DatumError::UnknownReference {
+                    kind: "edge",
+                    id: edge as u64,
+                })?;
+                let mid = edge_data
+                    .evaluate(0.5, &self.curves)
+                    .map_err(|e| DatumError::EvaluationFailed(format!("edge midpoint: {e}")))?;
+                Ok(Matrix4::from_translation(&Vector3::new(mid.x, mid.y, mid.z)))
+            }
+            DatumSource::FaceCentroid { face } => {
+                let face_data = self.faces.get(face).ok_or(DatumError::UnknownReference {
+                    kind: "face",
+                    id: face as u64,
+                })?;
+                let centroid = loop_vertex_centroid(self, face_data.outer_loop)?;
+                Ok(Matrix4::from_translation(&Vector3::new(
+                    centroid.x, centroid.y, centroid.z,
+                )))
+            }
+        }
+    }
+
+    /// Create a derived datum from a `DatumSource` recipe and record
+    /// `datum_create_derived`. Evaluates the source against the current
+    /// model, inserts the datum (with `kind` from
+    /// `DatumSource::default_kind`), and emits a timeline event whose
+    /// `parameters` carry the source recipe — replay re-evaluates the
+    /// recipe rather than re-applying a baked transform, which keeps
+    /// derived datums sticking to their referenced geometry across
+    /// branches.
+    pub fn create_derived_datum(
+        &self,
+        name: String,
+        source: crate::primitives::datum::DatumSource,
+    ) -> Result<crate::primitives::datum::DatumId, crate::primitives::datum::DatumError> {
+        let transform = self.evaluate_datum_source(&source)?;
+        let kind = source.default_kind();
+        let id = self
+            .datums
+            .create_derived(name.clone(), kind, transform, source)?;
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("datum_create_derived")
+                .with_parameters(serde_json::json!({
+                    "datum_id": id,
+                    "name": name,
+                    "source": source,
+                    "transform": matrix4_to_row_major(&transform),
+                }))
+                .with_outputs(vec![id as u64]),
+        );
+        Ok(id)
     }
 
     // ─────────────────────────── Datum-relative queries ──────────────────────
@@ -3823,6 +4124,390 @@ mod anchor_tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "datum_delete");
         assert_eq!(events[1].parameters["name"], "Tmp");
+    }
+
+    // ───────────────────── 4b: derived datum evaluation ────────────────────────
+
+    use crate::primitives::datum::{
+        AxisDirection, DatumError, DatumSource, INVALID_DATUM_ID,
+    };
+    use crate::primitives::vertex::VertexId;
+
+    fn box_with_seeded_datums() -> (BRepModel, SolidId) {
+        let mut model = BRepModel::new();
+        model.datums.seed_defaults();
+        let geo = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(2.0, 2.0, 2.0)
+                .expect("box creation succeeds")
+        };
+        let sid = match geo {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        (model, sid)
+    }
+
+    fn vertex_at(model: &BRepModel, target: [f64; 3]) -> VertexId {
+        for id in 0..(model.vertices.len() as u32) {
+            if let Some(v) = model.vertices.get(id) {
+                let dx = v.position[0] - target[0];
+                let dy = v.position[1] - target[1];
+                let dz = v.position[2] - target[2];
+                if dx * dx + dy * dy + dz * dz < 1e-18 {
+                    return id;
+                }
+            }
+        }
+        panic!("no vertex at {:?}", target);
+    }
+
+    #[test]
+    fn evaluate_manual_round_trips_transform() {
+        let model = BRepModel::new();
+        let m = Matrix4::from_translation(&Vector3::new(3.0, 4.0, 5.0));
+        let source = DatumSource::manual(m);
+        let evaluated = model
+            .evaluate_datum_source(&source)
+            .expect("manual evaluates");
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!((evaluated.get(r, c) - m.get(r, c)).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_offset_plane_translates_along_normal() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let source = DatumSource::OffsetPlane {
+            base: 1,
+            distance: 5.0,
+        };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("offset evaluates");
+        assert!((m.get(0, 3) - 0.0).abs() < 1e-12);
+        assert!((m.get(1, 3) - 0.0).abs() < 1e-12);
+        assert!((m.get(2, 3) - 5.0).abs() < 1e-12);
+        assert!((m.get(2, 2) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evaluate_offset_plane_unknown_base_errors() {
+        let model = BRepModel::new();
+        let source = DatumSource::OffsetPlane {
+            base: INVALID_DATUM_ID,
+            distance: 1.0,
+        };
+        let err = model
+            .evaluate_datum_source(&source)
+            .expect_err("unknown base");
+        assert!(matches!(
+            err,
+            DatumError::UnknownReference { kind: "datum", .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_angle_plane_rotates_normal_around_axis() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let source = DatumSource::AnglePlane {
+            base: 1,
+            axis: 4,
+            angle: std::f64::consts::FRAC_PI_2,
+        };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("angle plane evaluates");
+        let nz_x = m.get(0, 2);
+        let nz_y = m.get(1, 2);
+        let nz_z = m.get(2, 2);
+        assert!(nz_x.abs() < 1e-9);
+        assert!(nz_y.abs() > 0.9);
+        assert!(nz_z.abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_three_points_uses_first_vertex_as_origin() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
+        let p1 = vertex_at(&model, [1.0, -1.0, -1.0]);
+        let p2 = vertex_at(&model, [-1.0, 1.0, -1.0]);
+        let source = DatumSource::ThreePoints { p0, p1, p2 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("three points evaluate");
+        assert!((m.get(0, 3) - -1.0).abs() < 1e-12);
+        assert!((m.get(1, 3) - -1.0).abs() < 1e-12);
+        assert!((m.get(2, 3) - -1.0).abs() < 1e-12);
+        // (p1-p0) × (p2-p0) = (2,0,0) × (0,2,0) = (0,0,4) → +Z normal.
+        assert!((m.get(2, 2) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evaluate_three_points_collinear_is_degenerate() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
+        let source = DatumSource::ThreePoints {
+            p0,
+            p1: p0,
+            p2: p0,
+        };
+        let err = model
+            .evaluate_datum_source(&source)
+            .expect_err("collinear");
+        assert!(matches!(err, DatumError::DegenerateSource(_)));
+    }
+
+    #[test]
+    fn evaluate_mid_plane_averages_normals_and_origins() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let source = DatumSource::MidPlane { a: 1, b: 2 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("mid plane evaluates");
+        for c in 0..3 {
+            assert!(m.get(c, 3).abs() < 1e-12);
+        }
+        assert!((m.get(1, 2).abs() - m.get(2, 2).abs()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_mid_plane_antiparallel_is_degenerate() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let flip = Matrix4::rotation_x(std::f64::consts::PI);
+        let neg_z_id = model
+            .datums
+            .create_plane("NegZ".to_string(), flip)
+            .expect("flip plane created");
+        let source = DatumSource::MidPlane {
+            a: 1,
+            b: neg_z_id,
+        };
+        let err = model
+            .evaluate_datum_source(&source)
+            .expect_err("antiparallel");
+        assert!(matches!(err, DatumError::DegenerateSource(_)));
+    }
+
+    #[test]
+    fn evaluate_two_points_axis_uses_midpoint() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
+        let p1 = vertex_at(&model, [1.0, -1.0, -1.0]);
+        let source = DatumSource::TwoPointsAxis { p0, p1 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("two points axis evaluates");
+        assert!((m.get(0, 3) - 0.0).abs() < 1e-12);
+        assert!((m.get(1, 3) - -1.0).abs() < 1e-12);
+        assert!((m.get(2, 3) - -1.0).abs() < 1e-12);
+        assert!((m.get(0, 2) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evaluate_two_points_axis_coincident_is_degenerate() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
+        let source = DatumSource::TwoPointsAxis { p0, p1: p0 };
+        let err = model
+            .evaluate_datum_source(&source)
+            .expect_err("coincident");
+        assert!(matches!(err, DatumError::DegenerateSource(_)));
+    }
+
+    #[test]
+    fn evaluate_normal_axis_uses_plane_normal_through_vertex() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p = vertex_at(&model, [1.0, 1.0, 1.0]);
+        let source = DatumSource::NormalAxis { plane: 1, point: p };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("normal axis evaluates");
+        assert!((m.get(0, 3) - 1.0).abs() < 1e-12);
+        assert!((m.get(1, 3) - 1.0).abs() < 1e-12);
+        assert!((m.get(2, 3) - 1.0).abs() < 1e-12);
+        assert!((m.get(2, 2) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evaluate_vertex_point_translates_to_position() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p = vertex_at(&model, [-1.0, 1.0, -1.0]);
+        let source = DatumSource::VertexPoint { vertex: p };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("vertex point evaluates");
+        assert!((m.get(0, 3) - -1.0).abs() < 1e-12);
+        assert!((m.get(1, 3) - 1.0).abs() < 1e-12);
+        assert!((m.get(2, 3) - -1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evaluate_curve_midpoint_lies_on_box_edge() {
+        let (model, _sid) = box_with_seeded_datums();
+        let edge = model.edges.get(0).expect("at least one edge");
+        let start = model
+            .vertices
+            .get(edge.start_vertex)
+            .expect("start vertex");
+        let end = model.vertices.get(edge.end_vertex).expect("end vertex");
+        let expected = [
+            0.5 * (start.position[0] + end.position[0]),
+            0.5 * (start.position[1] + end.position[1]),
+            0.5 * (start.position[2] + end.position[2]),
+        ];
+        let source = DatumSource::CurveMidpoint { edge: 0 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("curve midpoint evaluates");
+        assert!((m.get(0, 3) - expected[0]).abs() < 1e-9);
+        assert!((m.get(1, 3) - expected[1]).abs() < 1e-9);
+        assert!((m.get(2, 3) - expected[2]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_face_centroid_lies_inside_box_bbox() {
+        let (model, _sid) = box_with_seeded_datums();
+        let source = DatumSource::FaceCentroid { face: 0 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("face centroid evaluates");
+        let x = m.get(0, 3);
+        let y = m.get(1, 3);
+        let z = m.get(2, 3);
+        assert!(
+            x.abs() <= 1.0 + 1e-9 && y.abs() <= 1.0 + 1e-9 && z.abs() <= 1.0 + 1e-9,
+            "centroid {:?} outside box bbox",
+            (x, y, z)
+        );
+    }
+
+    #[test]
+    fn evaluate_edge_axis_returns_unit_direction() {
+        let (model, _sid) = box_with_seeded_datums();
+        let source = DatumSource::EdgeAxis { edge: 0 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("edge axis evaluates");
+        let nz = (m.get(0, 2).powi(2) + m.get(1, 2).powi(2) + m.get(2, 2).powi(2)).sqrt();
+        assert!((nz - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_plane_from_face_returns_unit_normal() {
+        let (model, _sid) = box_with_seeded_datums();
+        let source = DatumSource::PlaneFromFace { face: 0 };
+        let m = model
+            .evaluate_datum_source(&source)
+            .expect("plane from face evaluates");
+        let nz = (m.get(0, 2).powi(2) + m.get(1, 2).powi(2) + m.get(2, 2).powi(2)).sqrt();
+        assert!((nz - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn create_derived_datum_records_event_and_uses_default_kind() {
+        let mut model = BRepModel::new();
+        model.datums.seed_defaults();
+        let recorder = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        let source = DatumSource::OffsetPlane {
+            base: 1,
+            distance: 7.0,
+        };
+        let id = model
+            .create_derived_datum("Offset7".to_string(), source)
+            .expect("create_derived succeeds");
+        let datum = model.datums.get(id).expect("datum present");
+        assert_eq!(datum.name, "Offset7");
+        assert!(!datum.is_default);
+        assert!(matches!(
+            datum.kind,
+            DatumKind::Plane(crate::sketch2d::sketch_plane::PlaneOrientation::Custom)
+        ));
+        match datum.source {
+            DatumSource::OffsetPlane { base, distance } => {
+                assert_eq!(base, 1);
+                assert!((distance - 7.0).abs() < 1e-12);
+            }
+            other => panic!("expected OffsetPlane, got {:?}", other),
+        }
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("CaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "datum_create_derived");
+        assert_eq!(events[0].outputs, vec![id as u64]);
+        assert_eq!(events[0].parameters["name"], "Offset7");
+    }
+
+    #[test]
+    fn create_derived_datum_axis_uses_axis_custom_kind() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
+        let p1 = vertex_at(&model, [1.0, -1.0, -1.0]);
+        let id = model
+            .create_derived_datum(
+                "EdgeAxis".to_string(),
+                DatumSource::TwoPointsAxis { p0, p1 },
+            )
+            .expect("create_derived succeeds");
+        let datum = model.datums.get(id).expect("datum present");
+        assert!(matches!(datum.kind, DatumKind::Axis(AxisDirection::Custom)));
+    }
+
+    #[test]
+    fn create_derived_datum_point_uses_origin_kind() {
+        let (model, _sid) = box_with_seeded_datums();
+        let p = vertex_at(&model, [1.0, 1.0, 1.0]);
+        let id = model
+            .create_derived_datum(
+                "Corner".to_string(),
+                DatumSource::VertexPoint { vertex: p },
+            )
+            .expect("create_derived succeeds");
+        let datum = model.datums.get(id).expect("datum present");
+        assert!(matches!(datum.kind, DatumKind::Origin));
+    }
+
+    #[test]
+    fn create_derived_datum_propagates_evaluation_error() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let source = DatumSource::VertexPoint {
+            vertex: u32::MAX - 1,
+        };
+        let err = model
+            .create_derived_datum("Bad".to_string(), source)
+            .expect_err("unknown vertex");
+        assert!(matches!(
+            err,
+            DatumError::UnknownReference { kind: "vertex", .. }
+        ));
+    }
+
+    #[test]
+    fn create_derived_datum_rejects_empty_name() {
+        let model = BRepModel::new();
+        model.datums.seed_defaults();
+        let source = DatumSource::OffsetPlane {
+            base: 1,
+            distance: 1.0,
+        };
+        let err = model
+            .create_derived_datum("".to_string(), source)
+            .expect_err("empty name");
+        assert!(matches!(err, DatumError::EmptyName));
     }
 }
 
