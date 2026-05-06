@@ -15,13 +15,15 @@ use super::line2d::ParametricLine2d;
 use super::point2d::ParametricPoint2d;
 use super::polyline2d::ParametricPolyline2d;
 use super::rectangle2d::ParametricRectangle2d;
+use super::sketch_plane::PlaneOrientation;
 use super::spline2d::{BSpline2d, ParametricSpline2d};
 use super::{
     Arc2d, Arc2dId, Circle2d, Circle2dId, Constraint, ConstraintId, Ellipse2d, Ellipse2dId, Line2d,
     Line2dId, LineSegment2d, Point2d, Point2dId, Polyline2d, Polyline2dId, Rectangle2d,
-    Rectangle2dId, Sketch2dError, Sketch2dResult, SketchPlane, Spline2d, Spline2dId, Tolerance2d,
-    Vector2d,
+    Rectangle2dId, Sketch2dError, Sketch2dResult, Spline2d, Spline2dId, Tolerance2d, Vector2d,
 };
+use crate::math::{Matrix4, Point3};
+use crate::primitives::datum::{Datum, DatumId, DatumKind, INVALID_DATUM_ID};
 use crate::sketch2d::SketchEntity2d;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -75,14 +77,85 @@ pub struct SketchStatistics {
     pub over_constrained_count: usize,
 }
 
+/// How a sketch is placed in 3D space.
+///
+/// Every sketch is anchored to a `Datum` (by id) which defines the
+/// local-to-world reference frame. The `frame` matrix is a snapshot of
+/// `Datum::frame()` materialised at the time the sketch was created or
+/// re-anchored, so 2D-to-3D conversion at use sites does not need to
+/// hold a `DatumStore` reference. When the source datum's transform
+/// changes (slice 4b derived datums + slice 5 propagation graph),
+/// callers must rebuild the `SketchAnchor` to refresh the cached frame
+/// — until the propagation graph lands, treat the cache as
+/// authoritative for the lifetime of the sketch.
+///
+/// `INVALID_DATUM_ID` is a sentinel reserved for tests and pre-datum
+/// legacy paths that synthesise a frame without an owning datum;
+/// production sketches must reference a real datum and use
+/// [`SketchAnchor::from_datum`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SketchAnchor {
+    /// Identifier of the datum this sketch is anchored to. Equal to
+    /// [`INVALID_DATUM_ID`] for free-floating anchors built via
+    /// [`SketchAnchor::standard`] / [`SketchAnchor::xy`] / etc.
+    pub datum_id: DatumId,
+    /// Snapshot of the datum's local-to-world frame. Local +Z is the
+    /// sketch plane normal; local +X / +Y are the in-plane axes.
+    pub frame: Matrix4,
+}
+
+impl SketchAnchor {
+    /// Build an anchor pointing at a real datum. Captures the datum's
+    /// current `frame()` for downstream 2D-to-3D conversion.
+    pub fn from_datum(datum: &Datum) -> Self {
+        Self {
+            datum_id: datum.id,
+            frame: datum.frame(),
+        }
+    }
+
+    /// Build a free-floating anchor with the canonical frame for one
+    /// of the standard plane orientations and [`INVALID_DATUM_ID`]
+    /// as the id. Tests and pre-datum legacy paths only.
+    pub fn standard(orientation: PlaneOrientation) -> Self {
+        Self {
+            datum_id: INVALID_DATUM_ID,
+            frame: Datum::canonical_transform(Point3::ORIGIN, DatumKind::Plane(orientation)),
+        }
+    }
+
+    /// XY plane (frame = identity), no datum binding.
+    pub fn xy() -> Self {
+        Self::standard(PlaneOrientation::XY)
+    }
+
+    /// XZ plane, no datum binding.
+    pub fn xz() -> Self {
+        Self::standard(PlaneOrientation::XZ)
+    }
+
+    /// YZ plane, no datum binding.
+    pub fn yz() -> Self {
+        Self::standard(PlaneOrientation::YZ)
+    }
+
+    /// Whether this anchor references a real datum (vs. a synthesised
+    /// standard orientation).
+    pub fn has_datum(&self) -> bool {
+        self.datum_id != INVALID_DATUM_ID
+    }
+}
+
 /// A 2D sketch containing entities and constraints
 pub struct Sketch {
     /// Unique identifier
     pub id: SketchId,
     /// Name of the sketch
     pub name: String,
-    /// Sketch plane
-    pub plane: SketchPlane,
+    /// Datum this sketch is anchored to plus the cached local-to-world
+    /// frame. Replaces the previous `plane: SketchPlane` field — the
+    /// datum is the lifecycle owner of the 3D placement.
+    pub anchor: SketchAnchor,
     /// Tolerance for geometric operations
     pub tolerance: Tolerance2d,
 
@@ -114,12 +187,15 @@ pub struct Sketch {
 }
 
 impl Sketch {
-    /// Create a new sketch on the given plane
-    pub fn new(name: String, plane: SketchPlane) -> Self {
+    /// Create a new sketch with the given anchor. The anchor's
+    /// `datum_id` is the lifecycle owner of the 3D placement; callers
+    /// that already have a `Datum` should build the anchor with
+    /// [`SketchAnchor::from_datum`].
+    pub fn new(name: String, anchor: SketchAnchor) -> Self {
         Self {
             id: SketchId::new(),
             name,
-            plane,
+            anchor,
             tolerance: Tolerance2d::default(),
             points: Arc::new(DashMap::new()),
             lines: Arc::new(DashMap::new()),
@@ -135,19 +211,27 @@ impl Sketch {
         }
     }
 
-    /// Create a sketch on the XY plane
+    /// Create a sketch anchored to the given datum. Convenience
+    /// wrapper over `Sketch::new(name, SketchAnchor::from_datum(datum))`.
+    pub fn anchored_to(name: String, datum: &Datum) -> Self {
+        Self::new(name, SketchAnchor::from_datum(datum))
+    }
+
+    /// Create a sketch on the XY plane with no datum binding. Tests
+    /// and pre-datum legacy paths only — production sketches must use
+    /// [`Sketch::anchored_to`].
     pub fn on_xy_plane(name: String) -> Self {
-        Self::new(name, SketchPlane::xy())
+        Self::new(name, SketchAnchor::xy())
     }
 
-    /// Create a sketch on the XZ plane
+    /// Create a sketch on the XZ plane with no datum binding.
     pub fn on_xz_plane(name: String) -> Self {
-        Self::new(name, SketchPlane::xz())
+        Self::new(name, SketchAnchor::xz())
     }
 
-    /// Create a sketch on the YZ plane
+    /// Create a sketch on the YZ plane with no datum binding.
     pub fn on_yz_plane(name: String) -> Self {
-        Self::new(name, SketchPlane::yz())
+        Self::new(name, SketchAnchor::yz())
     }
 
     // Point operations
@@ -1226,5 +1310,67 @@ impl SketchStore {
     /// Get all sketch IDs
     pub fn all_ids(&self) -> Vec<SketchId> {
         self.sketches.iter().map(|entry| *entry.key()).collect()
+    }
+}
+
+#[cfg(test)]
+mod sketch_anchor_tests {
+    use super::*;
+    use crate::primitives::datum::DatumStore;
+
+    #[test]
+    fn standard_xy_anchor_uses_invalid_id_and_identity_frame() {
+        let anchor = SketchAnchor::xy();
+        assert_eq!(anchor.datum_id, INVALID_DATUM_ID);
+        assert!(!anchor.has_datum());
+        // XY canonical frame is identity.
+        assert_eq!(anchor.frame, Matrix4::identity());
+    }
+
+    #[test]
+    fn standard_xz_yz_anchors_use_invalid_id() {
+        assert_eq!(SketchAnchor::xz().datum_id, INVALID_DATUM_ID);
+        assert_eq!(SketchAnchor::yz().datum_id, INVALID_DATUM_ID);
+    }
+
+    #[test]
+    fn from_datum_captures_id_and_frame() {
+        let store = DatumStore::new();
+        store.seed_defaults();
+        let snapshot = store.snapshot();
+        // FrontPlane (XY) is one of the seven seeded defaults.
+        let front = snapshot
+            .iter()
+            .find(|d| d.name == "FrontPlane")
+            .expect("FrontPlane default exists");
+
+        let anchor = SketchAnchor::from_datum(front);
+        assert_eq!(anchor.datum_id, front.id);
+        assert!(anchor.has_datum());
+        assert_eq!(anchor.frame, front.frame());
+    }
+
+    #[test]
+    fn sketch_new_carries_anchor() {
+        let sketch = Sketch::new("hole_pattern".to_string(), SketchAnchor::xy());
+        assert_eq!(sketch.name, "hole_pattern");
+        assert_eq!(sketch.anchor.datum_id, INVALID_DATUM_ID);
+        assert_eq!(sketch.anchor.frame, Matrix4::identity());
+    }
+
+    #[test]
+    fn sketch_anchored_to_uses_datum_id() {
+        let store = DatumStore::new();
+        store.seed_defaults();
+        let snapshot = store.snapshot();
+        let top = snapshot
+            .iter()
+            .find(|d| d.name == "TopPlane")
+            .expect("TopPlane default exists");
+
+        let sketch = Sketch::anchored_to("rib_profile".to_string(), top);
+        assert_eq!(sketch.anchor.datum_id, top.id);
+        assert!(sketch.anchor.has_datum());
+        assert_eq!(sketch.anchor.frame, top.frame());
     }
 }
