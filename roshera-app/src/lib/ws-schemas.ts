@@ -100,17 +100,16 @@ const subElementSchema = z.object({
 // Mirrors `roshera-backend/api-server/src/sketch.rs::SketchSession`.
 //
 // Multi-shape model: a session carries `shapes: SketchShape[]`, each
-// with its own tool / role / points. The active (in-progress) shape
-// is invariantly the last element of `shapes`. The wire `plane` is
-// either a standard string (`"xy"|"xz"|"yz"`) or a `CustomPlane`
-// object — the latter is accepted via `z.unknown()` here because the
-// store's `SketchPlane` type is a discriminated TS union the Zod
-// schema doesn't try to validate structurally (any well-formed
-// session sent by our backend will deserialize).
+// with its own tool and points. The active (in-progress) shape is
+// invariantly the last element of `shapes`. Outer-vs-hole
+// classification is decided geometrically at extrude time (point-in-
+// polygon containment), so shapes carry no role tag. The wire
+// `plane` is either a standard string (`"xy"|"xz"|"yz"`) or a
+// `CustomPlane` object — the store's `SketchPlane` is a TS
+// discriminated union which Zod accepts as a structural variant.
 const sketchShapeSchema = z.object({
   id: z.string(),
   tool: z.enum(['polyline', 'rectangle', 'circle']),
-  role: z.enum(['outer', 'hole']),
   points: z.array(z.tuple([z.number(), z.number()])),
 })
 

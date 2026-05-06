@@ -39,7 +39,6 @@ import {
   type SketchPlane,
   type SketchTool,
   type StandardPlane,
-  type ShapeRole,
 } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import {
@@ -88,9 +87,6 @@ export function SketchPanel() {
   const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
   const addNewSketchShape = useSceneStore((s) => s.addNewSketchShape)
   const deleteSketchShape = useSceneStore((s) => s.deleteSketchShape)
-  const setActiveSketchShapeRole = useSceneStore(
-    (s) => s.setActiveSketchShapeRole,
-  )
 
   const [busy, setBusy] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -117,12 +113,6 @@ export function SketchPanel() {
         setError(`Shape ${i + 1} needs more points`)
         return
       }
-    }
-    // Local guard 2: at least one Outer shape (also enforced by
-    // backend, but again — fail fast in the panel).
-    if (!sketch.shapes.some((s) => s.role === 'outer')) {
-      setError('Need at least one Outer shape')
-      return
     }
     if (!sketch.serverId) {
       // The backend create round-trip hasn't landed yet. The user can
@@ -392,18 +382,16 @@ export function SketchPanel() {
       </div>
 
       {/* Multi-shape strip: per-shape pill row + Add Shape buttons.
-          Lets the user lay down a bracket outline as Outer, then add
-          one or more Hole shapes to be subtracted on extrude. The
-          active (last) shape is highlighted; clicking earlier shapes
-          is not supported yet — editing past shapes requires
-          deleting and redrawing. */}
+          Lets the user draw multiple closed loops on the plane.
+          Outer-vs-hole classification is done geometrically at
+          extrude time (point-in-polygon containment) — the user just
+          draws the shapes; there is no per-shape role tag. The
+          active (last) shape is highlighted. */}
       <ShapeStrip
         shapes={sketch.shapes}
-        activeRole={sketch.activeRole}
         currentTool={sketch.tool}
         currentPoints={sketch.points}
-        onSetActiveRole={setActiveSketchShapeRole}
-        onAddShape={(role) => addNewSketchShape(role, sketch.tool)}
+        onAddShape={() => addNewSketchShape(sketch.tool)}
         onDeleteShape={(idx) => deleteSketchShape(idx)}
       />
 
@@ -651,19 +639,19 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
 // ─── Multi-shape strip ────────────────────────────────────────────────
 
 interface ShapeStripProps {
-  shapes: Array<{ id: string; tool: SketchTool; role: ShapeRole; points: Array<[number, number]> }>
-  activeRole: ShapeRole
+  shapes: Array<{ id: string; tool: SketchTool; points: Array<[number, number]> }>
   currentTool: SketchTool
   currentPoints: Array<[number, number]>
-  onSetActiveRole: (role: ShapeRole) => void
-  onAddShape: (role: ShapeRole) => void
+  onAddShape: () => void
   onDeleteShape: (idx: number) => void
 }
 
 /**
  * Compact pill row showing every shape in the session, plus the
- * "Add Outer" / "Add Hole" buttons that commit the current drawing
- * and start a fresh shape with the chosen role.
+ * "Add shape" button that commits the current drawing and starts a
+ * fresh shape with the same tool. Outer-vs-hole classification is
+ * decided geometrically at extrude time, so there is no per-shape
+ * role tag in the UI.
  *
  * Hidden when there's only one shape and no points placed yet (the
  * fresh-sketch case) — the panel is already busy with the first
@@ -671,10 +659,8 @@ interface ShapeStripProps {
  */
 function ShapeStrip({
   shapes,
-  activeRole,
   currentTool,
   currentPoints,
-  onSetActiveRole,
   onAddShape,
   onDeleteShape,
 }: ShapeStripProps) {
@@ -714,22 +700,12 @@ function ShapeStrip({
               )}
               title={
                 isActive
-                  ? `Active shape #${i + 1} · ${s.role} · ${s.tool} · ${points} pts`
-                  : `Shape #${i + 1} · ${s.role} · ${s.tool} · ${points} pts`
+                  ? `Active shape #${i + 1} · ${s.tool} · ${points} pts`
+                  : `Shape #${i + 1} · ${s.tool} · ${points} pts`
               }
             >
               <span className="text-muted-foreground/70">#{i + 1}</span>
               <ToolIcon className="w-2.5 h-2.5" />
-              <span
-                className={cn(
-                  'px-1 border text-[9px] uppercase tracking-wider',
-                  s.role === 'outer'
-                    ? 'border-emerald-400/60 text-emerald-300'
-                    : 'border-rose-400/60 text-rose-300',
-                )}
-              >
-                {s.role}
-              </span>
               <span className="text-muted-foreground/70">{points}</span>
               {shapes.length > 1 && !isActive && (
                 <button
@@ -745,68 +721,22 @@ function ShapeStrip({
             </div>
           )
         })}
-      </div>
 
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-muted-foreground text-[10px]">Active role</span>
-        <div className="flex items-center">
-          {(['outer', 'hole'] as ShapeRole[]).map((r) => (
-            <button
-              key={r}
-              type="button"
-              onClick={() => onSetActiveRole(r)}
-              className={cn(
-                'px-2 py-0.5 border text-[10px] uppercase tracking-wider transition-colors',
-                activeRole === r
-                  ? r === 'outer'
-                    ? 'border-emerald-400/60 text-emerald-300 bg-emerald-500/10'
-                    : 'border-rose-400/60 text-rose-300 bg-rose-500/10'
-                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
-              )}
-              title={
-                r === 'outer'
-                  ? 'Active shape adds material on extrude (Union)'
-                  : 'Active shape subtracts material on extrude (Difference)'
-              }
-              aria-pressed={activeRole === r}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
-
-        <div className="ml-auto flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => onAddShape('outer')}
-            disabled={!canAddShape}
-            className={cn(
-              'flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
-              canAddShape
-                ? 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10'
-                : 'border-border/40 text-muted-foreground/60',
-            )}
-            title="Commit current shape and start a new Outer shape"
-          >
-            <Plus className="w-2.5 h-2.5" />
-            <span>Outer</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => onAddShape('hole')}
-            disabled={!canAddShape}
-            className={cn(
-              'flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
-              canAddShape
-                ? 'border-rose-400/60 text-rose-300 hover:bg-rose-500/10'
-                : 'border-border/40 text-muted-foreground/60',
-            )}
-            title="Commit current shape and start a new Hole shape"
-          >
-            <Plus className="w-2.5 h-2.5" />
-            <span>Hole</span>
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => onAddShape()}
+          disabled={!canAddShape}
+          className={cn(
+            'ml-auto flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
+            canAddShape
+              ? 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10'
+              : 'border-border/40 text-muted-foreground/60',
+          )}
+          title="Commit current shape and start a new one"
+        >
+          <Plus className="w-2.5 h-2.5" />
+          <span>Add shape</span>
+        </button>
       </div>
       {/* Reference to currentTool so it's marked used (the icon is
           visible per-shape in the row above; we don't render the

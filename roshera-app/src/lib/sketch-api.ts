@@ -8,25 +8,23 @@
  * `SketchSession` (snake_case `circle_segments`, `created_at`,
  * `updated_at`). The store translates to its camelCase view.
  *
- * Multi-shape model (Slice 1+2 of the multi-shape plan): a session
- * carries `shapes: SketchShape[]`, each with its own tool / role /
- * points. The active (in-progress) shape is invariantly the *last*
- * element. Legacy point/tool/clear endpoints target the active shape;
- * `/shape/{idx}/...` endpoints address shapes explicitly.
+ * Multi-shape model: a session carries `shapes: SketchShape[]`, each
+ * with its own tool and points. The active (in-progress) shape is
+ * invariantly the *last* element. Legacy point/tool/clear endpoints
+ * target the active shape; `/shape/{idx}/...` endpoints address
+ * shapes explicitly. Outer-vs-hole classification is decided
+ * geometrically at extrude time (point-in-polygon containment), so
+ * shapes carry no role tag — the user just draws closed loops.
  */
 
 import type { SketchPlane, SketchTool } from '@/stores/scene-store'
 
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
 
-/** Role of a sketch shape — Outer adds material, Hole subtracts. */
-export type ShapeRole = 'outer' | 'hole'
-
 /** Backend `SketchShape` wire shape. */
 export interface ServerSketchShape {
   id: string
   tool: SketchTool
-  role: ShapeRole
   points: Array<[number, number]>
 }
 
@@ -135,13 +133,13 @@ export const sketchApi = {
     return request('PUT', `/sketch/${id}/circle-segments`, { segments })
   },
   /**
-   * Append a fresh empty shape with the given tool + role; it becomes
-   * the new active (last) shape. Used by the multi-shape UI flow when
-   * the user has finished an outline and wants to start a hole inside.
+   * Append a fresh empty shape with the given tool; it becomes the
+   * new active (last) shape. Used by the multi-shape UI flow when
+   * the user wants to draw a second loop on the same plane.
    */
   addShape(
     id: string,
-    body: { tool: SketchTool; role?: ShapeRole },
+    body: { tool: SketchTool },
   ): Promise<ServerSketchSession> {
     return request('POST', `/sketch/${id}/shape`, body)
   },
@@ -151,13 +149,6 @@ export const sketchApi = {
    */
   deleteShape(id: string, idx: number): Promise<ServerSketchSession> {
     return request('DELETE', `/sketch/${id}/shape/${idx}`)
-  },
-  setShapeRole(
-    id: string,
-    idx: number,
-    role: ShapeRole,
-  ): Promise<ServerSketchSession> {
-    return request('PUT', `/sketch/${id}/shape/${idx}/role`, { role })
   },
   setShapeTool(
     id: string,
@@ -174,11 +165,12 @@ export const sketchApi = {
     return request('POST', `/sketch/${id}/shape/${idx}/point`, { point })
   },
   /**
-   * Finalise a sketch into a solid. Backend extrudes every shape
-   * independently and folds via boolean (Outer→Union, Hole→Difference)
-   * starting from the first Outer. The resulting solid is broadcast
-   * as `ObjectCreated`; the sketch is then dropped (unless
-   * `consume: false` is passed).
+   * Finalise a sketch into a solid. Backend detects regions
+   * (point-in-polygon containment), extrudes each shape into its own
+   * solid, and folds per region (outer minus its holes), then unions
+   * across regions. The resulting solid is broadcast as
+   * `ObjectCreated`; the sketch persists by default unless
+   * `consume: true` is passed.
    */
   extrude(
     id: string,
