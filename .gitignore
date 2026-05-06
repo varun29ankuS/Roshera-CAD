@@ -79,6 +79,14 @@ output/
 *.3ds
 *.fbx
 
+# Video recordings (use GitHub user-attachments or Releases instead)
+# Keep .gif allowed — README hero gif lives at assets/kernel-demo.gif.
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
+
 # Rust
 **/*.rs.bk
 .cargo/

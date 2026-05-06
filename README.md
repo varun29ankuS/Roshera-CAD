@@ -15,6 +15,16 @@
 
 ---
 
+<p align="center">
+  <img src="assets/kernel-demo.gif" alt="Roshera kernel demo — datum system, B-Rep topology, viewport navigation" width="100%" />
+</p>
+
+<p align="center">
+  <em>Native B-Rep kernel: datum system, topology, tessellated viewport — running through the same REST/WebSocket bridge an external agent would use.</em>
+</p>
+
+---
+
 Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine (no wrapper around OpenCASCADE or Parasolid) whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
 
 The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. Many things work, many things don't — see [Status](#status) for what's actually usable today.
