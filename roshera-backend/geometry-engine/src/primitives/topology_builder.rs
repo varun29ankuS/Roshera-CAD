@@ -698,6 +698,69 @@ impl BRepModel {
         Ok(removed)
     }
 
+    /// Re-anchor a solid to a different datum, optionally with a new
+    /// local-frame offset. Records `solid_reanchor`.
+    ///
+    /// Slice 6 mediator backing the agent-facing `anchor_part` tool.
+    /// When `local_transform` is `None`, the solid's existing local
+    /// transform is preserved (use case: re-parenting under a new
+    /// datum without disturbing placement). When `Some(matrix)`, the
+    /// supplied matrix replaces the local transform.
+    ///
+    /// Internally constructs a [`TopologyBuilder`] and delegates to
+    /// `anchor_solid` so the slice-5 datum graph + cache invariants
+    /// are preserved by a single canonical code path. The recorded
+    /// event captures both the previous and new datum ids so timeline
+    /// replay and AI tooling can introspect the change.
+    pub fn reanchor_solid(
+        &mut self,
+        solid_id: SolidId,
+        new_datum_id: crate::primitives::datum::DatumId,
+        new_local_transform: Option<Matrix4>,
+    ) -> Result<(), PrimitiveError> {
+        // Validate solid id and capture previous anchor before
+        // mutating, so the recorded event carries the before-state.
+        let (prev_datum_id, preserved_local) = {
+            let solid =
+                self.solids
+                    .get(solid_id)
+                    .ok_or_else(|| PrimitiveError::InvalidParameters {
+                        parameter: "solid_id".to_string(),
+                        value: solid_id.to_string(),
+                        constraint: "must reference an existing solid".to_string(),
+                    })?;
+            (solid.anchor.datum_id, solid.anchor.local_transform)
+        };
+
+        // Validate datum id eagerly so the error surface matches
+        // `anchor_solid`'s without relying on its internal lookup.
+        if self.datums.get(new_datum_id).is_none() {
+            return Err(PrimitiveError::InvalidParameters {
+                parameter: "datum_id".to_string(),
+                value: new_datum_id.to_string(),
+                constraint: "must reference an existing datum".to_string(),
+            });
+        }
+
+        let local = new_local_transform.unwrap_or(preserved_local);
+        let mut builder = TopologyBuilder::new(self);
+        builder.anchor_solid(solid_id, new_datum_id, local)?;
+
+        self.record_operation(
+            crate::operations::recorder::RecordedOperation::new("solid_reanchor")
+                .with_parameters(serde_json::json!({
+                    "solid_id": solid_id,
+                    "previous_datum_id": prev_datum_id,
+                    "new_datum_id": new_datum_id,
+                    "local_transform_supplied": new_local_transform.is_some(),
+                }))
+                .with_inputs(vec![solid_id as u64, new_datum_id as u64])
+                .with_outputs(vec![solid_id as u64]),
+        );
+
+        Ok(())
+    }
+
     // ──────────────────── 4b: derived datum evaluation + authoring ───────────
     //
     // `evaluate_datum_source` is the single entry point that turns a

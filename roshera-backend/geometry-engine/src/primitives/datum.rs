@@ -481,7 +481,7 @@ impl Datum {
 ///   Independent of whether those default datums have been hidden or
 ///   renamed — the canonical mathematical planes are always available
 ///   as a stable reference frame for agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocationDescriptor {
     pub solid_id: u32,
     pub anchor_datum_id: DatumId,

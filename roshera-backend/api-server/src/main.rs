@@ -3644,6 +3644,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/geometry/{id}/properties",
             get(kernel_state::solid_properties),
         )
+        // ─── Datum 6: agent-readable surface ──────────────────────────────
+        // Thin REST projection of the kernel's `readable/` query module.
+        // Wire shapes are the kernel report types (`PartReport`,
+        // `PartSummary`, `DatumSummary`, …) — no DTO translation, so
+        // backend / agent drift is impossible.
+        //
+        // Lock discipline: read-mostly endpoints take `model.read()`;
+        // cache-warming endpoints (`/mass`, `/obb`, `/faces/{id}`,
+        // `/edges/{id}`) and the mutating reanchor take `model.write()`
+        // because the kernel populates per-entity caches on first call
+        // (volume integral, face area, edge length).
+        .route("/api/agent/parts", get(handlers::agent::list_parts))
+        .route("/api/agent/parts/{id}", get(handlers::agent::query_part))
+        .route(
+            "/api/agent/parts/{id}/mass",
+            get(handlers::agent::part_mass_properties),
+        )
+        .route(
+            "/api/agent/parts/{id}/obb",
+            get(handlers::agent::part_oriented_bbox),
+        )
+        .route(
+            "/api/agent/parts/{id}/reanchor",
+            post(handlers::agent::reanchor_part),
+        )
+        .route(
+            "/api/agent/parts/distance/{a}/{b}",
+            get(handlers::agent::part_distance),
+        )
+        .route("/api/agent/datums", get(handlers::agent::list_datums))
+        .route(
+            "/api/agent/datums/{id}/parts",
+            get(handlers::agent::parts_near_datum),
+        )
+        .route("/api/agent/faces/{id}", get(handlers::agent::query_face))
+        .route("/api/agent/edges/{id}", get(handlers::agent::query_edge))
         // Session endpoints
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
