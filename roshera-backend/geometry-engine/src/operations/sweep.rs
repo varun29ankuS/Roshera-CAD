@@ -1055,12 +1055,423 @@ fn validate_swept_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult
     Ok(())
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_sweep_validation() {
-//         // Test parameter validation
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::Line;
+    use crate::primitives::topology_builder::BRepModel;
+
+    /// Add a Line curve + Edge between two existing vertices.
+    fn add_line_edge(model: &mut BRepModel, v_start: VertexId, v_end: VertexId) -> EdgeId {
+        let s = model.vertices.get(v_start).expect("start vertex");
+        let e = model.vertices.get(v_end).expect("end vertex");
+        let line = Line::new(Point3::from(s.position), Point3::from(e.position));
+        let curve_id = model.curves.add(Box::new(line));
+        let edge = Edge::new_auto_range(0, v_start, v_end, curve_id, EdgeOrientation::Forward);
+        model.edges.add(edge)
+    }
+
+    /// Closed CCW unit-square profile in the XY plane.
+    fn make_unit_square(model: &mut BRepModel) -> Vec<EdgeId> {
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 1.0, 0.0);
+        let v3 = model.vertices.add(0.0, 1.0, 0.0);
+        vec![
+            add_line_edge(model, v0, v1),
+            add_line_edge(model, v1, v2),
+            add_line_edge(model, v2, v3),
+            add_line_edge(model, v3, v0),
+        ]
+    }
+
+    // -------------------------------------------------------------------
+    // SweepOptions defaults & Debug impls
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sweep_options_default_values() {
+        let opts = SweepOptions::default();
+        assert_eq!(opts.sweep_type, SweepType::Path);
+        assert!(matches!(opts.orientation, OrientationControl::Frenet));
+        assert!(matches!(opts.scale, ScaleControl::Constant));
+        assert!(matches!(opts.twist, TwistControl::None));
+        assert!(opts.create_solid);
+        assert_eq!(opts.quality, SweepQuality::Standard);
+    }
+
+    #[test]
+    fn sweep_type_variants_distinct() {
+        assert_ne!(SweepType::Path, SweepType::MultiGuide);
+        assert_ne!(SweepType::Rail, SweepType::BiRail);
+        assert_eq!(SweepType::Path, SweepType::Path);
+    }
+
+    #[test]
+    fn sweep_quality_variants_distinct() {
+        assert_ne!(SweepQuality::Draft, SweepQuality::Standard);
+        assert_ne!(SweepQuality::Standard, SweepQuality::High);
+    }
+
+    #[test]
+    fn orientation_control_debug_covers_each_variant() {
+        let frenet = format!("{:?}", OrientationControl::Frenet);
+        assert!(frenet.contains("Frenet"));
+        let minimal = format!("{:?}", OrientationControl::MinimalRotation);
+        assert!(minimal.contains("MinimalRotation"));
+        let fixed = format!("{:?}", OrientationControl::Fixed(Vector3::Z));
+        assert!(fixed.contains("Fixed"));
+        let normal = format!("{:?}", OrientationControl::Normal);
+        assert!(normal.contains("Normal"));
+        let custom = format!(
+            "{:?}",
+            OrientationControl::Custom(Box::new(|_| Matrix4::identity()))
+        );
+        assert!(custom.contains("Custom"));
+    }
+
+    #[test]
+    fn scale_control_debug_covers_each_variant() {
+        let constant = format!("{:?}", ScaleControl::Constant);
+        assert!(constant.contains("Constant"));
+        let linear = format!("{:?}", ScaleControl::Linear(0.5, 1.5));
+        assert!(linear.contains("Linear"));
+        let function = format!("{:?}", ScaleControl::Function(Box::new(|t| t)));
+        assert!(function.contains("Function"));
+    }
+
+    #[test]
+    fn twist_control_debug_covers_each_variant() {
+        let none = format!("{:?}", TwistControl::None);
+        assert!(none.contains("None"));
+        let linear = format!("{:?}", TwistControl::Linear(1.0));
+        assert!(linear.contains("Linear"));
+        let function = format!("{:?}", TwistControl::Function(Box::new(|t| t)));
+        assert!(function.contains("Function"));
+    }
+
+    // -------------------------------------------------------------------
+    // compute_scale_at_parameter / compute_twist_at_parameter
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compute_scale_constant_returns_unit() {
+        let v = compute_scale_at_parameter(0.42, &ScaleControl::Constant).expect("ok");
+        assert!((v - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compute_scale_linear_interpolates_endpoints() {
+        let ctrl = ScaleControl::Linear(0.5, 1.5);
+        assert!((compute_scale_at_parameter(0.0, &ctrl).expect("ok") - 0.5).abs() < 1e-12);
+        assert!((compute_scale_at_parameter(1.0, &ctrl).expect("ok") - 1.5).abs() < 1e-12);
+        assert!((compute_scale_at_parameter(0.5, &ctrl).expect("ok") - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compute_scale_function_invokes_closure() {
+        let ctrl = ScaleControl::Function(Box::new(|t| 2.0 * t + 0.25));
+        let v = compute_scale_at_parameter(0.5, &ctrl).expect("ok");
+        assert!((v - 1.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compute_twist_none_returns_zero() {
+        let v = compute_twist_at_parameter(0.7, &TwistControl::None).expect("ok");
+        assert_eq!(v, 0.0);
+    }
+
+    #[test]
+    fn compute_twist_linear_scales_with_t() {
+        let ctrl = TwistControl::Linear(std::f64::consts::PI);
+        let v = compute_twist_at_parameter(0.5, &ctrl).expect("ok");
+        assert!((v - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compute_twist_function_invokes_closure() {
+        let ctrl = TwistControl::Function(Box::new(|t| t * t));
+        let v = compute_twist_at_parameter(0.4, &ctrl).expect("ok");
+        assert!((v - 0.16).abs() < 1e-12);
+    }
+
+    // -------------------------------------------------------------------
+    // build_sweep_transform
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_sweep_transform_zero_twist_unit_scale_is_translation() {
+        let m = build_sweep_transform(
+            Point3::new(3.0, 4.0, 5.0),
+            Matrix4::identity(),
+            1.0,
+            0.0,
+        );
+        let p = m.transform_point(&Vector3::ZERO);
+        assert!((p.x - 3.0).abs() < 1e-12);
+        assert!((p.y - 4.0).abs() < 1e-12);
+        assert!((p.z - 5.0).abs() < 1e-12);
+    }
+
+    // -------------------------------------------------------------------
+    // validate_sweep_inputs / validate_swept_solid
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_sweep_inputs_rejects_unknown_profile_edge() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(0.0, 0.0, 1.0);
+        let path = add_line_edge(&mut model, v0, v1);
+        let result = validate_sweep_inputs(&model, &[9999], path, &SweepOptions::default());
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_sweep_inputs_rejects_unknown_path() {
+        let mut model = BRepModel::new();
+        let edges = make_unit_square(&mut model);
+        let result = validate_sweep_inputs(&model, &edges, 9999, &SweepOptions::default());
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_sweep_inputs_accepts_valid_inputs() {
+        let mut model = BRepModel::new();
+        let profile = make_unit_square(&mut model);
+        let v_a = model.vertices.add(0.0, 0.0, 0.0);
+        let v_b = model.vertices.add(0.0, 0.0, 5.0);
+        let path = add_line_edge(&mut model, v_a, v_b);
+        assert!(validate_sweep_inputs(&model, &profile, path, &SweepOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_swept_solid_rejects_unknown_solid() {
+        let model = BRepModel::new();
+        let result = validate_swept_solid(&model, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidBRep(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_or_find_edge / create_bilinear_surface / create_quad_face
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_or_find_edge_links_existing_vertices() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let edge_id = create_or_find_edge(&mut model, v0, v1).expect("edge");
+        let edge = model.edges.get(edge_id).expect("edge in store");
+        assert_eq!(edge.start_vertex, v0);
+        assert_eq!(edge.end_vertex, v1);
+    }
+
+    #[test]
+    fn create_or_find_edge_rejects_unknown_start_vertex() {
+        let mut model = BRepModel::new();
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let result = create_or_find_edge(&mut model, 9999, v1);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_or_find_edge_rejects_unknown_end_vertex() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let result = create_or_find_edge(&mut model, v0, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_bilinear_surface_returns_surface_for_quad() {
+        let mut model = BRepModel::new();
+        let v1 = model.vertices.add(0.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 0.0, 0.0);
+        let v3 = model.vertices.add(1.0, 1.0, 0.0);
+        let v4 = model.vertices.add(0.0, 1.0, 0.0);
+        assert!(create_bilinear_surface(&model, v1, v2, v3, v4).is_ok());
+    }
+
+    #[test]
+    fn create_bilinear_surface_rejects_unknown_vertex() {
+        let model = BRepModel::new();
+        let result = create_bilinear_surface(&model, 1, 2, 3, 4);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_quad_face_produces_face_with_outer_loop_of_4_edges() {
+        let mut model = BRepModel::new();
+        let v1 = model.vertices.add(0.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 0.0, 0.0);
+        let v3 = model.vertices.add(1.0, 1.0, 0.0);
+        let v4 = model.vertices.add(0.0, 1.0, 0.0);
+        let face_id = create_quad_face(&mut model, v1, v2, v3, v4).expect("face");
+        let face = model.faces.get(face_id).expect("face in store");
+        let outer = model.loops.get(face.outer_loop).expect("loop");
+        assert_eq!(outer.edges.len(), 4);
+    }
+
+    // -------------------------------------------------------------------
+    // create_lateral_faces / create_reversed_face
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_lateral_faces_rejects_mismatched_vertex_counts() {
+        let mut model = BRepModel::new();
+        let s1 = SweepSection {
+            face_id: 0,
+            vertices: vec![1, 2, 3],
+        };
+        let s2 = SweepSection {
+            face_id: 0,
+            vertices: vec![4, 5],
+        };
+        let result = create_lateral_faces(&mut model, &s1, &s2);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_lateral_faces_creates_n_quads_for_n_vertices() {
+        let mut model = BRepModel::new();
+        let v_bottom: Vec<VertexId> = (0..4)
+            .map(|i| model.vertices.add(i as f64, 0.0, 0.0))
+            .collect();
+        let v_top: Vec<VertexId> = (0..4)
+            .map(|i| model.vertices.add(i as f64, 0.0, 1.0))
+            .collect();
+        let s1 = SweepSection {
+            face_id: 0,
+            vertices: v_bottom,
+        };
+        let s2 = SweepSection {
+            face_id: 0,
+            vertices: v_top,
+        };
+        let faces = create_lateral_faces(&mut model, &s1, &s2).expect("ok");
+        assert_eq!(faces.len(), 4);
+    }
+
+    #[test]
+    fn create_reversed_face_flips_orientation() {
+        let mut model = BRepModel::new();
+        let v1 = model.vertices.add(0.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 0.0, 0.0);
+        let v3 = model.vertices.add(1.0, 1.0, 0.0);
+        let v4 = model.vertices.add(0.0, 1.0, 0.0);
+        let face_id = create_quad_face(&mut model, v1, v2, v3, v4).expect("face");
+        let original_orientation = model.faces.get(face_id).expect("face").orientation;
+        let reversed_id = create_reversed_face(&mut model, face_id).expect("reversed");
+        let reversed_orientation = model.faces.get(reversed_id).expect("reversed face").orientation;
+        assert_ne!(original_orientation, reversed_orientation);
+    }
+
+    #[test]
+    fn create_reversed_face_rejects_unknown_face() {
+        let mut model = BRepModel::new();
+        let result = create_reversed_face(&mut model, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_profile_face
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_profile_face_from_rectangle_succeeds() {
+        let mut model = BRepModel::new();
+        let edges = make_unit_square(&mut model);
+        let face_id = create_profile_face(&mut model, edges).expect("face");
+        assert!(model.faces.get(face_id).is_some());
+    }
+
+    #[test]
+    fn create_profile_face_rejects_too_few_points() {
+        let mut model = BRepModel::new();
+        // Single edge → only 1 point gathered (start vertex), insufficient.
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let e0 = add_line_edge(&mut model, v0, v1);
+        let result = create_profile_face(&mut model, vec![e0, e0]);
+        // Two edges = 2 distinct start positions only; below the 3-point threshold.
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_profile_face_rejects_collinear_profile() {
+        // Three edges on the same line — collinear samples, no plane.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(2.0, 0.0, 0.0);
+        let v3 = model.vertices.add(3.0, 0.0, 0.0);
+        let e0 = add_line_edge(&mut model, v0, v1);
+        let e1 = add_line_edge(&mut model, v1, v2);
+        let e2 = add_line_edge(&mut model, v2, v3);
+        let result = create_profile_face(&mut model, vec![e0, e1, e2]);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_profile_face_rejects_unknown_edge() {
+        let mut model = BRepModel::new();
+        let result = create_profile_face(&mut model, vec![9999]);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // sweep_profile entry point
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sweep_profile_validates_unknown_profile_edge() {
+        let mut model = BRepModel::new();
+        let v_a = model.vertices.add(0.0, 0.0, 0.0);
+        let v_b = model.vertices.add(0.0, 0.0, 1.0);
+        let path = add_line_edge(&mut model, v_a, v_b);
+        let opts = SweepOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = sweep_profile(&mut model, vec![9999], path, opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn sweep_profile_validates_unknown_path() {
+        let mut model = BRepModel::new();
+        let edges = make_unit_square(&mut model);
+        let opts = SweepOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = sweep_profile(&mut model, edges, 9999, opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn sweep_profile_along_z_line_creates_solid() {
+        let mut model = BRepModel::new();
+        let profile = make_unit_square(&mut model);
+        let v_a = model.vertices.add(0.0, 0.0, 0.0);
+        let v_b = model.vertices.add(0.0, 0.0, 5.0);
+        let path = add_line_edge(&mut model, v_a, v_b);
+        let opts = SweepOptions {
+            quality: SweepQuality::Draft,
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = sweep_profile(&mut model, profile, path, opts).expect("sweep");
+        assert!(model.solids.get(solid_id).is_some());
+    }
+}

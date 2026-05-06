@@ -1458,3 +1458,463 @@ fn create_planar_surface_from_vertices(
         .map_err(|e| OperationError::NumericalError(format!("Plane creation failed: {:?}", e)))?;
     Ok(Box::new(plane))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::Line;
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    /// Add a Line curve + Edge between two existing vertices.
+    fn add_line_edge(model: &mut BRepModel, v_start: VertexId, v_end: VertexId) -> EdgeId {
+        let s = model.vertices.get(v_start).expect("start vertex");
+        let e = model.vertices.get(v_end).expect("end vertex");
+        let line = Line::new(Point3::from(s.position), Point3::from(e.position));
+        let curve_id = model.curves.add(Box::new(line));
+        let edge = Edge::new_auto_range(0, v_start, v_end, curve_id, EdgeOrientation::Forward);
+        model.edges.add(edge)
+    }
+
+    /// Closed CCW rectangular profile in XY at z=0. Returns the four
+    /// edges in bottom→right→top→left order.
+    fn make_rectangle(model: &mut BRepModel, width: f64, height: f64) -> Vec<EdgeId> {
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(width, 0.0, 0.0);
+        let v2 = model.vertices.add(width, height, 0.0);
+        let v3 = model.vertices.add(0.0, height, 0.0);
+        vec![
+            add_line_edge(model, v0, v1),
+            add_line_edge(model, v1, v2),
+            add_line_edge(model, v2, v3),
+            add_line_edge(model, v3, v0),
+        ]
+    }
+
+    /// Pick the first face on the box's outer shell.
+    fn first_box_face(model: &BRepModel, solid_id: SolidId) -> FaceId {
+        let solid = model.solids.get(solid_id).expect("box solid");
+        let shell = model.shells.get(solid.outer_shell).expect("outer shell");
+        *shell.faces.first().expect("box has faces")
+    }
+
+    // -------------------------------------------------------------------
+    // ExtrudeOptions defaults
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extrude_options_default_values_match_documentation() {
+        let opts = ExtrudeOptions::default();
+        assert_eq!(opts.direction, Vector3::Z);
+        assert!((opts.distance - 1.0).abs() < 1e-12);
+        assert!(!opts.symmetric);
+        assert_eq!(opts.draft_angle, 0.0);
+        assert_eq!(opts.twist_angle, 0.0);
+        assert!(opts.cap_ends);
+        assert!((opts.end_scale - 1.0).abs() < 1e-12);
+    }
+
+    // -------------------------------------------------------------------
+    // create_face_from_profile
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_face_from_rectangle_profile_succeeds() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 10.0, 5.0);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        assert!(model.faces.get(face_id).is_some());
+    }
+
+    #[test]
+    fn create_face_from_open_profile_is_error() {
+        let mut model = BRepModel::new();
+        // Open chain: only two edges.
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 1.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+        ];
+        let result = create_face_from_profile(&mut model, edges);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_face_from_empty_profile_is_error() {
+        let mut model = BRepModel::new();
+        let result = create_face_from_profile(&mut model, vec![]);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // extrude_profile happy paths
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extrude_rectangle_profile_creates_solid_with_six_faces() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 10.0, 5.0);
+        let opts = ExtrudeOptions {
+            distance: 4.0,
+            ..Default::default()
+        };
+        let solid_id = extrude_profile(&mut model, edges, opts).expect("extrude");
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        // 4 sides + bottom cap + top cap.
+        assert_eq!(shell.faces.len(), 6);
+    }
+
+    #[test]
+    fn extrude_rectangle_profile_along_negative_distance_succeeds() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 2.0, 2.0);
+        let opts = ExtrudeOptions {
+            distance: -3.0,
+            ..Default::default()
+        };
+        let result = extrude_profile(&mut model, edges, opts);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extrude_l_shape_profile_creates_solid_with_eight_faces() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(6.0, 0.0, 0.0);
+        let v2 = model.vertices.add(6.0, 2.0, 0.0);
+        let v3 = model.vertices.add(2.0, 2.0, 0.0);
+        let v4 = model.vertices.add(2.0, 4.0, 0.0);
+        let v5 = model.vertices.add(0.0, 4.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+            add_line_edge(&mut model, v2, v3),
+            add_line_edge(&mut model, v3, v4),
+            add_line_edge(&mut model, v4, v5),
+            add_line_edge(&mut model, v5, v0),
+        ];
+        let opts = ExtrudeOptions {
+            distance: 2.0,
+            ..Default::default()
+        };
+        let solid_id = extrude_profile(&mut model, edges, opts).expect("extrude L");
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        assert_eq!(shell.faces.len(), 8);
+    }
+
+    #[test]
+    fn extrude_along_x_axis_succeeds() {
+        let mut model = BRepModel::new();
+        // Profile in YZ plane → extrude along +X.
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(0.0, 1.0, 0.0);
+        let v2 = model.vertices.add(0.0, 1.0, 1.0);
+        let v3 = model.vertices.add(0.0, 0.0, 1.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+            add_line_edge(&mut model, v2, v3),
+            add_line_edge(&mut model, v3, v0),
+        ];
+        let opts = ExtrudeOptions {
+            direction: Vector3::X,
+            distance: 5.0,
+            ..Default::default()
+        };
+        let result = extrude_profile(&mut model, edges, opts);
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // extrude_face on a box face (parent-solid / unified path)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extrude_face_on_existing_box_returns_solid() {
+        let mut model = BRepModel::new();
+        let solid_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            match builder.create_box_3d(2.0, 2.0, 2.0).expect("box") {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            }
+        };
+        let face_id = first_box_face(&model, solid_id);
+        let opts = ExtrudeOptions {
+            distance: 1.0,
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            ..Default::default()
+        };
+        let result = extrude_face(&mut model, face_id, opts);
+        assert!(result.is_ok(), "extrude_face on box face: {:?}", result);
+    }
+
+    // -------------------------------------------------------------------
+    // Validation errors
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extrude_face_rejects_unknown_face_id() {
+        let mut model = BRepModel::new();
+        let opts = ExtrudeOptions::default();
+        let result = extrude_face(&mut model, 99_999, opts);
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(msg.contains("Face not found"), "msg = {msg}");
+            }
+            other => panic!("expected InvalidGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extrude_face_rejects_zero_distance() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 1.0, 1.0);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = ExtrudeOptions {
+            distance: 0.0,
+            ..Default::default()
+        };
+        let result = extrude_face(&mut model, face_id, opts);
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(msg.contains("distance"), "msg = {msg}");
+            }
+            other => panic!("expected distance error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extrude_face_rejects_zero_direction() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 1.0, 1.0);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = ExtrudeOptions {
+            direction: Vector3::ZERO,
+            distance: 1.0,
+            ..Default::default()
+        };
+        let result = extrude_face(&mut model, face_id, opts);
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(msg.contains("direction"), "msg = {msg}");
+            }
+            other => panic!("expected direction error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extrude_face_rejects_draft_angle_at_or_above_ninety_degrees() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 1.0, 1.0);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = ExtrudeOptions {
+            distance: 1.0,
+            draft_angle: std::f64::consts::FRAC_PI_2,
+            ..Default::default()
+        };
+        let result = extrude_face(&mut model, face_id, opts);
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(msg.contains("Draft angle"), "msg = {msg}");
+            }
+            other => panic!("expected draft-angle error, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // walk_profile_chain / validate_closed_profile
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_closed_profile_accepts_rectangle() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 1.0, 1.0);
+        assert!(validate_closed_profile(&model, &edges).is_ok());
+    }
+
+    #[test]
+    fn validate_closed_profile_rejects_open_chain() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(2.0, 0.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+        ];
+        let result = validate_closed_profile(&model, &edges);
+        assert!(matches!(result, Err(OperationError::OpenProfile)));
+    }
+
+    #[test]
+    fn validate_closed_profile_rejects_disconnected_edges() {
+        let mut model = BRepModel::new();
+        let a0 = model.vertices.add(0.0, 0.0, 0.0);
+        let a1 = model.vertices.add(1.0, 0.0, 0.0);
+        let b0 = model.vertices.add(5.0, 5.0, 0.0);
+        let b1 = model.vertices.add(6.0, 5.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, a0, a1),
+            add_line_edge(&mut model, b0, b1),
+        ];
+        let result = validate_closed_profile(&model, &edges);
+        assert!(matches!(result, Err(OperationError::OpenProfile)));
+    }
+
+    #[test]
+    fn validate_closed_profile_accepts_reverse_orientation_first_edge() {
+        // First edge oriented v1→v0; chain must retry with end→start.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(0.0, 1.0, 0.0);
+        let e0 = add_line_edge(&mut model, v1, v0);
+        let e1 = add_line_edge(&mut model, v0, v2);
+        let e2 = add_line_edge(&mut model, v2, v1);
+        let edges = vec![e0, e1, e2];
+        assert!(validate_closed_profile(&model, &edges).is_ok());
+    }
+
+    #[test]
+    fn validate_closed_profile_rejects_empty_input() {
+        let model = BRepModel::new();
+        let result = validate_closed_profile(&model, &[]);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // try_build_cylinder_from_circles
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn try_build_cylinder_returns_none_for_lines() {
+        let line_a = Line::new(Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        let line_b = Line::new(Point3::new(0.0, 0.0, 1.0), Point3::new(1.0, 0.0, 1.0));
+        assert!(try_build_cylinder_from_circles(&line_a, &line_b).is_none());
+    }
+
+    #[test]
+    fn try_build_cylinder_from_coaxial_full_circles_succeeds() {
+        use crate::primitives::curve::Circle;
+        let bottom = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("bottom");
+        let top = Circle::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, 2.0).expect("top");
+        let cyl = try_build_cylinder_from_circles(&bottom, &top).expect("cylinder");
+        let limits = cyl.height_limits.expect("height limits set on finite cyl");
+        assert!((limits[0] - 0.0).abs() < 1e-12, "limits = {:?}", limits);
+        assert!((limits[1] - 5.0).abs() < 1e-9, "limits = {:?}", limits);
+        assert!((cyl.radius - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn try_build_cylinder_returns_none_for_mismatched_radii() {
+        use crate::primitives::curve::Circle;
+        let bottom = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("bottom");
+        let top = Circle::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, 3.0).expect("top");
+        assert!(try_build_cylinder_from_circles(&bottom, &top).is_none());
+    }
+
+    #[test]
+    fn try_build_cylinder_returns_none_for_non_parallel_axes() {
+        use crate::primitives::curve::Circle;
+        let bottom = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("bottom");
+        let top = Circle::new(Point3::new(0.0, 0.0, 5.0), Vector3::X, 2.0).expect("top");
+        assert!(try_build_cylinder_from_circles(&bottom, &top).is_none());
+    }
+
+    #[test]
+    fn try_build_cylinder_returns_none_for_zero_height() {
+        use crate::primitives::curve::Circle;
+        let bottom = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("bottom");
+        let top = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("top");
+        assert!(try_build_cylinder_from_circles(&bottom, &top).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // full_circle_params
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn full_circle_params_recognises_circle() {
+        use crate::primitives::curve::Circle;
+        let c = Circle::new(Point3::new(1.0, 2.0, 3.0), Vector3::Y, 4.0).expect("circle");
+        let (center, axis, radius) = full_circle_params(&c).expect("params");
+        assert!((center.x - 1.0).abs() < 1e-12);
+        assert!((center.y - 2.0).abs() < 1e-12);
+        assert!((center.z - 3.0).abs() < 1e-12);
+        assert!((axis.normalize().expect("axis").y - 1.0).abs() < 1e-9);
+        assert!((radius - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn full_circle_params_returns_none_for_line() {
+        let line = Line::new(Point3::ORIGIN, Point3::new(1.0, 0.0, 0.0));
+        assert!(full_circle_params(&line).is_none());
+    }
+
+    #[test]
+    fn full_circle_params_returns_none_for_partial_arc() {
+        use crate::primitives::curve::Arc;
+        let arc =
+            Arc::new(Point3::ORIGIN, Vector3::Z, 1.0, 0.0, std::f64::consts::PI).expect("arc");
+        assert!(full_circle_params(&arc).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // find_parent_solid
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn find_parent_solid_returns_none_for_orphan_face() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 1.0, 1.0);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        assert!(find_parent_solid(&model, face_id).is_none());
+    }
+
+    #[test]
+    fn find_parent_solid_finds_box_face_owner() {
+        let mut model = BRepModel::new();
+        let solid_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            match builder.create_box_3d(1.0, 1.0, 1.0).expect("box") {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            }
+        };
+        let face_id = first_box_face(&model, solid_id);
+        assert_eq!(find_parent_solid(&model, face_id), Some(solid_id));
+    }
+
+    // -------------------------------------------------------------------
+    // create_straight_edge
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_straight_edge_links_two_vertices() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(2.0, 0.0, 0.0);
+        let edge_id = create_straight_edge(&mut model, v0, v1).expect("edge");
+        let edge = model.edges.get(edge_id).expect("stored edge");
+        assert_eq!(edge.start_vertex, v0);
+        assert_eq!(edge.end_vertex, v1);
+    }
+
+    #[test]
+    fn create_straight_edge_rejects_unknown_vertex() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let result = create_straight_edge(&mut model, v0, 99_999);
+        assert!(matches!(
+            result,
+            Err(OperationError::InvalidGeometry(_))
+        ));
+    }
+}

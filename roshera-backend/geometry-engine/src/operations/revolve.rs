@@ -997,12 +997,426 @@ fn validate_revolved_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
     Ok(())
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_revolution_validation() {
-//         // Test validation of revolution parameters
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::Line;
+    use crate::primitives::topology_builder::BRepModel;
+
+    /// Add a Line curve + Edge between two existing vertices.
+    fn add_line_edge(model: &mut BRepModel, v_start: VertexId, v_end: VertexId) -> EdgeId {
+        let s = model.vertices.get(v_start).expect("start vertex");
+        let e = model.vertices.get(v_end).expect("end vertex");
+        let line = Line::new(Point3::from(s.position), Point3::from(e.position));
+        let curve_id = model.curves.add(Box::new(line));
+        let edge = Edge::new_auto_range(0, v_start, v_end, curve_id, EdgeOrientation::Forward);
+        model.edges.add(edge)
+    }
+
+    /// Closed CCW rectangle in the XZ plane offset along +X (so the Z axis
+    /// does NOT pierce it). Profile lives at y = 0.
+    fn make_offset_rectangle(model: &mut BRepModel) -> Vec<EdgeId> {
+        let v0 = model.vertices.add(2.0, 0.0, 0.0);
+        let v1 = model.vertices.add(4.0, 0.0, 0.0);
+        let v2 = model.vertices.add(4.0, 0.0, 1.0);
+        let v3 = model.vertices.add(2.0, 0.0, 1.0);
+        vec![
+            add_line_edge(model, v0, v1),
+            add_line_edge(model, v1, v2),
+            add_line_edge(model, v2, v3),
+            add_line_edge(model, v3, v0),
+        ]
+    }
+
+    /// Closed CCW rectangle in the XZ plane that straddles the Z axis
+    /// (one edge on the axis itself).
+    fn make_on_axis_rectangle(model: &mut BRepModel) -> Vec<EdgeId> {
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(2.0, 0.0, 0.0);
+        let v2 = model.vertices.add(2.0, 0.0, 1.0);
+        let v3 = model.vertices.add(0.0, 0.0, 1.0);
+        vec![
+            add_line_edge(model, v0, v1),
+            add_line_edge(model, v1, v2),
+            add_line_edge(model, v2, v3),
+            add_line_edge(model, v3, v0),
+        ]
+    }
+
+    // -------------------------------------------------------------------
+    // RevolveOptions defaults
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn revolve_options_default_values_match_documentation() {
+        let opts = RevolveOptions::default();
+        assert_eq!(opts.axis_origin, Point3::ZERO);
+        assert_eq!(opts.axis_direction, Vector3::Z);
+        assert!((opts.angle - std::f64::consts::TAU).abs() < 1e-12);
+        assert!(!opts.symmetric);
+        assert_eq!(opts.segments, 32);
+        assert_eq!(opts.pitch, 0.0);
+        assert!(opts.cap_ends);
+    }
+
+    // -------------------------------------------------------------------
+    // validate_revolve_inputs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_revolve_inputs_rejects_unknown_face() {
+        let model = BRepModel::new();
+        let result = validate_revolve_inputs(&model, 999, &RevolveOptions::default());
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_revolve_inputs_rejects_zero_angle() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            angle: 0.0,
+            ..Default::default()
+        };
+        let result = validate_revolve_inputs(&model, face_id, &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_revolve_inputs_rejects_negative_angle() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            angle: -std::f64::consts::PI,
+            ..Default::default()
+        };
+        let result = validate_revolve_inputs(&model, face_id, &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_revolve_inputs_rejects_oversized_angle() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            // > 4π (TAU * 2.0)
+            angle: std::f64::consts::TAU * 2.5,
+            ..Default::default()
+        };
+        let result = validate_revolve_inputs(&model, face_id, &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_revolve_inputs_accepts_full_double_revolution() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            // Exactly 4π is the upper inclusive bound.
+            angle: std::f64::consts::TAU * 2.0,
+            ..Default::default()
+        };
+        assert!(validate_revolve_inputs(&model, face_id, &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_revolve_inputs_rejects_zero_axis_direction() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            axis_direction: Vector3::new(0.0, 0.0, 0.0),
+            ..Default::default()
+        };
+        let result = validate_revolve_inputs(&model, face_id, &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_revolve_inputs_rejects_too_few_segments() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            segments: 2,
+            ..Default::default()
+        };
+        let result = validate_revolve_inputs(&model, face_id, &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_revolve_inputs_accepts_minimum_segment_count() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            segments: 3,
+            ..Default::default()
+        };
+        assert!(validate_revolve_inputs(&model, face_id, &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_revolve_inputs_accepts_default_options() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        assert!(validate_revolve_inputs(&model, face_id, &RevolveOptions::default()).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // face_intersects_axis
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn face_intersects_axis_offset_rectangle_does_not_intersect() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let face = model.faces.get(face_id).expect("face").clone();
+        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
+            .expect("intersect query");
+        assert!(!result, "offset rectangle should not touch the Z axis");
+    }
+
+    #[test]
+    fn face_intersects_axis_on_axis_rectangle_does_intersect() {
+        let mut model = BRepModel::new();
+        let edges = make_on_axis_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let face = model.faces.get(face_id).expect("face").clone();
+        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
+            .expect("intersect query");
+        assert!(result, "rectangle with vertices on Z axis must register");
+    }
+
+    #[test]
+    fn face_intersects_axis_pierce_through_interior_detects() {
+        // Profile in XY plane straddling origin; revolution axis = Z pierces it.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(-2.0, -2.0, 0.0);
+        let v1 = model.vertices.add(2.0, -2.0, 0.0);
+        let v2 = model.vertices.add(2.0, 2.0, 0.0);
+        let v3 = model.vertices.add(-2.0, 2.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+            add_line_edge(&mut model, v2, v3),
+            add_line_edge(&mut model, v3, v0),
+        ];
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let face = model.faces.get(face_id).expect("face").clone();
+        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
+            .expect("intersect query");
+        assert!(result, "Z axis pierces the centered XY rectangle");
+    }
+
+    #[test]
+    fn face_intersects_axis_offset_xy_rectangle_does_not_intersect() {
+        // XY rectangle far from the Z axis — no pierce, no boundary touch.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(10.0, 10.0, 0.0);
+        let v1 = model.vertices.add(12.0, 10.0, 0.0);
+        let v2 = model.vertices.add(12.0, 12.0, 0.0);
+        let v3 = model.vertices.add(10.0, 12.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+            add_line_edge(&mut model, v2, v3),
+            add_line_edge(&mut model, v3, v0),
+        ];
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let face = model.faces.get(face_id).expect("face").clone();
+        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
+            .expect("intersect query");
+        assert!(!result, "offset XY rectangle far from axis should not intersect");
+    }
+
+    // -------------------------------------------------------------------
+    // revolve_face / revolve_profile
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn revolve_profile_full_revolution_creates_solid() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let opts = RevolveOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = revolve_profile(&mut model, edges, opts).expect("revolve");
+        assert!(model.solids.get(solid_id).is_some());
+    }
+
+    #[test]
+    fn revolve_profile_partial_revolution_creates_solid_with_caps() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let opts = RevolveOptions {
+            angle: std::f64::consts::PI, // half revolution
+            cap_ends: true,
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = revolve_profile(&mut model, edges, opts).expect("revolve");
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        // Side faces (4 edges × default 32 segments) plus 2 caps.
+        assert_eq!(shell.faces.len(), 4 * 32 + 2);
+    }
+
+    #[test]
+    fn revolve_face_rejects_unknown_face_id() {
+        let mut model = BRepModel::new();
+        let opts = RevolveOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = revolve_face(&mut model, 9999, opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn revolve_face_rejects_face_intersecting_axis() {
+        let mut model = BRepModel::new();
+        let edges = make_on_axis_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = revolve_face(&mut model, face_id, opts);
+        assert!(matches!(result, Err(OperationError::SelfIntersection)));
+    }
+
+    #[test]
+    fn revolve_face_rejects_zero_angle() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        let opts = RevolveOptions {
+            angle: 0.0,
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = revolve_face(&mut model, face_id, opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn revolve_profile_helical_sweep_creates_solid() {
+        // Non-zero pitch routes through create_helical_sweep.
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let opts = RevolveOptions {
+            angle: std::f64::consts::TAU,
+            pitch: 1.0,
+            segments: 8,
+            cap_ends: false,
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = revolve_profile(&mut model, edges, opts).expect("helical");
+        assert!(model.solids.get(solid_id).is_some());
+    }
+
+    #[test]
+    fn revolve_profile_with_x_axis_creates_solid() {
+        // Profile in YZ-plane offset along +Y, revolved around X axis.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 2.0, 0.0);
+        let v1 = model.vertices.add(0.0, 4.0, 0.0);
+        let v2 = model.vertices.add(0.0, 4.0, 1.0);
+        let v3 = model.vertices.add(0.0, 2.0, 1.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+            add_line_edge(&mut model, v2, v3),
+            add_line_edge(&mut model, v3, v0),
+        ];
+        let opts = RevolveOptions {
+            axis_direction: Vector3::X,
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = revolve_profile(&mut model, edges, opts).expect("revolve");
+        assert!(model.solids.get(solid_id).is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_revolved_solid
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_revolved_solid_rejects_unknown_solid() {
+        let model = BRepModel::new();
+        let result = validate_revolved_solid(&model, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidBRep(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_face_from_profile (revolve thin wrapper)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_face_from_profile_wraps_extrude_helper() {
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let face_id = create_face_from_profile(&mut model, edges).expect("face");
+        assert!(model.faces.get(face_id).is_some());
+    }
+
+    #[test]
+    fn create_face_from_empty_profile_is_error() {
+        let mut model = BRepModel::new();
+        let result = create_face_from_profile(&mut model, vec![]);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // create_degenerate_edge
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_degenerate_edge_produces_zero_length_self_loop() {
+        let mut model = BRepModel::new();
+        let v = model.vertices.add(1.0, 2.0, 3.0);
+        let edge_id = create_degenerate_edge(&mut model, v, v).expect("degenerate edge");
+        let edge = model.edges.get(edge_id).expect("edge");
+        assert_eq!(edge.start_vertex, v);
+        assert_eq!(edge.end_vertex, v);
+    }
+
+    #[test]
+    fn create_degenerate_edge_rejects_unknown_vertex() {
+        let mut model = BRepModel::new();
+        let result = create_degenerate_edge(&mut model, 9999, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+}

@@ -1389,12 +1389,392 @@ pub fn compute_planar_surface_from_edges(
     compute_planar_surface(model, edges)
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_loft_validation() {
-//         // Test validation of loft parameters
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::Line;
+    use crate::primitives::topology_builder::BRepModel;
+
+    fn add_line_edge(model: &mut BRepModel, v_start: VertexId, v_end: VertexId) -> EdgeId {
+        let s = model.vertices.get(v_start).expect("start vertex");
+        let e = model.vertices.get(v_end).expect("end vertex");
+        let line = Line::new(Point3::from(s.position), Point3::from(e.position));
+        let curve_id = model.curves.add(Box::new(line));
+        let edge = Edge::new_auto_range(0, v_start, v_end, curve_id, EdgeOrientation::Forward);
+        model.edges.add(edge)
+    }
+
+    /// Closed CCW unit-square profile in the XY plane at the given Z height.
+    fn make_square_at_z(model: &mut BRepModel, z: f64) -> Vec<EdgeId> {
+        let v0 = model.vertices.add(0.0, 0.0, z);
+        let v1 = model.vertices.add(1.0, 0.0, z);
+        let v2 = model.vertices.add(1.0, 1.0, z);
+        let v3 = model.vertices.add(0.0, 1.0, z);
+        vec![
+            add_line_edge(model, v0, v1),
+            add_line_edge(model, v1, v2),
+            add_line_edge(model, v2, v3),
+            add_line_edge(model, v3, v0),
+        ]
+    }
+
+    // -------------------------------------------------------------------
+    // LoftOptions defaults & LoftType variants
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn loft_options_default_values() {
+        let opts = LoftOptions::default();
+        assert_eq!(opts.loft_type, LoftType::Linear);
+        assert!(!opts.closed);
+        assert!(opts.create_solid);
+        assert!(opts.start_tangent.is_none());
+        assert!(opts.end_tangent.is_none());
+        assert!(opts.guide_curves.is_empty());
+        assert!(opts.vertex_correspondence.is_none());
+        assert_eq!(opts.sections, 10);
+    }
+
+    #[test]
+    fn loft_type_variants_distinct() {
+        assert_ne!(LoftType::Linear, LoftType::Cubic);
+        assert_ne!(LoftType::Cubic, LoftType::MinimalTwist);
+        assert_ne!(LoftType::MinimalTwist, LoftType::Guided);
+    }
+
+    // -------------------------------------------------------------------
+    // validate_loft_inputs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_loft_inputs_rejects_single_profile() {
+        let mut model = BRepModel::new();
+        let p = make_square_at_z(&mut model, 0.0);
+        let result = validate_loft_inputs(&model, &[p], &LoftOptions::default());
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_loft_inputs_rejects_empty_profile_list() {
+        let model = BRepModel::new();
+        let result = validate_loft_inputs(&model, &[], &LoftOptions::default());
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_loft_inputs_rejects_unknown_edge() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let result = validate_loft_inputs(&model, &[p1, vec![9999]], &LoftOptions::default());
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_loft_inputs_rejects_unknown_guide_curve() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let p2 = make_square_at_z(&mut model, 1.0);
+        let opts = LoftOptions {
+            guide_curves: vec![9999],
+            ..Default::default()
+        };
+        let result = validate_loft_inputs(&model, &[p1, p2], &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn validate_loft_inputs_accepts_two_valid_profiles() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let p2 = make_square_at_z(&mut model, 1.0);
+        assert!(validate_loft_inputs(&model, &[p1, p2], &LoftOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_lofted_solid_rejects_unknown_solid() {
+        let model = BRepModel::new();
+        let result = validate_lofted_solid(&model, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidBRep(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_or_find_edge (incl. dedup)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_or_find_edge_creates_new_edge_when_absent() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let edge_id = create_or_find_edge(&mut model, v0, v1).expect("edge");
+        let edge = model.edges.get(edge_id).expect("edge in store");
+        assert_eq!(edge.start_vertex, v0);
+        assert_eq!(edge.end_vertex, v1);
+    }
+
+    #[test]
+    fn create_or_find_edge_reuses_existing_line_edge_same_direction() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let first = create_or_find_edge(&mut model, v0, v1).expect("first");
+        let second = create_or_find_edge(&mut model, v0, v1).expect("second");
+        assert_eq!(first, second, "duplicate edge should be deduplicated");
+    }
+
+    #[test]
+    fn create_or_find_edge_reuses_existing_line_edge_reversed_direction() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let forward = create_or_find_edge(&mut model, v0, v1).expect("forward");
+        let backward = create_or_find_edge(&mut model, v1, v0).expect("backward");
+        assert_eq!(
+            forward, backward,
+            "reverse-oriented duplicate should be deduplicated"
+        );
+    }
+
+    #[test]
+    fn create_or_find_edge_rejects_unknown_start() {
+        let mut model = BRepModel::new();
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let result = create_or_find_edge(&mut model, 9999, v1);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn create_or_find_edge_rejects_unknown_end() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let result = create_or_find_edge(&mut model, v0, 9999);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_bilinear_surface
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_bilinear_surface_returns_surface_for_quad() {
+        let mut model = BRepModel::new();
+        let v00 = model.vertices.add(0.0, 0.0, 0.0);
+        let v10 = model.vertices.add(1.0, 0.0, 0.0);
+        let v01 = model.vertices.add(0.0, 1.0, 0.0);
+        let v11 = model.vertices.add(1.0, 1.0, 0.0);
+        assert!(create_bilinear_surface(&mut model, v00, v10, v01, v11).is_ok());
+    }
+
+    #[test]
+    fn create_bilinear_surface_rejects_unknown_vertex() {
+        let mut model = BRepModel::new();
+        let result = create_bilinear_surface(&mut model, 1, 2, 3, 4);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_ruled_face / create_ruled_surfaces_between_profiles
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_ruled_face_produces_face_with_4_edge_loop() {
+        let mut model = BRepModel::new();
+        let v1s = model.vertices.add(0.0, 0.0, 0.0);
+        let v1e = model.vertices.add(1.0, 0.0, 0.0);
+        let v2s = model.vertices.add(0.0, 0.0, 1.0);
+        let v2e = model.vertices.add(1.0, 0.0, 1.0);
+        let face_id = create_ruled_face(&mut model, v1s, v1e, v2s, v2e).expect("face");
+        let face = model.faces.get(face_id).expect("face");
+        let outer = model.loops.get(face.outer_loop).expect("loop");
+        assert_eq!(outer.edges.len(), 4);
+    }
+
+    #[test]
+    fn create_ruled_surfaces_rejects_mismatched_vertex_counts() {
+        let mut model = BRepModel::new();
+        let v: Vec<VertexId> = (0..5)
+            .map(|i| model.vertices.add(i as f64, 0.0, 0.0))
+            .collect();
+        let three = vec![v[0], v[1], v[2]];
+        let two = vec![v[3], v[4]];
+        let result = create_ruled_surfaces_between_profiles(&mut model, &three, &two);
+        assert!(matches!(result, Err(OperationError::IncompatibleProfiles)));
+    }
+
+    #[test]
+    fn create_ruled_surfaces_creates_n_faces_for_n_corresponding_vertices() {
+        let mut model = BRepModel::new();
+        let v_bottom: Vec<VertexId> = (0..4)
+            .map(|i| model.vertices.add(i as f64, 0.0, 0.0))
+            .collect();
+        let v_top: Vec<VertexId> = (0..4)
+            .map(|i| model.vertices.add(i as f64, 0.0, 1.0))
+            .collect();
+        let faces = create_ruled_surfaces_between_profiles(&mut model, &v_bottom, &v_top)
+            .expect("surfaces");
+        assert_eq!(faces.len(), 4);
+    }
+
+    // -------------------------------------------------------------------
+    // create_reversed_face
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_reversed_face_flips_orientation() {
+        let mut model = BRepModel::new();
+        let v00 = model.vertices.add(0.0, 0.0, 0.0);
+        let v10 = model.vertices.add(1.0, 0.0, 0.0);
+        let v01 = model.vertices.add(0.0, 1.0, 0.0);
+        let v11 = model.vertices.add(1.0, 1.0, 0.0);
+        let face_id = create_ruled_face(&mut model, v00, v10, v01, v11).expect("face");
+        let original = model.faces.get(face_id).expect("face").orientation;
+        let reversed_id = create_reversed_face(&mut model, &face_id).expect("reversed");
+        let reversed = model.faces.get(reversed_id).expect("reversed").orientation;
+        assert_ne!(original, reversed);
+    }
+
+    #[test]
+    fn create_reversed_face_rejects_unknown_face() {
+        let mut model = BRepModel::new();
+        let result = create_reversed_face(&mut model, &9999);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // create_planar_face_from_edges / compute_planar_surface_from_edges
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_planar_face_from_rectangle_succeeds() {
+        let mut model = BRepModel::new();
+        let edges = make_square_at_z(&mut model, 0.0);
+        let face_id = create_planar_face_from_edges(&mut model, edges).expect("face");
+        assert!(model.faces.get(face_id).is_some());
+    }
+
+    #[test]
+    fn compute_planar_surface_from_edges_returns_surface_for_rectangle() {
+        let mut model = BRepModel::new();
+        let edges = make_square_at_z(&mut model, 0.0);
+        let surface = compute_planar_surface_from_edges(&mut model, &edges).expect("plane");
+        // Surface trait method available on the returned boxed surface.
+        let _ = surface.surface_type();
+    }
+
+    #[test]
+    fn compute_planar_surface_from_edges_rejects_unknown_edge() {
+        let mut model = BRepModel::new();
+        let result = compute_planar_surface_from_edges(&mut model, &[9999]);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // create_face_profiles
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_face_profiles_converts_each_edge_loop_to_face() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let p2 = make_square_at_z(&mut model, 1.0);
+        let faces = create_face_profiles(&mut model, vec![p1, p2]).expect("faces");
+        assert_eq!(faces.len(), 2);
+        for fid in faces {
+            assert!(model.faces.get(fid).is_some());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // get_ordered_vertices_from_face / establish_correspondence
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn get_ordered_vertices_from_rectangular_face_returns_4_distinct() {
+        let mut model = BRepModel::new();
+        let edges = make_square_at_z(&mut model, 0.0);
+        let face_id = create_planar_face_from_edges(&mut model, edges).expect("face");
+        let face = model.faces.get(face_id).expect("face").clone();
+        let verts = get_ordered_vertices_from_face(&model, &face).expect("verts");
+        assert_eq!(verts.len(), 4);
+    }
+
+    #[test]
+    fn establish_correspondence_returns_one_ring_per_profile() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let p2 = make_square_at_z(&mut model, 1.0);
+        let faces = create_face_profiles(&mut model, vec![p1, p2]).expect("faces");
+        let corr = establish_correspondence(&model, &faces).expect("correspondence");
+        assert_eq!(corr.len(), 2);
+        assert_eq!(corr[0].len(), 4);
+        assert_eq!(corr[1].len(), 4);
+    }
+
+    // -------------------------------------------------------------------
+    // densify_correspondence
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn densify_correspondence_passes_through_when_already_uniform() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let p2 = make_square_at_z(&mut model, 1.0);
+        let faces = create_face_profiles(&mut model, vec![p1, p2]).expect("faces");
+        let corr = establish_correspondence(&model, &faces).expect("correspondence");
+        // 4 vs 4: max=4 but min target is 8; will densify both to 8.
+        let densified = densify_correspondence(&mut model, &faces, corr).expect("densified");
+        assert_eq!(densified.len(), 2);
+        assert_eq!(densified[0].len(), 8);
+        assert_eq!(densified[1].len(), 8);
+    }
+
+    // -------------------------------------------------------------------
+    // loft_profiles entry-point validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn loft_profiles_rejects_single_profile() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let opts = LoftOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = loft_profiles(&mut model, vec![p1], opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn loft_profiles_rejects_unknown_edge_in_second_profile() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let opts = LoftOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = loft_profiles(&mut model, vec![p1, vec![9999]], opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn loft_profiles_two_squares_creates_solid() {
+        let mut model = BRepModel::new();
+        let p1 = make_square_at_z(&mut model, 0.0);
+        let p2 = make_square_at_z(&mut model, 2.0);
+        let opts = LoftOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = loft_profiles(&mut model, vec![p1, p2], opts).expect("loft");
+        assert!(model.solids.get(solid_id).is_some());
+    }
+}
