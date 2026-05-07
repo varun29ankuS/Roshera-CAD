@@ -772,20 +772,33 @@ fn create_wall_face(
     }
     let edge_dir = (p2 - p1).normalize()?;
 
-    // Wall offset direction is the inward direction of the removed face:
-    // the face whose plane the wall hangs from points outward, so the
-    // wall extends opposite that normal by `thickness`. This produces a
-    // wall perpendicular to the removed-face plane and parallel to the
-    // edge — independent of the global coordinate frame.
-    let offset_dir = (-removed_face_outward_normal).normalize()?;
+    // Wall offset direction lies IN the plane of the removed face,
+    // perpendicular to the boundary edge, pointing toward the face
+    // interior. By the CCW-loop convention (outer loops traverse CCW
+    // when viewed from the outward-normal side), `loop_edge_dir × n`
+    // gives that inward in-plane perpendicular. The wall is then a quad
+    // co-planar with the removed face, going from the outer rim to the
+    // offset rim — which is exactly where the inward-offset interior
+    // faces meet the opening boundary, so wall and interior faces
+    // share their boundary edge.
+    //
+    // The earlier `(-removed_face_outward_normal)` formulation made
+    // walls extend perpendicular to the removed face *into* the solid,
+    // which left a dangling wall not connected to any interior offset
+    // face — manifold regression caught while wiring 42-C edge sharing.
+    let loop_edge_dir = if forward { edge_dir } else { -edge_dir };
+    let offset_dir = loop_edge_dir
+        .cross(&removed_face_outward_normal)
+        .normalize()?;
 
     let offset = offset_dir * thickness.abs();
     let p3 = p2 + offset;
     let p4 = p1 + offset;
 
-    // Create the planar surface through the four corners. The wall
-    // normal must be perpendicular to both the edge direction and the
-    // wall's depth direction.
+    // The wall plane's normal is perpendicular to both the edge
+    // direction and the in-plane offset direction; this is the same
+    // convention the wall loop construction below assumes (CCW in the
+    // wall plane from the +wall_normal side).
     let wall_normal = edge_dir.cross(&offset_dir).normalize()?;
     let wall_surface = Plane::from_point_normal(p1, wall_normal)?;
     let surface_id = model.surfaces.add(Box::new(wall_surface));
