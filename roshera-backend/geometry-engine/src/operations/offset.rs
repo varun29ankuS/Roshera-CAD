@@ -774,21 +774,22 @@ fn create_wall_face(
 
     // Wall offset direction lies IN the plane of the removed face,
     // perpendicular to the boundary edge, pointing toward the face
-    // interior. By the CCW-loop convention (outer loops traverse CCW
-    // when viewed from the outward-normal side), `loop_edge_dir × n`
-    // gives that inward in-plane perpendicular. The wall is then a quad
-    // co-planar with the removed face, going from the outer rim to the
-    // offset rim — which is exactly where the inward-offset interior
-    // faces meet the opening boundary, so wall and interior faces
-    // share their boundary edge.
+    // interior. CCW outer loop convention (viewed from +n) means
+    // `loop_edge_dir × n` points OUTward from the face interior; the
+    // inward in-plane perpendicular is therefore `n × loop_edge_dir`.
+    //
+    // The wall is a quad co-planar with the removed face, going from
+    // the outer rim to the offset rim — which is exactly where the
+    // inward-offset interior faces meet the opening boundary, so wall
+    // and interior faces share their boundary edge.
     //
     // The earlier `(-removed_face_outward_normal)` formulation made
     // walls extend perpendicular to the removed face *into* the solid,
     // which left a dangling wall not connected to any interior offset
     // face — manifold regression caught while wiring 42-C edge sharing.
     let loop_edge_dir = if forward { edge_dir } else { -edge_dir };
-    let offset_dir = loop_edge_dir
-        .cross(&removed_face_outward_normal)
+    let offset_dir = removed_face_outward_normal
+        .cross(&loop_edge_dir)
         .normalize()?;
 
     let offset = offset_dir * thickness.abs();
