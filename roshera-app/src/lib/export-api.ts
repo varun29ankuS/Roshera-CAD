@@ -139,13 +139,36 @@ export async function exportSceneAs(format: string): Promise<ExportResult> {
       }
     }
 
+    // Firefox / Safari fallback: no native Save dialog, so prompt for a
+    // filename and trigger an anchor download. The anchor MUST be in
+    // the document tree before `.click()` — Firefox ignores `.click()`
+    // on detached anchors.
+    const promptedName = window.prompt(
+      `Save ${format} as:`,
+      meta.filename,
+    )
+    if (promptedName === null) {
+      // User cancelled the prompt — treat as success, don't download.
+      return { ok: true, filename: meta.filename }
+    }
+    const trimmed = promptedName.trim()
+    const finalName =
+      trimmed.length > 0
+        ? ext && !trimmed.toLowerCase().endsWith(ext.toLowerCase())
+          ? `${trimmed}${ext}`
+          : trimmed
+        : meta.filename
+
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = meta.filename
+    a.download = finalName
+    a.style.display = 'none'
+    document.body.appendChild(a)
     a.click()
+    document.body.removeChild(a)
     URL.revokeObjectURL(url)
-    return { ok: true, filename: meta.filename }
+    return { ok: true, filename: finalName }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return { ok: false, error: msg }
