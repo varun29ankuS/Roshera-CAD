@@ -417,8 +417,10 @@ The math module is FROZEN - use it, don't modify it:
 - `Quaternion` - Rotations
 - `Point3` - 3D points (alias for Vector3)
 - `Tolerance` - Precision handling
-- `BSplineCurve`, `BSplineSurface` - Spline evaluation
-- `NurbsCurve`, `NurbsSurface` - NURBS evaluation
+- `BSplineCurve` - Spline evaluation (math::bspline)
+- `NurbsCurve`, `NurbsSurface` - NURBS evaluation (math::nurbs)
+  Note: the legacy `math::bspline_surface` module (BSplineSurface +
+  parallel NurbsSurface) was deleted 2026-05-07 as orphaned dead code.
 
 ### Available Operations
 - Vector operations: dot, cross, normalize, angle
