@@ -104,8 +104,10 @@ pub fn offset_face(
     let offset_surface = create_offset_surface(model, &face, distance)?;
     let surface_id = model.surfaces.add(offset_surface);
 
-    // Create offset edges
-    let offset_loop = create_offset_loop(model, &face, distance, &options)?;
+    // Create offset edges. The standalone offset_face surface does not
+    // need the per-edge map — only the shell operation does — so
+    // discard it here.
+    let (offset_loop, _edge_map) = create_offset_loop(model, &face, distance, &options)?;
     let loop_id = model.loops.add(offset_loop);
 
     // Create new face
@@ -138,12 +140,24 @@ pub fn offset_solid(
         .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?
         .clone();
 
-    // Create offset faces for interior
-    let interior_faces =
+    // Create offset faces for interior. Capture the per-edge map so
+    // that walls erected over removed faces can reuse the offset edges
+    // these interior faces just created — that's what gives the
+    // resulting shell shared topology (manifold) instead of a stack of
+    // disjoint surfaces that just happen to dedup at their corner
+    // vertices.
+    let (interior_faces, original_to_offset_edge) =
         create_interior_offset_faces(model, &solid, -thickness.abs(), &faces_to_remove, &options)?;
 
     // Create side walls for removed faces
-    let wall_faces = create_shell_walls(model, &solid, thickness, &faces_to_remove, &options)?;
+    let wall_faces = create_shell_walls(
+        model,
+        &solid,
+        thickness,
+        &faces_to_remove,
+        &original_to_offset_edge,
+        &options,
+    )?;
 
     // Combine original exterior (minus removed faces) with new interior
     let shell_faces =
@@ -331,13 +345,21 @@ fn create_offset_nurbs(surface: &dyn Surface, distance: f64) -> OperationResult<
     Ok(surface.offset(distance))
 }
 
-/// Create offset loop (boundary curves)
+/// Create offset loop (boundary curves).
+///
+/// Returns the new loop together with a per-edge mapping
+/// `(source_edge_id, offset_edge_id)` in the same order the loop
+/// traverses them. The shell operation uses that mapping to share
+/// offset edges between interior offset faces and the walls erected
+/// over removed faces — without it each side creates an independent
+/// edge along the same boundary segment and the resulting solid is
+/// non-manifold even when its vertices have been dedup'd.
 fn create_offset_loop(
     model: &mut BRepModel,
     face: &Face,
     distance: f64,
     options: &OffsetOptions,
-) -> OperationResult<Loop> {
+) -> OperationResult<(Loop, Vec<(EdgeId, EdgeId)>)> {
     let original_loop = model
         .loops
         .get(face.outer_loop)
@@ -345,6 +367,7 @@ fn create_offset_loop(
         .clone();
 
     let mut offset_edges = Vec::new();
+    let mut edge_map = Vec::with_capacity(original_loop.edges.len());
 
     // Offset each edge in the loop. Adjacent edges share a source vertex on
     // the source face; both adjacent offset edges therefore compute the same
@@ -363,6 +386,7 @@ fn create_offset_loop(
         let offset_edge_id =
             create_offset_edge(model, edge_id, face.surface_id, distance, options)?;
         offset_edges.push((offset_edge_id, forward));
+        edge_map.push((edge_id, offset_edge_id));
     }
 
     // Create new loop
@@ -374,7 +398,7 @@ fn create_offset_loop(
         offset_loop.add_edge(edge_id, forward);
     }
 
-    Ok(offset_loop)
+    Ok((offset_loop, edge_map))
 }
 
 /// Create offset edge.
@@ -594,14 +618,26 @@ fn detect_offset_self_intersection(
     None
 }
 
-/// Create interior offset faces for shell
+/// Create interior offset faces for shell.
+///
+/// Returns the new face IDs alongside a `(source_edge_id ->
+/// offset_edge_id)` map covering every edge that participated in any
+/// non-removed face's outer loop. The map lets `create_shell_walls`
+/// reuse offset edges as wall bottoms, sharing topology between walls
+/// and interior faces — without it, the wall and the interior face
+/// each create their own edge along the same boundary segment and the
+/// resulting solid is non-manifold even when its vertices have been
+/// dedup'd. Each removed-face boundary edge is shared with exactly
+/// one non-removed adjacent face on a well-formed input solid, so the
+/// mapping is unambiguous (last-writer-wins on the rare degenerate
+/// case where an edge bounds multiple non-removed faces).
 fn create_interior_offset_faces(
     model: &mut BRepModel,
     solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
     options: &OffsetOptions,
-) -> OperationResult<Vec<FaceId>> {
+) -> OperationResult<(Vec<FaceId>, std::collections::HashMap<EdgeId, EdgeId>)> {
     let shell = model
         .shells
         .get(solid.outer_shell)
@@ -609,6 +645,14 @@ fn create_interior_offset_faces(
         .clone();
 
     let mut interior_faces = Vec::new();
+    let mut original_to_offset = std::collections::HashMap::new();
+
+    let offset_options = OffsetOptions {
+        common: options.common.clone(),
+        offset_type: OffsetType::Distance(thickness),
+        intersection_handling: options.intersection_handling,
+        max_deviation: options.max_deviation,
+    };
 
     for &face_id in &shell.faces {
         // Skip faces that will be removed (openings)
@@ -616,19 +660,36 @@ fn create_interior_offset_faces(
             continue;
         }
 
-        // Create inward offset of face
-        let offset_options = OffsetOptions {
-            common: options.common.clone(),
-            offset_type: OffsetType::Distance(thickness),
-            intersection_handling: options.intersection_handling,
-            max_deviation: options.max_deviation,
-        };
+        validate_offset_face_inputs(model, face_id, &offset_options)?;
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
+            .clone();
 
-        let interior_face = offset_face(model, face_id, offset_options)?;
-        interior_faces.push(interior_face);
+        // Create offset surface and loop, capturing the per-edge map.
+        let offset_surface = create_offset_surface(model, &face, thickness)?;
+        let surface_id = model.surfaces.add(offset_surface);
+
+        let (offset_loop, edge_map) =
+            create_offset_loop(model, &face, thickness, &offset_options)?;
+        let loop_id = model.loops.add(offset_loop);
+
+        let offset_face_obj = Face::new(
+            0, // ID assigned by store
+            surface_id,
+            loop_id,
+            face.orientation,
+        );
+        let offset_face_id = model.faces.add(offset_face_obj);
+        interior_faces.push(offset_face_id);
+
+        for (orig_edge_id, offset_edge_id) in edge_map {
+            original_to_offset.insert(orig_edge_id, offset_edge_id);
+        }
     }
 
-    Ok(interior_faces)
+    Ok((interior_faces, original_to_offset))
 }
 
 /// Create wall faces for shell openings.
@@ -643,6 +704,7 @@ fn create_shell_walls(
     solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
+    original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
     options: &OffsetOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // Confirm every face being removed lives on this solid's outer shell.
@@ -709,12 +771,21 @@ fn create_shell_walls(
         }
 
         // Create wall face for each edge. Pass the caller's tolerance
-        // so adjacent walls can dedup their shared corner vertices.
+        // so adjacent walls can dedup their shared corner vertices,
+        // and the original→offset edge map so the wall's bottom edge
+        // is the same edge the adjacent interior face already created.
         let tol = options.common.tolerance.distance();
         for (i, &edge_id) in loop_data.edges.iter().enumerate() {
             let forward = loop_data.orientations[i];
-            let wall_face =
-                create_wall_face(model, edge_id, thickness, forward, removed_normal, tol)?;
+            let wall_face = create_wall_face(
+                model,
+                edge_id,
+                thickness,
+                forward,
+                removed_normal,
+                tol,
+                original_to_offset_edge,
+            )?;
             wall_faces.push(wall_face);
         }
     }
@@ -735,6 +806,7 @@ fn create_wall_face(
     forward: bool,
     removed_face_outward_normal: Vector3,
     tol: f64,
+    original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
 ) -> OperationResult<FaceId> {
     use crate::primitives::curve::Line;
     use crate::primitives::edge::EdgeOrientation;
@@ -837,15 +909,34 @@ fn create_wall_face(
         EdgeOrientation::Forward,
     ));
 
-    let line_bottom = Line::new(p3, p4);
-    let c_bottom = model.curves.add(Box::new(line_bottom));
-    let e_bottom = model.edges.add(Edge::new_auto_range(
-        0,
-        v3,
-        v4,
-        c_bottom,
-        EdgeOrientation::Forward,
-    ));
+    // If the adjacent face was offset, the interior offset face has already
+    // created the edge that runs along the wall/interior boundary. Reuse
+    // that edge so wall and interior face share their meeting boundary,
+    // giving a topologically watertight shell along the opening.
+    //
+    // The interior offset edge was created with start_vertex =
+    // offset(orig.start_vertex) (positionally p4) and end_vertex =
+    // offset(orig.end_vertex) (positionally p3), so its stored direction
+    // is p4→p3. The wall's bottom traverses p3→p4, i.e., the reverse
+    // direction — hence `e_bottom_forward = false` on the reused edge.
+    //
+    // Vertex dedup via `add_or_find(.., tol)` above guarantees v3 equals
+    // the offset edge's end_vertex and v4 equals its start_vertex.
+    let (e_bottom, e_bottom_forward) =
+        if let Some(&offset_edge_id) = original_to_offset_edge.get(&outer_edge_id) {
+            (offset_edge_id, false)
+        } else {
+            let line_bottom = Line::new(p3, p4);
+            let c_bottom = model.curves.add(Box::new(line_bottom));
+            let edge = model.edges.add(Edge::new_auto_range(
+                0,
+                v3,
+                v4,
+                c_bottom,
+                EdgeOrientation::Forward,
+            ));
+            (edge, true)
+        };
 
     let line_left = Line::new(p4, p1);
     let c_left = model.curves.add(Box::new(line_left));
@@ -861,7 +952,7 @@ fn create_wall_face(
     let mut wall_loop = Loop::new(0, LoopType::Outer);
     wall_loop.add_edge(e_top, forward);
     wall_loop.add_edge(e_right, true);
-    wall_loop.add_edge(e_bottom, true);
+    wall_loop.add_edge(e_bottom, e_bottom_forward);
     wall_loop.add_edge(e_left, true);
     let loop_id = model.loops.add(wall_loop);
 
@@ -1294,6 +1385,113 @@ mod tests {
         }
 
         assert_eq!(walls_checked, 4, "expected to verify 4 walls");
+    }
+
+    /// Slice 42-C edge-sharing invariant: along the opening rim of a
+    /// hollow solid, every wall face's bottom edge must be the SAME
+    /// `EdgeId` as the adjacent interior offset face's boundary edge,
+    /// not a fresh duplicate planted at the same position. This makes
+    /// the resulting shell manifold along the opening — each rim edge
+    /// is bordered by exactly two faces (one wall + one interior).
+    ///
+    /// Without sharing, the wall bottom and interior top would be two
+    /// distinct edges at the same position, leaving each rim "slot"
+    /// bordered by only 1 face per id and breaking the manifold
+    /// invariant the validator (and downstream booleans) rely on.
+    #[test]
+    fn shell_wall_and_interior_share_rim_edge() {
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        let thickness = 1.0;
+        let half_extent = 5.0;
+        let inset = half_extent - thickness; // = 4.0
+
+        let options = OffsetOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            offset_type: OffsetType::Distance(thickness),
+            intersection_handling: IntersectionHandling::Trim,
+            max_deviation: 1e-3,
+        };
+
+        let hollow_id = offset_solid(
+            &mut model,
+            solid_id,
+            thickness,
+            vec![top_face_id],
+            options,
+        )
+        .expect("offset_solid must succeed");
+
+        let hollow = model.solids.get(hollow_id).expect("hollow").clone();
+        let hollow_shell = model
+            .shells
+            .get(hollow.outer_shell)
+            .expect("shell")
+            .clone();
+
+        // Build edge → faces adjacency over every face in the hollow
+        // shell. A manifold rim edge appears in exactly 2 of these.
+        let mut edge_to_faces: std::collections::HashMap<EdgeId, Vec<FaceId>> =
+            std::collections::HashMap::new();
+        for &face_id in &hollow_shell.faces {
+            let face = model.faces.get(face_id).expect("face");
+            let outer = model.loops.get(face.outer_loop).expect("outer loop");
+            for &edge_id in &outer.edges {
+                edge_to_faces.entry(edge_id).or_default().push(face_id);
+            }
+        }
+
+        // Locate the rim edges: both endpoints sit at z = +half_extent
+        // AND each endpoint sits on the inset square (|x| ≈ inset or
+        // |y| ≈ inset). The opening of a top-removed cube is a square
+        // with 4 such edges.
+        let mut rim_edges: Vec<(EdgeId, Vec<FaceId>)> = Vec::new();
+        for (&edge_id, faces) in &edge_to_faces {
+            let edge = model.edges.get(edge_id).expect("edge");
+            let s = model
+                .vertices
+                .get_position(edge.start_vertex)
+                .expect("start vertex position");
+            let e = model
+                .vertices
+                .get_position(edge.end_vertex)
+                .expect("end vertex position");
+            let on_top_plane =
+                (s[2] - half_extent).abs() < 1e-6 && (e[2] - half_extent).abs() < 1e-6;
+            if !on_top_plane {
+                continue;
+            }
+            let s_on_inset =
+                (s[0].abs() - inset).abs() < 1e-6 || (s[1].abs() - inset).abs() < 1e-6;
+            let e_on_inset =
+                (e[0].abs() - inset).abs() < 1e-6 || (e[1].abs() - inset).abs() < 1e-6;
+            if s_on_inset && e_on_inset {
+                rim_edges.push((edge_id, faces.clone()));
+            }
+        }
+
+        assert_eq!(
+            rim_edges.len(),
+            4,
+            "expected exactly 4 rim edges along the opening, found {}",
+            rim_edges.len()
+        );
+        for (edge_id, faces) in &rim_edges {
+            assert_eq!(
+                faces.len(),
+                2,
+                "rim edge {} must border exactly 2 faces \
+                 (wall + interior); found {}: {:?}. \
+                 If this is 1, walls and interior faces are using \
+                 separate edges at the rim and the shell is not \
+                 manifold along the opening (slice 42-C regression).",
+                edge_id,
+                faces.len(),
+                faces
+            );
+        }
     }
 
     /// `offset_solid` must emit a `RecordedOperation` so the timeline
