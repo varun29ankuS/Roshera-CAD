@@ -458,20 +458,37 @@ impl Shell {
             // Calculate surface area and volume (if closed)
             for &face_id in &self.faces {
                 if let Some(face) = face_store.get_mut(face_id) {
-                    let stats = face.compute_stats(
-                        loop_store,
-                        vertex_store,
-                        edge_store,
-                        curve_store,
-                        surface_store,
-                    )?;
+                    // `compute_stats` borrows the face mutably to populate
+                    // its cache; clone the stats out so we can re-borrow
+                    // the face immutably below for the outward normal.
+                    let stats = face
+                        .compute_stats(
+                            loop_store,
+                            vertex_store,
+                            edge_store,
+                            curve_store,
+                            surface_store,
+                        )?
+                        .clone();
 
                     total_area += stats.area;
 
-                    // Volume calculation using divergence theorem
+                    // Volume by Gauss / divergence theorem:
+                    //   V = (1/3) ∮ x⃗ · n̂ dA
+                    //     ≈ (1/3) Σ_faces (centroid · outward_normal) * area
+                    // (exact for planar faces, an O(curvature) approximation
+                    // for curved faces). Using `c · c` here was the source of
+                    // the regression — it accidentally gave the right answer
+                    // only when every face's outward normal happened to be
+                    // parallel to its centroid vector, which is never true
+                    // for a centred-at-origin axis-aligned box.
                     if self.shell_type == ShellType::Closed {
-                        let contribution =
-                            stats.centroid.to_vec().dot(&stats.centroid) * stats.area / 3.0;
+                        let u_mid = (face.uv_bounds[0] + face.uv_bounds[1]) * 0.5;
+                        let v_mid = (face.uv_bounds[2] + face.uv_bounds[3]) * 0.5;
+                        let outward_normal = face.normal_at(u_mid, v_mid, surface_store)?;
+                        let contribution = stats.centroid.to_vec().dot(&outward_normal)
+                            * stats.area
+                            / 3.0;
                         volume += contribution;
                         center += stats.centroid.to_vec() * stats.area;
                     }

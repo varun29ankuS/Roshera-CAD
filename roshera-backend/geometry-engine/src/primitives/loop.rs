@@ -251,19 +251,28 @@ impl Loop {
     ) -> MathResult<(f64, Point3)> {
         let n = vertices.len();
 
-        // Find best projection plane
+        // Pick the coordinate plane whose normal axis is closest to the
+        // loop's normal — this is the standard "drop the dominant
+        // component" trick that preserves planar area exactly. The
+        // dropped axis is recorded so we can lift the 2D centroid back
+        // to 3D using the loop vertices' shared coordinate along that
+        // axis (any planar polygon has a single value there modulo
+        // floating-point noise; we average over the vertices for
+        // robustness against curved-loop sampling).
         let abs_normal = normal.abs();
-        let (u_idx, v_idx) = if abs_normal.x > abs_normal.y && abs_normal.x > abs_normal.z {
-            (1, 2) // YZ plane
-        } else if abs_normal.y > abs_normal.z {
-            (0, 2) // XZ plane
-        } else {
-            (0, 1) // XY plane
-        };
+        let (u_idx, v_idx, dropped_idx) =
+            if abs_normal.x >= abs_normal.y && abs_normal.x >= abs_normal.z {
+                (1, 2, 0) // YZ plane (drop X)
+            } else if abs_normal.y >= abs_normal.z {
+                (0, 2, 1) // XZ plane (drop Y)
+            } else {
+                (0, 1, 2) // XY plane (drop Z)
+            };
 
         let mut area = 0.0;
         let mut cx = 0.0;
         let mut cy = 0.0;
+        let mut dropped_sum = 0.0;
 
         for i in 0..n {
             let v1 = vertex_store
@@ -275,6 +284,7 @@ impl Loop {
 
             let p1 = v1.position;
             let p2 = v2.position;
+            dropped_sum += p1[dropped_idx];
 
             let u1 = p1[u_idx];
             let v1 = p1[v_idx];
@@ -289,6 +299,7 @@ impl Loop {
 
         area *= 0.5;
         let area_abs = area.abs();
+        let dropped_avg = dropped_sum / n as f64;
 
         if area_abs < consts::EPSILON {
             // Degenerate loop, use simple average
@@ -307,22 +318,14 @@ impl Loop {
             cx /= 6.0 * area;
             cy /= 6.0 * area;
 
-            // Reconstruct 3D centroid
-            let mut centroid = Point3::new(0.0, 0.0, 0.0);
-            match u_idx {
-                0 => {
-                    centroid.x = cx;
-                    centroid.z = cy;
-                }
-                1 => {
-                    centroid.y = cx;
-                    centroid.z = cy;
-                }
-                _ => {
-                    centroid.x = cx;
-                    centroid.y = cy;
-                }
-            }
+            // Reconstruct 3D centroid: place the in-plane (cx, cy) on
+            // the (u_idx, v_idx) axes and the loop's shared
+            // dropped-axis value on the remaining one.
+            let mut coords = [0.0; 3];
+            coords[u_idx] = cx;
+            coords[v_idx] = cy;
+            coords[dropped_idx] = dropped_avg;
+            let centroid = Point3::new(coords[0], coords[1], coords[2]);
 
             Ok((area_abs, centroid))
         }
