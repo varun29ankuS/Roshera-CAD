@@ -1032,4 +1032,380 @@ mod tests {
         // Distance smaller than radius: still regular even on concave side.
         assert!(detect_offset_self_intersection(&arc, &toward_centre, 0.25).is_none());
     }
+
+    // ------------------------------------------------------------------
+    // Shell-op (offset_solid) tests.
+    //
+    // The wall-direction regression discussed in c39bfd6 / 71bdc1d /
+    // 8140327 boils down to a single observable invariant: walls erected
+    // at the boundary of a removed face must lie IN the plane of that
+    // face, not perpendicular to it. These tests check that invariant
+    // empirically against the real B-Rep produced by offset_solid, so a
+    // future direction regression cannot silently land.
+    // ------------------------------------------------------------------
+
+    use crate::operations::recorder::{
+        OperationRecorder, RecordedOperation, RecorderError,
+    };
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+    use std::sync::{Arc, Mutex};
+
+    /// Build a 10×10×10 box centred at the origin and locate the +Z
+    /// (top) face by surface normal. Returns (model, solid_id, top_face_id).
+    fn box_with_top_face() -> (BRepModel, SolidId, FaceId) {
+        let mut model = BRepModel::new();
+        let mut builder = TopologyBuilder::new(&mut model);
+        let solid_id = match builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("create_box_3d should succeed for positive dimensions")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("create_box_3d must return Solid, got {:?}", other),
+        };
+
+        // The +Z face is identified by surface normal ≈ (0,0,1) AND the
+        // face plane evaluating at +hd on Z. Iterating faces directly
+        // avoids depending on the box-face index ordering.
+        let solid = model.solids.get(solid_id).expect("solid must exist").clone();
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .expect("outer shell must exist")
+            .clone();
+        let mut top_face = None;
+        for &face_id in &shell.faces {
+            let face = model.faces.get(face_id).expect("face must exist");
+            let surface = model.surfaces.get(face.surface_id).expect("surface");
+            let n = surface
+                .normal_at(0.5, 0.5)
+                .expect("normal_at must succeed for a planar box face");
+            if (n.z - 1.0).abs() < 1e-9 && n.x.abs() < 1e-9 && n.y.abs() < 1e-9 {
+                top_face = Some(face_id);
+                break;
+            }
+        }
+        let top_face_id = top_face.expect("box must have exactly one +Z face");
+        (model, solid_id, top_face_id)
+    }
+
+    /// Collect the 3D positions of every distinct vertex referenced by
+    /// the outer loop of `face_id`. Walks the loop's edges, deduplicating
+    /// by VertexId.
+    fn loop_vertex_positions(model: &BRepModel, face_id: FaceId) -> Vec<Point3> {
+        let face = model.faces.get(face_id).expect("face");
+        let outer = model.loops.get(face.outer_loop).expect("outer loop");
+        let mut seen = std::collections::HashSet::new();
+        let mut positions = Vec::new();
+        for &edge_id in &outer.edges {
+            let edge = model.edges.get(edge_id).expect("edge");
+            for vid in [edge.start_vertex, edge.end_vertex] {
+                if seen.insert(vid) {
+                    let p = model
+                        .vertices
+                        .get_position(vid)
+                        .expect("vertex position");
+                    positions.push(Point3::new(p[0], p[1], p[2]));
+                }
+            }
+        }
+        positions
+    }
+
+    /// Walls erected at a removed face's boundary must be coplanar with
+    /// the removed face — every wall vertex sits on z = +hd for a top-
+    /// face-removed cube. The earlier (-removed_face_outward_normal)
+    /// formulation extruded walls to z = +hd - thickness instead, which
+    /// disconnected them from the inward-offset interior faces.
+    #[test]
+    fn shell_top_face_removed_walls_lie_in_removed_face_plane() {
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        let original_top_z = 5.0; // +hd for a 10x10x10 box centred at origin.
+        let thickness = 1.0;
+
+        let options = OffsetOptions {
+            common: CommonOptions {
+                // Skip post-shell validation: that path runs the full
+                // B-Rep validator, which has independent open work
+                // unrelated to the wall-direction invariant under test.
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            offset_type: OffsetType::Distance(thickness),
+            intersection_handling: IntersectionHandling::Trim,
+            max_deviation: 1e-3,
+        };
+
+        let hollow_id = offset_solid(
+            &mut model,
+            solid_id,
+            thickness,
+            vec![top_face_id],
+            options,
+        )
+        .expect("offset_solid on top-removed cube must succeed");
+
+        // Identify wall faces in the resulting hollow solid:
+        // - Their surface normal is parallel to the removed face's
+        //   normal (±Z), AND
+        // - Every vertex sits on z = +hd.
+        let hollow = model.solids.get(hollow_id).expect("hollow solid").clone();
+        let hollow_shell = model
+            .shells
+            .get(hollow.outer_shell)
+            .expect("hollow outer shell")
+            .clone();
+
+        let mut wall_count = 0usize;
+        for &face_id in &hollow_shell.faces {
+            let face = model.faces.get(face_id).expect("face");
+            let surface = model.surfaces.get(face.surface_id).expect("surface");
+            let n = surface
+                .normal_at(0.5, 0.5)
+                .expect("planar surface normal");
+            // Only consider faces parallel to the removed-face plane.
+            if !(n.x.abs() < 1e-6 && n.y.abs() < 1e-6 && (n.z.abs() - 1.0).abs() < 1e-6) {
+                continue;
+            }
+            let positions = loop_vertex_positions(&model, face_id);
+            // Detect by elevation: wall vertices all sit at z = +hd.
+            // Original bottom face / interior bottom offset face also
+            // satisfy the normal check but live at z = -hd or
+            // z = -hd + thickness.
+            let on_top_plane = positions
+                .iter()
+                .all(|p| (p.z - original_top_z).abs() < 1e-6);
+            if !on_top_plane {
+                continue;
+            }
+            wall_count += 1;
+            // Each wall is a quad — exactly 4 distinct vertices.
+            assert_eq!(
+                positions.len(),
+                4,
+                "wall face {} has {} vertices, expected 4",
+                face_id,
+                positions.len()
+            );
+        }
+
+        // Top face's outer loop has 4 edges → exactly 4 wall faces.
+        assert_eq!(
+            wall_count, 4,
+            "expected 4 wall faces in the plane of the removed top face, found {}",
+            wall_count
+        );
+    }
+
+    /// Walls' inner edges must coincide with the inward-offset side
+    /// faces' top edges so the new shell is manifold along the opening
+    /// rim. Concretely: every wall has two vertices at z=+hd that are
+    /// inset from the box boundary by exactly `thickness`. They must
+    /// match the top edges of the (now offset) side faces.
+    #[test]
+    fn shell_top_face_removed_walls_meet_inner_offset_at_inset_distance() {
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        let thickness = 1.0;
+        let half_extent = 5.0;
+
+        let options = OffsetOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            offset_type: OffsetType::Distance(thickness),
+            intersection_handling: IntersectionHandling::Trim,
+            max_deviation: 1e-3,
+        };
+
+        let hollow_id = offset_solid(
+            &mut model,
+            solid_id,
+            thickness,
+            vec![top_face_id],
+            options,
+        )
+        .expect("offset_solid must succeed");
+
+        let hollow = model.solids.get(hollow_id).expect("hollow").clone();
+        let hollow_shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
+
+        // For each wall face (recognised as in the previous test), the
+        // 4 corners split into two outer (on the cube boundary) and two
+        // inner (inset by `thickness`). Verify both pairs.
+        let mut walls_checked = 0usize;
+        for &face_id in &hollow_shell.faces {
+            let face = model.faces.get(face_id).expect("face");
+            let surface = model.surfaces.get(face.surface_id).expect("surface");
+            let n = surface.normal_at(0.5, 0.5).expect("normal");
+            if !(n.x.abs() < 1e-6 && n.y.abs() < 1e-6 && (n.z.abs() - 1.0).abs() < 1e-6) {
+                continue;
+            }
+            let positions = loop_vertex_positions(&model, face_id);
+            if !positions.iter().all(|p| (p.z - half_extent).abs() < 1e-6) {
+                continue;
+            }
+            // A vertex is "outer" iff it sits exactly on the cube
+            // boundary (|x| ≈ hw or |y| ≈ hh). Inner vertices have BOTH
+            // |x| < hw AND |y| < hh, inset by `thickness` along one of
+            // those axes.
+            let mut outer = 0;
+            let mut inner = 0;
+            for p in &positions {
+                let on_x_boundary = (p.x.abs() - half_extent).abs() < 1e-6;
+                let on_y_boundary = (p.y.abs() - half_extent).abs() < 1e-6;
+                if on_x_boundary || on_y_boundary {
+                    // Could be inner or outer depending on the other coord.
+                    // For an outer vertex of a wall edge, BOTH axes lie
+                    // on the original top-face rim; for an inner vertex,
+                    // exactly one axis is inset by thickness.
+                    let inset_x = (p.x.abs() - (half_extent - thickness)).abs() < 1e-6;
+                    let inset_y = (p.y.abs() - (half_extent - thickness)).abs() < 1e-6;
+                    if (on_x_boundary && inset_y) || (on_y_boundary && inset_x) {
+                        inner += 1;
+                    } else {
+                        outer += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                outer, 2,
+                "wall face {} should have 2 outer corners on the cube rim, got {}",
+                face_id, outer
+            );
+            assert_eq!(
+                inner, 2,
+                "wall face {} should have 2 inner corners inset by thickness, got {}",
+                face_id, inner
+            );
+            walls_checked += 1;
+        }
+
+        assert_eq!(walls_checked, 4, "expected to verify 4 walls");
+    }
+
+    /// `offset_solid` must emit a `RecordedOperation` so the timeline
+    /// can replay shell operations alongside booleans / extrudes /
+    /// fillets. Per CLAUDE.md every kernel entry point that mutates
+    /// topology records on success.
+    #[test]
+    fn shell_offset_solid_records_operation() {
+        #[derive(Debug, Default)]
+        struct CapturingRecorder(Mutex<Vec<RecordedOperation>>);
+        impl OperationRecorder for CapturingRecorder {
+            fn record(&self, op: RecordedOperation) -> Result<(), RecorderError> {
+                self.0
+                    .lock()
+                    .map_err(|e| RecorderError::Other(e.to_string()))?
+                    .push(op);
+                Ok(())
+            }
+        }
+
+        let recorder = Arc::new(CapturingRecorder::default());
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        model.attach_recorder(Some(recorder.clone()));
+
+        let _hollow_id = offset_solid(
+            &mut model,
+            solid_id,
+            1.0,
+            vec![top_face_id],
+            OffsetOptions {
+                common: CommonOptions {
+                    validate_result: false,
+                    ..CommonOptions::default()
+                },
+                offset_type: OffsetType::Distance(1.0),
+                intersection_handling: IntersectionHandling::Trim,
+                max_deviation: 1e-3,
+            },
+        )
+        .expect("offset_solid must succeed");
+
+        let recorded = recorder.0.lock().expect("recorder mutex").clone();
+        let shell_records: Vec<_> = recorded
+            .iter()
+            .filter(|op| op.kind == "offset_solid")
+            .collect();
+        assert_eq!(
+            shell_records.len(),
+            1,
+            "expected exactly one offset_solid recording, got {}: {:?}",
+            shell_records.len(),
+            recorded.iter().map(|r| &r.kind).collect::<Vec<_>>()
+        );
+        let rec = shell_records[0];
+        assert!(
+            rec.inputs.contains(&(solid_id as u64)),
+            "recording inputs must include the source solid"
+        );
+        assert!(
+            rec.inputs.contains(&(top_face_id as u64)),
+            "recording inputs must include the removed face"
+        );
+        assert_eq!(
+            rec.outputs.len(),
+            1,
+            "shell op produces a single output solid"
+        );
+    }
+
+    /// Negative thickness is rejected by `validate_shell_inputs`'s
+    /// |thickness| check — but that check uses `< 1e-10`, so a small
+    /// negative number close to zero must still be caught. Pin the
+    /// precondition.
+    #[test]
+    fn shell_rejects_zero_thickness() {
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        let result = offset_solid(
+            &mut model,
+            solid_id,
+            0.0,
+            vec![top_face_id],
+            OffsetOptions::default(),
+        );
+        assert!(result.is_err(), "zero thickness must be rejected");
+    }
+
+    /// Removing a face that doesn't belong to the solid's outer shell
+    /// must fail loudly — otherwise wall topology would point at edges
+    /// that aren't on the boundary loop, producing non-manifold output.
+    #[test]
+    fn shell_rejects_face_not_on_outer_shell() {
+        let (mut model, solid_id, _top) = box_with_top_face();
+        // Build a second box; use one of its faces as the "remove"
+        // target, which definitely isn't on the first solid's shell.
+        let mut builder2 = TopologyBuilder::new(&mut model);
+        let other_solid = match builder2.create_box_3d(2.0, 2.0, 2.0).expect("box2") {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let other_face = *model
+            .shells
+            .get(model.solids.get(other_solid).expect("solid").outer_shell)
+            .expect("shell")
+            .faces
+            .first()
+            .expect("at least one face");
+
+        let result = offset_solid(
+            &mut model,
+            solid_id,
+            0.5,
+            vec![other_face],
+            OffsetOptions {
+                common: CommonOptions {
+                    validate_result: false,
+                    ..CommonOptions::default()
+                },
+                offset_type: OffsetType::Distance(0.5),
+                intersection_handling: IntersectionHandling::Trim,
+                max_deviation: 1e-3,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "face from a different solid must not be accepted for removal"
+        );
+    }
 }
