@@ -1392,59 +1392,508 @@ impl Default for FaceStore {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_face_orientation() {
-//         assert_eq!(FaceOrientation::Forward.sign(), 1.0);
-//         assert_eq!(FaceOrientation::Backward.sign(), -1.0);
-//         assert_eq!(FaceOrientation::Forward.flipped(), FaceOrientation::Backward);
-//     }
-//
-//     #[test]
-//     fn test_face_creation() {
-//         let face = Face::new(0, 1, 2, FaceOrientation::Forward);
-//         assert_eq!(face.surface_id, 1);
-//         assert_eq!(face.outer_loop, 2);
-//         assert!(!face.has_holes());
-//         assert!(!face.is_trimmed());
-//     }
-//
-//     #[test]
-//     fn test_face_with_holes() {
-//         let mut face = Face::new(0, 1, 2, FaceOrientation::Forward);
-//         face.add_inner_loop(3);
-//         face.add_inner_loop(4);
-//
-//         assert!(face.has_holes());
-//         assert_eq!(face.inner_loops.len(), 2);
-//         assert_eq!(face.all_loops(), vec![2, 3, 4]);
-//     }
-//
-//     #[test]
-//     fn test_face_attributes() {
-//         let mut face = Face::new(0, 1, 2, FaceOrientation::Forward);
-//         face.attributes.color = Some([1.0, 0.0, 0.0, 1.0]);
-//         face.attributes.selected = true;
-//
-//         assert!(face.attributes.selected);
-//         assert_eq!(face.attributes.color, Some([1.0, 0.0, 0.0, 1.0]));
-//     }
-//
-//     #[test]
-//     fn test_face_adjacency() {
-//         let mut face1 = Face::new(0, 1, 2, FaceOrientation::Forward);
-//         let mut face2 = Face::new(1, 1, 3, FaceOrientation::Forward);
-//
-//         face1.add_adjacent(10, 1);
-//         face2.add_adjacent(10, 0);
-//
-//         assert_eq!(face1.adjacent_faces.get(&10), Some(&1));
-//         assert_eq!(face2.adjacent_faces.get(&10), Some(&0));
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::curve::ParameterRange;
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+
+    // ----- Fixture helpers -------------------------------------------------
+
+    /// Build a `(VertexStore, EdgeStore, LoopStore, LoopId)` tuple where the
+    /// loop is a closed polyline through the supplied 3D points. Edges share
+    /// curve_id = 0 (fine — `is_degenerate` only uses the vertex stream from
+    /// `Loop::vertices_cached`, which never reaches into the curve store).
+    fn build_polygon_loop(
+        points: &[[f64; 3]],
+    ) -> (VertexStore, EdgeStore, LoopStore, LoopId) {
+        let mut vertex_store = VertexStore::with_capacity(0);
+        let mut edge_store = EdgeStore::new();
+        let mut loop_store = LoopStore::new();
+
+        let tol = 1e-9;
+        let vids: Vec<_> = points
+            .iter()
+            .map(|p| vertex_store.add_or_find(p[0], p[1], p[2], tol))
+            .collect();
+
+        let mut loop_ = Loop::new(0, LoopType::Outer);
+        let n = vids.len();
+        for i in 0..n {
+            let start = vids[i];
+            let end = vids[(i + 1) % n];
+            let edge = Edge::new(
+                0,
+                start,
+                end,
+                0,
+                EdgeOrientation::Forward,
+                ParameterRange::unit(),
+            );
+            let eid = edge_store.add(edge);
+            loop_.add_edge(eid, true);
+        }
+        let lid = loop_store.add(loop_);
+        (vertex_store, edge_store, loop_store, lid)
+    }
+
+    // ----- FaceOrientation -------------------------------------------------
+
+    #[test]
+    fn orientation_is_forward_reports_correctly() {
+        assert!(FaceOrientation::Forward.is_forward());
+        assert!(!FaceOrientation::Backward.is_forward());
+    }
+
+    #[test]
+    fn orientation_sign_matches_direction() {
+        assert_eq!(FaceOrientation::Forward.sign(), 1.0);
+        assert_eq!(FaceOrientation::Backward.sign(), -1.0);
+    }
+
+    #[test]
+    fn orientation_flip_is_involutive() {
+        let f = FaceOrientation::Forward;
+        assert_eq!(f.flipped(), FaceOrientation::Backward);
+        assert_eq!(f.flipped().flipped(), f);
+    }
+
+    #[test]
+    fn orientation_equality_and_hash_value() {
+        // Eq + Hash derive — both variants are distinct keys.
+        let mut set = std::collections::HashSet::new();
+        set.insert(FaceOrientation::Forward);
+        set.insert(FaceOrientation::Backward);
+        set.insert(FaceOrientation::Forward); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    // ----- Defaults --------------------------------------------------------
+
+    #[test]
+    fn face_attributes_default_is_visible_unselected_uncoloured() {
+        let attr = FaceAttributes::default();
+        assert!(attr.color.is_none());
+        assert!(attr.material.is_none());
+        assert!(attr.layer.is_none());
+        assert!(!attr.selected);
+        assert!(attr.visible);
+        assert!(attr.user_data.is_none());
+    }
+
+    #[test]
+    fn tessellation_params_default_values() {
+        let p = TessellationParams::default();
+        assert_eq!(p.max_edge_length, 1.0);
+        assert!((p.max_normal_angle - 0.1).abs() < 1e-12);
+        assert_eq!(p.min_segments, 1);
+        assert_eq!(p.max_depth, 10);
+        assert!((p.uv_tolerance - 0.001).abs() < 1e-12);
+    }
+
+    // ----- Face construction & state mutation ------------------------------
+
+    #[test]
+    fn new_face_is_open_untrimmed_with_default_uv_bounds() {
+        let face = Face::new(0, 1, 2, FaceOrientation::Forward);
+        assert_eq!(face.id, 0);
+        assert_eq!(face.surface_id, 1);
+        assert_eq!(face.outer_loop, 2);
+        assert!(face.inner_loops.is_empty());
+        assert!(!face.has_holes());
+        assert!(!face.is_trimmed());
+        assert!(face.adjacent_faces.is_empty());
+        assert_eq!(face.uv_bounds, [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(face.tolerance, 1e-6);
+        assert_eq!(face.orientation, FaceOrientation::Forward);
+    }
+
+    #[test]
+    fn with_capacity_does_not_break_invariants() {
+        let face = Face::with_capacity(7, 1, 2, FaceOrientation::Backward, 32);
+        assert_eq!(face.id, 7);
+        assert_eq!(face.orientation, FaceOrientation::Backward);
+        // Capacity is an allocation hint; len must still be zero.
+        assert_eq!(face.inner_loops.len(), 0);
+        assert!(face.inner_loops.capacity() >= 32);
+    }
+
+    #[test]
+    fn set_get_tolerance_round_trip() {
+        let mut face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        face.set_tolerance(1e-9);
+        assert_eq!(face.get_tolerance(), 1e-9);
+    }
+
+    #[test]
+    fn add_inner_loop_marks_face_with_holes() {
+        let mut face = Face::new(0, 1, 2, FaceOrientation::Forward);
+        assert!(!face.has_holes());
+        face.add_inner_loop(3);
+        face.add_inner_loop(4);
+        assert!(face.has_holes());
+        assert_eq!(face.inner_loops, vec![3, 4]);
+    }
+
+    #[test]
+    fn all_loops_yields_outer_then_inner_in_order() {
+        let mut face = Face::new(0, 1, 10, FaceOrientation::Forward);
+        face.add_inner_loop(20);
+        face.add_inner_loop(30);
+        assert_eq!(face.all_loops(), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn add_trim_curve_marks_face_trimmed() {
+        let mut face = Face::new(0, 1, 2, FaceOrientation::Forward);
+        assert!(!face.is_trimmed());
+        face.add_trim_curve(TrimCurve {
+            curve_3d: None,
+            curve_2d: 0,
+            t_start: 0.0,
+            t_end: 1.0,
+            sense: true,
+        });
+        assert!(face.is_trimmed());
+        assert_eq!(face.trim_curves.len(), 1);
+    }
+
+    #[test]
+    fn set_uv_bounds_writes_through() {
+        let mut face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        face.set_uv_bounds(-1.0, 2.0, -3.0, 4.0);
+        assert_eq!(face.uv_bounds, [-1.0, 2.0, -3.0, 4.0]);
+    }
+
+    #[test]
+    fn add_adjacent_records_edge_to_face_mapping() {
+        let mut face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        face.add_adjacent(42, 11);
+        face.add_adjacent(43, 12);
+        assert_eq!(face.adjacent_faces.get(&42), Some(&11));
+        assert_eq!(face.adjacent_faces.get(&43), Some(&12));
+        assert_eq!(face.adjacent_faces.len(), 2);
+    }
+
+    #[test]
+    fn add_adjacent_overwrites_existing_edge_mapping() {
+        let mut face = Face::new(0, 0, 0, FaceOrientation::Forward);
+        face.add_adjacent(42, 11);
+        face.add_adjacent(42, 99); // same edge, new neighbour
+        assert_eq!(face.adjacent_faces.get(&42), Some(&99));
+        assert_eq!(face.adjacent_faces.len(), 1);
+    }
+
+    #[test]
+    fn reversed_flips_orientation_and_keeps_topology() {
+        let mut face = Face::new(7, 1, 2, FaceOrientation::Forward);
+        face.add_inner_loop(3);
+        let r = face.reversed();
+        assert_eq!(r.orientation, FaceOrientation::Backward);
+        assert_eq!(r.id, 7);
+        assert_eq!(r.surface_id, 1);
+        assert_eq!(r.outer_loop, 2);
+        assert_eq!(r.inner_loops, vec![3]);
+    }
+
+    #[test]
+    fn reversed_twice_is_original_orientation() {
+        let face = Face::new(0, 0, 0, FaceOrientation::Backward);
+        assert_eq!(face.reversed().reversed().orientation, face.orientation);
+    }
+
+    // ----- is_degenerate ---------------------------------------------------
+
+    #[test]
+    fn is_degenerate_when_outer_loop_missing() {
+        let vertex_store = VertexStore::with_capacity(0);
+        let edge_store = EdgeStore::new();
+        let loop_store = LoopStore::new();
+        // outer_loop = 99 not present in store -> degenerate
+        let face = Face::new(0, 0, 99, FaceOrientation::Forward);
+        assert!(face.is_degenerate(
+            &loop_store,
+            &edge_store,
+            &vertex_store,
+            Tolerance::default(),
+        ));
+    }
+
+    #[test]
+    fn is_degenerate_when_loop_has_two_distinct_vertices() {
+        // Two distinct points -> vertex_ids.len() < 3 after dedup -> degenerate.
+        let (v, e, l, lid) = build_polygon_loop(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        let face = Face::new(0, 0, lid, FaceOrientation::Forward);
+        assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
+    }
+
+    #[test]
+    fn is_degenerate_when_three_vertices_are_collinear() {
+        // Three points on the X axis -> Newell area magnitude ≈ 0.
+        let (v, e, l, lid) = build_polygon_loop(&[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ]);
+        let face = Face::new(0, 0, lid, FaceOrientation::Forward);
+        assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
+    }
+
+    #[test]
+    fn is_degenerate_when_three_vertices_are_a_sliver_under_tolerance() {
+        // Sliver triangle: two long edges of length 10 with the apex offset
+        // perpendicularly by 1e-15. Newell area = 0.5 · 10 · 1e-15 = 5e-15,
+        // which sits well below the default tol² = (1e-6)² = 1e-12.
+        let (v, e, l, lid) = build_polygon_loop(&[
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [5.0, 1e-15, 0.0],
+        ]);
+        let face = Face::new(0, 0, lid, FaceOrientation::Forward);
+        assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
+    }
+
+    #[test]
+    fn is_not_degenerate_for_unit_square() {
+        let (v, e, l, lid) = build_polygon_loop(&[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        let face = Face::new(0, 0, lid, FaceOrientation::Forward);
+        assert!(!face.is_degenerate(&l, &e, &v, Tolerance::default()));
+    }
+
+    #[test]
+    fn is_not_degenerate_for_tilted_planar_triangle() {
+        // Plane normal not aligned with any axis — Newell handles this.
+        let (v, e, l, lid) = build_polygon_loop(&[
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+        ]);
+        let face = Face::new(0, 0, lid, FaceOrientation::Forward);
+        assert!(!face.is_degenerate(&l, &e, &v, Tolerance::default()));
+    }
+
+    #[test]
+    fn is_degenerate_collapses_consecutive_duplicate_vertices() {
+        // Tolerance::default() distance is large enough that nearly-coincident
+        // points are collapsed; the residual loop has only 2 distinct points.
+        let (v, e, l, lid) = build_polygon_loop(&[
+            [0.0, 0.0, 0.0],
+            [1e-15, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ]);
+        let face = Face::new(0, 0, lid, FaceOrientation::Forward);
+        assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
+    }
+
+    // ----- FaceStore CRUD --------------------------------------------------
+
+    #[test]
+    fn store_new_is_empty() {
+        let store = FaceStore::new();
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn store_default_matches_new() {
+        let a = FaceStore::default();
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn store_with_capacity_is_empty_until_used() {
+        let store = FaceStore::with_capacity(64);
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn store_add_assigns_sequential_ids() {
+        let mut store = FaceStore::new();
+        let a = store.add(Face::new(999, 0, 0, FaceOrientation::Forward));
+        let b = store.add(Face::new(999, 0, 0, FaceOrientation::Forward));
+        let c = store.add(Face::new(999, 0, 0, FaceOrientation::Forward));
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(c, 2);
+        assert_eq!(store.len(), 3);
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn store_add_overwrites_supplied_id_with_assigned_id() {
+        let mut store = FaceStore::new();
+        let id = store.add(Face::new(42, 1, 2, FaceOrientation::Forward));
+        let face = store.get(id).expect("face just added");
+        assert_eq!(face.id, id);
+        assert_ne!(face.id, 42);
+    }
+
+    #[test]
+    fn store_add_increments_total_created_stat() {
+        let mut store = FaceStore::new();
+        store.add(Face::new(0, 0, 0, FaceOrientation::Forward));
+        store.add(Face::new(0, 0, 0, FaceOrientation::Forward));
+        assert_eq!(store.stats.total_created, 2);
+        assert_eq!(store.stats.total_deleted, 0);
+    }
+
+    #[test]
+    fn store_get_out_of_range_is_none() {
+        let store = FaceStore::new();
+        assert!(store.get(0).is_none());
+        assert!(store.get(99).is_none());
+    }
+
+    #[test]
+    fn store_get_mut_allows_field_mutation() {
+        let mut store = FaceStore::new();
+        let id = store.add(Face::new(0, 1, 2, FaceOrientation::Forward));
+        {
+            let f = store.get_mut(id).expect("face just added");
+            f.attributes.selected = true;
+        }
+        assert!(store.get(id).expect("face").attributes.selected);
+    }
+
+    #[test]
+    fn store_set_tolerance_returns_true_for_valid_id() {
+        let mut store = FaceStore::new();
+        let id = store.add(Face::new(0, 1, 2, FaceOrientation::Forward));
+        assert!(store.set_tolerance(id, 5e-7));
+        assert_eq!(store.get(id).expect("face").tolerance, 5e-7);
+    }
+
+    #[test]
+    fn store_set_tolerance_returns_false_for_missing_id() {
+        let mut store = FaceStore::new();
+        assert!(!store.set_tolerance(99, 1e-9));
+    }
+
+    #[test]
+    fn store_remove_returns_face_and_marks_slot_invalid() {
+        let mut store = FaceStore::new();
+        let id = store.add_with_indexing(Face::new(0, 1, 2, FaceOrientation::Forward));
+        let removed = store.remove(id);
+        assert!(removed.is_some());
+        // Slot is replaced with a sentinel; iter() must skip it.
+        assert_eq!(store.iter().count(), 0);
+        assert_eq!(store.stats.total_deleted, 1);
+    }
+
+    #[test]
+    fn store_remove_unknown_id_is_none() {
+        let mut store = FaceStore::new();
+        assert!(store.remove(99).is_none());
+        assert_eq!(store.stats.total_deleted, 0);
+    }
+
+    #[test]
+    fn store_remove_preserves_ids_of_other_faces() {
+        let mut store = FaceStore::new();
+        let a = store.add_with_indexing(Face::new(0, 1, 10, FaceOrientation::Forward));
+        let b = store.add_with_indexing(Face::new(0, 1, 11, FaceOrientation::Forward));
+        let c = store.add_with_indexing(Face::new(0, 1, 12, FaceOrientation::Forward));
+        store.remove(b);
+        // a and c keep their original ids — Vec is not compacted.
+        assert_eq!(store.get(a).expect("face a").outer_loop, 10);
+        assert_eq!(store.get(c).expect("face c").outer_loop, 12);
+        let live: Vec<_> = store.iter().map(|(id, _)| id).collect();
+        assert_eq!(live, vec![a, c]);
+    }
+
+    // ----- Surface / loop / adjacency queries ------------------------------
+
+    #[test]
+    fn faces_on_surface_finds_indexed_faces() {
+        let mut store = FaceStore::new();
+        let a = store.add_with_indexing(Face::new(0, 7, 1, FaceOrientation::Forward));
+        let _ = store.add_with_indexing(Face::new(0, 8, 2, FaceOrientation::Forward));
+        let c = store.add_with_indexing(Face::new(0, 7, 3, FaceOrientation::Forward));
+        let mut hits = store.faces_on_surface(7);
+        hits.sort_unstable();
+        assert_eq!(hits, vec![a, c]);
+    }
+
+    #[test]
+    fn faces_on_surface_is_empty_for_fast_path_adds() {
+        let mut store = FaceStore::new();
+        // `add` (fast path) deliberately skips index updates.
+        store.add(Face::new(0, 7, 1, FaceOrientation::Forward));
+        assert!(store.faces_on_surface(7).is_empty());
+    }
+
+    #[test]
+    fn faces_on_surface_unknown_surface_is_empty() {
+        let store = FaceStore::new();
+        assert!(store.faces_on_surface(123).is_empty());
+    }
+
+    #[test]
+    fn faces_with_loop_indexes_outer_and_inner_loops() {
+        let mut store = FaceStore::new();
+        let mut f = Face::new(0, 1, 100, FaceOrientation::Forward);
+        f.add_inner_loop(200);
+        f.add_inner_loop(201);
+        let id = store.add_with_indexing(f);
+        assert_eq!(store.faces_with_loop(100), vec![id]);
+        assert_eq!(store.faces_with_loop(200), vec![id]);
+        assert_eq!(store.faces_with_loop(201), vec![id]);
+        assert!(store.faces_with_loop(999).is_empty());
+    }
+
+    #[test]
+    fn iter_skips_removed_slots() {
+        let mut store = FaceStore::new();
+        let a = store.add_with_indexing(Face::new(0, 1, 10, FaceOrientation::Forward));
+        let b = store.add_with_indexing(Face::new(0, 1, 11, FaceOrientation::Forward));
+        let c = store.add_with_indexing(Face::new(0, 1, 12, FaceOrientation::Forward));
+        store.remove(a);
+        store.remove(c);
+        let live: Vec<_> = store.iter().map(|(id, _)| id).collect();
+        assert_eq!(live, vec![b]);
+    }
+
+    #[test]
+    fn find_adjacent_faces_returns_mutually_referenced_faces() {
+        let mut store = FaceStore::new();
+        let mut f0 = Face::new(0, 1, 10, FaceOrientation::Forward);
+        let mut f1 = Face::new(0, 1, 11, FaceOrientation::Forward);
+        // Edge 50 is shared. Each face records the *neighbour* keyed by the
+        // shared edge; find_adjacent_faces walks face0's neighbours and only
+        // returns those whose own neighbour map points back via the same edge.
+        f0.add_adjacent(50, 1);
+        f1.add_adjacent(50, 0);
+        let id0 = store.add_with_indexing(f0);
+        let id1 = store.add_with_indexing(f1);
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(store.find_adjacent_faces(0, 50), vec![1]);
+    }
+
+    #[test]
+    fn find_adjacent_faces_empty_when_no_back_reference() {
+        let mut store = FaceStore::new();
+        let mut f0 = Face::new(0, 1, 10, FaceOrientation::Forward);
+        let f1 = Face::new(0, 1, 11, FaceOrientation::Forward);
+        f0.add_adjacent(50, 1); // f1 has no reciprocal edge -> not adjacent
+        let _id0 = store.add_with_indexing(f0);
+        let _id1 = store.add_with_indexing(f1);
+        assert!(store.find_adjacent_faces(0, 50).is_empty());
+    }
+
+    #[test]
+    fn find_adjacent_faces_unknown_face_is_empty() {
+        let store = FaceStore::new();
+        assert!(store.find_adjacent_faces(99, 50).is_empty());
+    }
+}
 
 /// Validation result for faces
 #[derive(Debug, Clone)]
