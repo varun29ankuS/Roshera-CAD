@@ -40,11 +40,12 @@
 - ✅ **Arc-Arc Intersection** - Coplanar and 3D cases
 - ✅ **NURBS-Curve Intersection** - Newton-Raphson solver
 - ✅ **NURBS-Plane Intersection** - Subdivision approach
-- ✅ **Multiple NURBS Implementations**:
+- ✅ **NURBS Implementations**:
   - NurbsCurve (2D and 3D versions)
-  - NurbsSurface with derivatives
-  - BSplineSurface (1000+ lines)
+  - NurbsSurface with derivatives (math::nurbs)
   - Trimmed NURBS support
+  - Note: legacy `math::bspline_surface` (parallel BSplineSurface +
+    NurbsSurface) deleted 2026-05-07 as unused dead code.
 
 ### PHASE 4: OPERATIONS MODULE ✅ COMPLETE
 All operations implemented in timeline-engine/src/operations/:
