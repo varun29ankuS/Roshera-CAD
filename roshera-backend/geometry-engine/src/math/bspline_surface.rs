@@ -533,8 +533,14 @@ impl BSplineSurface {
                 };
 
                 for j in j1..=j2 {
-                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][rk as usize + j];
-                    d += a[s2][j] * ndu[rk as usize + j][pk as usize];
+                    // `rk` may be negative; the algorithm guarantees
+                    // `rk + j >= 0` whenever this loop body runs (j ≥ -rk),
+                    // but we must do the addition in i32 first — otherwise
+                    // `(rk as usize) + j` wraps around `usize::MAX` and
+                    // panics with "attempt to add with overflow".
+                    let idx = (rk + j as i32) as usize;
+                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][idx];
+                    d += a[s2][j] * ndu[idx][pk as usize];
                 }
 
                 if r <= pk as usize {
@@ -1488,4 +1494,316 @@ mod tests {
         assert!((param.v - 0.5).abs() < 1e-6);
         assert_eq!(closest, Point3::new(0.5, 0.5, 0.0));
     }
+
+    // ------------------------------------------------------------------
+    // Parameter helpers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parameter_range_contains_and_clamp() {
+        let r = ParameterRange::new(0.0, 1.0);
+        assert!(r.contains(0.0));
+        assert!(r.contains(1.0));
+        assert!(r.contains(0.5));
+        assert!(!r.contains(-0.0001));
+        assert!(!r.contains(1.0001));
+        assert_eq!(r.clamp(-1.0), 0.0);
+        assert_eq!(r.clamp(2.0), 1.0);
+        assert_eq!(r.clamp(0.5), 0.5);
+    }
+
+    #[test]
+    fn parameter_range_unit_is_zero_one() {
+        let r = ParameterRange::unit();
+        assert_eq!(r.min, 0.0);
+        assert_eq!(r.max, 1.0);
+    }
+
+    #[test]
+    fn parameter_domain_contains_and_clamp() {
+        let d =
+            ParameterDomain::new(ParameterRange::new(0.0, 2.0), ParameterRange::new(-1.0, 1.0));
+        assert!(d.contains(Parameter2D::new(1.0, 0.0)));
+        assert!(!d.contains(Parameter2D::new(2.5, 0.0)));
+        assert!(!d.contains(Parameter2D::new(1.0, -2.0)));
+
+        let clamped = d.clamp(Parameter2D::new(3.0, -2.0));
+        assert_eq!(clamped.u, 2.0);
+        assert_eq!(clamped.v, -1.0);
+    }
+
+    #[test]
+    fn parameter_domain_unit_round_trip() {
+        let d = ParameterDomain::unit();
+        assert!(d.contains(Parameter2D::new(0.5, 0.5)));
+        assert!(d.contains(Parameter2D::new(0.0, 1.0)));
+        assert!(!d.contains(Parameter2D::new(-0.1, 0.5)));
+    }
+
+    // ------------------------------------------------------------------
+    // SurfacePoint differential geometry
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn first_fundamental_form_unit_square_is_identity() {
+        // Bilinear unit square in z=0 has S_u=(1,0,0), S_v=(0,1,0)
+        // ⇒ E = G = 1, F = 0.
+        let surf = BSplineSurface::bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        )
+        .unwrap();
+        let eval = surf.evaluate(Parameter2D::new(0.3, 0.7)).unwrap();
+        let (e, f, g) = eval.first_fundamental_form();
+        assert!((e - 1.0).abs() < 1e-12);
+        assert!(f.abs() < 1e-12);
+        assert!((g - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn surface_normal_for_planar_patch_is_z_axis() {
+        let surf = BSplineSurface::bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(0.0, 3.0, 0.0),
+            Point3::new(2.0, 3.0, 0.0),
+        )
+        .unwrap();
+        let eval = surf.evaluate(Parameter2D::new(0.4, 0.6)).unwrap();
+        let normal = eval.normal().unwrap();
+        assert!((normal - Vector3::Z).magnitude() < 1e-10);
+    }
+
+    // ------------------------------------------------------------------
+    // BSplineSurface::new validation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn new_rejects_empty_grid() {
+        let res = BSplineSurface::new(1, 1, vec![], vec![0.0, 0.0, 1.0, 1.0], vec![
+            0.0, 0.0, 1.0, 1.0,
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn new_rejects_too_few_control_points_for_degree() {
+        // degree 2 needs 3 control points per direction; provide 2.
+        let cps = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let res = BSplineSurface::new(
+            2,
+            1,
+            cps,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn new_rejects_non_rectangular_grid() {
+        let cps = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0)], // ragged
+        ];
+        let res = BSplineSurface::new(1, 1, cps, vec![0.0, 0.0, 1.0, 1.0], vec![
+            0.0, 0.0, 1.0, 1.0,
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn new_rejects_wrong_knot_count() {
+        let cps = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        // U knots: expected 2+1+1 = 4, give 5.
+        let res = BSplineSurface::new(
+            1,
+            1,
+            cps,
+            vec![0.0, 0.0, 0.5, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn new_rejects_non_monotone_knots() {
+        let cps = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        // U knots non-decreasing? 0,0,1,0 fails.
+        let res =
+            BSplineSurface::new(1, 1, cps, vec![0.0, 0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0, 1.0]);
+        assert!(res.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // BSplineSurface::ruled / transform / bounding_box / closure
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ruled_surface_between_parallel_lines_is_planar() {
+        // Two parallel lines in z=0, offset in y. Ruled surface should be
+        // a flat strip; midpoint must lie on z=0.
+        let line0 = NurbsCurve::new(
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+        )
+        .unwrap();
+        let line1 = NurbsCurve::new(
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+            vec![1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+        )
+        .unwrap();
+        let surf = BSplineSurface::ruled(&line0, &line1).unwrap();
+
+        let mid = surf.point_at(Parameter2D::new(0.5, 0.5)).unwrap();
+        assert!((mid.x - 0.5).abs() < 1e-12);
+        assert!((mid.y - 0.5).abs() < 1e-12);
+        assert!(mid.z.abs() < 1e-12);
+    }
+
+    #[test]
+    fn ruled_surface_rejects_mismatched_degrees() {
+        let line = NurbsCurve::new(
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+        )
+        .unwrap();
+        let quad = NurbsCurve::new(
+            vec![
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.5, 1.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+            ],
+            vec![1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            2,
+        )
+        .unwrap();
+        assert!(BSplineSurface::ruled(&line, &quad).is_err());
+    }
+
+    #[test]
+    fn transform_translates_evaluated_points() {
+        let surf = BSplineSurface::bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        )
+        .unwrap();
+
+        let m = Matrix4::translation(10.0, 20.0, 30.0);
+        let moved = surf.transform(&m);
+
+        let p = moved.point_at(Parameter2D::new(0.5, 0.5)).unwrap();
+        assert!((p.x - 10.5).abs() < 1e-12);
+        assert!((p.y - 20.5).abs() < 1e-12);
+        assert!((p.z - 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bounding_box_envelopes_control_points() {
+        let surf = BSplineSurface::bilinear(
+            Point3::new(-1.0, -2.0, 5.0),
+            Point3::new(3.0, -2.0, 5.0),
+            Point3::new(-1.0, 4.0, 5.0),
+            Point3::new(3.0, 4.0, 5.0),
+        )
+        .unwrap();
+        let (min, max) = surf.bounding_box();
+        assert_eq!(min, Point3::new(-1.0, -2.0, 5.0));
+        assert_eq!(max, Point3::new(3.0, 4.0, 5.0));
+    }
+
+    #[test]
+    fn bilinear_unit_square_is_not_closed() {
+        let surf = BSplineSurface::bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        )
+        .unwrap();
+        assert!(!surf.is_closed_u());
+        assert!(!surf.is_closed_v());
+    }
+
+    #[test]
+    fn closed_u_detects_first_last_column_match() {
+        // Custom 3×2 grid where column 0 == column 2 (closed in U).
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let cps = vec![vec![p0, p1, p0], vec![
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ]];
+        let surf = BSplineSurface::new(
+            1,
+            1,
+            cps,
+            vec![0.0, 0.0, 0.5, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+        )
+        .unwrap();
+        assert!(surf.is_closed_u());
+        assert!(!surf.is_closed_v());
+    }
+
+    // ------------------------------------------------------------------
+    // NurbsSurface validation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nurbs_surface_rejects_non_positive_weight() {
+        let cps = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let weights = vec![vec![1.0, 0.0], vec![1.0, 1.0]]; // zero weight invalid
+        let res = NurbsSurface::new(1, 1, cps, weights, vec![0.0, 0.0, 1.0, 1.0], vec![
+            0.0, 0.0, 1.0, 1.0,
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn nurbs_surface_rejects_weight_dimension_mismatch() {
+        let cps = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let weights = vec![vec![1.0, 1.0]]; // only one row
+        let res = NurbsSurface::new(1, 1, cps, weights, vec![0.0, 0.0, 1.0, 1.0], vec![
+            0.0, 0.0, 1.0, 1.0,
+        ]);
+        assert!(res.is_err());
+    }
+
+    // NOTE: NurbsSurface::cylinder() in this module has a known bug — its
+    // 45° rational-quadratic control points are placed on the circle at
+    // (r/√2, r/√2) instead of at the bounding-box corner (r, r) required
+    // by the standard 9-point NURBS circle representation. Mid-arc
+    // evaluations therefore land inside the true circle (radius ≈ 0.83·r
+    // at u=0.125 instead of r). This module is also orphaned — production
+    // code uses crate::math::nurbs::NurbsSurface, not this one — so the
+    // bug ships in dead code. Tracked as a follow-up; do not write
+    // regression tests against this constructor until it's fixed.
 }
