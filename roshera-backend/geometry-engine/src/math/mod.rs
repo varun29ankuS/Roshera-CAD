@@ -30,7 +30,6 @@ pub mod vector2;
 
 // Advanced curve/surface mathematics
 pub mod bspline;
-pub mod bspline_surface;
 pub mod continuity_analysis;
 pub mod nurbs;
 pub mod surface_intersection;
