@@ -68,6 +68,7 @@ pub fn dispatch_tool_call(tool_use: &ToolUseBlock) -> Result<DispatchResult, Pro
         "revolve" => dispatch_operation("revolve", input),
         "chamfer" => dispatch_operation("chamfer", input),
         "fillet" => dispatch_operation("fillet", input),
+        "shell" => dispatch_operation("shell", input),
 
         // --- Queries ---
         "query_geometry" => dispatch_query("query_geometry", input),
@@ -83,7 +84,8 @@ pub fn dispatch_tool_call(tool_use: &ToolUseBlock) -> Result<DispatchResult, Pro
             "Unknown tool: '{}'. Available tools depend on the active tier. \
              Core tools: create_box, create_cylinder, create_sphere, create_cone, \
              create_torus, boolean_union, boolean_difference, boolean_intersection, \
-             transform_object, query_geometry, export_stl, \
+             transform_object, extrude, revolve, chamfer, fillet, shell, \
+             query_geometry, export_stl, \
              create_datum_plane, create_datum_axis, create_datum_point",
             name
         ))),

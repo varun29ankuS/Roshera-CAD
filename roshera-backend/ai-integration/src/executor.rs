@@ -1,7 +1,11 @@
 use dashmap::DashMap;
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+use geometry_engine::operations::offset::{
+    offset_solid, IntersectionHandling, OffsetOptions, OffsetType,
+};
 use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+use geometry_engine::primitives::face::FaceId;
 /// Command executor that bridges AI commands to geometry engine
 ///
 /// # Design Rationale
@@ -92,6 +96,11 @@ impl CommandExecutor {
                 self.boolean_difference(object_a, object_b).await
             }
             Command::Transform { object, transform } => self.transform(object, transform).await,
+            Command::Shell {
+                object,
+                faces_to_remove,
+                thickness,
+            } => self.shell(object, faces_to_remove, thickness).await,
             _ => Err(ExecutorError::NotImplemented(format!("{:?}", command))),
         }
     }
@@ -402,6 +411,75 @@ impl CommandExecutor {
         Ok(object)
     }
 
+    /// Hollow a solid into a shell of constant wall thickness.
+    ///
+    /// `faces_to_remove` are the kernel `FaceId`s of the faces that should be
+    /// opened up to expose the interior cavity (e.g., the top face of a box
+    /// to make an open-top container). `thickness` is the wall thickness in
+    /// model units; pass a positive value — the kernel offsets inward.
+    ///
+    /// # Design Rationale
+    /// - **Why spawn_blocking**: The shell op runs face-by-face surface
+    ///   offsets, builds wall faces at each removed-face boundary, and
+    ///   re-validates the resulting solid; CPU-heavy enough to keep off
+    ///   the async runtime.
+    /// - **Why a fresh GeometryId**: `offset_solid` adds a new hollow solid
+    ///   to the model; the original solid is left in place but is no
+    ///   longer referenced by the executor's id_map (mirroring the
+    ///   boolean op's "result is a new entity" convention).
+    /// - **Performance**: O(faces) for surface offset + O(rim edges) for
+    ///   wall construction; sub-100 ms for typical primitives.
+    async fn shell(
+        &mut self,
+        object: GeometryId,
+        faces_to_remove: Vec<u32>,
+        thickness: f64,
+    ) -> Result<GeometryId, ExecutorError> {
+        if !thickness.is_finite() || thickness.abs() < 1e-9 {
+            return Err(ExecutorError::InvalidParameters(format!(
+                "Shell thickness must be a non-zero finite number, got {thickness}"
+            )));
+        }
+
+        let solid_id = self.get_solid_id(&object)?;
+        let face_ids: Vec<FaceId> = faces_to_remove;
+
+        let model_clone = Arc::clone(&self.model);
+        let thickness_for_options = thickness.abs();
+        let result_solid_id = tokio::task::spawn_blocking(move || {
+            let options = OffsetOptions {
+                offset_type: OffsetType::Distance(thickness_for_options),
+                intersection_handling: IntersectionHandling::Trim,
+                ..OffsetOptions::default()
+            };
+            let mut model = model_clone.blocking_write();
+            offset_solid(
+                &mut model,
+                solid_id,
+                thickness_for_options,
+                face_ids,
+                options,
+            )
+            .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
+        })
+        .await
+        .map_err(|e| ExecutorError::GeometryError(format!("Task join error: {}", e)))??;
+
+        let geometry_id = self.generate_geometry_id();
+        self.id_map.insert(geometry_id.clone(), result_solid_id);
+        self.solid_to_geometry
+            .insert(result_solid_id, geometry_id.clone());
+
+        tracing::info!(
+            "Shell {:?} (thickness={}) -> {:?}",
+            object,
+            thickness,
+            geometry_id
+        );
+
+        Ok(geometry_id)
+    }
+
     /// Get solid ID from geometry ID
     fn get_solid_id(&self, geometry_id: &GeometryId) -> Result<SolidId, ExecutorError> {
         self.id_map
@@ -476,6 +554,54 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ExecutorError::InvalidParameters(_))));
+    }
+
+    #[tokio::test]
+    async fn test_shell_rejects_zero_thickness() {
+        let mut executor = CommandExecutor::new();
+        let id = executor
+            .execute(Command::CreateBox {
+                width: 10.0,
+                height: 10.0,
+                depth: 10.0,
+            })
+            .await
+            .expect("box creation should succeed");
+
+        // Zero / NaN thickness must be rejected at the executor boundary
+        // before reaching the kernel — surfacing a clean InvalidParameters
+        // error to the agent rather than a kernel-side InvalidGeometry.
+        let zero = executor
+            .execute(Command::Shell {
+                object: id.clone(),
+                faces_to_remove: vec![],
+                thickness: 0.0,
+            })
+            .await;
+        assert!(matches!(zero, Err(ExecutorError::InvalidParameters(_))));
+
+        let nan = executor
+            .execute(Command::Shell {
+                object: id,
+                faces_to_remove: vec![],
+                thickness: f64::NAN,
+            })
+            .await;
+        assert!(matches!(nan, Err(ExecutorError::InvalidParameters(_))));
+    }
+
+    #[tokio::test]
+    async fn test_shell_unknown_object_errors() {
+        let mut executor = CommandExecutor::new();
+        let bogus = GeometryId(Uuid::new_v4());
+        let result = executor
+            .execute(Command::Shell {
+                object: bogus,
+                faces_to_remove: vec![],
+                thickness: 1.0,
+            })
+            .await;
+        assert!(matches!(result, Err(ExecutorError::ObjectNotFound(_))));
     }
 
     #[tokio::test]

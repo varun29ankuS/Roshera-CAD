@@ -1009,6 +1009,198 @@ async fn boolean_operation(
     })))
 }
 
+/// POST /api/geometry/shell — hollow a solid with constant wall
+/// thickness. The faces in `faces_to_remove` are opened up to expose
+/// the interior cavity (e.g., the top face of a box to make an
+/// open-top container).
+///
+/// Request:
+/// ```json
+/// { "object":          "<uuid>",
+///   "thickness":       1.0,
+///   "faces_to_remove": [face_id_u32, ...]   // optional; defaults to []
+/// }
+/// ```
+///
+/// Response mirrors `boolean_operation`: a new UUID + tessellated
+/// mesh for the hollow solid, with the source UUID dropped from the
+/// id-mapping table and broadcast as deleted (the agent / UI sees
+/// the hollow solid replacing the original).
+async fn shell_solid(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::offset::{
+        offset_solid as kernel_offset_solid, IntersectionHandling, OffsetOptions, OffsetType,
+    };
+    use geometry_engine::primitives::face::FaceId;
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let object_uuid_str = payload
+        .get("object")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'object' is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+
+    let thickness = payload
+        .get("thickness")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("thickness"))?;
+    if !thickness.is_finite() || thickness.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'thickness' must be a non-zero finite number, got {thickness}"
+            ),
+        ));
+    }
+
+    // `faces_to_remove` is optional — an empty list yields a fully closed
+    // hollow solid (useful for material-property analysis but rarely the
+    // user intent). Validate every entry is a non-negative integer that
+    // fits in u32; surface garbage early as 400 rather than letting it
+    // reach the kernel as an out-of-range FaceId.
+    let mut faces_to_remove: Vec<FaceId> = Vec::new();
+    if let Some(arr) = payload.get("faces_to_remove") {
+        let list = arr.as_array().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                "'faces_to_remove' must be a JSON array of face ids".to_string(),
+            )
+        })?;
+        for (i, item) in list.iter().enumerate() {
+            let n = item.as_u64().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "'faces_to_remove[{i}]' must be a non-negative integer, got {item}"
+                    ),
+                )
+            })?;
+            if n > u32::MAX as u64 {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'faces_to_remove[{i}]'={n} exceeds u32::MAX"),
+                ));
+            }
+            faces_to_remove.push(n as FaceId);
+        }
+    }
+
+    let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object={object_uuid}"),
+        )
+    })?;
+
+    // Hold the model write lock only for the kernel shell op — same
+    // pattern as boolean_operation. Tessellation runs under read.
+    let thickness_abs = thickness.abs();
+    let result_solid_id = {
+        let mut model = state.model.write().await;
+        kernel_offset_solid(
+            &mut model,
+            solid_id,
+            thickness_abs,
+            faces_to_remove,
+            OffsetOptions {
+                offset_type: OffsetType::Distance(thickness_abs),
+                intersection_handling: IntersectionHandling::Trim,
+                ..OffsetOptions::default()
+            },
+        )
+        .map_err(ApiError::kernel_error)?
+        // model write guard drops here
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+        // model read guard drops here
+    };
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    // The shell op leaves the source solid in the model but the user's
+    // intent is to replace it with the hollow version (matching how
+    // SolidWorks / Fusion expose Shell as an in-place modify). Drop
+    // the source UUID from the mapping and broadcast its deletion so
+    // the viewport sees the hollow solid in place of the original.
+    state.unregister_id_mapping(&object_uuid);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let display_name = format!("Shell {}", result_solid_id);
+    let parameters = serde_json::json!({
+        "thickness": thickness_abs,
+        "source": object_uuid.to_string(),
+    });
+
+    broadcast_object_deleted(&object_uuid.to_string());
+    broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        result_solid_id,
+        "shell",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "consumed": [object_uuid.to_string()],
+        "object": {
+            "id":         result_id_str,
+            "name":       display_name,
+            "objectType": "shell",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":   tri_mesh.vertices.len(),
+            "triangle_count": tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 /// POST /api/geometry/extrude — sketch a closed planar polygon and
 /// extrude it into a solid in one shot.
 ///
@@ -3517,6 +3709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/boolean", post(boolean_operation))
         .route("/api/geometry/extrude", post(create_extrude))
         .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
+        .route("/api/geometry/shell", post(shell_solid))
         // 2D sketch sessions — backend-owned source of truth for the
         // click-to-place workflow. Frontend creates a session, streams
         // points / plane / tool changes through the REST surface, and
