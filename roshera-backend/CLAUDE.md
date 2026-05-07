@@ -133,14 +133,16 @@ or any other local-inference crate. Do not add them.
 
 ## Module reality check (verified 2026-04-30)
 
-`geometry-engine/src/math/` (24 files): includes `vector3.rs`,
-`vector2.rs`, `matrix4.rs`, `quaternion.rs`, `bspline.rs`, `nurbs.rs`,
-`bspline_surface.rs`, `trimmed_nurbs.rs`, `surface_intersection.rs`,
+`geometry-engine/src/math/`: includes `vector3.rs`, `vector2.rs`,
+`matrix4.rs`, `quaternion.rs`, `bspline.rs`, `nurbs.rs`,
+`trimmed_nurbs.rs`, `surface_intersection.rs`,
 `surface_plane_intersection.rs`, `linear_solver.rs`, `tolerance.rs`,
 plus tests and benches under `test_math/`. NurbsCurve has been
 consolidated (math layer = pure numerical, primitives layer =
 trait-object dispatch); see memory entry "NurbsCurve Consolidation
-(#13)".
+(#13)". The orphaned `bspline_surface.rs` was deleted (1809 LoC
+of unused B-Spline/NURBS surface math; production uses
+`math::nurbs::NurbsSurface`).
 
 `geometry-engine/src/primitives/`: full B-Rep with `VertexStore`,
 `EdgeStore`, `LoopStore`, `FaceStore`, `ShellStore`, `SolidStore`. T-Splines
