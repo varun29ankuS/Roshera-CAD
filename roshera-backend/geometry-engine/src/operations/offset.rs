@@ -164,6 +164,24 @@ pub fn offset_solid(
         validate_shell_solid(model, hollow_id)?;
     }
 
+    // Record for attached recorders so the timeline can replay shell
+    // operations alongside extrudes / booleans / fillets.
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("offset_solid")
+            .with_parameters(serde_json::json!({
+                "solid_id": solid_id,
+                "thickness": thickness,
+                "faces_to_remove": faces_to_remove,
+                "max_deviation": options.max_deviation,
+            }))
+            .with_inputs(
+                std::iter::once(solid_id as u64)
+                    .chain(faces_to_remove.iter().map(|&f| f as u64))
+                    .collect(),
+            )
+            .with_outputs(vec![hollow_id as u64]),
+    );
+
     Ok(hollow_id)
 }
 
@@ -560,10 +578,34 @@ fn create_shell_walls(
             .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
             .clone();
 
+        // Compute the removed face's outward normal — the wall offset
+        // direction is `-thickness * outward_normal` so walls hang inward
+        // (matching the inward direction used by the interior offset
+        // faces). Using a global-axis cross product as in the previous
+        // implementation produced walls perpendicular to the wrong plane
+        // for any face that wasn't axis-aligned.
+        let removed_surface = model
+            .surfaces
+            .get(face.surface_id)
+            .ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "create_shell_walls: surface {} of removed face {} not found",
+                    face.surface_id, face_id
+                ))
+            })?;
+        let mut removed_normal = removed_surface.normal_at(0.5, 0.5)?;
+        if matches!(
+            face.orientation,
+            crate::primitives::face::FaceOrientation::Backward
+        ) {
+            removed_normal = -removed_normal;
+        }
+
         // Create wall face for each edge
         for (i, &edge_id) in loop_data.edges.iter().enumerate() {
             let forward = loop_data.orientations[i];
-            let wall_face = create_wall_face(model, edge_id, thickness, forward)?;
+            let wall_face =
+                create_wall_face(model, edge_id, thickness, forward, removed_normal)?;
             wall_faces.push(wall_face);
         }
     }
@@ -571,12 +613,18 @@ fn create_shell_walls(
     Ok(wall_faces)
 }
 
-/// Create a wall face between outer and inner edges
+/// Create a wall face between outer and inner edges.
+///
+/// `removed_face_outward_normal` is the outward normal of the face being
+/// removed (i.e., the opening). Walls extend along `-thickness *
+/// outward_normal` so they meet the inward-offset interior faces in a
+/// coplanar fashion at the boundary loop.
 fn create_wall_face(
     model: &mut BRepModel,
     outer_edge_id: EdgeId,
     thickness: f64,
     forward: bool,
+    removed_face_outward_normal: Vector3,
 ) -> OperationResult<FaceId> {
     use crate::primitives::curve::Line;
     use crate::primitives::edge::EdgeOrientation;
@@ -602,11 +650,11 @@ fn create_wall_face(
     let p1 = Vector3::new(p1_arr[0], p1_arr[1], p1_arr[2]);
     let p2 = Vector3::new(p2_arr[0], p2_arr[1], p2_arr[2]);
 
-    // Compute offset direction from edge geometry. The mid-parameter
-    // evaluation acts as a sanity check: a well-formed edge must have its
-    // curve mid-point lie on the segment between the two stored vertex
-    // positions. If they diverge, the edge's curve is inconsistent with
-    // its vertices and we should refuse to build a wall on top of it.
+    // Validate the edge's curve is consistent with its endpoints: the
+    // curve mid-point must lie on the segment between the stored vertex
+    // positions. A drift here means the curve and vertices disagree;
+    // building a wall on inconsistent geometry would silently corrupt
+    // the result.
     let edge_curve = model
         .curves
         .get(outer_edge.curve_id)
@@ -626,18 +674,21 @@ fn create_wall_face(
         )));
     }
     let edge_dir = (p2 - p1).normalize()?;
-    // Use a default inward direction perpendicular to edge
-    let offset_dir = if edge_dir.cross(&Vector3::Z).magnitude_squared() > 1e-6 {
-        edge_dir.cross(&Vector3::Z).normalize()?
-    } else {
-        edge_dir.cross(&Vector3::Y).normalize()?
-    };
 
-    let offset = offset_dir * (-thickness.abs());
+    // Wall offset direction is the inward direction of the removed face:
+    // the face whose plane the wall hangs from points outward, so the
+    // wall extends opposite that normal by `thickness`. This produces a
+    // wall perpendicular to the removed-face plane and parallel to the
+    // edge — independent of the global coordinate frame.
+    let offset_dir = (-removed_face_outward_normal).normalize()?;
+
+    let offset = offset_dir * thickness.abs();
     let p3 = p2 + offset;
     let p4 = p1 + offset;
 
-    // Create the planar surface through the four corners
+    // Create the planar surface through the four corners. The wall
+    // normal must be perpendicular to both the edge direction and the
+    // wall's depth direction.
     let wall_normal = edge_dir.cross(&offset_dir).normalize()?;
     let wall_surface = Plane::from_point_normal(p1, wall_normal)?;
     let surface_id = model.surfaces.add(Box::new(wall_surface));
