@@ -107,7 +107,13 @@ impl fmt::Display for ShapeClassification {
 ///
 /// Walks the B-Rep topology, computes mass properties, classifies surface types,
 /// recognizes features, and produces a structured summary.
-pub fn summarize_solid(solid_id: u32, model: &BRepModel) -> MathResult<GeometrySummary> {
+///
+/// Takes `&mut BRepModel` because the mass-property calls
+/// (`calculate_solid_volume`, `calculate_solid_surface_area`) drive
+/// `Solid::compute_mass_properties` which populates per-entity caches
+/// on the solid, shell, face and loop stores. Subsequent calls hit
+/// the cache.
+pub fn summarize_solid(solid_id: u32, model: &mut BRepModel) -> MathResult<GeometrySummary> {
     let solid = model.solids.get(solid_id).ok_or_else(|| {
         crate::math::MathError::InvalidParameter(format!("Solid {} not found", solid_id))
     })?;
@@ -505,7 +511,7 @@ mod tests {
         let mut model = BRepModel::new();
         let solid_id = make_box(&mut model, 50.0, 30.0, 20.0);
 
-        let summary = summarize_solid(solid_id, &model).unwrap();
+        let summary = summarize_solid(solid_id, &mut model).unwrap();
 
         assert_eq!(summary.topology.faces, 6);
         assert_eq!(summary.topology.edges, 12);
@@ -535,7 +541,7 @@ mod tests {
         let mut model = BRepModel::new();
         let solid_id = make_cylinder(&mut model, 10.0, 30.0);
 
-        let summary = summarize_solid(solid_id, &model).unwrap();
+        let summary = summarize_solid(solid_id, &mut model).unwrap();
 
         // Cylinder primitive creates segmented topology (default 16 segments)
         // so it has planar caps + multiple cylindrical side faces
@@ -573,7 +579,7 @@ mod tests {
         let mut model = BRepModel::new();
         let solid_id = make_sphere(&mut model, 15.0);
 
-        let summary = summarize_solid(solid_id, &model).unwrap();
+        let summary = summarize_solid(solid_id, &mut model).unwrap();
 
         let sphere_count: usize = summary
             .surface_types
@@ -593,7 +599,7 @@ mod tests {
         let mut model = BRepModel::new();
         let solid_id = make_box(&mut model, 100.0, 100.0, 50.0);
 
-        let summary = summarize_solid(solid_id, &model).unwrap();
+        let summary = summarize_solid(solid_id, &mut model).unwrap();
         let text = summary.to_llm_text();
 
         assert!(text.contains("6 faces"));
@@ -608,7 +614,7 @@ mod tests {
         let mut model = BRepModel::new();
         let solid_id = make_box(&mut model, 20.0, 20.0, 20.0);
 
-        let summary = summarize_solid(solid_id, &model).unwrap();
+        let summary = summarize_solid(solid_id, &mut model).unwrap();
         let json = summary.to_json();
 
         assert!(json.is_object());

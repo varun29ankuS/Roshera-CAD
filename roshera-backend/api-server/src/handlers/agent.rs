@@ -77,11 +77,17 @@ pub async fn list_parts(
 
 /// `GET /api/agent/parts/{id}` — full agent-facing report for a single
 /// part. `404` when the id is unknown or the solid is degenerate.
+///
+/// Cache-warming on first call — takes a write lock because the kernel
+/// drives `Solid::compute_mass_properties` to populate the cached
+/// volume / surface-area / centre-of-mass figures stamped into the
+/// returned [`PartReport`]. Subsequent calls hit the per-solid cache.
+/// Same pattern as `part_mass_properties`.
 pub async fn query_part(
     State(state): State<AppState>,
     Path(id): Path<SolidId>,
 ) -> Result<Json<PartReport>, StatusCode> {
-    let model = state.model.read().await;
+    let mut model = state.model.write().await;
     model
         .query_part(id)
         .map(Json)
