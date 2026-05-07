@@ -427,8 +427,14 @@ fn compute_variable_rolling_ball_positions(
     Ok(data)
 }
 
-/// Create a function-based radius fillet by sampling the radius function along the edge
-/// and creating a variable-radius fillet from the start and end radii
+/// Create a function-based radius fillet.
+///
+/// The radius function `r(t)` is sampled along the edge parameter; the
+/// resulting profile drives the rolling-ball construction directly so
+/// arbitrary radius variation (linear, quadratic, sigmoid, polyline,
+/// any user-supplied closure) is honored exactly. If the function is
+/// near-constant within 1% relative tolerance, this collapses to the
+/// constant-radius fast path for the cylindrical/toroidal patches.
 fn create_function_radius_fillet(
     model: &mut BRepModel,
     edge_id: EdgeId,
@@ -436,42 +442,148 @@ fn create_function_radius_fillet(
     face2_id: FaceId,
     radius_fn: &Box<dyn Fn(f64) -> f64>,
 ) -> OperationResult<FaceId> {
-    // Sample the radius function at start and end of the edge
-    let r_start = radius_fn(0.0);
-    let r_end = radius_fn(1.0);
-
-    if r_start <= 0.0 || r_end <= 0.0 {
-        return Err(OperationError::InvalidGeometry(
-            "Radius function must return positive values".into(),
-        ));
-    }
-
-    // Use the average radius to create a constant-radius fillet as approximation
-    // For a production implementation, this would create a VariableRadiusFillet surface
-    // with the full radius profile sampled at multiple points
-    let avg_radius = (r_start + r_end) / 2.0;
-
-    // Sample multiple points to check the function is well-behaved
-    let num_samples = 10;
-    for i in 0..=num_samples {
-        let t = i as f64 / num_samples as f64;
+    // Validate the function over the full edge parameter at the same
+    // density used by the rolling-ball construction — we don't want
+    // to discover a non-finite radius midway through surface assembly.
+    const NUM_SAMPLES: usize = 20;
+    let mut radii = Vec::with_capacity(NUM_SAMPLES + 1);
+    for i in 0..=NUM_SAMPLES {
+        let t = i as f64 / NUM_SAMPLES as f64;
         let r = radius_fn(t);
-        if r <= 0.0 || !r.is_finite() {
+        if !r.is_finite() || r <= 0.0 {
             return Err(OperationError::InvalidGeometry(format!(
-                "Radius function returned invalid value {} at t={}",
+                "Radius function returned invalid value {} at t={:.3}",
                 r, t
             )));
         }
+        radii.push(r);
     }
 
-    // If start and end radii are similar, use constant radius for efficiency
-    if (r_start - r_end).abs() / r_start.max(r_end) < 0.01 {
-        return create_constant_radius_fillet(model, edge_id, face1_id, face2_id, avg_radius);
+    // Constant-radius shortcut: if every sample lies within 1% of the
+    // mean, the cylindrical/toroidal exact path is faster and produces
+    // a smaller (and analytically simpler) surface than the NURBS path.
+    let r_mean = radii.iter().copied().sum::<f64>() / radii.len() as f64;
+    let r_max_dev = radii
+        .iter()
+        .map(|r| (r - r_mean).abs())
+        .fold(0.0_f64, f64::max);
+    if r_mean > 0.0 && r_max_dev / r_mean < 0.01 {
+        return create_constant_radius_fillet(model, edge_id, face1_id, face2_id, r_mean);
     }
 
-    // For variable radius, compute fillet data and create the surface
-    // Use the start radius as primary (variable radius is handled by the surface itself)
-    create_constant_radius_fillet(model, edge_id, face1_id, face2_id, avg_radius)
+    // Variable path: build rolling-ball data using the function-derived
+    // radii directly, then route through the same NURBS surface
+    // construction the start/end variant uses.
+    let edge = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+        .clone();
+    let rolling_ball_data =
+        compute_function_rolling_ball_positions(model, &edge, face1_id, face2_id, &radii)?;
+    let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
+    let surface_id = model.surfaces.add(fillet_surface);
+
+    let (trim_curve1, trim_curve2) =
+        compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
+
+    create_trimmed_fillet_face(model, surface_id, edge_id, trim_curve1, trim_curve2)
+}
+
+/// Build rolling-ball data using a caller-supplied per-sample radius
+/// profile. Identical geometry as `compute_variable_rolling_ball_positions`
+/// but with arbitrary radii instead of linear interpolation between
+/// start/end.
+fn compute_function_rolling_ball_positions(
+    model: &BRepModel,
+    edge: &Edge,
+    face1_id: FaceId,
+    face2_id: FaceId,
+    radii: &[f64],
+) -> OperationResult<RollingBallData> {
+    let num_samples = radii.len() - 1;
+    let mut data = RollingBallData {
+        centers: Vec::with_capacity(radii.len()),
+        contacts1: Vec::with_capacity(radii.len()),
+        contacts2: Vec::with_capacity(radii.len()),
+        parameters: Vec::with_capacity(radii.len()),
+        radii: Vec::with_capacity(radii.len()),
+    };
+
+    let face1 = model
+        .faces
+        .get(face1_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face1 not found".to_string()))?;
+    let face2 = model
+        .faces
+        .get(face2_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
+    let surface1 = model
+        .surfaces
+        .get(face1.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
+    let surface2 = model
+        .surfaces
+        .get(face2.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;
+
+    for (i, &radius) in radii.iter().enumerate() {
+        let t = i as f64 / num_samples as f64;
+        data.parameters.push(t);
+        data.radii.push(radius);
+
+        let edge_point = edge.evaluate(t, &model.curves)?;
+        edge.tangent_at(t, &model.curves)?;
+
+        let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
+        let normal2 = get_surface_normal_at_point(surface2, &edge_point)?;
+
+        let bisector = (normal1 + normal2).normalize().map_err(|e| {
+            OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
+        })?;
+        let dot_product = normal1.dot(&normal2);
+        let offset_direction = if dot_product < 0.0 {
+            -bisector
+        } else {
+            bisector
+        };
+
+        let fillet_center = edge_point + offset_direction * radius;
+        data.centers.push(fillet_center);
+        data.contacts1.push(fillet_center - normal1 * radius);
+        data.contacts2.push(fillet_center - normal2 * radius);
+    }
+
+    Ok(data)
+}
+
+/// Resample an arbitrary-length radius array onto a fixed `target_len`
+/// uniform grid via linear interpolation. Required because the
+/// rolling-ball pipeline samples 21 points (`0..=20`) but the
+/// `VariableRadiusFillet` surface uses 20 control points in u —
+/// without resampling the surface and the trimming data drift apart.
+fn resample_radii_uniform(radii: &[f64], target_len: usize) -> Vec<f64> {
+    if radii.is_empty() || target_len == 0 {
+        return Vec::new();
+    }
+    if radii.len() == target_len {
+        return radii.to_vec();
+    }
+    let mut out = Vec::with_capacity(target_len);
+    let last = radii.len() - 1;
+    for j in 0..target_len {
+        // Map j ∈ [0, target_len-1] → s ∈ [0, last]
+        let s = if target_len == 1 {
+            0.0
+        } else {
+            j as f64 * (last as f64) / (target_len - 1) as f64
+        };
+        let i = (s.floor() as usize).min(last);
+        let i_next = (i + 1).min(last);
+        let frac = s - i as f64;
+        out.push(radii[i] * (1.0 - frac) + radii[i_next] * frac);
+    }
+    out
 }
 
 /// Create a chord length fillet
@@ -797,11 +909,15 @@ fn create_nurbs_fillet_surface(data: &RollingBallData) -> OperationResult<Box<dy
     let contact1 = create_curve_from_points(&data.contacts1)?;
     let contact2 = create_curve_from_points(&data.contacts2)?;
 
-    // Get start and end radii
-    let radius_start = data.radii.first().copied().unwrap_or(1.0);
-    let radius_end = data.radii.last().copied().unwrap_or(1.0);
+    // Resample the rolling-ball radii onto the surface's u-sampling
+    // density (20). The previous implementation collapsed the entire
+    // radius profile to its endpoints — `VariableRadiusFillet::new`
+    // would then linearly interpolate, discarding any non-linear
+    // variation the caller had provided. `with_radius_profile` honors
+    // every sample independently.
+    let resampled_radii = resample_radii_uniform(&data.radii, 20);
 
-    let fillet = VariableRadiusFillet::new(spine, radius_start, radius_end, contact1, contact2)
+    let fillet = VariableRadiusFillet::with_radius_profile(spine, resampled_radii, contact1, contact2)
         .map_err(|e| {
             OperationError::NumericalError(format!(
                 "Failed to create variable radius fillet: {:?}",
@@ -2439,6 +2555,51 @@ mod tests {
         let result =
             propagate_edge_selection(&model, vec![e1], PropagationMode::None).expect("propagate");
         assert_eq!(result, vec![e1]);
+    }
+
+    // -------------------------------------------------------------------
+    // resample_radii_uniform — variable-radius profile resampling
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resample_radii_uniform_preserves_endpoints() {
+        let radii = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let resampled = resample_radii_uniform(&radii, 20);
+        assert_eq!(resampled.len(), 20);
+        assert!((resampled[0] - 1.0).abs() < 1e-12);
+        assert!((resampled[19] - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resample_radii_uniform_linear_profile_stays_linear() {
+        // r(t) = 1 + 9t over t ∈ [0, 1] sampled at 21 points
+        let radii: Vec<f64> = (0..=20).map(|i| 1.0 + 9.0 * (i as f64 / 20.0)).collect();
+        let resampled = resample_radii_uniform(&radii, 20);
+        for (j, r) in resampled.iter().enumerate() {
+            // Map j ∈ [0, 19] → t ∈ [0, 1]
+            let t = j as f64 / 19.0;
+            let expected = 1.0 + 9.0 * t;
+            assert!(
+                (r - expected).abs() < 1e-9,
+                "resample[{}]={} expected {}",
+                j,
+                r,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn resample_radii_uniform_identity_when_lengths_match() {
+        let radii = vec![1.0, 2.5, 4.0, 0.5, 3.0];
+        let resampled = resample_radii_uniform(&radii, 5);
+        assert_eq!(resampled, radii);
+    }
+
+    #[test]
+    fn resample_radii_uniform_handles_empty_input() {
+        let resampled = resample_radii_uniform(&[], 20);
+        assert!(resampled.is_empty());
     }
 }
 

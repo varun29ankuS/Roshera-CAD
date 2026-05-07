@@ -1073,6 +1073,101 @@ impl VariableRadiusFillet {
             contact2,
         })
     }
+
+    /// Construct a variable-radius fillet from an explicit per-sample
+    /// radius profile. Unlike `new`, which linearly interpolates between
+    /// `radius_start` and `radius_end`, this constructor honors every
+    /// sample independently — supporting arbitrary radius variation
+    /// (linear, quadratic, user-defined function, polyline, etc.).
+    ///
+    /// `radii.len()` must equal the internal u-sampling density (20).
+    /// The caller is responsible for sampling their radius profile to
+    /// that density; helpers in `operations::fillet` resample edges to
+    /// match.
+    pub fn with_radius_profile(
+        spine: Box<dyn Curve>,
+        radii: Vec<f64>,
+        contact1: Box<dyn Curve>,
+        contact2: Box<dyn Curve>,
+    ) -> MathResult<Self> {
+        const NUM_U: usize = 20;
+        const NUM_V: usize = 5;
+
+        if radii.len() != NUM_U {
+            return Err(MathError::InvalidParameter(format!(
+                "VariableRadiusFillet::with_radius_profile expected {} radius samples, got {}",
+                NUM_U,
+                radii.len()
+            )));
+        }
+        for (i, &r) in radii.iter().enumerate() {
+            if !r.is_finite() || r <= 0.0 {
+                return Err(MathError::InvalidParameter(format!(
+                    "VariableRadiusFillet::with_radius_profile: radius[{}]={} is not positive-finite",
+                    i, r
+                )));
+            }
+        }
+
+        let mut control_points = vec![vec![Point3::ZERO; NUM_V]; NUM_U];
+        let weights = vec![vec![1.0; NUM_V]; NUM_U];
+
+        for i in 0..NUM_U {
+            let u = i as f64 / (NUM_U - 1) as f64;
+            let spine_point = spine.evaluate(u)?.position;
+            let spine_tangent = spine.tangent_at(u)?;
+            // Honor the caller-supplied radius for this sample exactly.
+            let radius = radii[i];
+
+            let z_axis = spine_tangent.normalize().unwrap_or(Vector3::Z);
+            let c1_point = contact1.evaluate(u)?.position;
+            let c2_point = contact2.evaluate(u)?.position;
+            let raw_x = c1_point - spine_point;
+            let x_in_plane = raw_x - z_axis * raw_x.dot(&z_axis);
+            let x_axis = x_in_plane.normalize().unwrap_or_else(|_| {
+                if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
+                    z_axis.cross(&Vector3::X).normalize().unwrap_or(Vector3::X)
+                } else {
+                    z_axis.cross(&Vector3::Y).normalize().unwrap_or(Vector3::Y)
+                }
+            });
+            let y_axis = z_axis.cross(&x_axis);
+
+            let raw_y = c2_point - spine_point;
+            let y_in_plane = raw_y - z_axis * raw_y.dot(&z_axis);
+            let cos_sweep =
+                (x_axis.dot(&y_in_plane) / y_in_plane.magnitude().max(1e-12)).clamp(-1.0, 1.0);
+            let sweep = cos_sweep.acos().clamp(1e-6, std::f64::consts::PI);
+
+            for j in 0..NUM_V {
+                let v = j as f64 / (NUM_V - 1) as f64;
+                let angle = v * sweep;
+                let radial = x_axis * angle.cos() + y_axis * angle.sin();
+                control_points[i][j] = spine_point + radial * radius;
+            }
+        }
+
+        let knot_u = KnotVector::uniform(3, NUM_U);
+        let knot_v = KnotVector::uniform(2, NUM_V);
+
+        let nurbs = NurbsSurface::new(
+            control_points,
+            weights,
+            knot_u.values().to_vec(),
+            knot_v.values().to_vec(),
+            3,
+            2,
+        )
+        .map_err(|e| MathError::InvalidParameter(e.to_string()))?;
+
+        Ok(Self {
+            nurbs,
+            spine,
+            radius_samples: radii,
+            contact1,
+            contact2,
+        })
+    }
 }
 
 impl Surface for VariableRadiusFillet {
