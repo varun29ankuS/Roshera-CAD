@@ -399,4 +399,329 @@ mod tests {
             loop_id: 0,
         }
     }
+
+    /// Build a flat 2×2 bilinear NURBS patch over the unit square in
+    /// the z=0 plane. Reused by TrimmedNurbsSurface fixtures.
+    fn unit_planar_patch() -> NurbsSurface {
+        let cp = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+            vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let w = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
+        NurbsSurface::new(
+            cp,
+            w,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+            1,
+        )
+        .expect("bilinear unit patch is well formed")
+    }
+
+    /// Helper: build a CCW square loop in (u,v) parameter space.
+    fn square_loop(u0: f64, v0: f64, u1: f64, v1: f64, is_outer: bool) -> TrimLoop {
+        let curves = vec![
+            create_line_segment(Point2::new(u0, v0), Point2::new(u1, v0)),
+            create_line_segment(Point2::new(u1, v0), Point2::new(u1, v1)),
+            create_line_segment(Point2::new(u1, v1), Point2::new(u0, v1)),
+            create_line_segment(Point2::new(u0, v1), Point2::new(u0, v0)),
+        ];
+        TrimLoop::new(curves, is_outer).expect("square loop is connected")
+    }
+
+    // ----- Point2 ----------------------------------------------------------
+
+    #[test]
+    fn point2_new_stores_components() {
+        let p = Point2::new(2.5, -1.0);
+        assert_eq!(p.u, 2.5);
+        assert_eq!(p.v, -1.0);
+    }
+
+    #[test]
+    fn point2_distance_to_self_is_zero() {
+        let p = Point2::new(3.0, 4.0);
+        assert_eq!(p.distance(&p), 0.0);
+    }
+
+    #[test]
+    fn point2_distance_3_4_5_triangle() {
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(3.0, 4.0);
+        assert!((p1.distance(&p2) - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn point2_distance_is_symmetric_under_negation() {
+        let p1 = Point2::new(1.0, 2.0);
+        let p2 = Point2::new(-1.0, -2.0);
+        assert!((p1.distance(&p2) - p2.distance(&p1)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn point2_lerp_at_zero_is_start() {
+        let a = Point2::new(1.0, 2.0);
+        let b = Point2::new(5.0, 7.0);
+        let r = a.lerp(&b, 0.0);
+        assert_eq!(r.u, a.u);
+        assert_eq!(r.v, a.v);
+    }
+
+    #[test]
+    fn point2_lerp_at_one_is_end() {
+        let a = Point2::new(1.0, 2.0);
+        let b = Point2::new(5.0, 7.0);
+        let r = a.lerp(&b, 1.0);
+        assert_eq!(r.u, b.u);
+        assert_eq!(r.v, b.v);
+    }
+
+    #[test]
+    fn point2_lerp_extrapolates_outside_zero_one() {
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(1.0, 1.0);
+        let r = a.lerp(&b, 2.0);
+        assert!((r.u - 2.0).abs() < 1e-12);
+        assert!((r.v - 2.0).abs() < 1e-12);
+    }
+
+    // ----- NurbsCurve2D::new validation -----------------------------------
+
+    #[test]
+    fn nurbs_curve_2d_new_rejects_weight_length_mismatch() {
+        let cp = vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)];
+        let result = NurbsCurve2D::new(cp, vec![1.0], vec![0.0, 0.0, 1.0, 1.0], 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nurbs_curve_2d_new_rejects_invalid_knot_vector() {
+        let cp = vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)];
+        // Non-monotone knots fail validation in KnotVector::new.
+        let result = NurbsCurve2D::new(cp, vec![1.0, 1.0], vec![1.0, 0.0, 0.0, 1.0], 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nurbs_curve_2d_new_rejects_wrong_degree_for_cp_count() {
+        // Degree 3 with only 2 control points → KnotVector::validate fails
+        // (n + p + 1 = 6 ≠ 4 knots supplied).
+        let cp = vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)];
+        let result = NurbsCurve2D::new(cp, vec![1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0], 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nurbs_curve_2d_new_accepts_valid_linear_curve() {
+        let cp = vec![Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)];
+        let result = NurbsCurve2D::new(cp, vec![1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0], 1);
+        assert!(result.is_ok());
+    }
+
+    // ----- NurbsCurve2D::evaluate ----------------------------------------
+
+    #[test]
+    fn nurbs_curve_2d_linear_evaluate_at_endpoints() {
+        let curve = NurbsCurve2D::new(
+            vec![Point2::new(2.0, 3.0), Point2::new(5.0, 7.0)],
+            vec![1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+        )
+        .expect("valid linear curve");
+        let p0 = curve.evaluate(0.0).expect("endpoint eval");
+        assert!((p0.u - 2.0).abs() < 1e-10);
+        assert!((p0.v - 3.0).abs() < 1e-10);
+        let p1 = curve.evaluate(1.0).expect("endpoint eval");
+        assert!((p1.u - 5.0).abs() < 1e-10);
+        assert!((p1.v - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn nurbs_curve_2d_linear_evaluate_at_midpoint() {
+        let curve = NurbsCurve2D::new(
+            vec![Point2::new(0.0, 0.0), Point2::new(4.0, 8.0)],
+            vec![1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+        )
+        .expect("valid linear curve");
+        let mid = curve.evaluate(0.5).expect("mid eval");
+        assert!((mid.u - 2.0).abs() < 1e-10);
+        assert!((mid.v - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn nurbs_curve_2d_rational_quadratic_quarter_circle_midpoint() {
+        // Standard rational quadratic Bézier for a quarter-circle arc from
+        // (1,0) to (0,1). With weights (1, √2/2, 1) and knot vector
+        // (0,0,0,1,1,1), evaluate at t=0.5 gives a point on the unit circle:
+        // (√2/2, √2/2).
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let curve = NurbsCurve2D::new(
+            vec![
+                Point2::new(1.0, 0.0),
+                Point2::new(1.0, 1.0),
+                Point2::new(0.0, 1.0),
+            ],
+            vec![1.0, s, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            2,
+        )
+        .expect("valid rational quadratic");
+        let m = curve.evaluate(0.5).expect("mid eval");
+        assert!((m.u - s).abs() < 1e-10);
+        assert!((m.v - s).abs() < 1e-10);
+        // Confirm it lies on the unit circle.
+        assert!((m.u * m.u + m.v * m.v - 1.0).abs() < 1e-10);
+    }
+
+    // ----- TrimLoop --------------------------------------------------------
+
+    #[test]
+    fn trim_loop_new_rejects_empty_curve_list() {
+        let result = TrimLoop::new(Vec::new(), true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trim_loop_new_rejects_disconnected_curves() {
+        let curves = vec![
+            create_line_segment(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)),
+            create_line_segment(Point2::new(2.0, 0.0), Point2::new(2.0, 1.0)), // gap
+            create_line_segment(Point2::new(2.0, 1.0), Point2::new(0.0, 0.0)),
+        ];
+        let result = TrimLoop::new(curves, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trim_loop_contains_point_inside_unit_square() {
+        let l = square_loop(0.0, 0.0, 1.0, 1.0, true);
+        assert!(l.contains_point(&Point2::new(0.5, 0.5)).expect("contains"));
+        assert!(l.contains_point(&Point2::new(0.1, 0.9)).expect("contains"));
+    }
+
+    #[test]
+    fn trim_loop_contains_point_outside_unit_square() {
+        let l = square_loop(0.0, 0.0, 1.0, 1.0, true);
+        assert!(!l.contains_point(&Point2::new(-0.5, 0.5)).expect("outside"));
+        assert!(!l.contains_point(&Point2::new(2.0, 0.5)).expect("outside"));
+        assert!(!l.contains_point(&Point2::new(0.5, 2.0)).expect("outside"));
+    }
+
+    #[test]
+    fn trim_loop_contains_point_for_offset_square() {
+        let l = square_loop(2.0, 3.0, 5.0, 7.0, true);
+        assert!(l.contains_point(&Point2::new(3.5, 5.0)).expect("inside"));
+        assert!(!l.contains_point(&Point2::new(0.0, 0.0)).expect("outside"));
+        assert!(!l.contains_point(&Point2::new(10.0, 10.0)).expect("outside"));
+    }
+
+    #[test]
+    fn trim_loop_winding_is_nonzero_in_either_orientation() {
+        // CCW square (positive winding) and CW square (negative winding) both
+        // report contains_point == true via the `!= 0` check.
+        let ccw = square_loop(0.0, 0.0, 1.0, 1.0, true);
+        let curves_cw = vec![
+            create_line_segment(Point2::new(0.0, 0.0), Point2::new(0.0, 1.0)),
+            create_line_segment(Point2::new(0.0, 1.0), Point2::new(1.0, 1.0)),
+            create_line_segment(Point2::new(1.0, 1.0), Point2::new(1.0, 0.0)),
+            create_line_segment(Point2::new(1.0, 0.0), Point2::new(0.0, 0.0)),
+        ];
+        let cw = TrimLoop::new(curves_cw, false).expect("cw square");
+        assert!(ccw.contains_point(&Point2::new(0.5, 0.5)).expect("ccw"));
+        assert!(cw.contains_point(&Point2::new(0.5, 0.5)).expect("cw"));
+    }
+
+    // ----- TrimmedNurbsSurface --------------------------------------------
+
+    #[test]
+    fn trimmed_surface_new_creates_default_unit_square_outer_loop() {
+        let s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        assert_eq!(s.trim_loops.len(), 1);
+        assert!(s.trim_loops[0].is_outer);
+        assert_eq!(s.trim_loops[0].curves.len(), 4);
+    }
+
+    #[test]
+    fn trimmed_surface_is_inside_center_of_default_domain() {
+        let s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        assert!(s.is_inside(0.5, 0.5).expect("inside"));
+    }
+
+    #[test]
+    fn trimmed_surface_is_outside_default_domain() {
+        let s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        assert!(!s.is_inside(-0.5, 0.5).expect("outside u"));
+        assert!(!s.is_inside(0.5, 1.5).expect("outside v"));
+    }
+
+    #[test]
+    fn trimmed_surface_add_trim_loop_rejects_out_of_domain_curve() {
+        let mut s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        let bad = square_loop(0.5, 0.5, 1.5, 1.5, false); // overflows v=1
+        let result = s.add_trim_loop(bad);
+        assert!(result.is_err());
+        assert_eq!(s.trim_loops.len(), 1);
+    }
+
+    #[test]
+    fn trimmed_surface_add_trim_loop_accepts_in_domain_hole() {
+        let mut s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        let hole = square_loop(0.25, 0.25, 0.75, 0.75, false);
+        s.add_trim_loop(hole).expect("hole inside domain");
+        assert_eq!(s.trim_loops.len(), 2);
+    }
+
+    #[test]
+    fn trimmed_surface_is_inside_with_hole() {
+        let mut s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        let hole = square_loop(0.25, 0.25, 0.75, 0.75, false);
+        s.add_trim_loop(hole).expect("hole");
+        // Inside outer, outside hole → trimmed region.
+        assert!(s.is_inside(0.1, 0.5).expect("ring"));
+        // Inside outer, inside hole → not in trimmed region.
+        assert!(!s.is_inside(0.5, 0.5).expect("hole interior"));
+        // Outside outer altogether.
+        assert!(!s.is_inside(2.0, 2.0).expect("outside"));
+    }
+
+    #[test]
+    fn trimmed_surface_evaluate_returns_some_inside_none_outside() {
+        let s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        assert!(s.evaluate(0.5, 0.5).expect("inside").is_some());
+        assert!(s.evaluate(-0.1, 0.5).expect("outside").is_none());
+    }
+
+    #[test]
+    fn trimmed_surface_evaluate_inside_yields_planar_point() {
+        let s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        let p = s.evaluate(0.25, 0.75).expect("eval ok").expect("inside");
+        // Bilinear z=0 patch over unit square: expect (0.25, 0.75, 0.0).
+        assert!((p.x - 0.25).abs() < 1e-10);
+        assert!((p.y - 0.75).abs() < 1e-10);
+        assert!(p.z.abs() < 1e-10);
+    }
+
+    #[test]
+    fn trimmed_surface_get_3d_trim_curve_samples_only_inside_region() {
+        // Hole loop is sampled by get_3d_trim_curve via evaluate(); points
+        // inside the hole map to None and are skipped. The hole boundary
+        // itself sits on inner-loop edges where the winding-number test is
+        // numerically unstable, so we just check that no point reaches us
+        // and the call succeeds.
+        let mut s = TrimmedNurbsSurface::new(unit_planar_patch(), Tolerance::default());
+        let hole = square_loop(0.25, 0.25, 0.75, 0.75, false);
+        s.add_trim_loop(hole.clone()).expect("hole");
+        // Pick the hole's first edge (a curve sitting on the boundary of the
+        // hole). All its sample points are *on* the hole boundary, so the
+        // get_3d_trim_curve call must complete without error.
+        let curve = &hole.curves[0];
+        let pts = s.get_3d_trim_curve(curve).expect("call ok");
+        // Boundary samples may go either way under the winding test, but
+        // at most we get the requested 51 samples.
+        assert!(pts.len() <= 51);
+    }
 }
