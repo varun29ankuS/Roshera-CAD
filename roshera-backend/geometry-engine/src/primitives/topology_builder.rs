@@ -1177,133 +1177,59 @@ impl BRepModel {
         self.solids.get(id)
     }
 
-    /// Calculate exact volume of a solid using divergence theorem
-    /// Volume = (1/3) ∫∫ (r · n) dS where r is position vector, n is outward normal
-    pub fn calculate_solid_volume(&self, solid_id: u32) -> Option<f64> {
-        let solid = self.solids.get(solid_id)?;
-        let shell = self.shells.get(solid.outer_shell)?;
-
-        let mut total_volume = 0.0;
-
-        // Process each face in the shell
-        for &face_id in &shell.faces {
-            let face = self.faces.get(face_id)?;
-            let outer_loop = self.loops.get(face.outer_loop)?;
-
-            // Get vertices of the face
-            let mut vertices = Vec::new();
-            for &edge_id in &outer_loop.edges {
-                let edge = self.edges.get(edge_id)?;
-                if let Some(vertex) = self.vertices.get(edge.start_vertex) {
-                    vertices.push(vertex.point());
-                }
-            }
-
-            if vertices.len() < 3 {
-                continue;
-            }
-
-            // Triangulate the face and compute volume contribution
-            // Using divergence theorem: V = (1/3) ∫∫ r·n dS
-            let _origin = Point3::ORIGIN;
-            for i in 1..vertices.len() - 1 {
-                let v0 = vertices[0];
-                let v1 = vertices[i];
-                let v2 = vertices[i + 1];
-
-                // Calculate triangle normal (outward pointing)
-                let edge1 = v1 - v0;
-                let edge2 = v2 - v0;
-                let _normal = edge1.cross(&edge2);
-
-                // Volume of tetrahedron formed by triangle and origin
-                // V = (1/6) |v0 · (v1 × v2)|
-                let volume_contribution = v0.dot(&(v1.cross(&v2))) / 6.0;
-
-                // Account for face orientation
-                let oriented_volume =
-                    if face.orientation == crate::primitives::face::FaceOrientation::Forward {
-                        volume_contribution
-                    } else {
-                        -volume_contribution
-                    };
-
-                total_volume += oriented_volume;
-            }
-        }
-
-        // Subtract volumes of inner shells (voids)
-        for &inner_shell_id in &solid.inner_shells {
-            if let Some(inner_volume) = self.calculate_shell_volume(inner_shell_id) {
-                total_volume -= inner_volume;
-            }
-        }
-
-        Some(total_volume.abs())
+    /// Calculate exact volume of a solid via the divergence-theorem
+    /// integral implemented on [`crate::primitives::solid::Solid::compute_mass_properties`].
+    ///
+    /// Delegates to the canonical mass-properties pipeline so volume,
+    /// surface area, centre of mass and inertia all come from the same
+    /// kernel state and never disagree. The previous in-method polyhedral
+    /// edge-walk only handled flat polygonal faces with enumerated
+    /// edge-loop vertices and silently returned `0` for spheres,
+    /// cylinders, cones, tori and any other curved-surface geometry —
+    /// it also under-counted boxes when face orientation tags differed
+    /// from outward winding (Task #49).
+    ///
+    /// Takes `&mut self` because `compute_mass_properties` populates
+    /// per-entity caches on the solid, shell, face and loop stores on
+    /// first call. Subsequent calls hit the cache and are free.
+    pub fn calculate_solid_volume(&mut self, solid_id: u32) -> Option<f64> {
+        Some(self.compute_solid_mass_properties(solid_id)?.volume)
     }
 
-    /// Calculate volume contribution of a shell
-    fn calculate_shell_volume(&self, shell_id: u32) -> Option<f64> {
-        let shell = self.shells.get(shell_id)?;
-        let mut volume = 0.0;
-
-        for &face_id in &shell.faces {
-            let face = self.faces.get(face_id)?;
-            let outer_loop = self.loops.get(face.outer_loop)?;
-
-            // Get vertices
-            let mut vertices = Vec::new();
-            for &edge_id in &outer_loop.edges {
-                let edge = self.edges.get(edge_id)?;
-                if let Some(vertex) = self.vertices.get(edge.start_vertex) {
-                    vertices.push(vertex.point());
-                }
-            }
-
-            if vertices.len() < 3 {
-                continue;
-            }
-
-            // Triangulate and compute volume
-            for i in 1..vertices.len() - 1 {
-                let v0 = vertices[0];
-                let v1 = vertices[i];
-                let v2 = vertices[i + 1];
-
-                // Signed volume of tetrahedron
-                let volume_contribution = v0.dot(&(v1.cross(&v2))) / 6.0;
-                volume += volume_contribution;
-            }
-        }
-
-        Some(volume.abs())
+    /// Calculate exact surface area of a solid.
+    ///
+    /// Delegates to [`crate::primitives::solid::Solid::compute_mass_properties`]
+    /// for the same reason as [`Self::calculate_solid_volume`] —
+    /// volume and surface area must come from the same divergence-theorem
+    /// face traversal so callers (LLM summary reports, agent-facing
+    /// part queries) never see numbers that drift relative to each
+    /// other.
+    pub fn calculate_solid_surface_area(&mut self, solid_id: u32) -> Option<f64> {
+        Some(self.compute_solid_mass_properties(solid_id)?.surface_area)
     }
 
-    /// Calculate exact surface area of a solid
-    pub fn calculate_solid_surface_area(&self, solid_id: u32) -> Option<f64> {
-        let solid = self.solids.get(solid_id)?;
-        let shell = self.shells.get(solid.outer_shell)?;
-
-        let mut total_area = 0.0;
-
-        // Sum areas of all faces in the shell
-        for &face_id in &shell.faces {
-            if let Some(area) = self.calculate_face_area(face_id) {
-                total_area += area;
-            }
-        }
-
-        // Add areas of inner shells (they contribute to surface area)
-        for &inner_shell_id in &solid.inner_shells {
-            let inner_shell = self.shells.get(inner_shell_id)?;
-            for &face_id in &inner_shell.faces {
-                if let Some(area) = self.calculate_face_area(face_id) {
-                    total_area += area;
-                }
-            }
-        }
-
-        Some(total_area)
+    /// Internal helper: drives [`crate::primitives::solid::Solid::compute_mass_properties`]
+    /// using this model's topology stores and returns a clone of the
+    /// resulting [`crate::primitives::solid::SolidMassProperties`] so
+    /// the caller does not have to juggle the simultaneous mutable
+    /// borrows of `solids` + the topology stores.
+    fn compute_solid_mass_properties(
+        &mut self,
+        solid_id: u32,
+    ) -> Option<crate::primitives::solid::SolidMassProperties> {
+        let solid = self.solids.get_mut(solid_id)?;
+        solid
+            .compute_mass_properties(
+                &mut self.shells,
+                &mut self.faces,
+                &mut self.loops,
+                &self.vertices,
+                &self.edges,
+                &self.curves,
+                &self.surfaces,
+            )
+            .ok()
+            .cloned()
     }
 
     /// Tessellate a solid into a watertight triangle mesh for visualization
@@ -1533,72 +1459,6 @@ impl BRepModel {
             normals,
             indices,
         })
-    }
-
-    /// Calculate exact area of a face
-    fn calculate_face_area(&self, face_id: u32) -> Option<f64> {
-        let face = self.faces.get(face_id)?;
-        let outer_loop = self.loops.get(face.outer_loop)?;
-
-        // Get vertices of outer loop
-        let mut vertices = Vec::new();
-        for &edge_id in &outer_loop.edges {
-            let edge = self.edges.get(edge_id)?;
-            if let Some(vertex) = self.vertices.get(edge.start_vertex) {
-                vertices.push(vertex.point());
-            }
-        }
-
-        if vertices.len() < 3 {
-            return Some(0.0);
-        }
-
-        // Calculate area using triangulation
-        let mut area = 0.0;
-
-        // For planar faces, use simple triangulation
-        // For curved surfaces, this would need surface parameterization
-        for i in 1..vertices.len() - 1 {
-            let v0 = vertices[0];
-            let v1 = vertices[i];
-            let v2 = vertices[i + 1];
-
-            // Area of triangle = 0.5 * |edge1 × edge2|
-            let edge1 = v1 - v0;
-            let edge2 = v2 - v0;
-            let triangle_area = edge1.cross(&edge2).magnitude() * 0.5;
-
-            area += triangle_area;
-        }
-
-        // Subtract areas of inner loops (holes)
-        for &inner_loop_id in &face.inner_loops {
-            let inner_loop = self.loops.get(inner_loop_id)?;
-
-            let mut inner_vertices = Vec::new();
-            for &edge_id in &inner_loop.edges {
-                let edge = self.edges.get(edge_id)?;
-                if let Some(vertex) = self.vertices.get(edge.start_vertex) {
-                    inner_vertices.push(vertex.point());
-                }
-            }
-
-            // Calculate area of hole
-            let mut hole_area = 0.0;
-            for i in 1..inner_vertices.len() - 1 {
-                let v0 = inner_vertices[0];
-                let v1 = inner_vertices[i];
-                let v2 = inner_vertices[i + 1];
-
-                let edge1 = v1 - v0;
-                let edge2 = v2 - v0;
-                hole_area += edge1.cross(&edge2).magnitude() * 0.5;
-            }
-
-            area -= hole_area;
-        }
-
-        Some(area)
     }
 
     /// Cascading delete of a vertex.

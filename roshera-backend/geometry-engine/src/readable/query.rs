@@ -65,15 +65,34 @@ impl BRepModel {
     /// degenerate or non-manifold geometry. Agents reasoning about
     /// mass / cost should branch on the `None` case rather than
     /// substituting zero.
-    pub fn query_part(&self, id: SolidId) -> Option<PartReport> {
-        let solid = self.solids.get(id)?;
+    ///
+    /// Takes `&mut self` because the volume / surface-area integrals
+    /// (`calculate_solid_volume`, `calculate_solid_surface_area`)
+    /// drive `Solid::compute_mass_properties` which populates per-entity
+    /// caches on the solid, shell, face, and loop stores. Subsequent
+    /// calls hit the cache and are free. The api-server should briefly
+    /// upgrade to a write lock for the first call against a given
+    /// solid; same pattern as `mass_properties_for`.
+    pub fn query_part(&mut self, id: SolidId) -> Option<PartReport> {
+        // Snapshot every field we need off `solid` up front so the
+        // immutable borrow of `self.solids` is released before the
+        // `&mut self` mass-property calls below. Same hoist pattern
+        // as `mass_properties_for`.
+        let (solid_name, material) = {
+            let solid = self.solids.get(id)?;
+            (
+                solid.name.clone(),
+                MaterialSummary {
+                    name: solid.attributes.material.name.clone(),
+                    density: solid.attributes.material.density,
+                },
+            )
+        };
+
         let location = self.solid_location_descriptor_cached(id)?;
         let bbox = self.solid_world_bbox(id)?;
 
-        let name = solid
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("solid_{id}"));
+        let name = solid_name.unwrap_or_else(|| format!("solid_{id}"));
 
         // Slice 6 ships with a generic "solid" kind; primitive-creation
         // entry points (`create_box_3d`, etc.) currently do not stamp a
@@ -100,11 +119,6 @@ impl BRepModel {
                 edge_count: 0,
                 vertex_count: 0,
             });
-
-        let material = MaterialSummary {
-            name: solid.attributes.material.name.clone(),
-            density: solid.attributes.material.density,
-        };
 
         let dependent_datums = self.compute_dependent_datums(id);
         let neighbors = self.compute_neighbors(id, &bbox.center(), PART_REPORT_NEIGHBOR_K);
@@ -922,7 +936,7 @@ mod tests {
 
     #[test]
     fn query_part_returns_full_report_for_origin_box() {
-        let (model, id) = fresh_model_with_box();
+        let (mut model, id) = fresh_model_with_box();
         let report = model.query_part(id).expect("part report");
         assert_eq!(report.id, id);
         assert_eq!(report.kind, "solid");
@@ -940,7 +954,7 @@ mod tests {
 
     #[test]
     fn query_part_populates_world_bbox() {
-        let (model, id) = fresh_model_with_box();
+        let (mut model, id) = fresh_model_with_box();
         let report = model.query_part(id).expect("part report");
         // 2×2×2 box centered at origin → corners at ±1.
         assert!((report.world_bbox_min[0] - -1.0).abs() < 1e-9);
@@ -949,7 +963,7 @@ mod tests {
 
     #[test]
     fn query_part_populates_topology_fingerprint() {
-        let (model, id) = fresh_model_with_box();
+        let (mut model, id) = fresh_model_with_box();
         let report = model.query_part(id).expect("part report");
         // A box has 6 faces, 12 edges, 8 vertices.
         assert_eq!(report.topology.face_count, 6);
@@ -959,7 +973,7 @@ mod tests {
 
     #[test]
     fn query_part_populates_default_material() {
-        let (model, id) = fresh_model_with_box();
+        let (mut model, id) = fresh_model_with_box();
         let report = model.query_part(id).expect("part report");
         // Default material is Steel @ 7850 kg/m³.
         assert_eq!(report.material.name, "Steel");
@@ -979,24 +993,29 @@ mod tests {
         };
         let id = BoxPrimitive::create(params, &mut model).expect("box");
         let report = model.query_part(id).expect("part report");
-        // We assert volume is populated and positive — the exact
-        // numerical value is kernel-dependent (the divergence-theorem
-        // implementation in `calculate_solid_volume` is the source of
-        // truth, not this test). Specific volume-correctness tests
-        // belong in the kernel volume code.
+        // Volume is now sourced from `Solid::compute_mass_properties`
+        // (the canonical divergence-theorem integral) via the
+        // delegation in `calculate_solid_volume`. For a 2×3×4 box
+        // the analytical answer is 24. Volume-correctness tests at
+        // tighter tolerances belong in the kernel volume code and
+        // in `tests/kernel_workflow_regression.rs`.
         let v = report.volume.expect("volume should be defined for closed box");
-        assert!(v > 0.0 && v.is_finite(), "got {}", v);
+        assert!(
+            (v - 24.0).abs() < 1e-6,
+            "expected box(2,3,4) volume = 24, got {}",
+            v
+        );
     }
 
     #[test]
     fn query_part_returns_none_for_unknown_id() {
-        let (model, _) = fresh_model_with_box();
+        let (mut model, _) = fresh_model_with_box();
         assert!(model.query_part(9999).is_none());
     }
 
     #[test]
     fn query_part_falls_back_to_auto_name_when_solid_unnamed() {
-        let (model, id) = fresh_model_with_box();
+        let (mut model, id) = fresh_model_with_box();
         let report = model.query_part(id).expect("part report");
         assert_eq!(report.name, format!("solid_{id}"));
     }
