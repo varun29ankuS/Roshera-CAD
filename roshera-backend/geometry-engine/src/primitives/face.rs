@@ -511,9 +511,10 @@ impl Face {
     ) -> MathResult<&FaceStats> {
         if self.cached_stats.is_none() {
             // Get surface
-            let _surface = surface_store
+            let surface = surface_store
                 .get(self.surface_id)
                 .ok_or(MathError::InvalidParameter("Surface not found".to_string()))?;
+            let is_planar = matches!(surface.surface_type(), SurfaceType::Plane);
 
             // Compute area (using parametric integration for accuracy)
             let area = self.compute_surface_area(
@@ -524,6 +525,17 @@ impl Face {
                 surface_store,
             )?;
 
+            // For planar faces we will reuse the per-loop centroid as the
+            // face centroid below, so the loop must compute its centroid
+            // in the face's plane (the loop caches its result on first
+            // call). For curved faces the perimeter is the only thing we
+            // read, and that's normal-independent — `Vector3::Z` is fine.
+            let loop_normal = if is_planar {
+                self.normal_at(0.5, 0.5, surface_store)?
+            } else {
+                Vector3::Z
+            };
+
             // Compute perimeter
             let mut perimeter = 0.0;
             for &loop_id in &self.all_loops() {
@@ -532,17 +544,67 @@ impl Face {
                         vertex_store,
                         edge_store,
                         curve_store,
-                        &Vector3::Z, // Dummy normal for perimeter
+                        &loop_normal,
                     )?;
                     perimeter += stats.perimeter;
                 }
             }
 
             // Compute bounding box and centroid
-            let (bbox_min, bbox_max, centroid) = self.compute_bbox_and_centroid(
+            let (bbox_min, bbox_max, mut centroid) = self.compute_bbox_and_centroid(
                 surface_store,
                 100, // Sample points
             )?;
+
+            // Centroid override for planar faces. The surface-sampling
+            // centroid in `compute_bbox_and_centroid` is biased: a Plane
+            // surface uses uv_bounds = [0, 1]² with unit-length u/v axes
+            // and an origin at the face's "lower-left" corner, so the
+            // sampling grid only covers a fixed 1×1 patch in world space
+            // independent of the face's actual extent. The result is a
+            // centroid biased by (+0.5, +0.5) along the face-local axes
+            // for any face larger than a unit square — wrong by enough
+            // to throw the solid's centre of mass off-axis and break
+            // every downstream inertia / OBB calculation.
+            //
+            // The outer loop's polygon centroid (and any inner-loop
+            // hole centroids) define the planar face centroid exactly:
+            //
+            //   c = (A_outer · c_outer − Σ A_i · c_i) / (A_outer − Σ A_i)
+            //
+            // `Loop::compute_stats` already projects vertices onto the
+            // dominant-normal coordinate plane, runs the shoelace
+            // centroid formula, and lifts the answer back to 3D, so we
+            // just composite its results.
+            if is_planar {
+                let mut weighted = Vector3::ZERO;
+                let mut signed_area = 0.0;
+                if let Some(outer) = loop_store.get_mut(self.outer_loop) {
+                    let outer_stats = outer.compute_stats(
+                        vertex_store,
+                        edge_store,
+                        curve_store,
+                        &loop_normal,
+                    )?;
+                    signed_area += outer_stats.area;
+                    weighted += outer_stats.centroid.to_vec() * outer_stats.area;
+                }
+                for &inner_id in &self.inner_loops {
+                    if let Some(inner) = loop_store.get_mut(inner_id) {
+                        let inner_stats = inner.compute_stats(
+                            vertex_store,
+                            edge_store,
+                            curve_store,
+                            &loop_normal,
+                        )?;
+                        signed_area -= inner_stats.area;
+                        weighted -= inner_stats.centroid.to_vec() * inner_stats.area;
+                    }
+                }
+                if signed_area.abs() > consts::EPSILON {
+                    centroid = Point3::from(weighted / signed_area);
+                }
+            }
 
             // Compute planarity and curvature
             let (planarity, max_curvature) = self.compute_shape_metrics(
@@ -594,6 +656,31 @@ impl Face {
                 // Simple rectangle - use shoelace formula directly (much faster)
                 let vertices = outer_loop.vertices_cached(edge_store)?;
                 if vertices.len() == 4 {
+                    // The shoelace formula is two-dimensional; we must
+                    // project the loop's 3D vertices onto a coordinate
+                    // plane that the face is NOT parallel to, otherwise
+                    // every signed contribution collapses to zero. Pick
+                    // the projection plane whose normal axis is closest
+                    // to the face's surface normal — this is the
+                    // standard "drop the dominant component" trick that
+                    // preserves area exactly for any axis-aligned planar
+                    // face and is the same convention used by
+                    // `Loop::compute_area_and_centroid` for the slow
+                    // path. Projecting along the dominant normal axis
+                    // contracts no in-plane direction, so the planar
+                    // area is preserved without rescaling.
+                    let normal = self.normal_at(0.5, 0.5, surface_store)?;
+                    let abs_normal = normal.abs();
+                    let (u_idx, v_idx) = if abs_normal.x >= abs_normal.y
+                        && abs_normal.x >= abs_normal.z
+                    {
+                        (1, 2) // X-dominant normal → project to YZ
+                    } else if abs_normal.y >= abs_normal.z {
+                        (0, 2) // Y-dominant normal → project to XZ
+                    } else {
+                        (0, 1) // Z-dominant normal → project to XY
+                    };
+
                     let mut area = 0.0;
                     for i in 0..4 {
                         // `vertices` comes from the outer loop's cached vertex list;
@@ -613,7 +700,8 @@ impl Face {
                                 vertices[(i + 1) % 4]
                             ))
                         })?;
-                        area += v1.position[0] * v2.position[1] - v2.position[0] * v1.position[1];
+                        area += v1.position[u_idx] * v2.position[v_idx]
+                            - v2.position[u_idx] * v1.position[v_idx];
                     }
                     return Ok(area.abs() / 2.0);
                 }
