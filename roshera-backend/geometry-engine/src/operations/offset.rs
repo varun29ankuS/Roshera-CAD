@@ -143,7 +143,7 @@ pub fn offset_solid(
         create_interior_offset_faces(model, &solid, -thickness.abs(), &faces_to_remove, &options)?;
 
     // Create side walls for removed faces
-    let wall_faces = create_shell_walls(model, &solid, thickness, &faces_to_remove)?;
+    let wall_faces = create_shell_walls(model, &solid, thickness, &faces_to_remove, &options)?;
 
     // Combine original exterior (minus removed faces) with new interior
     let shell_faces =
@@ -453,15 +453,22 @@ fn create_offset_edge(
     })?;
     let curve_id = model.curves.add(offset_curve);
 
-    let offset_start = model.vertices.add(
+    // Deduplicate offset endpoints against existing vertices via the
+    // caller-supplied tolerance. Adjacent boundary edges share a source
+    // vertex, and both adjacent offset edges produce coincident endpoints
+    // (same surface normal at the shared point) — `add_or_find` collapses
+    // those to a single VertexId, yielding a watertight offset loop.
+    let offset_start = model.vertices.add_or_find(
         start_pos.x + start_normal.x * signed_distance,
         start_pos.y + start_normal.y * signed_distance,
         start_pos.z + start_normal.z * signed_distance,
+        tol,
     );
-    let offset_end = model.vertices.add(
+    let offset_end = model.vertices.add_or_find(
         end_pos.x + end_normal.x * signed_distance,
         end_pos.y + end_normal.y * signed_distance,
         end_pos.z + end_normal.z * signed_distance,
+        tol,
     );
 
     // Create new edge
@@ -537,6 +544,7 @@ fn create_shell_walls(
     solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
+    options: &OffsetOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // Confirm every face being removed lives on this solid's outer shell.
     let outer_shell_faces: std::collections::HashSet<FaceId> = model
@@ -601,11 +609,13 @@ fn create_shell_walls(
             removed_normal = -removed_normal;
         }
 
-        // Create wall face for each edge
+        // Create wall face for each edge. Pass the caller's tolerance
+        // so adjacent walls can dedup their shared corner vertices.
+        let tol = options.common.tolerance.distance();
         for (i, &edge_id) in loop_data.edges.iter().enumerate() {
             let forward = loop_data.orientations[i];
             let wall_face =
-                create_wall_face(model, edge_id, thickness, forward, removed_normal)?;
+                create_wall_face(model, edge_id, thickness, forward, removed_normal, tol)?;
             wall_faces.push(wall_face);
         }
     }
@@ -625,6 +635,7 @@ fn create_wall_face(
     thickness: f64,
     forward: bool,
     removed_face_outward_normal: Vector3,
+    tol: f64,
 ) -> OperationResult<FaceId> {
     use crate::primitives::curve::Line;
     use crate::primitives::edge::EdgeOrientation;
@@ -693,9 +704,13 @@ fn create_wall_face(
     let wall_surface = Plane::from_point_normal(p1, wall_normal)?;
     let surface_id = model.surfaces.add(Box::new(wall_surface));
 
-    // Create vertices for inner edge
-    let v3 = model.vertices.add(p3.x, p3.y, p3.z);
-    let v4 = model.vertices.add(p4.x, p4.y, p4.z);
+    // Dedup wall corner vertices via tolerance — adjacent walls along
+    // the same boundary loop share their meeting corner, so the second
+    // wall finds the corner the first wall planted instead of creating
+    // a coincident duplicate. This is what makes the resulting shell
+    // topologically watertight at the opening boundary.
+    let v3 = model.vertices.add_or_find(p3.x, p3.y, p3.z, tol);
+    let v4 = model.vertices.add_or_find(p4.x, p4.y, p4.z, tol);
 
     // Create four edges for the rectangular face
     let e_top = outer_edge_id; // reuse outer edge
