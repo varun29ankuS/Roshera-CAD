@@ -440,6 +440,40 @@ fn create_offset_edge(
     let end_normal = compute_surface_normal_at_point(surface, end_pos)?;
     let mid_normal = compute_surface_normal_at_point(surface, mid_pos)?;
 
+    // Self-intersection guard. An offset curve folds onto itself wherever
+    // the curve is concave toward the offset direction and |distance|
+    // exceeds 1/κ at that point. We sample the parameter range and
+    // compute κ_eff(t) = (curvature_vector(t) · offset_direction); a
+    // positive κ_eff means the offset is on the concave side, and the
+    // offset is regular only while signed_distance · κ_eff < 1.
+    if let Some(t_fold) = detect_offset_self_intersection(curve, &mid_normal, signed_distance) {
+        match options.intersection_handling {
+            IntersectionHandling::Fail => {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "create_offset_edge: edge {} curve folds at parameter {:.4} \
+                     — |distance|={:.3e} exceeds local radius of curvature",
+                    edge_id,
+                    t_fold,
+                    signed_distance.abs()
+                )));
+            }
+            // `Trim` and `Keep` surface a warning and proceed; full
+            // trimming requires re-parameterising the offset over the
+            // regular sub-range, which the curve-offset trait does not
+            // expose today. Logging keeps the failure visible without
+            // silently producing degenerate geometry.
+            IntersectionHandling::Trim | IntersectionHandling::Keep => {
+                tracing::warn!(
+                    "offset edge {}: self-intersection detected at t={:.4} \
+                     (handling={:?}); offset may contain folded geometry",
+                    edge_id,
+                    t_fold,
+                    options.intersection_handling
+                );
+            }
+        }
+    }
+
     // Offset the curve along the surface normal at its midpoint. For planar
     // surfaces this is exact (constant normal); for low-curvature surfaces
     // it is a first-order accurate approximation. Higher-order accuracy
@@ -493,6 +527,58 @@ fn compute_surface_normal_at_point(
     let tol = Tolerance::new(1e-6, 1e-6);
     let (u, v) = surface.closest_point(&point, tol)?;
     Ok(surface.normal_at(u, v)?)
+}
+
+/// Detect curve-offset self-intersection.
+///
+/// An offset curve C_off(t) = C(t) + d · n folds onto itself where C is
+/// concave toward n and |d| ≥ 1 / κ_concave(t). Concavity is measured
+/// by the dot product `cv(t) · n` where `cv` is the curvature vector
+/// (points to the centre of the osculating circle, magnitude = κ).
+/// When that dot product is positive the offset is on the concave side,
+/// and the offset is regular only while `signed_distance · κ_eff < 1`.
+///
+/// Returns the first sampled parameter at which the fold condition is
+/// reached, or `None` if the offset is regular over the entire range.
+///
+/// Sampling density (32 points) matches the granularity used elsewhere
+/// in the kernel for curve-property scans (see Patrikalakis-Maekawa
+/// §4.5 for the same approach in curve-surface intersection seeding).
+fn detect_offset_self_intersection(
+    curve: &dyn crate::primitives::curve::Curve,
+    offset_dir: &Vector3,
+    signed_distance: f64,
+) -> Option<f64> {
+    const SAMPLES: usize = 32;
+    if signed_distance.abs() <= f64::EPSILON {
+        return None;
+    }
+    let n = offset_dir.normalize().ok()?;
+    for i in 0..=SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        let point = match curve.evaluate(t) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let cv = match point.curvature_vector() {
+            Some(v) => v,
+            None => continue,
+        };
+        // κ_eff = curvature_vector · n. Positive ⇒ offset is on concave
+        // side. Negative or zero ⇒ offset is on convex side or curve
+        // is locally straight — never folds in the offset direction.
+        let kappa_eff = cv.dot(&n);
+        if kappa_eff <= 0.0 {
+            continue;
+        }
+        // Fold iff signed_distance · κ_eff ≥ 1. Use ≥ so the boundary
+        // case (offset lands exactly on the centre of curvature) also
+        // counts as degenerate.
+        if signed_distance * kappa_eff >= 1.0 {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// Create interior offset faces for shell
@@ -880,12 +966,56 @@ fn validate_shell_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult
     Ok(())
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_offset_validation() {
-//         // Test parameter validation
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::Point3;
+    use crate::primitives::curve::{Arc as ArcCurve, Line};
+
+    /// A straight line has zero curvature; the offset never folds
+    /// regardless of distance.
+    #[test]
+    fn line_offset_never_self_intersects() {
+        let line = Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+        let n = Vector3::new(0.0, 1.0, 0.0);
+        assert!(detect_offset_self_intersection(&line, &n, 0.5).is_none());
+        assert!(detect_offset_self_intersection(&line, &n, 100.0).is_none());
+        assert!(detect_offset_self_intersection(&line, &n, -100.0).is_none());
+    }
+
+    /// An arc of radius 1 in the XY plane: offset on the convex side
+    /// (away from centre) is always regular; offset on the concave side
+    /// folds when |distance| ≥ radius.
+    #[test]
+    fn arc_offset_folds_when_distance_exceeds_radius_on_concave_side() {
+        // Quarter arc of radius 1 centered at origin, in XY plane.
+        // start_angle=0 sweeps from +X toward +Y for normal=+Z.
+        let arc = ArcCurve::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("quarter arc construction");
+
+        // At t=0 the arc point is +X; the curvature vector at any t
+        // points from C(t) toward the origin (the centre). At t=0
+        // that direction is -X.
+        let toward_centre = Vector3::new(-1.0, 0.0, 0.0);
+        // Convex side: offset_dir · cv < 0 at every sample → never folds
+        let convex = -toward_centre;
+        assert!(detect_offset_self_intersection(&arc, &convex, 5.0).is_none());
+
+        // Concave side: at t=0 the alignment is perfect (cv · n = κ = 1).
+        // signed_distance × κ_eff = 1.5 × 1.0 ≥ 1 → fold detected.
+        let fold = detect_offset_self_intersection(&arc, &toward_centre, 1.5);
+        assert!(
+            fold.is_some(),
+            "expected fold detection on concave side at d=1.5 (radius=1)"
+        );
+
+        // Distance smaller than radius: still regular even on concave side.
+        assert!(detect_offset_self_intersection(&arc, &toward_centre, 0.25).is_none());
+    }
+}
