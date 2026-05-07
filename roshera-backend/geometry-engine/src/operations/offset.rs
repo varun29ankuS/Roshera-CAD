@@ -350,10 +350,18 @@ fn create_offset_loop(
     // the source face; both adjacent offset edges therefore compute the same
     // surface normal at that shared point, producing coincident offset
     // vertices and a watertight loop without explicit corner handling.
+    //
+    // The loop's per-edge `forward` flag describes traversal direction
+    // (which side of the manifold this loop is on), NOT which side of
+    // the curve to offset to. The offset side is encoded entirely in the
+    // sign of `distance`. We pass every edge to `create_offset_edge`
+    // with the same offset distance — uniform shift along the surface
+    // normal — and preserve the original `forward` flag in the new
+    // loop so traversal stays consistent.
     for (i, &edge_id) in original_loop.edges.iter().enumerate() {
         let forward = original_loop.orientations[i];
         let offset_edge_id =
-            create_offset_edge(model, edge_id, face.surface_id, distance, forward, options)?;
+            create_offset_edge(model, edge_id, face.surface_id, distance, options)?;
         offset_edges.push((offset_edge_id, forward));
     }
 
@@ -369,13 +377,20 @@ fn create_offset_loop(
     Ok(offset_loop)
 }
 
-/// Create offset edge
+/// Create offset edge.
+///
+/// The offset is applied uniformly along the surface normal at every
+/// sample point of the source curve. The sign of `distance` selects
+/// which side of the surface to offset to — positive shifts along the
+/// surface's natural normal, negative shifts opposite. This is
+/// independent of any loop traversal flag the caller may have; an
+/// outer loop is offset coherently when every edge in the loop is
+/// offset by the same signed distance.
 fn create_offset_edge(
     model: &mut BRepModel,
     edge_id: EdgeId,
     surface_id: u32,
     distance: f64,
-    forward: bool,
     options: &OffsetOptions,
 ) -> OperationResult<EdgeId> {
     // Validate that the requested offset distance is geometrically meaningful
@@ -404,9 +419,7 @@ fn create_offset_edge(
             distance, options.max_deviation,
         )));
     }
-    // Honor the caller's direction preference: forward=false flips the offset
-    // sign so callers can request either side of the source curve.
-    let signed_distance = if forward { distance } else { -distance };
+    let signed_distance = distance;
 
     let edge = model
         .edges
@@ -1348,6 +1361,101 @@ mod tests {
             1,
             "shell op produces a single output solid"
         );
+    }
+
+    /// `create_offset_loop` must offset every edge of a kept face to
+    /// the same side, regardless of the loop's per-edge `forward` flag.
+    /// In a B-Rep, an outer loop traverses some edges in their natural
+    /// direction (forward=true) and others reversed (forward=false) —
+    /// that flag describes loop topology, NOT which side of the curve
+    /// to offset to.
+    ///
+    /// For the +X side face of a 10×10×10 cube, the box-faces helper
+    /// gives a loop with `[true, true, false, false]`. With
+    /// `signed_distance = if forward { d } else { -d }`, two edges
+    /// would offset inward (-X) and two outward (+X), producing a
+    /// disconnected interior offset face. The full inward-offset
+    /// face must instead live on the single plane x = hw - thickness.
+    #[test]
+    fn shell_interior_offset_face_loop_is_coplanar() {
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        let half_extent = 5.0;
+        let thickness = 1.0;
+        let inset = half_extent - thickness; // = 4.0
+
+        let options = OffsetOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            offset_type: OffsetType::Distance(thickness),
+            intersection_handling: IntersectionHandling::Trim,
+            max_deviation: 1e-3,
+        };
+
+        let hollow_id = offset_solid(
+            &mut model,
+            solid_id,
+            thickness,
+            vec![top_face_id],
+            options,
+        )
+        .expect("offset_solid must succeed");
+
+        // The +X kept face's interior offset is the (single) face in
+        // the result with surface normal ±X whose face center is at
+        // x = inset. Find it via face-vertex inspection.
+        let hollow = model.solids.get(hollow_id).expect("hollow").clone();
+        let hollow_shell = model
+            .shells
+            .get(hollow.outer_shell)
+            .expect("shell")
+            .clone();
+
+        let mut x_offset_faces = Vec::new();
+        for &face_id in &hollow_shell.faces {
+            let face = model.faces.get(face_id).expect("face");
+            let surface = model.surfaces.get(face.surface_id).expect("surface");
+            let n = surface.normal_at(0.5, 0.5).expect("normal");
+            // Faces with normal ±X
+            if !((n.x.abs() - 1.0).abs() < 1e-6 && n.y.abs() < 1e-6 && n.z.abs() < 1e-6) {
+                continue;
+            }
+            let positions = loop_vertex_positions(&model, face_id);
+            // Inward-offset +X face: every vertex sits at x = +inset.
+            // Inward-offset -X face: every vertex sits at x = -inset.
+            // Original kept faces are at x = ±half_extent.
+            let all_at_pos_inset = positions.iter().all(|p| (p.x - inset).abs() < 1e-6);
+            let all_at_neg_inset = positions
+                .iter()
+                .all(|p| (p.x - (-inset)).abs() < 1e-6);
+            if all_at_pos_inset || all_at_neg_inset {
+                x_offset_faces.push((face_id, positions));
+            }
+        }
+
+        // We expect exactly one inward-offset +X face and one inward-
+        // offset -X face. With the per-edge sign-flip bug, each kept
+        // X-side face produces a loop where two edges are at x=hw-t
+        // and two at x=hw+t — so neither all_at_pos_inset nor
+        // all_at_neg_inset holds, and this assertion fails.
+        assert_eq!(
+            x_offset_faces.len(),
+            2,
+            "expected 2 X-axis interior offset faces (one per ±X side), found {} \
+             — likely a per-edge offset-direction inconsistency",
+            x_offset_faces.len()
+        );
+
+        for (face_id, positions) in x_offset_faces {
+            assert_eq!(
+                positions.len(),
+                4,
+                "interior offset face {} should have 4 distinct vertices, got {}",
+                face_id,
+                positions.len()
+            );
+        }
     }
 
     /// Negative thickness is rejected by `validate_shell_inputs`'s
