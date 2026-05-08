@@ -27,14 +27,17 @@ export function SelectionOutline() {
     return mesh ? [mesh] : []
   }, [hoveredId, selectedIds, meshRefs])
 
-  // Selection / hover ink renders in black for maximum contrast against
-  // the blueprint cream / navy grounds. Hidden edges stay on the tick
-  // token so they read as "occluded" without blending into the geometry.
+  // Selected silhouettes render in pastel red (`--cad-edge-selected`)
+  // so a clicked solid is unambiguously distinguished from a hovered or
+  // unselected one. Hover stays on neutral ink for low-key feedback.
+  // Hidden edges stay on the tick token so they read as "occluded"
+  // without blending into the geometry.
   const palette = useMemo(() => {
     const tick = resolveCssVar('--cad-tick').color.getHex()
+    const selected = resolveCssVar('--cad-edge-selected').color.getHex()
     const ink = 0x000000
     return {
-      selectVisible: ink,
+      selectVisible: selected,
       selectHidden: tick,
       hoverVisible: ink,
       hoverHidden: tick,
@@ -57,8 +60,16 @@ export function SelectionOutline() {
   const showSelect = selectedMeshes.length > 0
   const showHover = hoveredMeshes.length > 0
 
+  // The `postprocessing` `OutlineEffect` binds its colour uniforms at
+  // construction; mutating `visibleEdgeColor` on a live effect doesn't
+  // always re-flow to the shader. Keying the composer on the palette
+  // ints forces a clean remount when the theme tokens change, so the
+  // selected silhouette always paints with the current `--cad-edge-
+  // selected` value rather than the value captured at first mount.
+  const composerKey = `${palette.selectVisible}-${palette.hoverVisible}`
+
   return (
-    <EffectComposer multisampling={4}>
+    <EffectComposer key={composerKey} multisampling={4}>
       <Outline
         selection={showSelect ? selectedMeshes : []}
         blendFunction={BlendFunction.ALPHA}

@@ -257,10 +257,24 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       userData={{ cadObjectId: object.id }}
     >
       {edgeSettings.visible && (
+        // `<Edges>` builds a drei LineSegments at construction and does
+        // not always re-flow `color` prop changes onto its material on
+        // the next frame — visible when toggling hover on an already-
+        // mounted mesh. Keying on the visual state forces a clean remount
+        // so the chosen colour reaches the GPU immediately.
+        //
+        // Selection visuals are intentionally NOT painted into the
+        // wireframe — the post-process `SelectionOutline` silhouette
+        // (whole-object) and `SubElementHighlight` overlay (picked
+        // face/edge/vertex) are the canonical feedback surfaces. Painting
+        // the wireframe red on `isSelected` would tint every edge of the
+        // mesh in sub-element mode (sub-element picks also set `selectedIds`
+        // so the object-scope outline can paint).
         <Edges
+          key={isHovered ? 'hov' : 'def'}
           threshold={edgeSettings.threshold}
-          color={isHovered ? accentEdgeHex : (edgeSettings.color || defaultEdgeHex)}
-          lineWidth={isSelected ? edgeSettings.lineWidth * 1.5 : edgeSettings.lineWidth}
+          color={isHovered ? accentEdgeHex : edgeSettings.color || defaultEdgeHex}
+          lineWidth={edgeSettings.lineWidth}
         />
       )}
     </mesh>
