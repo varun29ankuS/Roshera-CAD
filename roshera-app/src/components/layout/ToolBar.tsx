@@ -597,6 +597,72 @@ async function sendDirectCircularPattern(
 }
 
 /**
+ * Direct REST measure distance between the two currently selected
+ * solids. Hits `GET /api/agent/parts/distance/uuid/{a}/{b}`, which
+ * resolves both UUIDs to kernel SolidIds and returns center-to-center
+ * Euclidean distance, conservative AABB-gap surface-to-surface lower
+ * bound, bbox overlap flag, and the unit direction vector from a→b.
+ *
+ * Pure read — no kernel mutation, no broadcast. Result is rendered
+ * inline in the chat panel.
+ */
+async function sendDirectMeasureDistance() {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length !== 2) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly two solids before running Measure Distance.',
+    })
+    return
+  }
+
+  const [a, b] = selectedIds
+  addMessage({
+    role: 'user',
+    content: `Measure distance ${a.slice(0, 6)} ↔ ${b.slice(0, 6)}`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/agent/parts/distance/uuid/${a}/${b}`, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+    })
+    if (!resp.ok) {
+      const errBody = await resp.text().catch(() => '')
+      throw new Error(errBody || `${resp.status}`)
+    }
+    const data = await resp.json() as {
+      center_to_center: number
+      surface_to_surface: number
+      bbox_overlap: boolean
+      direction: [number, number, number] | null
+    }
+    const fmt = (n: number, p = 4) => Number.isFinite(n) ? n.toPrecision(p) : 'n/a'
+    const dirStr = data.direction
+      ? `(${data.direction.map((c) => fmt(c, 3)).join(', ')})`
+      : 'coincident'
+    addMessage({
+      role: 'assistant',
+      content:
+        `Distance ${a.slice(0, 6)} ↔ ${b.slice(0, 6)}:\n` +
+        `• centre-to-centre: ${fmt(data.center_to_center)} mm\n` +
+        `• AABB gap (surface lower bound): ${fmt(data.surface_to_surface)} mm\n` +
+        `• bbox overlap: ${data.bbox_overlap ? 'yes' : 'no'}\n` +
+        `• direction a→b: ${dirStr}`,
+      objectsAffected: [a, b],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Measure distance failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Direct REST mass properties query against the currently selected
  * solid. Hits `GET /api/agent/parts/uuid/{uuid}/mass`, which resolves
  * the public UUID to the kernel's local SolidId and returns volume,
@@ -953,7 +1019,7 @@ export function ToolBar() {
         {
           label: 'Analyze',
           items: [
-            { icon: Ruler, label: 'Measure Distance', action: () => notYetWired('Measure Distance') },
+            { icon: Ruler, label: 'Measure Distance', action: () => sendDirectMeasureDistance() },
             { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
             { icon: Eye, label: 'Section View', action: () => notYetWired('Section View') },
             { icon: Wrench, label: 'Interference', action: () => notYetWired('Interference') },
