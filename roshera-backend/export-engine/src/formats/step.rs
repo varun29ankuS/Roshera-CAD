@@ -1967,3 +1967,822 @@ fn resolve_oriented_edge(
         _ => None,
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+//
+// Inline `#[cfg(test)]` block exercising the public StepWriter surface
+// + the private parser helpers (accessible because we're in the same
+// module). These tests run in-memory against `Vec<u8>` writers — no
+// filesystem, no async — so they execute without `tokio::test`. The
+// async `export_brep_to_step` / `export_assembly_to_step` /
+// `import_step_to_brep` entry points are thin orchestration wrappers
+// over the writers tested here; their logic is covered transitively
+// by exercising every primitive.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::ros_snapshot::{CurveData, SurfaceData};
+
+    /// Helper: drive a StepWriter against an in-memory Vec<u8>, run
+    /// the closure, and return the resulting STEP text.
+    fn write_into<F>(f: F) -> String
+    where
+        F: FnOnce(&mut StepWriter<Vec<u8>>) -> std::io::Result<()>,
+    {
+        let buf: Vec<u8> = Vec::new();
+        let mut w = StepWriter::new(buf);
+        f(&mut w).expect("writer closure failed");
+        w.flush().expect("flush failed");
+        // Recover the inner Vec<u8> from the BufWriter.
+        let inner = w
+            .writer
+            .into_inner()
+            .expect("BufWriter::into_inner failed");
+        String::from_utf8(inner).expect("non-UTF8 STEP output")
+    }
+
+    // ─── A. Header & ID basics ─────────────────────────────────────
+
+    #[test]
+    fn step_header_default_fields() {
+        let h = StepHeader::default();
+        assert_eq!(h.description, "Roshera CAD Model");
+        assert_eq!(h.implementation_level, "2;1");
+        assert_eq!(h.name, "model.step");
+        assert_eq!(h.author, "Roshera User");
+        assert_eq!(h.organization, "Roshera CAD");
+        assert_eq!(h.preprocessor_version, "Roshera STEP Processor 1.0");
+        assert_eq!(h.originating_system, "Roshera CAD System");
+        assert_eq!(h.authorization, "");
+    }
+
+    #[test]
+    fn step_header_is_mutable() {
+        let mut h = StepHeader::default();
+        h.name = "custom.step".to_string();
+        h.description = "Custom desc".to_string();
+        assert_eq!(h.name, "custom.step");
+        assert_eq!(h.description, "Custom desc");
+    }
+
+    #[test]
+    fn step_id_display_formats_as_hash_n() {
+        assert_eq!(format!("{}", StepId(1)), "#1");
+        assert_eq!(format!("{}", StepId(42)), "#42");
+        assert_eq!(format!("{}", StepId(1_000_000)), "#1000000");
+    }
+
+    #[test]
+    fn step_id_equality_and_hash() {
+        let mut map: HashMap<StepId, &str> = HashMap::new();
+        map.insert(StepId(7), "seven");
+        assert_eq!(map.get(&StepId(7)), Some(&"seven"));
+        assert_eq!(map.get(&StepId(8)), None);
+        assert_eq!(StepId(3), StepId(3));
+        assert_ne!(StepId(3), StepId(4));
+    }
+
+    #[test]
+    fn step_writer_new_starts_counter_at_one() {
+        // First emitted entity must be `#1=...`.
+        let out = write_into(|w| {
+            w.write_cartesian_point(&[0.0, 0.0, 0.0])?;
+            Ok(())
+        });
+        assert!(out.starts_with("#1=CARTESIAN_POINT"), "got: {}", out);
+    }
+
+    #[test]
+    fn write_header_emits_iso_marker_and_sections() {
+        let out = write_into(|w| {
+            let h = StepHeader::default();
+            w.write_header(&h)
+        });
+        assert!(out.contains("ISO-10303-21;"));
+        assert!(out.contains("HEADER;"));
+        assert!(out.contains("FILE_DESCRIPTION"));
+        assert!(out.contains("Roshera CAD Model"));
+        assert!(out.contains("FILE_NAME"));
+        assert!(out.contains("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'))"));
+        assert!(out.contains("ENDSEC;"));
+    }
+
+    // ─── B. Section markers ────────────────────────────────────────
+
+    #[test]
+    fn begin_data_emits_data_keyword() {
+        let out = write_into(|w| w.begin_data());
+        assert_eq!(out.trim(), "DATA;");
+    }
+
+    #[test]
+    fn end_data_emits_endsec() {
+        let out = write_into(|w| w.end_data());
+        assert_eq!(out.trim(), "ENDSEC;");
+    }
+
+    #[test]
+    fn write_end_emits_iso_terminator() {
+        let out = write_into(|w| w.write_end());
+        assert_eq!(out.trim(), "END-ISO-10303-21;");
+    }
+
+    #[test]
+    fn flush_succeeds_on_empty_writer() {
+        let buf: Vec<u8> = Vec::new();
+        let mut w = StepWriter::new(buf);
+        w.flush().expect("flush should succeed");
+    }
+
+    // ─── C. Primitive entity writers ───────────────────────────────
+
+    #[test]
+    fn write_cartesian_point_format() {
+        let out = write_into(|w| {
+            w.write_cartesian_point(&[1.0, 2.0, 3.0])?;
+            Ok(())
+        });
+        assert!(out.contains("CARTESIAN_POINT('',(1.000000,2.000000,3.000000))"));
+        assert!(out.contains("#1="));
+    }
+
+    #[test]
+    fn write_cartesian_point_negative_coords_six_decimals() {
+        let out = write_into(|w| {
+            w.write_cartesian_point(&[-1.5, 0.0, -2.25])?;
+            Ok(())
+        });
+        assert!(out.contains("-1.500000"));
+        assert!(out.contains("0.000000"));
+        assert!(out.contains("-2.250000"));
+    }
+
+    #[test]
+    fn write_cartesian_point_increments_id() {
+        let out = write_into(|w| {
+            w.write_cartesian_point(&[0.0, 0.0, 0.0])?;
+            w.write_cartesian_point(&[1.0, 1.0, 1.0])?;
+            w.write_cartesian_point(&[2.0, 2.0, 2.0])?;
+            Ok(())
+        });
+        assert!(out.contains("#1=CARTESIAN_POINT"));
+        assert!(out.contains("#2=CARTESIAN_POINT"));
+        assert!(out.contains("#3=CARTESIAN_POINT"));
+    }
+
+    #[test]
+    fn write_direction_format() {
+        let out = write_into(|w| {
+            w.write_direction(&[0.0, 0.0, 1.0])?;
+            Ok(())
+        });
+        assert!(out.contains("DIRECTION('',(0.000000,0.000000,1.000000))"));
+    }
+
+    #[test]
+    fn write_vector_format_includes_direction_ref_and_magnitude() {
+        let out = write_into(|w| {
+            let dir = w.write_direction(&[1.0, 0.0, 0.0])?;
+            w.write_vector(dir, 5.0)?;
+            Ok(())
+        });
+        // direction is #1, vector is #2 referencing #1 with magnitude 5
+        assert!(out.contains("#2=VECTOR('',#1,5)"));
+    }
+
+    #[test]
+    fn write_axis2_placement_3d_with_no_axis_or_ref_dir() {
+        let out = write_into(|w| {
+            w.write_axis2_placement_3d(&[0.0, 0.0, 0.0], None, None)?;
+            Ok(())
+        });
+        // Origin → #1, AXIS2_PLACEMENT_3D → #2 with $,$
+        assert!(out.contains("AXIS2_PLACEMENT_3D('',#1,$,$)"));
+    }
+
+    #[test]
+    fn write_axis2_placement_3d_full() {
+        let out = write_into(|w| {
+            w.write_axis2_placement_3d(
+                &[0.0, 0.0, 0.0],
+                Some(&[0.0, 0.0, 1.0]),
+                Some(&[1.0, 0.0, 0.0]),
+            )?;
+            Ok(())
+        });
+        // origin #1, axis #2, ref_dir #3, placement #4
+        assert!(out.contains("AXIS2_PLACEMENT_3D('',#1,#2,#3)"));
+    }
+
+    #[test]
+    fn write_axis2_placement_3d_axis_only() {
+        let out = write_into(|w| {
+            w.write_axis2_placement_3d(&[0.0, 0.0, 0.0], Some(&[0.0, 0.0, 1.0]), None)?;
+            Ok(())
+        });
+        assert!(out.contains("AXIS2_PLACEMENT_3D('',#1,#2,$)"));
+    }
+
+    #[test]
+    fn write_line_emits_endpoints_direction_vector_line() {
+        let out = write_into(|w| {
+            w.write_line(&[0.0, 0.0, 0.0], &[3.0, 4.0, 0.0])?;
+            Ok(())
+        });
+        assert!(out.contains("CARTESIAN_POINT")); // both endpoints
+        assert!(out.contains("DIRECTION"));
+        assert!(out.contains("VECTOR"));
+        assert!(out.contains("LINE("));
+        // Magnitude of (3,4,0) = 5
+        assert!(out.contains(",5)"));
+    }
+
+    #[test]
+    fn write_circle_includes_radius() {
+        let out = write_into(|w| {
+            w.write_circle(&[0.0, 0.0, 0.0], &[0.0, 0.0, 1.0], 7.5)?;
+            Ok(())
+        });
+        assert!(out.contains("CIRCLE("));
+        assert!(out.contains(",7.5)"));
+    }
+
+    // ─── D. B-Spline curves ────────────────────────────────────────
+
+    #[test]
+    fn write_b_spline_curve_non_rational() {
+        let cps = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 1.0, 0.0]];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let mults = vec![3, 3];
+        let out = write_into(|w| {
+            w.write_b_spline_curve(2, &cps, &knots, &mults, false, None)?;
+            Ok(())
+        });
+        assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS"));
+        // 3 control points + 1 b-spline entity = 4 entities
+        assert!(out.contains("#1=CARTESIAN_POINT"));
+        assert!(out.contains("#2=CARTESIAN_POINT"));
+        assert!(out.contains("#3=CARTESIAN_POINT"));
+        assert!(out.contains("#4=B_SPLINE_CURVE_WITH_KNOTS"));
+        // Degree 2 appears as first arg
+        assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS(2,"));
+    }
+
+    #[test]
+    fn write_b_spline_curve_rational_with_weights() {
+        let cps = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 1.0, 0.0]];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let mults = vec![3, 3];
+        let weights = vec![1.0, 0.5, 1.0];
+        let out = write_into(|w| {
+            w.write_b_spline_curve(2, &cps, &knots, &mults, true, Some(&weights))?;
+            Ok(())
+        });
+        assert!(out.contains("RATIONAL_B_SPLINE_CURVE"));
+        assert!(out.contains("0.500000"));
+    }
+
+    #[test]
+    fn write_b_spline_curve_rational_without_weights_falls_back() {
+        // The rational branch is only taken when BOTH rational==true AND
+        // weights.is_some(). Passing rational=true with weights=None must
+        // therefore land in the non-rational branch (no panic).
+        let cps = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let knots = vec![0.0, 0.0, 1.0, 1.0];
+        let mults = vec![2, 2];
+        let out = write_into(|w| {
+            w.write_b_spline_curve(1, &cps, &knots, &mults, true, None)?;
+            Ok(())
+        });
+        assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS"));
+        assert!(!out.contains("RATIONAL_B_SPLINE_CURVE"));
+    }
+
+    // ─── E. CurveData dispatch ─────────────────────────────────────
+
+    #[test]
+    fn write_curve_line_variant() {
+        let out = write_into(|w| {
+            let curve = CurveData::Line {
+                start: [0.0, 0.0, 0.0],
+                end: [1.0, 0.0, 0.0],
+            };
+            let vmap: HashMap<&Uuid, StepId> = HashMap::new();
+            w.write_curve(&curve, &vmap)?;
+            Ok(())
+        });
+        assert!(out.contains("LINE"));
+        assert!(out.contains("DIRECTION"));
+        assert!(out.contains("VECTOR"));
+    }
+
+    #[test]
+    fn write_curve_circle_variant() {
+        let out = write_into(|w| {
+            let curve = CurveData::Circle {
+                center: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                radius: 5.0,
+            };
+            let vmap: HashMap<&Uuid, StepId> = HashMap::new();
+            w.write_curve(&curve, &vmap)?;
+            Ok(())
+        });
+        assert!(out.contains("CIRCLE"));
+        assert!(out.contains(",5)"));
+    }
+
+    #[test]
+    fn write_curve_arc_emits_trimmed_curve() {
+        let out = write_into(|w| {
+            let curve = CurveData::Arc {
+                center: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                radius: 1.0,
+                start_angle: 0.0,
+                end_angle: std::f64::consts::PI,
+            };
+            let vmap: HashMap<&Uuid, StepId> = HashMap::new();
+            w.write_curve(&curve, &vmap)?;
+            Ok(())
+        });
+        assert!(out.contains("CIRCLE"));
+        assert!(out.contains("PARAMETER_VALUE"));
+        assert!(out.contains("TRIMMED_CURVE"));
+        // end_angle > start_angle → .T.
+        assert!(out.contains(".T."));
+    }
+
+    #[test]
+    fn write_curve_bspline_variant() {
+        let out = write_into(|w| {
+            let curve = CurveData::BSpline {
+                control_points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+                knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                degree: 2,
+            };
+            let vmap: HashMap<&Uuid, StepId> = HashMap::new();
+            w.write_curve(&curve, &vmap)?;
+            Ok(())
+        });
+        assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS"));
+        assert!(!out.contains("RATIONAL_B_SPLINE_CURVE"));
+    }
+
+    #[test]
+    fn write_curve_nurbs_variant_emits_rational() {
+        let out = write_into(|w| {
+            let curve = CurveData::Nurbs {
+                control_points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+                weights: vec![1.0, 0.5, 1.0],
+                knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                degree: 2,
+            };
+            let vmap: HashMap<&Uuid, StepId> = HashMap::new();
+            w.write_curve(&curve, &vmap)?;
+            Ok(())
+        });
+        assert!(out.contains("RATIONAL_B_SPLINE_CURVE"));
+    }
+
+    // ─── F. SurfaceData dispatch ───────────────────────────────────
+
+    #[test]
+    fn write_surface_plane() {
+        let out = write_into(|w| {
+            let s = SurfaceData::Plane {
+                origin: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("AXIS2_PLACEMENT_3D"));
+        assert!(out.contains("PLANE("));
+    }
+
+    #[test]
+    fn write_surface_cylinder() {
+        let out = write_into(|w| {
+            let s = SurfaceData::Cylinder {
+                origin: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                radius: 3.0,
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("CYLINDRICAL_SURFACE"));
+        assert!(out.contains(",3)"));
+    }
+
+    #[test]
+    fn write_surface_sphere() {
+        let out = write_into(|w| {
+            let s = SurfaceData::Sphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 2.5,
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("SPHERICAL_SURFACE"));
+        assert!(out.contains(",2.5)"));
+    }
+
+    #[test]
+    fn write_surface_cone_converts_radians_to_degrees() {
+        // half-angle of π/4 rad → 45 degrees in output
+        let out = write_into(|w| {
+            let s = SurfaceData::Cone {
+                apex: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                half_angle: std::f64::consts::FRAC_PI_4,
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("CONICAL_SURFACE"));
+        // 45.0 degrees (or close, due to f64 print of FRAC_PI_4.to_degrees())
+        assert!(out.contains(",45"));
+    }
+
+    #[test]
+    fn write_surface_torus() {
+        let out = write_into(|w| {
+            let s = SurfaceData::Torus {
+                center: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                major_radius: 5.0,
+                minor_radius: 1.0,
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("TOROIDAL_SURFACE"));
+        assert!(out.contains(",5,1)"));
+    }
+
+    // ─── G. Format helpers ─────────────────────────────────────────
+
+    #[test]
+    fn format_real_list_six_decimals() {
+        assert_eq!(format_real_list(&[1.0]), "1.000000");
+        assert_eq!(format_real_list(&[1.0, 2.5]), "1.000000,2.500000");
+    }
+
+    #[test]
+    fn format_real_list_empty() {
+        assert_eq!(format_real_list(&[]), "");
+    }
+
+    #[test]
+    fn format_real_list_negatives() {
+        assert_eq!(format_real_list(&[-1.0, 0.0]), "-1.000000,0.000000");
+    }
+
+    #[test]
+    fn format_int_list_basic() {
+        assert_eq!(format_int_list(&[1, 2, 3]), "1,2,3");
+        assert_eq!(format_int_list(&[]), "");
+        assert_eq!(format_int_list(&[42]), "42");
+    }
+
+    #[test]
+    fn format_id_list_uses_hash_prefix() {
+        assert_eq!(
+            format_id_list(&[StepId(1), StepId(2), StepId(3)]),
+            "#1,#2,#3"
+        );
+        assert_eq!(format_id_list(&[]), "");
+    }
+
+    // ─── H. Parser helpers ────────────────────────────────────────
+
+    #[test]
+    fn parse_real_list_basic() {
+        assert_eq!(parse_real_list("1.0,2.0,3.0"), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn parse_real_list_handles_whitespace() {
+        assert_eq!(parse_real_list(" 1.0 , 2.0 , 3.0 "), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn parse_real_list_skips_invalid() {
+        assert_eq!(parse_real_list("1.0,abc,3.0"), vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn parse_real_list_empty() {
+        let v: Vec<f64> = parse_real_list("");
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_ref_strips_hash() {
+        assert_eq!(parse_ref("#42"), Some(42));
+        assert_eq!(parse_ref("  #7  "), Some(7));
+    }
+
+    #[test]
+    fn parse_ref_rejects_non_hash() {
+        assert_eq!(parse_ref("42"), None);
+        assert_eq!(parse_ref(""), None);
+        assert_eq!(parse_ref("$"), None);
+    }
+
+    #[test]
+    fn parse_ref_list_basic() {
+        assert_eq!(parse_ref_list("#1,#2,#3"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_ref_list_skips_unparseable() {
+        assert_eq!(parse_ref_list("#1,$,#3"), vec![1, 3]);
+    }
+
+    #[test]
+    fn split_step_args_simple() {
+        assert_eq!(
+            split_step_args("'foo','bar',1.0"),
+            vec!["'foo'", "'bar'", "1.0"]
+        );
+    }
+
+    #[test]
+    fn split_step_args_respects_nested_parens() {
+        // Nested parens must NOT be split on inner commas
+        assert_eq!(
+            split_step_args("'name',(1.0,2.0,3.0),#5"),
+            vec!["'name'", "(1.0,2.0,3.0)", "#5"]
+        );
+    }
+
+    #[test]
+    fn split_step_args_deeply_nested() {
+        assert_eq!(
+            split_step_args("'a',((1,2),(3,4)),'b'"),
+            vec!["'a'", "((1,2),(3,4))", "'b'"]
+        );
+    }
+
+    #[test]
+    fn parse_step_entities_single() {
+        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse should succeed");
+        assert_eq!(entities.len(), 1);
+        let e = entities.get(&1).expect("entity #1 missing");
+        assert_eq!(e.id, 1);
+        assert_eq!(e.type_name, "CARTESIAN_POINT");
+        assert!(e.args.contains("0.0,0.0,0.0"));
+    }
+
+    #[test]
+    fn parse_step_entities_multiple() {
+        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0)); #2=DIRECTION('',(0.0,0.0,1.0)); #3=VECTOR('',#2,5.0);";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert_eq!(entities.len(), 3);
+        assert_eq!(entities.get(&2).map(|e| e.type_name.as_str()), Some("DIRECTION"));
+        assert_eq!(entities.get(&3).map(|e| e.type_name.as_str()), Some("VECTOR"));
+    }
+
+    #[test]
+    fn parse_step_entities_uppercases_type_name() {
+        // Type names should be normalised to uppercase regardless of input casing
+        let data = "#1=cartesian_point('',(0.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert_eq!(
+            entities.get(&1).map(|e| e.type_name.as_str()),
+            Some("CARTESIAN_POINT")
+        );
+    }
+
+    #[test]
+    fn parse_step_entities_skips_malformed() {
+        // No '#' — silently skipped, not error
+        let data = "garbage_without_hash; #1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert_eq!(entities.len(), 1);
+    }
+
+    // ─── I. Extract helpers ────────────────────────────────────────
+
+    #[test]
+    fn extract_point_from_cartesian_point() {
+        let data = "#1=CARTESIAN_POINT('name',(1.0,2.0,3.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        let p = extract_point(&entities, 1).expect("extract failed");
+        assert_eq!(p, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn extract_point_returns_none_for_wrong_type() {
+        let data = "#1=DIRECTION('',(0.0,0.0,1.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert!(extract_point(&entities, 1).is_none());
+    }
+
+    #[test]
+    fn extract_point_returns_none_for_missing_id() {
+        let entities: HashMap<u32, StepEntity> = HashMap::new();
+        assert!(extract_point(&entities, 1).is_none());
+    }
+
+    #[test]
+    fn extract_direction_from_direction_entity() {
+        let data = "#1=DIRECTION('',(1.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        let d = extract_direction(&entities, 1).expect("extract failed");
+        assert_eq!(d, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn extract_direction_returns_none_for_cartesian_point() {
+        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert!(extract_direction(&entities, 1).is_none());
+    }
+
+    #[test]
+    fn extract_axis2_placement_full() {
+        let data = "\
+            #1=CARTESIAN_POINT('',(1.0,2.0,3.0)); \
+            #2=DIRECTION('',(0.0,0.0,1.0)); \
+            #3=DIRECTION('',(1.0,0.0,0.0)); \
+            #4=AXIS2_PLACEMENT_3D('',#1,#2,#3);";
+        let entities = parse_step_entities(data).expect("parse failed");
+        let (loc, axis, ref_dir) = extract_axis2_placement(&entities, 4).expect("extract failed");
+        assert_eq!(loc, [1.0, 2.0, 3.0]);
+        assert_eq!(axis, [0.0, 0.0, 1.0]);
+        assert_eq!(ref_dir, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn extract_axis2_placement_returns_none_for_wrong_type() {
+        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert!(extract_axis2_placement(&entities, 1).is_none());
+    }
+
+    #[test]
+    fn resolve_vertex_point_through_vertex_point_entity() {
+        let data = "\
+            #1=CARTESIAN_POINT('',(0.0,0.0,0.0)); \
+            #2=VERTEX_POINT('',#1);";
+        let entities = parse_step_entities(data).expect("parse failed");
+        assert_eq!(resolve_vertex_point(&entities, 2), Some(1));
+    }
+
+    #[test]
+    fn resolve_vertex_point_through_cartesian_point_passthrough() {
+        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
+        let entities = parse_step_entities(data).expect("parse failed");
+        // Direct CARTESIAN_POINT id is returned as-is.
+        assert_eq!(resolve_vertex_point(&entities, 1), Some(1));
+    }
+
+    #[test]
+    fn resolve_vertex_point_returns_none_for_unknown() {
+        let entities: HashMap<u32, StepEntity> = HashMap::new();
+        assert!(resolve_vertex_point(&entities, 99).is_none());
+    }
+
+    // ─── J. StepExportOptions ──────────────────────────────────────
+
+    #[test]
+    fn step_export_options_default() {
+        let opts = StepExportOptions::default();
+        assert_eq!(opts.application_protocol, StepApplicationProtocol::AP203);
+        assert!(opts.include_colors);
+        assert!(opts.include_layers);
+        assert_eq!(opts.tolerance, 1e-6);
+    }
+
+    #[test]
+    fn step_application_protocol_distinct() {
+        assert_ne!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP214);
+        assert_eq!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP203);
+    }
+
+    // ─── K. Assembly constraint name mapping ───────────────────────
+
+    #[test]
+    fn assembly_constraint_coincident_maps_correctly() {
+        use geometry_engine::assembly::MateType;
+        let out = write_into(|w| {
+            w.write_assembly_constraint(&MateType::Coincident)?;
+            Ok(())
+        });
+        assert!(out.contains("COINCIDENT_CONSTRAINT"));
+    }
+
+    #[test]
+    fn assembly_constraint_distance_maps_correctly() {
+        use geometry_engine::assembly::MateType;
+        let out = write_into(|w| {
+            w.write_assembly_constraint(&MateType::Distance(10.0))?;
+            Ok(())
+        });
+        assert!(out.contains("DISTANCE_CONSTRAINT"));
+    }
+
+    #[test]
+    fn assembly_constraint_tangent_maps_correctly() {
+        use geometry_engine::assembly::MateType;
+        let out = write_into(|w| {
+            w.write_assembly_constraint(&MateType::Tangent)?;
+            Ok(())
+        });
+        assert!(out.contains("TANGENT_CONSTRAINT"));
+    }
+
+    #[test]
+    fn assembly_constraint_lock_maps_correctly() {
+        use geometry_engine::assembly::MateType;
+        let out = write_into(|w| {
+            w.write_assembly_constraint(&MateType::Lock)?;
+            Ok(())
+        });
+        assert!(out.contains("LOCK_CONSTRAINT"));
+    }
+
+    #[test]
+    fn assembly_constraint_concentric_and_parallel() {
+        use geometry_engine::assembly::MateType;
+        let out_c = write_into(|w| {
+            w.write_assembly_constraint(&MateType::Concentric)?;
+            Ok(())
+        });
+        assert!(out_c.contains("CONCENTRIC_CONSTRAINT"));
+
+        let out_p = write_into(|w| {
+            w.write_assembly_constraint(&MateType::Parallel)?;
+            Ok(())
+        });
+        assert!(out_p.contains("PARALLEL_CONSTRAINT"));
+    }
+
+    // ─── L. Round-trip: write → reparse ────────────────────────────
+
+    #[test]
+    fn round_trip_cartesian_point_via_parser() {
+        let out = write_into(|w| {
+            w.write_cartesian_point(&[1.5, -2.25, 3.125])?;
+            Ok(())
+        });
+        // Parse what we wrote and recover the coordinates
+        let entities = parse_step_entities(&out).expect("parse failed");
+        let p = extract_point(&entities, 1).expect("extract failed");
+        assert!((p[0] - 1.5).abs() < 1e-9);
+        assert!((p[1] - (-2.25)).abs() < 1e-9);
+        assert!((p[2] - 3.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_trip_direction_via_parser() {
+        let out = write_into(|w| {
+            w.write_direction(&[0.0, 1.0, 0.0])?;
+            Ok(())
+        });
+        let entities = parse_step_entities(&out).expect("parse failed");
+        let d = extract_direction(&entities, 1).expect("extract failed");
+        assert_eq!(d, [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn round_trip_axis2_placement_via_parser() {
+        let out = write_into(|w| {
+            w.write_axis2_placement_3d(
+                &[1.0, 2.0, 3.0],
+                Some(&[0.0, 0.0, 1.0]),
+                Some(&[1.0, 0.0, 0.0]),
+            )?;
+            Ok(())
+        });
+        let entities = parse_step_entities(&out).expect("parse failed");
+        // 1=loc, 2=axis, 3=refdir, 4=placement
+        let (loc, axis, ref_dir) = extract_axis2_placement(&entities, 4).expect("extract failed");
+        assert_eq!(loc, [1.0, 2.0, 3.0]);
+        assert_eq!(axis, [0.0, 0.0, 1.0]);
+        assert_eq!(ref_dir, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn round_trip_multiple_points_distinct_ids() {
+        let out = write_into(|w| {
+            w.write_cartesian_point(&[1.0, 0.0, 0.0])?;
+            w.write_cartesian_point(&[0.0, 1.0, 0.0])?;
+            w.write_cartesian_point(&[0.0, 0.0, 1.0])?;
+            Ok(())
+        });
+        let entities = parse_step_entities(&out).expect("parse failed");
+        assert_eq!(entities.len(), 3);
+        assert_eq!(extract_point(&entities, 1), Some([1.0, 0.0, 0.0]));
+        assert_eq!(extract_point(&entities, 2), Some([0.0, 1.0, 0.0]));
+        assert_eq!(extract_point(&entities, 3), Some([0.0, 0.0, 1.0]));
+    }
+}
