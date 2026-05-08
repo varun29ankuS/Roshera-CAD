@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import * as THREE from 'three'
+import { Line } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { resolveCssVar } from '@/lib/css-color'
@@ -267,27 +268,20 @@ interface EdgePolylineProps {
 }
 
 function EdgePolyline({ points, color, hover }: EdgePolylineProps) {
-  // Render the kernel-sampled curve as connected line segments.
-  // R3F's intrinsic `<line>` clashes with SVG typings, so we expand
-  // the polyline `[P0, P1, P2, …]` into the pair list
-  // `[P0, P1, P1, P2, P2, P3, …]` and draw with `<lineSegments>`.
-  const geometry = useMemo(() => {
-    const pairs: THREE.Vector3[] = []
-    for (let i = 0; i + 1 < points.length; i++) {
-      pairs.push(points[i], points[i + 1])
-    }
-    return new THREE.BufferGeometry().setFromPoints(pairs)
-  }, [points])
+  // drei's Line is built on Line2 (Three.js examples LineMaterial),
+  // which respects `lineWidth` in pixels. Plain WebGL line primitives
+  // cap at 1px on every major browser, which is why the previous
+  // `<lineSegments>` + `lineBasicMaterial` highlight was invisible
+  // against a dark viewport.
   return (
-    <lineSegments geometry={geometry}>
-      <lineBasicMaterial
-        color={color}
-        linewidth={hover ? 2 : 3}
-        depthTest={false}
-        transparent
-        opacity={hover ? 0.6 : 1}
-      />
-    </lineSegments>
+    <Line
+      points={points}
+      color={color}
+      lineWidth={hover ? 3 : 5}
+      depthTest={false}
+      transparent
+      opacity={hover ? 0.7 : 1}
+    />
   )
 }
 
@@ -346,23 +340,32 @@ interface EdgeMarkProps {
 }
 
 function EdgeMark({ ao, bo, co, color, hover }: EdgeMarkProps) {
-  // Three line segments forming the triangle outline. Without backend
-  // topology resolution we don't yet know which of the three is the
-  // user-intended edge; outlining all three still makes "I clicked
-  // somewhere and something happened" obvious.
-  const geometry = useMemo(() => {
-    return new THREE.BufferGeometry().setFromPoints([ao, bo, bo, co, co, ao])
-  }, [ao, bo, co])
+  // Triangle outline rendered with three drei Line segments so the
+  // pixel width is honoured (plain WebGL lines cap at 1px). Used only
+  // as a legacy-frame fallback when the backend frame doesn't carry a
+  // kernel-sampled polyline.
+  const segments = useMemo<Array<[THREE.Vector3, THREE.Vector3]>>(
+    () => [
+      [ao, bo],
+      [bo, co],
+      [co, ao],
+    ],
+    [ao, bo, co],
+  )
   return (
-    <lineSegments geometry={geometry}>
-      <lineBasicMaterial
-        color={color}
-        linewidth={hover ? 1 : 2}
-        depthTest={false}
-        transparent
-        opacity={hover ? 0.5 : 1}
-      />
-    </lineSegments>
+    <group>
+      {segments.map(([p0, p1], i) => (
+        <Line
+          key={i}
+          points={[p0, p1]}
+          color={color}
+          lineWidth={hover ? 2 : 3}
+          depthTest={false}
+          transparent
+          opacity={hover ? 0.5 : 1}
+        />
+      ))}
+    </group>
   )
 }
 
