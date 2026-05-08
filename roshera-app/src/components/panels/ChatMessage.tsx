@@ -15,7 +15,7 @@ export function ChatMessage({ message }: Props) {
     return (
       <div className="flex items-start gap-2 px-3 py-2">
         <Info size={14} className="text-muted-foreground mt-0.5 shrink-0" />
-        <p className="text-xs text-muted-foreground italic">{message.content}</p>
+        <p className="text-xs text-muted-foreground italic select-text">{message.content}</p>
       </div>
     )
   }
@@ -42,7 +42,7 @@ export function ChatMessage({ message }: Props) {
 
       <div
         className={cn(
-          'max-w-[85%] rounded-lg px-3 py-2 text-sm',
+          'max-w-[85%] rounded-lg px-3 py-2 text-sm select-text',
           isUser
             ? 'bg-primary text-primary-foreground'
             : isError
