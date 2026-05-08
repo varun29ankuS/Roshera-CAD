@@ -4723,6 +4723,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::agent::part_mass_properties),
         )
         .route(
+            "/api/agent/parts/uuid/{uuid}/mass",
+            get(handlers::agent::part_mass_properties_by_uuid),
+        )
+        .route(
             "/api/agent/parts/{id}/obb",
             get(handlers::agent::part_oriented_bbox),
         )

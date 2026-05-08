@@ -597,6 +597,73 @@ async function sendDirectCircularPattern(
 }
 
 /**
+ * Direct REST mass properties query against the currently selected
+ * solid. Hits `GET /api/agent/parts/uuid/{uuid}/mass`, which resolves
+ * the public UUID to the kernel's local SolidId and returns volume,
+ * surface area, mass, centre of mass, principal moments, and inertia
+ * tensor. Cache-warming on first call (kernel populates per-entity
+ * caches during the divergence-theorem integral).
+ *
+ * Result is rendered as a chat message so the user sees the values
+ * inline next to the model. No state mutation — pure read.
+ */
+async function sendDirectMassProperties() {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Mass Properties.',
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  addMessage({ role: 'user', content: `Mass properties of ${object.slice(0, 6)}` })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/agent/parts/uuid/${object}/mass`, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+    })
+    if (!resp.ok) {
+      const errBody = await resp.text().catch(() => '')
+      throw new Error(errBody || `${resp.status}`)
+    }
+    const data = await resp.json() as {
+      volume: number
+      surface_area: number
+      mass: number
+      material: { name: string; density: number }
+      center_of_mass: [number, number, number]
+      principal_moments: [number, number, number]
+      inertia_tensor: [[number, number, number], [number, number, number], [number, number, number]]
+    }
+    const fmt = (n: number, p = 4) => Number.isFinite(n) ? n.toPrecision(p) : 'n/a'
+    const com = data.center_of_mass.map((c) => fmt(c, 4)).join(', ')
+    const pm = data.principal_moments.map((c) => fmt(c, 4)).join(', ')
+    addMessage({
+      role: 'assistant',
+      content:
+        `Mass properties of ${object.slice(0, 6)}:\n` +
+        `• volume: ${fmt(data.volume)} mm³\n` +
+        `• surface area: ${fmt(data.surface_area)} mm²\n` +
+        `• mass: ${fmt(data.mass)} g (${data.material.name}, ρ=${fmt(data.material.density)} g/cm³)\n` +
+        `• centre of mass: (${com})\n` +
+        `• principal moments: (${pm})`,
+      objectsAffected: [object],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Mass properties failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Placeholder for modify ops that don't yet have a direct REST
  * endpoint. Tells the user the feature is pending instead of routing
  * through the NLP pipeline (which 5xxs without `ANTHROPIC_API_KEY`)
@@ -887,7 +954,7 @@ export function ToolBar() {
           label: 'Analyze',
           items: [
             { icon: Ruler, label: 'Measure Distance', action: () => notYetWired('Measure Distance') },
-            { icon: Pipette, label: 'Mass Properties', action: () => notYetWired('Mass Properties', 'use /api/agent/parts/{id}') },
+            { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
             { icon: Eye, label: 'Section View', action: () => notYetWired('Section View') },
             { icon: Wrench, label: 'Interference', action: () => notYetWired('Interference') },
           ],
