@@ -1201,6 +1201,194 @@ async fn shell_solid(
     })))
 }
 
+/// POST /api/geometry/mirror — mirror a solid across a plane in place.
+///
+/// Request:
+/// ```json
+/// { "object":       "<uuid>",
+///   "plane_origin": [0.0, 0.0, 0.0],   // optional, defaults to origin
+///   "plane_normal": [0.0, 0.0, 1.0]    // required; non-zero
+/// }
+/// ```
+///
+/// The kernel mirror op transforms the solid in place (vertices, curves,
+/// surface parameterization) and reverses face orientations to keep
+/// outward normals consistent. The original UUID is dropped from the
+/// id-mapping table and a new UUID is broadcast — same swap pattern as
+/// `shell_solid` — so frontend selection state is reset, keeping the
+/// "Mirror replaces the original" UX consistent across modify ops.
+async fn mirror_solid(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::{Point3, Vector3};
+    use geometry_engine::operations::transform::{mirror as kernel_mirror, TransformOptions};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let object_uuid_str = payload
+        .get("object")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'object' is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+
+    // Parse a 3-element numeric array; bail with InvalidParameter on the
+    // first malformed entry. Used for both plane_origin and plane_normal.
+    let parse_vec3 = |key: &str, required: bool, default: [f64; 3]| -> Result<[f64; 3], ApiError> {
+        let raw = match payload.get(key) {
+            Some(v) => v,
+            None if !required => return Ok(default),
+            None => return Err(ApiError::missing_field(key)),
+        };
+        let arr = raw.as_array().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'{key}' must be a 3-element JSON array of numbers"),
+            )
+        })?;
+        if arr.len() != 3 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'{key}' must have exactly 3 entries, got {}", arr.len()),
+            ));
+        }
+        let mut out = [0.0_f64; 3];
+        for (i, item) in arr.iter().enumerate() {
+            let v = item.as_f64().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'{key}[{i}]' must be a finite number, got {item}"),
+                )
+            })?;
+            if !v.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'{key}[{i}]' must be finite, got {v}"),
+                ));
+            }
+            out[i] = v;
+        }
+        Ok(out)
+    };
+
+    let origin = parse_vec3("plane_origin", false, [0.0, 0.0, 0.0])?;
+    let normal = parse_vec3("plane_normal", true, [0.0, 0.0, 1.0])?;
+
+    let normal_len_sq = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+    if normal_len_sq < 1e-18 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'plane_normal' must be a non-zero vector".to_string(),
+        ));
+    }
+
+    let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object={object_uuid}"),
+        )
+    })?;
+
+    // Hold the model write lock only for the kernel mirror op; tessellation
+    // runs under a read lock so concurrent writers aren't blocked. Same
+    // pattern as boolean_operation / shell_solid.
+    {
+        let mut model = state.model.write().await;
+        kernel_mirror(
+            &mut model,
+            vec![solid_id],
+            Point3::new(origin[0], origin[1], origin[2]),
+            Vector3::new(normal[0], normal[1], normal[2]),
+            TransformOptions::default(),
+        )
+        .map_err(ApiError::kernel_error)?;
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+
+    let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    // Mirror is in-place at the kernel level, so the same solid_id now
+    // holds the mirrored topology. Swap the public UUID anyway so frontend
+    // viewers see a fresh ObjectCreated frame and reset selection state —
+    // matches the Shell pattern and avoids relying on a not-yet-existent
+    // ObjectUpdated frame.
+    state.unregister_id_mapping(&object_uuid);
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, solid_id);
+
+    let display_name = format!("Mirror {}", solid_id);
+    let parameters = serde_json::json!({
+        "plane_origin": origin,
+        "plane_normal": normal,
+        "source": object_uuid.to_string(),
+    });
+
+    broadcast_object_deleted(&object_uuid.to_string());
+    broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        solid_id,
+        "mirror",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals_buf,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": solid_id,
+        "consumed": [object_uuid.to_string()],
+        "object": {
+            "id":         result_id_str,
+            "name":       display_name,
+            "objectType": "mirror",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals_buf,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":   tri_mesh.vertices.len(),
+            "triangle_count": tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 /// POST /api/geometry/extrude — sketch a closed planar polygon and
 /// extrude it into a solid in one shot.
 ///
@@ -3710,6 +3898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/extrude", post(create_extrude))
         .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
         .route("/api/geometry/shell", post(shell_solid))
+        .route("/api/geometry/mirror", post(mirror_solid))
         // 2D sketch sessions — backend-owned source of truth for the
         // click-to-place workflow. Frontend creates a session, streams
         // points / plane / tool changes through the REST surface, and
