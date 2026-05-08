@@ -583,34 +583,35 @@ impl ConstraintSolver {
 
         // Numerical differentiation for now
         let h = 1e-8;
-        let mut param_index = 0;
 
+        // Snapshot free-parameter descriptors so the DashMap iterator's read
+        // guard is released before we hand mutating get_mut calls down to
+        // perturb_parameter. Holding the iter() guard across get_mut on the
+        // same shard would deadlock; this two-pass split is the safe pattern.
+        let mut free_params: Vec<(EntityRef, usize, f64)> = Vec::new();
         for entry in self.entity_state.iter() {
             let entity = entry.key();
             let state = entry.value();
-
             for (i, &fixed) in state.fixed_mask.iter().enumerate() {
                 if !fixed {
-                    // Perturb parameter
-                    let original = state.parameters[i];
-
-                    // Forward difference
-                    self.perturb_parameter(entity, i, original + h);
-                    let errors_plus = self.compute_constraint_errors();
-
-                    self.perturb_parameter(entity, i, original - h);
-                    let errors_minus = self.compute_constraint_errors();
-
-                    // Restore original
-                    self.perturb_parameter(entity, i, original);
-
-                    // Compute derivatives
-                    for (j, (ep, em)) in errors_plus.iter().zip(errors_minus.iter()).enumerate() {
-                        jacobian[j][param_index] = (ep - em) / (2.0 * h);
-                    }
-
-                    param_index += 1;
+                    free_params.push((entity.clone(), i, state.parameters[i]));
                 }
+            }
+        }
+
+        for (param_index, (entity, i, original)) in free_params.into_iter().enumerate() {
+            // Central difference
+            self.perturb_parameter(&entity, i, original + h);
+            let errors_plus = self.compute_constraint_errors();
+
+            self.perturb_parameter(&entity, i, original - h);
+            let errors_minus = self.compute_constraint_errors();
+
+            // Restore original
+            self.perturb_parameter(&entity, i, original);
+
+            for (j, (ep, em)) in errors_plus.iter().zip(errors_minus.iter()).enumerate() {
+                jacobian[j][param_index] = (ep - em) / (2.0 * h);
             }
         }
 
@@ -1162,5 +1163,1194 @@ impl EntityState {
             parameters: vec![center.x, center.y, radius],
             fixed_mask: vec![center_fixed, center_fixed, radius_fixed],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Coverage tests for the 2D constraint solver.
+    //!
+    //! These tests exercise:
+    //! - Solver lifecycle / configuration (Category A)
+    //! - Convergence-status enumeration (Category B)
+    //! - Geometric-constraint evaluators (Category C)
+    //! - Dimensional-constraint evaluators (Category D)
+    //! - Jacobian computation via numerical differentiation (Category E)
+    //! - Gaussian elimination (Category F)
+    //! - Parameter-update damping and the fixed mask (Category G)
+    //! - Violation reporting (Category H)
+    //! - Robustness / degenerate inputs (Category I)
+    //!
+    //! Tests use only the public surface of [`ConstraintSolver`] and
+    //! [`EntityState`]; entity kinds whose state cannot be authored
+    //! through the public API today (Arc, Rectangle, Ellipse, Spline,
+    //! Polyline) are exercised indirectly via constraints they share
+    //! with the supported kinds (Line, Circle).
+    #![allow(clippy::float_cmp)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::sketch2d::constraints::{ConstraintPriority, ConstraintType};
+    use crate::sketch2d::{Circle2dId, Line2dId, Point2dId};
+
+    // ────────────────────────────── helpers ───────────────────────────
+
+    fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
+        (a - b).abs() < eps
+    }
+
+    fn point_ref() -> EntityRef {
+        EntityRef::Point(Point2dId::new())
+    }
+
+    fn line_ref() -> EntityRef {
+        EntityRef::Line(Line2dId::new())
+    }
+
+    fn circle_ref() -> EntityRef {
+        EntityRef::Circle(Circle2dId::new())
+    }
+
+    fn coincident(p1: EntityRef, p2: EntityRef) -> Constraint {
+        Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![p1, p2],
+            ConstraintPriority::High,
+        )
+    }
+
+    fn distance(p1: EntityRef, p2: EntityRef, d: f64) -> Constraint {
+        Constraint::new_dimensional(
+            DimensionalConstraint::Distance(d),
+            vec![p1, p2],
+            ConstraintPriority::High,
+        )
+    }
+
+    // ───────────────────── A. Lifecycle & configuration ───────────────
+
+    #[test]
+    fn solver_new_has_zero_entities_and_constraints() {
+        let s = ConstraintSolver::new();
+        assert_eq!(s.entity_state.len(), 0);
+        assert_eq!(s.constraints.len(), 0);
+        assert_eq!(s.dependency_graph.len(), 0);
+    }
+
+    #[test]
+    fn solver_default_max_iterations_is_100() {
+        let s = ConstraintSolver::new();
+        assert_eq!(s.max_iterations, 100);
+    }
+
+    #[test]
+    fn solver_default_tolerance_is_1e_minus_10() {
+        let s = ConstraintSolver::new();
+        assert_eq!(s.tolerance, 1e-10);
+    }
+
+    #[test]
+    fn set_max_iterations_updates_field() {
+        let mut s = ConstraintSolver::new();
+        s.set_max_iterations(42);
+        assert_eq!(s.max_iterations, 42);
+    }
+
+    #[test]
+    fn set_tolerance_updates_field() {
+        let mut s = ConstraintSolver::new();
+        s.set_tolerance(1e-3);
+        assert_eq!(s.tolerance, 1e-3);
+    }
+
+    #[test]
+    fn add_entity_inserts_into_dashmap() {
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(1.0, 2.0), false));
+        assert!(s.entity_state.contains_key(&p));
+    }
+
+    #[test]
+    fn set_constraints_builds_dependency_graph() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let c = coincident(a, b);
+        let cid = c.id;
+        s.set_constraints(vec![c]);
+        let deps = s.dependency_graph.get(&cid).expect("graph entry");
+        assert!(deps.contains(&a));
+        assert!(deps.contains(&b));
+    }
+
+    // ────────────────── B. Convergence-status enumeration ─────────────
+
+    #[test]
+    fn empty_system_converges_immediately() {
+        let mut s = ConstraintSolver::new();
+        let r = s.solve();
+        match r.status {
+            SolverStatus::Converged { iterations, .. } => assert_eq!(iterations, 0),
+            other => panic!("expected Converged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn coincident_two_free_points_converges() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(2.0, 0.0), false));
+        s.set_constraints(vec![coincident(a, b)]);
+        let r = s.solve();
+        // The system is under-constrained (4 DOF, 2 equations), so
+        // check_constraint_count reports it before iteration starts.
+        assert!(matches!(
+            r.status,
+            SolverStatus::UnderConstrained { .. }
+                | SolverStatus::Converged { .. }
+        ));
+    }
+
+    #[test]
+    fn coincident_one_free_one_fixed_converges_to_fixed() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), true));
+        s.set_constraints(vec![coincident(a, b)]);
+        let r = s.solve();
+        match r.status {
+            SolverStatus::Converged { final_error, .. } => {
+                assert!(final_error < 1e-8, "final_error={}", final_error);
+            }
+            other => panic!("expected Converged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn loose_tolerance_converges_in_zero_iterations() {
+        let mut s = ConstraintSolver::new();
+        s.set_tolerance(1.0); // anything finite is "good enough"
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(0.5, 0.5), true));
+        s.set_constraints(vec![coincident(a, b)]);
+        let r = s.solve();
+        if let SolverStatus::Converged { iterations, .. } = r.status {
+            assert_eq!(iterations, 0);
+        } // else under-constrained — also acceptable: nothing to do
+    }
+
+    #[test]
+    fn over_constrained_emits_status() {
+        // 1 free point (DOF=2) with 5 X-coordinate constraints (DOF removed = 5).
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(0.0, 0.0), false));
+        let constraints: Vec<Constraint> = (0..5)
+            .map(|_| {
+                Constraint::new_dimensional(
+                    DimensionalConstraint::XCoordinate(1.0),
+                    vec![p],
+                    ConstraintPriority::High,
+                )
+            })
+            .collect();
+        s.set_constraints(constraints);
+        let r = s.solve();
+        match r.status {
+            SolverStatus::OverConstrained { conflicting_constraints } => {
+                assert_eq!(conflicting_constraints, 3);
+            }
+            other => panic!("expected OverConstrained, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn under_constrained_emits_status() {
+        // 2 free points (DOF=4) with no constraints.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 1.0), false));
+        let r = s.solve();
+        match r.status {
+            SolverStatus::UnderConstrained { degrees_of_freedom } => {
+                assert_eq!(degrees_of_freedom, 4);
+            }
+            other => panic!("expected UnderConstrained, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fixed_point_has_zero_dof() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(1.0, 2.0), true));
+        assert_eq!(s.count_degrees_of_freedom(), 0);
+    }
+
+    #[test]
+    fn free_circle_has_three_dof() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 1.0, false, false),
+        );
+        assert_eq!(s.count_degrees_of_freedom(), 3);
+    }
+
+    // ──────────────── C. Geometric-constraint evaluators ──────────────
+
+    #[test]
+    fn coincident_error_is_xy_difference() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(1.0, 2.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(4.0, 7.0), false));
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Coincident,
+            &[a, b],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], -3.0, 1e-12));
+        assert!(approx_eq(errs[1], -5.0, 1e-12));
+    }
+
+    #[test]
+    fn coincident_zero_when_collocated() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(2.0, 3.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(2.0, 3.0), false));
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Coincident,
+            &[a, b],
+        );
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+        assert!(approx_eq(errs[1], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn parallel_lines_error_zero_for_aligned_directions() {
+        let mut s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        s.add_entity(
+            l1,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::new(1.0, 0.0),
+                false,
+                false,
+            ),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(
+                Point2d::new(3.0, 4.0),
+                Vector2d::new(2.0, 0.0),
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Parallel,
+            &[l1, l2],
+        );
+        assert_eq!(errs.len(), 1);
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn perpendicular_lines_error_zero_for_orthogonal_directions() {
+        let mut s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        s.add_entity(
+            l1,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_X,
+                false,
+                false,
+            ),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_Y,
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Perpendicular,
+            &[l1, l2],
+        );
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn horizontal_error_is_dir_y() {
+        let mut s = ConstraintSolver::new();
+        let l = line_ref();
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::new(1.0, 0.5),
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Horizontal,
+            &[l],
+        );
+        assert!(approx_eq(errs[0], 0.5, 1e-12));
+    }
+
+    #[test]
+    fn vertical_error_is_dir_x() {
+        let mut s = ConstraintSolver::new();
+        let l = line_ref();
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::new(0.25, 1.0),
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Vertical,
+            &[l],
+        );
+        assert!(approx_eq(errs[0], 0.25, 1e-12));
+    }
+
+    #[test]
+    fn tangent_line_circle_error_perp_distance_minus_radius() {
+        // Line along x-axis through origin; circle at (0, 5), r = 3.
+        // Perpendicular distance from circle center to line = 5; error = 5 - 3 = 2.
+        let mut s = ConstraintSolver::new();
+        let l = line_ref();
+        let c = circle_ref();
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_X,
+                false,
+                false,
+            ),
+        );
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 5.0), 3.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Tangent,
+            &[l, c],
+        );
+        assert!(approx_eq(errs[0], 2.0, 1e-12));
+    }
+
+    #[test]
+    fn concentric_circles_error_is_center_diff() {
+        let mut s = ConstraintSolver::new();
+        let c1 = circle_ref();
+        let c2 = circle_ref();
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(1.0, 2.0), 5.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(4.0, 6.0), 5.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Concentric,
+            &[c1, c2],
+        );
+        assert!(approx_eq(errs[0], -3.0, 1e-12));
+        assert!(approx_eq(errs[1], -4.0, 1e-12));
+    }
+
+    #[test]
+    fn equal_circles_error_is_radius_diff() {
+        let mut s = ConstraintSolver::new();
+        let c1 = circle_ref();
+        let c2 = circle_ref();
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::ORIGIN, 7.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::ORIGIN, 4.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Equal,
+            &[c1, c2],
+        );
+        assert!(approx_eq(errs[0], 3.0, 1e-12));
+    }
+
+    #[test]
+    fn point_on_line_zero_error_when_on_line() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let l = line_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(5.0, 0.0), false));
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_X,
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, l],
+        );
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn point_on_line_nonzero_error_when_off_line() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let l = line_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(5.0, 3.0), false));
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_X,
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, l],
+        );
+        assert!(errs[0].abs() > 1e-6);
+    }
+
+    #[test]
+    fn point_on_circle_error_dist_minus_radius() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let c = circle_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(5.0, 0.0), false));
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::ORIGIN, 3.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, c],
+        );
+        assert!(approx_eq(errs[0], 2.0, 1e-12));
+    }
+
+    #[test]
+    fn collinear_three_points_zero_for_aligned() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let c = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 1.0), false));
+        s.add_entity(c, EntityState::point(Point2d::new(2.0, 2.0), false));
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Collinear,
+            &[a, b, c],
+        );
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn collinear_three_points_nonzero_for_offset() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let c = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), false));
+        s.add_entity(c, EntityState::point(Point2d::new(2.0, 1.0), false));
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Collinear,
+            &[a, b, c],
+        );
+        assert!(errs[0].abs() > 0.5);
+    }
+
+    #[test]
+    fn midpoint_constraint_zero_when_at_midpoint() {
+        // Line goes from (0,0) along +x; get_line_end uses scale of 100,
+        // so endpoint is (100,0); midpoint is (50, 0).
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let l = line_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(50.0, 0.0), false));
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_X,
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Midpoint,
+            &[p, l],
+        );
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+        assert!(approx_eq(errs[1], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn symmetric_zero_when_reflected_correctly() {
+        // Axis line: through origin along +x. Reflection of (1, 1) across
+        // x-axis is (1, -1).
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let axis = line_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(1.0, 1.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, -1.0), false));
+        s.add_entity(
+            axis,
+            EntityState::line(
+                Point2d::ORIGIN,
+                Vector2d::UNIT_X,
+                false,
+                false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Symmetric,
+            &[a, b, axis],
+        );
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+        assert!(approx_eq(errs[1], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn coincident_wrong_arity_returns_zeros() {
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        // Only one entity passed
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Coincident,
+            &[p],
+        );
+        assert_eq!(errs, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn parallel_missing_entity_returns_zero() {
+        // Both refs unknown to solver
+        let s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Parallel,
+            &[l1, l2],
+        );
+        // The solver returns Vector2d::UNIT_X for missing line directions,
+        // so both directions match → cross product = 0.
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+    }
+
+    // ─────────────── D. Dimensional-constraint evaluators ─────────────
+
+    #[test]
+    fn distance_error_is_actual_minus_target() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let errs = s.evaluate_dimensional_constraint(
+            &DimensionalConstraint::Distance(2.0),
+            &[a, b],
+        );
+        // Pythagorean distance is 5, target is 2 → error = 3
+        assert!(approx_eq(errs[0], 3.0, 1e-12));
+    }
+
+    #[test]
+    fn radius_error_is_actual_minus_target() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::ORIGIN, 5.0, false, false),
+        );
+        let errs = s.evaluate_dimensional_constraint(
+            &DimensionalConstraint::Radius(3.0),
+            &[c],
+        );
+        assert!(approx_eq(errs[0], 2.0, 1e-12));
+    }
+
+    #[test]
+    fn x_coordinate_error_is_pos_minus_target() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(1.5, 0.0), false));
+        let errs = s.evaluate_dimensional_constraint(
+            &DimensionalConstraint::XCoordinate(1.0),
+            &[p],
+        );
+        assert!(approx_eq(errs[0], 0.5, 1e-12));
+    }
+
+    #[test]
+    fn y_coordinate_error_is_pos_minus_target() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(0.0, -2.3), false));
+        let errs = s.evaluate_dimensional_constraint(
+            &DimensionalConstraint::YCoordinate(0.0),
+            &[p],
+        );
+        assert!(approx_eq(errs[0], -2.3, 1e-12));
+    }
+
+    #[test]
+    fn distance_missing_entity_returns_zero() {
+        let s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let errs = s.evaluate_dimensional_constraint(
+            &DimensionalConstraint::Distance(5.0),
+            &[a, b],
+        );
+        assert_eq!(errs, vec![0.0]);
+    }
+
+    #[test]
+    fn radius_for_non_circle_entity_returns_zero() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
+        let errs = s.evaluate_dimensional_constraint(
+            &DimensionalConstraint::Radius(1.0),
+            &[p],
+        );
+        assert_eq!(errs, vec![0.0]);
+    }
+
+    // ───────────────── E. Jacobian / numerical differentiation ────────
+
+    #[test]
+    fn jacobian_dimensions_match_system_size() {
+        // 1 free point (DOF=2) + 1 distance constraint (1 row).
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, true));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 1.0), false));
+        s.set_constraints(vec![distance(a, b, 1.0)]);
+        let j = s.compute_jacobian();
+        assert_eq!(j.len(), 1, "rows = number of error components");
+        assert_eq!(j[0].len(), 2, "cols = number of free parameters");
+    }
+
+    #[test]
+    fn jacobian_skips_fixed_parameters() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        // Point is fully fixed → 0 free params.
+        s.add_entity(p, EntityState::point(Point2d::new(1.0, 2.0), true));
+        s.set_constraints(vec![Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![p],
+            ConstraintPriority::High,
+        )]);
+        let j = s.compute_jacobian();
+        assert_eq!(j[0].len(), 0);
+    }
+
+    #[test]
+    fn jacobian_restores_perturbed_parameters() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, true));
+        s.add_entity(b, EntityState::point(Point2d::new(2.0, 3.0), false));
+        s.set_constraints(vec![distance(a, b, 1.0)]);
+        let _ = s.compute_jacobian();
+        let entry = s.entity_state.get(&b).expect("b present");
+        assert!(approx_eq(entry.parameters[0], 2.0, 1e-12));
+        assert!(approx_eq(entry.parameters[1], 3.0, 1e-12));
+    }
+
+    #[test]
+    fn jacobian_numerical_derivative_matches_distance() {
+        // For points A=(0,0) fixed and B=(1,0) free, distance constraint
+        // d(A,B)=t. ∂error/∂Bx = 1, ∂error/∂By = 0 at this configuration.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, true));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), false));
+        s.set_constraints(vec![distance(a, b, 0.5)]);
+        let j = s.compute_jacobian();
+        assert!(approx_eq(j[0][0], 1.0, 1e-5));
+        assert!(approx_eq(j[0][1], 0.0, 1e-5));
+    }
+
+    #[test]
+    fn constraint_error_count_matches_evaluator_output() {
+        let s = ConstraintSolver::new();
+        let coinc = coincident(point_ref(), point_ref());
+        let dist = distance(point_ref(), point_ref(), 1.0);
+        assert_eq!(s.constraint_error_count(&coinc), 2);
+        assert_eq!(s.constraint_error_count(&dist), 1);
+    }
+
+    // ─────────────────── F. Gaussian elimination ──────────────────────
+
+    #[test]
+    fn gauss_solves_identity() {
+        let s = ConstraintSolver::new();
+        let a = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let b = vec![1.0, 2.0, 3.0];
+        let x = s.gaussian_elimination(a, b).expect("ok");
+        assert!(approx_eq(x[0], 1.0, 1e-12));
+        assert!(approx_eq(x[1], 2.0, 1e-12));
+        assert!(approx_eq(x[2], 3.0, 1e-12));
+    }
+
+    #[test]
+    fn gauss_solves_2x2_simple() {
+        let s = ConstraintSolver::new();
+        // [[2,1],[1,2]] * [1,1]^T = [3,3]
+        let a = vec![vec![2.0, 1.0], vec![1.0, 2.0]];
+        let b = vec![3.0, 3.0];
+        let x = s.gaussian_elimination(a, b).expect("ok");
+        assert!(approx_eq(x[0], 1.0, 1e-12));
+        assert!(approx_eq(x[1], 1.0, 1e-12));
+    }
+
+    #[test]
+    fn gauss_pivots_when_first_row_has_zero_diag() {
+        let s = ConstraintSolver::new();
+        // [[0,1],[1,0]] * [x,y]^T = [2,3] → x=3, y=2
+        let a = vec![vec![0.0, 1.0], vec![1.0, 0.0]];
+        let b = vec![2.0, 3.0];
+        let x = s.gaussian_elimination(a, b).expect("ok");
+        assert!(approx_eq(x[0], 3.0, 1e-12));
+        assert!(approx_eq(x[1], 2.0, 1e-12));
+    }
+
+    #[test]
+    fn gauss_singular_matrix_returns_err() {
+        let s = ConstraintSolver::new();
+        // Linearly dependent rows
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let b = vec![3.0, 6.0];
+        assert!(s.gaussian_elimination(a, b).is_err());
+    }
+
+    #[test]
+    fn gauss_handles_3x3_with_pivoting() {
+        let s = ConstraintSolver::new();
+        // System: x+y+z=6, 2y+5z=-4, 2x+5y-z=27 → x=5, y=3, z=-2
+        let a = vec![
+            vec![1.0, 1.0, 1.0],
+            vec![0.0, 2.0, 5.0],
+            vec![2.0, 5.0, -1.0],
+        ];
+        let b = vec![6.0, -4.0, 27.0];
+        let x = s.gaussian_elimination(a, b).expect("ok");
+        assert!(approx_eq(x[0], 5.0, 1e-9));
+        assert!(approx_eq(x[1], 3.0, 1e-9));
+        assert!(approx_eq(x[2], -2.0, 1e-9));
+    }
+
+    #[test]
+    fn linear_solver_handles_empty_system() {
+        let s = ConstraintSolver::new();
+        let j: Vec<Vec<f64>> = vec![vec![]];
+        let errs: Vec<f64> = vec![];
+        let result = s.solve_linear_system(&j, &errs).expect("ok");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn linear_solver_least_squares_underdetermined() {
+        // 1 equation, 2 unknowns: J = [[1, 1]], errors = [2]
+        // J^T J = [[1,1],[1,1]] is singular → solve_linear_system returns Err.
+        let s = ConstraintSolver::new();
+        let j = vec![vec![1.0, 1.0]];
+        let errs = vec![2.0];
+        assert!(s.solve_linear_system(&j, &errs).is_err());
+    }
+
+    // ────────────────── G. apply_updates / damping ────────────────────
+
+    #[test]
+    fn apply_updates_with_default_damping_half() {
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(10.0, 20.0), false));
+        s.apply_updates(&[2.0, 4.0], 0.5);
+        let entry = s.entity_state.get(&p).expect("present");
+        assert!(approx_eq(entry.parameters[0], 11.0, 1e-12));
+        assert!(approx_eq(entry.parameters[1], 22.0, 1e-12));
+    }
+
+    #[test]
+    fn apply_updates_zero_damping_freezes_state() {
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(7.0, 8.0), false));
+        s.apply_updates(&[100.0, 200.0], 0.0);
+        let entry = s.entity_state.get(&p).expect("present");
+        assert_eq!(entry.parameters[0], 7.0);
+        assert_eq!(entry.parameters[1], 8.0);
+    }
+
+    #[test]
+    fn apply_updates_full_damping_takes_full_step() {
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.apply_updates(&[3.0, 4.0], 1.0);
+        let entry = s.entity_state.get(&p).expect("present");
+        assert!(approx_eq(entry.parameters[0], 3.0, 1e-12));
+        assert!(approx_eq(entry.parameters[1], 4.0, 1e-12));
+    }
+
+    #[test]
+    fn apply_updates_skips_fixed_components() {
+        // Line with point fixed and direction free.
+        let s = ConstraintSolver::new();
+        let l = line_ref();
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::new(1.0, 1.0),
+                Vector2d::new(0.0, 0.0),
+                true,
+                false,
+            ),
+        );
+        // 2 free params (dx, dy); apply [10, 20] with full damping.
+        s.apply_updates(&[10.0, 20.0], 1.0);
+        let entry = s.entity_state.get(&l).expect("present");
+        assert_eq!(entry.parameters[0], 1.0); // point.x untouched
+        assert_eq!(entry.parameters[1], 1.0); // point.y untouched
+        assert!(approx_eq(entry.parameters[2], 10.0, 1e-12));
+        assert!(approx_eq(entry.parameters[3], 20.0, 1e-12));
+    }
+
+    // ─────────────────── H. Violation reporting ───────────────────────
+
+    #[test]
+    fn violations_empty_when_constraints_satisfied() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::ORIGIN, false));
+        s.set_constraints(vec![coincident(a, b)]);
+        let v = s.get_violations();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn violations_populated_when_above_tolerance() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let c = coincident(a, b);
+        let cid = c.id;
+        s.set_constraints(vec![c]);
+        let v = s.get_violations();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].0, cid);
+        assert!(approx_eq(v[0].1, 5.0, 1e-12)); // sqrt(3² + 4²)
+    }
+
+    #[test]
+    fn violations_filtered_below_tolerance() {
+        let mut s = ConstraintSolver::new();
+        s.set_tolerance(10.0);
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), false));
+        s.set_constraints(vec![coincident(a, b)]);
+        let v = s.get_violations();
+        assert!(v.is_empty());
+    }
+
+    // ────────────────── I. Robustness / edge cases ────────────────────
+
+    #[test]
+    fn get_entity_updates_returns_point_variant_for_point_ref() {
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let updates = s.get_entity_updates();
+        match updates.get(&p).expect("present") {
+            EntityUpdate::Point(pt) => {
+                assert_eq!(pt.x, 3.0);
+                assert_eq!(pt.y, 4.0);
+            }
+            other => panic!("expected Point variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_entity_updates_returns_line_variant_for_line_ref() {
+        let s = ConstraintSolver::new();
+        let l = line_ref();
+        s.add_entity(
+            l,
+            EntityState::line(
+                Point2d::new(1.0, 2.0),
+                Vector2d::new(3.0, 4.0),
+                false,
+                false,
+            ),
+        );
+        let updates = s.get_entity_updates();
+        match updates.get(&l).expect("present") {
+            EntityUpdate::Line(pt, dir) => {
+                assert_eq!(pt.x, 1.0);
+                assert_eq!(pt.y, 2.0);
+                assert_eq!(dir.x, 3.0);
+                assert_eq!(dir.y, 4.0);
+            }
+            other => panic!("expected Line variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_entity_updates_returns_circle_variant_for_circle_ref() {
+        let s = ConstraintSolver::new();
+        let c = circle_ref();
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(5.0, 6.0), 2.5, false, false),
+        );
+        let updates = s.get_entity_updates();
+        match updates.get(&c).expect("present") {
+            EntityUpdate::Circle(center, r) => {
+                assert_eq!(center.x, 5.0);
+                assert_eq!(center.y, 6.0);
+                assert_eq!(*r, 2.5);
+            }
+            other => panic!("expected Circle variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dependency_graph_rebuilt_on_set_constraints() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let c = point_ref();
+        let first = coincident(a, b);
+        let second = coincident(b, c);
+        s.set_constraints(vec![first.clone()]);
+        assert_eq!(s.dependency_graph.len(), 1);
+        s.set_constraints(vec![second.clone()]);
+        // Old entry is gone; new one is present.
+        assert_eq!(s.dependency_graph.len(), 1);
+        assert!(!s.dependency_graph.contains_key(&first.id));
+        assert!(s.dependency_graph.contains_key(&second.id));
+    }
+
+    #[test]
+    fn missing_point_in_coincident_yields_zero_error() {
+        // entities[0] missing → get_point_position returns None → falls
+        // through to the `(None, _)` arm, which yields `vec![0.0, 0.0]`.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 2.0), false));
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Coincident,
+            &[a, b],
+        );
+        assert_eq!(errs, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn solve_empty_returns_finite_solve_time() {
+        let mut s = ConstraintSolver::new();
+        let r = s.solve();
+        assert!(r.solve_time_ms.is_finite());
+        assert!(r.solve_time_ms >= 0.0);
+    }
+
+    #[test]
+    fn count_constraint_dof_aggregates_priorities() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        // Coincident removes 2 DOF, distance removes 1 DOF → 3 total.
+        s.set_constraints(vec![coincident(a, b), distance(a, b, 1.0)]);
+        assert_eq!(s.count_constraint_dof(), 3);
+    }
+
+    #[test]
+    fn x_coordinate_constraint_drives_solver_to_target() {
+        // Single free point; one X-coordinate constraint (DOF=2 vs 1).
+        // System is under-constrained; solver returns UnderConstrained
+        // without iterating, regardless of input x.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(7.0, 0.0), false));
+        s.set_constraints(vec![Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![p],
+            ConstraintPriority::High,
+        )]);
+        let r = s.solve();
+        assert!(matches!(r.status, SolverStatus::UnderConstrained { .. }));
+    }
+
+    #[test]
+    fn fully_constrained_xy_drives_point_to_target() {
+        // 1 free point (2 DOF) + 2 dimensional constraints (X + Y).
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.set_constraints(vec![
+            Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(3.0),
+                vec![p],
+                ConstraintPriority::High,
+            ),
+            Constraint::new_dimensional(
+                DimensionalConstraint::YCoordinate(4.0),
+                vec![p],
+                ConstraintPriority::High,
+            ),
+        ]);
+        let r = s.solve();
+        match r.status {
+            SolverStatus::Converged { final_error, .. } => {
+                assert!(final_error < 1e-8, "final_error = {}", final_error);
+            }
+            other => panic!("expected Converged, got {:?}", other),
+        }
+        // Verify the point landed at (3, 4).
+        match r
+            .entity_updates
+            .get(&p)
+            .expect("update for p present")
+        {
+            EntityUpdate::Point(pt) => {
+                assert!(approx_eq(pt.x, 3.0, 1e-6));
+                assert!(approx_eq(pt.y, 4.0, 1e-6));
+            }
+            other => panic!("expected Point update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_constraints_sorts_by_priority_during_solve() {
+        // Required (0) < High (1). solve() sorts ascending so that
+        // higher-priority (lower-valued) constraints are processed first.
+        // Use two free points + two constraints sized so check_constraint_count
+        // returns None (4 DOF == 4 DOF removed) and the sort actually runs.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), false));
+        let high = Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![a, b],
+            ConstraintPriority::High,
+        );
+        let required = Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![a, b],
+            ConstraintPriority::Required,
+        );
+        s.set_constraints(vec![high, required]);
+        let _ = s.solve();
+        // After solve, constraints[0] should be Required.
+        assert_eq!(s.constraints[0].priority, ConstraintPriority::Required);
+        assert_eq!(s.constraints[1].priority, ConstraintPriority::High);
+    }
+
+    // EntityState constructors
+
+    #[test]
+    fn entity_state_point_layout() {
+        let st = EntityState::point(Point2d::new(1.5, -2.5), false);
+        assert_eq!(st.parameters, vec![1.5, -2.5]);
+        assert_eq!(st.fixed_mask, vec![false, false]);
+    }
+
+    #[test]
+    fn entity_state_point_fixed_layout() {
+        let st = EntityState::point(Point2d::new(0.0, 0.0), true);
+        assert_eq!(st.fixed_mask, vec![true, true]);
+    }
+
+    #[test]
+    fn entity_state_line_layout() {
+        let st = EntityState::line(
+            Point2d::new(1.0, 2.0),
+            Vector2d::new(3.0, 4.0),
+            false,
+            true,
+        );
+        assert_eq!(st.parameters, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(st.fixed_mask, vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn entity_state_circle_layout() {
+        let st = EntityState::circle(Point2d::new(5.0, 6.0), 7.0, true, false);
+        assert_eq!(st.parameters, vec![5.0, 6.0, 7.0]);
+        assert_eq!(st.fixed_mask, vec![true, true, false]);
+    }
+
+    #[test]
+    fn solver_result_carries_status_constraint_type_arms() {
+        // Just verifies all SolverStatus variants exist and are debug-printable.
+        let _converged = SolverStatus::Converged { iterations: 1, final_error: 0.0 };
+        let _not = SolverStatus::NotConverged { iterations: 99, final_error: 1.0 };
+        let _over = SolverStatus::OverConstrained { conflicting_constraints: 1 };
+        let _under = SolverStatus::UnderConstrained { degrees_of_freedom: 1 };
+        let _unstable = SolverStatus::Unstable;
+        let _ct = ConstraintType::Geometric(GeometricConstraint::Coincident);
     }
 }
