@@ -730,6 +730,110 @@ async function sendDirectMassProperties() {
 }
 
 /**
+ * Direct REST interference check across every pair of selected solids.
+ * For each unordered pair, hits
+ * `GET /api/agent/parts/distance/uuid/{a}/{b}` and surfaces every pair
+ * whose AABBs overlap (`bbox_overlap === true`) — a conservative
+ * indicator: overlap means the parts *may* interfere; no overlap is a
+ * fast rejection that they cannot.
+ *
+ * True surface-to-surface interference detection requires the
+ * trimmed-NURBS surface intersection machinery to stabilize (queued
+ * kernel work). Until then, the bbox overlap is the cheapest reliable
+ * signal — and it's already shipped by the existing distance endpoint.
+ */
+async function sendDirectInterference() {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length < 2) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select two or more solids before running Interference.',
+    })
+    return
+  }
+
+  addMessage({
+    role: 'user',
+    content: `Interference check across ${selectedIds.length} parts`,
+  })
+  setProcessing(true)
+
+  // Build the unordered-pair list once; n*(n-1)/2 fetches in parallel.
+  const pairs: Array<[string, string]> = []
+  for (let i = 0; i < selectedIds.length; i += 1) {
+    for (let j = i + 1; j < selectedIds.length; j += 1) {
+      pairs.push([selectedIds[i], selectedIds[j]])
+    }
+  }
+
+  try {
+    const results = await Promise.all(
+      pairs.map(async ([a, b]) => {
+        const resp = await fetch(`${API_BASE}/agent/parts/distance/uuid/${a}/${b}`, {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+        })
+        if (!resp.ok) {
+          const errBody = await resp.text().catch(() => '')
+          return { a, b, error: errBody || `${resp.status}` }
+        }
+        const data = await resp.json() as {
+          center_to_center: number
+          surface_to_surface: number
+          bbox_overlap: boolean
+        }
+        return {
+          a, b,
+          overlap: data.bbox_overlap,
+          gap: data.surface_to_surface,
+          centerDist: data.center_to_center,
+        }
+      }),
+    )
+
+    const errors = results.filter((r): r is { a: string; b: string; error: string } => 'error' in r)
+    const overlapping = results.filter(
+      (r): r is { a: string; b: string; overlap: true; gap: number; centerDist: number } =>
+        'overlap' in r && r.overlap === true,
+    )
+    const fmt = (n: number, p = 3) => Number.isFinite(n) ? n.toPrecision(p) : 'n/a'
+
+    if (errors.length > 0) {
+      addMessage({
+        role: 'assistant',
+        content: `Interference check: ${errors.length} pair(s) failed to resolve.`,
+      })
+    }
+
+    if (overlapping.length === 0) {
+      addMessage({
+        role: 'assistant',
+        content: `No bounding-box interference across ${pairs.length} pair${pairs.length === 1 ? '' : 's'}.`,
+      })
+    } else {
+      const lines = overlapping.map(
+        (r) => `• ${r.a.slice(0, 6)} ↔ ${r.b.slice(0, 6)} — centres ${fmt(r.centerDist)} mm apart`,
+      )
+      addMessage({
+        role: 'assistant',
+        content:
+          `Possible interference (bbox overlap) on ${overlapping.length}/${pairs.length} pair${pairs.length === 1 ? '' : 's'}:\n` +
+          lines.join('\n') +
+          `\n(bbox overlap is conservative — true surface-to-surface intersection still pending kernel work.)`,
+        objectsAffected: Array.from(new Set(overlapping.flatMap((r) => [r.a, r.b]))),
+      })
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Interference check failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Toggle the frontend-only Section View. Flips
  * `sectionView.enabled` on the scene store; CADMesh materials watch
  * the field and slot the cutting plane into their `clippingPlanes`
@@ -1052,7 +1156,7 @@ export function ToolBar() {
             { icon: Ruler, label: 'Measure Distance', action: () => sendDirectMeasureDistance() },
             { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
             { icon: Eye, label: 'Section View', action: () => toggleSectionViewWithFeedback() },
-            { icon: Wrench, label: 'Interference', action: () => notYetWired('Interference') },
+            { icon: Wrench, label: 'Interference', action: () => sendDirectInterference() },
           ],
         },
       ],
