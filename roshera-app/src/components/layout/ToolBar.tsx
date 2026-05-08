@@ -730,6 +730,36 @@ async function sendDirectMassProperties() {
 }
 
 /**
+ * Toggle the frontend-only Section View. Flips
+ * `sectionView.enabled` on the scene store; CADMesh materials watch
+ * the field and slot the cutting plane into their `clippingPlanes`
+ * array on the next frame. Renderer-side `localClippingEnabled` is
+ * set once in CADViewport.onCreated, so toggling is O(1) and never
+ * remounts the canvas.
+ *
+ * The user gets a chat note so the action has visible feedback even
+ * when the section is along the default X-axis at offset 0 and the
+ * model already straddles that plane.
+ */
+function toggleSectionViewWithFeedback() {
+  const { addMessage } = useChatStore.getState()
+  const scene = useSceneStore.getState()
+  const wasEnabled = scene.sectionView.enabled
+  scene.toggleSectionView()
+  const next = useSceneStore.getState().sectionView
+  if (wasEnabled) {
+    addMessage({ role: 'assistant', content: 'Section View off.' })
+  } else {
+    addMessage({
+      role: 'assistant',
+      content:
+        `Section View on (${next.axis.toUpperCase()}-axis, offset ${next.offset}). ` +
+        `Adjust from the panel above the viewport readout.`,
+    })
+  }
+}
+
+/**
  * Placeholder for modify ops that don't yet have a direct REST
  * endpoint. Tells the user the feature is pending instead of routing
  * through the NLP pipeline (which 5xxs without `ANTHROPIC_API_KEY`)
@@ -1021,7 +1051,7 @@ export function ToolBar() {
           items: [
             { icon: Ruler, label: 'Measure Distance', action: () => sendDirectMeasureDistance() },
             { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
-            { icon: Eye, label: 'Section View', action: () => notYetWired('Section View') },
+            { icon: Eye, label: 'Section View', action: () => toggleSectionViewWithFeedback() },
             { icon: Wrench, label: 'Interference', action: () => notYetWired('Interference') },
           ],
         },

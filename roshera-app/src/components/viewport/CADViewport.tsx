@@ -40,6 +40,11 @@ export function CADViewport() {
 
   const handleCreated = useCallback(
     (state: { gl: THREE.WebGLRenderer; scene: THREE.Scene }) => {
+      // Section View toggles per-material clipping planes; the renderer
+      // honours them only when local clipping is on. Enable globally so
+      // a per-CADMesh `material.clippingPlanes` array is respected the
+      // moment Section View is turned on, with no canvas re-mount.
+      state.gl.localClippingEnabled = true
       setGlRef(state.gl)
       setSceneRef(state.scene)
     },
@@ -95,6 +100,7 @@ export function CADViewport() {
       <ViewportReadout />
       <ViewportHints />
       <ModeBanner />
+      <SectionViewPanel />
       <ViewportContextMenu />
       <ExtrudeHoverTooltip />
       <SketchPanel />
@@ -236,6 +242,84 @@ function ViewportReadout() {
         <span className="text-muted-foreground">Selected</span>
         <span className="text-foreground tabular-nums">{selectedCount}</span>
       </div>
+    </div>
+  )
+}
+
+/**
+ * Floating panel surfaced when Section View is enabled. Lets the user
+ * pick an axis (X/Y/Z), drag the offset slider, and flip which side
+ * is culled. Hidden when section view is off so the viewport stays
+ * uncluttered.
+ *
+ * Pure UI over `sectionView` store state — CADMesh materials read the
+ * same state and slot a `THREE.Plane` into their `clippingPlanes`
+ * array. No backend round-trip.
+ */
+function SectionViewPanel() {
+  const sectionView = useSceneStore((s) => s.sectionView)
+  const setSectionView = useSceneStore((s) => s.setSectionView)
+  const toggleSectionView = useSceneStore((s) => s.toggleSectionView)
+
+  if (!sectionView.enabled) return null
+
+  return (
+    <div className="absolute top-3 right-3 cad-panel px-3 py-2 flex flex-col gap-2 text-[10px] uppercase tracking-wider min-w-[200px]">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-foreground font-semibold">Section View</span>
+        <button
+          type="button"
+          onClick={toggleSectionView}
+          className="px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
+          title="Disable section view"
+        >
+          Off
+        </button>
+      </div>
+      <div className="flex items-center gap-1">
+        {(['x', 'y', 'z'] as const).map((axis) => (
+          <button
+            key={axis}
+            type="button"
+            onClick={() => setSectionView({ axis })}
+            className={[
+              'flex-1 px-2 py-1 border transition-colors',
+              sectionView.axis === axis
+                ? 'border-border text-foreground bg-accent'
+                : 'border-border/40 text-muted-foreground hover:text-foreground',
+            ].join(' ')}
+          >
+            {axis.toUpperCase()}
+          </button>
+        ))}
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-muted-foreground w-12">Offset</span>
+        <input
+          type="range"
+          min={-50}
+          max={50}
+          step={0.5}
+          value={sectionView.offset}
+          onChange={(e) => setSectionView({ offset: Number(e.target.value) })}
+          className="flex-1"
+        />
+        <span className="tabular-nums text-foreground w-10 text-right">
+          {sectionView.offset.toFixed(1)}
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={() => setSectionView({ flipped: !sectionView.flipped })}
+        className={[
+          'px-2 py-1 border transition-colors',
+          sectionView.flipped
+            ? 'border-border text-foreground bg-accent'
+            : 'border-border/40 text-muted-foreground hover:text-foreground',
+        ].join(' ')}
+      >
+        Flip side
+      </button>
     </div>
   )
 }
