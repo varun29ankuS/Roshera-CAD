@@ -202,58 +202,113 @@ fn box_world_bbox_extent_matches_dimensions() {
 }
 
 // ---------------------------------------------------------------------
-// Curved-primitive volume gap (regression contract).
+// Curved-primitive volume — analytical contract.
 //
-// `BRepModel::calculate_solid_volume` delegates to
-// `Solid::compute_mass_properties`, which iterates the shell's faces
-// and runs the divergence-theorem face-area integral via
+// `BRepModel::calculate_solid_volume` first attempts the
+// divergence-theorem face-area integral via
 // `Shell::compute_mass_properties`. That path requires every loop to
 // have ≥3 unique vertex IDs because `Loop::compute_stats` uses the
-// shoelace formula on the loop's vertex polygon.
+// shoelace formula on the loop's vertex polygon, and curved primitives
+// created by the kernel (sphere seams, cylinder caps with a single
+// circular edge, cone apex) ship with degenerate edge-loops that fail
+// that pre-condition. When that happens, the kernel falls back to a
+// mesh-based divergence theorem on the tessellated solid:
 //
-// Curved primitives created by the kernel (sphere, cylinder caps,
-// cone apex) ship with degenerate edge-loops — a cylinder cap has a
-// single circular edge connecting one start/end vertex; a sphere
-// patch has a similarly compressed seam. Until the kernel grows
-// surface-parameter-space integration of `r⃗ · n̂ dA` for curved
-// faces (or auto-densifies degenerate loops to a polygonal
-// approximation), `calculate_solid_volume` will return `None` for
-// these primitives.
+//     V = | (1/6) Σ_t  v0_t · (v1_t × v2_t) |
 //
-// The three tests below pin that contract: they assert the kernel
-// honestly returns `None` rather than fabricating a wrong number.
-// The day someone adds curved-surface integration, these tests will
-// flip to `Some(_)` and need to be tightened to assert the analytical
-// value (4/3·π·r³, π·r²·h, π·r²·h/3) within tessellation tolerance.
+// Tessellation runs at `TessellationParams::fine()` (chord tolerance
+// 1e-4), which is dense enough that the mesh volume agrees with the
+// analytical formulas to roughly five decimal places. The relative
+// tolerance of 0.5% in the asserts below is generous — it leaves
+// room for adaptive samplers to coarsen on flat regions without
+// flapping the test.
+//
+// If the analytical face-by-face integrator ever grows native curved-
+// face support (surface-parameter-space integration of `r⃗ · n̂ dA`),
+// these tests should still pass — both paths target the same
+// analytical truth and the tolerance is wide enough to absorb the
+// switch.
 // ---------------------------------------------------------------------
 
+const CURVED_VOLUME_REL_TOL: f64 = 0.005;
+
 #[test]
-fn sphere_volume_currently_unsupported_returns_none() {
+fn sphere_volume_matches_analytical_within_tessellation_tolerance() {
     let mut model = BRepModel::new();
-    let id = make_sphere(&mut model, Point3::ORIGIN, 3.0);
+    let radius = 3.0;
+    let id = make_sphere(&mut model, Point3::ORIGIN, radius);
+    let expected = 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
+    let actual = model
+        .calculate_solid_volume(id)
+        .expect("sphere volume must be computable via mesh fallback");
     assert!(
-        model.calculate_solid_volume(id).is_none(),
-        "kernel does not yet integrate curved-surface volumes; expected None"
+        relative_close(actual, expected, CURVED_VOLUME_REL_TOL),
+        "sphere volume {actual} ≈ {expected} (4/3·π·r³ for r={radius})"
     );
 }
 
 #[test]
-fn cylinder_volume_currently_unsupported_returns_none() {
+fn cylinder_volume_matches_analytical_within_tessellation_tolerance() {
     let mut model = BRepModel::new();
-    let id = make_cylinder(&mut model, Point3::ORIGIN, Vector3::Z, 2.0, 5.0);
+    let radius = 2.0;
+    let height = 5.0;
+    let id = make_cylinder(&mut model, Point3::ORIGIN, Vector3::Z, radius, height);
+    let expected = std::f64::consts::PI * radius.powi(2) * height;
+    let actual = model
+        .calculate_solid_volume(id)
+        .expect("cylinder volume must be computable via mesh fallback");
     assert!(
-        model.calculate_solid_volume(id).is_none(),
-        "kernel does not yet integrate curved-surface volumes; expected None"
+        relative_close(actual, expected, CURVED_VOLUME_REL_TOL),
+        "cylinder volume {actual} ≈ {expected} (π·r²·h for r={radius}, h={height})"
     );
 }
 
 #[test]
-fn cone_volume_currently_unsupported_returns_none() {
+fn cone_volume_matches_analytical_within_tessellation_tolerance() {
     let mut model = BRepModel::new();
-    let id = make_cone(&mut model, Point3::ORIGIN, Vector3::Z, 2.0, 6.0);
+    let radius = 2.0;
+    let height = 6.0;
+    let id = make_cone(&mut model, Point3::ORIGIN, Vector3::Z, radius, height);
+    let expected = std::f64::consts::PI * radius.powi(2) * height / 3.0;
+    let actual = model
+        .calculate_solid_volume(id)
+        .expect("cone volume must be computable via mesh fallback");
     assert!(
-        model.calculate_solid_volume(id).is_none(),
-        "kernel does not yet integrate curved-surface volumes; expected None"
+        relative_close(actual, expected, CURVED_VOLUME_REL_TOL),
+        "cone volume {actual} ≈ {expected} (π·r²·h/3 for r={radius}, h={height})"
+    );
+}
+
+#[test]
+fn sphere_surface_area_matches_analytical_within_tessellation_tolerance() {
+    let mut model = BRepModel::new();
+    let radius = 3.0;
+    let id = make_sphere(&mut model, Point3::ORIGIN, radius);
+    let expected = 4.0 * std::f64::consts::PI * radius.powi(2);
+    let actual = model
+        .calculate_solid_surface_area(id)
+        .expect("sphere surface area must be computable via mesh fallback");
+    assert!(
+        relative_close(actual, expected, CURVED_VOLUME_REL_TOL),
+        "sphere surface area {actual} ≈ {expected} (4·π·r² for r={radius})"
+    );
+}
+
+#[test]
+fn cylinder_surface_area_matches_analytical_within_tessellation_tolerance() {
+    let mut model = BRepModel::new();
+    let radius = 2.0;
+    let height = 5.0;
+    let id = make_cylinder(&mut model, Point3::ORIGIN, Vector3::Z, radius, height);
+    // Closed cylinder: lateral 2·π·r·h plus two caps π·r².
+    let expected =
+        2.0 * std::f64::consts::PI * radius * height + 2.0 * std::f64::consts::PI * radius.powi(2);
+    let actual = model
+        .calculate_solid_surface_area(id)
+        .expect("cylinder surface area must be computable via mesh fallback");
+    assert!(
+        relative_close(actual, expected, CURVED_VOLUME_REL_TOL),
+        "cylinder surface area {actual} ≈ {expected} (2·π·r·h + 2·π·r² for r={radius}, h={height})"
     );
 }
 
