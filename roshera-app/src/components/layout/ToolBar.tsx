@@ -476,6 +476,127 @@ async function sendDirectChamfer(distance: number) {
 }
 
 /**
+ * Direct REST linear pattern. Replicates the selected solid `count`
+ * times along `axis` ('x'|'y'|'z') with the given spacing. Backend
+ * deep-clones + transforms each instance and broadcasts an
+ * ObjectCreated frame per copy.
+ */
+async function sendDirectLinearPattern(
+  axis: 'x' | 'y' | 'z' = 'x',
+  spacing: number = 15,
+  count: number = 3,
+) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Linear Pattern.',
+    })
+    return
+  }
+  const [object] = selectedIds
+  const direction: [number, number, number] =
+    axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1]
+
+  addMessage({
+    role: 'user',
+    content: `Linear pattern ${object.slice(0, 6)} × ${count} along ${axis.toUpperCase()} (spacing ${spacing})`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/pattern/linear`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ object, direction, spacing, count }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Linear pattern: created ${data.count} copies of ${object.slice(0, 6)}.`,
+      objectsAffected: Array.isArray(data.ids) ? data.ids.map(String) : [],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Linear pattern failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
+ * Direct REST circular pattern. Replicates the selected solid `count`
+ * times around `axis` ('x'|'y'|'z') passing through the world origin,
+ * spread over a full revolution by default.
+ */
+async function sendDirectCircularPattern(
+  axis: 'x' | 'y' | 'z' = 'z',
+  count: number = 6,
+  totalAngleRad: number = Math.PI * 2,
+) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Circular Pattern.',
+    })
+    return
+  }
+  const [object] = selectedIds
+  const axisVec: [number, number, number] =
+    axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1]
+
+  addMessage({
+    role: 'user',
+    content: `Circular pattern ${object.slice(0, 6)} × ${count} around ${axis.toUpperCase()}-axis`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/pattern/circular`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        object,
+        axis_origin: [0, 0, 0],
+        axis: axisVec,
+        count,
+        total_angle: totalAngleRad,
+      }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Circular pattern: created ${data.count} copies of ${object.slice(0, 6)}.`,
+      objectsAffected: Array.isArray(data.ids) ? data.ids.map(String) : [],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Circular pattern failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Placeholder for modify ops that don't yet have a direct REST
  * endpoint. Tells the user the feature is pending instead of routing
  * through the NLP pipeline (which 5xxs without `ANTHROPIC_API_KEY`)
@@ -739,8 +860,8 @@ export function ToolBar() {
         {
           label: 'Pattern',
           items: [
-            { icon: Grid3x3, label: 'Linear Pattern', action: () => notYetWired('Linear Pattern') },
-            { icon: Orbit, label: 'Circular Pattern', action: () => notYetWired('Circular Pattern') },
+            { icon: Grid3x3, label: 'Linear Pattern', action: () => sendDirectLinearPattern('x', 15, 3) },
+            { icon: Orbit, label: 'Circular Pattern', action: () => sendDirectCircularPattern('z', 6) },
             { icon: Hash, label: 'Rectangular', action: () => notYetWired('Rectangular Pattern') },
             { icon: Copy, label: 'Copy', action: () => notYetWired('Copy') },
           ],
