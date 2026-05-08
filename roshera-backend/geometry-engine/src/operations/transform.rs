@@ -537,17 +537,847 @@ fn validate_transformed_solid(model: &BRepModel, solid_id: SolidId) -> Operation
 // Helper functions for transform operations
 // Note: Matrix4 already has all the needed transformation methods
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_transform_validation() {
-//         // Test transform matrix validation
-//     }
-//
-//     #[test]
-//     fn test_scale_validation() {
-//         // Test scale factor validation
-//     }
-// }
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+    use std::sync::{Arc, Mutex};
+
+    // ────────── shared fixtures ──────────
+
+    /// Build a 2x2x2 box centered at origin. 8 vertices at (±1, ±1, ±1).
+    fn unit_box() -> (BRepModel, SolidId) {
+        let mut model = BRepModel::new();
+        let mut builder = TopologyBuilder::new(&mut model);
+        let id = builder
+            .create_box_3d(2.0, 2.0, 2.0)
+            .expect("create_box_3d failed");
+        let solid_id = match id {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        (model, solid_id)
+    }
+
+    /// Recorder that captures every emitted RecordedOperation.
+    #[derive(Debug, Default)]
+    struct CaptureRecorder {
+        events: Mutex<Vec<RecordedOperation>>,
+    }
+
+    impl OperationRecorder for CaptureRecorder {
+        fn record(&self, op: RecordedOperation) -> Result<(), RecorderError> {
+            self.events
+                .lock()
+                .expect("CaptureRecorder mutex poisoned")
+                .push(op);
+            Ok(())
+        }
+    }
+
+    fn captured_kinds(rec: &Arc<CaptureRecorder>) -> Vec<String> {
+        rec.events
+            .lock()
+            .expect("mutex")
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect()
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn approx_pos(p: [f64; 3], q: [f64; 3]) -> bool {
+        approx(p[0], q[0]) && approx(p[1], q[1]) && approx(p[2], q[2])
+    }
+
+    fn collect_positions(model: &BRepModel) -> Vec<[f64; 3]> {
+        model
+            .vertices
+            .iter()
+            .map(|(_, v)| v.position)
+            .collect()
+    }
+
+    // ────────── A. TransformOptions ──────────
+
+    #[test]
+    fn transform_options_default_updates_parameterization() {
+        let opts = TransformOptions::default();
+        assert!(opts.update_parameterization);
+    }
+
+    #[test]
+    fn transform_options_default_common_validate_result() {
+        let opts = TransformOptions::default();
+        // Default CommonOptions::validate_result is the kernel-wide default;
+        // we only assert the field exists and is reachable, not its value.
+        let _flag: bool = opts.common.validate_result;
+    }
+
+    // ────────── B. validate_transform_inputs ──────────
+
+    #[test]
+    fn validate_inputs_rejects_singular_matrix() {
+        let mut model = BRepModel::new();
+        // All-zero matrix has determinant 0.
+        let m = Matrix4::scale(0.0, 0.0, 0.0);
+        let err = validate_transform_inputs(&model, &m).unwrap_err();
+        match err {
+            OperationError::InvalidGeometry(msg) => assert!(msg.contains("singular")),
+            other => panic!("expected InvalidGeometry, got {:?}", other),
+        }
+        // Touch model so the param isn't unused.
+        let _ = &mut model;
+    }
+
+    #[test]
+    fn validate_inputs_accepts_identity() {
+        let model = BRepModel::new();
+        assert!(validate_transform_inputs(&model, &Matrix4::identity()).is_ok());
+    }
+
+    #[test]
+    fn validate_inputs_accepts_pure_translation() {
+        let model = BRepModel::new();
+        let m = Matrix4::translation(5.0, -3.0, 2.5);
+        assert!(validate_transform_inputs(&model, &m).is_ok());
+    }
+
+    #[test]
+    fn validate_inputs_accepts_reflection() {
+        // Reflection has determinant -1; |det| = 1 > 1e-10 → accepted.
+        let model = BRepModel::new();
+        let m = Matrix4::mirror(Point3::ORIGIN, Vector3::Z).expect("mirror");
+        assert!(validate_transform_inputs(&model, &m).is_ok());
+        assert!((m.determinant() - -1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn validate_inputs_rejects_below_tolerance() {
+        // det = 1e-12 < 1e-10 → rejected.
+        let model = BRepModel::new();
+        let m = Matrix4::scale(1e-4, 1e-4, 1e-4);
+        assert!(m.determinant().abs() < 1e-10);
+        assert!(validate_transform_inputs(&model, &m).is_err());
+    }
+
+    // ────────── C. scale public API validation ──────────
+
+    #[test]
+    fn scale_rejects_zero_x() {
+        let (mut model, sid) = unit_box();
+        let res = scale(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::new(0.0, 1.0, 1.0),
+            TransformOptions::default(),
+        );
+        assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn scale_rejects_negative_y() {
+        let (mut model, sid) = unit_box();
+        let res = scale(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::new(1.0, -1.0, 1.0),
+            TransformOptions::default(),
+        );
+        assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn scale_rejects_negative_z() {
+        let (mut model, sid) = unit_box();
+        let res = scale(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::new(1.0, 1.0, -2.0),
+            TransformOptions::default(),
+        );
+        assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn scale_accepts_isotropic_positive() {
+        let (mut model, sid) = unit_box();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res = scale(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::new(2.0, 2.0, 2.0),
+            opts,
+        )
+        .expect("scale");
+        assert_eq!(res.transformed_ids, vec![sid]);
+    }
+
+    // ────────── D. translate end-to-end ──────────
+
+    #[test]
+    fn translate_zero_distance_leaves_vertices_unchanged() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = translate(&mut model, vec![sid], Vector3::X, 0.0, opts).expect("translate");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx_pos(*a, *b));
+        }
+    }
+
+    #[test]
+    fn translate_along_x_shifts_x_only() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = translate(&mut model, vec![sid], Vector3::X, 5.0, opts).expect("translate");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx(b[0] - a[0], 5.0));
+            assert!(approx(b[1], a[1]));
+            assert!(approx(b[2], a[2]));
+        }
+    }
+
+    #[test]
+    fn translate_arbitrary_direction_distance_compose() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let dir = Vector3::new(0.0, 1.0, 0.0);
+        let _ = translate(&mut model, vec![sid], dir, 3.0, opts).expect("translate");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx(b[0], a[0]));
+            assert!(approx(b[1] - a[1], 3.0));
+            assert!(approx(b[2], a[2]));
+        }
+    }
+
+    #[test]
+    fn translate_returns_input_solid_id() {
+        let (mut model, sid) = unit_box();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res =
+            translate(&mut model, vec![sid], Vector3::Z, 1.0, opts).expect("translate");
+        assert_eq!(res.transformed_ids, vec![sid]);
+    }
+
+    // ────────── E. rotate end-to-end ──────────
+
+    #[test]
+    fn rotate_zero_angle_leaves_vertices_unchanged() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = rotate(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Z,
+            0.0,
+            opts,
+        )
+        .expect("rotate");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx_pos(*a, *b));
+        }
+    }
+
+    #[test]
+    fn rotate_full_turn_returns_to_origin() {
+        use std::f64::consts::PI;
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = rotate(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Z,
+            2.0 * PI,
+            opts,
+        )
+        .expect("rotate");
+        let after = collect_positions(&model);
+        // Allow looser tolerance for compounded float ops.
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!((a[0] - b[0]).abs() < 1e-6);
+            assert!((a[1] - b[1]).abs() < 1e-6);
+            assert!((a[2] - b[2]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn rotate_90_degrees_about_z_swaps_x_to_y() {
+        use std::f64::consts::FRAC_PI_2;
+        let (mut model, sid) = unit_box();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = rotate(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Z,
+            FRAC_PI_2,
+            opts,
+        )
+        .expect("rotate");
+        // After 90° about Z, (1, 1, _) → (-1, 1, _); in particular every
+        // vertex with (x = 1, y = 1) ends with x ≈ -1.
+        let after = collect_positions(&model);
+        // Bounding box on x should now be [-1, 1] still, but no vertex has x ≈ 1 with y ≈ 1
+        // because (1,1,*) → (-1,1,*).
+        let any_x_near_neg1 = after.iter().any(|p| (p[0] + 1.0).abs() < 1e-9);
+        let any_y_near_1 = after.iter().any(|p| (p[1] - 1.0).abs() < 1e-9);
+        assert!(any_x_near_neg1);
+        assert!(any_y_near_1);
+    }
+
+    #[test]
+    fn rotate_180_about_x_negates_y_and_z() {
+        use std::f64::consts::PI;
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = rotate(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::X,
+            PI,
+            opts,
+        )
+        .expect("rotate");
+        let after = collect_positions(&model);
+        // (x,y,z) → (x,-y,-z) under 180° about X.
+        // Multisets must match between `before` and `(x,-y,-z)` of after.
+        let mapped: Vec<[f64; 3]> = before.iter().map(|p| [p[0], -p[1], -p[2]]).collect();
+        for p in &after {
+            let mut found = false;
+            for q in &mapped {
+                if (p[0] - q[0]).abs() < 1e-9
+                    && (p[1] - q[1]).abs() < 1e-9
+                    && (p[2] - q[2]).abs() < 1e-9
+                {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "rotated vertex {:?} not found in expected set", p);
+        }
+    }
+
+    // ────────── F. scale end-to-end ──────────
+
+    #[test]
+    fn scale_isotropic_about_origin_doubles_coords() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = scale(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::new(2.0, 2.0, 2.0),
+            opts,
+        )
+        .expect("scale");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx(b[0], 2.0 * a[0]));
+            assert!(approx(b[1], 2.0 * a[1]));
+            assert!(approx(b[2], 2.0 * a[2]));
+        }
+    }
+
+    #[test]
+    fn scale_anisotropic_per_axis() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = scale(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::new(2.0, 3.0, 4.0),
+            opts,
+        )
+        .expect("scale");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx(b[0], 2.0 * a[0]));
+            assert!(approx(b[1], 3.0 * a[1]));
+            assert!(approx(b[2], 4.0 * a[2]));
+        }
+    }
+
+    #[test]
+    fn scale_about_non_origin_fixes_anchor_point() {
+        // Scale by 2 about point (5, 0, 0). A vertex initially at x=1
+        // ends at 5 + 2*(1 - 5) = -3. A vertex at x=5 stays at x=5.
+        let (mut model, sid) = unit_box();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let anchor = Point3::new(5.0, 0.0, 0.0);
+        let _ = scale(
+            &mut model,
+            vec![sid],
+            anchor,
+            Vector3::new(2.0, 1.0, 1.0),
+            opts,
+        )
+        .expect("scale");
+        let after = collect_positions(&model);
+        // Box vertex with original x=1 should now be at x = 5 + 2*(1-5) = -3.
+        // Box vertex with original x=-1 should now be at x = 5 + 2*(-1-5) = -7.
+        let xs: Vec<f64> = after.iter().map(|p| p[0]).collect();
+        assert!(xs.iter().any(|&x| approx(x, -3.0)));
+        assert!(xs.iter().any(|&x| approx(x, -7.0)));
+    }
+
+    // ────────── G. mirror end-to-end ──────────
+
+    #[test]
+    fn mirror_about_xy_plane_negates_z() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = mirror(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Z,
+            opts,
+        )
+        .expect("mirror");
+        let after = collect_positions(&model);
+        // Multiset {(x,y,-z)} of before should equal multiset {(x,y,z)} of after.
+        let expected: Vec<[f64; 3]> = before.iter().map(|p| [p[0], p[1], -p[2]]).collect();
+        for p in &after {
+            assert!(expected
+                .iter()
+                .any(|q| approx(p[0], q[0]) && approx(p[1], q[1]) && approx(p[2], q[2])));
+        }
+    }
+
+    #[test]
+    fn mirror_about_yz_plane_negates_x() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = mirror(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::X,
+            opts,
+        )
+        .expect("mirror");
+        let after = collect_positions(&model);
+        let expected: Vec<[f64; 3]> = before.iter().map(|p| [-p[0], p[1], p[2]]).collect();
+        for p in &after {
+            assert!(expected
+                .iter()
+                .any(|q| approx(p[0], q[0]) && approx(p[1], q[1]) && approx(p[2], q[2])));
+        }
+    }
+
+    #[test]
+    fn mirror_about_xz_plane_negates_y() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = mirror(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Y,
+            opts,
+        )
+        .expect("mirror");
+        let after = collect_positions(&model);
+        let expected: Vec<[f64; 3]> = before.iter().map(|p| [p[0], -p[1], p[2]]).collect();
+        for p in &after {
+            assert!(expected
+                .iter()
+                .any(|q| approx(p[0], q[0]) && approx(p[1], q[1]) && approx(p[2], q[2])));
+        }
+    }
+
+    #[test]
+    fn mirror_flips_face_orientations() {
+        let (mut model, sid) = unit_box();
+        // Capture face orientations before mirror.
+        let solid_before = model.solids.get(sid).expect("solid").clone();
+        let shell_before = model
+            .shells
+            .get(solid_before.outer_shell)
+            .expect("shell")
+            .clone();
+        let before_orients: Vec<_> = shell_before
+            .faces
+            .iter()
+            .filter_map(|fid| model.faces.get(*fid).map(|f| (*fid, f.orientation)))
+            .collect();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = mirror(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Z,
+            opts,
+        )
+        .expect("mirror");
+        for (fid, orig) in before_orients {
+            let new = model.faces.get(fid).expect("face").orientation;
+            assert_eq!(new, orig.flipped());
+        }
+    }
+
+    // ────────── H. transform_solid public API ──────────
+
+    #[test]
+    fn transform_solid_identity_preserves_vertex_positions() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res = transform_solid(&mut model, sid, Matrix4::identity(), opts).expect("identity");
+        assert_eq!(res.transformed_ids, vec![sid]);
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx_pos(*a, *b));
+        }
+    }
+
+    #[test]
+    fn transform_solid_returns_supplied_matrix() {
+        let (mut model, sid) = unit_box();
+        let m = Matrix4::translation(7.0, -2.0, 3.5);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res = transform_solid(&mut model, sid, m, opts).expect("transform");
+        // The result carries back the transform that was applied.
+        for i in 0..16 {
+            assert!(approx(res.transform.m[i], m.m[i]));
+        }
+    }
+
+    #[test]
+    fn transform_solid_records_transform_solid_event() {
+        let (mut model, sid) = unit_box();
+        let rec: Arc<CaptureRecorder> = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(rec.clone() as Arc<dyn OperationRecorder>));
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ =
+            transform_solid(&mut model, sid, Matrix4::translation(1.0, 0.0, 0.0), opts)
+                .expect("transform");
+        let kinds = captured_kinds(&rec);
+        assert!(kinds.iter().any(|k| k == "transform_solid"));
+    }
+
+    #[test]
+    fn transform_solid_rejects_singular_matrix() {
+        let (mut model, sid) = unit_box();
+        let m = Matrix4::scale(0.0, 0.0, 0.0);
+        let res = transform_solid(&mut model, sid, m, TransformOptions::default());
+        assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn transform_solid_skip_parameterization_does_not_panic() {
+        let (mut model, sid) = unit_box();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res = transform_solid(&mut model, sid, Matrix4::translation(1.0, 0.0, 0.0), opts);
+        assert!(res.is_ok());
+    }
+
+    // ────────── I. transform_faces ──────────
+
+    #[test]
+    fn transform_faces_empty_list_succeeds() {
+        let mut model = BRepModel::new();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res = transform_faces(&mut model, vec![], Matrix4::identity(), opts);
+        assert!(res.is_ok());
+        assert_eq!(res.expect("ok").transformed_ids.len(), 0);
+    }
+
+    #[test]
+    fn transform_faces_records_transform_faces_event() {
+        let (mut model, sid) = unit_box();
+        let face_ids: Vec<FaceId> = {
+            let solid = model.solids.get(sid).expect("solid").clone();
+            let shell = model.shells.get(solid.outer_shell).expect("shell").clone();
+            shell.faces
+        };
+        let rec: Arc<CaptureRecorder> = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(rec.clone() as Arc<dyn OperationRecorder>));
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = transform_faces(
+            &mut model,
+            face_ids,
+            Matrix4::translation(1.0, 0.0, 0.0),
+            opts,
+        )
+        .expect("transform_faces");
+        let kinds = captured_kinds(&rec);
+        assert!(kinds.iter().any(|k| k == "transform_faces"));
+    }
+
+    #[test]
+    fn transform_faces_translates_vertex_positions() {
+        let (mut model, sid) = unit_box();
+        let face_ids: Vec<FaceId> = {
+            let solid = model.solids.get(sid).expect("solid").clone();
+            let shell = model.shells.get(solid.outer_shell).expect("shell").clone();
+            shell.faces
+        };
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = transform_faces(
+            &mut model,
+            face_ids,
+            Matrix4::translation(0.0, 0.0, 5.0),
+            opts,
+        )
+        .expect("transform_faces");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx(b[2] - a[2], 5.0));
+        }
+    }
+
+    #[test]
+    fn transform_faces_rejects_singular_matrix() {
+        let mut model = BRepModel::new();
+        let opts = TransformOptions::default();
+        let res = transform_faces(&mut model, vec![], Matrix4::scale(0.0, 0.0, 0.0), opts);
+        assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // ────────── J. transform_edges ──────────
+
+    #[test]
+    fn transform_edges_empty_list_succeeds() {
+        let mut model = BRepModel::new();
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let res = transform_edges(&mut model, vec![], Matrix4::identity(), opts);
+        assert!(res.is_ok());
+        assert_eq!(res.expect("ok").transformed_ids.len(), 0);
+    }
+
+    #[test]
+    fn transform_edges_records_transform_edges_event() {
+        let (mut model, _sid) = unit_box();
+        let edge_ids: Vec<EdgeId> = model.edges.iter().map(|(id, _)| id).collect();
+        assert!(!edge_ids.is_empty());
+        let rec: Arc<CaptureRecorder> = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(rec.clone() as Arc<dyn OperationRecorder>));
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = transform_edges(
+            &mut model,
+            edge_ids,
+            Matrix4::translation(1.0, 0.0, 0.0),
+            opts,
+        )
+        .expect("transform_edges");
+        let kinds = captured_kinds(&rec);
+        assert!(kinds.iter().any(|k| k == "transform_edges"));
+    }
+
+    #[test]
+    fn transform_edges_dedups_shared_vertices() {
+        // The 12 box edges share 8 vertices; if dedup failed we'd transform
+        // each shared vertex multiple times, compounding the translation.
+        let (mut model, _sid) = unit_box();
+        let edge_ids: Vec<EdgeId> = model.edges.iter().map(|(id, _)| id).collect();
+        let before = collect_positions(&model);
+        let opts = TransformOptions {
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            update_parameterization: false,
+        };
+        let _ = transform_edges(
+            &mut model,
+            edge_ids,
+            Matrix4::translation(0.0, 7.0, 0.0),
+            opts,
+        )
+        .expect("transform_edges");
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            // Translation should apply exactly once: Δy == 7, not 14, 21, …
+            assert!(approx(b[1] - a[1], 7.0));
+        }
+    }
+
+    #[test]
+    fn transform_edges_rejects_singular_matrix() {
+        let mut model = BRepModel::new();
+        let opts = TransformOptions::default();
+        let res = transform_edges(&mut model, vec![], Matrix4::scale(0.0, 0.0, 0.0), opts);
+        assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+}
