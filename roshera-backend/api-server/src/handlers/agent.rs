@@ -110,6 +110,25 @@ pub async fn part_mass_properties(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// `GET /api/agent/parts/uuid/{uuid}/mass` — UUID-keyed wrapper around
+/// [`part_mass_properties`]. The frontend addresses objects by UUID
+/// (the wire `id` of every CAD object); this resolves the UUID to its
+/// kernel `SolidId` via [`AppState::get_local_id`] and dispatches to
+/// the same mass-properties path.
+pub async fn part_mass_properties_by_uuid(
+    State(state): State<AppState>,
+    Path(uuid): Path<uuid::Uuid>,
+) -> Result<Json<MassPropertiesReport>, StatusCode> {
+    let solid_id = state
+        .get_local_id(&uuid)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let mut model = state.model.write().await;
+    model
+        .mass_properties_for(solid_id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// `GET /api/agent/parts/{id}/obb` — oriented bounding box (axes
 /// aligned to the part's principal moments of inertia).
 pub async fn part_oriented_bbox(
