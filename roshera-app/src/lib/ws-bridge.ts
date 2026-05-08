@@ -285,6 +285,7 @@ function handleServerMessage(msg: ServerMessage) {
           objectId: msg.payload.object_id,
           type: el.type,
           index: el.index,
+          polyline: el.polyline,
         })
       }
       break

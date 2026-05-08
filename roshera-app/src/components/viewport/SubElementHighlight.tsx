@@ -20,9 +20,10 @@ import { resolveCssVar } from '@/lib/css-color'
  * If the mesh has no `faceIds` map (legacy frame), fall back to drawing
  * just the single triangle the user clicked.
  *
- * Edge / vertex paths still draw the three corners of the picked triangle —
- * a real backend topology lookup is what unlocks proper edge/vertex
- * highlighting and is handled by `SubElementResult` from the server.
+ * Edge selections render the kernel-sampled curve polyline (shipped in
+ * `SubElementSelection.polyline`) when available, falling back to the
+ * three-corner triangle outline only for legacy frames that lack one.
+ * Vertex selections still draw the three corners of the picked triangle.
  */
 export function SubElementHighlight() {
   const subElementSelections = useSceneStore((s) => s.subElementSelections)
@@ -57,6 +58,7 @@ export function SubElementHighlight() {
         c: THREE.Vector3
         normal: THREE.Vector3
       }>
+      polyline?: THREE.Vector3[]
       hover: boolean
     }> = []
 
@@ -80,6 +82,33 @@ export function SubElementHighlight() {
       if (!mesh) continue
       const geom = mesh.geometry
       if (!geom) continue
+
+      // Edge selections from backend ship a kernel-sampled polyline
+      // in world space. Render it directly — no triangle resolution
+      // needed. Mesh world transform is folded in by the kernel on
+      // BRep updates, so the polyline already matches the rendered
+      // geometry.
+      if (sel.type === 'edge' && sel.polyline && sel.polyline.length >= 6) {
+        const pts: THREE.Vector3[] = []
+        const flat = sel.polyline
+        for (let i = 0; i + 2 < flat.length; i += 3) {
+          pts.push(
+            new THREE.Vector3(flat[i], flat[i + 1], flat[i + 2]).applyMatrix4(
+              mesh.matrixWorld,
+            ),
+          )
+        }
+        if (pts.length >= 2) {
+          out.push({
+            key: `${hover ? 'hover' : 'sel'}:${sel.objectId}:edge:${sel.index}`,
+            type: 'edge',
+            triangles: [],
+            polyline: pts,
+            hover,
+          })
+          continue
+        }
+      }
 
       const positions = geom.getAttribute('position') as
         | THREE.BufferAttribute
@@ -176,6 +205,7 @@ export function SubElementHighlight() {
           key={r.key}
           type={r.type}
           triangles={r.triangles}
+          polyline={r.polyline}
           colors={palette}
           hover={r.hover}
         />
@@ -194,6 +224,7 @@ interface Triangle {
 interface SelectionMarkProps {
   type: 'face' | 'edge' | 'vertex'
   triangles: Triangle[]
+  polyline?: THREE.Vector3[]
   colors: { face: string; edge: string; vertex: string }
   hover: boolean
 }
@@ -204,12 +235,22 @@ function inflate(p: THREE.Vector3, normal: THREE.Vector3): THREE.Vector3 {
   return p.clone().addScaledVector(normal, OFFSET)
 }
 
-function SelectionMark({ type, triangles, colors, hover }: SelectionMarkProps) {
+function SelectionMark({
+  type,
+  triangles,
+  polyline,
+  colors,
+  hover,
+}: SelectionMarkProps) {
   if (type === 'face') {
     return <FaceMark triangles={triangles} color={colors.face} hover={hover} />
   }
-  // Edge / vertex always operate on the single picked triangle.
+  if (type === 'edge' && polyline && polyline.length >= 2) {
+    return <EdgePolyline points={polyline} color={colors.edge} hover={hover} />
+  }
+  // Edge fallback / vertex: operate on the single picked triangle.
   const tri = triangles[0]
+  if (!tri) return null
   const ao = inflate(tri.a, tri.normal)
   const bo = inflate(tri.b, tri.normal)
   const co = inflate(tri.c, tri.normal)
@@ -217,6 +258,37 @@ function SelectionMark({ type, triangles, colors, hover }: SelectionMarkProps) {
     return <EdgeMark ao={ao} bo={bo} co={co} color={colors.edge} hover={hover} />
   }
   return <VertexMark ao={ao} bo={bo} co={co} color={colors.vertex} hover={hover} />
+}
+
+interface EdgePolylineProps {
+  points: THREE.Vector3[]
+  color: string
+  hover: boolean
+}
+
+function EdgePolyline({ points, color, hover }: EdgePolylineProps) {
+  // Render the kernel-sampled curve as connected line segments.
+  // R3F's intrinsic `<line>` clashes with SVG typings, so we expand
+  // the polyline `[P0, P1, P2, …]` into the pair list
+  // `[P0, P1, P1, P2, P2, P3, …]` and draw with `<lineSegments>`.
+  const geometry = useMemo(() => {
+    const pairs: THREE.Vector3[] = []
+    for (let i = 0; i + 1 < points.length; i++) {
+      pairs.push(points[i], points[i + 1])
+    }
+    return new THREE.BufferGeometry().setFromPoints(pairs)
+  }, [points])
+  return (
+    <lineSegments geometry={geometry}>
+      <lineBasicMaterial
+        color={color}
+        linewidth={hover ? 2 : 3}
+        depthTest={false}
+        transparent
+        opacity={hover ? 0.6 : 1}
+      />
+    </lineSegments>
+  )
 }
 
 interface FaceMarkProps {

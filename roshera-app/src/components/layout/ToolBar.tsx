@@ -330,6 +330,81 @@ async function sendDirectMirror(plane: 'xy' | 'yz' | 'xz' = 'xy') {
 }
 
 /**
+ * Direct REST fillet against the currently picked edges of the
+ * currently selected solid. Reads `subElementSelections` from the
+ * scene store, filters to `type === 'edge'` matching the selected
+ * solid, and POSTs `{object, edges, radius}` to
+ * `/api/geometry/fillet`. Surfaces a clear chat message if no
+ * edges are picked instead of routing through the NLP pipeline.
+ */
+async function sendDirectFillet(radius: number) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const sceneState = useSceneStore.getState()
+  const selectedIds = Array.from(sceneState.selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Fillet.',
+    })
+    return
+  }
+  if (!Number.isFinite(radius) || radius <= 0) {
+    addMessage({
+      role: 'assistant',
+      content: 'Fillet radius must be a positive number.',
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  const edges = sceneState.subElementSelections
+    .filter((s) => s.type === 'edge' && s.objectId === object)
+    .map((s) => s.index)
+
+  if (edges.length === 0) {
+    addMessage({
+      role: 'assistant',
+      content:
+        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+    })
+    return
+  }
+
+  addMessage({
+    role: 'user',
+    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (radius ${radius})`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/fillet`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ object, edges, radius }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at radius ${radius}.`,
+      objectsAffected: [String(data.object.id)],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Placeholder for modify ops that don't yet have a direct REST
  * endpoint. Tells the user the feature is pending instead of routing
  * through the NLP pipeline (which 5xxs without `ANTHROPIC_API_KEY`)
@@ -582,7 +657,7 @@ export function ToolBar() {
         {
           label: 'Modify',
           items: [
-            { icon: Disc, label: 'Fillet', action: () => notYetWired('Fillet', 'needs edge-selection UX') },
+            { icon: Disc, label: 'Fillet', action: () => sendDirectFillet(2) },
             { icon: Hexagon, label: 'Chamfer', action: () => notYetWired('Chamfer', 'needs edge-selection UX') },
             { icon: SquareDashedBottom, label: 'Shell', action: () => sendDirectShell(1) },
             { icon: ScanLine, label: 'Offset', action: () => notYetWired('Offset', 'needs face-selection UX') },
