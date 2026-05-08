@@ -214,9 +214,134 @@ async function sendDirectBoolean(
   }
 }
 
-/** Fallback: route through NLP pipeline for complex/freeform commands */
-function sendCommand(cmd: string) {
-  processUserMessage(cmd)
+/**
+ * Hollow the currently-selected solid via the existing direct REST
+ * endpoint. Bypasses the NLP pipeline so a missing `ANTHROPIC_API_KEY`
+ * — which 5xxs every `/api/ai/command` request — can't block this
+ * deterministic op. Same swap-UUID semantics as the boolean handler:
+ * the kernel registers a fresh UUID for the hollow solid and the
+ * frontend's WS bridge reconciles the scene store.
+ */
+async function sendDirectShell(thickness: number) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Shell.',
+    })
+    return
+  }
+  if (!Number.isFinite(thickness) || thickness <= 0) {
+    addMessage({
+      role: 'assistant',
+      content: `Shell thickness must be a positive number, got ${thickness}.`,
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  addMessage({ role: 'user', content: `Shell ${object.slice(0, 6)} thickness ${thickness}` })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/shell`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ object, thickness }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Shelled ${object.slice(0, 6)} (thickness ${thickness}).`,
+      objectsAffected: [String(data.object.id)],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Shell failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
+ * Mirror the currently-selected solid across a coordinate plane. The
+ * kernel mirror op is in-place; the backend swaps the public UUID so
+ * viewers see a fresh ObjectCreated frame (no ObjectUpdated frame
+ * exists in the protocol yet). Plane defaults to XY (mirror through
+ * the world Z=0 plane).
+ */
+async function sendDirectMirror(plane: 'xy' | 'yz' | 'xz' = 'xy') {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Mirror.',
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  const plane_normal: [number, number, number] =
+    plane === 'xy' ? [0, 0, 1] : plane === 'yz' ? [1, 0, 0] : [0, 1, 0]
+
+  addMessage({ role: 'user', content: `Mirror ${object.slice(0, 6)} across ${plane.toUpperCase()} plane` })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/mirror`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        object,
+        plane_origin: [0, 0, 0],
+        plane_normal,
+      }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Mirrored ${object.slice(0, 6)} across ${plane.toUpperCase()}.`,
+      objectsAffected: [String(data.object.id)],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Mirror failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
+ * Placeholder for modify ops that don't yet have a direct REST
+ * endpoint. Tells the user the feature is pending instead of routing
+ * through the NLP pipeline (which 5xxs without `ANTHROPIC_API_KEY`)
+ * and surfacing a confusing "Failed to reach backend" error.
+ */
+function notYetWired(feature: string, reason?: string) {
+  const { addMessage } = useChatStore.getState()
+  const tail = reason ? ` (${reason})` : ''
+  addMessage({
+    role: 'assistant',
+    content: `${feature} is not yet wired to a direct backend endpoint${tail}. Coming in a follow-up slice.`,
+  })
 }
 
 /**
@@ -379,7 +504,7 @@ export function ToolBar() {
             { icon: Move3d, label: 'Translate', shortcut: 'G', active: activeTool === 'translate', action: () => handleToolChange('translate') },
             { icon: RotateCw, label: 'Rotate', shortcut: 'R', active: activeTool === 'rotate', action: () => handleToolChange('rotate') },
             { icon: Maximize, label: 'Scale', shortcut: 'S', active: activeTool === 'scale', action: () => handleToolChange('scale') },
-            { icon: FlipHorizontal, label: 'Mirror', action: () => sendCommand('mirror selected') },
+            { icon: FlipHorizontal, label: 'Mirror', action: () => sendDirectMirror('xy') },
           ],
         },
         {
@@ -431,10 +556,10 @@ export function ToolBar() {
         {
           label: 'Solid',
           items: [
-            { icon: ArrowUpFromLine, label: 'Extrude', action: () => sendCommand('extrude selected 10') },
-            { icon: RefreshCcw, label: 'Revolve', action: () => sendCommand('revolve selected 360') },
-            { icon: Layers, label: 'Loft', action: () => sendCommand('loft selected profiles') },
-            { icon: Workflow, label: 'Sweep', action: () => sendCommand('sweep selected along path') },
+            { icon: ArrowUpFromLine, label: 'Extrude', action: () => notYetWired('Extrude', 'use Sketch → Finish → Extrude flow') },
+            { icon: RefreshCcw, label: 'Revolve', action: () => notYetWired('Revolve') },
+            { icon: Layers, label: 'Loft', action: () => notYetWired('Loft') },
+            { icon: Workflow, label: 'Sweep', action: () => notYetWired('Sweep') },
           ],
         },
         {
@@ -457,21 +582,21 @@ export function ToolBar() {
         {
           label: 'Modify',
           items: [
-            { icon: Disc, label: 'Fillet', action: () => sendCommand('fillet selected edges radius 2') },
-            { icon: Hexagon, label: 'Chamfer', action: () => sendCommand('chamfer selected edges distance 2') },
-            { icon: SquareDashedBottom, label: 'Shell', action: () => sendCommand('shell selected thickness 1') },
-            { icon: ScanLine, label: 'Offset', action: () => sendCommand('offset selected faces distance 2') },
-            { icon: Scissors, label: 'Split', action: () => sendCommand('split selected body') },
-            { icon: Orbit, label: 'Draft', action: () => sendCommand('apply draft angle 3 to selected faces') },
+            { icon: Disc, label: 'Fillet', action: () => notYetWired('Fillet', 'needs edge-selection UX') },
+            { icon: Hexagon, label: 'Chamfer', action: () => notYetWired('Chamfer', 'needs edge-selection UX') },
+            { icon: SquareDashedBottom, label: 'Shell', action: () => sendDirectShell(1) },
+            { icon: ScanLine, label: 'Offset', action: () => notYetWired('Offset', 'needs face-selection UX') },
+            { icon: Scissors, label: 'Split', action: () => notYetWired('Split') },
+            { icon: Orbit, label: 'Draft', action: () => notYetWired('Draft', 'needs face-selection UX') },
           ],
         },
         {
           label: 'Pattern',
           items: [
-            { icon: Grid3x3, label: 'Linear Pattern', action: () => sendCommand('linear pattern selected count 3 spacing 15') },
-            { icon: Orbit, label: 'Circular Pattern', action: () => sendCommand('circular pattern selected count 6 angle 360') },
-            { icon: Hash, label: 'Rectangular', action: () => sendCommand('rectangular pattern selected 3x3 spacing 15') },
-            { icon: Copy, label: 'Copy', action: () => sendCommand('copy selected') },
+            { icon: Grid3x3, label: 'Linear Pattern', action: () => notYetWired('Linear Pattern') },
+            { icon: Orbit, label: 'Circular Pattern', action: () => notYetWired('Circular Pattern') },
+            { icon: Hash, label: 'Rectangular', action: () => notYetWired('Rectangular Pattern') },
+            { icon: Copy, label: 'Copy', action: () => notYetWired('Copy') },
           ],
         },
       ],
@@ -486,18 +611,18 @@ export function ToolBar() {
         {
           label: 'Manufacturing',
           items: [
-            { icon: CircleDot, label: 'Hole', action: () => sendCommand('create hole diameter 5 depth 10') },
-            { icon: Grip, label: 'Thread', action: () => sendCommand('create thread M10 pitch 1.5 length 15') },
-            { icon: Component, label: 'Rib', action: () => sendCommand('create rib thickness 2') },
+            { icon: CircleDot, label: 'Hole', action: () => notYetWired('Hole') },
+            { icon: Grip, label: 'Thread', action: () => notYetWired('Thread') },
+            { icon: Component, label: 'Rib', action: () => notYetWired('Rib') },
           ],
         },
         {
           label: 'Analyze',
           items: [
-            { icon: Ruler, label: 'Measure Distance', action: () => sendCommand('measure distance between selected') },
-            { icon: Pipette, label: 'Mass Properties', action: () => sendCommand('analyze mass of selected') },
-            { icon: Eye, label: 'Section View', action: () => sendCommand('create section view XZ plane') },
-            { icon: Wrench, label: 'Interference', action: () => sendCommand('check interference between selected') },
+            { icon: Ruler, label: 'Measure Distance', action: () => notYetWired('Measure Distance') },
+            { icon: Pipette, label: 'Mass Properties', action: () => notYetWired('Mass Properties', 'use /api/agent/parts/{id}') },
+            { icon: Eye, label: 'Section View', action: () => notYetWired('Section View') },
+            { icon: Wrench, label: 'Interference', action: () => notYetWired('Interference') },
           ],
         },
       ],
