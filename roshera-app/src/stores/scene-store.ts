@@ -247,6 +247,25 @@ export interface GridSettings {
   infiniteGrid: boolean
 }
 
+/**
+ * Cutting-plane configuration applied to every CAD mesh material when
+ * `enabled === true`. Frontend-only — no backend round-trip; the
+ * kernel keeps the full topology and the renderer simply hides one
+ * half-space behind a `THREE.Plane`.
+ *
+ * `axis` selects the world axis the plane normal points along. `offset`
+ * is the plane's signed distance from the world origin along that
+ * axis (in world units). `flipped` inverts which half-space is
+ * culled — the kernel-side topology never changes, so toggling
+ * `flipped` is a free O(1) way to inspect the other half.
+ */
+export interface SectionViewState {
+  enabled: boolean
+  axis: 'x' | 'y' | 'z'
+  offset: number
+  flipped: boolean
+}
+
 // ─── Sketch mode ─────────────────────────────────────────────────────
 /**
  * 2D sketch plane. Points are stored in plane-local (u, v) coordinates
@@ -429,6 +448,9 @@ interface SceneState {
   // Grid
   gridSettings: GridSettings
 
+  /** Cutting-plane state for Section View. See {@link SectionViewState}. */
+  sectionView: SectionViewState
+
   // Viewport
   viewportSize: { width: number; height: number }
 
@@ -496,6 +518,8 @@ interface SceneState {
 
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
+  setSectionView: (settings: Partial<SectionViewState>) => void
+  toggleSectionView: () => void
   setViewportSize: (size: { width: number; height: number }) => void
   openContextMenu: (menu: { x: number; y: number; objectId: string; faceId?: number }) => void
   closeContextMenu: () => void
@@ -623,6 +647,12 @@ export const useSceneStore = create<SceneState>()(
       sectionSize: 10,
       fadeDistance: 80,
       infiniteGrid: true,
+    },
+    sectionView: {
+      enabled: false,
+      axis: 'x',
+      offset: 0,
+      flipped: false,
     },
     viewportSize: { width: 0, height: 0 },
     contextMenu: null,
@@ -805,6 +835,16 @@ export const useSceneStore = create<SceneState>()(
     setGridSettings: (settings) =>
       set((state) => ({
         gridSettings: { ...state.gridSettings, ...settings },
+      })),
+
+    setSectionView: (settings) =>
+      set((state) => ({
+        sectionView: { ...state.sectionView, ...settings },
+      })),
+
+    toggleSectionView: () =>
+      set((state) => ({
+        sectionView: { ...state.sectionView, enabled: !state.sectionView.enabled },
       })),
 
     setViewportSize: (size) => set({ viewportSize: size }),

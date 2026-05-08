@@ -30,6 +30,7 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   const editingSketch = useSceneStore(
     (s) => s.sketch.active && s.sketch.serverId !== null,
   )
+  const sectionView = useSceneStore((s) => s.sectionView)
 
   const { defaultEdgeHex, accentEdgeHex } = useMemo(() => {
     const tick = resolveCssVar('--cad-tick')
@@ -71,6 +72,23 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
     return geom
   }, [object.mesh])
 
+  // Section-view clipping plane. The plane normal is the +axis world
+  // direction (negated when `flipped`); `constant` is the signed
+  // distance along that normal from the origin to the plane. The
+  // half-space the normal points away from is the surviving half:
+  // material is hidden where `dot(normal, p) + constant < 0`. So
+  // `constant = -offset` for a non-flipped slice along +axis at
+  // world coordinate `offset`.
+  const clippingPlanes = useMemo(() => {
+    if (!sectionView.enabled) return []
+    const sign = sectionView.flipped ? -1 : 1
+    const normal =
+      sectionView.axis === 'x' ? new THREE.Vector3(sign, 0, 0)
+      : sectionView.axis === 'y' ? new THREE.Vector3(0, sign, 0)
+      : new THREE.Vector3(0, 0, sign)
+    return [new THREE.Plane(normal, -sign * sectionView.offset)]
+  }, [sectionView.enabled, sectionView.axis, sectionView.offset, sectionView.flipped])
+
   // Material — no color swap for selection (outline post-processing handles that)
   // In edit-sketch mode the solid is rendered at low opacity with
   // depthWrite disabled so the in-canvas dimension labels and
@@ -86,8 +104,13 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       opacity,
       depthWrite: editingSketch ? false : true,
       side: THREE.DoubleSide,
+      // Section View. Toggling `clippingPlanes` between [] and [plane]
+      // doesn't trigger a re-mount; Three honours the new array on the
+      // next frame as long as `gl.localClippingEnabled` is true (set
+      // once in CADViewport's onCreated).
+      clippingPlanes,
     })
-  }, [object.material, editingSketch])
+  }, [object.material, editingSketch, clippingPlanes])
 
   const toggleSubElementSelection = useSceneStore((s) => s.toggleSubElementSelection)
 
