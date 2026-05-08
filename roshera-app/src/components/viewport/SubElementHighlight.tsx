@@ -273,8 +273,13 @@ function EdgePolyline({ points, color, hover }: EdgePolylineProps) {
   // cap at 1px on every major browser, which is why the previous
   // `<lineSegments>` + `lineBasicMaterial` highlight was invisible
   // against a dark viewport.
+  //
+  // Key on the colour so a theme/state change forces a clean remount —
+  // drei's Line2 binds its colour uniform at construction and doesn't
+  // always re-flow prop changes onto the GPU.
   return (
     <Line
+      key={color}
       points={points}
       color={color}
       lineWidth={hover ? 3 : 5}
@@ -356,7 +361,7 @@ function EdgeMark({ ao, bo, co, color, hover }: EdgeMarkProps) {
     <group>
       {segments.map(([p0, p1], i) => (
         <Line
-          key={i}
+          key={`${i}-${color}`}
           points={[p0, p1]}
           color={color}
           lineWidth={hover ? 2 : 3}

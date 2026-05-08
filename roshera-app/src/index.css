@@ -54,7 +54,7 @@
   --cad-selected: oklch(0.65 0.18 60);   /* warm yellow — single accent */
   --cad-hovered: oklch(0.45 0.12 220);
   --cad-face-selected: oklch(0.65 0.18 60 / 0.30);
-  --cad-edge-selected: oklch(0.78 0.13 22);  /* pastel red */
+  --cad-edge-selected: oklch(0.78 0.18 95);  /* yellow — saturated enough to read against cream viewport on thin lines */
   --cad-vertex-selected: oklch(0.55 0.20 25);
   --cad-viewport-bg: oklch(0.955 0.012 90);
 
@@ -116,7 +116,7 @@
   --cad-selected: oklch(0.95 0 0);
   --cad-hovered: oklch(0.92 0 0);
   --cad-face-selected: oklch(1 0 0 / 0.25);
-  --cad-edge-selected: oklch(0.80 0.13 22);  /* pastel red */
+  --cad-edge-selected: oklch(0.88 0.18 95);  /* yellow — chroma bumped so it reads against navy viewport on thin lines */
   --cad-vertex-selected: oklch(0.95 0 0);
   --cad-viewport-bg: oklch(0.16 0.10 258);
 
