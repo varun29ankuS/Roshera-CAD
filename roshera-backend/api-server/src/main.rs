@@ -1717,6 +1717,356 @@ async fn chamfer_edges_endpoint(
     })))
 }
 
+/// POST /api/geometry/pattern/linear — replicate a solid along a
+/// direction. Backend `deep_clone_solid` + `transform_solid` per
+/// instance; broadcasts a fresh `ObjectCreated` for every clone so
+/// the viewport renders all copies. The original solid is left in
+/// place; only `count - 1` clones are emitted (the original counts
+/// as the first instance).
+///
+/// Request:
+/// ```json
+/// { "object":    "<uuid>",
+///   "direction": [1.0, 0.0, 0.0],   // will be normalized
+///   "spacing":   10.0,              // distance between instances (plane units)
+///   "count":     3                   // total instances incl. original (≥ 2)
+/// }
+/// ```
+async fn pattern_linear_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::{Matrix4, Vector3};
+    use geometry_engine::operations::deep_clone::deep_clone_solid;
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let object_uuid_str = payload
+        .get("object")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'object' is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+
+    let direction_arr = payload
+        .get("direction")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("direction"))?;
+    if direction_arr.len() != 3 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'direction' must be a 3-element array".to_string(),
+        ));
+    }
+    let mut dir = [0.0f64; 3];
+    for (i, v) in direction_arr.iter().enumerate() {
+        dir[i] = v.as_f64().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'direction[{i}]' must be a number"),
+            )
+        })?;
+    }
+    let dir_vec = Vector3::new(dir[0], dir[1], dir[2]);
+    let dir_len = dir_vec.magnitude();
+    if !dir_len.is_finite() || dir_len < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'direction' must be a non-zero finite vector".to_string(),
+        ));
+    }
+    let dir_norm = Vector3::new(dir[0] / dir_len, dir[1] / dir_len, dir[2] / dir_len);
+
+    let spacing = payload
+        .get("spacing")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("spacing"))?;
+    if !spacing.is_finite() || spacing <= 0.0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'spacing' must be a positive finite number, got {spacing}"),
+        ));
+    }
+
+    let count = payload
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ApiError::missing_field("count"))?;
+    if !(2..=512).contains(&count) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'count' must be in [2, 512], got {count}"),
+        ));
+    }
+
+    let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object={object_uuid}"),
+        )
+    })?;
+
+    let mut emitted: Vec<String> = Vec::with_capacity((count as usize) - 1);
+
+    for i in 1..count {
+        let translation = Vector3::new(
+            dir_norm.x * spacing * (i as f64),
+            dir_norm.y * spacing * (i as f64),
+            dir_norm.z * spacing * (i as f64),
+        );
+
+        // Clone + transform under a single write lock per instance.
+        // Tessellation runs under a read lock immediately after.
+        let new_solid_id = {
+            let mut model = state.model.write().await;
+            let cloned = deep_clone_solid(&mut model, solid_id, None)
+                .map_err(ApiError::kernel_error)?;
+            transform_solid(
+                &mut model,
+                cloned,
+                Matrix4::from_translation(&translation),
+                TransformOptions::default(),
+            )
+            .map_err(ApiError::kernel_error)?;
+            cloned
+        };
+
+        let tri_mesh = {
+            let model = state.model.read().await;
+            let solid = model
+                .solids
+                .get(new_solid_id)
+                .ok_or_else(|| ApiError::solid_not_found(new_solid_id))?;
+            tessellate_solid(solid, &model, &TessellationParams::default())
+        };
+        if tri_mesh.triangles.is_empty() {
+            return Err(ApiError::tessellation_empty(
+                new_solid_id,
+                tri_mesh.vertices.len(),
+            ));
+        }
+        let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+        let result_uuid = Uuid::new_v4();
+        let result_id_str = result_uuid.to_string();
+        state.register_id_mapping(result_uuid, new_solid_id);
+
+        let display_name = format!("Linear Pattern {} #{}", solid_id, i);
+        let parameters = serde_json::json!({
+            "source": object_uuid.to_string(),
+            "instance": i,
+            "direction": [dir_norm.x, dir_norm.y, dir_norm.z],
+            "spacing": spacing,
+        });
+
+        broadcast_object_created(
+            &result_id_str,
+            &display_name,
+            new_solid_id,
+            "linear_pattern",
+            &parameters,
+            &vertices,
+            &indices,
+            &normals_buf,
+            &face_ids,
+            [0.0, 0.0, 0.0],
+        );
+        emitted.push(result_id_str);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "source":  object_uuid.to_string(),
+        "count":   emitted.len(),
+        "ids":     emitted,
+    })))
+}
+
+/// POST /api/geometry/pattern/circular — replicate a solid by rotating
+/// it around an axis. Equivalent to linear pattern but transforms are
+/// `Matrix4::rotation_axis(origin, axis, angle * i)` for each instance.
+///
+/// Request:
+/// ```json
+/// { "object":      "<uuid>",
+///   "axis_origin": [0.0, 0.0, 0.0],
+///   "axis":        [0.0, 0.0, 1.0],   // will be normalized
+///   "count":       6,                  // ≥ 2
+///   "total_angle": 6.2831853             // radians; full circle by default
+/// }
+/// ```
+async fn pattern_circular_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::{Matrix4, Point3, Vector3};
+    use geometry_engine::operations::deep_clone::deep_clone_solid;
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let object_uuid_str = payload
+        .get("object")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'object' is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+
+    fn read_vec3(
+        payload: &serde_json::Value,
+        key: &str,
+        default: [f64; 3],
+    ) -> Result<[f64; 3], ApiError> {
+        let arr = match payload.get(key).and_then(|v| v.as_array()) {
+            None => return Ok(default),
+            Some(a) => a,
+        };
+        if arr.len() != 3 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'{key}' must be a 3-element array"),
+            ));
+        }
+        let mut out = [0.0f64; 3];
+        for (i, v) in arr.iter().enumerate() {
+            out[i] = v.as_f64().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'{key}[{i}]' must be a number"),
+                )
+            })?;
+        }
+        Ok(out)
+    }
+
+    let axis_origin = read_vec3(&payload, "axis_origin", [0.0, 0.0, 0.0])?;
+    let axis = read_vec3(&payload, "axis", [0.0, 0.0, 1.0])?;
+    let axis_vec = Vector3::new(axis[0], axis[1], axis[2]);
+    let axis_len = axis_vec.magnitude();
+    if !axis_len.is_finite() || axis_len < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'axis' must be a non-zero finite vector".to_string(),
+        ));
+    }
+    let axis_norm = Vector3::new(
+        axis[0] / axis_len,
+        axis[1] / axis_len,
+        axis[2] / axis_len,
+    );
+
+    let count = payload
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ApiError::missing_field("count"))?;
+    if !(2..=512).contains(&count) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'count' must be in [2, 512], got {count}"),
+        ));
+    }
+
+    let total_angle = payload
+        .get("total_angle")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(std::f64::consts::TAU);
+    if !total_angle.is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'total_angle' must be finite (radians)".to_string(),
+        ));
+    }
+
+    let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object={object_uuid}"),
+        )
+    })?;
+
+    let step = total_angle / (count as f64);
+    let origin_pt = Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]);
+    let mut emitted: Vec<String> = Vec::with_capacity((count as usize) - 1);
+
+    for i in 1..count {
+        let angle = step * (i as f64);
+        let rot = Matrix4::rotation_axis(origin_pt, axis_norm, angle).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("rotation_axis failed: {e:?}"),
+            )
+        })?;
+
+        let new_solid_id = {
+            let mut model = state.model.write().await;
+            let cloned = deep_clone_solid(&mut model, solid_id, None)
+                .map_err(ApiError::kernel_error)?;
+            transform_solid(&mut model, cloned, rot, TransformOptions::default())
+                .map_err(ApiError::kernel_error)?;
+            cloned
+        };
+
+        let tri_mesh = {
+            let model = state.model.read().await;
+            let solid = model
+                .solids
+                .get(new_solid_id)
+                .ok_or_else(|| ApiError::solid_not_found(new_solid_id))?;
+            tessellate_solid(solid, &model, &TessellationParams::default())
+        };
+        if tri_mesh.triangles.is_empty() {
+            return Err(ApiError::tessellation_empty(
+                new_solid_id,
+                tri_mesh.vertices.len(),
+            ));
+        }
+        let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+        let result_uuid = Uuid::new_v4();
+        let result_id_str = result_uuid.to_string();
+        state.register_id_mapping(result_uuid, new_solid_id);
+
+        let display_name = format!("Circular Pattern {} #{}", solid_id, i);
+        let parameters = serde_json::json!({
+            "source": object_uuid.to_string(),
+            "instance": i,
+            "axis_origin": axis_origin,
+            "axis": [axis_norm.x, axis_norm.y, axis_norm.z],
+            "angle": angle,
+        });
+
+        broadcast_object_created(
+            &result_id_str,
+            &display_name,
+            new_solid_id,
+            "circular_pattern",
+            &parameters,
+            &vertices,
+            &indices,
+            &normals_buf,
+            &face_ids,
+            [0.0, 0.0, 0.0],
+        );
+        emitted.push(result_id_str);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "source":  object_uuid.to_string(),
+        "count":   emitted.len(),
+        "ids":     emitted,
+    })))
+}
+
 /// POST /api/geometry/extrude — sketch a closed planar polygon and
 /// extrude it into a solid in one shot.
 ///
@@ -4229,6 +4579,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/mirror", post(mirror_solid))
         .route("/api/geometry/fillet", post(fillet_edges_endpoint))
         .route("/api/geometry/chamfer", post(chamfer_edges_endpoint))
+        .route("/api/geometry/pattern/linear", post(pattern_linear_endpoint))
+        .route("/api/geometry/pattern/circular", post(pattern_circular_endpoint))
         // 2D sketch sessions — backend-owned source of truth for the
         // click-to-place workflow. Frontend creates a session, streams
         // points / plane / tool changes through the REST surface, and
