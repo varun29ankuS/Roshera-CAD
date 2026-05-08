@@ -94,6 +94,10 @@ export const cadObjectSchema = z.object({
 const subElementSchema = z.object({
   type: z.enum(['face', 'edge', 'vertex']),
   index: z.number(),
+  // Optional kernel-sampled curve polyline (flat [x,y,z, x,y,z, ...]).
+  // Backend ships this for edge picks so the viewport can outline the
+  // exact selected edge instead of the picked triangle's three sides.
+  polyline: z.array(z.number()).optional(),
 })
 
 // Backend `SketchSession` wire shape (snake_case as serialised by serde).

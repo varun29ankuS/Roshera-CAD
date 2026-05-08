@@ -2195,7 +2195,19 @@ async fn handle_subelement_pick(state: &AppState, pick: &serde_json::Value) -> s
                 }
             }
             match best {
-                Some((eid, _)) => serde_json::json!({ "type": "edge", "index": eid }),
+                Some((eid, _)) => {
+                    // Sample the resolved edge's curve into a flat polyline
+                    // so the frontend can render the actual B-Rep edge
+                    // instead of falling back to the picked triangle's
+                    // three sides. ~32 samples is enough for a smooth
+                    // arc at typical viewing distances and cheap to ship.
+                    let polyline = sample_edge_polyline(&model, eid, 32);
+                    serde_json::json!({
+                        "type": "edge",
+                        "index": eid,
+                        "polyline": polyline,
+                    })
+                }
                 None => {
                     return subelement_error(object_id_str, "no edges reachable from solid");
                 }
@@ -2260,6 +2272,68 @@ async fn handle_subelement_pick(state: &AppState, pick: &serde_json::Value) -> s
             "elements": [element],
         }
     })
+}
+
+/// Sample a B-Rep edge into a flat polyline for the frontend to render
+/// as a highlight. Returns `[x0, y0, z0, x1, y1, z1, …]` in world space
+/// (vertex positions are stored unmodified at the kernel level — the
+/// solid carries no per-instance transform today).
+///
+/// `samples` is the number of points along the curve; the segments
+/// returned are `samples - 1`. 32 samples is sufficient for visually
+/// smooth NURBS / arc / line rendering at typical viewing distances
+/// while keeping the WS payload small (≤ 96 floats).
+///
+/// Falls back to the edge's two vertex endpoints if the curve is
+/// missing or `evaluate` errors at every parameter — better a
+/// degenerate two-point line than no highlight at all.
+fn sample_edge_polyline(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    edge_id: u32,
+    samples: usize,
+) -> Vec<f64> {
+    use geometry_engine::primitives::curve::Curve;
+
+    let edge = match model.edges.get(edge_id) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    let endpoints_fallback = || {
+        let mut out: Vec<f64> = Vec::with_capacity(6);
+        if let Some(v0) = model.vertices.get(edge.start_vertex) {
+            out.extend_from_slice(&v0.position);
+        }
+        if let Some(v1) = model.vertices.get(edge.end_vertex) {
+            out.extend_from_slice(&v1.position);
+        }
+        out
+    };
+
+    let curve = match model.curves.get(edge.curve_id) {
+        Some(c) => c,
+        None => return endpoints_fallback(),
+    };
+
+    let range = curve.parameter_range();
+    let n = samples.max(2);
+    let span = range.end - range.start;
+    let mut out: Vec<f64> = Vec::with_capacity(n * 3);
+    for i in 0..n {
+        let t = range.start + span * (i as f64) / ((n - 1) as f64);
+        match curve.evaluate(t) {
+            Ok(p) => {
+                out.push(p.position.x);
+                out.push(p.position.y);
+                out.push(p.position.z);
+            }
+            Err(_) => continue,
+        }
+    }
+    if out.len() < 6 {
+        return endpoints_fallback();
+    }
+    out
 }
 
 /// Build a typed Error frame for SubElementPick failures.

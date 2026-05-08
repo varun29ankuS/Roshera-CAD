@@ -1389,6 +1389,175 @@ async fn mirror_solid(
     })))
 }
 
+/// POST /api/geometry/fillet — round one or more edges of a solid with
+/// a constant radius.
+///
+/// Request:
+/// ```json
+/// { "object":   "<uuid>",
+///   "edges":    [edge_id_u32, ...],   // ≥1 EdgeId from a SubElementPick
+///   "radius":   2.0
+/// }
+/// ```
+///
+/// Response mirrors `shell_solid`: the solid is filleted in place at
+/// the kernel level, the public UUID is swapped, and an
+/// `ObjectCreated` frame for the rounded solid is broadcast (paired
+/// with an `ObjectDeleted` for the original).
+async fn fillet_edges_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::fillet::{
+        fillet_edges as kernel_fillet, FilletOptions, FilletType, PropagationMode,
+    };
+    use geometry_engine::primitives::edge::EdgeId;
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let object_uuid_str = payload
+        .get("object")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'object' is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+
+    let radius = payload
+        .get("radius")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("radius"))?;
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'radius' must be a positive finite number, got {radius}"),
+        ));
+    }
+
+    let edges_raw = payload
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("edges"))?;
+    if edges_raw.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'edges' must contain at least one EdgeId".to_string(),
+        ));
+    }
+    let mut edges: Vec<EdgeId> = Vec::with_capacity(edges_raw.len());
+    for (i, item) in edges_raw.iter().enumerate() {
+        let n = item.as_u64().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'edges[{i}]' must be a non-negative integer, got {item}"),
+            )
+        })?;
+        if n > u32::MAX as u64 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'edges[{i}]'={n} exceeds u32::MAX"),
+            ));
+        }
+        edges.push(n as EdgeId);
+    }
+
+    let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object={object_uuid}"),
+        )
+    })?;
+
+    // Hold the model write lock only for the kernel fillet op;
+    // tessellation runs under a read lock. Same pattern as boolean /
+    // shell / mirror.
+    {
+        let mut model = state.model.write().await;
+        let opts = FilletOptions {
+            fillet_type: FilletType::Constant(radius),
+            propagation: PropagationMode::None,
+            ..FilletOptions::default()
+        };
+        kernel_fillet(&mut model, solid_id, edges, opts).map_err(ApiError::kernel_error)?;
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+
+    let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    state.unregister_id_mapping(&object_uuid);
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, solid_id);
+
+    let display_name = format!("Fillet {}", solid_id);
+    let parameters = serde_json::json!({
+        "radius": radius,
+        "source": object_uuid.to_string(),
+    });
+
+    broadcast_object_deleted(&object_uuid.to_string());
+    broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        solid_id,
+        "fillet",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals_buf,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": solid_id,
+        "consumed": [object_uuid.to_string()],
+        "object": {
+            "id":         result_id_str,
+            "name":       display_name,
+            "objectType": "fillet",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals_buf,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":   tri_mesh.vertices.len(),
+            "triangle_count": tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 /// POST /api/geometry/extrude — sketch a closed planar polygon and
 /// extrude it into a solid in one shot.
 ///
@@ -3899,6 +4068,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
         .route("/api/geometry/shell", post(shell_solid))
         .route("/api/geometry/mirror", post(mirror_solid))
+        .route("/api/geometry/fillet", post(fillet_edges_endpoint))
         // 2D sketch sessions — backend-owned source of truth for the
         // click-to-place workflow. Frontend creates a session, streams
         // points / plane / tool changes through the REST surface, and

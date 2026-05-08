@@ -19,6 +19,12 @@ export interface SubElementSelection {
   objectId: string
   type: 'face' | 'edge' | 'vertex'
   index: number
+  /**
+   * Optional flat polyline `[x,y,z, x,y,z, ...]` sampled by the kernel
+   * for edge selections. When present the viewport renders this exact
+   * curve; otherwise it falls back to outlining the picked triangle.
+   */
+  polyline?: number[]
 }
 
 // ─── Transform tools ─────────────────────────────────────────────────
