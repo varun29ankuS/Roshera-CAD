@@ -155,6 +155,24 @@ pub async fn part_distance(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// `GET /api/agent/parts/distance/uuid/{a}/{b}` — UUID-keyed wrapper
+/// around [`part_distance`]. Resolves both UUIDs through
+/// [`AppState::get_local_id`] before dispatching to the kernel, so
+/// frontends that address objects by public UUID don't need their
+/// own UUID-to-SolidId resolver.
+pub async fn part_distance_by_uuid(
+    State(state): State<AppState>,
+    Path((a_uuid, b_uuid)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Result<Json<DistanceReport>, StatusCode> {
+    let a = state.get_local_id(&a_uuid).ok_or(StatusCode::NOT_FOUND)?;
+    let b = state.get_local_id(&b_uuid).ok_or(StatusCode::NOT_FOUND)?;
+    let model = state.model.read().await;
+    model
+        .part_distance(a, b)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// Request body for `POST /api/agent/parts/{id}/reanchor`.
 ///
 /// `new_datum_id` is required; `local_transform`, when omitted, leaves

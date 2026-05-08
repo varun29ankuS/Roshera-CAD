@@ -4738,6 +4738,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/agent/parts/distance/{a}/{b}",
             get(handlers::agent::part_distance),
         )
+        .route(
+            "/api/agent/parts/distance/uuid/{a}/{b}",
+            get(handlers::agent::part_distance_by_uuid),
+        )
         .route("/api/agent/datums", get(handlers::agent::list_datums))
         .route(
             "/api/agent/datums/{id}/parts",
