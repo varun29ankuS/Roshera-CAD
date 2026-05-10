@@ -60,7 +60,9 @@ pub struct Matrix2x2 {
 /// Cylindrical fillet surface - constant radius along straight edge
 #[derive(Debug)]
 pub struct CylindricalFillet {
-    /// Spine curve (the edge)
+    /// Spine curve (the rolling-ball axis — i.e. the cylinder centre line,
+    /// NOT the original edge). Built from `RollingBallData::centers` by
+    /// `create_cylindrical_fillet_surface`.
     pub spine: Box<dyn Curve>,
     /// Radius of the fillet
     pub radius: f64,
@@ -68,9 +70,22 @@ pub struct CylindricalFillet {
     pub contact1: Box<dyn Curve>,
     /// Second contact curve on adjacent face
     pub contact2: Box<dyn Curve>,
-    /// Axis direction at each spine point
+    /// Axis direction (z) at each spine point — the spine tangent.
     pub axis_field: Vec<Vector3>,
-    /// Angle span at each spine point
+    /// Frame x-axis at each spine point: unit vector from the spine
+    /// (axis centre) toward the contact-1 point, projected to be
+    /// perpendicular to the spine tangent. `radial(angle = 0)` is
+    /// exactly this direction, which puts contact1 at v = 0.
+    pub frame_x_field: Vec<Vector3>,
+    /// Frame y-axis at each spine point: completes a right-handed
+    /// orthonormal basis with `axis_field` and `frame_x_field`, sign-
+    /// flipped if necessary so that contact2 sits at a POSITIVE angle
+    /// from frame_x. With this convention the arc traced as v: 0→1
+    /// goes the short way from contact1 to contact2 every time,
+    /// independent of which face is "face1" or which world axis the
+    /// edge happens to lie along.
+    pub frame_y_field: Vec<Vector3>,
+    /// Angle span at each spine point (always (0, +α) with α ∈ (0, π)).
     pub angle_span: Vec<(f64, f64)>,
 }
 
@@ -82,6 +97,8 @@ impl Clone for CylindricalFillet {
             contact1: self.contact1.clone_box(),
             contact2: self.contact2.clone_box(),
             axis_field: self.axis_field.clone(),
+            frame_x_field: self.frame_x_field.clone(),
+            frame_y_field: self.frame_y_field.clone(),
             angle_span: self.angle_span.clone(),
         }
     }
@@ -101,9 +118,18 @@ impl CylindricalFillet {
             ));
         }
 
-        // Sample spine to compute axis field
+        // Sample spine to compute axis + frame fields. The frame is the
+        // crucial bit: each (z, x, y) basis is anchored to the actual
+        // contact directions at that spine sample so that v = 0 lands
+        // exactly on contact1 and v = 1 lands exactly on contact2,
+        // independent of how the edge happens to be oriented in the
+        // world. Without this anchoring the cylinder arc renders on
+        // an arbitrary side of the spine, producing the visible
+        // "fillet on the wrong side" bug.
         let num_samples = 20;
         let mut axis_field = Vec::with_capacity(num_samples);
+        let mut frame_x_field = Vec::with_capacity(num_samples);
+        let mut frame_y_field = Vec::with_capacity(num_samples);
         let mut angle_span = Vec::with_capacity(num_samples);
 
         for i in 0..num_samples {
@@ -111,22 +137,42 @@ impl CylindricalFillet {
             let spine_point = spine.evaluate(t)?.position;
             let spine_tangent = spine.tangent_at(t)?;
 
-            // Get contact points
+            // Contact directions (from cylinder axis out to each face).
+            // For a correctly built rolling-ball fillet these are unit-
+            // length and perpendicular to the spine tangent within
+            // floating tolerance, but we project just in case the
+            // sampling introduced drift.
             let contact1_point = contact1.evaluate(t)?.position;
             let contact2_point = contact2.evaluate(t)?.position;
-
-            // Compute axis direction (perpendicular to spine and in bisector plane)
             let v1 = (contact1_point - spine_point).normalize()?;
             let v2 = (contact2_point - spine_point).normalize()?;
-            let axis = spine_tangent.normalize()?;
 
-            axis_field.push(axis);
+            let z_axis = spine_tangent.normalize()?;
+            let v1_perp = (v1 - z_axis * v1.dot(&z_axis)).normalize()?;
+            let v2_perp = (v2 - z_axis * v2.dot(&z_axis)).normalize()?;
 
-            // Compute angle span
-            let angle1 = v1.angle(&v2)?;
-            let start_angle = 0.0;
-            let end_angle = angle1;
-            angle_span.push((start_angle, end_angle));
+            // x-axis = v1 (so contact1 is at angle 0). y-axis sign is
+            // chosen so v2 lies on the positive-angle side; this makes
+            // the swept angle a well-defined positive number.
+            let frame_x = v1_perp;
+            let frame_y_unsigned = z_axis.cross(&frame_x);
+            let frame_y = if v2_perp.dot(&frame_y_unsigned) >= 0.0 {
+                frame_y_unsigned
+            } else {
+                -frame_y_unsigned
+            };
+
+            // Signed end angle. cos = v2 · frame_x; sin = v2 · frame_y
+            // (≥ 0 by construction). atan2 keeps both branches honest
+            // for ε-magnitudes.
+            let cos_a = v2_perp.dot(&frame_x).clamp(-1.0, 1.0);
+            let sin_a = v2_perp.dot(&frame_y).max(0.0);
+            let end_angle = sin_a.atan2(cos_a);
+
+            axis_field.push(z_axis);
+            frame_x_field.push(frame_x);
+            frame_y_field.push(frame_y);
+            angle_span.push((0.0, end_angle));
         }
 
         Ok(Self {
@@ -135,6 +181,8 @@ impl CylindricalFillet {
             contact1,
             contact2,
             axis_field,
+            frame_x_field,
+            frame_y_field,
             angle_span,
         })
     }
@@ -144,6 +192,20 @@ impl CylindricalFillet {
         let idx = (u * (self.axis_field.len() - 1) as f64) as usize;
         let idx = idx.min(self.axis_field.len() - 1);
         Ok(self.axis_field[idx])
+    }
+
+    /// Get frame x-axis (radial at angle 0 = direction toward contact1).
+    fn frame_x_at(&self, u: f64) -> Vector3 {
+        let idx = (u * (self.frame_x_field.len() - 1) as f64) as usize;
+        let idx = idx.min(self.frame_x_field.len() - 1);
+        self.frame_x_field[idx]
+    }
+
+    /// Get frame y-axis (oriented so contact2 has positive component).
+    fn frame_y_at(&self, u: f64) -> Vector3 {
+        let idx = (u * (self.frame_y_field.len() - 1) as f64) as usize;
+        let idx = idx.min(self.frame_y_field.len() - 1);
+        self.frame_y_field[idx]
     }
 
     /// Get angle span at parameter
@@ -178,17 +240,19 @@ impl Surface for CylindricalFillet {
         // right when axis_field varies with u.
         let position_at = |u: f64, v: f64| -> MathResult<(Point3, Vector3, Vector3)> {
             let spine_point = self.spine.evaluate(u)?.position;
-            let axis = self.axis_at(u)?;
+            let z_axis = self.axis_at(u)?.normalize()?;
+            let x_axis = self.frame_x_at(u);
+            let y_axis = self.frame_y_at(u);
             let (start_angle, end_angle) = self.angles_at(u);
             let angle = start_angle + v * (end_angle - start_angle);
 
-            let z_axis = axis.normalize()?;
-            let x_axis = if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
-                z_axis.cross(&Vector3::X).normalize()?
-            } else {
-                z_axis.cross(&Vector3::Y).normalize()?
-            };
-            let y_axis = z_axis.cross(&x_axis);
+            // Anchor the radial direction to the per-sample frame:
+            // angle = 0 ⇒ radial = x_axis ⇒ contact1; angle =
+            // end_angle ⇒ radial = v2 (contact2). The previous
+            // implementation derived x_axis from a world-axis cross
+            // product, which produced a frame independent of the
+            // contact directions and put the cylinder arc on whichever
+            // side that arbitrary frame happened to start on.
             let radial = x_axis * angle.cos() + y_axis * angle.sin();
             Ok((spine_point + radial * self.radius, radial, z_axis))
         };
@@ -292,12 +356,24 @@ impl Surface for CylindricalFillet {
             .iter()
             .map(|a| transform.transform_vector(a))
             .collect();
+        let frame_x_field: Vec<Vector3> = self
+            .frame_x_field
+            .iter()
+            .map(|x| transform.transform_vector(x))
+            .collect();
+        let frame_y_field: Vec<Vector3> = self
+            .frame_y_field
+            .iter()
+            .map(|y| transform.transform_vector(y))
+            .collect();
         Box::new(CylindricalFillet {
             spine: transformed_spine,
             radius: self.radius,
             contact1: transformed_c1,
             contact2: transformed_c2,
             axis_field,
+            frame_x_field,
+            frame_y_field,
             angle_span: self.angle_span.clone(),
         })
     }
@@ -345,6 +421,8 @@ impl Surface for CylindricalFillet {
             contact1: self.contact1.clone_box(),
             contact2: self.contact2.clone_box(),
             axis_field: self.axis_field.clone(),
+            frame_x_field: self.frame_x_field.clone(),
+            frame_y_field: self.frame_y_field.clone(),
             angle_span: self.angle_span.clone(),
         })
     }

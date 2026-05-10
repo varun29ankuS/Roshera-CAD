@@ -438,9 +438,18 @@ fn dispatch_generic(
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
-            let radius = parse_fillet_constant_radius(inner).unwrap_or(1.0);
+            // Prefer the structured `radius` field added in 2026-05-10;
+            // fall back to parsing the Debug-formatted `fillet_type`
+            // string for events recorded by older builds. Final fallback
+            // is the FilletOptions default radius.
+            let radius = inner
+                .get("radius")
+                .and_then(|v| v.as_f64())
+                .or_else(|| parse_fillet_constant_radius(inner))
+                .unwrap_or(1.0);
             let options = FilletOptions {
                 fillet_type: FilletType::Constant(radius),
+                radius,
                 ..FilletOptions::default()
             };
             let _faces =

@@ -13,6 +13,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -169,13 +170,17 @@ pub fn fillet_edges(
 
     // Create fillet surfaces for each chain
     let mut fillet_faces = Vec::new();
+    let mut surgeries = Vec::new();
     for chain in edge_chains {
-        let chain_faces = create_fillet_chain(model, solid_id, chain, &options)?;
+        let (chain_faces, chain_surgeries) =
+            create_fillet_chain(model, solid_id, chain, &options)?;
         fillet_faces.extend(chain_faces);
+        surgeries.extend(chain_surgeries);
     }
 
-    // Update adjacent faces to trim against fillet surfaces
-    update_adjacent_faces(model, solid_id, &selected_edges, &fillet_faces)?;
+    // Re-stitch the surrounding topology and add fillet faces to the
+    // outer shell so the resulting B-Rep is watertight.
+    update_adjacent_faces(model, solid_id, &fillet_faces, &surgeries)?;
 
     // Validate result if requested
     if options.common.validate_result {
@@ -192,7 +197,10 @@ pub fn fillet_edges(
             .with_parameters(serde_json::json!({
                 "solid_id": solid_id,
                 "fillet_type": format!("{:?}", options.fillet_type),
+                "radius": options.radius,
                 "propagation": format!("{:?}", options.propagation),
+                "preserve_edges": options.preserve_edges,
+                "quality": format!("{:?}", options.quality),
             }))
             .with_inputs(inputs)
             .with_outputs(fillet_face_ids),
@@ -231,21 +239,28 @@ pub fn fillet_vertices(
     Ok(fillet_faces)
 }
 
-/// Create a fillet chain along connected edges
+/// Create a fillet chain along connected edges.
+///
+/// Returns the new fillet face IDs alongside the per-edge
+/// `BlendEdgeSurgery` data (one entry per 4-sided fillet face — the
+/// 3-sided degenerate path returns no surgery). The surgery list is
+/// passed downstream to `update_adjacent_faces` for topology
+/// re-stitching.
 fn create_fillet_chain(
     model: &mut BRepModel,
     solid_id: SolidId,
     edges: Vec<EdgeId>,
     options: &FilletOptions,
-) -> OperationResult<Vec<FaceId>> {
+) -> OperationResult<(Vec<FaceId>, Vec<BlendEdgeSurgery>)> {
     let mut fillet_faces = Vec::new();
+    let mut surgeries = Vec::new();
 
     for &edge_id in &edges {
         // Get the two faces adjacent to this edge
         let (face1_id, face2_id) = get_adjacent_faces(model, solid_id, edge_id)?;
 
         // Create fillet surface between the faces
-        let fillet_face = match &options.fillet_type {
+        let (fillet_face, surgery) = match &options.fillet_type {
             FilletType::Constant(radius) => {
                 create_constant_radius_fillet(model, edge_id, face1_id, face2_id, *radius)?
             }
@@ -261,15 +276,20 @@ fn create_fillet_chain(
         };
 
         fillet_faces.push(fillet_face);
+        if let Some(s) = surgery {
+            surgeries.push(s);
+        }
     }
 
-    // Create transition surfaces where fillets meet
+    // Create transition surfaces where fillets meet. Transition faces
+    // are produced by a separate corner-blend pipeline and are not
+    // simple edge replacements — they don't carry surgery.
     if options.preserve_edges && edges.len() > 1 {
         let transitions = create_fillet_transitions(model, &edges, &fillet_faces)?;
         fillet_faces.extend(transitions);
     }
 
-    Ok(fillet_faces)
+    Ok((fillet_faces, surgeries))
 }
 
 /// Create a constant radius fillet
@@ -279,7 +299,7 @@ fn create_constant_radius_fillet(
     face1_id: FaceId,
     face2_id: FaceId,
     radius: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get edge and face data
     let edge = model
         .edges
@@ -289,7 +309,7 @@ fn create_constant_radius_fillet(
 
     // Compute rolling ball positions along edge
     let rolling_ball_data =
-        compute_rolling_ball_positions(model, &edge, face1_id, face2_id, radius)?;
+        compute_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, radius)?;
 
     // Create fillet surface (cylindrical or toroidal patch)
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
@@ -299,11 +319,33 @@ fn create_constant_radius_fillet(
     let (trim_curve1, trim_curve2) =
         compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
 
-    // Create fillet face with proper trimming
-    let fillet_face =
-        create_trimmed_fillet_face(model, surface_id, edge_id, trim_curve1, trim_curve2)?;
+    let cap_v0_center = *rolling_ball_data.centers.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
+    })?;
+    let cap_v1_center = *rolling_ball_data.centers.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
+    })?;
+    let cap_v0_radius = *rolling_ball_data.radii.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
+    })?;
+    let cap_v1_radius = *rolling_ball_data.radii.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
+    })?;
 
-    Ok(fillet_face)
+    // Create fillet face with proper trimming
+    create_trimmed_fillet_face(
+        model,
+        surface_id,
+        edge_id,
+        face1_id,
+        face2_id,
+        trim_curve1,
+        trim_curve2,
+        cap_v0_center,
+        cap_v1_center,
+        cap_v0_radius,
+        cap_v1_radius,
+    )
 }
 
 /// Create a variable radius fillet
@@ -314,7 +356,7 @@ fn create_variable_radius_fillet(
     face2_id: FaceId,
     start_radius: f64,
     end_radius: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get edge and face data
     let edge = model
         .edges
@@ -340,11 +382,33 @@ fn create_variable_radius_fillet(
     let (trim_curve1, trim_curve2) =
         compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
 
-    // Create fillet face
-    let fillet_face =
-        create_trimmed_fillet_face(model, surface_id, edge_id, trim_curve1, trim_curve2)?;
+    let cap_v0_center = *rolling_ball_data.centers.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
+    })?;
+    let cap_v1_center = *rolling_ball_data.centers.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
+    })?;
+    let cap_v0_radius = *rolling_ball_data.radii.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
+    })?;
+    let cap_v1_radius = *rolling_ball_data.radii.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
+    })?;
 
-    Ok(fillet_face)
+    // Create fillet face
+    create_trimmed_fillet_face(
+        model,
+        surface_id,
+        edge_id,
+        face1_id,
+        face2_id,
+        trim_curve1,
+        trim_curve2,
+        cap_v0_center,
+        cap_v1_center,
+        cap_v0_radius,
+        cap_v1_radius,
+    )
 }
 
 /// Compute rolling ball positions for variable radius
@@ -441,7 +505,7 @@ fn create_function_radius_fillet(
     face1_id: FaceId,
     face2_id: FaceId,
     radius_fn: &Box<dyn Fn(f64) -> f64>,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Validate the function over the full edge parameter at the same
     // density used by the rolling-ball construction — we don't want
     // to discover a non-finite radius midway through surface assembly.
@@ -487,7 +551,32 @@ fn create_function_radius_fillet(
     let (trim_curve1, trim_curve2) =
         compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
 
-    create_trimmed_fillet_face(model, surface_id, edge_id, trim_curve1, trim_curve2)
+    let cap_v0_center = *rolling_ball_data.centers.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
+    })?;
+    let cap_v1_center = *rolling_ball_data.centers.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
+    })?;
+    let cap_v0_radius = *rolling_ball_data.radii.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
+    })?;
+    let cap_v1_radius = *rolling_ball_data.radii.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
+    })?;
+
+    create_trimmed_fillet_face(
+        model,
+        surface_id,
+        edge_id,
+        face1_id,
+        face2_id,
+        trim_curve1,
+        trim_curve2,
+        cap_v0_center,
+        cap_v1_center,
+        cap_v0_radius,
+        cap_v1_radius,
+    )
 }
 
 /// Build rolling-ball data using a caller-supplied per-sample radius
@@ -593,7 +682,7 @@ fn create_chord_fillet(
     face1_id: FaceId,
     face2_id: FaceId,
     chord_length: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Compute radius from chord length and face angle
     let angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     let half_sin = (angle / 2.0).sin();
@@ -663,6 +752,37 @@ fn create_vertex_blend(
     )))
 }
 
+/// Look up `edge_id` in `face_id`'s outer + inner loops and return the
+/// orientation sign (+1.0 if the edge appears forward in the loop,
+/// -1.0 if backward). `None` if the edge is not present in any of the
+/// face's loops — that indicates a topology bug upstream.
+///
+/// Used to project the edge curve's parameter-direction tangent into
+/// the loop-traversal direction of `face_id`. The signed dihedral
+/// returned by `robust_face_angle` is only a geometric invariant
+/// (positive ⇒ convex, negative ⇒ concave) when the tangent it sees
+/// is the loop tangent of one of the two adjacent faces. The raw
+/// curve tangent flips sign across edges that happen to be
+/// parameterized against face1's CCW loop, so a classifier built on
+/// `angle.signum()` with the curve tangent is wrong for ~half of
+/// edges in any given solid.
+pub(crate) fn edge_orientation_in_face(
+    model: &BRepModel,
+    face_id: FaceId,
+    edge_id: EdgeId,
+) -> Option<f64> {
+    let face = model.faces.get(face_id)?;
+    for loop_id in face.all_loops() {
+        let lp = model.loops.get(loop_id)?;
+        for (i, &eid) in lp.edges.iter().enumerate() {
+            if eid == edge_id {
+                return Some(if lp.orientations[i] { 1.0 } else { -1.0 });
+            }
+        }
+    }
+    None
+}
+
 /// Data for rolling ball fillet computation
 struct RollingBallData {
     /// Center positions of rolling ball along edge
@@ -681,6 +801,7 @@ struct RollingBallData {
 fn compute_rolling_ball_positions(
     model: &BRepModel,
     edge: &Edge,
+    edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     radius: f64,
@@ -711,10 +832,26 @@ fn compute_rolling_ball_positions(
     let face2_normal = get_surface_normal_at_point(surface2, &edge_midpoint)?;
     let edge_tangent = edge.tangent_at(0.5, &model.curves)?;
 
+    // Project the edge tangent into face1's loop-traversal direction.
+    // `robust_face_angle` returns a signed dihedral whose sign is only a
+    // geometric invariant (positive ⇒ convex, negative ⇒ concave) when
+    // the tangent it sees is oriented along one face's CCW loop. The
+    // raw curve tangent depends on the curve's parameter direction,
+    // which is independent of face topology — using it directly makes
+    // the convex/concave classifier flip across edges that happen to
+    // be parameterized backwards relative to face1's outer loop.
+    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })?;
+    let edge_tangent_in_loop = edge_tangent * face1_loop_sign;
+
     let angle = robust_face_angle(
         &face1_normal,
         &face2_normal,
-        &edge_tangent,
+        &edge_tangent_in_loop,
         &Tolerance::default(),
     )?;
     // `robust_face_angle` returns a signed dihedral in (-π, π]; concave
@@ -767,23 +904,51 @@ fn compute_rolling_ball_positions(
             OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
         })?;
 
-        // For a convex edge (normal vectors point away), offset inward
-        // For a concave edge (normal vectors point toward each other), offset outward
-        let dot_product = normal1.dot(&normal2);
-        let offset_direction = if dot_product < 0.0 {
-            // Convex edge - offset inward (toward solid)
-            -bisector
+        // Use the signed dihedral (`angle`, computed above from
+        // `robust_face_angle`) to classify the edge:
+        //   angle > 0  → convex  (solid sticks out at this edge)
+        //   angle < 0  → concave (interior corner / cavity)
+        // The previous classifier (`normal1·normal2 < 0`) failed for
+        // the canonical 90° box edge — `dot = 0` falls into the
+        // concave branch, the ball is offset OUTSIDE the solid, and
+        // the visible curvature is inverted.
+        //
+        // For a convex edge the rolling ball lies INSIDE the solid;
+        // the bisector of the outward normals points away from the
+        // solid, so the ball center is offset along -bisector. The
+        // tangent contact on each face is then `center + r·n` (the
+        // normal points from inside back up onto the face). For a
+        // concave edge the ball lies in the cavity along +bisector,
+        // and the contact flips to `center - r·n`.
+        //
+        // Magnitude:  |center − edge| = r / sin(α/2)
+        // where α is the interior dihedral. For unit `n1`, `n2` this
+        // simplifies to `r / (bisector · n1)` because
+        //   bisector·n1 = (1 + n1·n2)/|n1+n2| = sin(α/2)
+        // The near-tangent guard above (|angle| < 0.1 or near π)
+        // already excludes the cases where this denominator collapses.
+        let bisector_dot_n1 = bisector.dot(&normal1);
+        if bisector_dot_n1.abs() < 1e-9 {
+            return Err(OperationError::NumericalError(
+                "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
+            ));
+        }
+        let offset_distance = radius / bisector_dot_n1;
+
+        let (offset_sign, contact_sign) = if angle > 0.0 {
+            // Convex: ball inside solid; contact = center + r·n
+            (-1.0, 1.0)
         } else {
-            // Concave edge - offset outward (away from solid)
-            bisector
+            // Concave: ball in cavity; contact = center − r·n
+            (1.0, -1.0)
         };
 
-        let fillet_center = edge_point + offset_direction * radius;
+        let fillet_center = edge_point + bisector * (offset_sign * offset_distance);
         data.centers.push(fillet_center);
 
         // Calculate contact points (where rolling ball touches each surface)
-        let contact1 = fillet_center - normal1 * radius;
-        let contact2 = fillet_center - normal2 * radius;
+        let contact1 = fillet_center + normal1 * (contact_sign * radius);
+        let contact2 = fillet_center + normal2 * (contact_sign * radius);
 
         data.contacts1.push(contact1);
         data.contacts2.push(contact2);
@@ -1000,14 +1165,91 @@ fn compute_fillet_trim_curves(
     Ok((trim_points1, trim_points2))
 }
 
-/// Create trimmed fillet face
+/// Build a circular-arc cap edge that closes the fillet face's outer
+/// loop at one end of the original edge.
+///
+/// The arc lies in the plane perpendicular to `axis_dir` through
+/// `arc_center`, has radius `radius`, and is oriented so that
+/// `arc.point_at(0) ≈ trim_a` and `arc.point_at(1) ≈ trim_b`. The arc
+/// is the cylinder/torus cross-section the rolling ball traces at the
+/// V0 (or V1) end of its sweep — using it (rather than the chord
+/// between the two trim endpoints) keeps the loop boundary on the
+/// fillet surface, eliminating the triangular gap a chord would leave.
+fn build_cap_arc(
+    arc_center: Point3,
+    axis_dir: Vector3,
+    radius: f64,
+    trim_a: Point3,
+    trim_b: Point3,
+) -> OperationResult<crate::primitives::curve::Arc> {
+    use crate::primitives::curve::Arc;
+    use std::f64::consts::PI;
+
+    // Construct a seed arc so we can read the canonical `x_axis` the
+    // Arc primitive uses for angle measurement; the angle convention
+    // depends on `axis_dir` orientation, so we match it exactly.
+    let seed = Arc::new(arc_center, axis_dir, radius, 0.0, 1.0)
+        .map_err(|e| OperationError::NumericalError(format!("Cap arc seed: {:?}", e)))?;
+    let x_axis = seed.x_axis;
+    let normal = axis_dir.normalize().map_err(|e| {
+        OperationError::NumericalError(format!("Cap axis normalize failed: {:?}", e))
+    })?;
+    let y_axis = normal.cross(&x_axis);
+
+    let project = |p: Point3| -> (f64, f64) {
+        let v = p - arc_center;
+        (v.dot(&x_axis), v.dot(&y_axis))
+    };
+    let (ax, ay) = project(trim_a);
+    let (bx, by) = project(trim_b);
+    let alpha_a = ay.atan2(ax);
+    let alpha_b = by.atan2(bx);
+
+    // Pick the short arc (|sweep| ≤ π). For the canonical convex 90°
+    // fillet this gives the +π/2 arc through the corner side, exactly
+    // matching the natural cylindrical cross-section the rolling ball
+    // traces. Concave dihedrals likewise produce the supplement angle.
+    let two_pi = 2.0 * PI;
+    let mut sweep = alpha_b - alpha_a;
+    while sweep > PI {
+        sweep -= two_pi;
+    }
+    while sweep <= -PI {
+        sweep += two_pi;
+    }
+
+    Arc::new(arc_center, axis_dir, radius, alpha_a, sweep)
+        .map_err(|e| OperationError::NumericalError(format!("Cap arc construction: {:?}", e)))
+}
+
+/// Create trimmed fillet face.
+///
+/// Returns `(face_id, surgery)` where `surgery` is `Some(BlendEdgeSurgery)`
+/// in the 4-sided case (the production path on convex/concave dihedrals)
+/// and `None` in the 3-sided degenerate case (zero-radius limit, where
+/// trim curves collapse onto the original edge endpoints and no F3/F4
+/// cap insertion is needed).
+///
+/// `cap_v0_center` / `cap_v1_center` are the rolling-ball centers at the
+/// V0 and V1 ends of the original edge (== fillet-surface axis at the
+/// caps). `cap_v0_radius` / `cap_v1_radius` are the rolling-ball radii at
+/// those ends. Together they define the circular-arc cross-section the
+/// blend face's natural boundary takes at each cap; the cap edges are
+/// constructed as those arcs so the loop boundary tracks the fillet
+/// surface instead of cutting a chord across it.
 fn create_trimmed_fillet_face(
     model: &mut BRepModel,
     surface_id: u32,
     edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
     trim_curve1: Vec<Point3>,
     trim_curve2: Vec<Point3>,
-) -> OperationResult<FaceId> {
+    cap_v0_center: Point3,
+    cap_v1_center: Point3,
+    cap_v0_radius: f64,
+    cap_v1_radius: f64,
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     use crate::math::surface_intersection::intersection_curve_to_nurbs;
     use crate::primitives::r#loop::Loop;
 
@@ -1072,51 +1314,14 @@ fn create_trimmed_fillet_face(
         OperationError::NumericalError(format!("Failed to convert trim curve 2: {:?}", e))
     })?;
 
-    // Add curves to model
+    // Add trim curves to model up-front; reused by both 3-sided and
+    // 4-sided face construction below.
     let curve1_id = model.curves.add(Box::new(trim_curve1_nurbs));
     let curve2_id = model.curves.add(Box::new(trim_curve2_nurbs));
 
-    // Create edges for the fillet face boundary
-    let mut fillet_edges = Vec::new();
-
-    // Edge along first trim curve
-    let edge1 = Edge::new(
-        0, // Temporary ID
-        start_vertex,
-        end_vertex,
-        curve1_id,
-        EdgeOrientation::Forward,
-        ParameterRange::new(0.0, 1.0),
-    );
-    fillet_edges.push(model.edges.add(edge1));
-
-    // Edge along original edge
-    fillet_edges.push(edge_id);
-
-    // Edge along second trim curve (reversed)
-    let edge2 = Edge::new(
-        0, // Temporary ID
-        end_vertex,
-        start_vertex,
-        curve2_id,
-        EdgeOrientation::Backward,
-        ParameterRange::new(0.0, 1.0),
-    );
-    fillet_edges.push(model.edges.add(edge2));
-
-    // 3-sided fillet topology assumes the trim curves on the two
-    // adjacent faces both terminate exactly at the original edge's
-    // endpoints (i.e. the rolling-ball radius vanishes at the edge
-    // vertices). This is the canonical case for sharp-edge fillets.
-    //
-    // The 4-sided fillet topology — required when the contact trails
-    // extend past the original edge ends (long fillets, blends spanning
-    // multiple edges, vanishing radii inside the face) — needs two
-    // additional side edges plus two new vertices, and a cap (spherical
-    // arc or N-sided patch) at each end. The kernel does not yet emit
-    // those side edges, so we validate the 3-sided assumption here and
-    // surface the gap loudly when it doesn't hold rather than silently
-    // emitting an open loop.
+    // Trim-curve endpoints + original-edge vertex positions drive the
+    // 3-vs-4-sided decision. Both branches need the same data, so
+    // compute once.
     let endpoint_tol = Tolerance::default().distance().max(1e-6);
     let start_pos = model
         .vertices
@@ -1152,43 +1357,177 @@ fn create_trimmed_fillet_face(
         && dist(end_pos, trim1_last) < endpoint_tol
         && dist(start_pos, trim2_first) < endpoint_tol
         && dist(end_pos, trim2_last) < endpoint_tol;
-    if !three_sided_ok {
-        return Err(OperationError::NotImplemented(format!(
-            "create_trimmed_fillet_face: 4-sided fillet topology required \
-             (trim curve endpoints offset from original edge by up to {:.3e}, \
-             tol={:.3e}); side-edge synthesis + cap patches not yet implemented",
-            [
-                dist(start_pos, trim1_first),
-                dist(end_pos, trim1_last),
-                dist(start_pos, trim2_first),
-                dist(end_pos, trim2_last),
-            ]
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max),
-            endpoint_tol
-        )));
-    }
 
-    // Create loop for fillet face
-    let mut fillet_loop = Loop::new(
-        0, // Temporary ID
-        crate::primitives::r#loop::LoopType::Outer,
-    );
-    for edge_id in fillet_edges {
+    let (loop_id, surgery) = if three_sided_ok {
+        // 3-sided fillet topology: the rolling-ball radius vanishes at
+        // both edge endpoints so the trim curves on F1, F2 meet exactly
+        // at V0 and V1. This is the canonical sharp-edge limiting case
+        // (effectively zero-radius). Loop has 3 edges:
+        //   trim1 (V0→V1) → original_edge (V1→V0 via Backward) → trim2 (V0→V1 reversed)
+        let edge1 = Edge::new(
+            0,
+            start_vertex,
+            end_vertex,
+            curve1_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        let edge1_id = model.edges.add(edge1);
+        let edge2 = Edge::new(
+            0,
+            end_vertex,
+            start_vertex,
+            curve2_id,
+            EdgeOrientation::Backward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        let edge2_id = model.edges.add(edge2);
+        let mut fillet_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+        fillet_loop.add_edge(edge1_id, true);
         fillet_loop.add_edge(edge_id, true);
-    }
-    let loop_id = model.loops.add(fillet_loop);
+        fillet_loop.add_edge(edge2_id, true);
+        // 3-sided is the zero-radius degenerate: trim curves coincide
+        // with the original edge, the new fillet face shares the
+        // original edge with F1/F2, and no cap insertion at V0/V1 is
+        // required. Surgery is therefore None — the caller skips it.
+        (model.loops.add(fillet_loop), None)
+    } else {
+        // 4-sided fillet topology: the trim curves on F1 and F2 do not
+        // reach V0/V1 — the rolling-ball envelope lifts off each face
+        // at a positive distance from the original edge endpoints. The
+        // fillet face boundary is therefore a quadrilateral:
+        //
+        //   v_t1_start ──[trim1 fwd]──▶ v_t1_end
+        //        ▲                           │
+        //  [cap_V0 fwd]                 [cap_V1 fwd]
+        //        │                           ▼
+        //   v_t2_start ◀──[trim2 rev]── v_t2_end
+        //
+        // The two cap edges close the loop at the rolling-ball cross-
+        // section at V0 and V1. The cross-section is a circular arc on
+        // the fillet surface centered at the rolling-ball center
+        // (`cap_v0_center` / `cap_v1_center`), of radius equal to the
+        // rolling-ball radius at that end (`cap_v0_radius` /
+        // `cap_v1_radius`), in the plane perpendicular to the edge axis
+        // direction. Building the cap edges as arcs (not chords) makes
+        // the loop boundary coincide with the fillet face's natural
+        // boundary so tessellation does not leak triangles into the
+        // chord-arc gap.
+        //
+        // The returned `BlendEdgeSurgery` carries every new ID so
+        // `update_adjacent_faces` can re-stitch F1, F2, F3, F4 around
+        // the freshly-built blend face.
+        let v_t1_start = model.vertices.add_or_find(
+            trim1_first.x,
+            trim1_first.y,
+            trim1_first.z,
+            endpoint_tol,
+        );
+        let v_t1_end = model.vertices.add_or_find(
+            trim1_last.x,
+            trim1_last.y,
+            trim1_last.z,
+            endpoint_tol,
+        );
+        let v_t2_start = model.vertices.add_or_find(
+            trim2_first.x,
+            trim2_first.y,
+            trim2_first.z,
+            endpoint_tol,
+        );
+        let v_t2_end = model.vertices.add_or_find(
+            trim2_last.x,
+            trim2_last.y,
+            trim2_last.z,
+            endpoint_tol,
+        );
 
-    // Create fillet face
-    let face = Face::new(
-        0, // Temporary ID
-        surface_id,
-        loop_id,
-        FaceOrientation::Forward,
-    );
+        let edge_trim1 = Edge::new(
+            0,
+            v_t1_start,
+            v_t1_end,
+            curve1_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        let edge_trim1_id = model.edges.add(edge_trim1);
 
-    Ok(model.faces.add(face))
+        let edge_trim2 = Edge::new(
+            0,
+            v_t2_start,
+            v_t2_end,
+            curve2_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        let edge_trim2_id = model.edges.add(edge_trim2);
+
+        // Edge axis direction (V0 → V1). The cap arcs lie in planes
+        // perpendicular to this direction — the cylinder/torus
+        // cross-section at each end of the rolling-ball sweep.
+        let axis_dir = (Point3::new(end_pos[0], end_pos[1], end_pos[2])
+            - Point3::new(start_pos[0], start_pos[1], start_pos[2]))
+        .normalize()
+        .map_err(|e| {
+            OperationError::NumericalError(format!("Edge axis normalize failed: {:?}", e))
+        })?;
+
+        let cap_v1_curve =
+            build_cap_arc(cap_v1_center, axis_dir, cap_v1_radius, trim1_last, trim2_last)?;
+        let cap_v1_curve_id = model.curves.add(Box::new(cap_v1_curve));
+        let edge_cap_v1 = Edge::new(
+            0,
+            v_t1_end,
+            v_t2_end,
+            cap_v1_curve_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        let edge_cap_v1_id = model.edges.add(edge_cap_v1);
+
+        let cap_v0_curve =
+            build_cap_arc(cap_v0_center, axis_dir, cap_v0_radius, trim2_first, trim1_first)?;
+        let cap_v0_curve_id = model.curves.add(Box::new(cap_v0_curve));
+        let edge_cap_v0 = Edge::new(
+            0,
+            v_t2_start,
+            v_t1_start,
+            cap_v0_curve_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        let edge_cap_v0_id = model.edges.add(edge_cap_v0);
+
+        // Loop traversal:
+        //   v_t1_start →[trim1 fwd]→ v_t1_end →[cap_V1 fwd]→ v_t2_end
+        //              →[trim2 rev]→ v_t2_start →[cap_V0 fwd]→ v_t1_start
+        let mut fillet_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+        fillet_loop.add_edge(edge_trim1_id, true);
+        fillet_loop.add_edge(edge_cap_v1_id, true);
+        fillet_loop.add_edge(edge_trim2_id, false);
+        fillet_loop.add_edge(edge_cap_v0_id, true);
+        let lid = model.loops.add(fillet_loop);
+
+        let surgery = BlendEdgeSurgery {
+            original_edge: edge_id,
+            original_v0: start_vertex,
+            original_v1: end_vertex,
+            face1: face1_id,
+            face2: face2_id,
+            trim1_edge: edge_trim1_id,
+            trim2_edge: edge_trim2_id,
+            cap_v0_edge: edge_cap_v0_id,
+            cap_v1_edge: edge_cap_v1_id,
+            v_t1_start,
+            v_t1_end,
+            v_t2_start,
+            v_t2_end,
+        };
+        (lid, Some(surgery))
+    };
+
+    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    Ok((model.faces.add(face), surgery))
 }
 
 /// Create transition surfaces between fillets.
@@ -1213,26 +1552,50 @@ fn create_fillet_transitions(
     Ok(Vec::new())
 }
 
-/// Update adjacent faces to account for fillet trimming.
+/// Re-stitch the topology around freshly created fillet faces.
 ///
-/// Stub: a complete implementation would re-trim each face whose boundary
-/// originally contained a filleted edge so the new fillet face shares a
-/// loop with the trimmed face. Until that lands, this is a no-op and the
-/// model contains both the original (untrimmed) face AND the new fillet
-/// face. A warning is emitted so the missing trim is observable.
+/// Two-step pass:
+/// 1. Add every new fillet face to the solid's outer shell so it
+///    participates in shell traversal (face-list, validation, etc.).
+/// 2. For each 4-sided fillet, run [`splice_blend_edge`] to:
+///    - Replace the original edge `E` in F1's loop with `trim1` and
+///      re-vertex F1's V0/V1 neighbours onto `v_t1_start`/`v_t1_end`.
+///    - Symmetrically splice F2 with `trim2`.
+///    - Insert `cap_v0` into F3 (the third face at V0) and `cap_v1`
+///      into F4 (the third face at V1).
+///    - Remove the now-orphaned original edge and original V0/V1
+///      vertices from the model.
+///
+/// The 3-sided (zero-radius degenerate) path produces no surgery and is
+/// correct as built — `create_trimmed_fillet_face` returns `None` in
+/// that case and the loop here simply skips it.
 fn update_adjacent_faces(
-    _model: &mut BRepModel,
-    _solid_id: SolidId,
-    edges: &[EdgeId],
+    model: &mut BRepModel,
+    solid_id: SolidId,
     fillet_faces: &[FaceId],
+    surgeries: &[BlendEdgeSurgery],
 ) -> OperationResult<()> {
-    if !fillet_faces.is_empty() {
-        tracing::warn!(
-            "update_adjacent_faces: face re-trimming not implemented; \
-             {} edge(s) filleted but adjacent face boundaries left untrimmed",
-            edges.len()
-        );
+    // Step 1 — register fillet faces with the outer shell.
+    let shell_id = {
+        let solid = model.solids.get(solid_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("Solid {} not found", solid_id))
+        })?;
+        solid.outer_shell
+    };
+    {
+        let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("Outer shell {} not found", shell_id))
+        })?;
+        for &face_id in fillet_faces {
+            shell.add_face(face_id);
+        }
     }
+
+    // Step 2 — splice each blend edge.
+    for surgery in surgeries {
+        splice_blend_edge(model, solid_id, surgery)?;
+    }
+
     Ok(())
 }
 

@@ -36,6 +36,9 @@ pub fn tessellate_face(
         "Cone" => tessellate_conical_face(face, model, params, mesh),
         "Torus" => tessellate_toroidal_face(face, model, params, mesh),
         "NURBS" => tessellate_nurbs_face(face, model, params, mesh),
+        "CylindricalFillet" | "ToroidalFillet" | "SphericalFillet" | "VariableRadiusFillet" => {
+            tessellate_fillet_face(face, model, params, mesh)
+        }
         _ => {
             // RuledSurface (extruded straight-line side faces, prismatic
             // sweeps, etc.) is geometrically planar whenever its two
@@ -1595,6 +1598,162 @@ fn tessellate_nurbs_face(
     tessellate_nurbs_adaptive(
         surface, face, model, params, mesh, u_min, u_max, v_min, v_max,
     );
+}
+
+/// Tessellate a fillet face (CylindricalFillet, ToroidalFillet,
+/// SphericalFillet, VariableRadiusFillet).
+///
+/// Fillet surfaces are parameterized over a full `[0,1] × [0,1]` UV
+/// domain whose four boundaries correspond exactly to the four-sided
+/// blend loop produced by `create_trimmed_fillet_face`:
+///
+/// * `v = 0` → contact-1 curve (= trim1 in 3D, sampled by face1's
+///   planar tessellator via `sample_loop_3d_polygon`)
+/// * `v = 1` → contact-2 curve (= trim2 in 3D, sampled by face2)
+/// * `u = 0` → cap_v0 (a Line in 3D between trim2_first and trim1_first)
+/// * `u = 1` → cap_v1 (a Line in 3D between trim1_last and trim2_last)
+///
+/// Because the loop tightly wraps the surface's parameter domain, no
+/// inside-loop filter is needed — every grid sample is on the face.
+///
+/// **Watertightness contract**: the U-direction sample count is
+/// derived from `compute_curve_sample_count` of the longest non-line
+/// loop edge (trim1 or trim2) so it matches the count the adjacent
+/// planar face uses when sampling the same trim curve via
+/// `sample_loop_3d_polygon`. With matching U counts and matching
+/// `point_at(u, 0) == trim1.point_at(u)` / `point_at(u, 1) == trim2(u)`
+/// (an invariant of `CylindricalFillet::evaluate_full` after the
+/// frame-storage fix), the boundary vertices on both sides of the
+/// shared edge land at the same 3D positions and
+/// `weld_mesh_watertight_range` collapses the seam.
+///
+/// V-direction count is chord-tolerance-driven on the actual arc
+/// (probed by sampling `point_at(u_mid, v)` so we don't depend on
+/// a per-fillet-type radius accessor).
+fn tessellate_fillet_face(
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) {
+    let Some(surface) = model.surfaces.get(face.surface_id) else {
+        return;
+    };
+
+    // U-direction sample count: take the maximum of compute_curve_sample_count
+    // over every non-degenerate loop edge whose 3D length exceeds the
+    // maximum cap-edge length. The loop has 2 trim edges (long, curved
+    // along the spine) and 2 cap edges (short, straight). The trim edges
+    // dominate; using the max is robust if the loop is partially
+    // collapsed (3-sided degenerate case).
+    let mut u_steps = params.min_segments.max(3);
+    if let Some(outer_loop) = model.loops.get(face.outer_loop) {
+        let mut longest_edge_len = 0.0_f64;
+        let mut longest_edge_n = 0usize;
+        for &edge_id in &outer_loop.edges {
+            let Some(edge) = model.edges.get(edge_id) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let t_start = edge.param_range.start;
+            let t_end = edge.param_range.end;
+            // Chord-length probe: 16 sample sum, same as compute_curve_sample_count.
+            let mut len = 0.0_f64;
+            let mut prev = curve.point_at(t_start).ok();
+            for i in 1..=16 {
+                let t = t_start + (i as f64) * (t_end - t_start) / 16.0;
+                let cur = curve.point_at(t).ok();
+                if let (Some(a), Some(b)) = (prev.as_ref(), cur.as_ref()) {
+                    len += (*b - *a).magnitude();
+                }
+                prev = cur;
+            }
+            if len > longest_edge_len {
+                longest_edge_len = len;
+                longest_edge_n = compute_curve_sample_count(
+                    curve,
+                    t_start,
+                    t_end,
+                    params,
+                );
+            }
+        }
+        if longest_edge_n > u_steps {
+            u_steps = longest_edge_n;
+        }
+    }
+
+    // V-direction sample count: chord-length probe along the arc at u=0.5,
+    // which traces the fillet's cross-section through the spine midpoint.
+    let v_steps = {
+        let mut arc_length = 0.0_f64;
+        let mut prev = surface.point_at(0.5, 0.0).ok();
+        const PROBE: usize = 16;
+        for i in 1..=PROBE {
+            let v = (i as f64) / (PROBE as f64);
+            let cur = surface.point_at(0.5, v).ok();
+            if let (Some(a), Some(b)) = (prev.as_ref(), cur.as_ref()) {
+                arc_length += (*b - *a).magnitude();
+            }
+            prev = cur;
+        }
+        let n = if params.max_edge_length > 0.0 && arc_length > 0.0 {
+            (arc_length / params.max_edge_length).ceil() as usize
+        } else {
+            params.min_segments
+        };
+        n.max(params.min_segments.max(3))
+            .min(params.max_segments)
+    };
+
+    // Generate the full UV grid. No inside-loop filter is needed — the
+    // parameter domain is exactly the face's interior plus boundary.
+    let mut vertex_grid: Vec<Vec<Option<u32>>> = Vec::with_capacity(v_steps + 1);
+    for v_idx in 0..=v_steps {
+        let v = (v_idx as f64) / (v_steps as f64);
+        let mut row = Vec::with_capacity(u_steps + 1);
+        for u_idx in 0..=u_steps {
+            let u = (u_idx as f64) / (u_steps as f64);
+            if let (Ok(point), Ok(normal)) = (
+                surface.point_at(u, v),
+                face.normal_at(u, v, &model.surfaces),
+            ) {
+                let index = mesh.add_vertex(MeshVertex {
+                    position: point,
+                    normal,
+                    uv: Some((u, v)),
+                });
+                row.push(Some(index));
+            } else {
+                row.push(None);
+            }
+        }
+        vertex_grid.push(row);
+    }
+
+    // Triangulate the grid. Winding follows `face.orientation` so
+    // emitted geometric normals match the stored vertex normals
+    // (which `face.normal_at` already flips for backward faces).
+    let forward = face.orientation.is_forward();
+    for v_idx in 0..v_steps {
+        for u_idx in 0..u_steps {
+            let v0 = vertex_grid[v_idx][u_idx];
+            let v1 = vertex_grid[v_idx][u_idx + 1];
+            let v2 = vertex_grid[v_idx + 1][u_idx];
+            let v3 = vertex_grid[v_idx + 1][u_idx + 1];
+            if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (v0, v1, v2, v3) {
+                if forward {
+                    mesh.add_triangle(v0, v1, v2);
+                    mesh.add_triangle(v1, v3, v2);
+                } else {
+                    mesh.add_triangle(v0, v2, v1);
+                    mesh.add_triangle(v1, v2, v3);
+                }
+            }
+        }
+    }
 }
 
 /// Generic surface tessellation using uniform grid.
