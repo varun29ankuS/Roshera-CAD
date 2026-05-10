@@ -11,6 +11,7 @@ import { TransformGizmo } from './TransformGizmo'
 import { ExtrudeGizmo } from './ExtrudeGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { SubElementHighlight } from './SubElementHighlight'
+import { ModifyPreview } from './ModifyPreview'
 import { ViewportContextMenu } from './ViewportContextMenu'
 import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { SketchOverlay } from './SketchOverlay'
@@ -90,6 +91,7 @@ export function CADViewport() {
         <SceneObjects />
         <TransformGizmo />
         <SubElementHighlight />
+        <ModifyPreview />
         <ExtrudeGizmo />
         <SelectionOutline />
         <SketchOverlay />
