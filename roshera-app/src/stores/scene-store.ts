@@ -409,6 +409,20 @@ interface SceneState {
   subElementSelections: SubElementSelection[]
   hoveredSubElement: SubElementSelection | null
 
+  /**
+   * Live preview state for the fillet/chamfer modify dialog. While the
+   * dialog is open and edges are picked, the viewport renders a
+   * cross-section indicator at the midpoint of each picked edge so the
+   * user can visually couple the numeric input to a geometric scale.
+   * `null` when no modify dialog is open.
+   *
+   * `value` is in plane units (mm). For fillet it's the radius; for
+   * chamfer it's the equal-distance setback. Shell does not appear here
+   * — shell preview is whole-solid and would require a backend round
+   * trip, deferred to a follow-up.
+   */
+  modifyPreview: { mode: 'fillet' | 'chamfer'; value: number } | null
+
   // Mesh ref registry for outline effects
   meshRefs: Map<string, THREE.Mesh>
 
@@ -499,6 +513,7 @@ interface SceneState {
   clearSubElementSelections: () => void
   toggleSubElementSelection: (sel: SubElementSelection) => void
   setHoveredSubElement: (sel: SubElementSelection | null) => void
+  setModifyPreview: (next: { mode: 'fillet' | 'chamfer'; value: number } | null) => void
 
   registerMeshRef: (id: string, mesh: THREE.Mesh) => void
   unregisterMeshRef: (id: string) => void
@@ -625,6 +640,7 @@ export const useSceneStore = create<SceneState>()(
     selectionMode: 'object',
     subElementSelections: [],
     hoveredSubElement: null,
+    modifyPreview: null,
     meshRefs: new Map(),
     gizmoDragging: false,
     activeTool: 'select',
@@ -750,6 +766,7 @@ export const useSceneStore = create<SceneState>()(
       set({ selectionMode: mode, subElementSelections: [], hoveredSubElement: null }),
 
     setHoveredSubElement: (sel) => set({ hoveredSubElement: sel }),
+    setModifyPreview: (next) => set({ modifyPreview: next }),
 
     addSubElementSelection: (sel) =>
       set((state) => ({

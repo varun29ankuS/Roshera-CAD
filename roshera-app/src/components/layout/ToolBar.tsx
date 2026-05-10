@@ -45,6 +45,7 @@ import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { cn } from '@/lib/utils'
+import { ModifyDialog, type ModifyMode } from '@/components/panels/ModifyDialog'
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -998,6 +999,21 @@ export function ToolBar() {
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
   const [openId, setOpenId] = useState<string | null>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
+  // Fusion-style modify panel — fillet / chamfer / shell. Single state
+  // because the three operations are mutually exclusive (one panel at
+  // a time); the dialog renders nothing when `null`.
+  const [modifyMode, setModifyMode] = useState<ModifyMode | null>(null)
+
+  const handleModifyApply = useCallback((mode: ModifyMode, value: number) => {
+    if (mode === 'fillet') sendDirectFillet(value)
+    else if (mode === 'chamfer') sendDirectChamfer(value)
+    else sendDirectShell(value)
+  }, [])
+
+  const openModify = useCallback((mode: ModifyMode) => {
+    setOpenId(null) // dismiss the flyout once the user has chosen
+    setModifyMode(mode)
+  }, [])
 
   const handleToolChange = useCallback((tool: TransformTool) => {
     if (useSceneStore.getState().selectionMode !== 'object') {
@@ -1116,9 +1132,21 @@ export function ToolBar() {
         {
           label: 'Modify',
           items: [
-            { icon: Disc, label: 'Fillet', action: () => sendDirectFillet(2) },
-            { icon: Hexagon, label: 'Chamfer', action: () => sendDirectChamfer(1) },
-            { icon: SquareDashedBottom, label: 'Shell', action: () => sendDirectShell(1) },
+            {
+              icon: Disc,
+              label: 'Fillet',
+              action: () => openModify('fillet'),
+            },
+            {
+              icon: Hexagon,
+              label: 'Chamfer',
+              action: () => openModify('chamfer'),
+            },
+            {
+              icon: SquareDashedBottom,
+              label: 'Shell',
+              action: () => openModify('shell'),
+            },
             { icon: ScanLine, label: 'Offset', action: () => notYetWired('Offset', 'needs face-selection UX') },
             { icon: Scissors, label: 'Split', action: () => notYetWired('Split') },
             { icon: Orbit, label: 'Draft', action: () => notYetWired('Draft', 'needs face-selection UX') },
@@ -1182,10 +1210,18 @@ export function ToolBar() {
   ]
 
   return (
-    <div ref={toolbarRef} className="flex flex-col items-center w-16 cad-panel border-r py-2 gap-1 overflow-visible">
-      {groups.map((group) => (
-        <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
-      ))}
-    </div>
+    <>
+      <div ref={toolbarRef} className="flex flex-col items-center w-16 cad-panel border-r py-2 gap-1 overflow-visible">
+        {groups.map((group) => (
+          <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
+        ))}
+      </div>
+      <ModifyDialog
+        open={modifyMode !== null}
+        mode={modifyMode}
+        onOpenChange={(next) => { if (!next) setModifyMode(null) }}
+        onApply={handleModifyApply}
+      />
+    </>
   )
 }
