@@ -7,6 +7,8 @@
 //! enumeration. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::fillet::edge_orientation_in_face;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -101,13 +103,15 @@ pub fn chamfer_edges(
 
     // Create chamfer faces for each edge
     let mut chamfer_faces = Vec::new();
+    let mut surgeries = Vec::new();
     for &edge_id in &selected_edges {
-        let face_id = create_edge_chamfer(model, solid_id, edge_id, &options)?;
+        let (face_id, surgery) = create_edge_chamfer(model, solid_id, edge_id, &options)?;
         chamfer_faces.push(face_id);
+        surgeries.push(surgery);
     }
 
-    // Update adjacent faces to account for chamfer
-    update_adjacent_faces_for_chamfer(model, solid_id, &selected_edges, &chamfer_faces)?;
+    // Re-stitch surrounding topology and add chamfer faces to outer shell.
+    update_adjacent_faces_for_chamfer(model, solid_id, &chamfer_faces, &surgeries)?;
 
     // Handle vertex conditions where multiple chamfers meet
     if selected_edges.len() > 1 {
@@ -147,7 +151,7 @@ fn create_edge_chamfer(
     solid_id: SolidId,
     edge_id: EdgeId,
     options: &ChamferOptions,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Get adjacent faces
     let (face1_id, face2_id) = get_adjacent_faces(model, solid_id, edge_id)?;
 
@@ -175,7 +179,7 @@ fn create_equal_distance_chamfer(
     face1_id: FaceId,
     face2_id: FaceId,
     distance: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Get edge geometry
     let edge = model
         .edges
@@ -185,16 +189,14 @@ fn create_equal_distance_chamfer(
 
     // Compute chamfer offsets along edge
     let chamfer_data =
-        compute_chamfer_offsets(model, &edge, face1_id, face2_id, distance, distance)?;
+        compute_chamfer_offsets(model, &edge, edge_id, face1_id, face2_id, distance, distance)?;
 
     // Create chamfer surface (ruled surface between offset curves)
     let chamfer_surface = create_ruled_chamfer_surface(model, &chamfer_data)?;
     let surface_id = model.surfaces.add(chamfer_surface);
 
     // Create chamfer face with proper boundaries
-    let chamfer_face = create_chamfer_face(model, surface_id, edge_id, &chamfer_data)?;
-
-    Ok(chamfer_face)
+    create_chamfer_face(model, surface_id, edge_id, face1_id, face2_id, &chamfer_data)
 }
 
 /// Create two-distance chamfer
@@ -205,7 +207,7 @@ fn create_two_distance_chamfer(
     face2_id: FaceId,
     distance1: f64,
     distance2: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Similar to equal distance but with different offsets
     let edge = model
         .edges
@@ -214,14 +216,12 @@ fn create_two_distance_chamfer(
         .clone();
 
     let chamfer_data =
-        compute_chamfer_offsets(model, &edge, face1_id, face2_id, distance1, distance2)?;
+        compute_chamfer_offsets(model, &edge, edge_id, face1_id, face2_id, distance1, distance2)?;
 
     let chamfer_surface = create_ruled_chamfer_surface(model, &chamfer_data)?;
     let surface_id = model.surfaces.add(chamfer_surface);
 
-    let chamfer_face = create_chamfer_face(model, surface_id, edge_id, &chamfer_data)?;
-
-    Ok(chamfer_face)
+    create_chamfer_face(model, surface_id, edge_id, face1_id, face2_id, &chamfer_data)
 }
 
 /// Create distance-angle chamfer
@@ -232,7 +232,7 @@ fn create_distance_angle_chamfer(
     face2_id: FaceId,
     distance: f64,
     angle: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Compute second distance from angle
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     let distance2 = distance * (angle.sin() / (face_angle - angle).sin());
@@ -257,7 +257,7 @@ fn create_angle_chamfer(
     face1_id: FaceId,
     face2_id: FaceId,
     angle: f64,
-) -> OperationResult<FaceId> {
+) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     if angle <= 0.0 || angle >= face_angle {
         return Err(OperationError::InvalidGeometry(format!(
@@ -310,6 +310,7 @@ struct ChamferData {
 fn compute_chamfer_offsets(
     model: &BRepModel,
     edge: &Edge,
+    edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     distance1: f64,
@@ -329,6 +330,38 @@ fn compute_chamfer_offsets(
         .get(edge.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
 
+    // Each adjacent face traverses the shared edge in its own loop
+    // direction. The chamfer offset on a face must lie IN that face's
+    // plane and point INTO that face's interior (perpendicular to the
+    // edge). The canonical right-hand-rule construction for
+    // "in-face-inward perpendicular to edge" is `n × t_loop`, where
+    // `t_loop` is the edge tangent oriented along the face's loop
+    // traversal — NOT the curve's parameter direction. The two
+    // adjacent faces always traverse the edge in opposite directions
+    // in a closed manifold shell, so the resulting offset directions
+    // are NOT colinear; both correctly point toward each face's
+    // interior.
+    //
+    // The previous formulation derived loop direction from the sign
+    // of the dihedral, but `robust_face_angle`'s sign itself depends
+    // on the input tangent's parameterization, so the disambiguation
+    // was circular: edges whose curve was parameterized backwards
+    // relative to face1's loop would flip the chamfer to the wrong
+    // side, putting the offset outside the face polygon and the
+    // chamfer surface outside the solid.
+    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })?;
+    let face2_loop_sign = edge_orientation_in_face(model, face2_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face2_id
+        ))
+    })?;
+
     for i in 0..=num_samples {
         let t = i as f64 / num_samples as f64;
         data.parameters.push(t);
@@ -347,15 +380,22 @@ fn compute_chamfer_offsets(
         let face_normal1 = face_normal_at_point(model, face1_id, &edge_point)?;
         let face_normal2 = face_normal_at_point(model, face2_id, &edge_point)?;
 
-        // Offset direction on each face = cross(face_normal, edge_tangent), pointing inward on face
-        // This gives a direction lying in the face plane, perpendicular to the edge
-        let offset_dir1 = face_normal1.cross(&edge_tangent).normalize().map_err(|e| {
+        // Project the curve tangent onto each face's loop direction.
+        // `edge.orientation` already maps curve param to edge param,
+        // and `loop_sign` then maps edge param to loop direction. We
+        // bypass `Edge::tangent_at` here because we walk the curve
+        // directly above; apply the same composition manually.
+        let edge_dir_sign = edge.orientation.sign();
+        let t_loop1 = edge_tangent * (edge_dir_sign * face1_loop_sign);
+        let t_loop2 = edge_tangent * (edge_dir_sign * face2_loop_sign);
+
+        let offset_dir1 = face_normal1.cross(&t_loop1).normalize().map_err(|e| {
             OperationError::NumericalError(format!(
                 "Offset direction normalization failed: {:?}",
                 e
             ))
         })?;
-        let offset_dir2 = edge_tangent.cross(&face_normal2).normalize().map_err(|e| {
+        let offset_dir2 = face_normal2.cross(&t_loop2).normalize().map_err(|e| {
             OperationError::NumericalError(format!(
                 "Offset direction normalization failed: {:?}",
                 e
@@ -411,19 +451,29 @@ fn create_ruled_chamfer_surface(
     Ok(Box::new(RuledSurface::new(curve1, curve2)))
 }
 
-/// Create chamfer face with boundaries
+/// Create chamfer face with boundaries.
+///
+/// Returns `(face_id, surgery)` — the surgery captures every new
+/// vertex/edge/face ID needed by `update_adjacent_faces_for_chamfer`
+/// to splice F1, F2, F3, F4 around the new chamfer face.
 #[allow(clippy::expect_used)] // offset_points{1,2} non-empty: is_empty() guard at fn entry
 fn create_chamfer_face(
     model: &mut BRepModel,
     surface_id: u32,
     edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
     data: &ChamferData,
-) -> OperationResult<FaceId> {
-    // Create edges for chamfer boundary
-    let _edge = model
-        .edges
-        .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
+    // Capture original edge endpoints up-front; they're consumed by
+    // the surgery and are needed before any mutable borrows.
+    let (original_v0, original_v1) = {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+        (edge.start_vertex, edge.end_vertex)
+    };
 
     // Validate chamfer data has non-empty offset point sequences.
     // Upstream `compute_chamfer_offsets` always populates these via a
@@ -449,64 +499,76 @@ fn create_chamfer_face(
         .last()
         .expect("offset_points2 non-empty: validated above");
 
-    // Create vertices at ends
-    let v1_start = model.vertices.add(
+    // Create vertices at ends. Naming aligns with the surgery contract:
+    //   v_t1_start = chamfer-vertex on F1 near V0
+    //   v_t1_end   = chamfer-vertex on F1 near V1
+    //   v_t2_start = chamfer-vertex on F2 near V0
+    //   v_t2_end   = chamfer-vertex on F2 near V1
+    let v_t1_start = model.vertices.add(
         data.offset_points1[0].x,
         data.offset_points1[0].y,
         data.offset_points1[0].z,
     );
-    let v1_end = model.vertices.add(last1.x, last1.y, last1.z);
-    let v2_start = model.vertices.add(
+    let v_t1_end = model.vertices.add(last1.x, last1.y, last1.z);
+    let v_t2_start = model.vertices.add(
         data.offset_points2[0].x,
         data.offset_points2[0].y,
         data.offset_points2[0].z,
     );
-    let v2_end = model.vertices.add(last2.x, last2.y, last2.z);
+    let v_t2_end = model.vertices.add(last2.x, last2.y, last2.z);
 
-    // Create edges
-    let edge1 = Edge::new_auto_range(
-        0, // Will be assigned by store
-        v1_start,
-        v1_end,
-        offset_curve1,
-        EdgeOrientation::Forward,
-    );
-    let edge1_id = model.edges.add(edge1);
+    // Trim edge on F1: start = v_t1_start, end = v_t1_end, Forward.
+    let trim1 = Edge::new_auto_range(0, v_t1_start, v_t1_end, offset_curve1, EdgeOrientation::Forward);
+    let trim1_edge = model.edges.add(trim1);
 
-    let edge2 = create_straight_edge(model, v1_end, v2_end)?;
+    // Cap edge at V1: v_t1_end → v_t2_end. The straight-line cap is a
+    // chord across the chamfer cross-section at V1.
+    let cap_v1_edge = create_straight_edge(model, v_t1_end, v_t2_end)?;
 
-    let edge3 = Edge::new_auto_range(
-        0, // Will be assigned by store
-        v2_end,
-        v2_start,
-        offset_curve2,
-        EdgeOrientation::Forward,
-    );
-    let edge3_id = model.edges.add(edge3);
+    // Trim edge on F2: start = v_t2_start, end = v_t2_end, Forward —
+    // same orientation contract as trim1 / fillet's trim2. Loop
+    // traversal at this site is reversed (`add_edge(_, false)` below),
+    // so the rectangular boundary still walks
+    //   v_t1_start → v_t1_end → v_t2_end → v_t2_start → v_t1_start.
+    let trim2 = Edge::new_auto_range(0, v_t2_start, v_t2_end, offset_curve2, EdgeOrientation::Forward);
+    let trim2_edge = model.edges.add(trim2);
 
-    let edge4 = create_straight_edge(model, v2_start, v1_start)?;
+    // Cap edge at V0: v_t2_start → v_t1_start.
+    let cap_v0_edge = create_straight_edge(model, v_t2_start, v_t1_start)?;
 
-    // Create loop
-    let mut chamfer_loop = Loop::new(
-        0, // Will be assigned by store
-        crate::primitives::r#loop::LoopType::Outer,
-    );
-    chamfer_loop.add_edge(edge1_id, true);
-    chamfer_loop.add_edge(edge2, true);
-    chamfer_loop.add_edge(edge3_id, false);
-    chamfer_loop.add_edge(edge4, true);
+    // Create loop. Traversal:
+    //   trim1 fwd: v_t1_start → v_t1_end
+    //   cap_v1 fwd: v_t1_end → v_t2_end
+    //   trim2 rev: v_t2_end → v_t2_start
+    //   cap_v0 fwd: v_t2_start → v_t1_start
+    let mut chamfer_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+    chamfer_loop.add_edge(trim1_edge, true);
+    chamfer_loop.add_edge(cap_v1_edge, true);
+    chamfer_loop.add_edge(trim2_edge, false);
+    chamfer_loop.add_edge(cap_v0_edge, true);
     let loop_id = model.loops.add(chamfer_loop);
 
     // Create face
-    let face = Face::new(
-        0, // Will be assigned by store
-        surface_id,
-        loop_id,
-        FaceOrientation::Forward,
-    );
+    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
     let face_id = model.faces.add(face);
 
-    Ok(face_id)
+    let surgery = BlendEdgeSurgery {
+        original_edge: edge_id,
+        original_v0,
+        original_v1,
+        face1: face1_id,
+        face2: face2_id,
+        trim1_edge,
+        trim2_edge,
+        cap_v0_edge,
+        cap_v1_edge,
+        v_t1_start,
+        v_t1_end,
+        v_t2_start,
+        v_t2_end,
+    };
+
+    Ok((face_id, surgery))
 }
 
 /// Create an offset curve through a sequence of sample points.
@@ -580,80 +642,47 @@ fn create_straight_edge(
     Ok(edge_id)
 }
 
-/// Update adjacent faces for chamfer.
-/// Adds the chamfer faces to the solid's outer shell and replaces
-/// the original chamfered edges in adjacent faces' loops with the
-/// corresponding chamfer boundary edges.
+/// Re-stitch the topology around freshly created chamfer faces.
+///
+/// Two-step pass:
+/// 1. Add every new chamfer face to the solid's outer shell so it
+///    participates in shell traversal (face-list, validation, etc.).
+/// 2. For each chamfer, run [`splice_blend_edge`] to:
+///    - Replace the original edge `E` in F1's loop with `trim1` and
+///      re-vertex F1's V0/V1 neighbours onto `v_t1_start`/`v_t1_end`.
+///    - Symmetrically splice F2 with `trim2`.
+///    - Insert `cap_v0` into F3 (the third face at V0) and `cap_v1`
+///      into F4 (the third face at V1).
+///    - Remove the now-orphaned original edge and original V0/V1
+///      vertices from the model.
+///
+/// Mirrors `fillet::update_adjacent_faces`; the surgery helper is
+/// shared in `super::edge_blend_topology`.
 fn update_adjacent_faces_for_chamfer(
     model: &mut BRepModel,
     solid_id: SolidId,
-    edges: &[EdgeId],
     chamfer_faces: &[FaceId],
+    surgeries: &[BlendEdgeSurgery],
 ) -> OperationResult<()> {
-    // Get the solid's outer shell
-    let solid = model
-        .solids
-        .get(solid_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?;
-    let shell_id = solid.outer_shell;
-
-    // Add chamfer faces to the shell
-    let shell = model
-        .shells
-        .get_mut(shell_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
-    for &face_id in chamfer_faces {
-        shell.add_face(face_id);
+    // Step 1 — register chamfer faces with the outer shell.
+    let shell_id = {
+        let solid = model.solids.get(solid_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("Solid {} not found", solid_id))
+        })?;
+        solid.outer_shell
+    };
+    {
+        let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("Outer shell {} not found", shell_id))
+        })?;
+        for &face_id in chamfer_faces {
+            shell.add_face(face_id);
+        }
     }
 
-    // For each original chamfered edge, remove it from adjacent face
-    // loops. The chamfer face bridges the gap — adjacent faces'
-    // boundaries are trimmed by the offset curves (already created as
-    // chamfer face edges). The current pass removes the consumed edge
-    // from each loop; the downstream loop re-stitching pass connects
-    // the now-open ends through the chamfer face's offset edge.
-    for &edge_id in edges {
-        // Scan all faces in the shell for loops containing this edge
-        let shell = model
-            .shells
-            .get(shell_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
-        let face_ids: Vec<FaceId> = shell.faces.clone();
-
-        for face_id in face_ids {
-            // Skip chamfer faces themselves
-            if chamfer_faces.contains(&face_id) {
-                continue;
-            }
-
-            let face = match model.faces.get(face_id) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            let loop_ids: Vec<_> = std::iter::once(face.outer_loop)
-                .chain(face.inner_loops.iter().copied())
-                .collect();
-
-            for loop_id in loop_ids {
-                if let Some(loop_data) = model.loops.get_mut(loop_id) {
-                    // Find indices of the chamfered edge and remove from both edges and orientations
-                    let mut indices_to_remove: Vec<usize> = Vec::new();
-                    for (idx, &e_id) in loop_data.edges.iter().enumerate() {
-                        if e_id == edge_id {
-                            indices_to_remove.push(idx);
-                        }
-                    }
-                    // Remove in reverse order to preserve indices
-                    for &idx in indices_to_remove.iter().rev() {
-                        loop_data.edges.remove(idx);
-                        if idx < loop_data.orientations.len() {
-                            loop_data.orientations.remove(idx);
-                        }
-                    }
-                }
-            }
-        }
+    // Step 2 — splice each blend edge.
+    for surgery in surgeries {
+        splice_blend_edge(model, solid_id, surgery)?;
     }
 
     Ok(())

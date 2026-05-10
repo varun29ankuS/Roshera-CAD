@@ -282,6 +282,18 @@ impl Edge {
         curve.curvature_at(curve_param)
     }
 
+    /// Drop the cached arc-length so the next [`Edge::length`] call
+    /// recomputes from the underlying curve.
+    ///
+    /// Call this whenever `param_range` is mutated in place (for example,
+    /// when blend topology surgery re-trims an edge to terminate at a
+    /// new vertex). The cached length is private and would otherwise go
+    /// stale relative to the new range.
+    #[inline]
+    pub fn invalidate_length_cache(&mut self) {
+        self.cached_length = f64::NAN;
+    }
+
     /// Calculate edge length (cached)
     pub fn length(&mut self, curves: &CurveStore, tolerance: Tolerance) -> MathResult<f64> {
         if !self.cached_length.is_nan() {
