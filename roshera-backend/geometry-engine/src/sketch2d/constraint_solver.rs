@@ -25,11 +25,13 @@ use super::{
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Solver status
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SolverStatus {
     /// Successfully solved all constraints
     Converged { iterations: usize, final_error: f64 },
@@ -57,7 +59,8 @@ pub struct SolverResult {
 }
 
 /// Entity position/parameter update
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum EntityUpdate {
     /// Updated point position
     Point(Point2d),

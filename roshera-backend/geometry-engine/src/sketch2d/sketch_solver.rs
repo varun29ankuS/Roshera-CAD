@@ -55,6 +55,7 @@ use super::line2d::{LineGeometry, ParametricLine2d};
 use super::point2d::ParametricPoint2d;
 use super::sketch::Sketch;
 use super::{Circle2d, Line2d, LineSegment2d, Point2d, Ray2d, Vector2d};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Tag for an entity the bridge skipped because the solver does not yet
@@ -75,7 +76,8 @@ pub type SkippedEntity = EntityRef;
 /// frontend grows handles for them. Mismatched (entity, target)
 /// pairs are rejected up-front by [`solve_drag`] with
 /// [`SketchSolveError::DragTargetKindMismatch`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum DragTarget {
     /// Pull a point toward `(x, y)` via least-squares X/Y residuals.
     Point(Point2d),
@@ -103,7 +105,7 @@ impl DragTarget {
 /// reasonable zoom), fewer iterations (`30`), and tighter damping
 /// (`0.8`, closer to undamped Newton) so the dragged point tracks
 /// the cursor crisply without overshoot.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SolveOptions {
     /// Cap on Newton-Raphson iterations before declaring divergence.
     pub max_iterations: usize,
@@ -160,7 +162,8 @@ impl SolveOptions {
 /// outcomes the caller may want to display in the UI, not bugs.
 /// Errors here are reserved for inputs the bridge itself can reject
 /// before invoking the solver.
-#[derive(Debug, Error, Clone, PartialEq)]
+#[derive(Debug, Error, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SketchSolveError {
     /// `SolveOptions::damping_factor` is outside (0, 1].
     #[error("invalid damping_factor {value}: must be in (0.0, 1.0]")]
@@ -185,7 +188,7 @@ pub enum SketchSolveError {
     )]
     DragTargetKindMismatch {
         entity: EntityRef,
-        target_kind: &'static str,
+        target_kind: String,
     },
     /// The dragged entity is pinned by its own `is_fixed` flag.
     /// Dragging a locked point is a user error: the soft X/Y pull
@@ -203,7 +206,7 @@ pub enum SketchSolveError {
 /// accessors. The report carries everything a UI needs to draw a
 /// "Fully constrained / 3 DOF / 12 iterations / 0.42 ms" status badge
 /// without having to pattern-match the raw [`SolverStatus`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchSolveReport {
     /// Newton-Raphson outcome.
     pub status: SolverStatus,
@@ -326,7 +329,8 @@ impl SketchSolveReport {
 /// (`check_constraint_count`), but exposed without running the
 /// Newton-Raphson iteration, so the UI can update a "DOF: 3" badge
 /// reactively as constraints are added or removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DofStatus {
     /// `total_free_dofs == constraint_dofs_removed`.
     FullyConstrained,
@@ -345,7 +349,7 @@ pub enum DofStatus {
 /// [`SketchSolveReport`] for entity counting so the UI can use a
 /// single render path for "pre-solve summary" and "post-solve
 /// summary" panels.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DofReport {
     /// Total degrees of freedom across all analysable entities.
     ///
@@ -645,7 +649,7 @@ fn build_drag_constraints(
         // produce a no-op solve.
         (entity, _) => Err(SketchSolveError::DragTargetKindMismatch {
             entity,
-            target_kind: target.kind(),
+            target_kind: target.kind().to_string(),
         }),
     }
 }
