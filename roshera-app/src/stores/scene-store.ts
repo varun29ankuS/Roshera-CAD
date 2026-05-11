@@ -104,6 +104,63 @@ export const CAMERA_PRESETS: Record<string, CameraPreset> = {
   isometric:   { name: 'Isometric',   position: [20, 15, 20], target: [0, 0, 0], up: [0, 1, 0] },
 }
 
+// ─── Sketch session readiness ────────────────────────────────────────
+//
+// `enterSketch` fires `sketchApi.create` asynchronously and the
+// resulting `serverId` only lands when the response arrives. Every
+// mutation action awaits this readiness promise before dispatching its
+// REST call — there is no local op queue, and there is no optimistic
+// local mutation. The backend is the only source of truth for sketch
+// geometry: state updates flow back exclusively through the
+// `SketchUpdated` WebSocket echo → `applyServerSketchSnapshot`. This
+// matches the "frontend is a thin display layer" architectural rule.
+//
+// Module-level state because there's at most one in-flight create
+// per browser tab.
+let sketchSessionReady: Promise<string> | null = null
+let sketchSessionReadyResolve: ((id: string) => void) | null = null
+let sketchSessionReadyReject: ((err: unknown) => void) | null = null
+
+/**
+ * Arm a fresh readiness promise for a new `enterSketch`. Rejects any
+ * prior in-flight promise so consumers waiting on a now-abandoned
+ * session fail fast rather than racing against the new one. Returns
+ * the resolve/reject pair for the *current* session — callers compare
+ * identity against the module-level handles to detect supersession.
+ */
+function armSketchReady(): {
+  resolve: (id: string) => void
+  reject: (err: unknown) => void
+} {
+  if (sketchSessionReadyReject) {
+    sketchSessionReadyReject(new Error('sketch session superseded'))
+  }
+  let resolve!: (id: string) => void
+  let reject!: (err: unknown) => void
+  sketchSessionReady = new Promise<string>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  // Suppress UnhandledPromiseRejection if nothing ever awaits this.
+  sketchSessionReady.catch(() => {})
+  sketchSessionReadyResolve = resolve
+  sketchSessionReadyReject = reject
+  return { resolve, reject }
+}
+
+/**
+ * Reject and drop the readiness promise — called by `exitSketch` and
+ * the supersession path in `enterSketch`.
+ */
+function clearSketchReady(reason: string): void {
+  if (sketchSessionReadyReject) {
+    sketchSessionReadyReject(new Error(reason))
+  }
+  sketchSessionReady = null
+  sketchSessionReadyResolve = null
+  sketchSessionReadyReject = null
+}
+
 /**
  * Resolve the (camera-preset key, full preset data) pair the viewport
  * should snap to when a sketch is opened on `plane`.
@@ -114,83 +171,6 @@ export const CAMERA_PRESETS: Record<string, CameraPreset> = {
  *     `up` aligned to the plane's v_axis. This gives the user a
  *     flat-on view of the face regardless of orientation.
  */
-/**
- * Apply `update` to the *last* element of `shapes` (the active /
- * in-progress shape) and return a new array. No-op when `shapes` is
- * empty — caller should never hit that path under the
- * "shapes invariantly non-empty while sketch is active" rule, but we
- * defensively pass through rather than throw so a transient empty
- * doesn't crash an action.
- */
-function withActiveShapeUpdate(
-  shapes: ServerSketchShape[],
-  update: (s: ServerSketchShape) => ServerSketchShape,
-): ServerSketchShape[] {
-  if (shapes.length === 0) return shapes
-  const next = shapes.slice()
-  next[next.length - 1] = update(next[next.length - 1])
-  return next
-}
-
-// ─── Pending-op queue for the sketch session ─────────────────────────
-//
-// `enterSketch` fires `sketchApi.create` asynchronously and the
-// resulting `serverId` only lands when the response arrives. Anything
-// the user does in that window (place a point, add a second shape,
-// switch tool, hit Finish) needs to be replayed to the backend in
-// order once the id is known — otherwise the second shape is silently
-// dropped by the API layer and Finish bails with "Preparing sketch
-// session". Module-level state because there's at most one in-flight
-// create at a time.
-type PendingSketchOp =
-  | { type: 'addPoint'; point: [number, number] }
-  | { type: 'popPoint' }
-  | { type: 'clearPoints' }
-  | { type: 'setPoint'; index: number; point: [number, number] }
-  | { type: 'setTool'; tool: SketchTool }
-  | { type: 'setPlane'; plane: SketchPlane }
-  | { type: 'addShape'; tool: SketchTool }
-  | { type: 'deleteShape'; idx: number }
-
-let sketchPendingOps: PendingSketchOp[] = []
-let sketchSessionReady: Promise<string> | null = null
-let sketchSessionReadyResolve: ((id: string) => void) | null = null
-let sketchSessionReadyReject: ((err: unknown) => void) | null = null
-
-function resetSketchPendingState(reason?: string): void {
-  sketchPendingOps = []
-  if (sketchSessionReadyReject) {
-    sketchSessionReadyReject(new Error(reason ?? 'sketch session ended'))
-  }
-  sketchSessionReady = null
-  sketchSessionReadyResolve = null
-  sketchSessionReadyReject = null
-}
-
-async function replayPendingSketchOp(
-  id: string,
-  op: PendingSketchOp,
-): Promise<ServerSketchSession> {
-  switch (op.type) {
-    case 'addPoint':
-      return sketchApi.addPoint(id, op.point)
-    case 'popPoint':
-      return sketchApi.popPoint(id)
-    case 'clearPoints':
-      return sketchApi.clearPoints(id)
-    case 'setPoint':
-      return sketchApi.setPoint(id, op.index, op.point)
-    case 'setTool':
-      return sketchApi.setTool(id, op.tool)
-    case 'setPlane':
-      return sketchApi.setPlane(id, op.plane)
-    case 'addShape':
-      return sketchApi.addShape(id, { tool: op.tool })
-    case 'deleteShape':
-      return sketchApi.deleteShape(id, op.idx)
-  }
-}
-
 function sketchCameraSetup(plane: SketchPlane): {
   presetKey: string
   preset: CameraPreset | undefined
@@ -336,8 +316,9 @@ export interface SketchState {
   /**
    * Backend session id (UUID) once the `POST /api/sketch` round-trip
    * has completed. `null` between `enterSketch` being called and the
-   * server response landing — actions taken in that window are
-   * queued and replayed once the id is known.
+   * server response landing — every mutation action awaits
+   * `awaitSketchReady` before dispatching, so callers never need to
+   * special-case the null window.
    */
   serverId: string | null
   plane: SketchPlane
@@ -565,12 +546,12 @@ interface SceneState {
     inferenceAxis: InferenceAxis | null
   }) => void
   /**
-   * Resolve once the active sketch's `serverId` is known and the
-   * pending-op queue has fully drained. Resolves immediately with the
-   * id when serverId is already set; rejects when the create round-
-   * trip failed or the user exited before it landed. The Finish
-   * handler awaits this so a fast user can't trip the "Preparing
-   * sketch session" race.
+   * Resolve once the active sketch's `serverId` is known. Resolves
+   * immediately with the id when serverId is already set; rejects
+   * when the create round-trip failed or the user exited before it
+   * landed. Every mutation action awaits this before dispatching its
+   * REST call, and the Finish handler awaits it so a fast user can't
+   * extrude before the session lands.
    */
   awaitSketchReady: () => Promise<string>
   /**
@@ -599,9 +580,11 @@ interface SceneState {
   /**
    * Reconcile a server `SketchSession` snapshot into the local store.
    * Called by `ws-bridge` on every `SketchCreated` / `SketchUpdated`
-   * frame. The local state for the active session is overwritten so
-   * the backend stays the single source of truth — optimistic local
-   * mutations are clobbered by the broadcast that follows.
+   * frame, and once directly from the `enterSketch` create-response
+   * path in case the WS echo is delayed. This is the **sole writer**
+   * of sketch geometry state — mutation actions (`addSketchPoint`,
+   * `setSketchTool`, …) never touch state directly; they dispatch a
+   * REST call and rely on the resulting WS echo to reach this method.
    */
   applyServerSketchSnapshot: (session: ServerSketchSession) => void
   /**
@@ -883,9 +866,10 @@ export const useSceneStore = create<SceneState>()(
           active: true,
           serverId: null,
           plane: targetPlane,
-          // Seed a single shape locally so the overlay / dimension-
-          // input code paths that read `shapes[last]` have an entry
-          // before the backend snapshot lands.
+          // Seed an empty shape so dimension-input / overlay code that
+          // reads `shapes[last]` has a valid placeholder until the
+          // `SketchCreated` WS frame lands. WS echo will replace this
+          // with the canonical session shapes.
           shapes: [
             {
               id: 'pending',
@@ -911,77 +895,36 @@ export const useSceneStore = create<SceneState>()(
         cameraPreset: presetKey,
         pendingCameraPreset: preset ?? state.pendingCameraPreset,
       }))
-      // Reset and re-arm the readiness promise. Any prior in-flight
-      // create from a previous (now abandoned) session is rejected so
-      // its `awaitSketchReady` consumers fail fast rather than racing
-      // against the new session.
-      resetSketchPendingState('sketch session restarted')
-      sketchSessionReady = new Promise<string>((resolve, reject) => {
-        sketchSessionReadyResolve = resolve
-        sketchSessionReadyReject = reject
-      })
-      // Capture the resolve/reject references for *this* session.
-      // If the user exits and re-enters, `enterSketch` swaps the
-      // module-level handles to a new pair; comparing identity inside
-      // our `.then` lets us detect that we've been superseded and
-      // bail without touching the new session's queue.
-      const mySessionResolve = sketchSessionReadyResolve
-      const mySessionReject = sketchSessionReadyReject
-      // Suppress UnhandledPromiseRejection if no one ever awaits this
-      // session (e.g. user enters and immediately exits).
-      sketchSessionReady.catch(() => {})
-      // Fire the backend create. The server is the source of truth —
-      // a `SketchCreated` WS frame will reconcile the snapshot, but
-      // we also stamp `serverId` from the direct response in case the
-      // broadcast is delayed.
+      // Arm a fresh readiness promise. Captures the resolve/reject
+      // pair for *this* session; later supersession (user enters a
+      // second sketch before this create resolves) replaces the
+      // module-level handles, and the identity check below lets us
+      // bail without clobbering the new session.
+      const { resolve: myResolve, reject: myReject } = armSketchReady()
+      // Fire the backend create. Server is source of truth — the
+      // `SketchCreated` WS frame will reconcile shapes/plane via
+      // `applyServerSketchSnapshot`. We also apply the direct response
+      // here in case the broadcast is delayed by the network.
       sketchApi
         .create(targetPlane, targetTool)
-        .then(async (session) => {
-          // If a newer `enterSketch` has superseded us, our resolver
-          // identity won't match the module-level handle anymore.
-          // Bail without touching the new session's queue.
-          if (sketchSessionReadyResolve !== mySessionResolve) {
+        .then((session) => {
+          // Supersession guard: if a newer `enterSketch` has run,
+          // our resolver identity no longer matches the module-level
+          // handle. Drop the response on the floor.
+          if (sketchSessionReadyResolve !== myResolve) {
             return
           }
-          // Drop the response if the user exited.
-          const cur = useSceneStore.getState().sketch
-          if (!cur.active) {
-            mySessionReject?.(new Error('sketch exited before create resolved'))
-            return
-          }
-          // Drain the pending-op queue *before* stamping serverId or
-          // applying the snapshot. New actions taken during the drain
-          // see serverId still null and so also queue (the outer
-          // while-loop picks them up). When the queue is empty we
-          // stamp serverId via `applyServerSketchSnapshot(lastSnap)`
-          // and only then do further actions fire directly.
-          let lastSnap: ServerSketchSession = session
-          while (sketchPendingOps.length > 0) {
-            const op = sketchPendingOps.shift()
-            if (!op) break
-            try {
-              lastSnap = await replayPendingSketchOp(session.id, op)
-            } catch (err) {
-              console.error('[sketch] replay op failed:', op, err)
-            }
-            // A user exit during an awaited replay swaps our handles
-            // out; bail before clobbering the new session's state.
-            if (sketchSessionReadyResolve !== mySessionResolve) {
-              return
-            }
-          }
-          // Re-check active in case the user exited mid-drain.
           if (!useSceneStore.getState().sketch.active) {
-            mySessionReject?.(new Error('sketch exited during drain'))
+            myReject(new Error('sketch exited before create resolved'))
             return
           }
-          useSceneStore.getState().applyServerSketchSnapshot(lastSnap)
-          mySessionResolve?.(session.id)
+          useSceneStore.getState().applyServerSketchSnapshot(session)
+          myResolve(session.id)
         })
         .catch((err) => {
           console.error('[sketch] create failed:', err)
-          if (sketchSessionReadyResolve === mySessionResolve) {
-            mySessionReject?.(err)
+          if (sketchSessionReadyResolve === myResolve) {
+            myReject(err)
           }
         })
     },
@@ -1022,11 +965,11 @@ export const useSceneStore = create<SceneState>()(
           console.error('[sketch] delete failed:', err)
         })
       }
-      // Tear down the pending-op queue. Anything still waiting was
-      // staged for a session the user just abandoned; rejecting the
-      // readiness promise unblocks any `awaitSketchReady` consumer
-      // (e.g. SketchPanel.handleFinish racing the user's Cancel).
-      resetSketchPendingState('sketch exited')
+      // Reject the readiness promise so any in-flight `awaitSketchReady`
+      // consumer (e.g. SketchPanel.handleFinish racing the user's
+      // Cancel, or a click-handler still resolving its REST dispatch)
+      // fails fast rather than touching a now-defunct session.
+      clearSketchReady('sketch exited')
     },
 
     setSketchTool: (tool) => {
@@ -1048,48 +991,32 @@ export const useSceneStore = create<SceneState>()(
         ((activeTool === 'rectangle' || activeTool === 'circle') &&
           activeCount >= 2)
       if (activeIsValid && tool !== activeTool) {
-        // Commit the current shape via the existing multi-shape path,
-        // which snapshots the active points into `shapes`, appends an
-        // empty new active, and fires the backend `addShape` round-
-        // trip. We pass `tool` so the new shape starts in the user's
-        // freshly-selected mode.
+        // Commit the current shape via `addNewSketchShape`, which the
+        // backend implements as "snapshot active shape, append fresh
+        // empty shape with `tool`". WS echo carries the new state.
         useSceneStore.getState().addNewSketchShape(tool)
         return
       }
-
-      const id = state0.serverId
-      set((state) => {
-        // No valid in-progress shape to commit: just retag the
-        // active shape's tool and wipe any half-placed points (the
-        // primitives don't share semantics so reusing prior clicks
-        // would always be wrong).
-        const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          tool,
-          points: [],
-        }))
-        return {
-          sketch: {
-            ...state.sketch,
-            tool,
-            points: [],
-            shapes,
-            hover: state.sketch.hover,
-            // Tool switch invalidates the previous anchor, so any
-            // active inference axis is meaningless. Snap targets
-            // recompute on the next pointermove.
-            snapTarget: null,
-            inferenceAxis: null,
-          },
-        }
-      })
-      if (id) {
-        sketchApi.setTool(id, tool).catch((err) => {
+      // Tool switch invalidates the previous anchor: drop snap /
+      // inference axis locally (pure UX state, never round-tripped).
+      // The shapes/points fields stay untouched here — backend's
+      // setTool clears the active shape's points and the WS echo
+      // propagates that authoritatively.
+      set((state) => ({
+        sketch: {
+          ...state.sketch,
+          snapTarget: null,
+          inferenceAxis: null,
+        },
+      }))
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.setTool(id, tool)
+        } catch (err) {
           console.error('[sketch] setTool failed:', err)
-        })
-      } else {
-        sketchPendingOps.push({ type: 'setTool', tool })
-      }
+        }
+      })()
     },
 
     setSketchPlane: (plane) => {
@@ -1097,93 +1024,68 @@ export const useSceneStore = create<SceneState>()(
       // so the sketcher always sees the surface flat-on. Standard
       // planes hit one of the axis presets; custom (face-anchored)
       // planes synthesise a fresh preset along the face normal — see
-      // sketchCameraSetup.
+      // sketchCameraSetup. Camera preset is pure UX state and lives
+      // only on the client.
       const { presetKey, preset } = sketchCameraSetup(plane)
-      const id = useSceneStore.getState().sketch.serverId
-      set((state) => {
-        // Backend `set_plane` clears every shape's points (plane swap
-        // invalidates all UV). Mirror that locally.
-        const shapes = state.sketch.shapes.map((s) => ({
-          ...s,
-          points: [],
-        }))
-        return {
-          sketch: {
-            ...state.sketch,
-            plane,
-            points: [],
-            shapes,
-            hover: null,
-            snapTarget: null,
-            inferenceAxis: null,
-          },
-          cameraPreset: presetKey,
-          pendingCameraPreset: preset ?? state.pendingCameraPreset,
-        }
-      })
-      if (id) {
-        sketchApi.setPlane(id, plane).catch((err) => {
+      set((state) => ({
+        sketch: {
+          ...state.sketch,
+          // Clear transient UX state (cursor preview / snap / inference)
+          // because their values reference the old plane's coordinate
+          // frame. Authoritative shapes/plane/points fields wait for
+          // the WS echo from the backend's `set_plane`.
+          hover: null,
+          snapTarget: null,
+          inferenceAxis: null,
+        },
+        cameraPreset: presetKey,
+        pendingCameraPreset: preset ?? state.pendingCameraPreset,
+      }))
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.setPlane(id, plane)
+        } catch (err) {
           console.error('[sketch] setPlane failed:', err)
-        })
-      } else {
-        sketchPendingOps.push({ type: 'setPlane', plane })
-      }
+        }
+      })()
     },
 
     addSketchPoint: (point) => {
-      const id = useSceneStore.getState().sketch.serverId
-      set((state) => {
-        const points = [...state.sketch.points, point]
-        const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          points,
-        }))
-        return { sketch: { ...state.sketch, points, shapes } }
-      })
-      if (id) {
-        sketchApi.addPoint(id, point).catch((err) => {
+      // Pure backend dispatch — state lands via `SketchUpdated` WS
+      // echo, never written locally here. The redraw lag is the WS
+      // round-trip (~5-15 ms on localhost) and keeps the kernel as
+      // the single source of truth.
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.addPoint(id, point)
+        } catch (err) {
           console.error('[sketch] addPoint failed:', err)
-        })
-      } else {
-        sketchPendingOps.push({ type: 'addPoint', point })
-      }
+        }
+      })()
     },
 
     popSketchPoint: () => {
-      const id = useSceneStore.getState().sketch.serverId
-      set((state) => {
-        const points = state.sketch.points.slice(0, -1)
-        const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          points,
-        }))
-        return { sketch: { ...state.sketch, points, shapes } }
-      })
-      if (id) {
-        sketchApi.popPoint(id).catch((err) => {
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.popPoint(id)
+        } catch (err) {
           console.error('[sketch] popPoint failed:', err)
-        })
-      } else {
-        sketchPendingOps.push({ type: 'popPoint' })
-      }
+        }
+      })()
     },
 
     clearSketchPoints: () => {
-      const id = useSceneStore.getState().sketch.serverId
-      set((state) => {
-        const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          points: [],
-        }))
-        return { sketch: { ...state.sketch, points: [], shapes } }
-      })
-      if (id) {
-        sketchApi.clearPoints(id).catch((err) => {
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.clearPoints(id)
+        } catch (err) {
           console.error('[sketch] clearPoints failed:', err)
-        })
-      } else {
-        sketchPendingOps.push({ type: 'clearPoints' })
-      }
+        }
+      })()
     },
 
     setSketchHover: (point) =>
@@ -1210,28 +1112,22 @@ export const useSceneStore = create<SceneState>()(
     },
 
     setSketchPoint: (index, point) => {
-      const id = useSceneStore.getState().sketch.serverId
-      let updated = false
-      set((state) => {
-        if (index < 0 || index >= state.sketch.points.length) return state
-        const points = state.sketch.points.slice()
-        points[index] = point
-        const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          points,
-        }))
-        updated = true
-        return { sketch: { ...state.sketch, points, shapes } }
-      })
-      if (updated) {
-        if (id) {
-          sketchApi.setPoint(id, index, point).catch((err) => {
-            console.error('[sketch] setPoint failed:', err)
-          })
-        } else {
-          sketchPendingOps.push({ type: 'setPoint', index, point })
-        }
+      // Bounds check against the local mirror of the active shape so
+      // dimension-input UI doesn't fire a guaranteed-to-fail REST
+      // call for an out-of-range index. The authoritative update
+      // still arrives via the WS echo.
+      const cur = useSceneStore.getState().sketch
+      if (index < 0 || index >= cur.points.length) {
+        return
       }
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.setPoint(id, index, point)
+        } catch (err) {
+          console.error('[sketch] setPoint failed:', err)
+        }
+      })()
     },
 
     setSketchView: (patch) =>
@@ -1241,91 +1137,53 @@ export const useSceneStore = create<SceneState>()(
 
     addNewSketchShape: (tool) => {
       const cur = useSceneStore.getState().sketch
-      const id = cur.serverId
-      // No-op when the active shape has no points: we'd just be
-      // committing an empty shape and ending up with two trailing
-      // empties. The user must place at least one point first.
+      // No-op when the active shape has no points: we'd commit an
+      // empty shape and end up with two trailing empties. Backend
+      // refuses this case too, but checking locally avoids the
+      // round-trip. The shape count read here is from the latest WS
+      // snapshot, which is the authoritative view.
       if (cur.points.length === 0) {
         return
       }
       const nextTool: SketchTool = tool ?? cur.tool
-      set((state) => {
-        const newShape: ServerSketchShape = {
-          id: `pending-${Date.now()}`,
-          tool: nextTool,
-          points: [],
+      // Clear transient UX state (hover / snap / inference). Shapes
+      // and tool fields wait for the WS echo from `addShape`.
+      set((state) => ({
+        sketch: {
+          ...state.sketch,
+          hover: null,
+          snapTarget: null,
+          inferenceAxis: null,
+        },
+      }))
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.addShape(id, { tool: nextTool })
+        } catch (err) {
+          console.error('[sketch] addShape failed:', err)
         }
-        // Snapshot the active shape's current state into `shapes`
-        // (so it stays in the committed list with its final points)
-        // and append the empty new active.
-        const committed = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
-          ...s,
-          tool: state.sketch.tool,
-          points: state.sketch.points,
-        }))
-        return {
-          sketch: {
-            ...state.sketch,
-            shapes: [...committed, newShape],
-            tool: nextTool,
-            points: [],
-            hover: null,
-            snapTarget: null,
-            inferenceAxis: null,
-          },
-        }
-      })
-      if (id) {
-        sketchApi
-          .addShape(id, { tool: nextTool })
-          .then((session) => {
-            useSceneStore.getState().applyServerSketchSnapshot(session)
-          })
-          .catch((err) => {
-            console.error('[sketch] addShape failed:', err)
-          })
-      } else {
-        sketchPendingOps.push({ type: 'addShape', tool: nextTool })
-      }
+      })()
     },
 
     deleteSketchShape: (idx) => {
       const cur = useSceneStore.getState().sketch
-      const id = cur.serverId
       // Refuse to remove the only remaining shape — matches backend.
+      // Skipping the round-trip on guaranteed-invalid input keeps
+      // server logs clean.
       if (cur.shapes.length <= 1) {
         console.warn('[sketch] deleteSketchShape: cannot remove the last shape')
         return
       }
       if (idx < 0 || idx >= cur.shapes.length) return
-      set((state) => {
-        const next = state.sketch.shapes.slice()
-        next.splice(idx, 1)
-        const last = next[next.length - 1]
-        return {
-          sketch: {
-            ...state.sketch,
-            shapes: next,
-            // The new active shape's tool/points become the top-
-            // level convenience view.
-            tool: last.tool,
-            points: last.points,
-            hover: null,
-          },
+      void (async () => {
+        try {
+          const id = await useSceneStore.getState().awaitSketchReady()
+          await sketchApi.deleteShape(id, idx)
+        } catch (err) {
+          console.error('[sketch] deleteShape failed:', err)
         }
-      })
-      if (id) {
-        sketchApi
-          .deleteShape(id, idx)
-          .then((session) => {
-            useSceneStore.getState().applyServerSketchSnapshot(session)
-          })
-          .catch((err) => {
-            console.error('[sketch] deleteShape failed:', err)
-          })
-      } else {
-        sketchPendingOps.push({ type: 'deleteShape', idx })
-      }
+      })()
     },
 
     applyServerSketchSnapshot: (session) =>
