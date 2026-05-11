@@ -164,6 +164,28 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
         let _ = sender.send(Message::Text(welcome_json.into())).await;
     }
 
+    // Replay the current kernel scene to this freshly-connected client.
+    //
+    // The backend keeps kernel solids and timeline events in memory
+    // across frontend reloads (the process doesn't restart on F5). On
+    // reconnect the REST endpoints (`/api/timeline/history`,
+    // `/api/datums`) repopulate their respective panels, but the
+    // viewport / ModelTree depend on `ObjectCreated` WS frames — and
+    // without an explicit scene-sync the client sees an empty scene
+    // until the next mutation broadcasts. This loop fixes that: every
+    // registered (uuid, solid) pair is shipped as an `ObjectCreated`
+    // frame right after Welcome.
+    //
+    // Frames are constructed via `build_object_created_frame` in
+    // `main.rs`, byte-identical to what live mutations emit, so the
+    // frontend's `cadObjectSchema` and `convertCADObject` paths handle
+    // them without divergence. `addObject` in the scene store is
+    // idempotent on duplicate ids, so this is safe even if a redundant
+    // broadcast follows.
+    for frame in crate::current_scene_frames(&state).await {
+        let _ = sender.send(Message::Text(frame.into())).await;
+    }
+
     // Subscribe to the global geometry broadcast so REST / AI / CLI
     // mutators that bypass this connection still surface in the
     // viewport. Frames arrive pre-serialized; we just forward bytes.

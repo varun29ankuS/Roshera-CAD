@@ -203,13 +203,52 @@ async fn ensure_session_position_at_head(
 /// for the duration of the replay (preventing replayed events from
 /// being re-recorded into the timeline) and reattaches it before
 /// returning.
+/// Fetch the `EventId` of the most-recently-recorded event on the
+/// recorder's active branch. Used by consuming handlers (boolean,
+/// delete, face-extrude replace) to associate their just-recorded
+/// timeline event with the `(kernel_id → uuid)` bindings they
+/// consumed, so a later `replay_session_to_model` rolling back across
+/// this event can resurrect those UUIDs.
+///
+/// Flushes the recorder before reading so the event we just enqueued
+/// (immediately before this call) is guaranteed to have landed in the
+/// timeline. Without the flush the MPSC backlog could leave the just-
+/// emitted op invisible to `get_branch_events`, and we'd tombstone
+/// against an earlier event — wrong association, lost resurrection.
+///
+/// Returns `None` if the recorder's active branch has no events yet
+/// (which can only happen if the caller is racing the very first
+/// kernel op on a fresh branch, and means the consuming op itself
+/// hasn't materialised; the caller should treat that as a no-op).
+pub async fn latest_event_id_on_active_branch(state: &AppState) -> Option<Uuid> {
+    if state.timeline_recorder.flush().await.is_err() {
+        return None;
+    }
+    let branch_id = state.timeline_recorder.branch_id();
+    let timeline = state.timeline.read().await;
+    let events = timeline.get_branch_events(&branch_id, None, None).ok()?;
+    events
+        .into_iter()
+        .max_by_key(|e| e.sequence_number)
+        .map(|e| e.id.0)
+}
+
 async fn replay_session_to_model(
     state: &AppState,
     session_uuid: Uuid,
 ) -> Result<ReplayOutcome, String> {
-    // 1. Snapshot the session's position + fetch the events to replay.
-    //    Held under a single read lock so position and events are
-    //    consistent with each other.
+    // 1. Snapshot the session's position + fetch the events to replay
+    //    **and the events being skipped** (sequence_number ≥ cutoff).
+    //    Both are held under a single read lock so position, replay
+    //    set, and skip set are mutually consistent.
+    //
+    //    Skipped events matter for slice-2 of the Ctrl-Z fix: each
+    //    consuming op (boolean, delete, face-extrude replace) has
+    //    tombstoned its consumed `(kernel_id, uuid)` bindings against
+    //    its own `EventId` (see `AppState::tombstone_consumed_uuids`).
+    //    Walking the skip set yields the resurrection table — original
+    //    UUIDs to restore for solids that come back when the consuming
+    //    op is rolled past.
     //
     //    `event_index` is the *count of applied events*, so it equals
     //    the number of events to fetch from the branch root. Events are
@@ -222,21 +261,46 @@ async fn replay_session_to_model(
     // recorded; an undrained MPSC means we'd rebuild the model against
     // an incomplete event prefix.
     let _ = state.timeline_recorder.flush().await;
-    let (branch_id, events) = {
+    let (branch_id, events, skipped) = {
         let timeline = state.timeline.read().await;
         let position = timeline
             .get_session_position(session_uuid)
             .ok_or_else(|| "session has no timeline position".to_string())?;
         let limit = position.event_index as usize;
-        let mut events = timeline
+        let mut all_events = timeline
             .get_branch_events(&position.branch_id, None, None)
             .map_err(|e| format!("failed to fetch branch events: {}", e))?;
-        events.sort_by_key(|e| e.sequence_number);
-        events.truncate(limit);
-        (position.branch_id, events)
+        all_events.sort_by_key(|e| e.sequence_number);
+        let skipped: Vec<TimelineEvent> = all_events.split_off(limit.min(all_events.len()));
+        (position.branch_id, all_events, skipped)
     };
 
-    // 2. Replace the live model with a fresh one and reattach the
+    // 2. Snapshot pre-replay UUID ↔ kernel-id mapping.
+    //
+    //    The kernel's `SolidId` counter is deterministic — re-running
+    //    the same event prefix in the same order produces the same
+    //    kernel-id assignments. So a kernel id that survives the undo
+    //    (i.e. that exists in both the pre- and post-replay models)
+    //    points at the **same logical solid** before and after, and we
+    //    can reuse its UUID across the rebuild.
+    //
+    //    Reusing the UUID matters for the user: it preserves selection,
+    //    transform-gizmo state, outliner ordering, browser names, and
+    //    AI references. Pre-fix, every undo wiped every UUID and minted
+    //    fresh ones — every solid in the scene appeared to be renamed
+    //    and recreated, which is **not** the "step back one event"
+    //    semantics a user expects from Ctrl-Z.
+    let pre_replay_kernel_to_uuid: HashMap<u32, Uuid> = {
+        let mut map = HashMap::new();
+        for uuid in state.snapshot_registered_uuids() {
+            if let Some(kid) = state.get_local_id(&uuid) {
+                map.insert(kid, uuid);
+            }
+        }
+        map
+    };
+
+    // 3. Replace the live model with a fresh one and reattach the
     //    shared recorder so post-replay kernel ops continue to be
     //    timeline-recorded against the *current* active branch.
     //
@@ -252,7 +316,7 @@ async fn replay_session_to_model(
     let recorder: Arc<dyn OperationRecorder> = state.timeline_recorder.clone();
     model_guard.attach_recorder(Some(recorder));
 
-    // 3. Replay. `rebuild_model_from_events` detaches the recorder for
+    // 4. Replay. `rebuild_model_from_events` detaches the recorder for
     //    the duration of the replay and reattaches it before returning.
     let outcome = rebuild_model_from_events(&mut *model_guard, &events);
     tracing::info!(
@@ -264,54 +328,118 @@ async fn replay_session_to_model(
         "BRepModel reconciled with session timeline position"
     );
 
-    // 4. Tell every connected viewer about the new world.
+    // 5. Build the resurrection table from skipped events' tombstones.
     //
-    //    Strategy: brute-force scene reload. We snapshot every UUID the
-    //    api-server currently knows about, drop them from id_mapping,
-    //    and emit `ObjectDeleted` for each. We then walk the rebuilt
-    //    `BRepModel`, mint fresh UUIDs for each solid, register them in
-    //    id_mapping, and emit `ObjectCreated`.
+    //    `state.consumed_uuids` is keyed by the consuming event's raw
+    //    `Uuid`. For every event we just rolled past (`skipped`), look
+    //    up its tombstoned `(kernel_id → uuid)` bindings. Earlier
+    //    skipped events win on conflict (`entry().or_insert()`) so the
+    //    binding from the *first* op that consumed a given kernel id
+    //    survives — that's the binding that was active in the pre-undo
+    //    timeline at the moment of consumption.
+    let mut resurrection_table: HashMap<u32, Uuid> = HashMap::new();
+    for ev in &skipped {
+        if let Some(bindings) = state.consumed_uuids_for_event(&ev.id.0) {
+            for (kid, uuid) in bindings {
+                resurrection_table.entry(kid).or_insert(uuid);
+            }
+        }
+    }
+
+    // 6. Resolve the post-replay UUID assignment.
     //
-    //    Why fresh UUIDs: `BRepModel::new()` resets the kernel's
-    //    `SolidId` counter, so the rebuilt model's solids have
-    //    `SolidId`s that may collide with stale id_mapping entries that
-    //    referred to entirely different (now-evicted) solids. Re-using
-    //    UUIDs for "the same logical solid" would require tracking
-    //    operation outputs across replay, which the recorder's current
-    //    envelope (`{"params", "inputs", "outputs"}`) doesn't surface
-    //    in a way the post-replay walk can reconstruct cheaply.
-    //    Fresh-mint is correct and cheap for the common case (1–10
-    //    solids); revisit if scenes grow to thousands.
-    let old_uuids = state.snapshot_registered_uuids();
-    for uuid in &old_uuids {
+    //    For each surviving kernel solid:
+    //      (a) reuse the pre-replay UUID if one was registered against
+    //          the same kernel id (the common case — solid existed
+    //          before and survived the rollback),
+    //      (b) else resurrect from the tombstone table (the operand-
+    //          resurrection case — boolean/delete consumed this kernel
+    //          id and was rolled past, restoring its original UUID),
+    //      (c) else mint a fresh `Uuid::new_v4()` (genuinely new state
+    //          the user has never seen — rare; would happen only if
+    //          a replay produced a kernel id that was never registered
+    //          and never tombstoned, which the deterministic counter
+    //          shouldn't allow but the path stays robust).
+    let mut post_replay_kernel_to_uuid: HashMap<u32, Uuid> = HashMap::new();
+    for (solid_id, _solid) in model_guard.solids.iter() {
+        let uuid = pre_replay_kernel_to_uuid
+            .get(&solid_id)
+            .copied()
+            .or_else(|| resurrection_table.get(&solid_id).copied())
+            .unwrap_or_else(Uuid::new_v4);
+        post_replay_kernel_to_uuid.insert(solid_id, uuid);
+    }
+
+    let pre_uuids: std::collections::HashSet<Uuid> =
+        pre_replay_kernel_to_uuid.values().copied().collect();
+    let post_uuids: std::collections::HashSet<Uuid> =
+        post_replay_kernel_to_uuid.values().copied().collect();
+
+    // 6. Stage 1 — broadcast `ObjectDeleted` only for UUIDs that did
+    //    not survive (i.e. solids the undone op had produced). Every
+    //    other UUID stays alive.
+    for uuid in pre_uuids.difference(&post_uuids) {
         state.unregister_id_mapping(uuid);
         crate::broadcast_object_deleted(&uuid.to_string());
     }
 
+    // 7. Stage 2 — register every surviving UUID against its
+    //    (potentially renumbered) kernel id, then broadcast.
+    //
+    //    Kept UUIDs (pre ∩ post): emit `ObjectUpdated` so the frontend
+    //    bridge merges the rebuilt mesh into the existing object slot
+    //    without dropping selection / transform-gizmo / outliner state.
+    //
+    //    Fresh UUIDs (post − pre): emit `ObjectCreated`. The
+    //    analytic-geometry envelope is intentionally empty here — the
+    //    kernel does not track which primitive produced each surviving
+    //    solid after replay (e.g. boolean output), so we ship the mesh
+    //    as a generic `"mesh"` and let the frontend's `convertCADObject`
+    //    fall through to the mesh path. The solid still renders,
+    //    selects, and exports correctly.
     let tess_params = geometry_engine::tessellation::TessellationParams::default();
     for (solid_id, solid) in model_guard.solids.iter() {
+        let uuid = match post_replay_kernel_to_uuid.get(&solid_id) {
+            Some(u) => *u,
+            None => continue,
+        };
         let mesh =
             geometry_engine::tessellation::tessellate_solid(solid, &model_guard, &tess_params);
         let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
-        let uuid = state.create_uuid_for_local(solid_id);
-        // No analytical-geometry envelope after replay: the kernel
-        // doesn't track which primitive produced each surviving solid
-        // (e.g. boolean output), so we ship the mesh as a generic
-        // "mesh" — the frontend's `convertCADObject` falls through to
-        // the mesh path for this case and the solid still renders,
-        // selects, and exports correctly.
-        crate::broadcast_object_created(
-            &uuid.to_string(),
-            solid.name.as_deref().unwrap_or("Solid"),
-            solid_id,
-            "mesh",
-            &serde_json::json!({}),
-            &vertices,
-            &indices,
-            &normals,
-            &face_ids,
-            [0.0, 0.0, 0.0],
-        );
+        let name = solid.name.as_deref().unwrap_or("Solid").to_string();
+
+        // Clear any stale row before re-registering so id_mapping is
+        // single-valued. For fresh UUIDs the unregister is a no-op.
+        state.unregister_id_mapping(&uuid);
+        state.register_id_mapping(uuid, solid_id);
+
+        if pre_uuids.contains(&uuid) {
+            crate::broadcast_object_updated(
+                &uuid.to_string(),
+                &name,
+                solid_id,
+                "mesh",
+                &serde_json::json!({}),
+                &vertices,
+                &indices,
+                &normals,
+                &face_ids,
+                [0.0, 0.0, 0.0],
+            );
+        } else {
+            crate::broadcast_object_created(
+                &uuid.to_string(),
+                &name,
+                solid_id,
+                "mesh",
+                &serde_json::json!({}),
+                &vertices,
+                &indices,
+                &normals,
+                &face_ids,
+                [0.0, 0.0, 0.0],
+            );
+        }
     }
 
     Ok(outcome)
@@ -694,10 +822,24 @@ fn walk_for_lineage(value: &serde_json::Value, lineage: &mut Lineage) {
                     "outputs" | "created" | "result_ids" => {
                         lineage.outputs.extend(extract_id_list(v));
                     }
-                    "source" | "target" | "target_id" | "solid_id" | "host_solid_id"
-                    | "face_id" | "edge_id" | "object_id" => {
+                    "source" | "target" | "target_id" | "object_id" => {
                         if let Some(key) = entity_key(v) {
                             lineage.inputs.push(key);
+                        }
+                    }
+                    "solid_id" | "host_solid_id" => {
+                        if let Some(key) = entity_key(v) {
+                            lineage.inputs.push(namespace_bare_id("solid", &key));
+                        }
+                    }
+                    "face_id" => {
+                        if let Some(key) = entity_key(v) {
+                            lineage.inputs.push(namespace_bare_id("face", &key));
+                        }
+                    }
+                    "edge_id" => {
+                        if let Some(key) = entity_key(v) {
+                            lineage.inputs.push(namespace_bare_id("edge", &key));
                         }
                     }
                     "result" | "result_id" | "new_id" => {
@@ -710,6 +852,19 @@ fn walk_for_lineage(value: &serde_json::Value, lineage: &mut Lineage) {
             }
         }
         _ => {}
+    }
+}
+
+/// Add the canonical `"<kind>:<id>"` namespace prefix to a bare entity
+/// id sourced from a typed `Operation` field (e.g. `solid_id`,
+/// `face_id`, `edge_id`). If the value already carries a colon — i.e.
+/// it was emitted by the Generic recorder path which always namespaces
+/// — leave it alone so we don't double-prefix.
+fn namespace_bare_id(kind: &str, raw: &str) -> String {
+    if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("{}:{}", kind, raw)
     }
 }
 

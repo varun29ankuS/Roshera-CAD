@@ -18,9 +18,46 @@
 //! — the operation has already mutated the model successfully. A failed
 //! record is logged via `tracing::warn!` so the issue is visible without
 //! breaking the kernel.
+//!
+//! # Lineage ID namespacing
+//!
+//! `inputs` and `outputs` are `Vec<String>` whose entries follow the
+//! canonical wire form `"<kind>:<id>"`, where `<kind>` is one of
+//! [`ENTITY_SOLID`], [`ENTITY_FACE`], [`ENTITY_EDGE`], [`ENTITY_VERTEX`],
+//! [`ENTITY_LOOP`], [`ENTITY_CURVE`], [`ENTITY_DATUM`]. Each kernel ID
+//! counter (`solid_id`, `face_id`, `edge_id`, …) lives in its own
+//! integer namespace inside `BRepModel`, so a bare integer is ambiguous
+//! — `face:1` and `solid:1` are distinct entities that previously
+//! collided in the lineage graph and produced incorrect parent-child
+//! edges in the operation tree. The typed `with_input_*` / `with_output_*`
+//! builders below are the only sanctioned construction sites; callers
+//! never assemble the `kind:id` string by hand.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// Entity-kind tag for a solid (`BRepModel::solids`).
+pub const ENTITY_SOLID: &str = "solid";
+/// Entity-kind tag for a face (`BRepModel::faces`).
+pub const ENTITY_FACE: &str = "face";
+/// Entity-kind tag for an edge (`BRepModel::edges`).
+pub const ENTITY_EDGE: &str = "edge";
+/// Entity-kind tag for a vertex (`BRepModel::vertices`).
+pub const ENTITY_VERTEX: &str = "vertex";
+/// Entity-kind tag for a loop (`BRepModel::loops`).
+pub const ENTITY_LOOP: &str = "loop";
+/// Entity-kind tag for a curve (`BRepModel::curves`).
+pub const ENTITY_CURVE: &str = "curve";
+/// Entity-kind tag for a user-authored datum (`BRepModel::datums`).
+pub const ENTITY_DATUM: &str = "datum";
+
+/// Format a single entity reference as `"<kind>:<id>"`. The numeric
+/// `id` is widened to `u64` so all kernel counter widths fit without
+/// loss of information.
+#[inline]
+pub fn entity_ref(kind: &str, id: u64) -> String {
+    format!("{}:{}", kind, id)
+}
 
 /// A structured description of one geometry operation that has just
 /// completed successfully.
@@ -40,13 +77,15 @@ pub struct RecordedOperation {
     /// back into the same kernel version.
     pub parameters: serde_json::Value,
 
-    /// Entity IDs consumed by this operation (input faces, edges, solids).
-    /// Empty when the operation is purely constructive.
-    pub inputs: Vec<u64>,
+    /// Entity references consumed by this operation, each in the canonical
+    /// `"<kind>:<id>"` wire form (see module docs). Empty when the operation
+    /// is purely constructive.
+    pub inputs: Vec<String>,
 
-    /// Entity IDs produced by this operation (new solid, new faces, new
-    /// edges, …). Empty when the operation is purely destructive.
-    pub outputs: Vec<u64>,
+    /// Entity references produced by this operation, each in the canonical
+    /// `"<kind>:<id>"` wire form (see module docs). Empty when the operation
+    /// is purely destructive.
+    pub outputs: Vec<String>,
 }
 
 impl RecordedOperation {
@@ -66,16 +105,154 @@ impl RecordedOperation {
         self
     }
 
-    /// Attach input entity IDs.
-    pub fn with_inputs(mut self, inputs: Vec<u64>) -> Self {
-        self.inputs = inputs;
+    /// Append pre-formatted input entity references. Callers that already
+    /// hold `"<kind>:<id>"` strings (typically because they assembled a
+    /// heterogeneous list from multiple typed helpers) use this builder
+    /// instead of one of the kind-specific ones below.
+    pub fn with_input_refs<I, S>(mut self, refs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs.extend(refs.into_iter().map(Into::into));
         self
     }
 
-    /// Attach output entity IDs.
-    pub fn with_outputs(mut self, outputs: Vec<u64>) -> Self {
-        self.outputs = outputs;
+    /// Append pre-formatted output entity references — counterpart of
+    /// [`with_input_refs`](Self::with_input_refs).
+    pub fn with_output_refs<I, S>(mut self, refs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.outputs.extend(refs.into_iter().map(Into::into));
         self
+    }
+
+    /// Append solid inputs (`solid:<id>`).
+    pub fn with_input_solids<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_SOLID, i.into())))
+    }
+
+    /// Append face inputs (`face:<id>`).
+    pub fn with_input_faces<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_FACE, i.into())))
+    }
+
+    /// Append edge inputs (`edge:<id>`).
+    pub fn with_input_edges<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_EDGE, i.into())))
+    }
+
+    /// Append vertex inputs (`vertex:<id>`).
+    pub fn with_input_vertices<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_VERTEX, i.into())))
+    }
+
+    /// Append loop inputs (`loop:<id>`).
+    pub fn with_input_loops<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_LOOP, i.into())))
+    }
+
+    /// Append curve inputs (`curve:<id>`).
+    pub fn with_input_curves<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_CURVE, i.into())))
+    }
+
+    /// Append datum inputs (`datum:<id>`).
+    pub fn with_input_datums<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_input_refs(ids.into_iter().map(|i| entity_ref(ENTITY_DATUM, i.into())))
+    }
+
+    /// Append solid outputs (`solid:<id>`).
+    pub fn with_output_solids<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_SOLID, i.into())))
+    }
+
+    /// Append face outputs (`face:<id>`).
+    pub fn with_output_faces<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_FACE, i.into())))
+    }
+
+    /// Append edge outputs (`edge:<id>`).
+    pub fn with_output_edges<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_EDGE, i.into())))
+    }
+
+    /// Append vertex outputs (`vertex:<id>`).
+    pub fn with_output_vertices<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_VERTEX, i.into())))
+    }
+
+    /// Append loop outputs (`loop:<id>`).
+    pub fn with_output_loops<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_LOOP, i.into())))
+    }
+
+    /// Append curve outputs (`curve:<id>`).
+    pub fn with_output_curves<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_CURVE, i.into())))
+    }
+
+    /// Append datum outputs (`datum:<id>`).
+    pub fn with_output_datums<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_DATUM, i.into())))
     }
 }
 
@@ -170,11 +347,46 @@ mod tests {
     fn recorded_operation_builder_captures_all_fields() {
         let op = RecordedOperation::new("extrude_face")
             .with_parameters(serde_json::json!({ "distance": 5.0 }))
-            .with_inputs(vec![1, 2])
-            .with_outputs(vec![10, 11, 12]);
+            .with_input_faces([1u64, 2])
+            .with_output_solids([10u64, 11, 12]);
         assert_eq!(op.kind, "extrude_face");
         assert_eq!(op.parameters["distance"], 5.0);
-        assert_eq!(op.inputs, vec![1, 2]);
-        assert_eq!(op.outputs, vec![10, 11, 12]);
+        assert_eq!(op.inputs, vec!["face:1", "face:2"]);
+        assert_eq!(op.outputs, vec!["solid:10", "solid:11", "solid:12"]);
+    }
+
+    #[test]
+    fn entity_ref_uses_canonical_wire_form() {
+        assert_eq!(entity_ref(ENTITY_SOLID, 7), "solid:7");
+        assert_eq!(entity_ref(ENTITY_FACE, 42), "face:42");
+        assert_eq!(entity_ref(ENTITY_EDGE, 0), "edge:0");
+        assert_eq!(entity_ref(ENTITY_VERTEX, u64::MAX), format!("vertex:{}", u64::MAX));
+    }
+
+    #[test]
+    fn mixed_kind_builder_chain_preserves_namespaces() {
+        // Common chamfer / fillet pattern: solid plus edges on the input
+        // side, solid plus new faces on the output side. The lineage graph
+        // must keep all four kinds distinct.
+        let op = RecordedOperation::new("chamfer_edges")
+            .with_input_solids([5u64])
+            .with_input_edges([10u64, 11, 12])
+            .with_output_solids([5u64])
+            .with_output_faces([20u64, 21, 22]);
+        assert_eq!(
+            op.inputs,
+            vec!["solid:5", "edge:10", "edge:11", "edge:12"]
+        );
+        assert_eq!(
+            op.outputs,
+            vec!["solid:5", "face:20", "face:21", "face:22"]
+        );
+    }
+
+    #[test]
+    fn with_input_refs_passes_through_preformatted_strings() {
+        let pre: Vec<String> = vec!["solid:1".into(), "face:2".into()];
+        let op = RecordedOperation::new("custom").with_input_refs(pre.clone());
+        assert_eq!(op.inputs, pre);
     }
 }

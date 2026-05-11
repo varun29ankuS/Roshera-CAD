@@ -104,7 +104,7 @@ fn capture_recorder_observes_primitive_creation_in_order() {
     }
 
     // Outputs must be unique — each creation produced a distinct solid.
-    let outs: Vec<u64> = events.iter().flat_map(|e| e.outputs.clone()).collect();
+    let outs: Vec<String> = events.iter().flat_map(|e| e.outputs.clone()).collect();
     let mut sorted = outs.clone();
     sorted.sort_unstable();
     sorted.dedup();

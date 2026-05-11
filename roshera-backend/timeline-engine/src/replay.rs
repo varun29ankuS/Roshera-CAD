@@ -202,7 +202,7 @@ fn dispatch_generic(
     let recorded_outputs: Vec<u64> = parameters
         .get("outputs")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+        .map(|a| a.iter().filter_map(parse_any_entity_ref).collect())
         .unwrap_or_default();
 
     // Translate a recorded ID into the live-model ID, falling back to
@@ -425,16 +425,15 @@ fn dispatch_generic(
                     reason: "empty inputs[]".to_string(),
                 });
             }
-            let solid_raw = inputs[0]
-                .as_u64()
+            let solid_raw = parse_entity_ref(&inputs[0], "solid")
                 .ok_or_else(|| ReplayError::InvalidParameters {
                     kind: kind.to_string(),
-                    reason: "inputs[0] (solid_id) not u64".to_string(),
+                    reason: "inputs[0] expected `solid:<id>`".to_string(),
                 })?;
             let edge_ids: Vec<EdgeId> = inputs
                 .iter()
                 .skip(1)
-                .filter_map(|v| v.as_u64())
+                .filter_map(|v| parse_entity_ref(v, "edge"))
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
@@ -471,16 +470,15 @@ fn dispatch_generic(
                     reason: "empty inputs[]".to_string(),
                 });
             }
-            let solid_raw = inputs[0]
-                .as_u64()
+            let solid_raw = parse_entity_ref(&inputs[0], "solid")
                 .ok_or_else(|| ReplayError::InvalidParameters {
                     kind: kind.to_string(),
-                    reason: "inputs[0] (solid_id) not u64".to_string(),
+                    reason: "inputs[0] expected `solid:<id>`".to_string(),
                 })?;
             let edge_ids: Vec<EdgeId> = inputs
                 .iter()
                 .skip(1)
-                .filter_map(|v| v.as_u64())
+                .filter_map(|v| parse_entity_ref(v, "edge"))
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
@@ -513,7 +511,7 @@ fn dispatch_generic(
                 .ok_or_else(|| missing_inputs(kind))?;
             let face_ids: Vec<FaceId> = inputs
                 .iter()
-                .filter_map(|v| v.as_u64())
+                .filter_map(|v| parse_entity_ref(v, "face"))
                 .map(|id| remap_id(id, id_remap) as FaceId)
                 .collect();
             let transform = matrix4_field(inner, "transform", kind)?;
@@ -529,7 +527,7 @@ fn dispatch_generic(
                 .ok_or_else(|| missing_inputs(kind))?;
             let edge_ids: Vec<EdgeId> = inputs
                 .iter()
-                .filter_map(|v| v.as_u64())
+                .filter_map(|v| parse_entity_ref(v, "edge"))
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let transform = matrix4_field(inner, "transform", kind)?;
@@ -601,11 +599,14 @@ fn dispatch_generic(
                     ),
                 });
             }
-            let raw_inputs: Vec<u64> = inputs_arr.iter().filter_map(|v| v.as_u64()).collect();
+            let raw_inputs: Vec<u64> = inputs_arr
+                .iter()
+                .filter_map(|v| parse_entity_ref(v, "edge"))
+                .collect();
             if raw_inputs.len() != inputs_arr.len() {
                 return Err(ReplayError::InvalidParameters {
                     kind: kind.to_string(),
-                    reason: "inputs[] contains non-u64 entries".to_string(),
+                    reason: "inputs[] contains non-`edge:<id>` entries".to_string(),
                 });
             }
             let profile: Vec<EdgeId> = raw_inputs[..profile_edge_count]
@@ -660,7 +661,10 @@ fn dispatch_generic(
                 .iter()
                 .filter_map(|v| v.as_u64().map(|n| n as usize))
                 .collect();
-            let raw_inputs: Vec<u64> = inputs_arr.iter().filter_map(|v| v.as_u64()).collect();
+            let raw_inputs: Vec<u64> = inputs_arr
+                .iter()
+                .filter_map(|v| parse_entity_ref(v, "edge"))
+                .collect();
             if raw_inputs.len() != counts.iter().sum::<usize>() {
                 return Err(ReplayError::InvalidParameters {
                     kind: kind.to_string(),
@@ -844,6 +848,42 @@ fn geometry_id_to_u64(id: GeometryId) -> u64 {
         GeometryId::Solid(i) => i as u64,
         GeometryId::Edge(i) => i as u64,
         GeometryId::Vertex(i) => i as u64,
+    }
+}
+
+/// Parse a recorded entity reference (`"<kind>:<id>"` form, as emitted
+/// by `geometry-engine/src/operations/recorder.rs::entity_ref`) and
+/// return the numeric id when the kind matches. Pre-2026-05-10 events
+/// recorded inputs as bare numeric `u64` values; for backward
+/// compatibility we accept those too (the bare form has no kind tag,
+/// so we trust the caller's positional contract).
+///
+/// Returning `None` for a kind mismatch lets call sites use
+/// `filter_map` to drop entries of the wrong kind silently — useful
+/// when `inputs[]` interleaves multiple kinds and only one is wanted
+/// (e.g. fillet recording `[solid, edge, edge, ...]`).
+fn parse_entity_ref(v: &Value, expected_kind: &str) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        let (kind, id) = s.split_once(':')?;
+        if kind != expected_kind {
+            return None;
+        }
+        id.parse::<u64>().ok()
+    } else {
+        v.as_u64()
+    }
+}
+
+/// Extract the numeric id from any recorded entity reference, ignoring
+/// its kind. Used for `recorded_outputs` because `stamp_outputs` keys
+/// the remap by the recorded id only — the kind is fixed by the kernel
+/// call's return type at the matching site.
+fn parse_any_entity_ref(v: &Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        let (_, id) = s.split_once(':')?;
+        id.parse::<u64>().ok()
+    } else {
+        v.as_u64()
     }
 }
 

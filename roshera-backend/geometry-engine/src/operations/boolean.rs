@@ -245,8 +245,8 @@ pub fn boolean_operation(
                 "solid_b": solid_b,
                 "operation": format!("{:?}", operation),
             }))
-            .with_inputs(vec![solid_a as u64, solid_b as u64])
-            .with_outputs(vec![result_solid as u64]),
+            .with_input_solids([solid_a as u64, solid_b as u64])
+            .with_output_solids([result_solid as u64]),
     );
 
     Ok(result_solid)

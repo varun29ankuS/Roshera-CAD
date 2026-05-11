@@ -232,9 +232,6 @@ pub fn imprint_curves_on_face(
     // ------------------------------------------------------------------
     // 8. Record for attached recorders.
     // ------------------------------------------------------------------
-    let mut inputs: Vec<u64> = Vec::with_capacity(1 + curves.len());
-    inputs.push(face_id as u64);
-    inputs.extend(curves.iter().map(|&c| c as u64));
     model.record_operation(
         RecordedOperation::new("imprint_curves_on_face")
             .with_parameters(serde_json::json!({
@@ -243,8 +240,9 @@ pub fn imprint_curves_on_face(
                 "tolerance": tolerance.distance(),
                 "sub_face_count": sub_faces.len(),
             }))
-            .with_inputs(inputs)
-            .with_outputs(sub_faces.iter().map(|&f| f as u64).collect()),
+            .with_input_faces([face_id as u64])
+            .with_input_curves(curves.iter().map(|&c| c as u64))
+            .with_output_faces(sub_faces.iter().map(|&f| f as u64)),
     );
 
     Ok(ImprintResult {

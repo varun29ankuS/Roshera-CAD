@@ -87,8 +87,8 @@ pub fn transform_solid(
                 "transform": transform,
                 "update_parameterization": options.update_parameterization,
             }))
-            .with_inputs(vec![solid_id as u64])
-            .with_outputs(vec![solid as u64]),
+            .with_input_solids([solid_id as u64])
+            .with_output_solids([solid as u64]),
     );
 
     Ok(TransformResult {
@@ -106,7 +106,7 @@ pub fn transform_faces(
 ) -> OperationResult<TransformResult> {
     validate_transform_inputs(model, &transform)?;
 
-    let input_face_ids: Vec<u64> = face_ids.iter().map(|&f| f as u64).collect();
+    let input_face_ids: Vec<u32> = face_ids.clone();
 
     let faces = face_ids.clone();
 
@@ -124,15 +124,15 @@ pub fn transform_faces(
         transform_surfaces(model, &faces, &transform)?;
     }
 
-    let output_face_ids: Vec<u64> = faces.iter().map(|&f| f as u64).collect();
+    let output_face_ids: Vec<u32> = faces.clone();
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("transform_faces")
             .with_parameters(serde_json::json!({
                 "transform": transform,
                 "update_parameterization": options.update_parameterization,
             }))
-            .with_inputs(input_face_ids)
-            .with_outputs(output_face_ids),
+            .with_input_faces(input_face_ids.iter().map(|&f| f as u64))
+            .with_output_faces(output_face_ids.iter().map(|&f| f as u64)),
     );
 
     Ok(TransformResult {
@@ -150,7 +150,7 @@ pub fn transform_edges(
 ) -> OperationResult<TransformResult> {
     validate_transform_inputs(model, &transform)?;
 
-    let input_edge_ids: Vec<u64> = edge_ids.iter().map(|&e| e as u64).collect();
+    let input_edge_ids: Vec<u32> = edge_ids.clone();
 
     let edges = edge_ids.clone();
 
@@ -170,15 +170,15 @@ pub fn transform_edges(
     // Transform curves
     transform_curves(model, &edges, &transform)?;
 
-    let output_edge_ids: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
+    let output_edge_ids: Vec<u32> = edges.clone();
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("transform_edges")
             .with_parameters(serde_json::json!({
                 "transform": transform,
                 "update_parameterization": options.update_parameterization,
             }))
-            .with_inputs(input_edge_ids)
-            .with_outputs(output_edge_ids),
+            .with_input_edges(input_edge_ids.iter().map(|&e| e as u64))
+            .with_output_edges(output_edge_ids.iter().map(|&e| e as u64)),
     );
 
     Ok(TransformResult {

@@ -101,7 +101,7 @@ pub fn chamfer_edges(
     validate_no_shared_corners(model, &edges)?;
 
     // Capture input edges before the Vec is consumed by propagation.
-    let input_edges_for_record: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
+    let input_edges_for_record: Vec<u32> = edges.clone();
 
     // Propagate edge selection if requested
     let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
@@ -139,10 +139,6 @@ pub fn chamfer_edges(
     // primitive that originally produced `solid_id`. The chamfer face
     // ids follow so the lineage graph still records *what* topology
     // the op produced.
-    let mut inputs = input_edges_for_record;
-    inputs.insert(0, solid_id as u64);
-    let mut outputs: Vec<u64> = vec![solid_id as u64];
-    outputs.extend(chamfer_faces.iter().map(|&f| f as u64));
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("chamfer_edges")
             .with_parameters(serde_json::json!({
@@ -154,8 +150,10 @@ pub fn chamfer_edges(
                 "propagation": format!("{:?}", options.propagation),
                 "preserve_edges": options.preserve_edges,
             }))
-            .with_inputs(inputs)
-            .with_outputs(outputs),
+            .with_input_solids([solid_id as u64])
+            .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
+            .with_output_solids([solid_id as u64])
+            .with_output_faces(chamfer_faces.iter().map(|&f| f as u64)),
     );
 
     Ok(chamfer_faces)
