@@ -5019,6 +5019,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             put(sketch::set_sketch_circle_segments),
         )
         .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
+        .route(
+            "/api/sketch/{id}/extrude_cut",
+            post(sketch::extrude_cut_sketch),
+        )
+        .route("/api/sketch/{id}/revolve", post(sketch::revolve_sketch))
         .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
         // Multi-shape control — a sketch session may carry multiple
         // shapes; outer/hole classification is decided geometrically
