@@ -94,6 +94,75 @@ pub(crate) struct BlendEdgeSurgery {
     pub v_t2_end: VertexId,
 }
 
+/// Reject multi-edge blend calls whose input edges share a vertex.
+///
+/// When two blended edges meet at a corner, the corner topology
+/// requires a vertex blend (corner sphere) — Task #82 slice 2 —
+/// which is not yet implemented. Without it, the second edge's
+/// surgery has no well-defined "third face" at the shared corner:
+/// the first surgery already replaced the corner vertex with new
+/// trim vertices and inserted a cap into what used to be `F3`, so
+/// `find_third_face_at_vertex` either picks up the previous blend
+/// face (geometrically wrong) or finds no candidate at all.
+///
+/// Rather than crashing deep in surgery after partial topology
+/// mutation — which would leave the caller with an inconsistent
+/// model and no clear way to recover — we detect the case up front
+/// and reject the entire call atomically. The 3-valent-corner
+/// assumption documented at the top of this module is then
+/// guaranteed at the entry of `splice_blend_edge`.
+///
+/// Returns `Ok(())` when `edges.len() < 2` (single-edge call is
+/// always safe wrt. this contract) or when no pairwise vertex
+/// overlap exists. Errors with `OperationError::NotImplemented`
+/// listing the conflicting edges and shared vertex otherwise so
+/// the caller can route to per-edge calls.
+pub(crate) fn validate_no_shared_corners(
+    model: &BRepModel,
+    edges: &[EdgeId],
+) -> OperationResult<()> {
+    if edges.len() < 2 {
+        return Ok(());
+    }
+    let mut endpoints: Vec<(EdgeId, VertexId, VertexId)> = Vec::with_capacity(edges.len());
+    for &eid in edges {
+        let e = model
+            .edges
+            .get(eid)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {} missing", eid)))?;
+        endpoints.push((eid, e.start_vertex, e.end_vertex));
+    }
+    for i in 0..endpoints.len() {
+        let (ei, ai, bi) = endpoints[i];
+        for j in (i + 1)..endpoints.len() {
+            let (ej, aj, bj) = endpoints[j];
+            // Duplicate input edges are not a corner conflict — they
+            // get collapsed to a single edge by `propagate_edge_selection`
+            // downstream. Skip the pair rather than reject.
+            if ei == ej {
+                continue;
+            }
+            let shared = if ai == aj || ai == bj {
+                Some(ai)
+            } else if bi == aj || bi == bj {
+                Some(bi)
+            } else {
+                None
+            };
+            if let Some(v) = shared {
+                return Err(OperationError::NotImplemented(format!(
+                    "Edges {} and {} share corner vertex {}; filleting/chamfering \
+                     multiple edges that meet at a corner requires a vertex \
+                     (corner-sphere) blend, which is tracked as Task #82. Apply \
+                     each edge in a separate call.",
+                    ei, ej, v
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Splice the four-face neighbourhood of a freshly created blend face
 /// back into a watertight B-Rep.
 ///
