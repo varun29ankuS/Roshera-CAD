@@ -131,20 +131,32 @@ pub fn tessellate_face(
             // through `tessellate_planar_face` is mandatory for
             // watertightness: the planar caps that share the same B-Rep
             // edges sample those edges via `sample_loop_3d_polygon`,
-            // which emits exactly one sample per straight segment.
-            // `tessellate_generic_face`'s UV-grid sampler instead emits
-            // N+1 samples along every boundary parametric direction, so
-            // the side face's interior boundary samples have no twin on
-            // the cap for `weld_mesh_watertight_range` to collapse —
-            // leaving the seam open and visible as a crack on the
-            // rendered solid. Routing planar generics through the
-            // polygon path makes both faces agree at every shared edge.
+            // which emits exactly one sample per straight segment. A
+            // grid sampler instead emits N+1 samples along every
+            // boundary parametric direction, so the side face's
+            // interior boundary samples have no twin on the cap for
+            // `weld_mesh_watertight_range` to collapse — leaving the
+            // seam open and visible as a crack on the rendered solid.
+            // Routing planar generics through the polygon path makes
+            // both faces agree at every shared edge.
+            //
+            // Non-planar generic surfaces (extrude/sweep of a curved
+            // profile, RuledSurface with non-parallel rails, foreign
+            // surface implementations) go through the curvature-adaptive
+            // quadtree — the same path NURBS uses. This replaces the
+            // legacy uniform UV-grid sampler, which had no curvature
+            // awareness and either under-tessellated tight curvature
+            // (visible faceting) or over-tessellated low curvature
+            // (wasted triangles) depending on `max_edge_length`.
             let planar_tolerance =
                 Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
             if surface.is_planar(planar_tolerance) {
                 tessellate_planar_face(face, model, params, mesh);
             } else {
-                tessellate_generic_face(face, model, params, mesh);
+                let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
+                tessellate_curved_adaptive(
+                    surface, face, model, params, mesh, u_min, u_max, v_min, v_max,
+                );
             }
         }
     }
@@ -1572,9 +1584,11 @@ fn tessellate_nurbs_face(
     // Get parameter bounds for the face
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
-    // For NURBS surfaces, we need adaptive tessellation based on curvature
-    // Use a more sophisticated approach than generic grid
-    tessellate_nurbs_adaptive(
+    // For NURBS surfaces, we need adaptive tessellation based on curvature.
+    // The adaptive path is generic over `&dyn Surface` — it's also used
+    // for any other curved generic surface (see the `_ =>` arm in
+    // `tessellate_face`).
+    tessellate_curved_adaptive(
         surface, face, model, params, mesh, u_min, u_max, v_min, v_max,
     );
 }
@@ -1723,203 +1737,6 @@ fn tessellate_fillet_face(
             let v2 = vertex_grid[v_idx + 1][u_idx];
             let v3 = vertex_grid[v_idx + 1][u_idx + 1];
             if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (v0, v1, v2, v3) {
-                if forward {
-                    mesh.add_triangle(v0, v1, v2);
-                    mesh.add_triangle(v1, v3, v2);
-                } else {
-                    mesh.add_triangle(v0, v2, v1);
-                    mesh.add_triangle(v1, v2, v3);
-                }
-            }
-        }
-    }
-}
-
-/// Generic surface tessellation using uniform grid.
-///
-/// Builds the face's boundary polygon in (u, v) parameter space once,
-/// then point-tests every grid cell against that cached polygon. The
-/// previous implementation called `is_point_inside_face` per cell, which
-/// reprojected every loop sample through `surface.closest_point` (an
-/// iterative Newton solve) for every test — O(grid² · samples · Newton)
-/// per face. Caching collapses it to O(grid² + samples · Newton).
-fn tessellate_generic_face(
-    face: &Face,
-    model: &BRepModel,
-    params: &TessellationParams,
-    mesh: &mut TriangleMesh,
-) {
-    let surface = match model.surfaces.get(face.surface_id) {
-        Some(s) => s,
-        None => return,
-    };
-
-    // Get parameter bounds
-    let (_u_range, _v_range) = surface.parameter_bounds();
-    let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
-
-    // Triple-guard subdivision: parameter-derived chord, max_segments cap,
-    // floor for visual smoothness. The previous formula multiplied the
-    // parameter-space ratio by 10, saturating at the clamp ceiling for any
-    // realistic max_edge_length and torching tessellation throughput.
-    let raw_u = ((u_max - u_min) / params.max_edge_length).ceil() as usize + 1;
-    let raw_v = ((v_max - v_min) / params.max_edge_length).ceil() as usize + 1;
-    let u_steps = raw_u.max(3).min(params.max_segments.max(3));
-    let v_steps = raw_v.max(3).min(params.max_segments.max(3));
-
-    // Precompute the outer-loop polygon once and the inner-loop polygons
-    // (holes) once. All subsequent point-in-face tests reuse these.
-    let outer_polygon = match model.loops.get(face.outer_loop) {
-        Some(loop_data) => get_loop_polygon_2d(loop_data, model, surface),
-        None => Vec::new(),
-    };
-    let inner_polygons: Vec<Vec<(f64, f64)>> = face
-        .inner_loops
-        .iter()
-        .filter_map(|&inner_id| {
-            model
-                .loops
-                .get(inner_id)
-                .map(|loop_data| get_loop_polygon_2d(loop_data, model, surface))
-        })
-        .collect();
-
-    // Boundary tolerance, scaled to the polygon's own UV span so it
-    // works for unit-cube RuledSurfaces (span ≈ 1) and large-domain
-    // NURBS alike. `calculate_winding_number` uses atan2 + subtended-
-    // angle accumulation, which cancels to ≈ 0 (not 0.5) at axis-
-    // aligned polygon corners, so a corner sample that lands exactly
-    // on the polygon boundary is otherwise classified as "outside" by
-    // the strict `< 0.5` test. Accepting samples within this tolerance
-    // of any polygon edge bridges the gap without weakening the
-    // interior/exterior decision.
-    let polygon_span = {
-        let mut span = 0.0_f64;
-        if outer_polygon.len() >= 2 {
-            let (mut u_lo, mut u_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            let (mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            for &(uu, vv) in &outer_polygon {
-                u_lo = u_lo.min(uu);
-                u_hi = u_hi.max(uu);
-                v_lo = v_lo.min(vv);
-                v_hi = v_hi.max(vv);
-            }
-            span = (u_hi - u_lo).max(v_hi - v_lo);
-        }
-        if span > 0.0 {
-            span
-        } else {
-            1.0
-        }
-    };
-    let boundary_tol = polygon_span * 1e-9;
-    let boundary_tol_sq = boundary_tol * boundary_tol;
-
-    // Squared distance from a 2D point to the closed polyline of
-    // `polygon`. Used to detect samples that land on the polygon
-    // boundary (where atan2 winding is unreliable).
-    let point_to_polygon_distance_sq = |p: (f64, f64), polygon: &[(f64, f64)]| -> f64 {
-        let n = polygon.len();
-        if n < 2 {
-            return f64::INFINITY;
-        }
-        let mut best = f64::INFINITY;
-        for i in 0..n {
-            let a = polygon[i];
-            let b = polygon[(i + 1) % n];
-            let dx = b.0 - a.0;
-            let dy = b.1 - a.1;
-            let len_sq = dx * dx + dy * dy;
-            let (cx, cy) = if len_sq <= 0.0 {
-                a
-            } else {
-                let t = ((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq;
-                let tc = t.max(0.0).min(1.0);
-                (a.0 + tc * dx, a.1 + tc * dy)
-            };
-            let ex = p.0 - cx;
-            let ey = p.1 - cy;
-            let d2 = ex * ex + ey * ey;
-            if d2 < best {
-                best = d2;
-            }
-        }
-        best
-    };
-
-    let inside_face = |u: f64, v: f64| -> bool {
-        if outer_polygon.len() < 3 {
-            // Surface has no usable boundary; accept the whole grid so we
-            // still emit triangles rather than silently dropping the face.
-            return true;
-        }
-        let p = (u, v);
-        // Boundary acceptance: a sample within `boundary_tol` of the
-        // outer polygon's edges is on the face boundary and must be
-        // emitted, regardless of how atan2 cancellation rules its
-        // winding number.
-        let on_outer_boundary = point_to_polygon_distance_sq(p, &outer_polygon) <= boundary_tol_sq;
-        if !on_outer_boundary && calculate_winding_number(&p, &outer_polygon).abs() < 0.5 {
-            return false;
-        }
-        for hole in &inner_polygons {
-            if hole.len() < 3 {
-                continue;
-            }
-            // A sample on a hole boundary IS on the face boundary,
-            // accept it. Strict-interior of a hole (winding > 0.5 and
-            // not on hole boundary) is rejected.
-            if point_to_polygon_distance_sq(p, hole) <= boundary_tol_sq {
-                continue;
-            }
-            if calculate_winding_number(&p, hole).abs() > 0.5 {
-                return false;
-            }
-        }
-        true
-    };
-
-    // Generate vertices
-    let mut vertex_grid = Vec::new();
-    for v_idx in 0..=v_steps {
-        let v = v_min + (v_idx as f64) * (v_max - v_min) / (v_steps as f64);
-        let mut row = Vec::new();
-
-        for u_idx in 0..=u_steps {
-            let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
-
-            if inside_face(u, v) {
-                if let (Ok(point), Ok(normal)) = (
-                    surface.point_at(u, v),
-                    face.normal_at(u, v, &model.surfaces),
-                ) {
-                    let index = mesh.add_vertex(MeshVertex {
-                        position: point,
-                        normal,
-                        uv: None,
-                    });
-                    row.push(Some(index));
-                } else {
-                    row.push(None);
-                }
-            } else {
-                row.push(None);
-            }
-        }
-        vertex_grid.push(row);
-    }
-
-    // Generate triangles. Winding follows `face.orientation`
-    // (see cylindrical path for rationale).
-    let forward = face.orientation.is_forward();
-    for v_idx in 0..v_steps {
-        for u_idx in 0..u_steps {
-            if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (
-                vertex_grid[v_idx].get(u_idx).and_then(|&v| v),
-                vertex_grid[v_idx].get(u_idx + 1).and_then(|&v| v),
-                vertex_grid[v_idx + 1].get(u_idx).and_then(|&v| v),
-                vertex_grid[v_idx + 1].get(u_idx + 1).and_then(|&v| v),
-            ) {
                 if forward {
                     mesh.add_triangle(v0, v1, v2);
                     mesh.add_triangle(v1, v3, v2);
@@ -2376,7 +2193,25 @@ pub fn tessellate_surface(
 }
 
 /// Adaptive NURBS tessellation with curvature-based refinement
-fn tessellate_nurbs_adaptive(
+/// Adaptive curvature-driven tessellation for any curved surface
+/// (NURBS, RuledSurface with non-linear profile, generic
+/// non-planar `&dyn Surface` implementations).
+///
+/// Initialises a UV quadtree over the face's parametric bounds and
+/// recursively subdivides whenever the chord-height, normal-deviation,
+/// or edge-length guards are violated (see `should_subdivide_curved`).
+/// Leaf quads are stamped into the mesh; samples outside the face's
+/// trim loops are skipped via `is_point_inside_face`.
+///
+/// **Watertightness**: relies on `weld_mesh_watertight_range` at the
+/// shell level to collapse coincident vertices. Adjacent faces sharing
+/// a B-Rep edge will produce 3D-coincident corner samples whenever the
+/// edge endpoint parameters align, which holds for the common case of
+/// untrimmed parametric boundaries. T-junctions between adjacent leaves
+/// at different subdivision levels are not currently healed; the welder
+/// tolerates them within `weld_tolerance` but they remain a known
+/// limitation of the adaptive path.
+fn tessellate_curved_adaptive(
     surface: &dyn Surface,
     face: &Face,
     model: &BRepModel,
@@ -2391,7 +2226,7 @@ fn tessellate_nurbs_adaptive(
     let mut quad_tree = QuadTree::new(u_min, u_max, v_min, v_max);
 
     // Perform adaptive subdivision
-    subdivide_nurbs_quad(
+    subdivide_curved_quad(
         &mut quad_tree,
         surface,
         face,
@@ -2471,7 +2306,7 @@ impl QuadTree {
 }
 
 /// Recursive subdivision based on curvature
-fn subdivide_nurbs_quad(
+fn subdivide_curved_quad(
     quad_tree: &mut QuadTree,
     surface: &dyn Surface,
     face: &Face,
@@ -2487,7 +2322,7 @@ fn subdivide_nurbs_quad(
 
     // Check if we should subdivide based on curvature
     if depth >= MAX_DEPTH
-        || !should_subdivide_nurbs(surface, face, model, params, u_min, u_max, v_min, v_max)
+        || !should_subdivide_curved(surface, face, model, params, u_min, u_max, v_min, v_max)
     {
         return;
     }
@@ -2502,7 +2337,7 @@ fn subdivide_nurbs_quad(
     let u_mid = (u_min + u_max) / 2.0;
     let v_mid = (v_min + v_max) / 2.0;
 
-    subdivide_nurbs_quad(
+    subdivide_curved_quad(
         quad_tree,
         surface,
         face,
@@ -2514,7 +2349,7 @@ fn subdivide_nurbs_quad(
         v_mid,
         depth + 1,
     );
-    subdivide_nurbs_quad(
+    subdivide_curved_quad(
         quad_tree,
         surface,
         face,
@@ -2526,7 +2361,7 @@ fn subdivide_nurbs_quad(
         v_mid,
         depth + 1,
     );
-    subdivide_nurbs_quad(
+    subdivide_curved_quad(
         quad_tree,
         surface,
         face,
@@ -2538,7 +2373,7 @@ fn subdivide_nurbs_quad(
         v_max,
         depth + 1,
     );
-    subdivide_nurbs_quad(
+    subdivide_curved_quad(
         quad_tree,
         surface,
         face,
@@ -2553,7 +2388,7 @@ fn subdivide_nurbs_quad(
 }
 
 /// Check if a quad should be subdivided based on curvature
-fn should_subdivide_nurbs(
+fn should_subdivide_curved(
     surface: &dyn Surface,
     face: &Face,
     model: &BRepModel,
