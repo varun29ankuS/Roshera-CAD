@@ -187,6 +187,14 @@ pub enum SketchSolveError {
         entity: EntityRef,
         target_kind: &'static str,
     },
+    /// The dragged entity is pinned by its own `is_fixed` flag.
+    /// Dragging a locked point is a user error: the soft X/Y pull
+    /// would fight the fixed flag and produce a misleading
+    /// over-constrained verdict. Refusing up-front keeps the UI
+    /// honest — modern parametric sketchers (Fusion / Onshape /
+    /// SolidWorks) all treat a locked sketch entity as undraggable.
+    #[error("drag entity {entity:?} is locked (is_fixed = true); unlock it before dragging")]
+    DragEntityFixed { entity: EntityRef },
 }
 
 /// Snapshot of one solve invocation.
@@ -347,19 +355,28 @@ pub struct DofReport {
     /// Entities listed in `entities_skipped` contribute 0 (slice
     /// B-1 limitation).
     pub total_free_dofs: usize,
-    /// Sum of `degrees_of_freedom_removed()` across every active
-    /// constraint in the sketch. Constraints attached to a skipped
-    /// entity still count — they have a real DOF cost even though
-    /// their residual isn't currently evaluated by the solver.
+    /// Sum of `degrees_of_freedom_removed()` across constraints
+    /// whose entire entity set is supported in slice B-2 (points,
+    /// lines, circles). Constraints that reference any unsupported
+    /// entity are excluded from this tally — counting them while
+    /// excluding the unsupported entity's own free DOFs would
+    /// produce a phantom over-constrained verdict. See
+    /// `constraints_skipped` for the count of such constraints.
     pub constraint_dofs_removed: usize,
-    /// Derived verdict.
+    /// Derived verdict over the supported subset.
     pub status: DofStatus,
     /// Count of entities the analysis registered (points + lines +
     /// circles, fixed or free).
     pub entities_analysed: usize,
-    /// Count of constraints inspected.
+    /// Count of constraints that contributed to `constraint_dofs_removed`.
     pub constraints_analysed: usize,
-    /// Entities that cannot contribute DOFs in slice B-1 — same
+    /// Count of constraints excluded from the DOF accounting because
+    /// at least one referenced entity is in `entities_skipped`.
+    /// Non-zero values tell the UI the verdict is over a partial
+    /// view of the sketch — slice C lifts this by adding solver
+    /// support for arcs / splines / rectangles.
+    pub constraints_skipped: usize,
+    /// Entities that cannot contribute DOFs in slice B-2 — same
     /// list semantics as [`SketchSolveReport::entities_skipped`].
     pub entities_skipped: Vec<SkippedEntity>,
 }
@@ -376,6 +393,13 @@ impl DofReport {
     /// Convenience: is the sketch structurally over-constrained?
     pub fn is_over_constrained(&self) -> bool {
         matches!(self.status, DofStatus::OverConstrained { .. })
+    }
+    /// True when the DOF verdict is computed over a partial view of
+    /// the sketch (one or more constraints excluded because they
+    /// touch a kind unsupported by slice B-2). UIs should show a
+    /// "partial DOF accounting" hint when this is true.
+    pub fn has_skipped_constraints(&self) -> bool {
+        self.constraints_skipped > 0
     }
     /// Remaining DOFs when under-constrained; `None` otherwise.
     pub fn remaining_dofs(&self) -> Option<usize> {
@@ -498,11 +522,25 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     }
 
     let entities_skipped = collect_unsupported(sketch);
+    // HashSet for O(1) membership checks while iterating constraints.
+    let skipped_set: std::collections::HashSet<EntityRef> =
+        entities_skipped.iter().copied().collect();
 
-    let constraints = sketch.all_constraints();
-    let constraints_analysed = constraints.len();
-    let constraint_dofs_removed: usize =
-        constraints.iter().map(|c| c.degrees_of_freedom_removed()).sum();
+    let mut constraint_dofs_removed: usize = 0;
+    let mut constraints_analysed: usize = 0;
+    let mut constraints_skipped: usize = 0;
+    for c in sketch.all_constraints().iter() {
+        if c.entities.iter().any(|e| skipped_set.contains(e)) {
+            // Constraint references at least one kind we can't yet
+            // analyse — excluding it keeps the DOF arithmetic
+            // mathematically honest (we'd otherwise subtract DOFs
+            // from a system whose other side contributed 0).
+            constraints_skipped += 1;
+            continue;
+        }
+        constraint_dofs_removed += c.degrees_of_freedom_removed();
+        constraints_analysed += 1;
+    }
 
     let status = match constraint_dofs_removed.cmp(&total_free_dofs) {
         Ordering::Equal => DofStatus::FullyConstrained,
@@ -520,6 +558,7 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         status,
         entities_analysed,
         constraints_analysed,
+        constraints_skipped,
         entities_skipped,
     }
 }
@@ -578,9 +617,16 @@ fn build_drag_constraints(
 
     match (dragged, target) {
         (EntityRef::Point(point_id), DragTarget::Point(target_pos)) => {
-            if !sketch.points().contains_key(&point_id) {
-                return Err(SketchSolveError::DragEntityNotFound { entity: dragged });
+            let entry = sketch
+                .points()
+                .get(&point_id)
+                .ok_or(SketchSolveError::DragEntityNotFound { entity: dragged })?;
+            if entry.value().is_fixed {
+                return Err(SketchSolveError::DragEntityFixed { entity: dragged });
             }
+            // Drop the DashMap read guard before constructing the
+            // returned vector so we don't hold it across the alloc.
+            drop(entry);
             let x_constraint = Constraint::new_dimensional(
                 DimensionalConstraint::XCoordinate(target_pos.x),
                 vec![EntityRef::Point(point_id)],
@@ -1458,5 +1504,89 @@ mod tests {
         // entities_skipped so the UI can surface the gap.
         assert_eq!(report.total_free_dofs, 0);
         assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
+        // Empty constraint list → no skipped constraints.
+        assert_eq!(report.constraints_skipped, 0);
+        assert!(!report.has_skipped_constraints());
+    }
+
+    #[test]
+    fn analyze_dofs_excludes_constraints_touching_unsupported_entities() {
+        // 1 point (2 free DOFs) + 1 rectangle (skipped) +
+        // Coincident(Point, RectangleVertex via EntityRef::Rectangle).
+        // Without filtering, we'd count 2 DOFs removed and report
+        // FullyConstrained — a lie, because the constraint can't
+        // be evaluated. With filtering: 2 free, 0 removed →
+        // UnderConstrained, plus constraints_skipped = 1.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        let rect = sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
+            .expect("rect");
+        sketch.add_constraint(Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![EntityRef::Point(p), EntityRef::Rectangle(rect)],
+            ConstraintPriority::High,
+        ));
+
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 2);
+        assert_eq!(
+            report.constraint_dofs_removed, 0,
+            "constraint must be skipped because rectangle is unsupported"
+        );
+        assert_eq!(report.constraints_analysed, 0);
+        assert_eq!(report.constraints_skipped, 1);
+        assert!(report.has_skipped_constraints());
+        assert!(report.is_under_constrained());
+        assert_eq!(report.remaining_dofs(), Some(2));
+    }
+
+    // ── B-2 hardening: dragging a fixed point is rejected ──────────
+
+    #[test]
+    fn drag_rejects_fixed_point_up_front() {
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        if let Some(mut e) = sketch.points().get_mut(&p) {
+            e.value_mut().fix();
+        } else {
+            panic!("p missing");
+        }
+        let err = solve_drag(
+            &sketch,
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(1.0, 1.0)),
+        )
+        .expect_err("dragging a fixed point must be rejected");
+        match err {
+            SketchSolveError::DragEntityFixed { entity } => {
+                assert_eq!(entity, EntityRef::Point(p));
+            }
+            other => panic!("expected DragEntityFixed, got {:?}", other),
+        }
+        // Position must not have moved (drag rejected before solve).
+        let pos = sketch.points().get(&p).expect("p").value().position;
+        assert_eq!(pos.x, 0.0);
+        assert_eq!(pos.y, 0.0);
+    }
+
+    #[test]
+    fn drag_preserves_entity_id_across_call() {
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        let _ = solve_drag(
+            &sketch,
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(5.0, 5.0)),
+        )
+        .expect("drag");
+        // Identity preservation: the id we started with still
+        // resolves after the drag. Matches the body-modify
+        // architecture (chamfer/fillet/mirror/shell/extrude_face
+        // also emit ObjectUpdated rather than delete+create).
+        assert!(
+            sketch.points().contains_key(&p),
+            "drag must preserve entity id"
+        );
     }
 }
