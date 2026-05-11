@@ -16,7 +16,7 @@ import { ViewportContextMenu } from './ViewportContextMenu'
 import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { SketchOverlay } from './SketchOverlay'
 import { SketchPanel } from '@/components/panels/SketchPanel'
-import { useSceneStore } from '@/stores/scene-store'
+import { isStandardPlane, useSceneStore, type SketchPlane } from '@/stores/scene-store'
 import type * as THREE from 'three'
 
 export function CADViewport() {
@@ -100,6 +100,7 @@ export function CADViewport() {
       <ViewportFrame />
       <ViewportControls />
       <ViewportReadout />
+      <SketchCoordReadout />
       <ViewportHints />
       <ModeBanner />
       <SectionViewPanel />
@@ -108,6 +109,113 @@ export function CADViewport() {
       <SketchPanel />
     </div>
   )
+}
+
+/**
+ * Live cursor coordinates while in 2D sketch mode. Mounts only when
+ * `sketch.active` is true; hidden otherwise so the viewport stays
+ * clean for 3D work.
+ *
+ * Shows two readouts:
+ *   * Plane-local (U, V) — what the kernel actually stores. This is
+ *     the coordinate space the user is drawing in.
+ *   * World (X, Y, Z) — the lifted position. Useful for cross-
+ *     referencing with the 3D origin / grid.
+ *
+ * (U, V) and (X, Y, Z) are derived from the same `sketch.hover`
+ * field that the SketchOverlay maintains on every pointer-move; this
+ * component only reads, never updates. When the pointer leaves the
+ * capture plane `sketch.hover` becomes `null` and the values blank
+ * out to dashes instead of stale numbers.
+ *
+ * The world-space computation mirrors `SketchOverlay.uvToWorld`
+ * exactly (`origin + u·u_axis + v·v_axis` for custom planes,
+ * standard-plane lift otherwise) so the displayed XYZ agrees with
+ * the position the backend will record.
+ */
+function SketchCoordReadout() {
+  const active = useSceneStore((s) => s.sketch.active)
+  const plane = useSceneStore((s) => s.sketch.plane)
+  const hover = useSceneStore((s) => s.sketch.hover)
+
+  if (!active) return null
+
+  const planeLabel = isStandardPlane(plane) ? plane.toUpperCase() : 'FACE'
+
+  const fmt = (n: number) => {
+    // Three decimals matches the dimension annotations rendered by
+    // SketchOverlay's `<Html>` labels. Pad to a fixed width so the
+    // readout doesn't jitter as the cursor crosses zero.
+    const s = n.toFixed(3)
+    return s.startsWith('-') ? s : ` ${s}`
+  }
+
+  const worldXYZ = hover ? sketchUvToWorldXYZ(hover, plane) : null
+
+  return (
+    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[180px]">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">Plane</span>
+        <span className="text-foreground">{planeLabel}</span>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">U</span>
+        <span className="text-foreground tabular-nums font-mono">
+          {hover ? fmt(hover[0]) : '   ---'}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">V</span>
+        <span className="text-foreground tabular-nums font-mono">
+          {hover ? fmt(hover[1]) : '   ---'}
+        </span>
+      </div>
+      <div className="mt-1 pt-1 border-t border-border/40">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground/70">X</span>
+          <span className="text-muted-foreground tabular-nums font-mono">
+            {worldXYZ ? fmt(worldXYZ[0]) : '   ---'}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground/70">Y</span>
+          <span className="text-muted-foreground tabular-nums font-mono">
+            {worldXYZ ? fmt(worldXYZ[1]) : '   ---'}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground/70">Z</span>
+          <span className="text-muted-foreground tabular-nums font-mono">
+            {worldXYZ ? fmt(worldXYZ[2]) : '   ---'}
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Lift plane-local (u, v) to world (x, y, z). Mirrors
+ * `SketchOverlay.uvToWorld` byte-for-byte; duplicated here to avoid
+ * pulling the entire R3F-side module into the HUD layer.
+ */
+function sketchUvToWorldXYZ(
+  uv: [number, number],
+  plane: SketchPlane,
+): [number, number, number] {
+  const [u, v] = uv
+  if (isStandardPlane(plane)) {
+    switch (plane) {
+      case 'xy': return [u, v, 0]
+      case 'xz': return [u, 0, v]
+      case 'yz': return [0, u, v]
+    }
+  }
+  return [
+    plane.origin[0] + plane.u_axis[0] * u + plane.v_axis[0] * v,
+    plane.origin[1] + plane.u_axis[1] * u + plane.v_axis[1] * v,
+    plane.origin[2] + plane.u_axis[2] * u + plane.v_axis[2] * v,
+  ]
 }
 
 /**
