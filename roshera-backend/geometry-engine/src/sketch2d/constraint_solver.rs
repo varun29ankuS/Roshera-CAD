@@ -18,7 +18,7 @@
 //! nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::constraints::EntityRef;
+use super::constraints::{ConstraintPriority, EntityRef};
 use super::{
     Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
     Vector2d,
@@ -176,20 +176,30 @@ impl ConstraintSolver {
         }
     }
 
-    /// Solve the constraint system
+    /// Solve the constraint system.
+    ///
+    /// Strategy: capture the DOF verdict from `check_constraint_count`
+    /// but do **not** early-bail on over/under-constrained systems —
+    /// Newton-Raphson still runs and `solve_linear_system` uses
+    /// Tikhonov regularisation (J^T·J + λI) so a rank-deficient
+    /// Jacobian still produces a well-defined minimum-norm step.
+    /// This lets us drive a free point onto e.g. its required
+    /// distance circle even when the system has a remaining rotational
+    /// DOF, while still surfacing the DOF verdict to the caller.
+    ///
+    /// Final status precedence:
+    /// 1. `Unstable` if linear solve never produced a step.
+    /// 2. The captured DOF verdict (`OverConstrained` /
+    ///    `UnderConstrained`) when present — even if Newton-Raphson
+    ///    drove the residual under the tolerance, the system is still
+    ///    structurally degenerate and the UI needs to know.
+    /// 3. `Converged` / `NotConverged` otherwise.
     pub fn solve(&mut self) -> SolverResult {
         let start_time = std::time::Instant::now();
 
-        // Check for under/over-constrained system
-        let constraint_check = self.check_constraint_count();
-        if let Some(status) = constraint_check {
-            return SolverResult {
-                status,
-                entity_updates: HashMap::new(),
-                violations: self.get_violations(),
-                solve_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-            };
-        }
+        // Capture but do not act on the DOF verdict — it is folded
+        // into the final status after Newton-Raphson runs.
+        let dof_verdict = self.check_constraint_count();
 
         // Sort constraints by priority
         self.constraints.sort_by_key(|c| c.priority);
@@ -197,6 +207,7 @@ impl ConstraintSolver {
         // Newton-Raphson iteration
         let mut iteration = 0;
         let mut error = f64::INFINITY;
+        let mut linear_solve_failed = false;
 
         while iteration < self.max_iterations && error > self.tolerance {
             // Compute constraint errors
@@ -210,6 +221,12 @@ impl ConstraintSolver {
             // Compute Jacobian matrix
             let jacobian = self.compute_jacobian();
 
+            // Empty Jacobian (no free parameters or no constraint
+            // equations) — nothing to update; exit cleanly.
+            if jacobian.is_empty() || jacobian[0].is_empty() {
+                break;
+            }
+
             // Solve linear system: J * dx = -errors
             match self.solve_linear_system(&jacobian, &errors) {
                 Ok(delta) => {
@@ -217,20 +234,20 @@ impl ConstraintSolver {
                     self.apply_updates(&delta, self.damping_factor);
                 }
                 Err(_) => {
-                    return SolverResult {
-                        status: SolverStatus::Unstable,
-                        entity_updates: self.get_entity_updates(),
-                        violations: self.get_violations(),
-                        solve_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-                    };
+                    linear_solve_failed = true;
+                    break;
                 }
             }
 
             iteration += 1;
         }
 
-        // Determine final status
-        let status = if error < self.tolerance {
+        // Determine final status with the precedence documented above.
+        let status = if linear_solve_failed {
+            SolverStatus::Unstable
+        } else if let Some(verdict) = dof_verdict {
+            verdict
+        } else if error < self.tolerance {
             SolverStatus::Converged {
                 iterations: iteration,
                 final_error: error,
@@ -291,12 +308,38 @@ impl ConstraintSolver {
             .sum()
     }
 
-    /// Compute constraint errors
+    /// Compute constraint errors (unweighted).
+    ///
+    /// The Newton-Raphson convergence check operates on these raw
+    /// residuals — applying priority weights here would let the
+    /// loop exit while the true geometric residual is still above
+    /// tolerance, just because a low-priority constraint scaled the
+    /// residual norm down. Priority weighting is applied inside
+    /// [`solve_linear_system`] where it belongs (weighted least
+    /// squares is a property of the linear solve, not of the
+    /// residual measurement).
     fn compute_constraint_errors(&self) -> Vec<f64> {
         self.constraints
             .iter()
             .flat_map(|constraint| self.evaluate_constraint_error(constraint))
             .collect()
+    }
+
+    /// Per-residual priority weight vector, in the same row order as
+    /// [`compute_constraint_errors`] / [`compute_jacobian`]. Each
+    /// constraint contributes `constraint_error_count(c)` consecutive
+    /// entries, all set to `priority_weight(c.priority)`. Used by
+    /// [`solve_linear_system`] to assemble a weighted normal-equation
+    /// matrix.
+    fn priority_weights(&self) -> Vec<f64> {
+        let mut weights = Vec::new();
+        for c in &self.constraints {
+            let w = priority_weight(c.priority);
+            for _ in 0..self.constraint_error_count(c) {
+                weights.push(w);
+            }
+        }
+        weights
     }
 
     /// Evaluate error for a single constraint
@@ -662,7 +705,17 @@ impl ConstraintSolver {
         }
     }
 
-    /// Solve linear system using LU decomposition
+    /// Solve the normal-equations linear system used by Newton-Raphson:
+    /// `(J^T·J) · dx = -J^T · errors`. When `J^T·J` is singular —
+    /// which happens whenever the Jacobian is rank-deficient
+    /// (under-constrained systems, redundant constraints, parallel
+    /// constraint gradients) — Gaussian elimination fails. We then
+    /// fall back to **Tikhonov regularisation**: add `λI` to the
+    /// diagonal and re-solve. This gives the minimum-norm
+    /// least-squares step, which is exactly the right behaviour for
+    /// under-constrained sketches (the solver advances the
+    /// parameters by the smallest amount that satisfies the active
+    /// constraints, leaving the residual DOFs untouched).
     fn solve_linear_system(&self, jacobian: &[Vec<f64>], errors: &[f64]) -> Result<Vec<f64>, ()> {
         let n = jacobian[0].len();
         let m = jacobian.len();
@@ -671,28 +724,65 @@ impl ConstraintSolver {
             return Ok(vec![0.0; n]);
         }
 
-        // Use least squares for over-determined systems
-        // J^T * J * x = J^T * (-errors)
+        // Apply priority weights at the linear-solve layer: each
+        // row k of J and each entry k of errors carries a weight
+        // w_k = priority_weight(constraint_k.priority). The
+        // weighted normal equations are
+        //     (W·J)^T · (W·J) · dx = -(W·J)^T · (W·errors)
+        //   = (J^T · W² · J) · dx = -J^T · W² · errors
+        // so the entries of `J^T·J` and `J^T·errors` accumulate
+        // with a `w² = w_k * w_k` factor. The convergence loop sees
+        // unweighted residuals; weighting only biases the Newton
+        // *step direction* toward satisfying higher-priority
+        // constraints first.
+        let weights = self.priority_weights();
+        // Defensive: if priority_weights() yields fewer entries
+        // than rows (should not happen — it iterates the same
+        // constraints) fall back to a weight of 1.0 so we still
+        // produce a meaningful step instead of indexing out of
+        // bounds.
+        let w_at = |k: usize| weights.get(k).copied().unwrap_or(1.0);
 
-        // Compute J^T * J
+        // Compute J^T * W² * J
         let mut jtj = vec![vec![0.0; n]; n];
         for i in 0..n {
             for j in 0..n {
                 for k in 0..m {
-                    jtj[i][j] += jacobian[k][i] * jacobian[k][j];
+                    let w2 = w_at(k) * w_at(k);
+                    jtj[i][j] += w2 * jacobian[k][i] * jacobian[k][j];
                 }
             }
         }
 
-        // Compute J^T * (-errors)
+        // Compute -J^T * W² * errors
         let mut jte = vec![0.0; n];
         for i in 0..n {
             for j in 0..m {
-                jte[i] -= jacobian[j][i] * errors[j];
+                let w2 = w_at(j) * w_at(j);
+                jte[i] -= w2 * jacobian[j][i] * errors[j];
             }
         }
 
-        // Solve using Gaussian elimination
+        // First attempt: plain Gaussian elimination on J^T·J.
+        // For well- and over-determined systems this is numerically
+        // ideal — λ would only introduce shrinkage bias.
+        if let Ok(x) = self.gaussian_elimination(jtj.clone(), jte.clone()) {
+            return Ok(x);
+        }
+
+        // Fallback: Tikhonov-regularised solve.
+        // λ is scaled by the trace of J^T·J so it adapts to the
+        // problem magnitude — a constant λ would over-regularise
+        // small-residual systems and under-regularise large ones.
+        let trace: f64 = (0..n).map(|i| jtj[i][i]).sum();
+        let lambda = if trace > 0.0 {
+            (trace / n as f64) * 1e-8
+        } else {
+            STRICT_TOLERANCE.distance()
+        };
+        for i in 0..n {
+            jtj[i][i] += lambda;
+        }
         self.gaussian_elimination(jtj, jte)
     }
 
@@ -1159,6 +1249,29 @@ impl ConstraintSolver {
     /// kinds currently return `None` from both methods.
     fn get_curve_curvature_at_start(&self, entity: &EntityRef) -> Option<f64> {
         self.get_curve_curvature_at_end(entity)
+    }
+}
+
+/// Map a `ConstraintPriority` to a numerical weight applied to its
+/// row(s) in the Jacobian and corresponding residual entries.
+///
+/// The ratios are chosen so the weighted least-squares objective
+/// respects the documented semantics:
+/// - `Required` and `High` carry full weight — they are the
+///   sketch's actual rigid constraints and must be solved exactly
+///   when feasible.
+/// - `Medium` and `Low` are best-effort. They participate in the
+///   Newton step but are dominated when they conflict with a
+///   higher-priority constraint. This is how a "soft" drag target
+///   stays subordinate to the persistent constraints already on the
+///   sketch — pulling the dragged point toward the cursor only as
+///   far as the rigid constraint manifold allows.
+fn priority_weight(p: ConstraintPriority) -> f64 {
+    match p {
+        ConstraintPriority::Required => 1.0,
+        ConstraintPriority::High => 1.0,
+        ConstraintPriority::Medium => 1e-2,
+        ConstraintPriority::Low => 1e-3,
     }
 }
 
@@ -2066,12 +2179,25 @@ mod tests {
 
     #[test]
     fn linear_solver_least_squares_underdetermined() {
-        // 1 equation, 2 unknowns: J = [[1, 1]], errors = [2]
-        // J^T J = [[1,1],[1,1]] is singular → solve_linear_system returns Err.
+        // 1 equation, 2 unknowns: J = [[1, 1]], errors = [2].
+        // `J^T·J = [[1,1],[1,1]]` is singular, so plain Gaussian
+        // elimination cannot solve it — but the linear solver now
+        // falls back to Tikhonov regularisation `(J^T·J + λI)·dx
+        // = -J^T·r`, which produces the well-defined minimum-norm
+        // solution `dx = (-1, -1)`. This is exactly the desired
+        // behaviour for under-constrained sketch updates: advance
+        // the parameters by the smallest move that satisfies the
+        // active constraint.
         let s = ConstraintSolver::new();
         let j = vec![vec![1.0, 1.0]];
         let errs = vec![2.0];
-        assert!(s.solve_linear_system(&j, &errs).is_err());
+        let dx = s
+            .solve_linear_system(&j, &errs)
+            .expect("Tikhonov fallback solves singular normal equations");
+        // λ is small (trace-scaled, 1e-8 here), so the minimum-norm
+        // solution is reproduced to ~1e-8 absolute.
+        assert!((dx[0] - (-1.0)).abs() < 1e-7, "dx[0] = {}", dx[0]);
+        assert!((dx[1] - (-1.0)).abs() < 1e-7, "dx[1] = {}", dx[1]);
     }
 
     // ────────────────── G. apply_updates / damping ────────────────────

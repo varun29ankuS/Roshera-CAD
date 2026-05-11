@@ -467,16 +467,19 @@ pub fn solve_with_options(
 /// (1e-6 tolerance, 30 iterations, 0.8 damping). Use
 /// [`solve_drag_with_options`] to override.
 ///
-/// The drag is implemented as least-squares: a temporary
-/// `Required`-priority `XCoordinate(target.x)` and
-/// `YCoordinate(target.y)` pair is added to the constraint set for
-/// this solve invocation only — they are not persisted into the
-/// sketch's `ConstraintStore`. If the target is reachable, the
-/// dragged point lands on it; if not (e.g. the point is constrained
-/// to a fixed circle and the cursor is off the circle), Newton-
-/// Raphson finds the residual minimum, which is the closest
-/// reachable point. This matches the drag behaviour every modern
-/// parametric sketcher implements.
+/// The drag is implemented as weighted least-squares: a temporary
+/// `Low`-priority `XCoordinate(target.x)` and `YCoordinate(target.y)`
+/// pair is added to the constraint set for this solve invocation
+/// only — they are not persisted into the sketch's
+/// `ConstraintStore`. Because they are `Low` priority, the solver's
+/// priority weighting subordinates them to any pre-existing
+/// `Required`/`High` constraint: if the cursor target is reachable
+/// the dragged point lands on it, but if not (e.g. the point is
+/// constrained to a fixed circle and the cursor is off the circle),
+/// Newton-Raphson honours the rigid constraint exactly and lands on
+/// the closest reachable point in the direction of the drag. This
+/// matches the drag behaviour every modern parametric sketcher
+/// implements.
 ///
 /// Returns the standard [`SketchSolveReport`]; the achieved
 /// position is read from the sketch's entity store after the call.
@@ -644,15 +647,24 @@ fn build_drag_constraints(
             // Drop the DashMap read guard before constructing the
             // returned vector so we don't hold it across the alloc.
             drop(entry);
+            // Synthesised drag constraints are intentionally `Low`
+            // priority — soft pulls, not rigid pins. The constraint
+            // solver's priority-weighted least-squares treats them
+            // as dominated by any `Required`/`High` constraint the
+            // sketch already carries, so a drag toward an
+            // unreachable cursor lands on the closest reachable
+            // point (e.g. the intersection of the drag direction
+            // with a distance circle). This matches Fusion /
+            // SolveSpace drag semantics.
             let x_constraint = Constraint::new_dimensional(
                 DimensionalConstraint::XCoordinate(target_pos.x),
                 vec![EntityRef::Point(point_id)],
-                ConstraintPriority::Required,
+                ConstraintPriority::Low,
             );
             let y_constraint = Constraint::new_dimensional(
                 DimensionalConstraint::YCoordinate(target_pos.y),
                 vec![EntityRef::Point(point_id)],
-                ConstraintPriority::Required,
+                ConstraintPriority::Low,
             );
             Ok(vec![x_constraint, y_constraint])
         }
@@ -1383,7 +1395,13 @@ mod tests {
     // ── B-2: build_drag_constraints (synthesis + rejection) ─────────
 
     #[test]
-    fn drag_constraints_synthesise_x_and_y_required_for_point() {
+    fn drag_constraints_synthesise_x_and_y_soft_for_point() {
+        // Drag constraints are synthesised at `Low` priority so the
+        // weighted-least-squares solver treats them as soft pulls —
+        // any pre-existing `Required`/`High` constraint dominates,
+        // and the dragged point lands on the closest reachable
+        // location instead of forcibly snapping to an infeasible
+        // cursor target.
         use super::super::constraints::{
             ConstraintPriority, ConstraintType, DimensionalConstraint,
         };
@@ -1399,7 +1417,7 @@ mod tests {
 
         assert_eq!(extras.len(), 2, "expected X+Y pair");
         for c in &extras {
-            assert_eq!(c.priority, ConstraintPriority::Required);
+            assert_eq!(c.priority, ConstraintPriority::Low);
             assert_eq!(c.entities.len(), 1);
             assert_eq!(c.entities[0], EntityRef::Point(p));
             match &c.constraint_type {
