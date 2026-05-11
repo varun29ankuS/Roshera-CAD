@@ -178,4 +178,47 @@ export const sketchApi = {
   ): Promise<ExtrudeSketchResponse> {
     return request('POST', `/sketch/${id}/extrude`, body)
   },
+  /**
+   * Extrude-cut: builds the same cutter as `extrude`, then boolean-
+   * subtracts it from the named target solid. Target's UUID is
+   * preserved (identity-preserving modify); the response carries the
+   * new kernel solid id under the same UUID. Backend broadcasts
+   * `ObjectUpdated`.
+   */
+  extrudeCut(
+    id: string,
+    body: {
+      distance: number
+      direction?: [number, number, number]
+      target_id: string
+      consume?: boolean
+    },
+  ): Promise<{
+    success: boolean
+    sketch_id: string
+    consumed: boolean
+    target_id: string
+    solid_id: number
+  }> {
+    return request('POST', `/sketch/${id}/extrude_cut`, body)
+  },
+  /**
+   * Revolve the sketch profile around a world-space axis to create a
+   * solid of revolution. Defaults: full 2π revolution, 32 segments.
+   * Backend broadcasts `ObjectCreated`.
+   */
+  revolve(
+    id: string,
+    body: {
+      axis_origin: [number, number, number]
+      axis_direction: [number, number, number]
+      angle?: number
+      segments?: number
+      symmetric?: boolean
+      name?: string
+      consume?: boolean
+    },
+  ): Promise<ExtrudeSketchResponse> {
+    return request('POST', `/sketch/${id}/revolve`, body)
+  },
 }

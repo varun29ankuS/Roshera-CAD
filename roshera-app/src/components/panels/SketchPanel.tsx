@@ -29,6 +29,8 @@ import {
   Trash2,
   Check,
   X,
+  Scissors,
+  RotateCw,
 } from 'lucide-react'
 import {
   isStandardPlane,
@@ -73,6 +75,27 @@ const TOOL_OPTIONS: Array<{
   { value: 'circle', label: 'Circle', icon: CircleIcon },
 ]
 
+/**
+ * Three ways to finalise a sketch into 3D geometry. `extrude` is the
+ * existing default (build a prism from the profile). `extrude_cut`
+ * builds the same prism but boolean-subtracts it from the selected
+ * target solid. `revolve` spins the profile around a world-space
+ * axis. Sweep/Loft live in a later slice (J-5) because they need
+ * cross-sketch coordination.
+ */
+type FinishOp = 'extrude' | 'extrude_cut' | 'revolve'
+
+const FINISH_OP_OPTIONS: Array<{
+  value: FinishOp
+  label: string
+  icon: typeof PenTool
+  title: string
+}> = [
+  { value: 'extrude', label: 'Extrude', icon: Check, title: 'Pull the profile along the plane normal' },
+  { value: 'extrude_cut', label: 'Cut', icon: Scissors, title: 'Pull the profile and subtract it from a target body' },
+  { value: 'revolve', label: 'Revolve', icon: RotateCw, title: 'Spin the profile around an axis' },
+]
+
 export function SketchPanel() {
   const sketch = useSceneStore((s) => s.sketch)
   const setSketchTool = useSceneStore((s) => s.setSketchTool)
@@ -83,9 +106,35 @@ export function SketchPanel() {
   const setSketchView = useSceneStore((s) => s.setSketchView)
   const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
   const awaitSketchReady = useSceneStore((s) => s.awaitSketchReady)
+  // Cut target resolution: first selection wins; falls back to the
+  // most recently created solid if nothing is selected (matches the
+  // user mental model of "I just drew this, now cut from it").
+  const selectedIds = useSceneStore((s) => s.selectedIds)
+  const objectOrder = useSceneStore((s) => s.objectOrder)
 
   const [busy, setBusy] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
+  const [finishOp, setFinishOp] = useState<FinishOp>('extrude')
+
+  // Revolve axis: default to the world X-axis through the origin —
+  // works for any plane-aligned sketch as a starting point. The user
+  // edits the six numbers below if their axis differs. (Selecting a
+  // sketch line as the axis is a follow-up slice — needs an extra
+  // selection mode in the overlay.)
+  const [revolveAngleDeg, setRevolveAngleDeg] = useState<number>(360)
+  const [revolveSegments, setRevolveSegments] = useState<number>(32)
+  const [revolveAxisOrigin, setRevolveAxisOrigin] =
+    useState<[number, number, number]>([0, 0, 0])
+  const [revolveAxisDir, setRevolveAxisDir] =
+    useState<[number, number, number]>([1, 0, 0])
+
+  // Resolve the cut target: prefer first selected solid, fall back
+  // to the last-created one. `null` if the scene is empty.
+  const cutTargetId = useMemo<string | null>(() => {
+    for (const id of selectedIds) return id
+    if (objectOrder.length === 0) return null
+    return objectOrder[objectOrder.length - 1] ?? null
+  }, [selectedIds, objectOrder])
 
   // Reset transient feedback every time we (re)enter sketch mode.
   useEffect(() => {
@@ -166,23 +215,73 @@ export function SketchPanel() {
       // the same profile. Without this, the backend deletes the
       // session (default behaviour) and re-edit silently fails because
       // there's nothing to load.
-      const result = await sketchApi.extrude(serverId, {
-        distance: sketch.thickness,
-        name: `${sketch.tool}-extrude`,
-        consume: false,
-      })
       const { addMessage } = useChatStore.getState()
-      const stats =
-        result.stats?.vertex_count && result.stats?.triangle_count
-          ? ` (${result.stats.vertex_count} verts, ${result.stats.triangle_count} tris${
-              result.stats.tessellation_ms ? `, ${result.stats.tessellation_ms} ms` : ''
-            })`
-          : ''
-      addMessage({
-        role: 'assistant',
-        content: `Extruded ${sketch.tool} on ${planeLabel(sketch.plane)} plane (t=${sketch.thickness})${stats}.`,
-        objectsAffected: [result.object.id],
-      })
+      let affectedId: string
+
+      if (finishOp === 'extrude_cut') {
+        if (!cutTargetId) {
+          setBusy(false)
+          setError('Select a body to cut from (click it in the viewport), then retry.')
+          return
+        }
+        const result = await sketchApi.extrudeCut(serverId, {
+          distance: sketch.thickness,
+          target_id: cutTargetId,
+          consume: false,
+        })
+        affectedId = result.target_id
+        addMessage({
+          role: 'assistant',
+          content: `Cut ${sketch.tool} (t=${sketch.thickness}) from body ${cutTargetId.slice(0, 8)} on ${planeLabel(sketch.plane)} plane.`,
+          objectsAffected: [affectedId],
+        })
+      } else if (finishOp === 'revolve') {
+        const dirMag = Math.hypot(...revolveAxisDir)
+        if (!Number.isFinite(dirMag) || dirMag < 1e-9) {
+          setBusy(false)
+          setError('Revolve axis direction must be non-zero.')
+          return
+        }
+        const angleRad = (revolveAngleDeg * Math.PI) / 180
+        const result = await sketchApi.revolve(serverId, {
+          axis_origin: revolveAxisOrigin,
+          axis_direction: revolveAxisDir,
+          angle: angleRad,
+          segments: revolveSegments,
+          name: `${sketch.tool}-revolve`,
+          consume: false,
+        })
+        affectedId = result.object.id
+        const stats =
+          result.stats?.vertex_count && result.stats?.triangle_count
+            ? ` (${result.stats.vertex_count} verts, ${result.stats.triangle_count} tris${
+                result.stats.tessellation_ms ? `, ${result.stats.tessellation_ms} ms` : ''
+              })`
+            : ''
+        addMessage({
+          role: 'assistant',
+          content: `Revolved ${sketch.tool} on ${planeLabel(sketch.plane)} plane (${revolveAngleDeg}°)${stats}.`,
+          objectsAffected: [affectedId],
+        })
+      } else {
+        const result = await sketchApi.extrude(serverId, {
+          distance: sketch.thickness,
+          name: `${sketch.tool}-extrude`,
+          consume: false,
+        })
+        affectedId = result.object.id
+        const stats =
+          result.stats?.vertex_count && result.stats?.triangle_count
+            ? ` (${result.stats.vertex_count} verts, ${result.stats.triangle_count} tris${
+                result.stats.tessellation_ms ? `, ${result.stats.tessellation_ms} ms` : ''
+              })`
+            : ''
+        addMessage({
+          role: 'assistant',
+          content: `Extruded ${sketch.tool} on ${planeLabel(sketch.plane)} plane (t=${sketch.thickness})${stats}.`,
+          objectsAffected: [affectedId],
+        })
+      }
       // We pass `consume: false` above, so the backend keeps the
       // session alive — but the user is done with this editing pass,
       // so tear down the local active flag. Pass `deleteBackend:
@@ -199,7 +298,13 @@ export function SketchPanel() {
   }, [
     awaitSketchReady,
     busy,
+    cutTargetId,
     exitSketch,
+    finishOp,
+    revolveAngleDeg,
+    revolveAxisDir,
+    revolveAxisOrigin,
+    revolveSegments,
     sketch.circleSegments,
     sketch.editingSourceObjectId,
     sketch.plane,
@@ -414,6 +519,72 @@ export function SketchPanel() {
         setSketchPoint={setSketchPoint}
       />
 
+      {/* Finalise operation selector. Three ways to turn the 2D
+          profile into 3D: pull it (Extrude), pull-and-subtract
+          (Cut), or spin it around an axis (Revolve). Sweep/Loft are
+          out of scope for the single-sketch session (need cross-
+          sketch coordination — see slice J-5). */}
+      <div className="flex items-center gap-1 pt-1 border-t border-border/30 flex-wrap">
+        <span className="text-muted-foreground text-[10px] mr-1">Op</span>
+        {FINISH_OP_OPTIONS.map((opt) => {
+          const Icon = opt.icon
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => setFinishOp(opt.value)}
+              className={cn(
+                'flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
+                finishOp === opt.value
+                  ? 'border-border text-foreground bg-foreground/10'
+                  : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+              )}
+              title={opt.title}
+              aria-pressed={finishOp === opt.value}
+            >
+              <Icon className="w-3 h-3" />
+              <span>{opt.label}</span>
+            </button>
+          )
+        })}
+        {finishOp === 'extrude_cut' && (
+          <span className="ml-2 text-[10px] font-mono text-muted-foreground">
+            target:{' '}
+            <span className={cn(cutTargetId ? 'text-foreground' : 'text-rose-400')}>
+              {cutTargetId ? cutTargetId.slice(0, 8) : '— select a body —'}
+            </span>
+          </span>
+        )}
+      </div>
+
+      {finishOp === 'revolve' && (
+        <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-border/30">
+          <NumberField
+            label="Angle°"
+            value={revolveAngleDeg}
+            onChange={(n) => setRevolveAngleDeg(n)}
+            step={15}
+          />
+          <NumberField
+            label="Segs"
+            value={revolveSegments}
+            onChange={(n) => setRevolveSegments(Math.max(3, Math.round(n)))}
+            min={3}
+            step={1}
+          />
+          <AxisInputs
+            label="origin"
+            value={revolveAxisOrigin}
+            onChange={setRevolveAxisOrigin}
+          />
+          <AxisInputs
+            label="dir"
+            value={revolveAxisDir}
+            onChange={setRevolveAxisDir}
+          />
+        </div>
+      )}
+
       {/* Action row */}
       <div className="flex items-center gap-2">
         <button
@@ -448,7 +619,8 @@ export function SketchPanel() {
             // Active shape must have at least 2 points (the minimum
             // any of our tools accepts). Other shapes are validated
             // inside `handleFinish` before the round-trip.
-            sketch.points.length < 2
+            sketch.points.length < 2 ||
+            (finishOp === 'extrude_cut' && cutTargetId === null)
           }
           className={cn(
             'ml-auto flex items-center gap-1.5 px-3 py-1 border text-[10px] font-semibold transition-colors',
@@ -456,10 +628,28 @@ export function SketchPanel() {
               ? 'border-border/40 text-muted-foreground'
               : 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40',
           )}
-          title="Finish sketch and extrude (Enter)"
+          title={
+            finishOp === 'extrude_cut'
+              ? 'Finish sketch and cut from target (Enter)'
+              : finishOp === 'revolve'
+                ? 'Finish sketch and revolve around axis (Enter)'
+                : 'Finish sketch and extrude (Enter)'
+          }
         >
           <Check className="w-3 h-3" />
-          <span>{busy ? 'Extruding…' : 'Finish & Extrude'}</span>
+          <span>
+            {busy
+              ? finishOp === 'extrude_cut'
+                ? 'Cutting…'
+                : finishOp === 'revolve'
+                  ? 'Revolving…'
+                  : 'Extruding…'
+              : finishOp === 'extrude_cut'
+                ? 'Finish & Cut'
+                : finishOp === 'revolve'
+                  ? 'Finish & Revolve'
+                  : 'Finish & Extrude'}
+          </span>
         </button>
       </div>
 
@@ -515,6 +705,44 @@ function NumberField({ label, value, onChange, min, step }: NumberFieldProps) {
         className="w-16 px-1.5 py-0.5 bg-background/40 border border-border/40 text-foreground text-[10px] font-mono focus:outline-none focus:border-border"
       />
     </label>
+  )
+}
+
+interface AxisInputsProps {
+  label: string
+  value: [number, number, number]
+  onChange: (v: [number, number, number]) => void
+}
+
+/**
+ * Three tightly-packed number boxes labelled x/y/z. Used for revolve
+ * axis origin + direction. Each box edits one component; the parent
+ * holds the tuple. Invalid numerics are dropped (the box clears
+ * to empty but the underlying state keeps its prior value).
+ */
+function AxisInputs({ label, value, onChange }: AxisInputsProps) {
+  return (
+    <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+      <span>{label}</span>
+      {(['x', 'y', 'z'] as const).map((axis, i) => (
+        <input
+          key={axis}
+          type="number"
+          value={Number.isFinite(value[i]) ? value[i] : ''}
+          step={0.1}
+          onChange={(e) => {
+            const n = Number(e.target.value)
+            if (!Number.isFinite(n)) return
+            const next: [number, number, number] = [...value]
+            next[i] = n
+            onChange(next)
+          }}
+          className="w-12 px-1 py-0.5 bg-background/40 border border-border/40 text-foreground text-[10px] font-mono focus:outline-none focus:border-border"
+          title={`${label} ${axis}`}
+          aria-label={`${label} ${axis}`}
+        />
+      ))}
+    </span>
   )
 }
 
