@@ -1566,8 +1566,25 @@ fn get_adjacent_faces(
     Ok((adjacent_faces[0], adjacent_faces[1]))
 }
 
-/// Compute dihedral angle between two faces at a shared edge.
-/// Returns the angle in radians between the outward-facing normals.
+/// Compute the **interior** dihedral angle between two adjacent faces
+/// at a shared edge, measured inside the solid material.
+///
+/// The return value lies in `(0, 2π)`:
+/// - flat pair (faces coplanar): `π`
+/// - convex 90° (e.g. box edge): `π/2`
+/// - concave 90° (interior of an "L" or pocket): `3π/2`
+///
+/// This is the angle the chamfer-triangle's law-of-sines wants
+/// (`d2 = d1 · sin(angle) / sin(face_angle − angle)`): the apex
+/// angle at the edge vertex.
+///
+/// The previous formulation used the unsigned `π − acos(n1·n2)`,
+/// which yields the same value for convex and concave edges with
+/// equal `|signed_dihedral|` and would silently give wrong distances
+/// when chamfering a concave edge with `DistanceAngle` / `Angle`
+/// modes. We now derive the signed dihedral via
+/// `fillet_robust::robust_face_angle` (right-hand rule about the
+/// loop-corrected edge tangent) and convert: `interior = π − signed`.
 fn compute_face_angle(
     model: &BRepModel,
     edge_id: EdgeId,
@@ -1577,9 +1594,9 @@ fn compute_face_angle(
     let edge = model
         .edges
         .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+        .clone();
 
-    // Evaluate edge midpoint
     let curve = model
         .curves
         .get(edge.curve_id)
@@ -1588,16 +1605,36 @@ fn compute_face_angle(
         OperationError::NumericalError(format!("Edge midpoint evaluation failed: {:?}", e))
     })?;
 
-    // Get surface normals at edge midpoint for both faces
+    // Face-oriented outward normals (the helper already applies
+    // FaceOrientation::Backward → negate, so this is the canonical
+    // outward direction independent of which side of the surface the
+    // face occupies).
     let n1 = face_normal_at_point(model, face1_id, &mid_point)?;
     let n2 = face_normal_at_point(model, face2_id, &mid_point)?;
 
-    // Dihedral angle = π - acos(n1 · n2)
-    // For outward-facing normals on a convex edge, n1·n2 < 0 → angle > π/2
-    let dot = n1.dot(&n2).clamp(-1.0, 1.0);
-    let angle = std::f64::consts::PI - dot.acos();
+    // Edge tangent in face1's loop direction. `robust_face_angle`
+    // measures the signed angle via the right-hand rule about the
+    // input tangent — using the *loop* direction (rather than the raw
+    // curve direction) makes the sign convention "positive = convex"
+    // independent of how the underlying curve was parameterized.
+    let face1_loop_sign =
+        super::fillet::edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "Edge {} not present in any loop of face {}",
+                edge_id, face1_id
+            ))
+        })?;
+    let edge_tangent = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
 
-    Ok(angle)
+    let signed = super::fillet_robust::robust_face_angle(
+        &n1,
+        &n2,
+        &edge_tangent,
+        &Tolerance::default(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("Signed face angle failed: {:?}", e)))?;
+
+    Ok(std::f64::consts::PI - signed)
 }
 
 /// Get face surface normal at a given 3D point by finding the closest UV parameters
@@ -1871,13 +1908,26 @@ mod tests {
         let edge = Edge::new_auto_range(0, v1, v2, curve_id, EdgeOrientation::Forward);
         let edge_id = model.edges.add(edge);
 
-        // Create loops and faces
+        // Loop orientations representing a *convex* 90° edge under
+        // the right-hand-rule convention `robust_face_angle` enforces.
+        // For the +Z and +Y faces of a notional box sharing the edge
+        // along +X: walking the +Z face's outer loop CCW (viewed from
+        // +Z) traverses this edge in −X, and walking the +Y face's
+        // loop CCW (viewed from +Y) traverses it in +X. The curve is
+        // parameterized in +X, so loop1 carries it backward and loop2
+        // carries it forward.
+        //
+        // The previous test set both loops in the inverse orientation,
+        // which under the new signed-dihedral formulation models a
+        // concave (interior-of-an-L) corner. The unsigned `π−acos`
+        // formula returned `π/2` regardless of orientation, masking
+        // the mistake.
         let mut loop1 = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
-        loop1.add_edge(edge_id, true);
+        loop1.add_edge(edge_id, false);
         let loop1_id = model.loops.add(loop1);
 
         let mut loop2 = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
-        loop2.add_edge(edge_id, false);
+        loop2.add_edge(edge_id, true);
         let loop2_id = model.loops.add(loop2);
 
         let face1 = Face::new(0, s1, loop1_id, FaceOrientation::Forward);
@@ -1886,12 +1936,15 @@ mod tests {
         let face2 = Face::new(0, s2, loop2_id, FaceOrientation::Forward);
         let face2_id = model.faces.add(face2);
 
-        // Dihedral angle between perpendicular faces should be ~π/2
+        // Interior dihedral of a convex 90° corner is π/2 — the apex
+        // angle of the chamfer triangle sitting in the solid material
+        // between the two faces. `compute_face_angle` returns
+        // `π − signed_dihedral`, so signed = +π/2 (convex) yields π/2.
         let angle = compute_face_angle(&model, edge_id, face1_id, face2_id).unwrap();
         let expected = std::f64::consts::FRAC_PI_2;
         assert!(
-            (angle - expected).abs() < 0.1,
-            "Expected ~π/2 ({expected:.3}), got {angle:.3}"
+            (angle - expected).abs() < 1e-6,
+            "Convex perpendicular faces: expected π/2 ({expected:.6}), got {angle:.6}"
         );
     }
 
@@ -1938,5 +1991,170 @@ mod tests {
             "Midpoint x should be 5.0, got {}",
             pm.x
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Regression: EqualDistance chamfer must succeed on every edge of a
+    // box independent of which adjacent face is FaceOrientation::Backward.
+    //
+    // Mirrors the fillet regression
+    // `unit_box_every_edge_classifies_as_convex_ninety_degrees`. Unlike
+    // fillet's old broken state, chamfer's `face_normal_at_point` already
+    // applies the orientation flip and `compute_chamfer_offsets` derives
+    // its in-face perpendicular via `n × t_loop` (not via the dihedral
+    // sign), so the failure mode is not expected — this test pins that
+    // good state and catches any future regression that re-introduces an
+    // orientation-blind helper.
+    //
+    // Each iteration uses a freshly-built box; TopologyBuilder assigns
+    // edge ids monotonically and deterministically, so the same id maps
+    // to the same edge of every fresh box. The post-chamfer solid is
+    // validated by `validate_chamfered_solid` (toggled on via
+    // `common.validate_result`); any orientation, face-loop, or surgery
+    // bug that produces a non-manifold result is caught there.
+    // -------------------------------------------------------------------
+    // Pin the convex-vs-concave behaviour of compute_face_angle under
+    // the signed-dihedral formulation. The two test configurations
+    // share *identical geometry* — same planes, same shared edge —
+    // and differ only in loop orientation, which is what carries the
+    // information about which side of the corner is solid material.
+    //
+    // The previous unsigned formula returned π/2 for both, silently
+    // collapsing the convex and concave cases. That would have given
+    // the DistanceAngle / Angle chamfer modes a wrong magnitude on
+    // any concave edge they were applied to.
+    #[test]
+    fn compute_face_angle_distinguishes_convex_from_concave() {
+        use crate::primitives::curve::Line;
+        use crate::primitives::surface::Plane;
+
+        // Shared geometry: two perpendicular planes meeting on the X
+        // axis. Plane1 lies in the XY plane (normal +Z); Plane2 lies
+        // in the XZ plane (normal +Y).
+        let build = |loop1_forward: bool, loop2_forward: bool| -> f64 {
+            let mut model = BRepModel::new();
+            let plane1 = Plane::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                Vector3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap();
+            let plane2 = Plane::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+            )
+            .unwrap();
+            let s1 = model.surfaces.add(Box::new(plane1));
+            let s2 = model.surfaces.add(Box::new(plane2));
+            let line = Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
+            let curve_id = model.curves.add(Box::new(line));
+            let v1 = model.vertices.add(0.0, 0.0, 0.0);
+            let v2 = model.vertices.add(10.0, 0.0, 0.0);
+            let edge = Edge::new_auto_range(0, v1, v2, curve_id, EdgeOrientation::Forward);
+            let edge_id = model.edges.add(edge);
+
+            let mut loop1 = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+            loop1.add_edge(edge_id, loop1_forward);
+            let loop1_id = model.loops.add(loop1);
+            let mut loop2 = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+            loop2.add_edge(edge_id, loop2_forward);
+            let loop2_id = model.loops.add(loop2);
+
+            let face1 = Face::new(0, s1, loop1_id, FaceOrientation::Forward);
+            let face1_id = model.faces.add(face1);
+            let face2 = Face::new(0, s2, loop2_id, FaceOrientation::Forward);
+            let face2_id = model.faces.add(face2);
+
+            compute_face_angle(&model, edge_id, face1_id, face2_id).unwrap()
+        };
+
+        // Convex configuration (canonical box edge): loop1 backward,
+        // loop2 forward. Interior dihedral = π/2.
+        let convex = build(false, true);
+        assert!(
+            (convex - std::f64::consts::FRAC_PI_2).abs() < 1e-6,
+            "Convex 90° must give interior dihedral π/2, got {convex}"
+        );
+
+        // Concave configuration (interior of an L): loop1 forward,
+        // loop2 backward. Interior dihedral = 3π/2. The signed
+        // dihedral flips sign with loop orientation, and `π − signed`
+        // moves the result into the (π, 2π) half-plane.
+        let concave = build(true, false);
+        let three_pi_over_two = 3.0 * std::f64::consts::FRAC_PI_2;
+        assert!(
+            (concave - three_pi_over_two).abs() < 1e-6,
+            "Concave 90° must give interior dihedral 3π/2 \
+             ({three_pi_over_two:.6}), got {concave}"
+        );
+    }
+
+    #[test]
+    fn unit_box_each_edge_chamfers_with_validation() {
+        use std::collections::HashSet;
+
+        // Collect unique edge ids for a 10×10×10 box (matches the rest
+        // of the file's box scale, so the 0.5 chamfer distance stays
+        // well under half the edge length validator).
+        let probe_edges: Vec<EdgeId> = {
+            let mut model = BRepModel::new();
+            let mut builder = TopologyBuilder::new(&mut model);
+            let solid_id = match builder.create_box_3d(10.0, 10.0, 10.0).unwrap() {
+                crate::primitives::topology_builder::GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            };
+            let solid = model.solids.get(solid_id).unwrap().clone();
+            let shell = model.shells.get(solid.outer_shell).unwrap().clone();
+            let mut seen: HashSet<EdgeId> = HashSet::new();
+            for fid in &shell.faces {
+                let face = model.faces.get(*fid).unwrap().clone();
+                let outer_loop = model.loops.get(face.outer_loop).unwrap().clone();
+                for e in &outer_loop.edges {
+                    seen.insert(*e);
+                }
+            }
+            assert_eq!(seen.len(), 12, "unit box has 12 edges, got {}", seen.len());
+            seen.into_iter().collect()
+        };
+
+        // Chamfer each edge on a fresh box. The whole-solid validation
+        // catches any orientation-induced non-manifold output.
+        for edge_id in &probe_edges {
+            let mut model = BRepModel::new();
+            let mut builder = TopologyBuilder::new(&mut model);
+            let solid_id = match builder.create_box_3d(10.0, 10.0, 10.0).unwrap() {
+                crate::primitives::topology_builder::GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            };
+
+            let opts = ChamferOptions {
+                common: CommonOptions {
+                    validate_result: true,
+                    ..CommonOptions::default()
+                },
+                chamfer_type: ChamferType::EqualDistance(0.5),
+                distance1: 0.5,
+                distance2: 0.5,
+                symmetric: true,
+                propagation: PropagationMode::None,
+                preserve_edges: false,
+            };
+
+            let result = chamfer_edges(&mut model, solid_id, vec![*edge_id], opts);
+            assert!(
+                result.is_ok(),
+                "EqualDistance chamfer on edge {edge_id} failed: {result:?}. \
+                 This is the regression class an orientation-blind face-normal \
+                 helper would introduce — see fillet.rs::get_face_oriented_normal \
+                 for the canonical pattern."
+            );
+            let chamfer_faces = result.unwrap();
+            assert_eq!(
+                chamfer_faces.len(),
+                1,
+                "EqualDistance chamfer of one edge produces exactly one face"
+            );
+        }
     }
 }
