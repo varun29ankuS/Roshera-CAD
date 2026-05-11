@@ -1427,15 +1427,66 @@ async fn fillet_edges_endpoint(
         )
     })?;
 
-    let radius = payload
-        .get("radius")
-        .and_then(|v| v.as_f64())
-        .ok_or_else(|| ApiError::missing_field("radius"))?;
-    if !radius.is_finite() || radius <= 0.0 {
+    // Two accepted radius shapes:
+    //   - `radius: f64`        — uniform constant for every edge (legacy).
+    //   - `radii: [f64; N]`    — per-edge constant radii, parallel to `edges`.
+    // Exactly one must be present. Mixing both is rejected so the client
+    // cannot ship an ambiguous payload.
+    let radius_field = payload.get("radius");
+    let radii_field = payload.get("radii");
+    if radius_field.is_some() && radii_field.is_some() {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!("'radius' must be a positive finite number, got {radius}"),
+            "cannot specify both 'radius' and 'radii' — pick one".to_string(),
         ));
+    }
+    let radius_opt: Option<f64> = match radius_field {
+        Some(v) => Some(v.as_f64().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'radius' must be a number, got {v}"),
+            )
+        })?),
+        None => None,
+    };
+    if let Some(r) = radius_opt {
+        if !r.is_finite() || r <= 0.0 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'radius' must be a positive finite number, got {r}"),
+            ));
+        }
+    }
+    let radii_opt: Option<Vec<f64>> = match radii_field {
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "'radii' must be a JSON array of numbers".to_string(),
+                )
+            })?;
+            let mut out: Vec<f64> = Vec::with_capacity(arr.len());
+            for (i, item) in arr.iter().enumerate() {
+                let r = item.as_f64().ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'radii[{i}]' must be a number, got {item}"),
+                    )
+                })?;
+                if !r.is_finite() || r <= 0.0 {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'radii[{i}]' must be a positive finite number, got {r}"),
+                    ));
+                }
+                out.push(r);
+            }
+            Some(out)
+        }
+        None => None,
+    };
+    if radius_opt.is_none() && radii_opt.is_none() {
+        return Err(ApiError::missing_field("radius"));
     }
 
     let edges_raw = payload
@@ -1465,6 +1516,38 @@ async fn fillet_edges_endpoint(
         edges.push(n as EdgeId);
     }
 
+    // `radii` length must equal `edges` length when present. Slice 1
+    // pairs them by index — the per-edge dispatch loop below uses
+    // `radii[i]` for `edges[i]`.
+    if let Some(rs) = &radii_opt {
+        if rs.len() != edges.len() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "'radii' length {} must equal 'edges' length {}",
+                    rs.len(),
+                    edges.len()
+                ),
+            ));
+        }
+    }
+
+    // Reject duplicate edge ids. The per-edge loop would hit the second
+    // occurrence after the first call has already consumed the edge,
+    // which surfaces as a confusing kernel "edge not found" error half-
+    // way through a partial commit. Cheap to defend at the boundary.
+    {
+        let mut seen: std::collections::HashSet<EdgeId> = std::collections::HashSet::new();
+        for &eid in &edges {
+            if !seen.insert(eid) {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'edges' contains duplicate id {eid}"),
+                ));
+            }
+        }
+    }
+
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -1472,17 +1555,57 @@ async fn fillet_edges_endpoint(
         )
     })?;
 
+    // Resolve to a parallel radii vector. Back-compat single `radius`
+    // expands to `vec![r; edges.len()]`; explicit `radii` is taken as-
+    // is. The uniform check below decides between the single atomic
+    // kernel call and the per-edge loop.
+    let radii_resolved: Vec<f64> = match (&radius_opt, &radii_opt) {
+        (Some(r), None) => vec![*r; edges.len()],
+        (None, Some(rs)) => rs.clone(),
+        // The missing-both case returned `missing_field` above; the
+        // both-present case returned `InvalidParameter` above. Either
+        // way this arm is unreachable on the success path.
+        _ => unreachable!("radius/radii presence already validated"),
+    };
+    let uniform = radii_resolved.windows(2).all(|w| (w[0] - w[1]).abs() < f64::EPSILON);
+
     // Hold the model write lock only for the kernel fillet op;
     // tessellation runs under a read lock. Same pattern as boolean /
     // shell / mirror.
+    //
+    // Two dispatch paths:
+    //   - Uniform radii → one atomic `fillet_edges` call across every
+    //     edge. Preserves the kernel's edge-chain grouping (matters for
+    //     blend continuity when adjacent edges share a corner) and is
+    //     byte-identical to the legacy single-radius path.
+    //   - Mixed radii → one `fillet_edges` call per edge, each with
+    //     `FilletType::Constant(radii_resolved[i])` and
+    //     `PropagationMode::None` (so edge K's propagation cannot
+    //     swallow edge K+1 and break the parallel-radius invariant).
+    //     A mid-loop kernel failure leaves the solid partially
+    //     filleted; slice 3 will add per-edge options to the kernel
+    //     for atomic apply.
     {
         let mut model = state.model.write().await;
-        let opts = FilletOptions {
-            fillet_type: FilletType::Constant(radius),
-            propagation: PropagationMode::None,
-            ..FilletOptions::default()
-        };
-        kernel_fillet(&mut model, solid_id, edges, opts).map_err(ApiError::kernel_error)?;
+        if uniform {
+            let opts = FilletOptions {
+                fillet_type: FilletType::Constant(radii_resolved[0]),
+                propagation: PropagationMode::None,
+                ..FilletOptions::default()
+            };
+            kernel_fillet(&mut model, solid_id, edges.clone(), opts)
+                .map_err(ApiError::kernel_error)?;
+        } else {
+            for (i, &edge_id) in edges.iter().enumerate() {
+                let opts = FilletOptions {
+                    fillet_type: FilletType::Constant(radii_resolved[i]),
+                    propagation: PropagationMode::None,
+                    ..FilletOptions::default()
+                };
+                kernel_fillet(&mut model, solid_id, vec![edge_id], opts)
+                    .map_err(ApiError::kernel_error)?;
+            }
+        }
     };
 
     let (tri_mesh, tessellation_ms) = {
@@ -1512,10 +1635,20 @@ async fn fillet_edges_endpoint(
     state.register_id_mapping(result_uuid, solid_id);
 
     let display_name = format!("Fillet {}", solid_id);
-    let parameters = serde_json::json!({
-        "radius": radius,
-        "source": object_uuid.to_string(),
-    });
+    // Per-edge path round-trips `radii`; back-compat / uniform path
+    // round-trips a single `radius`. Downstream broadcast consumers
+    // (chat, timeline mirror) can branch on which key is present.
+    let parameters = if radii_opt.is_some() {
+        serde_json::json!({
+            "radii":  radii_resolved,
+            "source": object_uuid.to_string(),
+        })
+    } else {
+        serde_json::json!({
+            "radius": radii_resolved[0],
+            "source": object_uuid.to_string(),
+        })
+    };
 
     broadcast_object_deleted(&object_uuid.to_string());
     broadcast_object_created(
