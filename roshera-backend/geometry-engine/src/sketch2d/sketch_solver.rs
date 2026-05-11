@@ -13,16 +13,19 @@
 //!
 //! # Coverage
 //!
-//! [`solve`] translates the sketch's points, lines, and circles into
-//! solver `EntityState`s, runs the existing solver, and writes the
-//! result back onto the parametric entities. These three kinds are the
-//! only ones the solver exposes public `EntityState` constructors for
-//! (`EntityState::point`, `::line`, `::circle`); arcs, rectangles,
-//! ellipses, splines, and polylines pass through unsolved with a
-//! tracing warning. Extending coverage to those kinds is the responsi-
-//! bility of [Slice C] (`Arc + spline curve types in SketchEntity`),
-//! which adds the solver-side EntityState constructors and the
-//! per-kind constraint evaluators.
+//! [`solve`] translates the sketch's points, lines, circles, and arcs
+//! into solver `EntityState`s, runs the existing solver, and writes
+//! the result back onto the parametric entities. These four kinds are
+//! the ones the solver exposes public `EntityState` constructors for
+//! (`EntityState::point`, `::line`, `::circle`, `::arc`); rectangles,
+//! ellipses, splines, and polylines pass through unsolved (slices C-2
+//! through C-5 lift the remaining kinds).
+//!
+//! For arcs the bridge solves the 5-parameter state
+//! `[center.x, center.y, radius, start_angle, end_angle]`. The `ccw`
+//! orientation bit is preserved across solve cycles in
+//! [`apply_solver_result`] — it is not a continuously-varying
+//! parameter the solver could differentiate over.
 //!
 //! # Identity preservation
 //!
@@ -46,6 +49,7 @@
 //!
 //! [Slice C]: see project roadmap
 
+use super::arc2d::ParametricArc2d;
 use super::circle2d::ParametricCircle2d;
 use super::constraint_solver::{
     ConstraintSolver, EntityState, EntityUpdate, SolverResult, SolverStatus,
@@ -72,9 +76,9 @@ pub type SkippedEntity = EntityRef;
 ///
 /// The shape of the target is keyed to the kind of the dragged
 /// entity. Slice B-2 supports dragging a [`EntityRef::Point`] to a
-/// 2D location; lines and circles will gain drag targets when the
-/// frontend grows handles for them. Mismatched (entity, target)
-/// pairs are rejected up-front by [`solve_drag`] with
+/// 2D location; lines, circles, and arcs will gain drag targets
+/// when the frontend grows handles for them. Mismatched (entity,
+/// target) pairs are rejected up-front by [`solve_drag`] with
 /// [`SketchSolveError::DragTargetKindMismatch`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -217,7 +221,7 @@ pub struct SketchSolveReport {
     /// Wall-clock cost of the solve, in milliseconds.
     pub solve_time_ms: f64,
     /// Number of entities the bridge registered with the solver
-    /// before invoking it (= points + lines + circles).
+    /// before invoking it (= points + lines + circles + arcs).
     pub entities_solved: usize,
     /// Number of constraints registered with the solver. Includes
     /// constraints whose entity kind is unsupported in v1 (they are
@@ -225,10 +229,10 @@ pub struct SketchSolveReport {
     pub constraints_solved: usize,
     /// Entity references the bridge could not address through the
     /// public `EntityState` constructors and therefore excluded from
-    /// the solve. Slice B-1 limitation; slice C lifts it for arcs /
-    /// splines / polylines. Reporting the [`EntityRef`] (not just a
-    /// count) lets the UI highlight exactly which entities went
-    /// unsolved.
+    /// the solve. As of slice C-1 the only unsupported kinds are
+    /// rectangles, ellipses, splines, and polylines (slices C-2
+    /// through C-5). Reporting the [`EntityRef`] (not just a count)
+    /// lets the UI highlight exactly which entities went unsolved.
     pub entities_skipped: Vec<SkippedEntity>,
 }
 
@@ -306,8 +310,8 @@ impl SketchSolveReport {
 
     /// Count of entities the bridge could not register with the
     /// solver because their kind has no public `EntityState`
-    /// constructor yet (arc / spline / polyline / rectangle /
-    /// ellipse). Equivalent to `entities_skipped.len()`.
+    /// constructor yet (rectangle / ellipse / spline / polyline).
+    /// Equivalent to `entities_skipped.len()`.
     pub fn skipped_count(&self) -> usize {
         self.entities_skipped.len()
     }
@@ -356,21 +360,22 @@ pub struct DofReport {
     /// Points contribute 2 (x, y), 0 if `is_fixed`.
     /// Lines contribute 4 (px, py, dx, dy).
     /// Circles contribute 3 (cx, cy, r).
-    /// Entities listed in `entities_skipped` contribute 0 (slice
-    /// B-1 limitation).
+    /// Arcs contribute 5 (cx, cy, r, start_angle, end_angle).
+    /// Entities listed in `entities_skipped` contribute 0 — slices
+    /// C-2 through C-5 lift this for the remaining kinds.
     pub total_free_dofs: usize,
     /// Sum of `degrees_of_freedom_removed()` across constraints
-    /// whose entire entity set is supported in slice B-2 (points,
-    /// lines, circles). Constraints that reference any unsupported
-    /// entity are excluded from this tally — counting them while
-    /// excluding the unsupported entity's own free DOFs would
-    /// produce a phantom over-constrained verdict. See
-    /// `constraints_skipped` for the count of such constraints.
+    /// whose entire entity set is supported by the current bridge
+    /// (points, lines, circles, arcs). Constraints that reference
+    /// any unsupported entity are excluded from this tally —
+    /// counting them while excluding the unsupported entity's own
+    /// free DOFs would produce a phantom over-constrained verdict.
+    /// See `constraints_skipped` for the count of such constraints.
     pub constraint_dofs_removed: usize,
     /// Derived verdict over the supported subset.
     pub status: DofStatus,
     /// Count of entities the analysis registered (points + lines +
-    /// circles, fixed or free).
+    /// circles + arcs, fixed or free).
     pub entities_analysed: usize,
     /// Count of constraints that contributed to `constraint_dofs_removed`.
     pub constraints_analysed: usize,
@@ -524,6 +529,14 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         entities_analysed += 1;
         total_free_dofs += 3;
     }
+    // Arcs: 5 DOFs (cx, cy, r, start_angle, end_angle). Matches
+    // `ParametricArc2d::degrees_of_freedom` and the solver-side
+    // `EntityState::arc` parameter layout. `ccw` is not a solver
+    // DOF — orientation is a discrete bit.
+    for _entry in sketch.arcs().iter() {
+        entities_analysed += 1;
+        total_free_dofs += 5;
+    }
 
     let entities_skipped = collect_unsupported(sketch);
     // HashSet for O(1) membership checks while iterating constraints.
@@ -675,8 +688,9 @@ fn validate_options(options: &SolveOptions) -> Result<(), SketchSolveError> {
 
 /// Register every supported entity with the solver.
 ///
-/// Returns the count of entities registered. Points, lines, and
-/// circles are supported; other kinds are skipped (see [`count_unsupported`]).
+/// Returns the count of entities registered. Points, lines, circles,
+/// and arcs are supported; other kinds are skipped (see
+/// [`collect_unsupported`]).
 fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     let mut registered = 0usize;
 
@@ -711,22 +725,45 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         registered += 1;
     }
 
+    for entry in sketch.arcs().iter() {
+        let id = *entry.key();
+        let arc: &ParametricArc2d = entry.value();
+        // Arcs have no per-DOF fix flags today — pass `false` for
+        // every group so the solver treats center/radius/angles as
+        // free unless a dimensional or positional constraint pins
+        // them. `ccw` is not a solver parameter (orientation is a
+        // discrete bit, not a continuously-varying scalar); the
+        // bridge preserves it across solve cycles in
+        // [`apply_solver_result`].
+        solver.add_entity(
+            EntityRef::Arc(id),
+            EntityState::arc(
+                arc.arc.center,
+                arc.arc.radius,
+                arc.arc.start_angle,
+                arc.arc.end_angle,
+                false,
+                false,
+                false,
+            ),
+        );
+        registered += 1;
+    }
+
     registered
 }
 
 /// Collect `EntityRef`s for entities whose kinds are unsupported by
-/// the slice B-1 bridge (arcs / rectangles / ellipses / splines /
-/// polylines). The returned vector is in DashMap iteration order;
-/// callers that need a stable order should sort after collection.
+/// the current bridge (rectangles / ellipses / splines / polylines).
+/// Arcs are supported as of slice C-1 and no longer appear here.
+/// The returned vector is in DashMap iteration order; callers that
+/// need a stable order should sort after collection.
 ///
 /// Returning the IDs (not just a count) lets the UI highlight
 /// specifically which entities will remain unsolved until later
 /// slices add `EntityState` constructors for their kinds.
 fn collect_unsupported(sketch: &Sketch) -> Vec<EntityRef> {
     let mut skipped: Vec<EntityRef> = Vec::new();
-    for entry in sketch.arcs().iter() {
-        skipped.push(EntityRef::Arc(*entry.key()));
-    }
     for entry in sketch.rectangles().iter() {
         skipped.push(EntityRef::Rectangle(*entry.key()));
     }
@@ -765,10 +802,12 @@ fn line_to_point_direction(geometry: &LineGeometry) -> (Point2d, Vector2d) {
 /// Write solver outputs back onto the sketch's parametric entities.
 ///
 /// Entity IDs are preserved; only the geometric fields are updated.
-/// Updates for kinds the bridge did not register (arc/rect/ellipse/
-/// spline/polyline) cannot appear here because we never called
-/// `add_entity` for them; defensive matches are still in place to
-/// avoid panics if the solver ever starts returning them.
+/// For arcs the `ccw` orientation bit is preserved as well — the
+/// solver does not own it. Updates for kinds the bridge did not
+/// register (rectangle/ellipse/spline/polyline) cannot appear here
+/// because we never called `add_entity` for them; defensive matches
+/// are still in place to avoid panics if the solver ever starts
+/// returning them.
 fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
     for (entity_ref, update) in &result.entity_updates {
         match (entity_ref, update) {
@@ -789,6 +828,22 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
                         center: *center,
                         radius: *radius,
                     };
+                }
+            }
+            (
+                EntityRef::Arc(id),
+                EntityUpdate::Arc(center, radius, start_angle, end_angle),
+            ) => {
+                if let Some(mut entry) = sketch.arcs().get_mut(id) {
+                    // ID and `ccw` flag are preserved — the solver
+                    // does not own the orientation bit (see
+                    // `EntityState::arc` doc) and the bridge keeps
+                    // it stable across solve cycles.
+                    let arc = &mut entry.value_mut().arc;
+                    arc.center = *center;
+                    arc.radius = *radius;
+                    arc.start_angle = *start_angle;
+                    arc.end_angle = *end_angle;
                 }
             }
             // The remaining entity kinds are not registered by
@@ -1072,6 +1127,81 @@ mod tests {
         assert_eq!(c.center.x, 3.0);
         assert_eq!(c.center.y, -4.0);
         assert_eq!(c.radius, 2.5);
+    }
+
+    #[test]
+    fn arc_geometry_round_trips_unchanged_with_no_constraints() {
+        // Slice C-1: arcs are first-class solver entities. With no
+        // constraints the bridge must register the arc, run the
+        // solver (which converges trivially), and write back the
+        // identical parameters — preserving id, center, radius,
+        // angles, and the `ccw` orientation bit.
+        let sketch = fresh_sketch();
+        let id = sketch
+            .add_arc_center_angles(
+                Point2d::new(1.5, -0.25),
+                0.75,
+                0.0,
+                std::f64::consts::PI / 2.0,
+            )
+            .expect("arc");
+
+        let report = solve(&sketch).expect("solve");
+        // No more arc-skipped entry — slice C-1 lifted the
+        // limitation.
+        assert!(
+            !report
+                .entities_skipped
+                .iter()
+                .any(|e| matches!(e, EntityRef::Arc(_))),
+            "arc must not appear in entities_skipped: {:?}",
+            report.entities_skipped,
+        );
+        assert_eq!(report.entities_solved, 1);
+
+        let entry = sketch.arcs().get(&id).expect("arc survives");
+        let a = &entry.value().arc;
+        assert!((a.center.x - 1.5).abs() < 1e-10);
+        assert!((a.center.y - (-0.25)).abs() < 1e-10);
+        assert!((a.radius - 0.75).abs() < 1e-10);
+        assert!((a.start_angle - 0.0).abs() < 1e-10);
+        assert!((a.end_angle - std::f64::consts::PI / 2.0).abs() < 1e-10);
+        // `ccw` is not a solver parameter — must be preserved.
+        assert!(a.ccw);
+    }
+
+    #[test]
+    fn arc_contributes_five_dofs_to_analysis() {
+        // Per `ParametricArc2d::degrees_of_freedom`: center.x,
+        // center.y, radius, start_angle, end_angle. `ccw` is
+        // discrete and not counted.
+        let sketch = fresh_sketch();
+        sketch
+            .add_arc_center_angles(Point2d::new(0.0, 0.0), 1.0, 0.0, 1.0)
+            .expect("arc");
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 5);
+        assert_eq!(report.entities_analysed, 1);
+        // No skipped arcs after slice C-1.
+        assert!(report.entities_skipped.is_empty());
+    }
+
+    #[test]
+    fn mixed_kinds_with_arc_register_arc_as_supported() {
+        // Sanity check for the supported-kinds list update: a
+        // sketch carrying one point + one arc + one ellipse should
+        // count 2 supported and 1 skipped.
+        let sketch = fresh_sketch();
+        sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch
+            .add_arc_center_angles(Point2d::new(0.0, 0.0), 1.0, 0.0, 1.0)
+            .expect("arc");
+        let ellipse_id = sketch
+            .add_ellipse(Point2d::new(2.0, 0.0), 1.0, 0.5, 0.0)
+            .expect("ellipse");
+        let report = solve(&sketch).expect("solve");
+        assert_eq!(report.entities_solved, 2);
+        assert_eq!(report.entities_skipped, vec![EntityRef::Ellipse(ellipse_id)]);
     }
 
     #[test]

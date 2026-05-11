@@ -1186,6 +1186,45 @@ impl EntityState {
             fixed_mask: vec![center_fixed, center_fixed, radius_fixed],
         }
     }
+
+    /// Create state for an arc.
+    ///
+    /// Parameter layout is `[center.x, center.y, radius, start_angle,
+    /// end_angle]` — matches the comment on `get_arc_angles` and the
+    /// `EntityUpdate::Arc(center, radius, start_angle, end_angle)`
+    /// emission path. `ccw` is not stored as a solver parameter
+    /// (orientation is a discrete bit, not a continuously-varying
+    /// quantity the solver could differentiate over); the sketch
+    /// bridge preserves it across solve cycles.
+    ///
+    /// The three fix flags follow the same shape as `circle(…)`:
+    /// `center_fixed` pins both x and y; `radius_fixed` pins the
+    /// scalar; `angles_fixed` pins both angular endpoints together.
+    /// Splitting start/end fix into separate flags would be a no-op
+    /// for every constraint that currently exists (tangent / equal /
+    /// radius / concentric / point-on-curve all leave the angles
+    /// free), so the simpler API ships first; refine if a user
+    /// surface needs per-endpoint pinning later.
+    pub fn arc(
+        center: Point2d,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+        center_fixed: bool,
+        radius_fixed: bool,
+        angles_fixed: bool,
+    ) -> Self {
+        Self {
+            parameters: vec![center.x, center.y, radius, start_angle, end_angle],
+            fixed_mask: vec![
+                center_fixed,
+                center_fixed,
+                radius_fixed,
+                angles_fixed,
+                angles_fixed,
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
