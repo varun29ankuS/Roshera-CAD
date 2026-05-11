@@ -1728,6 +1728,103 @@ pub(crate) fn edge_orientation_in_face(
     None
 }
 
+/// Pure sign-counting kernel for inflection detection.
+///
+/// Returns `true` iff `signs` contains at least one entry strictly
+/// greater than `+threshold` AND at least one entry strictly less
+/// than `-threshold`. Entries with `|s| <= threshold` are treated as
+/// indeterminate (numerical noise near zero) and never contribute to
+/// classification.
+///
+/// Factored out so the sign-flip logic can be unit-tested independent
+/// of the BRep geometry machinery that feeds it.
+fn signs_indicate_inflection(signs: &[f64], threshold: f64) -> bool {
+    let has_pos = signs.iter().any(|&s| s > threshold);
+    let has_neg = signs.iter().any(|&s| s < -threshold);
+    has_pos && has_neg
+}
+
+/// Detect a dihedral-sign inflection along `edge_id` between
+/// `face1_id` and `face2_id` (Task #98 slice 1).
+///
+/// Samples the signed dihedral at `sample_count` parameter values
+/// uniformly spaced over `[0, 1]` and asks `signs_indicate_inflection`
+/// whether the resulting sign vector flips. The angle at each sample
+/// is computed the same way `compute_rolling_ball_positions` computes
+/// its midpoint angle — surface normals projected at the edge point,
+/// edge tangent rotated into `face1`'s loop direction, fed through
+/// `robust_face_angle`. The sign-flip threshold is `0.05 rad ≈ 2.86°`,
+/// well below the existing near-tangent gate's `0.1 rad ≈ 5.73°`,
+/// so an edge whose dihedral straddles zero by more than the noise
+/// floor is classified as inflection.
+///
+/// The current rolling-ball pipeline classifies an edge as convex or
+/// concave based on a *single* midpoint sample of the dihedral and
+/// commits the ball offset to that side for the whole edge. An
+/// inflection edge — convex at one end, concave at the other — fed
+/// to this pipeline produces a blend surface that caves outward on
+/// the convex segment and inward on the concave segment, meeting in
+/// a singular self-intersecting fold at the inflection parameter.
+/// Slice 1 detects this case and rejects it with a clear diagnostic;
+/// slice 2 will split the edge at the inflection parameter and
+/// fillet each sub-segment with its sign-appropriate orientation.
+fn detect_dihedral_inflection(
+    model: &BRepModel,
+    edge: &Edge,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
+    sample_count: usize,
+) -> OperationResult<bool> {
+    // Need ≥ 2 distinct parameter samples to spot a sign change.
+    // Caller passes 11 by default; clamp defensively here so an
+    // accidental 0 or 1 just no-ops to "no inflection found".
+    if sample_count < 2 {
+        return Ok(false);
+    }
+
+    let face1 = model
+        .faces
+        .get(face1_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} missing", face1_id)))?;
+    let face2 = model
+        .faces
+        .get(face2_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} missing", face2_id)))?;
+    let surface1 = model.surfaces.get(face1.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} missing", face1.surface_id))
+    })?;
+    let surface2 = model.surfaces.get(face2.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} missing", face2.surface_id))
+    })?;
+    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })?;
+
+    let tol = Tolerance::default();
+    let mut signs = Vec::with_capacity(sample_count);
+    for i in 0..sample_count {
+        // Uniform sweep across the parameter interval: t = i / (n-1).
+        let t = i as f64 / (sample_count - 1) as f64;
+        let p = edge.evaluate(t, &model.curves)?;
+        let n1 = get_surface_normal_at_point(surface1, &p)?;
+        let n2 = get_surface_normal_at_point(surface2, &p)?;
+        let tangent = edge.tangent_at(t, &model.curves)? * face1_loop_sign;
+        let angle = robust_face_angle(&n1, &n2, &tangent, &tol)?;
+        signs.push(angle);
+    }
+
+    // 0.05 rad (~2.86°) noise floor — below the near-tangent gate's
+    // 0.1 rad but well above floating-point noise on the angle
+    // computation. Edges that straddle zero by less than this are
+    // treated as "effectively tangent at that sample" and skipped
+    // rather than being miscounted as a sign flip.
+    Ok(signs_indicate_inflection(&signs, 0.05))
+}
+
 /// Data for rolling ball fillet computation
 struct RollingBallData {
     /// Center positions of rolling ball along edge
@@ -1811,6 +1908,27 @@ fn compute_rolling_ball_positions(
         return Err(OperationError::InvalidGeometry(
             "Near-tangent surfaces require special handling".to_string(),
         ));
+    }
+
+    // Inflection-edge guard (Task #98 slice 1). The midpoint
+    // classification above commits the rolling ball to one side of
+    // the surface for the entire edge; an edge whose dihedral flips
+    // sign along its parameter would produce a self-intersecting
+    // blend. Sample at 11 uniformly-spaced points (resolution ~10%
+    // of the edge length) — if both positive and negative dihedrals
+    // are observed above the noise floor, reject before any surface
+    // is built so the caller sees an actionable diagnostic instead
+    // of a corrupted output.
+    if detect_dihedral_inflection(model, edge, edge_id, face1_id, face2_id, 11)? {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Edge {} has a dihedral sign inflection along its parameter \
+             (convex on one segment, concave on another). A single-radius \
+             fillet cannot span an inflection without self-intersecting. \
+             Split the edge at each inflection parameter and fillet the \
+             sub-segments separately. (Task #98 slice 1 — automatic split \
+             is slice 2.)",
+            edge_id
+        )));
     }
 
     // Use adaptive sampling for better quality
@@ -4284,6 +4402,115 @@ mod tests {
         assert!(center.z.abs() < 1e-12, "z = {}", center.z);
         // Residual: distance from (0,0,0) to L1 is 1.0; the slice-1
         // wrapper's 1e-6 residual gate would reject this case.
+    }
+
+    // ------------------------------------------------------------------
+    // Task #98 slice 1: dihedral inflection sign-counting kernel
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn signs_indicate_inflection_all_positive_returns_false() {
+        // A consistently convex edge: every sample is > +threshold.
+        assert!(!signs_indicate_inflection(
+            &[0.5, 1.0, 1.2, 0.8, 0.3],
+            0.05
+        ));
+    }
+
+    #[test]
+    fn signs_indicate_inflection_all_negative_returns_false() {
+        // A consistently concave edge: every sample is < -threshold.
+        assert!(!signs_indicate_inflection(
+            &[-0.5, -1.0, -1.2, -0.8, -0.3],
+            0.05
+        ));
+    }
+
+    #[test]
+    fn signs_indicate_inflection_mixed_signs_returns_true() {
+        // The defining case: at least one sample is convex, at least
+        // one is concave, both clear the threshold.
+        assert!(signs_indicate_inflection(
+            &[0.5, 0.3, 0.1, -0.2, -0.4],
+            0.05
+        ));
+    }
+
+    #[test]
+    fn signs_indicate_inflection_endpoint_flip_returns_true() {
+        // Inflection at the edge endpoints — the easy detection case.
+        assert!(signs_indicate_inflection(&[0.4, 0.2, -0.3], 0.05));
+    }
+
+    #[test]
+    fn signs_indicate_inflection_below_threshold_treated_as_indeterminate() {
+        // Mixed magnitudes but only one side clears the noise floor.
+        // The other side is below threshold → indeterminate, not a
+        // sign flip. Without this gate, floating-point noise around
+        // a tangent-coincident region would generate false positives.
+        assert!(!signs_indicate_inflection(
+            &[0.4, 0.3, -0.01, -0.02],
+            0.05
+        ));
+        assert!(!signs_indicate_inflection(&[0.02, 0.01, -0.4, -0.3], 0.05));
+    }
+
+    #[test]
+    fn signs_indicate_inflection_pure_zeros_returns_false() {
+        // Degenerate: all-zero (or all-near-zero) sign vector. Neither
+        // pos nor neg side has a sample above threshold → no
+        // inflection claim. The near-tangent gate that runs alongside
+        // catches this case via a different diagnostic.
+        assert!(!signs_indicate_inflection(&[0.0, 0.0, 0.0], 0.05));
+        assert!(!signs_indicate_inflection(&[0.04, -0.04, 0.03], 0.05));
+    }
+
+    #[test]
+    fn signs_indicate_inflection_threshold_is_strict() {
+        // Threshold comparison is strict (`> threshold`, not `>=`),
+        // so a sample exactly at +/- threshold does NOT count. This
+        // matches the comparator semantics; the helper's behaviour
+        // at the boundary should be deterministic, not flicker.
+        assert!(!signs_indicate_inflection(&[0.05, -0.05], 0.05));
+        // A hair past the threshold on both sides DOES count.
+        assert!(signs_indicate_inflection(
+            &[0.051, -0.051],
+            0.05
+        ));
+    }
+
+    #[test]
+    fn detect_dihedral_inflection_clamps_below_two_samples() {
+        // Sample counts of 0 and 1 cannot represent a sign change;
+        // the helper short-circuits to false without touching the
+        // model. We use a bogus EdgeId/FaceId because the function
+        // must return before any lookups.
+        let model = BRepModel::new();
+        let edge = Edge::new_auto_range(
+            0,
+            0,
+            1,
+            0,
+            EdgeOrientation::Forward,
+        );
+        assert!(!detect_dihedral_inflection(
+            &model,
+            &edge,
+            999_u32,
+            999_u32,
+            999_u32,
+            0
+        )
+        .expect("sample_count = 0 must short-circuit to Ok(false)"));
+        assert!(!detect_dihedral_inflection(
+            &model,
+            &edge,
+            999_u32,
+            999_u32,
+            999_u32,
+            1
+        )
+        .expect("sample_count = 1 must short-circuit to Ok(false)"));
     }
 }
 
