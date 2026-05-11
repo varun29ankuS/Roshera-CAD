@@ -50,6 +50,37 @@ fn first_open_edge(model: &BRepModel) -> EdgeId {
         .expect("box must have at least one open edge")
 }
 
+/// Return two open edges on `model` that share no endpoint vertex.
+///
+/// Required for multi-edge fillet tests: edges that share a corner
+/// vertex are rejected up-front because corner-sphere (vertex)
+/// blends are tracked separately as Task #82. A box has 12 edges
+/// and each edge has 7 non-adjacent peers, so the search always
+/// succeeds for any non-degenerate box.
+fn two_non_adjacent_open_edges(model: &BRepModel) -> (EdgeId, EdgeId) {
+    let candidates: Vec<(EdgeId, [geometry_engine::primitives::vertex::VertexId; 2])> = model
+        .edges
+        .iter()
+        .filter_map(|(id, e)| {
+            if !e.is_loop() {
+                Some((id, [e.start_vertex, e.end_vertex]))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for i in 0..candidates.len() {
+        let (ei, vi) = candidates[i];
+        for j in (i + 1)..candidates.len() {
+            let (ej, vj) = candidates[j];
+            if vi[0] != vj[0] && vi[0] != vj[1] && vi[1] != vj[0] && vi[1] != vj[1] {
+                return (ei, ej);
+            }
+        }
+    }
+    panic!("box must have at least one pair of vertex-disjoint open edges");
+}
+
 fn variable_opts(r1: f64, r2: f64) -> FilletOptions {
     FilletOptions {
         fillet_type: FilletType::Variable(r1, r2),
@@ -130,23 +161,16 @@ fn multi_edge_call_rejected_if_any_edge_violates_bound() {
     // violation must abort the entire call without applying the
     // valid edge. This pins the all-or-nothing contract — a partial
     // mutation would leave the caller with no way to recover.
+    //
+    // The two test edges must be vertex-disjoint. Edges that share
+    // a corner are rejected by `validate_no_shared_corners` for a
+    // *different* reason (corner-sphere blends are tracked as Task
+    // #82); that case is covered by its own regression test below
+    // and would obscure the radius-validation contract being pinned
+    // here.
     let mut model = BRepModel::new();
     let solid = make_box(&mut model, 4.0, 4.0, 4.0);
-
-    // Two distinct open edges. The first is 4.0 long, the second
-    // (chosen as the second open-edge entry) is also 4.0 long for a
-    // unit-side box. Collect into a Vec so the iterator's immutable
-    // borrow of `model` is released before the `&mut model` call
-    // below.
-    let open: Vec<EdgeId> = model
-        .edges
-        .iter()
-        .filter_map(|(id, edge)| if !edge.is_loop() { Some(id) } else { None })
-        .take(2)
-        .collect();
-    assert_eq!(open.len(), 2, "box must have at least two open edges");
-    let e1 = open[0];
-    let e2 = open[1];
+    let (e1, e2) = two_non_adjacent_open_edges(&model);
 
     // r1 = 0.5 is valid for any 4.0-long edge; the validation loop
     // applies the same radius to every edge. Because no edge
@@ -155,14 +179,15 @@ fn multi_edge_call_rejected_if_any_edge_violates_bound() {
     // valid before we move on to the rejection case.
     let mut sanity_model = BRepModel::new();
     let sanity_solid = make_box(&mut sanity_model, 4.0, 4.0, 4.0);
+    let (s1, s2) = two_non_adjacent_open_edges(&sanity_model);
     let opts = FilletOptions {
         fillet_type: FilletType::Constant(0.5),
         radius: 0.5,
         propagation: PropagationMode::None,
         ..Default::default()
     };
-    fillet_edges(&mut sanity_model, sanity_solid, vec![e1, e2], opts)
-        .expect("two valid edges with r=0.5 must succeed");
+    fillet_edges(&mut sanity_model, sanity_solid, vec![s1, s2], opts)
+        .expect("two vertex-disjoint valid edges with r=0.5 must succeed");
 
     // Now the rejection case: a radius that exceeds the half-edge
     // bound for both edges. The validate loop iterates over `edges`
@@ -184,6 +209,85 @@ fn multi_edge_call_rejected_if_any_edge_violates_bound() {
         model.faces.len(),
         face_count_before,
         "rejected fillet must not partially mutate the model — face count unchanged"
+    );
+}
+
+#[test]
+fn multi_edge_sharing_corner_rejected_with_task_82_message() {
+    // Filleting two edges that meet at a corner requires a vertex
+    // (corner-sphere) blend (Task #82 slice 2), which is not yet
+    // implemented. The fundamental fix shipped alongside Task #89
+    // is to detect this case at the top of `fillet_edges` and
+    // reject the entire call atomically — *before* any topology
+    // surgery runs — rather than crash deep in
+    // `find_third_face_at_vertex` after partial mutation.
+    //
+    // This pins both halves of that contract:
+    //   1. The call returns `NotImplemented` with a message that
+    //      names Task #82, so a human or AI orchestrator can tell
+    //      what the right next step is.
+    //   2. The model is unmodified — face count unchanged.
+    let mut model = BRepModel::new();
+    let solid = make_box(&mut model, 4.0, 4.0, 4.0);
+
+    // Take the first two open edges by iteration order. On a freshly
+    // created box these are adjacent (they share at least one box
+    // corner), which is exactly the case we're rejecting.
+    let open: Vec<EdgeId> = model
+        .edges
+        .iter()
+        .filter_map(|(id, edge)| if !edge.is_loop() { Some(id) } else { None })
+        .take(2)
+        .collect();
+    assert_eq!(open.len(), 2);
+    let e1 = open[0];
+    let e2 = open[1];
+
+    // Confirm the test premise: e1 and e2 do share a vertex.
+    let (a, b, c, d) = {
+        let r1 = model.edges.get(e1).expect("e1 in store");
+        let r2 = model.edges.get(e2).expect("e2 in store");
+        (
+            r1.start_vertex,
+            r1.end_vertex,
+            r2.start_vertex,
+            r2.end_vertex,
+        )
+    };
+    assert!(
+        a == c || a == d || b == c || b == d,
+        "test premise: first two box edges must share a vertex \
+         (otherwise the rejection path is not exercised)"
+    );
+
+    let face_count_before = model.faces.len();
+    let opts = FilletOptions {
+        fillet_type: FilletType::Constant(0.5),
+        radius: 0.5,
+        propagation: PropagationMode::None,
+        ..Default::default()
+    };
+    let err = fillet_edges(&mut model, solid, vec![e1, e2], opts)
+        .expect_err("corner-sharing multi-edge fillet must be rejected");
+    match &err {
+        OperationError::NotImplemented(msg) => {
+            assert!(
+                msg.contains("Task #82"),
+                "rejection message must reference Task #82 so the \
+                 caller knows where the fix lives; got: {msg}"
+            );
+            assert!(
+                msg.contains("corner") || msg.contains("vertex"),
+                "rejection message must name the corner-blend issue; \
+                 got: {msg}"
+            );
+        }
+        other => panic!("expected NotImplemented; got {other:?}"),
+    }
+    assert_eq!(
+        model.faces.len(),
+        face_count_before,
+        "corner-rejected fillet must not partially mutate the model"
     );
 }
 

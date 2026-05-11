@@ -7,7 +7,7 @@
 //! enumeration. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::edge_blend_topology::{splice_blend_edge, validate_no_shared_corners, BlendEdgeSurgery};
 use super::fillet::edge_orientation_in_face;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
@@ -94,6 +94,11 @@ pub fn chamfer_edges(
 ) -> OperationResult<Vec<FaceId>> {
     // Validate inputs
     validate_chamfer_inputs(model, solid_id, &edges, &options)?;
+
+    // Reject multi-edge calls that meet at a corner — corner sphere
+    // blends are not yet implemented (Task #82 slice 2). This must
+    // run before any topology mutation so the rejection is atomic.
+    validate_no_shared_corners(model, &edges)?;
 
     // Capture input edges before the Vec is consumed by propagation.
     let input_edges_for_record: Vec<u64> = edges.iter().map(|&e| e as u64).collect();

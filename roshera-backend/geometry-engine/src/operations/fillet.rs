@@ -13,7 +13,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::edge_blend_topology::{splice_blend_edge, validate_no_shared_corners, BlendEdgeSurgery};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -159,6 +159,11 @@ pub fn fillet_edges(
             validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)?;
         }
     }
+
+    // Reject multi-edge calls that meet at a corner — corner sphere
+    // blends are not yet implemented (Task #82 slice 2). This must
+    // run before any topology mutation so the rejection is atomic.
+    validate_no_shared_corners(model, &edges)?;
 
     // Get radius value(s)
     let radius = match &options.fillet_type {
