@@ -45,6 +45,7 @@ pub mod spline2d;
 // Constraint system
 pub mod constraint_solver;
 pub mod constraints;
+pub mod sketch_solver;
 
 // Sketch container and management
 pub mod sketch;
@@ -69,6 +70,7 @@ pub use constraints::{
     Constraint, ConstraintId, ConstraintPriority, ConstraintStatus, ConstraintType,
     DimensionalConstraint, GeometricConstraint,
 };
+pub use sketch_solver::{SketchSolveError, SketchSolveReport, SolveOptions};
 
 pub use sketch::{Sketch, SketchAnchor, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};

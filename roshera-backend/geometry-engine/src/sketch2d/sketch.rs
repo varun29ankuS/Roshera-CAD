@@ -631,6 +631,37 @@ impl Sketch {
         self.constraints.get_entity_constraints(entity)
     }
 
+    /// Solve all constraints currently registered on this sketch and
+    /// write the result back onto the parametric entities in place.
+    ///
+    /// Delegates to [`super::sketch_solver::solve`]. Entity IDs are
+    /// preserved across the solve — only geometric fields are
+    /// updated. Returns a [`super::sketch_solver::SketchSolveReport`]
+    /// summarising the Newton-Raphson outcome and any unsatisfied
+    /// constraint residuals; non-convergent outcomes (over- /
+    /// under-constrained, unstable Jacobian) are surfaced in the
+    /// report's `status` field rather than as errors, because they
+    /// are valid analytical outcomes the UI may want to display.
+    pub fn solve_constraints(
+        &self,
+    ) -> Result<super::sketch_solver::SketchSolveReport, super::sketch_solver::SketchSolveError>
+    {
+        super::sketch_solver::solve(self)
+    }
+
+    /// Solve all constraints with custom solver options.
+    ///
+    /// See [`Sketch::solve_constraints`] for the default-options
+    /// variant; see [`super::sketch_solver::SolveOptions`] for the
+    /// tunable surface.
+    pub fn solve_constraints_with_options(
+        &self,
+        options: super::sketch_solver::SolveOptions,
+    ) -> Result<super::sketch_solver::SketchSolveReport, super::sketch_solver::SketchSolveError>
+    {
+        super::sketch_solver::solve_with_options(self, options)
+    }
+
     // Delete operations
 
     /// Delete a point from the sketch
