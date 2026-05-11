@@ -9,6 +9,7 @@
 
 mod auth_middleware;
 mod branches;
+mod csketch;
 mod delta_handlers;
 mod error_catalog;
 mod frame;
@@ -169,6 +170,14 @@ pub struct AppState {
     /// hands it to the existing `extrude_profile` pipeline. See
     /// `sketch.rs`.
     pub sketches: Arc<sketch::SketchManager>,
+
+    /// Constrained 2D sketches (kernel `Sketch` from
+    /// `geometry-engine::sketch2d`). Distinct from `sketches` above,
+    /// which holds the click-to-place sessions: this manager exposes
+    /// the parametric/constraint surface (points, lines, circles,
+    /// geometric & dimensional constraints, Newton solver, drag,
+    /// DOF analysis) over REST. See `csketch.rs`.
+    pub csketches: Arc<csketch::CSketchManager>,
 }
 
 impl AppState {
@@ -4904,6 +4913,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport_bridge: viewport_bridge::ViewportBridge::new(),
         transactions: Arc::new(transactions::TransactionManager::new()),
         sketches: Arc::new(sketch::SketchManager::new()),
+        csketches: Arc::new(csketch::CSketchManager::new()),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside
@@ -5029,6 +5039,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/sketch/{id}/shape/{idx}/point",
             post(sketch::add_sketch_shape_point),
         )
+        // Constrained 2D sketches — the parametric/constraint surface of
+        // the kernel `sketch2d::Sketch`. Independent of the click-to-place
+        // sketches above: this is where agents build sketches that need
+        // dimensional and geometric relationships (coincident, parallel,
+        // distance, equal, …) and want a Newton solver to enforce them.
+        // See `csketch.rs`.
+        .route(
+            "/api/csketch",
+            post(csketch::create_csketch).get(csketch::list_csketches),
+        )
+        .route(
+            "/api/csketch/{id}",
+            get(csketch::get_csketch).delete(csketch::delete_csketch),
+        )
+        .route("/api/csketch/{id}/point", post(csketch::add_point))
+        .route("/api/csketch/{id}/line", post(csketch::add_line))
+        .route("/api/csketch/{id}/circle", post(csketch::add_circle))
+        .route(
+            "/api/csketch/{id}/constraint",
+            post(csketch::add_constraint),
+        )
+        .route(
+            "/api/csketch/{id}/constraint/{cid}",
+            delete(csketch::delete_constraint),
+        )
+        .route(
+            "/api/csketch/{id}/constraints",
+            get(csketch::list_constraints),
+        )
+        .route("/api/csketch/{id}/solve", post(csketch::solve))
+        .route("/api/csketch/{id}/drag", post(csketch::drag))
+        .route("/api/csketch/{id}/dof", get(csketch::dof))
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.
