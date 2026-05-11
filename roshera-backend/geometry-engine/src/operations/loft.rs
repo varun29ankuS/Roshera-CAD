@@ -91,7 +91,8 @@ pub fn loft_profiles(
     validate_loft_inputs(model, &profiles, &options)?;
 
     // Capture profile edges (flattened) before they're consumed, for recording.
-    let profile_edges_for_record: Vec<u64> = profiles.iter().flatten().map(|&e| e as u64).collect();
+    let profile_edges_for_record: Vec<u32> =
+        profiles.iter().flatten().copied().collect();
     let profile_count = profiles.len();
 
     // Convert edge profiles to face profiles if needed
@@ -131,8 +132,8 @@ pub fn loft_profiles(
                 "closed": options.closed,
                 "create_solid": options.create_solid,
             }))
-            .with_inputs(profile_edges_for_record)
-            .with_outputs(vec![solid_id as u64]),
+            .with_input_edges(profile_edges_for_record.iter().map(|&e| e as u64))
+            .with_output_solids([solid_id as u64]),
     );
 
     Ok(solid_id)

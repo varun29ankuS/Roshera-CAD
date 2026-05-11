@@ -118,8 +118,8 @@ pub fn revolve_face(
                 "segments": options.segments,
                 "cap_ends": options.cap_ends,
             }))
-            .with_inputs(vec![face_id as u64])
-            .with_outputs(vec![solid_id as u64]),
+            .with_input_faces([face_id as u64])
+            .with_output_solids([solid_id as u64]),
     );
 
     Ok(solid_id)

@@ -188,12 +188,9 @@ pub fn offset_solid(
                 "faces_to_remove": faces_to_remove,
                 "max_deviation": options.max_deviation,
             }))
-            .with_inputs(
-                std::iter::once(solid_id as u64)
-                    .chain(faces_to_remove.iter().map(|&f| f as u64))
-                    .collect(),
-            )
-            .with_outputs(vec![hollow_id as u64]),
+            .with_input_solids([solid_id as u64])
+            .with_input_faces(faces_to_remove.iter().map(|&f| f as u64))
+            .with_output_solids([hollow_id as u64]),
     );
 
     Ok(hollow_id)
@@ -1547,11 +1544,11 @@ mod tests {
         );
         let rec = shell_records[0];
         assert!(
-            rec.inputs.contains(&(solid_id as u64)),
+            rec.inputs.contains(&format!("solid:{}", solid_id)),
             "recording inputs must include the source solid"
         );
         assert!(
-            rec.inputs.contains(&(top_face_id as u64)),
+            rec.inputs.contains(&format!("face:{}", top_face_id)),
             "recording inputs must include the removed face"
         );
         assert_eq!(

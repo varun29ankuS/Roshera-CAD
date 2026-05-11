@@ -136,7 +136,7 @@ pub fn fillet_edges(
 
     // Capture input edges before `edges` is consumed by the propagation
     // step below — needed for the recorder payload.
-    let input_edges_for_record: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
+    let input_edges_for_record: Vec<u32> = edges.clone();
 
     // Additional robust validation. For variable-radius fillets we
     // must check both endpoint radii — the linear interpolant means
@@ -211,10 +211,6 @@ pub fn fillet_edges(
     // this event instead of jumping past it back to the primitive. The
     // generated fillet faces follow so the recorded op still names the
     // topology it introduced.
-    let mut inputs = input_edges_for_record;
-    inputs.insert(0, solid_id as u64);
-    let mut outputs: Vec<u64> = vec![solid_id as u64];
-    outputs.extend(fillet_faces.iter().map(|&f| f as u64));
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("fillet_edges")
             .with_parameters(serde_json::json!({
@@ -225,8 +221,10 @@ pub fn fillet_edges(
                 "preserve_edges": options.preserve_edges,
                 "quality": format!("{:?}", options.quality),
             }))
-            .with_inputs(inputs)
-            .with_outputs(outputs),
+            .with_input_solids([solid_id as u64])
+            .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
+            .with_output_solids([solid_id as u64])
+            .with_output_faces(fillet_faces.iter().map(|&f| f as u64)),
     );
 
     Ok(fillet_faces)

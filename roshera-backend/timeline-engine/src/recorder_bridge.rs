@@ -239,8 +239,9 @@ mod tests {
     fn maps_recorded_operation_to_generic() {
         let rec = RecordedOperation::new("extrude_face")
             .with_parameters(serde_json::json!({ "distance": 5.0 }))
-            .with_inputs(vec![1, 2, 3])
-            .with_outputs(vec![42]);
+            .with_input_faces([1u64])
+            .with_input_edges([2u64, 3u64])
+            .with_output_solids([42u64]);
 
         let op = to_timeline_operation(&rec);
         match op {
@@ -250,8 +251,11 @@ mod tests {
             } => {
                 assert_eq!(command_type, "extrude_face");
                 assert_eq!(parameters["params"]["distance"], 5.0);
-                assert_eq!(parameters["inputs"], serde_json::json!([1u64, 2u64, 3u64]));
-                assert_eq!(parameters["outputs"], serde_json::json!([42u64]));
+                assert_eq!(
+                    parameters["inputs"],
+                    serde_json::json!(["face:1", "edge:2", "edge:3"])
+                );
+                assert_eq!(parameters["outputs"], serde_json::json!(["solid:42"]));
             }
             other => panic!("expected Operation::Generic, got {:?}", other),
         }
@@ -269,7 +273,7 @@ mod tests {
                 .record(
                     RecordedOperation::new("noop")
                         .with_parameters(serde_json::json!({ "i": i }))
-                        .with_outputs(vec![i]),
+                        .with_output_solids([i]),
                 )
                 .expect("record succeeds while worker is alive");
         }

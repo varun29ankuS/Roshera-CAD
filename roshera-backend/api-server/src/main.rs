@@ -83,6 +83,28 @@ pub struct AppState {
     uuid_to_local: Arc<DashMap<uuid::Uuid, u32>>,
     local_to_uuid: Arc<DashMap<u32, uuid::Uuid>>,
 
+    /// Tombstone table: bindings (kernel solid id → public UUID) that
+    /// a given timeline event consumed when it ran. Keyed by the
+    /// **raw `Uuid` inside `EventId`** (so callers that don't import
+    /// timeline-engine types still construct the key trivially).
+    ///
+    /// The id-mapping above is single-valued — when an operation
+    /// consumes a solid (boolean, delete, face-extrude replace), the
+    /// handler calls `unregister_id_mapping(uuid)` and the UUID
+    /// disappears. Pre-fix, Ctrl-Z replayed the timeline minus the
+    /// consuming op, the kernel produced the operands again under
+    /// their original deterministic `solid_id`s, but the public
+    /// UUIDs were gone — so the operands reappeared with fresh
+    /// v4 UUIDs, losing selection / outliner / AI references.
+    ///
+    /// The fix: every handler that unregisters a UUID also tombstones
+    /// `(kernel_id, uuid)` against the consuming event's `EventId`.
+    /// `replay_session_to_model` consults this table for events it's
+    /// **skipping** (i.e. sequence_number ≥ the rollback cutoff) and
+    /// resurrects the original UUID for surviving kernel ids that
+    /// have no pre-replay mapping. See `handlers/timeline.rs`.
+    pub consumed_uuids: Arc<DashMap<uuid::Uuid, HashMap<u32, uuid::Uuid>>>,
+
     // Enhanced AI integration
     ai_processor: Arc<Mutex<AIProcessor>>,
     session_aware_ai: Arc<SessionAwareAIProcessor>,
@@ -206,6 +228,39 @@ impl AppState {
             .iter()
             .map(|entry| *entry.key())
             .collect()
+    }
+
+    /// Tombstone the consumed-UUID bindings for `event_id`. Called by
+    /// every handler that retires a kernel solid as part of an
+    /// operation it just recorded into the timeline, immediately after
+    /// the recorder flush confirms the consuming event was persisted.
+    /// `bindings` is `(kernel_solid_id, public_uuid)` pairs — one per
+    /// consumed operand.
+    ///
+    /// Idempotent: re-tombstoning the same `event_id` overwrites the
+    /// prior entry (which only matters if the same event was retried,
+    /// which the timeline doesn't currently support but the table
+    /// tolerates).
+    pub fn tombstone_consumed_uuids(
+        &self,
+        event_id: uuid::Uuid,
+        bindings: impl IntoIterator<Item = (u32, uuid::Uuid)>,
+    ) {
+        let map: HashMap<u32, uuid::Uuid> = bindings.into_iter().collect();
+        if map.is_empty() {
+            return;
+        }
+        self.consumed_uuids.insert(event_id, map);
+    }
+
+    /// Fetch the consumed-UUID bindings for `event_id`, if any.
+    pub fn consumed_uuids_for_event(
+        &self,
+        event_id: &uuid::Uuid,
+    ) -> Option<HashMap<u32, uuid::Uuid>> {
+        self.consumed_uuids
+            .get(event_id)
+            .map(|entry| entry.value().clone())
     }
 }
 
@@ -944,6 +999,21 @@ async fn boolean_operation(
     }
 
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    // Tombstone the consumed `(kernel_id → uuid)` bindings against the
+    // boolean event the kernel just recorded. If the user later rolls
+    // the session back past this point with Ctrl-Z,
+    // `replay_session_to_model` consults this table and restores
+    // `uuid_a` / `uuid_b` against the resurrected kernel solids
+    // instead of minting fresh v4 UUIDs. Without this slice the
+    // operands reappear under new identities and lose selection /
+    // outliner placement / AI references.
+    if let Some(event_id) = handlers::timeline::latest_event_id_on_active_branch(&state).await {
+        state.tombstone_consumed_uuids(
+            event_id,
+            [(solid_a, uuid_a), (solid_b, uuid_b)],
+        );
+    }
 
     // Drop the consumed operands from the id-mapping table. The kernel
     // boolean has already merged or removed those solids; leaving stale
@@ -3238,14 +3308,20 @@ async fn delete_geometry(
         ));
     };
 
-    state.unregister_id_mapping(&uuid);
-
     // Cascade-delete the kernel-side B-Rep so the model isn't left holding
     // dangling shells/faces/edges; record the operation through the
     // attached `OperationRecorder` so the timeline panel reflects deletes
     // alongside creates and edits. Without this hook, deletes were
     // invisible to the timeline (only the UUID mapping was being dropped),
     // leaving the history desynced from the visible scene.
+    //
+    // Order matters: we capture the `(solid_id, uuid)` binding **before**
+    // unregistering, then record the delete event, then look up the
+    // recorder's just-persisted event id and tombstone the binding
+    // against it. A Ctrl-Z that rolls past this delete consults the
+    // tombstone and resurrects `uuid` against the restored kernel
+    // solid — without it the resurrected solid would appear under a
+    // fresh v4 UUID, losing selection / outliner / AI references.
     {
         let mut model = state.model.write().await;
         if let Err(e) = geometry_engine::operations::delete::delete_solid(
@@ -3264,9 +3340,15 @@ async fn delete_geometry(
                     "solid_id": solid_id,
                     "cascade":  true,
                 }))
-                .with_inputs(vec![solid_id as u64]),
+                .with_input_solids([solid_id as u64]),
         );
     }
+
+    if let Some(event_id) = handlers::timeline::latest_event_id_on_active_branch(&state).await {
+        state.tombstone_consumed_uuids(event_id, [(solid_id, uuid)]);
+    }
+
+    state.unregister_id_mapping(&uuid);
 
     broadcast_object_deleted(&uuid.to_string());
 
@@ -4058,6 +4140,104 @@ fn compute_bbox_and_center(vertices: &[f32]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     (min, max, center)
 }
 
+/// Build the wire `ObjectCreated` JSON for a single (`uuid`, kernel
+/// solid) pair, ready to ship over WebSocket. Frame shape is identical
+/// to what `broadcast_object_created` emits — same key set, same
+/// snake_case naming — so the frontend's `cadObjectSchema` parses it
+/// without divergence.
+///
+/// Used by `current_scene_frames` to repaint a freshly-connected
+/// client's viewport / ModelTree with the geometry that already lives
+/// in the kernel. Returns `None` when tessellation yields zero
+/// triangles (degenerate solid that wouldn't render anyway).
+fn build_object_created_frame(
+    uuid: uuid::Uuid,
+    solid_id: u32,
+    solid: &geometry_engine::primitives::solid::Solid,
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+) -> Option<String> {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let mesh = tessellate_solid(solid, model, &TessellationParams::default());
+    if mesh.triangles.is_empty() {
+        return None;
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&mesh);
+    let (bbox_min, bbox_max, center) = compute_bbox_and_center(&vertices);
+    let name = solid
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Solid {}", solid_id));
+    let now = chrono::Utc::now().timestamp_millis();
+    let frame = serde_json::json!({
+        "type": "ObjectCreated",
+        "payload": {
+            "id": uuid.to_string(),
+            "name": name,
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analytical_geometry": {
+                "solid_id":       solid_id,
+                "primitive_type": "mesh",
+                "parameters":     serde_json::Value::Null,
+                "properties": {
+                    "volume":         0.0,
+                    "surface_area":   0.0,
+                    "bounding_box":   { "min": bbox_min, "max": bbox_max },
+                    "center_of_mass": center,
+                }
+            },
+            "transform": {
+                "translation": [0.0_f32, 0.0, 0.0],
+                "rotation":    [0.0, 0.0, 0.0, 1.0],
+                "scale":       [1.0, 1.0, 1.0],
+            },
+            "material": {
+                "diffuse_color": [0.7, 0.7, 0.75, 1.0],
+                "metallic":      0.1,
+                "roughness":     0.8,
+                "emission":      [0.0, 0.0, 0.0],
+                "name":          "default",
+            },
+            "visible":     true,
+            "locked":      false,
+            "children":    [],
+            "metadata":    {},
+            "created_at":  now,
+            "modified_at": now,
+        }
+    });
+    serde_json::to_string(&frame).ok()
+}
+
+/// Serialize the current kernel scene as a vector of `ObjectCreated`
+/// JSON frames, one per registered (uuid, solid_id) pair. Sent to
+/// freshly-connecting WebSocket clients so a frontend reload repaints
+/// the existing scene instead of staring at an empty viewport.
+///
+/// Walks `state.local_to_uuid` rather than `model.solids` so we only
+/// emit frames for solids that have a public UUID — kernel-internal
+/// scratch solids (none today, but a hedge against future use) stay
+/// invisible to the wire.
+pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
+    let model = state.model.read().await;
+    let mut frames = Vec::new();
+    for entry in state.local_to_uuid.iter() {
+        let solid_id = *entry.key();
+        let uuid = *entry.value();
+        let Some(solid) = model.solids.get(solid_id) else {
+            continue;
+        };
+        if let Some(text) = build_object_created_frame(uuid, solid_id, solid, &model) {
+            frames.push(text);
+        }
+    }
+    frames
+}
+
 /// Build an `ObjectCreated` frame matching `roshera-app/src/lib/ws-schemas.ts`
 /// and publish it. Field names are snake_case to match `cadObjectSchema`.
 ///
@@ -4700,6 +4880,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         solids: Arc::new(RwLock::new(HashMap::new())),
         uuid_to_local: Arc::new(DashMap::new()),
         local_to_uuid: Arc::new(DashMap::new()),
+        consumed_uuids: Arc::new(DashMap::new()),
         ai_processor,
         session_aware_ai,
         full_integration_executor,

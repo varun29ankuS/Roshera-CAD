@@ -366,7 +366,7 @@ impl BRepModel {
                     "visible": visible,
                     "previous_visible": previous,
                 }))
-                .with_inputs(vec![id as u64]),
+                .with_input_datums([id as u64]),
         );
         Some(previous)
     }
@@ -394,7 +394,7 @@ impl BRepModel {
                     "name": name,
                     "transform": mat,
                 }))
-                .with_outputs(vec![id as u64]),
+                .with_output_datums([id as u64]),
         );
         Ok(id)
     }
@@ -422,7 +422,7 @@ impl BRepModel {
                     "origin": [origin.x, origin.y, origin.z],
                     "direction": dir_label,
                 }))
-                .with_outputs(vec![id as u64]),
+                .with_output_datums([id as u64]),
         );
         Ok(id)
     }
@@ -442,7 +442,7 @@ impl BRepModel {
                     "name": name,
                     "position": [position.x, position.y, position.z],
                 }))
-                .with_outputs(vec![id as u64]),
+                .with_output_datums([id as u64]),
         );
         Ok(id)
     }
@@ -461,7 +461,7 @@ impl BRepModel {
                     "name": name,
                     "previous_name": previous,
                 }))
-                .with_inputs(vec![id as u64]),
+                .with_input_datums([id as u64]),
         );
         Ok(previous)
     }
@@ -506,7 +506,7 @@ impl BRepModel {
                     "transform": matrix4_to_row_major(&transform),
                     "previous_transform": matrix4_to_row_major(&previous),
                 }))
-                .with_inputs(vec![id as u64]),
+                .with_input_datums([id as u64]),
         );
         Ok(previous)
     }
@@ -693,7 +693,7 @@ impl BRepModel {
                     "datum_id": id,
                     "name": removed.name.clone(),
                 }))
-                .with_inputs(vec![id as u64]),
+                .with_input_datums([id as u64]),
         );
         Ok(removed)
     }
@@ -754,8 +754,9 @@ impl BRepModel {
                     "new_datum_id": new_datum_id,
                     "local_transform_supplied": new_local_transform.is_some(),
                 }))
-                .with_inputs(vec![solid_id as u64, new_datum_id as u64])
-                .with_outputs(vec![solid_id as u64]),
+                .with_input_solids([solid_id as u64])
+                .with_input_datums([new_datum_id as u64])
+                .with_output_solids([solid_id as u64]),
         );
 
         Ok(())
@@ -1008,7 +1009,7 @@ impl BRepModel {
                     "source": source,
                     "transform": matrix4_to_row_major(&transform),
                 }))
-                .with_outputs(vec![id as u64]),
+                .with_output_datums([id as u64]),
         );
         Ok(id)
     }
@@ -1574,7 +1575,12 @@ impl BRepModel {
 
         if self.vertices.remove(vertex_id) {
             report.removed_vertices.push(vertex_id);
-            self.record_cascade("delete_vertex_cascade", vertex_id as u64, &report);
+            self.record_cascade(
+                "delete_vertex_cascade",
+                crate::operations::recorder::ENTITY_VERTEX,
+                vertex_id as u64,
+                &report,
+            );
         }
         report
     }
@@ -1585,7 +1591,12 @@ impl BRepModel {
         let mut report = CascadeReport::default();
         let removed = self.cascade_delete_edge(edge_id, &mut report);
         if removed {
-            self.record_cascade("delete_edge_cascade", edge_id as u64, &report);
+            self.record_cascade(
+                "delete_edge_cascade",
+                crate::operations::recorder::ENTITY_EDGE,
+                edge_id as u64,
+                &report,
+            );
         }
         report
     }
@@ -1598,7 +1609,12 @@ impl BRepModel {
         let mut report = CascadeReport::default();
         let removed = self.cascade_delete_face(face_id, &mut report);
         if removed {
-            self.record_cascade("delete_face_cascade", face_id as u64, &report);
+            self.record_cascade(
+                "delete_face_cascade",
+                crate::operations::recorder::ENTITY_FACE,
+                face_id as u64,
+                &report,
+            );
         }
         report
     }
@@ -1610,7 +1626,12 @@ impl BRepModel {
         let mut report = CascadeReport::default();
         let removed = self.cascade_delete_loop(loop_id, &mut report);
         if removed {
-            self.record_cascade("delete_loop_cascade", loop_id as u64, &report);
+            self.record_cascade(
+                "delete_loop_cascade",
+                crate::operations::recorder::ENTITY_LOOP,
+                loop_id as u64,
+                &report,
+            );
         }
         report
     }
@@ -1688,20 +1709,41 @@ impl BRepModel {
         }
     }
 
-    fn record_cascade(&self, kind: &str, root_id: u64, report: &CascadeReport) {
-        use crate::operations::recorder::RecordedOperation;
-        let outputs: Vec<u64> = report
+    fn record_cascade(
+        &self,
+        kind: &str,
+        root_entity_kind: &str,
+        root_id: u64,
+        report: &CascadeReport,
+    ) {
+        use crate::operations::recorder::{entity_ref, RecordedOperation, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX};
+        let outputs: Vec<String> = report
             .removed_vertices
             .iter()
-            .map(|id| *id as u64)
-            .chain(report.removed_edges.iter().map(|id| *id as u64))
-            .chain(report.removed_loops.iter().map(|id| *id as u64))
-            .chain(report.removed_faces.iter().map(|id| *id as u64))
+            .map(|id| entity_ref(ENTITY_VERTEX, *id as u64))
+            .chain(
+                report
+                    .removed_edges
+                    .iter()
+                    .map(|id| entity_ref(ENTITY_EDGE, *id as u64)),
+            )
+            .chain(
+                report
+                    .removed_loops
+                    .iter()
+                    .map(|id| entity_ref(ENTITY_LOOP, *id as u64)),
+            )
+            .chain(
+                report
+                    .removed_faces
+                    .iter()
+                    .map(|id| entity_ref(ENTITY_FACE, *id as u64)),
+            )
             .collect();
         self.record_operation(
             RecordedOperation::new(kind)
-                .with_inputs(vec![root_id])
-                .with_outputs(outputs)
+                .with_input_refs([entity_ref(root_entity_kind, root_id)])
+                .with_output_refs(outputs)
                 .with_parameters(serde_json::json!({
                     "removed_vertices": report.removed_vertices,
                     "removed_edges": report.removed_edges,
@@ -1827,12 +1869,22 @@ fn is_approx_identity(m: &Matrix4, eps: f64) -> bool {
     true
 }
 
-fn geometry_id_to_u64(id: GeometryId) -> u64 {
+/// Convert a typed `GeometryId` to the canonical namespaced wire form
+/// (`"<kind>:<id>"`) consumed by `RecordedOperation::inputs` / `outputs`.
+///
+/// Solids, faces, edges, and vertices each occupy independent `u32`
+/// counter namespaces in the kernel, so the bare integer alone cannot
+/// disambiguate them downstream (Feature Tree lineage walker, persisted
+/// timeline). The namespace prefix is the single source of identity.
+fn geometry_id_to_ref(id: GeometryId) -> String {
+    use crate::operations::recorder::{
+        entity_ref, ENTITY_EDGE, ENTITY_FACE, ENTITY_SOLID, ENTITY_VERTEX,
+    };
     match id {
-        GeometryId::Face(i)
-        | GeometryId::Solid(i)
-        | GeometryId::Edge(i)
-        | GeometryId::Vertex(i) => i as u64,
+        GeometryId::Face(i) => entity_ref(ENTITY_FACE, i as u64),
+        GeometryId::Solid(i) => entity_ref(ENTITY_SOLID, i as u64),
+        GeometryId::Edge(i) => entity_ref(ENTITY_EDGE, i as u64),
+        GeometryId::Vertex(i) => entity_ref(ENTITY_VERTEX, i as u64),
     }
 }
 
@@ -1893,10 +1945,14 @@ impl<'a> TopologyBuilder<'a> {
     ///    handoff to `timeline-engine` (or any other recorder) living
     ///    outside the kernel.
     ///
-    /// `outputs` should list entity IDs produced by the operation (e.g. the
-    /// newly created solid/face/edge). Pass an empty `Vec` when the call
-    /// is purely destructive or modifies existing entities in place.
-    fn record_and_push(&mut self, operation: TimelineOperation, outputs: Vec<u64>) {
+    /// `outputs` should list the typed `GeometryId`s produced by the
+    /// operation (e.g. the newly created solid/face/edge). Pass an empty
+    /// `Vec` when the call is purely destructive or modifies existing
+    /// entities in place. Each `GeometryId` carries its entity kind, which
+    /// is preserved through the recorder as a namespaced `"<kind>:<id>"`
+    /// string — solid/face/edge/vertex counters overlap in integer space,
+    /// so bare integers cannot disambiguate them downstream.
+    fn record_and_push(&mut self, operation: TimelineOperation, outputs: Vec<GeometryId>) {
         // Preserve existing in-builder timeline semantics verbatim.
         self.timeline.push(operation.clone());
 
@@ -1925,23 +1981,24 @@ impl<'a> TopologyBuilder<'a> {
         };
 
         // Derive inputs structurally from variants that reference existing
-        // entities. Downstream recorders rely on `parameters` (below) for
-        // full semantic detail; `inputs`/`outputs` are opaque entity
-        // handles for lineage tracking.
-        let inputs: Vec<u64> = match &operation {
+        // entities. Each input carries its `GeometryId` kind, so we route
+        // through the namespacing helper rather than dropping to bare u64.
+        let inputs: Vec<String> = match &operation {
             TimelineOperation::Extrude { profile_id, .. } => {
-                vec![geometry_id_to_u64(*profile_id)]
+                vec![geometry_id_to_ref(*profile_id)]
             }
             TimelineOperation::Boolean { operand_ids, .. } => operand_ids
                 .iter()
                 .copied()
-                .map(geometry_id_to_u64)
+                .map(geometry_id_to_ref)
                 .collect(),
             TimelineOperation::UpdateParameters { geometry_id, .. } => {
-                vec![geometry_id_to_u64(*geometry_id)]
+                vec![geometry_id_to_ref(*geometry_id)]
             }
             _ => Vec::new(),
         };
+
+        let output_refs: Vec<String> = outputs.into_iter().map(geometry_id_to_ref).collect();
 
         // Serialize the full TimelineOperation as the parameters payload
         // so a recorder can replay without lossy encoding.
@@ -1955,8 +2012,8 @@ impl<'a> TopologyBuilder<'a> {
 
         let record = crate::operations::recorder::RecordedOperation::new(kind)
             .with_parameters(parameters)
-            .with_inputs(inputs)
-            .with_outputs(outputs);
+            .with_input_refs(inputs)
+            .with_output_refs(output_refs);
 
         self.model.record_operation(record);
     }
@@ -1978,7 +2035,7 @@ impl<'a> TopologyBuilder<'a> {
             parameters: [("x".to_string(), x), ("y".to_string(), y)].into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![vertex_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Vertex(vertex_id)]);
 
         Ok(GeometryId::Vertex(vertex_id))
     }
@@ -2026,7 +2083,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![edge_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Edge(edge_id)]);
 
         Ok(GeometryId::Edge(edge_id))
     }
@@ -2080,7 +2137,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![edge_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Edge(edge_id)]);
 
         Ok(GeometryId::Edge(edge_id))
     }
@@ -2172,7 +2229,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![face_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Face(face_id)]);
 
         Ok(GeometryId::Face(face_id))
     }
@@ -2226,7 +2283,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![solid_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Solid(solid_id)]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -2280,7 +2337,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![solid_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Solid(solid_id)]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -2329,7 +2386,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![solid_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Solid(solid_id)]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -2389,7 +2446,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![solid_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Solid(solid_id)]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -2435,7 +2492,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![solid_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Solid(solid_id)]);
 
         Ok(GeometryId::Solid(solid_id))
     }
@@ -2707,7 +2764,7 @@ impl<'a> TopologyBuilder<'a> {
             .into(),
             timestamp: self.next_timestamp(),
         };
-        self.record_and_push(operation, vec![solid_id as u64]);
+        self.record_and_push(operation, vec![GeometryId::Solid(solid_id)]);
 
         Ok(solid_id)
     }
@@ -3987,7 +4044,7 @@ mod anchor_tests {
         assert_eq!(events.len(), 1, "exactly one event recorded");
         let ev = &events[0];
         assert_eq!(ev.kind, "datum_set_visibility");
-        assert_eq!(ev.inputs, vec![0u64]);
+        assert_eq!(ev.inputs, vec!["datum:0".to_string()]);
         assert_eq!(ev.parameters["datum_id"], 0);
         assert_eq!(ev.parameters["visible"], false);
         assert_eq!(ev.parameters["previous_visible"], true);
@@ -4173,7 +4230,7 @@ mod anchor_tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind, "datum_create");
-        assert_eq!(ev.outputs, vec![id as u64]);
+        assert_eq!(ev.outputs, vec![format!("datum:{}", id)]);
         assert_eq!(ev.parameters["kind"], "plane");
         assert_eq!(ev.parameters["name"], "WorkPlane");
         assert_eq!(ev.parameters["datum_id"], id);
@@ -4202,7 +4259,7 @@ mod anchor_tests {
         assert_eq!(events[0].kind, "datum_create");
         assert_eq!(events[0].parameters["kind"], "axis");
         assert_eq!(events[0].parameters["direction"], "y");
-        assert_eq!(events[0].outputs, vec![id as u64]);
+        assert_eq!(events[0].outputs, vec![format!("datum:{}", id)]);
     }
 
     #[test]
@@ -4229,7 +4286,7 @@ mod anchor_tests {
         assert_eq!(pos[0].as_f64().unwrap_or_default(), 7.0);
         assert_eq!(pos[1].as_f64().unwrap_or_default(), 8.0);
         assert_eq!(pos[2].as_f64().unwrap_or_default(), 9.0);
-        assert_eq!(events[0].outputs, vec![id as u64]);
+        assert_eq!(events[0].outputs, vec![format!("datum:{}", id)]);
     }
 
     #[test]
@@ -4319,7 +4376,7 @@ mod anchor_tests {
             .clone();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "datum_set_transform");
-        assert_eq!(events[1].inputs, vec![id as u64]);
+        assert_eq!(events[1].inputs, vec![format!("datum:{}", id)]);
     }
 
     #[test]
@@ -4672,7 +4729,7 @@ mod anchor_tests {
             .clone();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "datum_create_derived");
-        assert_eq!(events[0].outputs, vec![id as u64]);
+        assert_eq!(events[0].outputs, vec![format!("datum:{}", id)]);
         assert_eq!(events[0].parameters["name"], "Offset7");
     }
 

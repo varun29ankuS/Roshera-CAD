@@ -361,8 +361,8 @@ pub fn extrude_face(
                 "twist_angle": options.twist_angle,
                 "end_scale": options.end_scale,
             }))
-            .with_inputs(vec![face_id as u64])
-            .with_outputs(vec![unified_solid_id as u64]),
+            .with_input_faces([face_id as u64])
+            .with_output_solids([unified_solid_id as u64]),
     );
 
     Ok(unified_solid_id)
