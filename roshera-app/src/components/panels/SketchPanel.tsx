@@ -270,22 +270,29 @@ export function SketchPanel() {
 
   if (!sketch.active) return null
 
+  // Hints surface the multi-shape flow: completing a shape rolls
+  // into a new one of the same tool automatically, and the sketch
+  // only ends when the user explicitly Finishes (Enter) or Cancels
+  // (Esc). For polyline the close trigger is clicking back at the
+  // first point (snap engine already attracts the cursor there);
+  // for rectangle / circle the next click after the second anchor
+  // commits and starts a fresh shape.
   const hint =
     sketch.tool === 'polyline'
       ? sketch.points.length < 3
-        ? `Click ${3 - sketch.points.length} more point${sketch.points.length === 2 ? '' : 's'} · Enter to finish`
-        : 'Enter to finish · Backspace to undo'
+        ? `Click ${3 - sketch.points.length} more point${sketch.points.length === 2 ? '' : 's'} · Enter to finish & extrude`
+        : 'Click first point to close loop · Enter to finish & extrude'
       : sketch.tool === 'rectangle'
         ? sketch.points.length < 1
-          ? 'Click first corner'
+          ? 'Click first corner · keep going for more rectangles'
           : sketch.points.length < 2
             ? 'Click opposite corner'
-            : 'Enter to extrude'
+            : 'Click again for another rectangle · Enter to finish & extrude'
         : sketch.points.length < 1
-          ? 'Click circle center'
+          ? 'Click circle center · keep going for more circles'
           : sketch.points.length < 2
             ? 'Click radius point'
-            : 'Enter to extrude'
+            : 'Click again for another circle · Enter to finish & extrude'
 
   return (
     <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-auto cad-panel px-3 py-2 flex flex-col gap-2 text-[11px] uppercase tracking-wider min-w-[460px] max-w-[640px]">

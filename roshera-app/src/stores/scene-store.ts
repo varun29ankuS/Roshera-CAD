@@ -1030,14 +1030,39 @@ export const useSceneStore = create<SceneState>()(
     },
 
     setSketchTool: (tool) => {
-      const id = useSceneStore.getState().sketch.serverId
+      const state0 = useSceneStore.getState().sketch
+      // If the active shape already carries enough points to be a
+      // valid loop on its own, switching tools should commit it as a
+      // finished shape and start a fresh empty shape with the new
+      // tool — not discard the user's work. Mirrors the multi-shape
+      // flow in SketchOverlay: the sketch session keeps rolling
+      // forward and only ends on explicit Finish / Cancel.
+      //
+      // Threshold per tool matches the click-handler's auto-commit:
+      // polyline needs ≥3 points (the minimum non-degenerate
+      // polygon); rectangle / circle need both anchor points.
+      const activeTool = state0.tool
+      const activeCount = state0.points.length
+      const activeIsValid =
+        (activeTool === 'polyline' && activeCount >= 3) ||
+        ((activeTool === 'rectangle' || activeTool === 'circle') &&
+          activeCount >= 2)
+      if (activeIsValid && tool !== activeTool) {
+        // Commit the current shape via the existing multi-shape path,
+        // which snapshots the active points into `shapes`, appends an
+        // empty new active, and fires the backend `addShape` round-
+        // trip. We pass `tool` so the new shape starts in the user's
+        // freshly-selected mode.
+        useSceneStore.getState().addNewSketchShape(tool)
+        return
+      }
+
+      const id = state0.serverId
       set((state) => {
-        // Switching tools mid-sketch wipes the in-progress points; the
-        // primitives don't share semantics (polyline = N points,
-        // rectangle = 2 corners, circle = center+radius), so reusing
-        // prior clicks would always be wrong. Mirror this onto the
-        // last entry of `shapes` so the active-shape view stays
-        // consistent.
+        // No valid in-progress shape to commit: just retag the
+        // active shape's tool and wipe any half-placed points (the
+        // primitives don't share semantics so reusing prior clicks
+        // would always be wrong).
         const shapes = withActiveShapeUpdate(state.sketch.shapes, (s) => ({
           ...s,
           tool,

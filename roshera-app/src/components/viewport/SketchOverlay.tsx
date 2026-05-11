@@ -346,6 +346,7 @@ function fmtAngle(rad: number): string {
 export function SketchOverlay() {
   const sketch = useSceneStore((s) => s.sketch)
   const addSketchPoint = useSceneStore((s) => s.addSketchPoint)
+  const addNewSketchShape = useSceneStore((s) => s.addNewSketchShape)
   const setSketchHover = useSceneStore((s) => s.setSketchHover)
   const setSketchSnapState = useSceneStore((s) => s.setSketchSnapState)
   const showMeasure = sketch.measure
@@ -425,16 +426,63 @@ export function SketchOverlay() {
       const rawUv = pointToPlaneUV(e.point, sketch.plane)
       const { uv: snapped } = computeSnap(rawUv)
 
-      // Tool-specific termination: rectangle = 2 corners, circle =
-      // center + radius point. For polyline the panel's "Finish"
-      // button (or Enter) closes the loop.
+      // Multi-shape sketch flow: a single sketch session can carry
+      // multiple closed loops, each becoming its own ServerSketchShape.
+      // The user should never have to reach for "Add shape" — every
+      // completed loop rolls into a new shape automatically, and the
+      // sketch only ends when the user explicitly Finishes or Cancels.
+      // Three completion triggers, one per tool:
+      //
+      //   - Rectangle / circle: each tool consumes exactly 2 clicks.
+      //     A 3rd click on the same plane means "I'm done with this
+      //     one, start another" — auto-commit the current shape and
+      //     drop this click as the first point of a new shape with
+      //     the same tool.
+      //
+      //   - Polyline: the user signals "close this loop" by clicking
+      //     back at the first vertex (which the snap engine already
+      //     attracts the cursor to as a magnetic target). The clicked
+      //     point is NOT appended — the polygon naturally closes via
+      //     the first→last edge — and we auto-commit + start a fresh
+      //     polyline ready for the next loop.
       const tool: SketchTool = sketch.tool
-      if (tool === 'rectangle' && sketch.points.length >= 2) return
-      if (tool === 'circle' && sketch.points.length >= 2) return
+      const pts = sketch.points
+
+      if (tool === 'polyline' && pts.length >= 3) {
+        const p0 = pts[0]
+        const dx = snapped[0] - p0[0]
+        const dy = snapped[1] - p0[1]
+        // Tolerance matches the snap-target rounding in snapToGeometry:
+        // when the cursor latches onto the first vertex, the snapped
+        // uv is the exact stored point, so any difference > epsilon
+        // means the user clicked somewhere else.
+        if (dx * dx + dy * dy < 1e-12) {
+          addNewSketchShape(tool)
+          return
+        }
+      }
+
+      if ((tool === 'rectangle' || tool === 'circle') && pts.length >= 2) {
+        // The current rectangle / circle has both anchor points, so
+        // it's a complete shape on the backend's terms. Commit it,
+        // start a fresh shape with the same tool, and use this click
+        // as that new shape's first anchor — all in one gesture.
+        addNewSketchShape(tool)
+        addSketchPoint(snapped)
+        return
+      }
 
       addSketchPoint(snapped)
     },
-    [sketch.active, sketch.plane, sketch.points.length, sketch.tool, addSketchPoint, computeSnap],
+    [
+      sketch.active,
+      sketch.plane,
+      sketch.points,
+      sketch.tool,
+      addSketchPoint,
+      addNewSketchShape,
+      computeSnap,
+    ],
   )
 
   if (!sketch.active) return null
