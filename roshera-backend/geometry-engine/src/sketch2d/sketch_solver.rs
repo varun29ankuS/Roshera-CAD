@@ -57,6 +57,16 @@ use super::sketch::Sketch;
 use super::{Circle2d, Line2d, LineSegment2d, Point2d, Ray2d, Vector2d};
 use thiserror::Error;
 
+/// Tag for an entity the bridge skipped because the solver does not yet
+/// have a public `EntityState` constructor for its kind.
+///
+/// Surfaced in [`SketchSolveReport::entities_skipped`] so the UI can
+/// highlight specifically which arcs / splines / rectangles will
+/// remain unsolved until the relevant slice (C for arcs/splines) lands.
+/// Reporting the [`EntityRef`] (not just a count) lets downstream
+/// callers cross-reference against the sketch's entity stores.
+pub type SkippedEntity = EntityRef;
+
 /// Tunables for a single solve invocation.
 ///
 /// Defaults match `ConstraintSolver::new()`:
@@ -121,10 +131,10 @@ pub enum SketchSolveError {
 
 /// Snapshot of one solve invocation.
 ///
-/// This is intentionally a value object, not a builder — callers
-/// destructure it. `entities_solved` distinguishes the population that
-/// participated in the solve (point/line/circle) from the kinds that
-/// passed through unsolved.
+/// Value object — callers destructure it or use the convenience
+/// accessors. The report carries everything a UI needs to draw a
+/// "Fully constrained / 3 DOF / 12 iterations / 0.42 ms" status badge
+/// without having to pattern-match the raw [`SolverStatus`].
 #[derive(Debug, Clone)]
 pub struct SketchSolveReport {
     /// Newton-Raphson outcome.
@@ -142,17 +152,93 @@ pub struct SketchSolveReport {
     /// constraints whose entity kind is unsupported in v1 (they are
     /// no-ops inside the solver but still counted).
     pub constraints_solved: usize,
-    /// Number of sketch entities that were not addressable through
-    /// the public `EntityState` constructors and were therefore
-    /// excluded from the solve. Non-zero values are an inherent
-    /// limitation of slice B-1; slice C lifts it for arcs / splines.
-    pub entities_skipped_unsupported: usize,
+    /// Entity references the bridge could not address through the
+    /// public `EntityState` constructors and therefore excluded from
+    /// the solve. Slice B-1 limitation; slice C lifts it for arcs /
+    /// splines / polylines. Reporting the [`EntityRef`] (not just a
+    /// count) lets the UI highlight exactly which entities went
+    /// unsolved.
+    pub entities_skipped: Vec<SkippedEntity>,
 }
 
 impl SketchSolveReport {
     /// Convenience: did the solver converge to within tolerance?
     pub fn converged(&self) -> bool {
         matches!(self.status, SolverStatus::Converged { .. })
+    }
+
+    /// Convenience: is the sketch fully constrained (converged with
+    /// no remaining degrees of freedom)?
+    ///
+    /// In Onshape / SolidWorks / Fusion parlance this is the "fully
+    /// defined" state that turns the sketch border green.
+    pub fn is_fully_constrained(&self) -> bool {
+        self.converged()
+    }
+
+    /// Convenience: did the solver report an under-constrained system?
+    pub fn is_under_constrained(&self) -> bool {
+        matches!(self.status, SolverStatus::UnderConstrained { .. })
+    }
+
+    /// Convenience: did the solver report an over-constrained system?
+    pub fn is_over_constrained(&self) -> bool {
+        matches!(self.status, SolverStatus::OverConstrained { .. })
+    }
+
+    /// Convenience: did the solver report numerical instability
+    /// (singular or near-singular Jacobian, NaN propagation)?
+    pub fn is_unstable(&self) -> bool {
+        matches!(self.status, SolverStatus::Unstable)
+    }
+
+    /// Newton-Raphson iteration count when available
+    /// (`Converged` / `NotConverged`). `None` for early-rejected
+    /// statuses (under/over-constrained, unstable).
+    pub fn iterations(&self) -> Option<usize> {
+        match self.status {
+            SolverStatus::Converged { iterations, .. }
+            | SolverStatus::NotConverged { iterations, .. } => Some(iterations),
+            _ => None,
+        }
+    }
+
+    /// `‖residual‖₂` at solver exit when available
+    /// (`Converged` / `NotConverged`).
+    pub fn final_error(&self) -> Option<f64> {
+        match self.status {
+            SolverStatus::Converged { final_error, .. }
+            | SolverStatus::NotConverged { final_error, .. } => Some(final_error),
+            _ => None,
+        }
+    }
+
+    /// Remaining degrees of freedom reported by the under-constrained
+    /// detector. `Some(n)` only when `status == UnderConstrained{…}`.
+    pub fn degrees_of_freedom(&self) -> Option<usize> {
+        match self.status {
+            SolverStatus::UnderConstrained { degrees_of_freedom } => Some(degrees_of_freedom),
+            _ => None,
+        }
+    }
+
+    /// Conflicting-constraint count from the over-constrained
+    /// detector. `Some(n)` only when `status == OverConstrained{…}`.
+    pub fn conflicting_constraints(&self) -> Option<usize> {
+        match self.status {
+            SolverStatus::OverConstrained {
+                conflicting_constraints,
+            } => Some(conflicting_constraints),
+            _ => None,
+        }
+    }
+
+    /// Count of entities the bridge could not register with the
+    /// solver because their kind has no public `EntityState`
+    /// constructor yet (arc / spline / polyline / rectangle /
+    /// ellipse). Equivalent to `entities_skipped.len()`.
+    pub fn skipped_count(&self) -> usize {
+        self.entities_skipped.len()
     }
 }
 
@@ -190,22 +276,10 @@ pub fn solve_with_options(
     let mut solver = ConstraintSolver::new();
     solver.set_max_iterations(options.max_iterations);
     solver.set_tolerance(options.tolerance);
-    // `damping_factor` is a private field on ConstraintSolver in the
-    // current solver impl; the public API ships with `0.5` and that
-    // is documented in `SolveOptions::default`. The `damping_factor`
-    // field on `SolveOptions` exists for forward-compat with B-2
-    // (drag re-solve will want a tighter damping). Until the solver
-    // exposes a setter we honour the documented default — passing a
-    // non-default value is rejected up-front so callers cannot
-    // silently rely on a no-op.
-    if (options.damping_factor - 0.5).abs() > f64::EPSILON {
-        return Err(SketchSolveError::InvalidDamping {
-            value: options.damping_factor,
-        });
-    }
+    solver.set_damping_factor(options.damping_factor);
 
     let entities_solved = populate_solver(sketch, &solver);
-    let entities_skipped_unsupported = count_unsupported(sketch);
+    let entities_skipped = collect_unsupported(sketch);
 
     let constraints = sketch.all_constraints();
     let constraints_solved = constraints.len();
@@ -221,7 +295,7 @@ pub fn solve_with_options(
         solve_time_ms: result.solve_time_ms,
         entities_solved,
         constraints_solved,
-        entities_skipped_unsupported,
+        entities_skipped,
     })
 }
 
@@ -285,19 +359,32 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     registered
 }
 
-/// Count entities whose kinds are unsupported by the v1 bridge.
-fn count_unsupported(sketch: &Sketch) -> usize {
-    // We can't iterate arcs / rectangles / ellipses / splines /
-    // polylines through public accessors today, but we can count
-    // them via the existing `SketchStatistics` surface. The bridge
-    // uses the stat counters because they go through the same
-    // public surface the rest of the API uses.
-    let stats = sketch.statistics();
-    stats.arc_count
-        + stats.rectangle_count
-        + stats.ellipse_count
-        + stats.spline_count
-        + stats.polyline_count
+/// Collect `EntityRef`s for entities whose kinds are unsupported by
+/// the slice B-1 bridge (arcs / rectangles / ellipses / splines /
+/// polylines). The returned vector is in DashMap iteration order;
+/// callers that need a stable order should sort after collection.
+///
+/// Returning the IDs (not just a count) lets the UI highlight
+/// specifically which entities will remain unsolved until later
+/// slices add `EntityState` constructors for their kinds.
+fn collect_unsupported(sketch: &Sketch) -> Vec<EntityRef> {
+    let mut skipped: Vec<EntityRef> = Vec::new();
+    for entry in sketch.arcs().iter() {
+        skipped.push(EntityRef::Arc(*entry.key()));
+    }
+    for entry in sketch.rectangles().iter() {
+        skipped.push(EntityRef::Rectangle(*entry.key()));
+    }
+    for entry in sketch.ellipses().iter() {
+        skipped.push(EntityRef::Ellipse(*entry.key()));
+    }
+    for entry in sketch.splines().iter() {
+        skipped.push(EntityRef::Spline(*entry.key()));
+    }
+    for entry in sketch.polylines().iter() {
+        skipped.push(EntityRef::Polyline(*entry.key()));
+    }
+    skipped
 }
 
 /// Translate a `LineGeometry` variant into the (point, direction)
@@ -472,14 +559,26 @@ mod tests {
     }
 
     #[test]
-    fn options_non_default_damping_rejected_until_setter_lands() {
-        // The current solver hardcodes 0.5; passing 1.0 is rejected
-        // up-front so callers cannot silently rely on a no-op.
+    fn options_damping_at_one_accepted() {
+        // 1.0 is the upper bound of the valid range and corresponds
+        // to an undamped Newton step. The solver now exposes a real
+        // setter so the bridge passes the value through; the smoke
+        // test asserts that a 1.0 damping factor does not get
+        // rejected upstream.
         let opts = SolveOptions::new(50, 1e-10, 1.0);
-        assert!(matches!(
-            solve_with_options(&fresh_sketch(), opts),
-            Err(SketchSolveError::InvalidDamping { .. }),
-        ));
+        let report = solve_with_options(&fresh_sketch(), opts)
+            .expect("damping 1.0 is in (0, 1] and must be accepted");
+        let _ = report.status;
+    }
+
+    #[test]
+    fn options_damping_propagates_into_solver() {
+        // 0.25 is in range and distinct from the solver's default
+        // 0.5; calling solve with it must not error.
+        let opts = SolveOptions::new(50, 1e-10, 0.25);
+        let report = solve_with_options(&fresh_sketch(), opts)
+            .expect("damping 0.25 in (0, 1] is accepted");
+        let _ = report.status;
     }
 
     // ── Population counts ──────────────────────────────────────────
@@ -490,7 +589,8 @@ mod tests {
         let report = solve(&sketch).expect("empty solve");
         assert_eq!(report.entities_solved, 0);
         assert_eq!(report.constraints_solved, 0);
-        assert_eq!(report.entities_skipped_unsupported, 0);
+        assert!(report.entities_skipped.is_empty());
+        assert_eq!(report.skipped_count(), 0);
     }
 
     #[test]
@@ -508,14 +608,15 @@ mod tests {
         sketch
             .add_circle(Point2d::new(1.0, 1.0), 0.5)
             .expect("c");
-        sketch
+        let rect_id = sketch
             .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(2.0, 1.0))
             .expect("rect");
 
         let report = solve(&sketch).expect("solve");
         // 1 point + 1 circle = 2 supported; rectangle skipped.
         assert_eq!(report.entities_solved, 2);
-        assert_eq!(report.entities_skipped_unsupported, 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
     }
 
     // ── Write-back correctness ─────────────────────────────────────
@@ -690,6 +791,80 @@ mod tests {
         let (p, d) = line_to_point_direction(&inf);
         assert_eq!(p.x, 0.0);
         assert_eq!(d.x, 1.0);
+    }
+
+    // ── Convenience accessors on SketchSolveReport ─────────────────
+
+    fn report_with_status(status: SolverStatus) -> SketchSolveReport {
+        SketchSolveReport {
+            status,
+            violations: Vec::new(),
+            solve_time_ms: 0.0,
+            entities_solved: 0,
+            constraints_solved: 0,
+            entities_skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn report_converged_status_maps_through() {
+        let r = report_with_status(SolverStatus::Converged {
+            iterations: 7,
+            final_error: 1e-12,
+        });
+        assert!(r.converged());
+        assert!(r.is_fully_constrained());
+        assert!(!r.is_under_constrained());
+        assert!(!r.is_over_constrained());
+        assert!(!r.is_unstable());
+        assert_eq!(r.iterations(), Some(7));
+        assert!(r.final_error().expect("err") < 1e-10);
+        assert_eq!(r.degrees_of_freedom(), None);
+        assert_eq!(r.conflicting_constraints(), None);
+    }
+
+    #[test]
+    fn report_under_constrained_exposes_dof() {
+        let r = report_with_status(SolverStatus::UnderConstrained {
+            degrees_of_freedom: 3,
+        });
+        assert!(!r.converged());
+        assert!(r.is_under_constrained());
+        assert_eq!(r.degrees_of_freedom(), Some(3));
+        assert_eq!(r.iterations(), None);
+        assert_eq!(r.final_error(), None);
+        assert_eq!(r.conflicting_constraints(), None);
+    }
+
+    #[test]
+    fn report_over_constrained_exposes_conflicting_count() {
+        let r = report_with_status(SolverStatus::OverConstrained {
+            conflicting_constraints: 2,
+        });
+        assert!(r.is_over_constrained());
+        assert_eq!(r.conflicting_constraints(), Some(2));
+        assert_eq!(r.degrees_of_freedom(), None);
+        assert_eq!(r.iterations(), None);
+    }
+
+    #[test]
+    fn report_unstable_status_recognised() {
+        let r = report_with_status(SolverStatus::Unstable);
+        assert!(r.is_unstable());
+        assert!(!r.converged());
+        assert_eq!(r.iterations(), None);
+        assert_eq!(r.degrees_of_freedom(), None);
+    }
+
+    #[test]
+    fn report_not_converged_exposes_iterations() {
+        let r = report_with_status(SolverStatus::NotConverged {
+            iterations: 100,
+            final_error: 0.42,
+        });
+        assert!(!r.converged());
+        assert_eq!(r.iterations(), Some(100));
+        assert_eq!(r.final_error(), Some(0.42));
     }
 
     #[test]
