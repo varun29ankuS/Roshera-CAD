@@ -439,3 +439,77 @@ fn drag_options_preset_validates() {
         .expect("drag preset accepted");
     let _ = report.status;
 }
+
+#[test]
+fn drag_locked_point_rejected_before_solve_runs() {
+    // A point with `is_fixed = true` must refuse to drag — this
+    // mirrors Fusion / SolidWorks / Onshape behaviour where locked
+    // sketch geometry is undraggable. Without this guard the soft
+    // X/Y pull would fight the fixed-mask inside the solver and
+    // produce a misleading over-constrained report.
+    let sketch = fresh();
+    let p = sketch.add_point(Point2d::new(7.0, -3.0));
+    {
+        let mut e = sketch.points().get_mut(&p).expect("p");
+        e.value_mut().fix();
+    }
+    let err = sketch
+        .solve_drag(
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(0.0, 0.0)),
+        )
+        .expect_err("locked point cannot be dragged");
+    assert_eq!(
+        err,
+        SketchSolveError::DragEntityFixed {
+            entity: EntityRef::Point(p),
+        }
+    );
+    // Position must not have moved (rejection happens pre-solve).
+    let pos = sketch.points().get(&p).expect("p").value().position;
+    assert_eq!(pos.x, 7.0);
+    assert_eq!(pos.y, -3.0);
+}
+
+#[test]
+fn drag_preserves_entity_id_after_call() {
+    // Identity preservation contract — matches the body-modify
+    // architecture where mutations rewrite fields on existing ids.
+    let sketch = fresh();
+    let id = sketch.add_point(Point2d::new(0.0, 0.0));
+    let _ = sketch
+        .solve_drag(
+            EntityRef::Point(id),
+            DragTarget::Point(Point2d::new(11.0, -2.5)),
+        )
+        .expect("drag");
+    assert!(sketch.points().contains_key(&id));
+}
+
+#[test]
+fn analyze_dofs_flags_constraints_skipped_when_unsupported_kinds_touched() {
+    // The DOF verdict must remain honest when the sketch contains
+    // entity kinds slice B-2 cannot analyse. Counting their
+    // constraints while excluding their free DOFs would produce
+    // a phantom over-constraint; the bridge instead surfaces a
+    // `constraints_skipped > 0` flag so the UI can warn.
+    let sketch = fresh();
+    let p = sketch.add_point(Point2d::new(0.0, 0.0));
+    let rect = sketch
+        .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
+        .expect("rect");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Coincident,
+        vec![EntityRef::Point(p), EntityRef::Rectangle(rect)],
+        ConstraintPriority::High,
+    ));
+
+    let dof = sketch.analyze_dofs();
+    assert!(dof.has_skipped_constraints());
+    assert_eq!(dof.constraints_skipped, 1);
+    assert_eq!(dof.constraints_analysed, 0);
+    // Verdict reflects the supported subset only: 2 free DOFs on
+    // the point, 0 removed (constraint filtered out).
+    assert!(dof.is_under_constrained());
+    assert_eq!(dof.remaining_dofs(), Some(2));
+}
