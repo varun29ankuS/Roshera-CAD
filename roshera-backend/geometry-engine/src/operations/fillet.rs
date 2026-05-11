@@ -138,15 +138,26 @@ pub fn fillet_edges(
     // step below — needed for the recorder payload.
     let input_edges_for_record: Vec<u64> = edges.iter().map(|&e| e as u64).collect();
 
-    // Additional robust validation
+    // Additional robust validation. For variable-radius fillets we
+    // must check both endpoint radii — the linear interpolant means
+    // either end can independently violate the half-edge-length bound,
+    // and rejecting only `r1` (as the original loop did) lets a
+    // pathological `r2` slip through to surgery time where it would
+    // surface a less actionable error.
     for &edge_id in &edges {
-        let radius = match &options.fillet_type {
-            FilletType::Constant(r) => *r,
-            FilletType::Variable(r1, _) => *r1,
-            FilletType::Function(_) => 1.0, // Will validate per point
-            FilletType::Chord(c) => *c,
+        let radii_to_check: Vec<f64> = match &options.fillet_type {
+            FilletType::Constant(r) => vec![*r],
+            FilletType::Variable(r1, r2) => vec![*r1, *r2],
+            // Function radii are validated per-sample inside the
+            // surgery loop; the placeholder of 1.0 only exercises the
+            // structural bounds here (edge length non-zero, edge
+            // exists).
+            FilletType::Function(_) => vec![1.0],
+            FilletType::Chord(c) => vec![*c],
         };
-        validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)?;
+        for radius in radii_to_check {
+            validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)?;
+        }
     }
 
     // Get radius value(s)
@@ -307,6 +318,17 @@ fn create_constant_radius_fillet(
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
         .clone();
 
+    // Closed circular edges (cylinder/hole rims, torus seams) require a
+    // distinct topology — a torus blend with two periodic trim loops and
+    // no V0/V1 caps. The default 4-sided template assumes V0 != V1 and
+    // would hit `Edge axis normalize failed: DivisionByZero` at the cap
+    // construction step. Slice A2 fills in the real implementation; for
+    // now this surfaces a clean error so the caller sees an actionable
+    // message instead of the cryptic numerical failure.
+    if edge.is_loop() {
+        return create_closed_edge_fillet(model, edge_id, face1_id, face2_id, radius, radius);
+    }
+
     // Compute rolling ball positions along edge
     let rolling_ball_data =
         compute_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, radius)?;
@@ -364,6 +386,21 @@ fn create_variable_radius_fillet(
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
         .clone();
 
+    // Same closed-edge guard as the constant path. A variable-radius
+    // closed fillet is geometrically more nuanced (the radius profile
+    // must be periodic to avoid a discontinuity at the seam) and is
+    // doubly-not-supported until A2 lands the constant case first.
+    if edge.is_loop() {
+        return create_closed_edge_fillet(
+            model,
+            edge_id,
+            face1_id,
+            face2_id,
+            start_radius,
+            end_radius,
+        );
+    }
+
     // Compute rolling ball positions with variable radius
     let rolling_ball_data = compute_variable_rolling_ball_positions(
         model,
@@ -409,6 +446,524 @@ fn create_variable_radius_fillet(
         cap_v0_radius,
         cap_v1_radius,
     )
+}
+
+/// Closed-edge fillet (cylinder/hole rim, torus seam) — entry dispatcher.
+///
+/// A closed edge has `start_vertex == end_vertex`, so the rolling-ball
+/// sweep produces a torus segment that closes on itself with no V0/V1
+/// caps. The default 4-sided template assumes V0 != V1 and would hit
+/// `Edge axis normalize failed: DivisionByZero` at the cap construction
+/// step.
+///
+/// Slice A2 ships the cylinder-rim case (Plane cap + Cylinder lateral):
+///   - The cap circle shrinks from `R` to `R - r`.
+///   - The lateral cylinder shortens by `r` along its axis on the rim
+///     side; the lateral surface itself is replaced in-place with a new
+///     `Cylinder` carrying updated `height_limits`.
+///   - A new quarter-torus surface (`Torus` with `param_limits` set to
+///     `u ∈ [0, 2π], v ∈ [0, π/2]`) becomes the blend face. Its outer
+///     loop is the standard "seamed" pattern shared with cylinder
+///     lateral faces:
+///         lat_trim_edge  forward
+///         seam_arc_edge  forward
+///         cap_trim_edge  backward
+///         seam_arc_edge  backward
+///   - The original rim edge and seam edge are retired; the rim seam
+///     vertex is mutated to its new (shortened) position and a fresh
+///     vertex is added at the reduced cap radius.
+///
+/// Cone caps (Cone+Plane), torus seams (Torus+Plane), and revolve seams
+/// land in follow-up slices — they need their own surface-type pairs and
+/// are surfaced here as `NotImplemented`.
+///
+/// Returns `(blend_face_id, None)` — closed-edge fillets do their own
+/// surgery in-line (no four-sided splice via `BlendEdgeSurgery`), so
+/// the surgery slot is left empty for `update_adjacent_faces` to skip.
+fn create_closed_edge_fillet(
+    model: &mut BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
+    start_radius: f64,
+    end_radius: f64,
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
+    use crate::primitives::surface::{Cylinder, Plane};
+
+    // Variable radius on a closed edge requires a *periodic* radius
+    // profile (same value at u=0 and u=2π) to avoid a discontinuity at
+    // the seam. Slice A2 ships the constant case only.
+    if (start_radius - end_radius).abs() > 1e-9 {
+        return Err(OperationError::NotImplemented(format!(
+            "Variable-radius fillet on closed edges (edge {edge_id}) requires a \
+             periodic radius profile and is not yet supported. Use a constant \
+             radius (start == end). Tracked as a follow-up under task #89."
+        )));
+    }
+    let radius = start_radius;
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Closed-edge fillet (edge {edge_id}) radius must be a positive finite \
+             number; got {radius}"
+        )));
+    }
+
+    // Identify cap (Plane) vs lateral (Cylinder). The cylinder-rim case
+    // is the only Plane–Cylinder pair we ship in slice A2.
+    let face1 = model
+        .faces
+        .get(face1_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {face1_id} not found")))?
+        .clone();
+    let face2 = model
+        .faces
+        .get(face2_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {face2_id} not found")))?
+        .clone();
+
+    let surf1 = model.surfaces.get(face1.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face1.surface_id))
+    })?;
+    let surf2 = model.surfaces.get(face2.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face2.surface_id))
+    })?;
+
+    let plane1 = surf1.as_any().downcast_ref::<Plane>();
+    let cyl1 = surf1.as_any().downcast_ref::<Cylinder>();
+    let plane2 = surf2.as_any().downcast_ref::<Plane>();
+    let cyl2 = surf2.as_any().downcast_ref::<Cylinder>();
+
+    let (cap_face_id, lat_face_id, plane, cylinder) = if let (Some(p), Some(c)) = (plane1, cyl2) {
+        (face1_id, face2_id, *p, *c)
+    } else if let (Some(c), Some(p)) = (cyl1, plane2) {
+        (face2_id, face1_id, *p, *c)
+    } else {
+        return Err(OperationError::NotImplemented(format!(
+            "Closed-edge fillet (edge {edge_id}) currently supports only \
+             Plane–Cylinder rims (cylinder caps). Cone, torus, and revolve \
+             seams are tracked as follow-up slices under task #89."
+        )));
+    };
+
+    cylinder_rim_fillet(
+        model,
+        edge_id,
+        cap_face_id,
+        lat_face_id,
+        &plane,
+        &cylinder,
+        radius,
+    )
+}
+
+/// Build the quarter-torus blend that replaces a cylinder/cap rim.
+///
+/// See [`create_closed_edge_fillet`] for the high-level recipe. This
+/// helper does the topology surgery directly because the new face's
+/// loop pattern is the same "seamed" rectangle a cylinder lateral uses,
+/// which `splice_blend_edge` (designed for the open V0–V1 case) cannot
+/// produce.
+fn cylinder_rim_fillet(
+    model: &mut BRepModel,
+    rim_edge_id: EdgeId,
+    cap_face_id: FaceId,
+    lat_face_id: FaceId,
+    plane: &crate::primitives::surface::Plane,
+    cylinder: &crate::primitives::surface::Cylinder,
+    radius: f64,
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
+    use crate::primitives::curve::Arc;
+    use crate::primitives::edge::EdgeOrientation;
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::{Cylinder, Torus};
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+
+    let axis = cylinder.axis;
+    let ref_dir = cylinder.ref_dir;
+    let big_r = cylinder.radius;
+    let origin = cylinder.origin;
+
+    let height_limits = cylinder.height_limits.ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "Closed-edge fillet requires a finite cylinder (height_limits set)".to_string(),
+        )
+    })?;
+    let h_low = height_limits[0];
+    let h_high = height_limits[1];
+    let height = h_high - h_low;
+
+    // Geometric preconditions:
+    //   - r < R/2 keeps the resulting torus's minor radius strictly
+    //     below its major radius, so the surface doesn't self-pinch
+    //     (Torus::new rejects minor >= major outright).
+    //   - r < height keeps the lateral cylinder non-degenerate after
+    //     it's shortened on the rim side.
+    if radius >= big_r * 0.5 - 1e-9 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Fillet radius {radius} too large for cylinder rim: must be strictly \
+             less than half the cylinder radius ({big_r}); the resulting torus \
+             would self-pinch (minor >= major)."
+        )));
+    }
+    if radius >= height - 1e-9 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Fillet radius {radius} too large for cylinder rim: exceeds available \
+             cylinder height ({height}); the lateral surface would collapse."
+        )));
+    }
+
+    // sign = +1 for top rim (cap normal aligned with cylinder axis),
+    //      = -1 for bottom rim (cap normal opposite the cylinder axis).
+    let sign: f64 = if plane.normal.dot(&axis) > 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+
+    // After the fillet:
+    //   - cap stays at its original height (cap_h) but its outer
+    //     boundary shrinks from R to (R - r);
+    //   - the lateral cylinder is shortened by r on the cap side, so
+    //     its boundary on that side moves to lat_seam_h.
+    let cap_h = if sign > 0.0 { h_high } else { h_low };
+    let lat_seam_h = cap_h - sign * radius;
+
+    let new_height_limits = if sign > 0.0 {
+        [h_low, lat_seam_h]
+    } else {
+        [lat_seam_h, h_high]
+    };
+
+    // World-frame positions of the two new rim seam vertices.
+    //   v_lat (= old rim seam vertex, repurposed) lives on the lateral
+    //   cylinder at the new shorter height.
+    //   v_cap (= newly created) lives on the cap at the reduced radius.
+    let lat_seam_pos = origin + axis * lat_seam_h + ref_dir * big_r;
+    let cap_seam_pos = origin + axis * cap_h + ref_dir * (big_r - radius);
+
+    // Torus blend center on the cylinder axis at the lateral shrink
+    // height; its axis is the cylinder axis flipped for the rim's
+    // outward direction so v=0 of the parametrisation lies on the
+    // lateral side and v=π/2 on the cap side, regardless of which rim.
+    let torus_center = origin + axis * lat_seam_h;
+    let torus_axis = axis * sign;
+    // Center of the meridional quarter-arc (in the seam plane).
+    let torus_arc_center = torus_center + ref_dir * (big_r - radius);
+
+    // Snapshot the rim edge before mutating anything else.
+    let rim_edge = model
+        .edges
+        .get(rim_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Rim edge not found".to_string()))?
+        .clone();
+    if rim_edge.start_vertex != rim_edge.end_vertex {
+        return Err(OperationError::InvalidGeometry(
+            "Closed-edge fillet invariant violated: rim edge is not a loop".to_string(),
+        ));
+    }
+    let v_lat = rim_edge.start_vertex;
+
+    // Locate the two loops we need to rewrite.
+    let lat_loop_id = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Lateral face missing".to_string()))?;
+    let cap_loop_id = model
+        .faces
+        .get(cap_face_id)
+        .map(|f| f.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+
+    // The lateral seam edge appears twice in the lateral loop (once
+    // forward, once backward) — that's the canonical "seamed face"
+    // pattern. We need both index positions so we can replace them
+    // together with a fresh seam edge whose endpoints reflect v_lat's
+    // new position.
+    let (rim_idx_in_lat, seam_edge_id, seam_idx_first, seam_idx_second) = {
+        let lat_loop = model
+            .loops
+            .get(lat_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Lateral loop missing".to_string()))?;
+        let mut counts: HashMap<EdgeId, Vec<usize>> = HashMap::new();
+        for (i, &e) in lat_loop.edges.iter().enumerate() {
+            counts.entry(e).or_default().push(i);
+        }
+        let mut rim_idx: Option<usize> = None;
+        let mut seam_id: Option<EdgeId> = None;
+        let mut seam_first: Option<usize> = None;
+        let mut seam_second: Option<usize> = None;
+        for (i, &e) in lat_loop.edges.iter().enumerate() {
+            if e == rim_edge_id {
+                rim_idx = Some(i);
+                break;
+            }
+        }
+        for (e, idxs) in &counts {
+            if idxs.len() == 2 {
+                seam_id = Some(*e);
+                seam_first = Some(idxs[0]);
+                seam_second = Some(idxs[1]);
+                break;
+            }
+        }
+        (
+            rim_idx.ok_or_else(|| {
+                OperationError::InvalidGeometry(
+                    "Rim edge not found in lateral loop".to_string(),
+                )
+            })?,
+            seam_id.ok_or_else(|| {
+                OperationError::InvalidGeometry(
+                    "Lateral seam edge not found (no duplicate edge in loop)".to_string(),
+                )
+            })?,
+            seam_first.ok_or_else(|| {
+                OperationError::InvalidGeometry("Seam first occurrence missing".to_string())
+            })?,
+            seam_second.ok_or_else(|| {
+                OperationError::InvalidGeometry("Seam second occurrence missing".to_string())
+            })?,
+        )
+    };
+
+    // Snapshot the seam edge so we preserve its (start, end) vertex
+    // ordering on the replacement.
+    let seam_edge = model
+        .edges
+        .get(seam_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Seam edge not found".to_string()))?
+        .clone();
+
+    // ---- step 1: mutate v_lat to its new shortened-rim position. ----
+    // Every edge that referenced v_lat (rim, seam) is being rewritten
+    // in this same pass, so the move is safe.
+    if !model
+        .vertices
+        .set_position(v_lat, lat_seam_pos.x, lat_seam_pos.y, lat_seam_pos.z)
+    {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Failed to move lateral seam vertex {v_lat} to new rim position"
+        )));
+    }
+
+    // ---- step 2: create v_cap at the reduced cap radius. ----
+    let tol = Tolerance::default().distance();
+    let v_cap = model
+        .vertices
+        .add_or_find(cap_seam_pos.x, cap_seam_pos.y, cap_seam_pos.z, tol);
+
+    // ---- step 3: build the new curves. ----
+    // Cap and lateral trim circles share the cylinder's parametric
+    // direction so loop orientation flags carry over from the original
+    // top/bottom edges unchanged (see step 5).
+    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, big_r - radius)
+        .map_err(|e| OperationError::NumericalError(format!("cap trim circle: {e}")))?;
+    let lat_trim_circle = Arc::circle(torus_center, axis, big_r)
+        .map_err(|e| OperationError::NumericalError(format!("lat trim circle: {e}")))?;
+
+    // The seam arc connects v_lat (radial direction at the start) to
+    // v_cap (axial direction at the end) along a quarter-circle in the
+    // meridional plane spanned by (ref_dir, axis*sign). Arc picks its
+    // own canonical x_axis based on the normal it's given, so we
+    // compute start/sweep in the (x_axis, y_axis) frame Arc actually
+    // uses rather than assuming any particular alignment.
+    let normal_arc = ref_dir.cross(&axis) * sign;
+    let seam_arc = {
+        let probe = Arc::new(torus_arc_center, normal_arc, radius, 0.0, 0.0)
+            .map_err(|e| OperationError::NumericalError(format!("seam arc probe: {e}")))?;
+        let x_axis = probe.x_axis;
+        // probe.normal is the normalised version of normal_arc.
+        let y_axis = probe.normal.cross(&x_axis);
+        let start_a = ref_dir.dot(&y_axis).atan2(ref_dir.dot(&x_axis));
+        let end_dir = axis * sign;
+        let end_a = end_dir.dot(&y_axis).atan2(end_dir.dot(&x_axis));
+        let mut sweep = end_a - start_a;
+        if sweep > PI {
+            sweep -= TAU;
+        } else if sweep < -PI {
+            sweep += TAU;
+        }
+        Arc::new(torus_arc_center, normal_arc, radius, start_a, sweep)
+            .map_err(|e| OperationError::NumericalError(format!("seam arc: {e}")))?
+    };
+
+    // The new lateral seam line keeps the original edge's (start, end)
+    // vertex IDs — the IDs are unchanged, only their positions have
+    // moved (or v_cap, which didn't exist before).
+    let start_pos = {
+        let v = model.vertices.get(seam_edge.start_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Seam start vertex missing".to_string())
+        })?;
+        Point3::new(v.position[0], v.position[1], v.position[2])
+    };
+    let end_pos = {
+        let v = model.vertices.get(seam_edge.end_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Seam end vertex missing".to_string())
+        })?;
+        Point3::new(v.position[0], v.position[1], v.position[2])
+    };
+    let new_seam_line = Line::new(start_pos, end_pos);
+
+    let cap_trim_curve_id = model.curves.add(Box::new(cap_trim_circle));
+    let lat_trim_curve_id = model.curves.add(Box::new(lat_trim_circle));
+    let seam_arc_curve_id = model.curves.add(Box::new(seam_arc));
+    let new_seam_line_id = model.curves.add(Box::new(new_seam_line));
+
+    // ---- step 4: build the new edges. ----
+    // ParameterRange::new(0.0, 1.0) matches `Arc`'s unit
+    // parameterisation (see `Arc::new` → `range = ParameterRange::unit()`)
+    // — using [0, 2π] would clamp every t > 1 to 1 and pile every
+    // sample after the first onto the seam vertex (same trap fixed
+    // in `create_cylinder_topology`).
+    let cap_trim_edge_id = model.edges.add(Edge::new(
+        0,
+        v_cap,
+        v_cap,
+        cap_trim_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let lat_trim_edge_id = model.edges.add(Edge::new(
+        0,
+        v_lat,
+        v_lat,
+        lat_trim_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let torus_seam_edge_id = model.edges.add(Edge::new(
+        0,
+        v_lat,
+        v_cap,
+        seam_arc_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let new_seam_edge_id = model.edges.add(Edge::new(
+        0,
+        seam_edge.start_vertex,
+        seam_edge.end_vertex,
+        new_seam_line_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+
+    // ---- step 5: replace the rim slot in the cap loop. ----
+    // The cap loop is a single closed circle; preserve its original
+    // orientation flag (forward for top, backward for bottom — see
+    // `create_cylinder_topology` for why).
+    let cap_orientation = {
+        let cap_loop = model
+            .loops
+            .get(cap_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap loop missing".to_string()))?;
+        let mut orient = None;
+        for (i, &e) in cap_loop.edges.iter().enumerate() {
+            if e == rim_edge_id {
+                orient = Some(cap_loop.orientations[i]);
+                break;
+            }
+        }
+        orient.ok_or_else(|| {
+            OperationError::InvalidGeometry("Rim edge not found in cap loop".to_string())
+        })?
+    };
+    {
+        let cap_loop = model.loops.get_mut(cap_loop_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Cap loop missing (mut)".to_string())
+        })?;
+        for (i, edge) in cap_loop.edges.iter_mut().enumerate() {
+            if *edge == rim_edge_id {
+                *edge = cap_trim_edge_id;
+                cap_loop.orientations[i] = cap_orientation;
+                break;
+            }
+        }
+    }
+
+    // ---- step 6: replace rim + both seam slots in the lateral loop. ----
+    {
+        let lat_loop = model.loops.get_mut(lat_loop_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Lateral loop missing (mut)".to_string())
+        })?;
+        let rim_orient = lat_loop.orientations[rim_idx_in_lat];
+        let s1 = lat_loop.orientations[seam_idx_first];
+        let s2 = lat_loop.orientations[seam_idx_second];
+        lat_loop.edges[rim_idx_in_lat] = lat_trim_edge_id;
+        lat_loop.orientations[rim_idx_in_lat] = rim_orient;
+        lat_loop.edges[seam_idx_first] = new_seam_edge_id;
+        lat_loop.orientations[seam_idx_first] = s1;
+        lat_loop.edges[seam_idx_second] = new_seam_edge_id;
+        lat_loop.orientations[seam_idx_second] = s2;
+    }
+
+    // ---- step 7: shorten the lateral cylinder surface in-place. ----
+    let lat_surface_id = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.surface_id)
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "Lateral face missing for surface swap".to_string(),
+            )
+        })?;
+    let new_height = new_height_limits[1] - new_height_limits[0];
+    let new_origin = origin + axis * new_height_limits[0];
+    let new_cylinder = Cylinder::new_finite(new_origin, axis, big_r, new_height)
+        .map_err(|e| OperationError::NumericalError(format!("Shortened cylinder: {e}")))?;
+    if model
+        .surfaces
+        .replace(lat_surface_id, Box::new(new_cylinder))
+        .is_none()
+    {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Failed to replace lateral surface {lat_surface_id}"
+        )));
+    }
+
+    // ---- step 8: build the torus surface + blend face. ----
+    let mut torus = Torus::new(torus_center, torus_axis, big_r - radius, radius)
+        .map_err(|e| OperationError::NumericalError(format!("Torus blend: {e}")))?;
+    // Restrict to the quarter-toroidal sector u ∈ [0, 2π], v ∈ [0, π/2]
+    // so the surface domain matches the loop the four edges define.
+    torus.param_limits = Some([0.0, TAU, 0.0, FRAC_PI_2]);
+    // Anchor u=0 to the same ref_dir as the cylinder so the torus seam
+    // aligns with the new lateral seam edge.
+    torus.ref_dir = ref_dir;
+    let torus_surface_id = model.surfaces.add(Box::new(torus));
+
+    // Loop sequence (parameter-space CCW for outward-pointing torus):
+    //   (u=0, v=0)    → (u=2π, v=0)   : lat_trim_edge   forward
+    //   (u=2π, v=0)   → (u=2π, v=π/2) : torus_seam_edge forward
+    //   (u=2π, v=π/2) → (u=0,  v=π/2) : cap_trim_edge   backward
+    //   (u=0,  v=π/2) → (u=0,  v=0)   : torus_seam_edge backward
+    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    blend_loop.add_edge(lat_trim_edge_id, true);
+    blend_loop.add_edge(torus_seam_edge_id, true);
+    blend_loop.add_edge(cap_trim_edge_id, false);
+    blend_loop.add_edge(torus_seam_edge_id, false);
+    let blend_loop_id = model.loops.add(blend_loop);
+
+    let mut blend_face = Face::new(
+        0,
+        torus_surface_id,
+        blend_loop_id,
+        FaceOrientation::Forward,
+    );
+    blend_face.outer_loop = blend_loop_id;
+    let blend_face_id = model.faces.add(blend_face);
+
+    // ---- step 9: cleanup. ----
+    // The original rim edge and seam edge are no longer referenced by
+    // any loop. Curves are append-only in the kernel, so the old
+    // circle/line curves become orphaned but cannot be safely removed
+    // here without a curve-store reference count (out of scope).
+    model.edges.remove(rim_edge_id);
+    model.edges.remove(seam_edge_id);
+
+    Ok((blend_face_id, None))
 }
 
 /// Compute rolling ball positions for variable radius
