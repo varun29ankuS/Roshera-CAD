@@ -119,9 +119,16 @@ fn cylinder_top_rim_chamfer_succeeds_with_cone_blend() {
 
     // The original rim edge should no longer be present in the model
     // — it was retired in step 11 of create_closed_edge_chamfer.
+    //
+    // `EdgeStore::remove` marks the slot as deleted (rewrites it to a
+    // sentinel with `id == INVALID_EDGE_ID`) rather than freeing the
+    // backing Vec slot, so `edges.get(rim)` would still return
+    // `Some(&sentinel)`. The iterator at `EdgeStore::iter()` filters
+    // these sentinel slots out, which is the semantically correct
+    // "live edges only" view.
     assert!(
-        model.edges.get(rim).is_none(),
-        "rim edge {rim} should be removed from the model after the chamfer"
+        !model.edges.iter().any(|(id, _)| id == rim),
+        "rim edge {rim} should be retired from the live-edge iterator after the chamfer"
     );
 }
 
