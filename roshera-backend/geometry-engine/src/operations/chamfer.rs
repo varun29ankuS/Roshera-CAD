@@ -101,13 +101,17 @@ pub fn chamfer_edges(
     // Propagate edge selection if requested
     let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
-    // Create chamfer faces for each edge
+    // Create chamfer faces for each edge. Closed-edge (rim) chamfers
+    // perform their topology surgery inline and return `None`; open
+    // edges return `Some(surgery)` for the 4-face splice below.
     let mut chamfer_faces = Vec::new();
-    let mut surgeries = Vec::new();
+    let mut surgeries: Vec<BlendEdgeSurgery> = Vec::new();
     for &edge_id in &selected_edges {
         let (face_id, surgery) = create_edge_chamfer(model, solid_id, edge_id, &options)?;
         chamfer_faces.push(face_id);
-        surgeries.push(surgery);
+        if let Some(s) = surgery {
+            surgeries.push(s);
+        }
     }
 
     // Re-stitch surrounding topology and add chamfer faces to outer shell.
@@ -145,29 +149,71 @@ pub fn chamfer_edges(
     Ok(chamfer_faces)
 }
 
-/// Create chamfer for a single edge
+/// Create chamfer for a single edge.
+///
+/// Returns `(FaceId, Option<BlendEdgeSurgery>)`. For open edges the
+/// surgery is `Some(...)` and consumed by
+/// [`update_adjacent_faces_for_chamfer`] to splice the four-face
+/// neighbourhood around V0/V1. For closed (rim) edges the surgery is
+/// `None` because the rim-blend pipeline performs its surgery
+/// inline (no V0≠V1 to splice).
 fn create_edge_chamfer(
     model: &mut BRepModel,
     solid_id: SolidId,
     edge_id: EdgeId,
     options: &ChamferOptions,
-) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get adjacent faces
     let (face1_id, face2_id) = get_adjacent_faces(model, solid_id, edge_id)?;
 
-    // Create chamfer based on type
+    // Closed (rim/seam) edges — `start_vertex == end_vertex` — need a
+    // distinct topology. The shared `create_chamfer_face` helper assumes
+    // V0 != V1 and produces straight cap edges between distinct V0/V1
+    // chamfer vertices; on a closed edge both caps collapse to a single
+    // point and the chamfer face has no usable boundary. Upstream of
+    // that, `compute_chamfer_offsets` derives an edge axis via
+    // `(p1 - p0).normalize()` which is zero-length and surfaces as a
+    // cryptic `DivisionByZero` from the math layer.
+    //
+    // Dispatch closed cylinder rims to the cone-frustum blend pipeline
+    // — mirrors `create_closed_edge_fillet` in operations/fillet.rs but
+    // produces a truncated cone instead of a torus (chamfer's straight
+    // cross-section vs fillet's circular cross-section).
+    let is_closed = model
+        .edges
+        .get(edge_id)
+        .map(|e| e.is_loop())
+        .unwrap_or(false);
+    if is_closed {
+        let (d_lat, d_cap) = chamfer_distances_for_closed_edge(
+            model,
+            edge_id,
+            face1_id,
+            face2_id,
+            &options.chamfer_type,
+        )?;
+        return create_closed_edge_chamfer(model, edge_id, face1_id, face2_id, d_lat, d_cap);
+    }
+
+    // Create chamfer based on type. Open-edge creators return a
+    // non-optional surgery; wrap in `Some` to match the unified return
+    // shape that closed-edge dispatch above uses.
     match &options.chamfer_type {
         ChamferType::EqualDistance(dist) => {
             create_equal_distance_chamfer(model, edge_id, face1_id, face2_id, *dist)
+                .map(|(f, s)| (f, Some(s)))
         }
         ChamferType::TwoDistances(dist1, dist2) => {
             create_two_distance_chamfer(model, edge_id, face1_id, face2_id, *dist1, *dist2)
+                .map(|(f, s)| (f, Some(s)))
         }
         ChamferType::DistanceAngle(dist, angle) => {
             create_distance_angle_chamfer(model, edge_id, face1_id, face2_id, *dist, *angle)
+                .map(|(f, s)| (f, Some(s)))
         }
         ChamferType::Angle(angle) => {
             create_angle_chamfer(model, edge_id, face1_id, face2_id, *angle)
+                .map(|(f, s)| (f, Some(s)))
         }
     }
 }
@@ -291,6 +337,568 @@ fn create_angle_chamfer(
     let distance2 = distance1 * angle.sin() / denom;
 
     create_two_distance_chamfer(model, edge_id, face1_id, face2_id, distance1, distance2)
+}
+
+/// Resolve `(d_lat, d_cap)` distances for a closed-rim chamfer, where
+/// `d_lat` is the axial pullback along the cylinder and `d_cap` is the
+/// radial pullback on the cap face. Cylinder rims always have a π/2
+/// dihedral between cap and lateral, which fixes the geometry for
+/// `DistanceAngle` and `Angle` chamfer types.
+///
+/// Mapping of the four [`ChamferType`] variants:
+///
+///   * `EqualDistance(d)` → `(d, d)`.
+///   * `TwoDistances(d1, d2)` — `d1` is the pullback on `face1`; we
+///     route it to `d_lat` or `d_cap` depending on which face is the
+///     cylinder.
+///   * `DistanceAngle(d, a)` — by law of sines in the chamfer triangle
+///     with a π/2 dihedral, the second distance is `d · tan(a)`. The
+///     base distance `d` is on `face1` (same orientation convention as
+///     [`create_distance_angle_chamfer`]).
+///   * `Angle(a)` — the base distance defaults to one-tenth of the
+///     edge arc-length (matching [`create_angle_chamfer`]); the second
+///     follows by `tan(a)` as above. For a closed rim
+///     `edge_length = 2π·R`, so `Angle` typically requires a small
+///     cylinder radius to keep `d_cap < R`.
+fn chamfer_distances_for_closed_edge(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
+    chamfer_type: &ChamferType,
+) -> OperationResult<(f64, f64)> {
+    use crate::primitives::surface::Cylinder;
+    use std::f64::consts::FRAC_PI_2;
+
+    let face1 = model
+        .faces
+        .get(face1_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {face1_id} not found")))?;
+    let face2 = model
+        .faces
+        .get(face2_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {face2_id} not found")))?;
+    let surf1 = model.surfaces.get(face1.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face1.surface_id))
+    })?;
+    let surf2 = model.surfaces.get(face2.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face2.surface_id))
+    })?;
+
+    let face1_is_cylinder = surf1.as_any().downcast_ref::<Cylinder>().is_some();
+    let face2_is_cylinder = surf2.as_any().downcast_ref::<Cylinder>().is_some();
+
+    if face1_is_cylinder == face2_is_cylinder {
+        // Either both faces are cylinders (impossible for a manifold
+        // rim) or neither is — closed-edge chamfer only supports a
+        // Plane–Cylinder pair in this slice.
+        return Err(OperationError::NotImplemented(format!(
+            "Closed-edge chamfer (edge {edge_id}) currently supports only \
+             Plane–Cylinder rims (cylinder caps). Other rim topologies \
+             (cone, torus, revolve seams) are tracked as follow-ups."
+        )));
+    }
+
+    // `face1`'s distance is the user's `distance1` slot; route to
+    // (d_lat, d_cap) per which face is the cylinder.
+    let route = |d1_for_face1: f64, d2_for_face2: f64| -> (f64, f64) {
+        if face1_is_cylinder {
+            (d1_for_face1, d2_for_face2) // face1=lat, face2=cap
+        } else {
+            (d2_for_face2, d1_for_face1) // face1=cap, face2=lat → swap
+        }
+    };
+
+    match chamfer_type {
+        ChamferType::EqualDistance(d) => {
+            if !d.is_finite() || *d <= 0.0 {
+                return Err(OperationError::InvalidRadius(*d));
+            }
+            Ok((*d, *d))
+        }
+        ChamferType::TwoDistances(d1, d2) => {
+            if !d1.is_finite() || *d1 <= 0.0 {
+                return Err(OperationError::InvalidRadius(*d1));
+            }
+            if !d2.is_finite() || *d2 <= 0.0 {
+                return Err(OperationError::InvalidRadius(*d2));
+            }
+            Ok(route(*d1, *d2))
+        }
+        ChamferType::DistanceAngle(d, angle) => {
+            if !d.is_finite() || *d <= 0.0 {
+                return Err(OperationError::InvalidRadius(*d));
+            }
+            if !angle.is_finite() || *angle <= 0.0 || *angle >= FRAC_PI_2 {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "Chamfer angle {angle} rad must be in (0, π/2) rad for a \
+                     cylinder-rim chamfer (dihedral = π/2)"
+                )));
+            }
+            // π/2 dihedral: d2 = d * sin(a) / sin(π/2 − a) = d · tan(a).
+            let d_other = *d * angle.tan();
+            Ok(route(*d, d_other))
+        }
+        ChamferType::Angle(angle) => {
+            if !angle.is_finite() || *angle <= 0.0 || *angle >= FRAC_PI_2 {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "Chamfer angle {angle} rad must be in (0, π/2) rad for a \
+                     cylinder-rim chamfer (dihedral = π/2)"
+                )));
+            }
+            // Match `create_angle_chamfer`'s default: distance1 = 1/10
+            // of the underlying edge's arc-length. For a closed rim
+            // that's 2π·R / 10. We cannot reach `length()` without a
+            // mutable handle to curves here, so derive it from the
+            // cylinder radius directly.
+            // `Edge::length` is `&mut self` (caches the result), so we
+            // clone before measuring — chamfer_distances_for_closed_edge
+            // borrows `model` immutably and must not mutate the store.
+            let mut edge = model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+                .clone();
+            let edge_length = edge
+                .length(&model.curves, Tolerance::default())
+                .map_err(|e| OperationError::NumericalError(format!("Rim length: {:?}", e)))?;
+            if !edge_length.is_finite() || edge_length <= 0.0 {
+                return Err(OperationError::FeatureTooSmall);
+            }
+            let d1 = (edge_length * 0.1).max(Tolerance::default().distance() * 10.0);
+            let d2 = d1 * angle.tan();
+            Ok(route(d1, d2))
+        }
+    }
+}
+
+/// Build a cone-frustum chamfer that replaces a cylinder rim.
+///
+/// Mirrors `cylinder_rim_fillet` in `operations/fillet.rs`. The only
+/// surface-level difference is the chamfer surface — a truncated cone
+/// — versus the fillet's quarter-torus. Both produce the same loop
+/// topology (lateral trim circle + cap trim circle + two seam
+/// traversals), and both perform inline topology surgery (no
+/// [`BlendEdgeSurgery`] is returned because the rim has no V0/V1 pair
+/// to splice).
+///
+/// Returns `(blend_face_id, None)`. The `None` tells
+/// [`update_adjacent_faces_for_chamfer`] to skip the open-edge splice.
+#[allow(clippy::too_many_lines)] // mirrors cylinder_rim_fillet's structure for maintainability
+fn create_closed_edge_chamfer(
+    model: &mut BRepModel,
+    rim_edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
+    d_lat: f64,
+    d_cap: f64,
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
+    use crate::primitives::curve::{Arc, Line, ParameterRange};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::{Cone, Cylinder, Plane};
+    use std::collections::HashMap;
+
+    // ---------- step 0: identify cap (Plane) vs lateral (Cylinder). ----------
+    let face1 = model
+        .faces
+        .get(face1_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {face1_id} not found")))?
+        .clone();
+    let face2 = model
+        .faces
+        .get(face2_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {face2_id} not found")))?
+        .clone();
+    let surf1 = model.surfaces.get(face1.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face1.surface_id))
+    })?;
+    let surf2 = model.surfaces.get(face2.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face2.surface_id))
+    })?;
+
+    let plane1 = surf1.as_any().downcast_ref::<Plane>();
+    let cyl1 = surf1.as_any().downcast_ref::<Cylinder>();
+    let plane2 = surf2.as_any().downcast_ref::<Plane>();
+    let cyl2 = surf2.as_any().downcast_ref::<Cylinder>();
+
+    let (cap_face_id, lat_face_id, plane, cylinder) = if let (Some(p), Some(c)) = (plane1, cyl2) {
+        (face1_id, face2_id, *p, *c)
+    } else if let (Some(c), Some(p)) = (cyl1, plane2) {
+        (face2_id, face1_id, *p, *c)
+    } else {
+        return Err(OperationError::NotImplemented(format!(
+            "Closed-edge chamfer (edge {rim_edge_id}) currently supports only \
+             Plane–Cylinder rims (cylinder caps)."
+        )));
+    };
+
+    let axis = cylinder.axis;
+    let ref_dir = cylinder.ref_dir;
+    let big_r = cylinder.radius;
+    let origin = cylinder.origin;
+    let height_limits = cylinder.height_limits.ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "Closed-edge chamfer requires a finite cylinder (height_limits set)".to_string(),
+        )
+    })?;
+    let h_low = height_limits[0];
+    let h_high = height_limits[1];
+    let height = h_high - h_low;
+
+    // ---------- step 0b: geometric preconditions. ----------
+    // d_cap < big_r keeps the inner cap circle non-degenerate.
+    // d_lat < height keeps the lateral surface non-degenerate after
+    // it's shortened on the rim side.
+    if d_cap >= big_r - 1e-9 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Chamfer cap distance {d_cap} is too large for cylinder rim: must \
+             be strictly less than the cylinder radius ({big_r}); the inner \
+             cap circle would collapse to (or invert through) the axis."
+        )));
+    }
+    if d_lat >= height - 1e-9 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Chamfer lateral distance {d_lat} is too large for cylinder rim: \
+             exceeds available cylinder height ({height}); the lateral \
+             surface would collapse."
+        )));
+    }
+
+    // ---------- step 0c: rim sign + new seam positions. ----------
+    // sign = +1 for top rim (cap normal aligned with cylinder axis),
+    //      = -1 for bottom rim (cap normal opposite the cylinder axis).
+    let sign: f64 = if plane.normal.dot(&axis) > 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+
+    let cap_h = if sign > 0.0 { h_high } else { h_low };
+    let lat_seam_h = cap_h - sign * d_lat;
+
+    let new_height_limits = if sign > 0.0 {
+        [h_low, lat_seam_h]
+    } else {
+        [lat_seam_h, h_high]
+    };
+
+    // World-frame positions of the two new rim seam vertices.
+    //   v_lat (= old rim seam vertex, repurposed) lives on the lateral
+    //   cylinder at the new shorter height.
+    //   v_cap (= newly created) lives on the cap at the reduced radius.
+    let lat_seam_pos = origin + axis * lat_seam_h + ref_dir * big_r;
+    let cap_seam_pos = origin + axis * cap_h + ref_dir * (big_r - d_cap);
+
+    // ---------- step 0d: cone geometry. ----------
+    // Walking the chamfer line in (radial, axial) coordinates from
+    // (big_r, lat_seam_h) toward (big_r - d_cap, cap_h), the line hits
+    // the axis (r = 0) at axial height `cap_h + sign * h_a` where
+    //   h_a = d_lat * (big_r - d_cap) / d_cap.
+    // That intercept is the cone apex; the cone half-angle is
+    // atan2(d_cap, d_lat) (cap pullback over axial pullback). The
+    // cone's natural v-direction runs from the apex outward into the
+    // cylinder; v = h_a coincides with the cap seam circle (smaller
+    // radius), v = h_a + d_lat with the lateral seam circle (radius
+    // = big_r).
+    let h_a = d_lat * (big_r - d_cap) / d_cap;
+    let cone_apex = origin + axis * (cap_h + sign * h_a);
+    let cone_axis = axis * (-sign);
+    let cone_half_angle = (d_cap / d_lat).atan();
+    let cone_v_cap = h_a;
+    let cone_v_lat = h_a + d_lat;
+
+    // ---------- step 1: snapshot the rim edge. ----------
+    let rim_edge = model
+        .edges
+        .get(rim_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Rim edge not found".to_string()))?
+        .clone();
+    if rim_edge.start_vertex != rim_edge.end_vertex {
+        return Err(OperationError::InvalidGeometry(
+            "Closed-edge chamfer invariant violated: rim edge is not a loop".to_string(),
+        ));
+    }
+    let v_lat = rim_edge.start_vertex;
+
+    // ---------- step 2: locate the cap and lateral loops. ----------
+    let lat_loop_id = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Lateral face missing".to_string()))?;
+    let cap_loop_id = model
+        .faces
+        .get(cap_face_id)
+        .map(|f| f.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+
+    // The lateral seam edge appears twice in the lateral loop (once
+    // forward, once backward) — same "seamed face" pattern the fillet
+    // uses. Find both occurrences so they can be replaced together
+    // with a fresh shorter seam.
+    let (rim_idx_in_lat, seam_edge_id, seam_idx_first, seam_idx_second) = {
+        let lat_loop = model
+            .loops
+            .get(lat_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Lateral loop missing".to_string()))?;
+        let mut counts: HashMap<EdgeId, Vec<usize>> = HashMap::new();
+        for (i, &e) in lat_loop.edges.iter().enumerate() {
+            counts.entry(e).or_default().push(i);
+        }
+        let mut rim_idx: Option<usize> = None;
+        let mut seam_id: Option<EdgeId> = None;
+        let mut seam_first: Option<usize> = None;
+        let mut seam_second: Option<usize> = None;
+        for (i, &e) in lat_loop.edges.iter().enumerate() {
+            if e == rim_edge_id {
+                rim_idx = Some(i);
+                break;
+            }
+        }
+        for (e, idxs) in &counts {
+            if idxs.len() == 2 {
+                seam_id = Some(*e);
+                seam_first = Some(idxs[0]);
+                seam_second = Some(idxs[1]);
+                break;
+            }
+        }
+        (
+            rim_idx.ok_or_else(|| {
+                OperationError::InvalidGeometry(
+                    "Rim edge not found in lateral loop".to_string(),
+                )
+            })?,
+            seam_id.ok_or_else(|| {
+                OperationError::InvalidGeometry(
+                    "Lateral seam edge not found (no duplicate edge in loop)".to_string(),
+                )
+            })?,
+            seam_first.ok_or_else(|| {
+                OperationError::InvalidGeometry("Seam first occurrence missing".to_string())
+            })?,
+            seam_second.ok_or_else(|| {
+                OperationError::InvalidGeometry("Seam second occurrence missing".to_string())
+            })?,
+        )
+    };
+
+    let seam_edge = model
+        .edges
+        .get(seam_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Seam edge not found".to_string()))?
+        .clone();
+
+    // ---------- step 3: move v_lat to its shortened-rim position. ----------
+    // Every edge that referenced v_lat (rim, seam) is being rewritten
+    // in this same pass, so the move is safe.
+    if !model
+        .vertices
+        .set_position(v_lat, lat_seam_pos.x, lat_seam_pos.y, lat_seam_pos.z)
+    {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Failed to move lateral seam vertex {v_lat} to new rim position"
+        )));
+    }
+
+    // ---------- step 4: create v_cap at the reduced cap radius. ----------
+    let tol = Tolerance::default().distance();
+    let v_cap = model
+        .vertices
+        .add_or_find(cap_seam_pos.x, cap_seam_pos.y, cap_seam_pos.z, tol);
+
+    // ---------- step 5: build the new curves. ----------
+    // Cap and lateral trim circles share the cylinder's parametric
+    // direction so loop orientation flags carry the same convention as
+    // the fillet implementation (see step 7).
+    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, big_r - d_cap)
+        .map_err(|e| OperationError::NumericalError(format!("cap trim circle: {e}")))?;
+    let lat_trim_circle = Arc::circle(origin + axis * lat_seam_h, axis, big_r)
+        .map_err(|e| OperationError::NumericalError(format!("lat trim circle: {e}")))?;
+
+    // Chamfer cross-section is a straight slant — a Line from the
+    // lateral seam vertex to the cap seam vertex. (Fillet uses an Arc
+    // here; that's the only surface-shape difference.)
+    let cone_seam_line = Line::new(lat_seam_pos, cap_seam_pos);
+
+    // New (shorter) lateral seam line. Vertex IDs are preserved; only
+    // the position of v_lat has moved (step 3).
+    let new_seam_start_pos = {
+        let v = model.vertices.get(seam_edge.start_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Seam start vertex missing".to_string())
+        })?;
+        Point3::new(v.position[0], v.position[1], v.position[2])
+    };
+    let new_seam_end_pos = {
+        let v = model.vertices.get(seam_edge.end_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Seam end vertex missing".to_string())
+        })?;
+        Point3::new(v.position[0], v.position[1], v.position[2])
+    };
+    let new_seam_line = Line::new(new_seam_start_pos, new_seam_end_pos);
+
+    let cap_trim_curve_id = model.curves.add(Box::new(cap_trim_circle));
+    let lat_trim_curve_id = model.curves.add(Box::new(lat_trim_circle));
+    let cone_seam_curve_id = model.curves.add(Box::new(cone_seam_line));
+    let new_seam_line_id = model.curves.add(Box::new(new_seam_line));
+
+    // ---------- step 6: build the new edges. ----------
+    // ParameterRange::new(0.0, 1.0) matches `Arc`'s and `Line`'s unit
+    // parameterisation — same convention as the fillet path.
+    let cap_trim_edge_id = model.edges.add(Edge::new(
+        0,
+        v_cap,
+        v_cap,
+        cap_trim_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let lat_trim_edge_id = model.edges.add(Edge::new(
+        0,
+        v_lat,
+        v_lat,
+        lat_trim_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let cone_seam_edge_id = model.edges.add(Edge::new(
+        0,
+        v_lat,
+        v_cap,
+        cone_seam_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let new_seam_edge_id = model.edges.add(Edge::new(
+        0,
+        seam_edge.start_vertex,
+        seam_edge.end_vertex,
+        new_seam_line_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+
+    // ---------- step 7: replace the rim slot in the cap loop. ----------
+    // The cap loop is a single closed circle; preserve its original
+    // orientation flag (forward for top, backward for bottom — see
+    // `create_cylinder_topology`).
+    let cap_orientation = {
+        let cap_loop = model
+            .loops
+            .get(cap_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap loop missing".to_string()))?;
+        let mut orient = None;
+        for (i, &e) in cap_loop.edges.iter().enumerate() {
+            if e == rim_edge_id {
+                orient = Some(cap_loop.orientations[i]);
+                break;
+            }
+        }
+        orient.ok_or_else(|| {
+            OperationError::InvalidGeometry("Rim edge not found in cap loop".to_string())
+        })?
+    };
+    {
+        let cap_loop = model.loops.get_mut(cap_loop_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Cap loop missing (mut)".to_string())
+        })?;
+        for (i, edge) in cap_loop.edges.iter_mut().enumerate() {
+            if *edge == rim_edge_id {
+                *edge = cap_trim_edge_id;
+                cap_loop.orientations[i] = cap_orientation;
+                break;
+            }
+        }
+    }
+
+    // ---------- step 8: replace rim + both seam slots in lateral loop. ----------
+    {
+        let lat_loop = model.loops.get_mut(lat_loop_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Lateral loop missing (mut)".to_string())
+        })?;
+        let rim_orient = lat_loop.orientations[rim_idx_in_lat];
+        let s1 = lat_loop.orientations[seam_idx_first];
+        let s2 = lat_loop.orientations[seam_idx_second];
+        lat_loop.edges[rim_idx_in_lat] = lat_trim_edge_id;
+        lat_loop.orientations[rim_idx_in_lat] = rim_orient;
+        lat_loop.edges[seam_idx_first] = new_seam_edge_id;
+        lat_loop.orientations[seam_idx_first] = s1;
+        lat_loop.edges[seam_idx_second] = new_seam_edge_id;
+        lat_loop.orientations[seam_idx_second] = s2;
+    }
+
+    // ---------- step 9: shorten the lateral cylinder in-place. ----------
+    let lat_surface_id = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.surface_id)
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "Lateral face missing for surface swap".to_string(),
+            )
+        })?;
+    let new_height = new_height_limits[1] - new_height_limits[0];
+    let new_origin = origin + axis * new_height_limits[0];
+    let new_cylinder = Cylinder::new_finite(new_origin, axis, big_r, new_height)
+        .map_err(|e| OperationError::NumericalError(format!("Shortened cylinder: {e}")))?;
+    if model
+        .surfaces
+        .replace(lat_surface_id, Box::new(new_cylinder))
+        .is_none()
+    {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Failed to replace lateral surface {lat_surface_id}"
+        )));
+    }
+
+    // ---------- step 10: build the cone surface + blend face. ----------
+    let mut cone = Cone::truncated(
+        cone_apex,
+        cone_axis,
+        cone_half_angle,
+        cone_v_cap,
+        cone_v_lat,
+    )
+    .map_err(|e| OperationError::NumericalError(format!("Cone blend: {e}")))?;
+    // Anchor u=0 to the cylinder's ref_dir so the cone's seam aligns
+    // with the new lateral seam edge.
+    cone.ref_dir = ref_dir;
+    cone.angle_limits = Some([0.0, std::f64::consts::TAU]);
+    let cone_surface_id = model.surfaces.add(Box::new(cone));
+
+    // Loop sequence — same convention as `cylinder_rim_fillet`:
+    //   lat_trim forward, seam forward, cap_trim backward, seam backward.
+    // The two trim circles are stored with cylinder-axis orientation
+    // (CCW from +axis) and the seam line walks lat → cap forward.
+    // Stored-edge orientations match the fillet exactly; the cone's
+    // parametric chirality differs from the torus's, which the kernel
+    // tolerates because `FaceOrientation::Forward` plus the loop's
+    // closed cycle uniquely determines the boundary regardless of the
+    // surface's natural normal direction.
+    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    blend_loop.add_edge(lat_trim_edge_id, true);
+    blend_loop.add_edge(cone_seam_edge_id, true);
+    blend_loop.add_edge(cap_trim_edge_id, false);
+    blend_loop.add_edge(cone_seam_edge_id, false);
+    let blend_loop_id = model.loops.add(blend_loop);
+
+    let mut blend_face = Face::new(
+        0,
+        cone_surface_id,
+        blend_loop_id,
+        FaceOrientation::Forward,
+    );
+    blend_face.outer_loop = blend_loop_id;
+    let blend_face_id = model.faces.add(blend_face);
+
+    // ---------- step 11: cleanup. ----------
+    // The original rim edge and old seam edge are no longer referenced
+    // by any loop. Curves are append-only; the orphaned circle/line
+    // curves remain in the curve store (same trade-off as the fillet).
+    model.edges.remove(rim_edge_id);
+    model.edges.remove(seam_edge_id);
+
+    Ok((blend_face_id, None))
 }
 
 /// Data for chamfer computation

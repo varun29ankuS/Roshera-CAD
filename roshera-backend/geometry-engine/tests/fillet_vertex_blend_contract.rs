@@ -100,13 +100,19 @@ fn census(model: &BRepModel) -> TopologyCensus {
 }
 
 #[test]
-fn fillet_vertices_returns_not_implemented_for_valid_input() {
-    // The headline contract: valid input passes validation, enters
-    // `create_vertex_blend`, and that function fails loudly with
-    // NotImplemented. This is the documented behaviour — see the
-    // doc comment on `create_vertex_blend` in fillet.rs:1254. If a
-    // future change implements vertex blend AND lands here, this
-    // test must be updated to assert the new success behaviour.
+fn fillet_vertices_rejects_vertex_without_pre_filleted_edges() {
+    // Slice 1 of Task #82 (Task #104) changed the contract for a
+    // raw vertex on an un-filleted polyhedron. The vertex-blend
+    // pipeline now requires that the 3 (or more) edges meeting at
+    // the corner have already been rounded by `fillet_edges` — the
+    // sphere is tangent to the resulting cylindrical fillet faces,
+    // so there must be cylindrical fillet faces to be tangent *to*.
+    //
+    // A bare box vertex has 3 incident edges, all adjacent to two
+    // planar faces (no cylinder). Slice-1 classification finds 0
+    // filleted incidents and rejects with InvalidGeometry whose
+    // message names the precondition. The model must not be
+    // mutated.
     let mut model = BRepModel::new();
     let solid = make_box(&mut model, 4.0, 4.0, 4.0);
     let vertex = first_vertex(&model);
@@ -115,21 +121,25 @@ fn fillet_vertices_returns_not_implemented_for_valid_input() {
     let result = fillet_vertices(&mut model, solid, vec![vertex], 0.5, default_opts());
 
     let err = result.expect_err(
-        "vertex blend is not yet implemented; must return NotImplemented for valid input",
+        "bare box vertex (no prior edge fillets) must fail slice-1 classification",
     );
+    let msg = match &err {
+        OperationError::InvalidGeometry(m) => m.clone(),
+        other => panic!("expected InvalidGeometry; got {other:?}"),
+    };
     assert!(
-        matches!(err, OperationError::NotImplemented(_)),
-        "expected NotImplemented for valid vertex blend; got {err:?}"
+        msg.contains("filleted incident edge"),
+        "expected diagnostic to name the missing-fillet precondition; got: {msg}"
     );
 
-    // The model must not be partially mutated when the NotImplemented
-    // branch is hit. This is the critical invariant — a half-applied
-    // vertex blend would leave the caller with a corrupt B-Rep and
-    // no way to recover.
+    // The model must not be partially mutated when classification
+    // fails. This is the critical invariant — a half-applied vertex
+    // blend would leave the caller with a corrupt B-Rep and no way
+    // to recover.
     let after = census(&model);
     assert_eq!(
         before, after,
-        "fillet_vertices must not mutate topology when it returns NotImplemented; \
+        "fillet_vertices must not mutate topology when classification fails; \
          before = {before:?}, after = {after:?}"
     );
 }
