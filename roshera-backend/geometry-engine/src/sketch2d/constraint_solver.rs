@@ -133,6 +133,25 @@ impl ConstraintSolver {
         self.tolerance = tolerance;
     }
 
+    /// Set the Newton-Raphson damping factor.
+    ///
+    /// Each iteration applies `delta * damping_factor` to the entity
+    /// parameters rather than the full Newton step. Values in `(0, 1]`
+    /// are accepted; out-of-range inputs are clamped (≤ 0 maps to a
+    /// tiny positive value, > 1 saturates at 1.0) so a misconfigured
+    /// caller cannot stall the solver or drive it unstable. Callers
+    /// that want strict validation should reject out-of-range inputs
+    /// at their own layer (the sketch bridge in `sketch_solver.rs`
+    /// does this).
+    pub fn set_damping_factor(&mut self, damping_factor: f64) {
+        self.damping_factor = damping_factor.clamp(f64::MIN_POSITIVE, 1.0);
+    }
+
+    /// Current damping factor (for diagnostics / tests).
+    pub fn damping_factor(&self) -> f64 {
+        self.damping_factor
+    }
+
     /// Add an entity to the solver
     pub fn add_entity(&self, entity: EntityRef, initial_state: EntityState) {
         self.entity_state.insert(entity, initial_state);

@@ -67,9 +67,16 @@ fn coincident_pulls_free_point_onto_fixed_anchor() {
         "expected convergence, got {:?}",
         report.status
     );
+    assert!(report.is_fully_constrained());
     assert_eq!(report.entities_solved, 2);
     assert_eq!(report.constraints_solved, 1);
-    assert_eq!(report.entities_skipped_unsupported, 0);
+    assert_eq!(report.skipped_count(), 0);
+    // Convergence implies a finite iteration count and a residual
+    // below the configured tolerance (1e-10 default).
+    let iters = report.iterations().expect("converged → iteration count");
+    assert!(iters <= 100, "expected ≤100 iterations, got {iters}");
+    let err = report.final_error().expect("converged → final error");
+    assert!(err < 1e-9, "expected final error < 1e-9, got {err:e}");
 
     let pos = sketch
         .points()
@@ -128,23 +135,27 @@ fn empty_sketch_solve_is_a_no_op_with_valid_report() {
     let report = sketch.solve_constraints().expect("empty solve");
     assert_eq!(report.entities_solved, 0);
     assert_eq!(report.constraints_solved, 0);
-    assert_eq!(report.entities_skipped_unsupported, 0);
+    assert_eq!(report.skipped_count(), 0);
+    assert!(report.entities_skipped.is_empty());
     // Status is solver-defined for empty input; the contract is
     // that the bridge produced a report rather than an error.
     let _ = report.status;
 }
 
 #[test]
-fn unsupported_kinds_are_counted_not_silently_dropped() {
+fn unsupported_kinds_are_surfaced_as_entity_refs() {
     let sketch = fresh();
     let _p = sketch.add_point(Point2d::new(0.0, 0.0));
-    let _r = sketch
+    let rect_id = sketch
         .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
         .expect("rect");
 
     let report = sketch.solve_constraints().expect("solve");
     assert_eq!(report.entities_solved, 1);
-    assert_eq!(report.entities_skipped_unsupported, 1);
+    assert_eq!(report.skipped_count(), 1);
+    // The rectangle's id is surfaced verbatim so UI layers can
+    // highlight specifically which entity went unsolved.
+    assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
 }
 
 #[test]
@@ -155,6 +166,44 @@ fn invalid_options_are_rejected_before_solver_runs() {
         sketch.solve_constraints_with_options(bad).unwrap_err(),
         SketchSolveError::InvalidMaxIterations
     );
+}
+
+#[test]
+fn convenience_accessors_compose_a_status_summary() {
+    // A coincident-on-pinned-anchor sketch is fully constrained
+    // (one DOF removed by the pin, both DOFs of the free point
+    // removed by Coincident). The convenience accessors should
+    // compose into the "fully defined" badge a sketcher UI draws.
+    let sketch = fresh();
+    let anchor = sketch.add_point(Point2d::new(0.0, 0.0));
+    let free = sketch.add_point(Point2d::new(1.0, 0.0));
+    {
+        let mut entry = sketch.points().get_mut(&anchor).expect("anchor");
+        entry.value_mut().fix();
+    }
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Coincident,
+        vec![EntityRef::Point(anchor), EntityRef::Point(free)],
+        ConstraintPriority::High,
+    ));
+
+    let report = sketch.solve_constraints().expect("solve");
+    // The four accessors should agree about the status.
+    let converged = report.converged();
+    let fully = report.is_fully_constrained();
+    assert_eq!(
+        converged, fully,
+        "is_fully_constrained() must agree with converged()"
+    );
+    if converged {
+        assert!(!report.is_under_constrained());
+        assert!(!report.is_over_constrained());
+        assert!(!report.is_unstable());
+        assert!(report.iterations().is_some());
+        assert!(report.final_error().is_some());
+        assert_eq!(report.degrees_of_freedom(), None);
+        assert_eq!(report.conflicting_constraints(), None);
+    }
 }
 
 #[test]
