@@ -33,7 +33,9 @@ use geometry_engine::sketch2d::constraints::{
     Constraint, ConstraintPriority, DimensionalConstraint, EntityRef, GeometricConstraint,
 };
 use geometry_engine::sketch2d::sketch::{Sketch, SketchAnchor};
-use geometry_engine::sketch2d::sketch_solver::{SketchSolveError, SolveOptions};
+use geometry_engine::sketch2d::sketch_solver::{
+    DofStatus, DragTarget, SketchSolveError, SolveOptions,
+};
 use geometry_engine::sketch2d::{Point2d, SolverStatus};
 
 fn fresh() -> Sketch {
@@ -255,4 +257,185 @@ fn three_point_chain_converges_or_partially_constrains() {
         assert!((dab - 3.0).abs() < 1e-6, "|ab| = {}", dab);
         assert!((dbc - 4.0).abs() < 1e-6, "|bc| = {}", dbc);
     }
+}
+
+// ── B-2: drag + DOF analysis (public Sketch surface) ──────────────
+
+#[test]
+fn analyze_dofs_reports_zero_for_empty_sketch() {
+    let sketch = fresh();
+    let dof = sketch.analyze_dofs();
+    assert_eq!(dof.total_free_dofs, 0);
+    assert_eq!(dof.constraint_dofs_removed, 0);
+    assert_eq!(dof.entities_analysed, 0);
+    assert_eq!(dof.constraints_analysed, 0);
+    assert!(matches!(dof.status, DofStatus::FullyConstrained));
+}
+
+#[test]
+fn analyze_dofs_reactively_reflects_constraint_additions() {
+    // Before any constraints: 2 free points = 4 free DOFs.
+    let sketch = fresh();
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(1.0, 0.0));
+    let dof_before = sketch.analyze_dofs();
+    assert_eq!(dof_before.total_free_dofs, 4);
+    assert_eq!(dof_before.constraint_dofs_removed, 0);
+    assert!(dof_before.is_under_constrained());
+    assert_eq!(dof_before.remaining_dofs(), Some(4));
+
+    // Pin `a` to the origin with two coordinate constraints; pin `b`
+    // to a fixed X. That's 3 DOFs removed.
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::XCoordinate(0.0),
+        vec![EntityRef::Point(a)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::YCoordinate(0.0),
+        vec![EntityRef::Point(a)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::XCoordinate(5.0),
+        vec![EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+
+    let dof_after = sketch.analyze_dofs();
+    assert_eq!(dof_after.total_free_dofs, 4);
+    assert_eq!(dof_after.constraint_dofs_removed, 3);
+    assert!(dof_after.is_under_constrained());
+    assert_eq!(dof_after.remaining_dofs(), Some(1));
+}
+
+#[test]
+fn drag_pulls_free_point_to_cursor_position() {
+    let sketch = fresh();
+    let p = sketch.add_point(Point2d::new(0.0, 0.0));
+    let report = sketch
+        .solve_drag(
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(3.0, 4.0)),
+        )
+        .expect("drag");
+    assert!(report.converged(), "status was {:?}", report.status);
+    let pos = sketch.points().get(&p).expect("p").value().position;
+    assert!((pos.x - 3.0).abs() < 1e-5, "x = {}", pos.x);
+    assert!((pos.y - 4.0).abs() < 1e-5, "y = {}", pos.y);
+}
+
+#[test]
+fn drag_lands_on_closest_reachable_when_target_outside_constraint() {
+    // `a` pinned at origin, |ab|=2; drag `b` toward (10, 0) — the
+    // closest reachable point is (2, 0) on the constraint circle.
+    let sketch = fresh();
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(1.0, 0.0));
+    {
+        let mut entry = sketch.points().get_mut(&a).expect("a present");
+        entry.value_mut().fix();
+    }
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Distance(2.0),
+        vec![EntityRef::Point(a), EntityRef::Point(b)],
+        ConstraintPriority::High,
+    ));
+
+    let _ = sketch
+        .solve_drag(
+            EntityRef::Point(b),
+            DragTarget::Point(Point2d::new(10.0, 0.0)),
+        )
+        .expect("drag");
+
+    let pa = sketch.points().get(&a).expect("a").value().position;
+    let pb = sketch.points().get(&b).expect("b").value().position;
+    let dist = ((pb.x - pa.x).powi(2) + (pb.y - pa.y).powi(2)).sqrt();
+    assert!(
+        (dist - 2.0).abs() < 1e-4,
+        "|ab| should be pinned at 2.0, got {}",
+        dist
+    );
+    // `a` must stay at the origin.
+    assert!(pa.x.abs() < 1e-10);
+    assert!(pa.y.abs() < 1e-10);
+}
+
+#[test]
+fn drag_does_not_persist_temporary_constraints() {
+    let sketch = fresh();
+    let p = sketch.add_point(Point2d::new(0.0, 0.0));
+    let before = sketch.all_constraints().len();
+    let _ = sketch
+        .solve_drag(
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(2.0, 2.0)),
+        )
+        .expect("drag");
+    let after = sketch.all_constraints().len();
+    assert_eq!(
+        before, after,
+        "drag must not pollute the persistent ConstraintStore"
+    );
+}
+
+#[test]
+fn drag_rejects_unknown_entity_with_descriptive_error() {
+    use geometry_engine::sketch2d::Point2dId;
+    let sketch = fresh();
+    let ghost = Point2dId::new();
+    let err = sketch
+        .solve_drag(
+            EntityRef::Point(ghost),
+            DragTarget::Point(Point2d::new(0.0, 0.0)),
+        )
+        .expect_err("unknown entity must be rejected");
+    assert_eq!(
+        err,
+        SketchSolveError::DragEntityNotFound {
+            entity: EntityRef::Point(ghost),
+        }
+    );
+}
+
+#[test]
+fn drag_rejects_kind_mismatch_with_target_kind_label() {
+    let sketch = fresh();
+    let circle = sketch
+        .add_circle(Point2d::new(0.0, 0.0), 1.0)
+        .expect("circle");
+    let err = sketch
+        .solve_drag(
+            EntityRef::Circle(circle),
+            DragTarget::Point(Point2d::new(0.0, 0.0)),
+        )
+        .expect_err("circle cannot be dragged with a point target in slice B-2");
+    match err {
+        SketchSolveError::DragTargetKindMismatch {
+            entity,
+            target_kind,
+        } => {
+            assert_eq!(entity, EntityRef::Circle(circle));
+            assert_eq!(target_kind, "Point");
+        }
+        other => panic!("expected DragTargetKindMismatch, got {:?}", other),
+    }
+}
+
+#[test]
+fn drag_options_preset_validates() {
+    // The `for_drag` preset must round-trip through the public
+    // sketch surface — this guards against drift in the validator
+    // rejecting our own preset.
+    let sketch = fresh();
+    let p = sketch.add_point(Point2d::new(0.0, 0.0));
+    let report = sketch
+        .solve_drag_with_options(
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(1.0, 1.0)),
+            SolveOptions::for_drag(),
+        )
+        .expect("drag preset accepted");
+    let _ = report.status;
 }

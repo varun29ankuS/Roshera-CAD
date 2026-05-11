@@ -70,7 +70,9 @@ pub use constraints::{
     Constraint, ConstraintId, ConstraintPriority, ConstraintStatus, ConstraintType,
     DimensionalConstraint, GeometricConstraint,
 };
-pub use sketch_solver::{SketchSolveError, SketchSolveReport, SolveOptions};
+pub use sketch_solver::{
+    DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport, SolveOptions,
+};
 
 pub use sketch::{Sketch, SketchAnchor, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
