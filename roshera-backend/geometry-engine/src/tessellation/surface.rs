@@ -16,6 +16,90 @@ use crate::primitives::topology_builder::BRepModel;
 use std::collections::HashMap;
 use tracing;
 
+/// Number of subdivisions across an angular `span` on a circle of given
+/// `radius` to satisfy every quality bound in `params`. Returns the max
+/// of three step counts so the strictest constraint always wins:
+///
+/// - **Chord-height (sagitta)** — `θ ≤ 2·acos(1 − chord_tolerance/radius)`.
+///   The perpendicular deviation from the true arc stays below
+///   `chord_tolerance`. This is size-invariant in the quality-per-pixel
+///   sense (segments per arc grow as √radius, not radius), which is why
+///   it's the primary driver here. Falls back to `min_segments` if
+///   `chord_tolerance ≥ radius` (degenerate over-coarse setting).
+/// - **Chord length** — `θ ≤ 2·asin(max_edge_length / (2·radius))`.
+///   Caps the *geometric* edge length of mesh triangles. Useful for
+///   shaders and downstream consumers that care about absolute size.
+/// - **Angle deviation** — `θ ≤ max_angle_deviation`. Caps the parametric
+///   step regardless of curvature. Becomes the binding constraint on
+///   small radii where chord-height would otherwise demand very large θ.
+///
+/// Final result is clamped to `[params.min_segments, params.max_segments]`.
+fn arc_steps_for_quality(span: f64, radius: f64, params: &TessellationParams) -> usize {
+    if span <= 0.0 || radius <= 0.0 {
+        return params.min_segments;
+    }
+
+    let from_sagitta = if params.chord_tolerance > 0.0 && params.chord_tolerance < radius {
+        // cos(θ/2) = 1 − h/r, with h = chord_tolerance. The guard above
+        // keeps the argument strictly in (0, 1) so acos is real-valued.
+        let cos_half = 1.0 - params.chord_tolerance / radius;
+        // cos_half is in (0, 1) by the guard above, so acos is in (0, π/2).
+        let theta = 2.0 * cos_half.acos();
+        if theta > 0.0 {
+            (span / theta).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+
+    let from_chord_length = if params.max_edge_length > 0.0 {
+        // half_chord clamped to 1.0 so asin stays in [0, π/2] for
+        // degenerate cases where max_edge_length ≥ 2·radius.
+        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
+        let theta = 2.0 * half_chord.asin();
+        if theta > 0.0 {
+            (span / theta).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+
+    let from_angle = if params.max_angle_deviation > 0.0 {
+        (span / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+
+    from_sagitta
+        .max(from_chord_length)
+        .max(from_angle)
+        .max(params.min_segments)
+        .min(params.max_segments)
+}
+
+/// Number of subdivisions across a linear span of given `length` to
+/// satisfy `params.max_edge_length`. Linear axes have zero curvature
+/// (a cylinder's height, a cone's slant) so chord-height and
+/// angle-deviation never bind — only the absolute edge-length cap matters.
+/// Result is clamped to `[params.min_segments.max(1), params.max_segments]`.
+fn linear_steps_for_quality(length: f64, params: &TessellationParams) -> usize {
+    if length <= 0.0 {
+        return params.min_segments.max(1);
+    }
+    let from_chord = if params.max_edge_length > 0.0 {
+        ((length / params.max_edge_length).ceil() as usize).max(1)
+    } else {
+        1
+    };
+    from_chord
+        .max(params.min_segments.max(1))
+        .min(params.max_segments)
+}
+
 /// Tessellate a face into triangles
 pub fn tessellate_face(
     face: &Face,
@@ -708,39 +792,15 @@ fn tessellate_cylindrical_face(
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 
-    // Angular subdivision capped by max_segments — mirrors the spherical
-    // path. The previous formula `(radius * u_span) / max_edge_length`
-    // never consulted max_segments and produced ~1M steps per face for
-    // r=15, h=80, max_edge_length=0.1; the floor+cap below keeps it
-    // bounded while still respecting both chord-length and angle
-    // tolerances.
-    let u_from_chord = if params.max_edge_length > 0.0 && radius > 0.0 {
-        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
-        let theta = 2.0 * half_chord.asin();
-        if theta > 0.0 {
-            (u_span / theta).ceil() as usize
-        } else {
-            params.min_segments
-        }
-    } else {
-        params.min_segments
-    };
-    let u_from_angle = if params.max_angle_deviation > 0.0 {
-        (u_span / params.max_angle_deviation).ceil() as usize
-    } else {
-        params.min_segments
-    };
-    let u_steps = u_from_chord
-        .max(u_from_angle)
-        .max(params.min_segments)
-        .min(params.max_segments);
-
-    let v_steps_raw = if params.max_edge_length > 0.0 {
-        ((v_span / params.max_edge_length).ceil() as usize).max(1)
-    } else {
-        1
-    };
-    let v_steps = v_steps_raw.min(params.max_segments);
+    // Radial subdivision is driven by curvature: `arc_steps_for_quality`
+    // combines chord-height (sagitta), chord-length, and angle-deviation
+    // and picks the strictest. Chord-height is the size-invariant quality
+    // driver — segments grow as √radius instead of radius, so a 100 mm
+    // cylinder doesn't get 10× the triangles of a 10 mm one for the same
+    // visual quality. Axial subdivision uses chord-length only because a
+    // cylinder has zero curvature along its axis.
+    let u_steps = arc_steps_for_quality(u_span, radius, params);
+    let v_steps = linear_steps_for_quality(v_span, params);
 
     // Generate vertices
     let mut vertex_grid = Vec::new();
@@ -815,54 +875,13 @@ fn tessellate_spherical_face(
     let u_span = u_max - u_min;
     let v_span = v_max - v_min;
 
-    // Calculate resolution using the same triple-guard pattern as the
-    // cylinder and cone tessellators: chord tolerance, angular tolerance,
-    // and an explicit `max_segments` cap. Without the cap, an aggressive
-    // `max_edge_length` (e.g. 0.1 mm on a 30 mm sphere) and a tiny
-    // `max_angle_deviation` would request millions of triangles per face.
+    // Both axes on a sphere trace circles of the same radius, so both
+    // use `arc_steps_for_quality` (chord-height + chord-length + angle).
+    // The sphere's principal curvature is 1/radius in both directions,
+    // so this is exact — not a conservative approximation.
     let radius = estimate_sphere_radius(surface).max(crate::math::constants::EPSILON);
-
-    let u_from_chord = if params.max_edge_length > 0.0 {
-        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
-        let theta = 2.0 * half_chord.asin();
-        if theta > 0.0 {
-            (u_span / theta).ceil() as usize
-        } else {
-            params.min_segments
-        }
-    } else {
-        params.min_segments
-    };
-    let u_from_angle = if params.max_angle_deviation > 0.0 {
-        (u_span / params.max_angle_deviation).ceil() as usize
-    } else {
-        params.min_segments
-    };
-    let u_steps = u_from_chord
-        .max(u_from_angle)
-        .max(params.min_segments.max(3))
-        .min(params.max_segments);
-
-    let v_from_chord = if params.max_edge_length > 0.0 {
-        let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
-        let theta = 2.0 * half_chord.asin();
-        if theta > 0.0 {
-            (v_span / theta).ceil() as usize
-        } else {
-            params.min_segments
-        }
-    } else {
-        params.min_segments
-    };
-    let v_from_angle = if params.max_angle_deviation > 0.0 {
-        (v_span / params.max_angle_deviation).ceil() as usize
-    } else {
-        params.min_segments
-    };
-    let v_steps = v_from_chord
-        .max(v_from_angle)
-        .max(params.min_segments.max(3))
-        .min(params.max_segments);
+    let u_steps = arc_steps_for_quality(u_span, radius, params);
+    let v_steps = arc_steps_for_quality(v_span, radius, params);
 
     // Special handling for poles to avoid degeneracies
     if near_north_pole || near_south_pole {
@@ -1157,52 +1176,26 @@ fn tessellate_conical_face(
     // Detect if we include the apex (v = 0 for typical cone parameterization)
     let includes_apex = v_min.abs() < 1e-6;
 
-    // Calculate tessellation resolution. Both axes use a triple guard
-    // (chord-tolerance, angle-tolerance, hard `max_segments` cap) so a
-    // user-supplied `max_angle_deviation` near zero or `max_edge_length`
-    // near zero cannot blow the step count to millions — the same
-    // failure mode the cylinder path used to suffer.
+    // Radial subdivision uses the MAXIMUM cross-section radius (at the
+    // wide end) because chord-height demands more steps as radius grows.
+    // Picking the max is conservative — every other v-level meets the
+    // tolerance with slack. For a `Cone`, r(v) = v · sin(half_angle).
+    // Falls back to 1.0 if the surface is not a `Cone` (generic-grid
+    // path), which keeps the angular metric as the safe lower bound.
     let u_span = u_max - u_min;
-
-    // Maximum cross-section radius (at v_max) for the chord metric. For
-    // a Cone, r(v) = v · sin(half_angle). Falls back to a unit radius if
-    // the surface is not a Cone (generic-grid path), which keeps the
-    // angular metric as the safe lower bound on step count.
     let base_radius = surface
         .as_any()
         .downcast_ref::<crate::primitives::surface::Cone>()
         .map(|cone| (v_max.abs()).max(v_min.abs()) * cone.half_angle.sin())
         .unwrap_or(1.0);
+    let u_steps = arc_steps_for_quality(u_span, base_radius, params)
+        // Apex-singular cones need at least 8 radial divisions to avoid
+        // a visually triangular cross-section near the tip.
+        .max(params.min_segments.max(8));
 
-    let u_from_chord = if params.max_edge_length > 0.0 && base_radius > 0.0 {
-        let half_chord = (params.max_edge_length / (2.0 * base_radius)).min(1.0);
-        let theta = 2.0 * half_chord.asin();
-        if theta > 0.0 {
-            (u_span / theta).ceil() as usize
-        } else {
-            params.min_segments
-        }
-    } else {
-        params.min_segments
-    };
-    let u_from_angle = if params.max_angle_deviation > 0.0 {
-        (u_span / params.max_angle_deviation).ceil() as usize
-    } else {
-        params.min_segments
-    };
-    let u_steps = u_from_chord
-        .max(u_from_angle)
-        .max(params.min_segments.max(8))
-        .min(params.max_segments);
-
-    // Linear resolution for v (along slant), capped by max_segments.
+    // Linear resolution along the cone's slant (zero curvature in v).
     let cone_height = estimate_cone_height(surface, v_min, v_max);
-    let v_steps_raw = if params.max_edge_length > 0.0 {
-        ((cone_height / params.max_edge_length).ceil() as usize).max(3)
-    } else {
-        3
-    };
-    let v_steps = v_steps_raw.min(params.max_segments);
+    let v_steps = linear_steps_for_quality(cone_height, params).max(3);
 
     if includes_apex {
         tessellate_conical_with_apex(
@@ -1405,37 +1398,23 @@ fn tessellate_toroidal_face(
     // Get torus radii: u sweeps the major (R) circle, v sweeps the minor (r) circle.
     let (major_radius, minor_radius) = estimate_torus_radii(surface);
 
-    // Triple guard for both axes (chord, angle, max_segments). The
-    // previous implementation handed the patch off to
-    // `AdaptiveTessellator::tessellate_patch`, which ignored
-    // `max_segments` entirely — a torus with R=30, r=10 generated ≈115k
-    // triangles, blowing through the 100k regression cap. The grid path
-    // below mirrors `tessellate_cylindrical_face` and always honours the
-    // hard segment cap.
-    let steps_for = |span: f64, radius: f64, cap: usize| -> usize {
-        let from_chord = if params.max_edge_length > 0.0 && radius > 0.0 {
-            let half_chord = (params.max_edge_length / (2.0 * radius)).min(1.0);
-            let theta = 2.0 * half_chord.asin();
-            if theta > 0.0 {
-                (span / theta).ceil() as usize
-            } else {
-                params.min_segments
-            }
-        } else {
-            params.min_segments
-        };
-        let from_angle = if params.max_angle_deviation > 0.0 {
-            (span / params.max_angle_deviation).ceil() as usize
-        } else {
-            params.min_segments
-        };
-        from_chord.max(from_angle).max(params.min_segments).min(cap)
+    // U sweeps the major circle; the radius of the 3D circle traced by a
+    // fixed-v latitude is `R + r·cos(v)`, which peaks at `R + r` (v = 0).
+    // Use that worst case so the chord-height bound holds across the
+    // entire (u_min..u_max, v_min..v_max) patch — at any other v, the
+    // chord error is strictly less than tolerance with slack.
+    //
+    // V sweeps the minor circle of constant radius `r`, so the chord
+    // metric on v uses `minor_radius` directly. Cap v at half
+    // `max_segments` so the total triangle count for a full torus stays
+    // within max_segments² rather than 2·max_segments².
+    let u_radius = major_radius + minor_radius;
+    let u_steps = arc_steps_for_quality(u_span, u_radius, params);
+    let v_cap_params = TessellationParams {
+        max_segments: params.max_segments.max(2) / 2,
+        ..params.clone()
     };
-
-    let u_steps = steps_for(u_span, major_radius, params.max_segments);
-    // Cap v at half max_segments so the grand total tri count stays
-    // within max_segments² rather than 2·max_segments² for a full torus.
-    let v_steps = steps_for(v_span, minor_radius, params.max_segments.max(2) / 2);
+    let v_steps = arc_steps_for_quality(v_span, minor_radius, &v_cap_params);
 
     // Generate vertices on a regular (u, v) grid. As with the cylinder
     // path, the (u, v) extent has been clamped against surface bounds by
@@ -3088,5 +3067,231 @@ mod tests {
         let (verts, loops) = build_planar_loops(&[(0.0, 0.0), (1.0, 0.0)], &[]);
         let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
         assert!(tris.is_empty());
+    }
+
+    // === T-1: arc_steps_for_quality / linear_steps_for_quality tests ===
+
+    /// Default params at radius 1 with full 2π sweep: sagitta=0.001 wins
+    /// over chord-length=0.1 (sagitta gives ≈71 steps, chord-length ≈63,
+    /// angle ≈63), so we expect at least 70 steps and within max_segments.
+    #[test]
+    fn arc_steps_default_unit_radius_full_sweep() {
+        let params = TessellationParams::default();
+        let n = arc_steps_for_quality(2.0 * std::f64::consts::PI, 1.0, &params);
+        assert!(n >= 70, "expected ≥70 steps at default quality, got {n}");
+        assert!(
+            n <= params.max_segments,
+            "expected ≤max_segments, got {n}"
+        );
+    }
+
+    /// Chord-height is the primary driver: tightening `chord_tolerance`
+    /// must monotonically increase the step count (until max_segments cap).
+    #[test]
+    fn arc_steps_monotonic_in_chord_tolerance() {
+        let mk = |tol: f64| TessellationParams {
+            chord_tolerance: tol,
+            max_edge_length: 0.0,   // disable chord-length cap
+            max_angle_deviation: 0.0, // disable angle cap
+            min_segments: 3,
+            max_segments: 10_000, // raise cap so monotonicity is observable
+        };
+        let span = 2.0 * std::f64::consts::PI;
+        let n_coarse = arc_steps_for_quality(span, 1.0, &mk(0.1));
+        let n_medium = arc_steps_for_quality(span, 1.0, &mk(0.01));
+        let n_fine = arc_steps_for_quality(span, 1.0, &mk(0.001));
+        let n_ultra = arc_steps_for_quality(span, 1.0, &mk(0.0001));
+        assert!(
+            n_coarse < n_medium && n_medium < n_fine && n_fine < n_ultra,
+            "expected strict monotonic step growth, got {n_coarse}, {n_medium}, {n_fine}, {n_ultra}"
+        );
+    }
+
+    /// Size-invariance test: a 100× larger radius needs only √100 = 10×
+    /// more segments for the same chord tolerance (not 100× as
+    /// chord-length sampling would give). Verifies n ∝ √r scaling.
+    #[test]
+    fn arc_steps_chord_height_scales_with_sqrt_radius() {
+        let params = TessellationParams {
+            chord_tolerance: 0.001,
+            max_edge_length: 0.0,
+            max_angle_deviation: 0.0,
+            min_segments: 3,
+            max_segments: 100_000,
+        };
+        let span = 2.0 * std::f64::consts::PI;
+        let n_small = arc_steps_for_quality(span, 1.0, &params) as f64;
+        let n_big = arc_steps_for_quality(span, 100.0, &params) as f64;
+        let ratio = n_big / n_small;
+        // Expected ratio ≈ √100 = 10. Allow ±15% slack for ceil rounding.
+        assert!(
+            ratio > 8.5 && ratio < 11.5,
+            "expected ≈10× growth (√r law), got ratio {ratio} (n_small={n_small}, n_big={n_big})"
+        );
+    }
+
+    /// Chord-length cap dominates when set tighter than chord-height.
+    /// At max_edge_length=0.01 on r=1 full sweep: θ ≈ 0.01 rad → ~628 steps.
+    /// Chord-height of 0.1 gives only ~7 steps. The strictest (628) must win.
+    #[test]
+    fn arc_steps_strictest_constraint_wins() {
+        let params = TessellationParams {
+            chord_tolerance: 0.1,  // loose
+            max_edge_length: 0.01, // tight
+            max_angle_deviation: 0.0,
+            min_segments: 3,
+            max_segments: 10_000,
+        };
+        let n = arc_steps_for_quality(2.0 * std::f64::consts::PI, 1.0, &params);
+        assert!(n >= 620, "chord-length cap should dominate, got {n}");
+    }
+
+    /// Result is clamped to [min_segments, max_segments].
+    #[test]
+    fn arc_steps_respects_segment_clamps() {
+        let params = TessellationParams {
+            chord_tolerance: 1e-6,    // would request enormous step count
+            max_edge_length: 1e-6,
+            max_angle_deviation: 1e-6,
+            min_segments: 3,
+            max_segments: 50,
+        };
+        let n = arc_steps_for_quality(2.0 * std::f64::consts::PI, 1.0, &params);
+        assert_eq!(n, 50, "result must clamp to max_segments");
+
+        let params_min = TessellationParams {
+            chord_tolerance: 100.0, // way larger than radius → fallback
+            max_edge_length: 100.0,
+            max_angle_deviation: 100.0,
+            min_segments: 12,
+            max_segments: 200,
+        };
+        // span small enough that all metrics request 1 step → floor at min
+        let n_min = arc_steps_for_quality(0.01, 1.0, &params_min);
+        assert_eq!(n_min, 12, "result must floor at min_segments");
+    }
+
+    /// Degenerate inputs return min_segments without panicking.
+    #[test]
+    fn arc_steps_degenerate_inputs() {
+        let params = TessellationParams::default();
+        assert_eq!(arc_steps_for_quality(0.0, 1.0, &params), params.min_segments);
+        assert_eq!(arc_steps_for_quality(-1.0, 1.0, &params), params.min_segments);
+        assert_eq!(arc_steps_for_quality(1.0, 0.0, &params), params.min_segments);
+        assert_eq!(arc_steps_for_quality(1.0, -1.0, &params), params.min_segments);
+    }
+
+    /// linear_steps: zero-curvature axis only uses chord-length.
+    #[test]
+    fn linear_steps_basic_chord_length() {
+        let params = TessellationParams {
+            chord_tolerance: 0.001,    // ignored on linear axis
+            max_edge_length: 0.1,
+            max_angle_deviation: 0.01, // ignored on linear axis
+            min_segments: 1,
+            max_segments: 100,
+        };
+        // length 1.0 / chord 0.1 → 10 segments
+        assert_eq!(linear_steps_for_quality(1.0, &params), 10);
+        // length 0.5 / chord 0.1 → 5 segments
+        assert_eq!(linear_steps_for_quality(0.5, &params), 5);
+    }
+
+    /// linear_steps clamps to [min, max] and handles degenerate inputs.
+    #[test]
+    fn linear_steps_clamps() {
+        let params = TessellationParams {
+            chord_tolerance: 0.0,
+            max_edge_length: 0.001, // tight
+            max_angle_deviation: 0.0,
+            min_segments: 1,
+            max_segments: 50,
+        };
+        assert_eq!(linear_steps_for_quality(10.0, &params), 50);
+        assert_eq!(linear_steps_for_quality(0.0, &params), 1);
+    }
+
+    /// End-to-end integration test: tightening `chord_tolerance` on a
+    /// cylinder must produce strictly more triangles than a looser one
+    /// (with all other quality knobs disabled). This verifies that the
+    /// chord-height path is actually wired into `tessellate_cylindrical_face`,
+    /// not just available as a helper.
+    #[test]
+    fn cylinder_tessellation_density_grows_with_chord_tolerance() {
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+        use crate::tessellation::tessellate_solid;
+
+        fn tri_count(chord_tol: f64) -> usize {
+            let mut model = BRepModel::new();
+            let solid_id = {
+                let mut b = TopologyBuilder::new(&mut model);
+                match b
+                    .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 1.0, 2.0)
+                    .expect("create_cylinder_3d")
+                {
+                    GeometryId::Solid(id) => id,
+                    other => panic!("expected Solid, got {other:?}"),
+                }
+            };
+            let solid = model.solids.get(solid_id).expect("solid").clone();
+            let params = TessellationParams {
+                chord_tolerance: chord_tol,
+                // Disable the other quality knobs so chord-height is the
+                // sole driver of step count for this assertion.
+                max_edge_length: 0.0,
+                max_angle_deviation: 0.0,
+                min_segments: 3,
+                max_segments: 10_000,
+            };
+            tessellate_solid(&solid, &model, &params).triangles.len()
+        }
+
+        let coarse = tri_count(0.1);
+        let medium = tri_count(0.01);
+        let fine = tri_count(0.001);
+        assert!(
+            coarse < medium && medium < fine,
+            "tightening chord_tolerance must strictly increase tri count, got \
+             coarse={coarse}, medium={medium}, fine={fine}"
+        );
+    }
+
+    /// Sphere tessellation density also grows with tightening tolerance —
+    /// proves T-1's primary curvature path is wired for spheres too.
+    #[test]
+    fn sphere_tessellation_density_grows_with_chord_tolerance() {
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+        use crate::tessellation::tessellate_solid;
+
+        fn tri_count(chord_tol: f64) -> usize {
+            let mut model = BRepModel::new();
+            let solid_id = {
+                let mut b = TopologyBuilder::new(&mut model);
+                match b
+                    .create_sphere_3d(Point3::new(0.0, 0.0, 0.0), 1.0)
+                    .expect("create_sphere_3d")
+                {
+                    GeometryId::Solid(id) => id,
+                    other => panic!("expected Solid, got {other:?}"),
+                }
+            };
+            let solid = model.solids.get(solid_id).expect("solid").clone();
+            let params = TessellationParams {
+                chord_tolerance: chord_tol,
+                max_edge_length: 0.0,
+                max_angle_deviation: 0.0,
+                min_segments: 3,
+                max_segments: 10_000,
+            };
+            tessellate_solid(&solid, &model, &params).triangles.len()
+        }
+
+        let coarse = tri_count(0.1);
+        let fine = tri_count(0.001);
+        assert!(
+            coarse < fine,
+            "tightening chord_tolerance must increase sphere tri count, \
+             got coarse={coarse}, fine={fine}"
+        );
     }
 }
