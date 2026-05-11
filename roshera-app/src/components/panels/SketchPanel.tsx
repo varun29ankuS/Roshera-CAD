@@ -29,9 +29,6 @@ import {
   Trash2,
   Check,
   X,
-  Plus,
-  Square as SquareIcon,
-  CircleDot,
 } from 'lucide-react'
 import {
   isStandardPlane,
@@ -85,8 +82,6 @@ export function SketchPanel() {
   const exitSketch = useSceneStore((s) => s.exitSketch)
   const setSketchView = useSceneStore((s) => s.setSketchView)
   const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
-  const addNewSketchShape = useSceneStore((s) => s.addNewSketchShape)
-  const deleteSketchShape = useSceneStore((s) => s.deleteSketchShape)
   const awaitSketchReady = useSceneStore((s) => s.awaitSketchReady)
 
   const [busy, setBusy] = useState<boolean>(false)
@@ -397,19 +392,18 @@ export function SketchPanel() {
         </div>
       </div>
 
-      {/* Multi-shape strip: per-shape pill row + Add Shape buttons.
-          Lets the user draw multiple closed loops on the plane.
-          Outer-vs-hole classification is done geometrically at
-          extrude time (point-in-polygon containment) — the user just
-          draws the shapes; there is no per-shape role tag. The
-          active (last) shape is highlighted. */}
-      <ShapeStrip
-        shapes={sketch.shapes}
-        currentTool={sketch.tool}
-        currentPoints={sketch.points}
-        onAddShape={() => addNewSketchShape(sketch.tool)}
-        onDeleteShape={(idx) => deleteSketchShape(idx)}
-      />
+      {/* Multi-loop shapes are an implementation detail of the kernel —
+          they exist so the extrude pipeline can classify outer vs hole
+          loops via point-in-polygon containment. Surfacing them as
+          shape pills makes the sketch feel like a sequence of
+          disjoint mini-canvases ("draw shape 1, now draw shape 2");
+          Fusion / SolidWorks present a single continuous 2D design
+          space and let the user keep adding geometry. We match that
+          by hiding the pill row entirely — every closed polyline /
+          completed rectangle / circle still rolls into its own
+          backend shape silently, but the user never has to think
+          about it. The next pointer click after a closure just
+          starts the next primitive on the same canvas. */}
 
       {/* Per-tool dimension inputs — type exact lengths instead of
           (or in addition to) clicking. Visible once enough points
@@ -652,113 +646,3 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
   )
 }
 
-// ─── Multi-shape strip ────────────────────────────────────────────────
-
-interface ShapeStripProps {
-  shapes: Array<{ id: string; tool: SketchTool; points: Array<[number, number]> }>
-  currentTool: SketchTool
-  currentPoints: Array<[number, number]>
-  onAddShape: () => void
-  onDeleteShape: (idx: number) => void
-}
-
-/**
- * Compact pill row showing every shape in the session, plus the
- * "Add shape" button that commits the current drawing and starts a
- * fresh shape with the same tool. Outer-vs-hole classification is
- * decided geometrically at extrude time, so there is no per-shape
- * role tag in the UI.
- *
- * Hidden when there's only one shape and no points placed yet (the
- * fresh-sketch case) — the panel is already busy with the first
- * tool selector and showing a single-pill strip would just be noise.
- */
-function ShapeStrip({
-  shapes,
-  currentTool,
-  currentPoints,
-  onAddShape,
-  onDeleteShape,
-}: ShapeStripProps) {
-  // Hide entirely until the user has either placed at least one
-  // point on shape 1, or there's already > 1 shape in the session.
-  if (shapes.length <= 1 && currentPoints.length === 0) return null
-
-  // The active shape's `points` may lag the live `currentPoints`
-  // (the store updates both, but a single re-render may show a
-  // mismatch). Trust the prop-passed `currentPoints` for the active
-  // shape so the count is always live.
-  const activeIdx = shapes.length - 1
-  const canAddShape = currentPoints.length >= 2
-
-  return (
-    <div className="flex flex-col gap-1.5 pt-1 border-t border-border/30">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-muted-foreground text-[10px]">Shapes</span>
-        {shapes.map((s, i) => {
-          const isActive = i === activeIdx
-          const points =
-            isActive ? currentPoints.length : s.points.length
-          const ToolIcon =
-            s.tool === 'rectangle'
-              ? SquareIcon
-              : s.tool === 'circle'
-                ? CircleDot
-                : PenTool
-          return (
-            <div
-              key={s.id}
-              className={cn(
-                'flex items-center gap-1 px-1.5 py-0.5 border text-[10px] font-mono',
-                isActive
-                  ? 'border-border text-foreground bg-foreground/10'
-                  : 'border-border/40 text-muted-foreground',
-              )}
-              title={
-                isActive
-                  ? `Active shape #${i + 1} · ${s.tool} · ${points} pts`
-                  : `Shape #${i + 1} · ${s.tool} · ${points} pts`
-              }
-            >
-              <span className="text-muted-foreground/70">#{i + 1}</span>
-              <ToolIcon className="w-2.5 h-2.5" />
-              <span className="text-muted-foreground/70">{points}</span>
-              {shapes.length > 1 && !isActive && (
-                <button
-                  type="button"
-                  onClick={() => onDeleteShape(i)}
-                  className="ml-0.5 text-muted-foreground/60 hover:text-rose-400"
-                  title={`Delete shape #${i + 1}`}
-                  aria-label={`Delete shape ${i + 1}`}
-                >
-                  <X className="w-2.5 h-2.5" />
-                </button>
-              )}
-            </div>
-          )
-        })}
-
-        <button
-          type="button"
-          onClick={() => onAddShape()}
-          disabled={!canAddShape}
-          className={cn(
-            'ml-auto flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
-            canAddShape
-              ? 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10'
-              : 'border-border/40 text-muted-foreground/60',
-          )}
-          title="Commit current shape and start a new one"
-        >
-          <Plus className="w-2.5 h-2.5" />
-          <span>Add shape</span>
-        </button>
-      </div>
-      {/* Reference to currentTool so it's marked used (the icon is
-          visible per-shape in the row above; we don't render the
-          current-tool icon separately since the main tool selector
-          already shows it). */}
-      <span className="hidden">{currentTool}</span>
-    </div>
-  )
-}
