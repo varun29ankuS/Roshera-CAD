@@ -1143,16 +1143,17 @@ async fn shell_solid(
 
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    // The shell op leaves the source solid in the model but the user's
-    // intent is to replace it with the hollow version (matching how
-    // SolidWorks / Fusion expose Shell as an in-place modify). Drop
-    // the source UUID from the mapping and broadcast its deletion so
-    // the viewport sees the hollow solid in place of the original.
-    state.unregister_id_mapping(&object_uuid);
-
-    let result_uuid = Uuid::new_v4();
-    let result_id_str = result_uuid.to_string();
-    state.register_id_mapping(result_uuid, result_solid_id);
+    // Identity-preserving modify: the user's intent is "hollow this
+    // body". The body keeps its UUID and its user-visible name; only
+    // the topology changes. If the kernel returned a different
+    // `SolidId` (it can — offset sometimes mints a fresh `SolidId`
+    // when the topology change is structural), re-point the existing
+    // public UUID at the new kernel id rather than swapping the UUID.
+    if result_solid_id != solid_id {
+        state.unregister_id_mapping(&object_uuid);
+        state.register_id_mapping(object_uuid, result_solid_id);
+    }
+    let result_id_str = object_uuid.to_string();
 
     let display_name = format!("Shell {}", result_solid_id);
     let parameters = serde_json::json!({
@@ -1160,8 +1161,7 @@ async fn shell_solid(
         "source": object_uuid.to_string(),
     });
 
-    broadcast_object_deleted(&object_uuid.to_string());
-    broadcast_object_created(
+    broadcast_object_updated(
         &result_id_str,
         &display_name,
         result_solid_id,
@@ -1177,7 +1177,7 @@ async fn shell_solid(
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
-        "consumed": [object_uuid.to_string()],
+        "consumed": [],
         "object": {
             "id":         result_id_str,
             "name":       display_name,
@@ -1213,10 +1213,10 @@ async fn shell_solid(
 ///
 /// The kernel mirror op transforms the solid in place (vertices, curves,
 /// surface parameterization) and reverses face orientations to keep
-/// outward normals consistent. The original UUID is dropped from the
-/// id-mapping table and a new UUID is broadcast — same swap pattern as
-/// `shell_solid` — so frontend selection state is reset, keeping the
-/// "Mirror replaces the original" UX consistent across modify ops.
+/// outward normals consistent. `Solid::id` is preserved across the
+/// transform, so the public UUID survives — the frontend keeps the
+/// user-visible name and the feature tree nests `Mirror-N` as a child
+/// of the original body event rather than replacing it.
 async fn mirror_solid(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
@@ -1331,25 +1331,17 @@ async fn mirror_solid(
 
     let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    // Mirror is in-place at the kernel level, so the same solid_id now
-    // holds the mirrored topology. Swap the public UUID anyway so frontend
-    // viewers see a fresh ObjectCreated frame and reset selection state —
-    // matches the Shell pattern and avoids relying on a not-yet-existent
-    // ObjectUpdated frame.
-    state.unregister_id_mapping(&object_uuid);
-    let result_uuid = Uuid::new_v4();
-    let result_id_str = result_uuid.to_string();
-    state.register_id_mapping(result_uuid, solid_id);
-
+    // Identity-preserving modify: same kernel solid_id, same public
+    // UUID. See chamfer / fillet for the identity rationale.
     let display_name = format!("Mirror {}", solid_id);
     let parameters = serde_json::json!({
         "plane_origin": origin,
         "plane_normal": normal,
         "source": object_uuid.to_string(),
     });
+    let result_id_str = object_uuid.to_string();
 
-    broadcast_object_deleted(&object_uuid.to_string());
-    broadcast_object_created(
+    broadcast_object_updated(
         &result_id_str,
         &display_name,
         solid_id,
@@ -1365,7 +1357,7 @@ async fn mirror_solid(
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
-        "consumed": [object_uuid.to_string()],
+        "consumed": [],
         "object": {
             "id":         result_id_str,
             "name":       display_name,
@@ -1400,10 +1392,12 @@ async fn mirror_solid(
 /// }
 /// ```
 ///
-/// Response mirrors `shell_solid`: the solid is filleted in place at
-/// the kernel level, the public UUID is swapped, and an
-/// `ObjectCreated` frame for the rounded solid is broadcast (paired
-/// with an `ObjectDeleted` for the original).
+/// Identity-preserving modify: the kernel rounds edges in place
+/// (Solid::id is stable across `fillet_edges`), so the public UUID
+/// and the user-visible name (e.g. "Box 1") survive the operation.
+/// Frontends receive a single `ObjectUpdated` frame with the new
+/// tessellation; the feature tree nests `Fillet-N` as a child of
+/// the body event, matching SolidWorks / Fusion behaviour.
 async fn fillet_edges_endpoint(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
@@ -1629,11 +1623,8 @@ async fn fillet_edges_endpoint(
 
     let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    state.unregister_id_mapping(&object_uuid);
-    let result_uuid = Uuid::new_v4();
-    let result_id_str = result_uuid.to_string();
-    state.register_id_mapping(result_uuid, solid_id);
-
+    // Identity-preserving modify: same kernel solid_id, same public
+    // UUID. See chamfer for the identity rationale; same logic applies.
     let display_name = format!("Fillet {}", solid_id);
     // Per-edge path round-trips `radii`; back-compat / uniform path
     // round-trips a single `radius`. Downstream broadcast consumers
@@ -1649,9 +1640,9 @@ async fn fillet_edges_endpoint(
             "source": object_uuid.to_string(),
         })
     };
+    let result_id_str = object_uuid.to_string();
 
-    broadcast_object_deleted(&object_uuid.to_string());
-    broadcast_object_created(
+    broadcast_object_updated(
         &result_id_str,
         &display_name,
         solid_id,
@@ -1667,7 +1658,7 @@ async fn fillet_edges_endpoint(
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
-        "consumed": [object_uuid.to_string()],
+        "consumed": [],
         "object": {
             "id":         result_id_str,
             "name":       display_name,
@@ -1798,19 +1789,23 @@ async fn chamfer_edges_endpoint(
 
     let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    state.unregister_id_mapping(&object_uuid);
-    let result_uuid = Uuid::new_v4();
-    let result_id_str = result_uuid.to_string();
-    state.register_id_mapping(result_uuid, solid_id);
-
+    // Identity-preserving modify: the kernel chamfered the same solid
+    // in place (Solid::id is stable across `chamfer_edges`), so the
+    // public UUID stays on the same kernel id and the frontend keeps
+    // its user-visible name ("Box 1" stays "Box 1", with a Chamfer
+    // child in the feature tree). The `display_name` carried in the
+    // wire frame is a fallback for first-load (a future client that
+    // missed the original Box's `ObjectCreated`); the live bridge
+    // discards it in favour of the existing name (see
+    // `ws-bridge.ts::case 'ObjectUpdated'`).
     let display_name = format!("Chamfer {}", solid_id);
     let parameters = serde_json::json!({
         "distance": distance,
         "source": object_uuid.to_string(),
     });
+    let result_id_str = object_uuid.to_string();
 
-    broadcast_object_deleted(&object_uuid.to_string());
-    broadcast_object_created(
+    broadcast_object_updated(
         &result_id_str,
         &display_name,
         solid_id,
@@ -1826,7 +1821,7 @@ async fn chamfer_edges_endpoint(
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
-        "consumed": [object_uuid.to_string()],
+        "consumed": [],
         "object": {
             "id":         result_id_str,
             "name":       display_name,
@@ -2440,12 +2435,14 @@ async fn create_extrude(
 /// }
 /// ```
 ///
-/// The kernel may either modify the existing solid in place or return
-/// a new solid id. Either way we (1) drop the old UUID from the
-/// id-mapping and broadcast `ObjectDeleted`, then (2) register a fresh
-/// UUID for the result and broadcast `ObjectCreated`. Frontends treat
-/// it as a delete-then-create rather than guessing replacement
-/// semantics.
+/// Identity-preserving modify: the host body keeps its UUID and
+/// user-visible name across the operation — pulling a face is a
+/// modification of the host, not a replacement. The kernel may
+/// internally mint a fresh `SolidId` (it can when the topology
+/// change is structural); we re-point the existing UUID at that
+/// new kernel id rather than swapping the UUID itself. The frontend
+/// receives an `ObjectUpdated` frame with the new tessellation and
+/// merges it into the existing scene row.
 async fn extrude_face_endpoint(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
@@ -2589,15 +2586,11 @@ async fn extrude_face_endpoint(
     }
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    // Preserve the host UUID across the operation. The user's mental
-    // model is "I pulled a face on this box; it's still the same box,
-    // just modified" — retiring the UUID and minting a fresh one
-    // breaks that lineage in the model tree. We rebroadcast the
-    // existing id with the new tessellation; the frontend `addObject`
-    // path upserts on collision so the row stays put with refreshed
-    // mesh data. Only the kernel-side mapping needs touching — and
-    // only when `extrude_face` produced a new solid id (it sometimes
-    // does, sometimes mutates in place).
+    // Preserve the host UUID across the operation. Re-point the
+    // mapping only when the kernel chose to mint a fresh `SolidId`
+    // internally; the user-facing UUID stays put either way so the
+    // browser / feature tree / selection / agent reports survive
+    // the modification.
     if result_solid_id != host_solid_id {
         state.unregister_id_mapping(&object_uuid);
         state.register_id_mapping(object_uuid, result_solid_id);
@@ -2611,7 +2604,7 @@ async fn extrude_face_endpoint(
         "direction": [direction.x, direction.y, direction.z],
         "distance":  distance,
     });
-    broadcast_object_created(
+    broadcast_object_updated(
         &result_id_str,
         &name,
         result_solid_id,
@@ -2627,7 +2620,7 @@ async fn extrude_face_endpoint(
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
-        "consumed": [object_uuid_str],
+        "consumed": [],
         "object": {
             "id":         result_id_str,
             "name":       name,
@@ -4139,13 +4132,100 @@ pub(crate) fn broadcast_object_created(
 }
 
 /// Publish an `ObjectDeleted` frame so every connected viewer drops the
-/// solid from its scene. Used by the boolean op (consumed operands), the
-/// DELETE endpoint, and the face-extrude endpoint (the host solid is
-/// replaced by a new id once the kernel finishes).
+/// solid from its scene. Used by the boolean op (consumed operands) and
+/// the DELETE endpoint. Modifying ops (shell, mirror, fillet, chamfer,
+/// face-extrude) deliberately do NOT use this — they preserve UUID and
+/// emit `ObjectUpdated` instead so body identity survives across the
+/// modification (browser keeps "Box 1" as "Box 1" with a Fillet child,
+/// not a fresh "Fillet 7" replacement).
 pub(crate) fn broadcast_object_deleted(object_id: &str) {
     let frame = serde_json::json!({
         "type": "ObjectDeleted",
         "payload": { "id": object_id }
+    });
+    if let Ok(text) = serde_json::to_string(&frame) {
+        let _ = GEOMETRY_BROADCASTER.send(text);
+    }
+}
+
+/// Build an `ObjectUpdated` frame matching `roshera-app/src/lib/ws-schemas.ts`
+/// `cadObjectSchema` and publish it. Frame shape is byte-identical to
+/// `ObjectCreated` — the discriminant just signals "merge into existing
+/// id, do not destroy" to the WS bridge (`updateObject(id, patch)` in
+/// scene-store, vs the create-side upsert that also pushes into
+/// `objectOrder` and clears related selection state).
+///
+/// Use this from every modifying op (shell, mirror, fillet, chamfer,
+/// face-extrude) so the body's UUID survives the kernel mutation,
+/// preserving lineage in the browser / feature tree / agent reports.
+/// `solid_id` is the kernel solid id post-modification; it may differ
+/// from the pre-op id if the kernel chose to mint a fresh `SolidId`
+/// internally — the public UUID does not care, only the kernel mapping
+/// does. The caller is responsible for re-pointing the UUID mapping
+/// (unregister + register with the same UUID) when that happens.
+///
+/// `name` should be the existing user-visible name of the object — the
+/// frontend bridge merges fields, but defensively pinning the name
+/// here means a future bridge refactor cannot accidentally rename a
+/// body via a modifying op. Callers typically look the name up from
+/// scene state or, if unavailable, pass through whatever name the
+/// kernel parameters carry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn broadcast_object_updated(
+    object_id: &str,
+    name: &str,
+    solid_id: u32,
+    primitive_type: &str,
+    parameters: &serde_json::Value,
+    vertices: &[f32],
+    indices: &[u32],
+    normals: &[f32],
+    face_ids: &[u32],
+    position: [f32; 3],
+) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let (bbox_min, bbox_max, center) = compute_bbox_and_center(vertices);
+    let frame = serde_json::json!({
+        "type": "ObjectUpdated",
+        "payload": {
+            "id": object_id,
+            "name": name,
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analytical_geometry": {
+                "solid_id":       solid_id,
+                "primitive_type": primitive_type,
+                "parameters":     parameters,
+                "properties": {
+                    "volume":         0.0,
+                    "surface_area":   0.0,
+                    "bounding_box":   { "min": bbox_min, "max": bbox_max },
+                    "center_of_mass": center,
+                }
+            },
+            "transform": {
+                "translation": position,
+                "rotation":    [0.0, 0.0, 0.0, 1.0],
+                "scale":       [1.0, 1.0, 1.0],
+            },
+            "material": {
+                "diffuse_color": [0.7, 0.7, 0.75, 1.0],
+                "metallic":      0.1,
+                "roughness":     0.8,
+                "emission":      [0.0, 0.0, 0.0],
+                "name":          "default",
+            },
+            "visible":     true,
+            "locked":      false,
+            "children":    [],
+            "metadata":    {},
+            "created_at":  now,
+            "modified_at": now,
+        }
     });
     if let Ok(text) = serde_json::to_string(&frame) {
         let _ = GEOMETRY_BROADCASTER.send(text);
@@ -4917,6 +4997,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/timeline/init", post(initialize_timeline))
         .route("/api/timeline/record", post(record_operation))
         .route("/api/timeline/history/{branch_id}", get(get_history))
+        // Operation-graph view of the same branch — kernel-derived
+        // hierarchy (parent = earliest event that produced any of this
+        // event's inputs). Consumed by the frontend FeatureTree panel
+        // as a pure renderer; no derivation lives client-side.
+        .route(
+            "/api/feature-tree/{branch_id}",
+            get(crate::handlers::timeline::get_feature_tree),
+        )
         // Disambiguate against the session-scoped undo/redo also re-
         // exported via `handlers::*` (handlers/session.rs). The
         // timeline-scoped variant takes `Json<Value>` carrying a

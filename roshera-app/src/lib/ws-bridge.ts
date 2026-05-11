@@ -240,7 +240,19 @@ function handleServerMessage(msg: ServerMessage) {
     }
 
     case 'ObjectUpdated': {
+      // Modifying ops (shell, mirror, fillet, chamfer, face-extrude)
+      // ship `ObjectUpdated` with the new tessellation but a backend-
+      // generated `name` field (the kernel does not track user-visible
+      // names). Mirror the `ObjectCreated` upsert convention here:
+      // identity is the UUID, the user owns the name. Strip the name
+      // and objectType from the patch so the kernel cannot rename a
+      // box to "Fillet 7" just because an edge was rounded.
       const obj = convertCADObject(msg.payload)
+      const existing = scene.objects.get(obj.id)
+      if (existing) {
+        obj.name = existing.name
+        obj.objectType = existing.objectType
+      }
       scene.updateObject(obj.id, obj)
       break
     }

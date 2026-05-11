@@ -133,9 +133,16 @@ pub fn chamfer_edges(
     }
 
     // Record the operation for timeline / event-sourcing consumers.
+    // `outputs` leads with `solid_id` so that downstream modify ops
+    // (fillet-after-chamfer, shell-after-chamfer, …) resolve their
+    // parent edge to this event rather than skipping past it to the
+    // primitive that originally produced `solid_id`. The chamfer face
+    // ids follow so the lineage graph still records *what* topology
+    // the op produced.
     let mut inputs = input_edges_for_record;
     inputs.insert(0, solid_id as u64);
-    let chamfer_face_ids: Vec<u64> = chamfer_faces.iter().map(|&f| f as u64).collect();
+    let mut outputs: Vec<u64> = vec![solid_id as u64];
+    outputs.extend(chamfer_faces.iter().map(|&f| f as u64));
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("chamfer_edges")
             .with_parameters(serde_json::json!({
@@ -148,7 +155,7 @@ pub fn chamfer_edges(
                 "preserve_edges": options.preserve_edges,
             }))
             .with_inputs(inputs)
-            .with_outputs(chamfer_face_ids),
+            .with_outputs(outputs),
     );
 
     Ok(chamfer_faces)

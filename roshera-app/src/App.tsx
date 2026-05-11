@@ -63,12 +63,13 @@ export function App() {
           <CADViewport />
           <AIChatPanel />
 
-          {/* Browser (Model Tree) — floating, top-left, collapsible.
-              The header chip is always visible and acts as the
-              collapse toggle; the tree content below renders only
-              when expanded. Only the header carries its own outline,
-              so the chip stays as an anchor even when the tree is
-              hidden. */}
+          {/* Browser — single consolidated panel. The header chip is
+              always visible and acts as the collapse toggle; an
+              inline segmented control flips the body between the
+              assembly hierarchy ("parts") and the timeline-derived
+              feature tree ("features"). Only the header carries its
+              own outline, so the chip stays as an anchor even when
+              the tree is hidden. */}
           <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] flex flex-col overflow-hidden">
             <ModelTree
               expanded={browserOpen}

@@ -7,15 +7,23 @@ import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { CreateDatumDialog } from '@/components/panels/CreateDatumDialog'
+import { FeatureTreeBody } from '@/components/panels/FeatureTree'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
-// ─── Preview mode (opt-in via ?preview URL param) ───────────────────
-
-function isPreviewMode(): boolean {
-  if (typeof window === 'undefined') return false
-  return new URLSearchParams(window.location.search).has('preview')
-}
+/**
+ * Browser viewing modes.
+ *
+ * - `browser` → assembly hierarchy + datums + sketches, sourced from
+ *   `GET /api/hierarchy/{session_id}` and `GET /api/datums`.
+ * - `features` → timeline-derived operation graph, rendered by
+ *   `FeatureTreeBody` over `GET /api/feature-tree/{branch_id}`.
+ *
+ * Both modes are pure renderers over backend responses — the kernel
+ * is the authoritative source of every node, parent edge, and
+ * visibility flag. Mode is a UI-local toggle only.
+ */
+type BrowserMode = 'browser' | 'features'
 
 // ─── Backend hierarchy types (GET /api/hierarchy/{session_id}) ─────
 
@@ -432,22 +440,15 @@ function sceneToNodes(
 }
 
 /**
- * Pull the source-sketch id off an object's analytical-geometry params,
- * if any. Extrude broadcasts (api-server `extrude_sketch`) embed
- * `sketch_id` + `plane` in `parameters`; the linkage survives even when
- * the sketch session itself is consumed (default), so the model tree
- * can still surface the sketch as a child feature post-extrude.
+ * Map a single backend `CADObject` to a renderable tree node.
+ *
+ * Frontend does no lineage synthesis here — `parentId` (sourced from
+ * the backend `parent` field via the WS bridge) is the only signal
+ * that wires children to parents. Cross-feature lineage (which
+ * sketch produced which extrude, which body each modifier touches)
+ * is the Features mode's job; it queries the kernel feature tree
+ * directly so the two modes never diverge.
  */
-function ownedSketchInfo(obj: CADObject): { id: string; plane?: string } | null {
-  const params = obj.analyticalGeometry?.params
-  if (!params) return null
-  const id = params['sketch_id']
-  if (typeof id !== 'string' || id.length === 0) return null
-  const planeRaw = params['plane']
-  const plane = typeof planeRaw === 'string' ? planeRaw : undefined
-  return { id, plane }
-}
-
 function buildLocalNode(
   obj: CADObject,
   allObjects: Map<string, CADObject>,
@@ -457,24 +458,6 @@ function buildLocalNode(
     if (child.parentId === obj.id) {
       children.push(buildLocalNode(child, allObjects))
     }
-  }
-
-  // Synthesize a "Sketch" child for any object that was produced from a
-  // sketch (extrude today; revolve/sweep/loft when those land). The
-  // params blob is authoritative — the sketch session itself may have
-  // been consumed by the operation, but the id + plane are preserved
-  // on the resulting feature.
-  const owned = ownedSketchInfo(obj)
-  if (owned) {
-    const planeLabel = owned.plane ? owned.plane.toUpperCase() : '?'
-    children.push({
-      id: owned.id,
-      name: `Sketch (${planeLabel})`,
-      type: 'sketch',
-      symbol: symbolForType('sketch'),
-      visible: true,
-      locked: false,
-    })
   }
 
   return {
@@ -487,60 +470,6 @@ function buildLocalNode(
     children: children.length > 0 ? children : undefined,
   }
 }
-
-// ─── Mock data for preview mode ─────────────────────────────────────
-
-const MOCK_TREE_NODES: TreeNode[] = [
-  {
-    id: 'mock-box-1',
-    name: 'Box #1',
-    type: 'box',
-    symbol: symbolForType('box'),
-    visible: true,
-    locked: false,
-    children: [
-      { id: 'mock-extrude-1', name: 'Extrude', type: 'extrude', symbol: symbolForType('extrude'), visible: true },
-      { id: 'mock-fillet-1', name: 'Fillet', type: 'fillet', symbol: symbolForType('fillet'), visible: true },
-    ],
-  },
-  {
-    id: 'mock-sphere-1',
-    name: 'Sphere',
-    type: 'sphere',
-    symbol: symbolForType('sphere'),
-    visible: true,
-    locked: false,
-  },
-  {
-    id: 'mock-union-1',
-    name: 'Union #1',
-    type: 'assembly',
-    symbol: symbolForType('assembly'),
-    visible: true,
-    locked: false,
-    children: [
-      { id: 'mock-box-2', name: 'Box #2', type: 'box', symbol: symbolForType('box'), visible: true },
-      {
-        id: 'mock-cyl-1',
-        name: 'Cylinder',
-        type: 'cylinder',
-        symbol: symbolForType('cylinder'),
-        visible: true,
-        children: [
-          { id: 'mock-chamfer-1', name: 'Chamfer', type: 'chamfer', symbol: symbolForType('chamfer'), visible: true },
-        ],
-      },
-    ],
-  },
-  {
-    id: 'mock-sketch-1',
-    name: 'Sketch',
-    type: 'sketch',
-    symbol: symbolForType('sketch'),
-    visible: false,
-    locked: true,
-  },
-]
 
 // ─── Main panel ─────────────────────────────────────────────────────
 
@@ -576,6 +505,10 @@ export function ModelTree({
   const wsStatus = useWSStore((s) => s.status)
   const sessionId = useWSStore((s) => s.sessionId)
 
+  // `mode` flips the body between the assembly tree and the
+  // timeline-derived operation graph. Header chip remains a single
+  // "browser" anchor; the segmented control inside it swaps modes.
+  const [mode, setMode] = useState<BrowserMode>('browser')
   const [backendNodes, setBackendNodes] = useState<TreeNode[] | null>(null)
   const [datums, setDatums] = useState<DatumDto[]>([])
   const [menu, setMenu] = useState<TreeContextMenuState | null>(null)
@@ -677,35 +610,21 @@ export function ModelTree({
     }
   }, [fetchHierarchy, fetchDatums])
 
-  // Preview mode short-circuits to mock data; otherwise use backend hierarchy
-  // if available *and non-empty*, falling back to the local scene store.
-  // The hierarchy endpoint returns `success: true` with empty children when
-  // the project has no Parts yet — but the scene store is already mirroring
-  // ObjectCreated broadcasts, so falling through gives the user something
-  // to right-click instead of a permanently empty Browser.
+  // Tree composition order (top → bottom):
+  //   1. Datums  — canonical reference frame, listed first so users
+  //      see "the world's axes" before any feature placed in it.
+  //   2. Sketches — sources users sketch *into*; visually grouped
+  //      above solids the way every CAD package's tree convention
+  //      does. Sketch-vs-feature lineage (which extrude consumed
+  //      which sketch) is the Features mode's job — Browser mode
+  //      stays a pure backend mirror with no synthesized children.
+  //   3. Bodies — backend assembly hierarchy when populated;
+  //      otherwise a flat scene-store mirror of `ObjectCreated`
+  //      broadcasts (still backend-sourced, just unparented).
   const localNodes = sceneToNodes(objects, objectOrder)
-  // Sketches that are already represented as a child of an extrude
-  // (or any other operation that records `sketch_id` in its params)
-  // must not also appear at the top level — that would render the
-  // same sketch twice for the same feature.
-  const ownedSketchIds = new Set<string>()
-  for (const obj of objects.values()) {
-    const owned = ownedSketchInfo(obj)
-    if (owned) ownedSketchIds.add(owned.id)
-  }
-  const sketchNodes = sketchesToNodes(serverSketches).filter(
-    (n) => !ownedSketchIds.has(n.id),
-  )
-  // Sketches appear above solids — they're the source the user
-  // sketches *into*, and grouping them visually at the top mirrors
-  // every CAD package's feature-tree convention.
-  const objectNodes = isPreviewMode()
-    ? MOCK_TREE_NODES
-    : (backendNodes && backendNodes.length > 0 ? backendNodes : localNodes)
-  // Datums sit at the very top of the tree — they're the canonical
-  // reference frame everything else is positioned against, so listing
-  // them first matches the mental model "place primitives relative to
-  // these references".
+  const sketchNodes = sketchesToNodes(serverSketches)
+  const objectNodes =
+    backendNodes && backendNodes.length > 0 ? backendNodes : localNodes
   const datumNodes = datumsToNodes(datums)
   const treeNodes = [...datumNodes, ...sketchNodes, ...objectNodes]
 
@@ -772,36 +691,88 @@ export function ModelTree({
   }, [])
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header is the only element in the browser that carries panel
-          chrome — border, rounded corners, drop shadow, and the
-          background fill. The whole header is a button that toggles
-          the tree's expanded state. When collapsed, only this chip
-          remains visible. */}
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-        aria-controls="browser-tree"
-        title={expanded ? 'Collapse browser' : 'Expand browser'}
+    <div className="flex flex-col h-full min-h-0">
+      {/* Consolidated header chip.
+          ─ Outer area is the expand/collapse toggle (one click target
+            mirrors the previous single-mode behaviour).
+          ─ Inline segmented control flips body mode between the
+            assembly browser and the timeline-derived feature tree.
+            Mode buttons stop propagation so clicking a tab does not
+            also collapse the panel.
+          When collapsed, only the chip remains visible — the mode
+          control is hidden because there's no body for it to drive. */}
+      <div
         className={cn(
-          'cad-panel-header flex items-center gap-1.5 font-mono border border-border rounded shadow-md backdrop-blur-sm w-full text-left cursor-pointer',
-          expanded
-            ? 'bg-card/95 hover:bg-card'
-            // Slightly darker shade of the panel background when
-            // collapsed — uses the design-system `muted` token so the
-            // chip stays visually grouped with the rest of the UI
-            // while still standing out against the viewport.
-            : 'bg-muted/95 hover:bg-muted',
+          'cad-panel-header flex items-center gap-1.5 font-mono border border-border rounded shadow-md backdrop-blur-sm w-full',
+          expanded ? 'bg-card/95' : 'bg-muted/95',
         )}
       >
-        <span className="flex-1">browser</span>
-        <span aria-hidden="true" className="text-muted-foreground/70">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={expanded}
+          aria-controls="browser-tree"
+          title={expanded ? 'Collapse browser' : 'Expand browser'}
+          className={cn(
+            'flex-1 text-left cursor-pointer transition-colors',
+            expanded ? 'hover:text-foreground' : 'hover:text-foreground',
+          )}
+        >
+          browser
+        </button>
+        {expanded && (
+          <div
+            role="tablist"
+            aria-label="Browser mode"
+            className="flex items-center gap-0 text-[11px] leading-none"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'browser'}
+              onClick={(e) => {
+                e.stopPropagation()
+                setMode('browser')
+              }}
+              className={cn(
+                'px-1.5 py-0.5 rounded-sm transition-colors',
+                mode === 'browser'
+                  ? 'bg-accent text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              parts
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'features'}
+              onClick={(e) => {
+                e.stopPropagation()
+                setMode('features')
+              }}
+              className={cn(
+                'px-1.5 py-0.5 rounded-sm transition-colors',
+                mode === 'features'
+                  ? 'bg-accent text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              features
+            </button>
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-label={expanded ? 'Collapse browser' : 'Expand browser'}
+          className="text-muted-foreground/70 hover:text-foreground transition-colors px-1"
+        >
           {expanded ? '«' : '»'}
-        </span>
-      </button>
-      {expanded && (
-        <ScrollArea id="browser-tree" className="flex-1">
+        </button>
+      </div>
+      {expanded && mode === 'browser' && (
+        <ScrollArea id="browser-tree" className="flex-1 min-h-0">
           {treeNodes.length === 0 ? (
             <div className="p-3 text-[13px] text-muted-foreground/60 text-center font-mono">
               ∅ no objects in scene
@@ -824,6 +795,11 @@ export function ModelTree({
               ))}
             </div>
           )}
+        </ScrollArea>
+      )}
+      {expanded && mode === 'features' && (
+        <ScrollArea id="browser-tree" className="flex-1 min-h-0">
+          <FeatureTreeBody />
         </ScrollArea>
       )}
       {menu && (
