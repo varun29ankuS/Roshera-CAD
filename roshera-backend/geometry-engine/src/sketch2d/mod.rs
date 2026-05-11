@@ -68,7 +68,7 @@ pub use spline2d::{BSpline2d, NurbsCurve2d, Spline2d, Spline2dId};
 pub use constraint_solver::{ConstraintSolver, EntityState, SolverResult, SolverStatus};
 pub use constraints::{
     Constraint, ConstraintId, ConstraintPriority, ConstraintStatus, ConstraintType,
-    DimensionalConstraint, GeometricConstraint,
+    DimensionalConstraint, EntityRef, GeometricConstraint,
 };
 pub use sketch_solver::{
     DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport, SolveOptions,
