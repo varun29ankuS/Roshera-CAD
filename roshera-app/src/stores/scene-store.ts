@@ -679,7 +679,8 @@ export const useSceneStore = create<SceneState>()(
     addObject: (obj) =>
       set((state) => {
         const objects = new Map(state.objects)
-        const existed = objects.has(obj.id)
+        const prior = objects.get(obj.id)
+        const existed = prior !== undefined
         objects.set(obj.id, obj)
         // `addObject` is also the path the WS bridge uses to apply an
         // `ObjectCreated` for an id we've already seen (e.g., REST
@@ -690,7 +691,22 @@ export const useSceneStore = create<SceneState>()(
         const objectOrder = existed
           ? state.objectOrder
           : [...state.objectOrder, obj.id]
-        return { objects, objectOrder }
+        // Topology rebuild → invalidate stale face/edge/vertex picks.
+        // The kernel reassigns FaceIds (monotonic `FaceStore.next_id`)
+        // on every rebuild, so any sub-element selection captured
+        // against the prior mesh now points at a different physical
+        // face. Letting them persist makes the highlight overlay
+        // appear to drift across faces as operations are applied.
+        const meshChanged =
+          existed && prior !== undefined && prior.mesh !== obj.mesh
+        const subElementSelections = meshChanged
+          ? state.subElementSelections.filter((s) => s.objectId !== obj.id)
+          : state.subElementSelections
+        const hoveredSubElement =
+          meshChanged && state.hoveredSubElement?.objectId === obj.id
+            ? null
+            : state.hoveredSubElement
+        return { objects, objectOrder, subElementSelections, hoveredSubElement }
       }),
 
     updateObject: (id, patch) =>
@@ -698,8 +714,21 @@ export const useSceneStore = create<SceneState>()(
         const existing = state.objects.get(id)
         if (!existing) return state
         const objects = new Map(state.objects)
-        objects.set(id, { ...existing, ...patch })
-        return { objects }
+        const next = { ...existing, ...patch }
+        objects.set(id, next)
+        // Same rationale as `addObject`: when the patch swaps the
+        // mesh (modify ops broadcast `ObjectUpdated` with a fresh
+        // tessellation), face/edge/vertex indices captured against
+        // the prior mesh are no longer meaningful.
+        const meshChanged = patch.mesh !== undefined && patch.mesh !== existing.mesh
+        const subElementSelections = meshChanged
+          ? state.subElementSelections.filter((s) => s.objectId !== id)
+          : state.subElementSelections
+        const hoveredSubElement =
+          meshChanged && state.hoveredSubElement?.objectId === id
+            ? null
+            : state.hoveredSubElement
+        return { objects, subElementSelections, hoveredSubElement }
       }),
 
     removeObject: (id) =>
