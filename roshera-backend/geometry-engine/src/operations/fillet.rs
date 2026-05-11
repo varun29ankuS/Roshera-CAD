@@ -15,14 +15,14 @@
 
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Point3, Tolerance, Vector3};
+use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Curve, Line, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     fillet_surfaces::{CylindricalFillet, ToroidalFillet, VariableRadiusFillet},
     solid::SolidId,
-    surface::Surface,
+    surface::{Cylinder, Surface},
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -238,7 +238,8 @@ pub fn fillet_vertices(
         let connected_edges = get_edges_at_vertex(model, solid_id, vertex_id)?;
 
         // Create spherical patch at vertex
-        let sphere_faces = create_vertex_blend(model, vertex_id, &connected_edges, radius)?;
+        let sphere_faces =
+            create_vertex_blend(model, solid_id, vertex_id, &connected_edges, radius)?;
         fillet_faces.extend(sphere_faces);
     }
 
@@ -1251,36 +1252,420 @@ fn create_chord_fillet(
     create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius)
 }
 
+/// Describes one filleted edge-blend surface adjacent to a vertex.
+///
+/// A constant-radius edge fillet between two faces is realized in the
+/// kernel as a cylindrical face whose axis is the rolling-ball spine
+/// (an offset of the original edge curve). For vertex-blend purposes
+/// we only need the axis line and radius: the sphere center lies on
+/// the axis line of every incident edge-blend, and the sphere radius
+/// must equal the edge-blend radius (a constant-radius vertex blend
+/// across N edge fillets is well-posed only when all radii agree).
+///
+/// Variable-radius (toroidal) and offset-NURBS edge fillets are not
+/// classified by slice 1 — those surface kinds report `None` from
+/// `classify_blend_for_edge` so the caller raises NotImplemented.
+#[derive(Debug, Clone)]
+struct EdgeBlendDescriptor {
+    /// The cylindrical fillet face adjacent to the vertex. Consumed by
+    /// slice 2 (Task #82) to re-trim the fillet face against the sphere.
+    #[allow(dead_code)]
+    face_id: FaceId,
+    /// Unit axis direction of the fillet cylinder.
+    axis: Vector3,
+    /// A point on the fillet-cylinder axis (the cylinder's `origin`).
+    axis_origin: Point3,
+    /// Radius of the fillet cylinder.
+    radius: f64,
+}
+
+/// One incident edge at the vertex, optionally classified as a blend.
+///
+/// `adjacent_faces` is the pair of original B-Rep faces meeting at this
+/// edge. After `fillet_edges` has run, exactly one of these face pairs
+/// per filleted incident is replaced by a cylindrical fillet face whose
+/// descriptor is captured in `blend`. Non-filleted incident edges
+/// (which the caller has not asked to be rounded) carry
+/// `blend == None`; they bound the spherical patch only via the
+/// sphere/face intersection on the original face, not through a fillet
+/// surface.
+#[derive(Debug, Clone)]
+struct IncidentEdgeClassification {
+    edge_id: EdgeId,
+    /// The original face pair across this edge. Consumed by slice 2 to
+    /// stitch the sphere patch into the adjacent shell faces.
+    #[allow(dead_code)]
+    adjacent_faces: (FaceId, FaceId),
+    /// `Some` if at least one of the adjacent faces is a cylindrical
+    /// edge-fillet that we recognize as a blend; otherwise `None`.
+    blend: Option<EdgeBlendDescriptor>,
+}
+
+/// Result of classifying every edge incident to the vertex.
+///
+/// Slice 1 produces this struct; slice 2 will consume it to emit the
+/// sphere/face SSI trimming curves and stitch the patch into the shell.
+/// The geometry-only contract for slice 1 is:
+///
+///   * `incidents.len()` matches the number of edges actually meeting
+///     the vertex in the B-Rep (deduplicated by EdgeId).
+///   * `filleted_incidents` is the subset of `incidents` whose `blend`
+///     is `Some`, in the same order.
+///   * `sphere_center` is the least-squares-best point lying on every
+///     filleted-incident's axis line. The residual `max_axis_distance`
+///     is bounded by `1e-6` — exceeding that signals non-concurrent
+///     axes (the math problem has no exact solution, which physically
+///     means three or more edge fillets cannot all be tangent to a
+///     single sphere of the given radius). The caller turns that into
+///     an `InvalidGeometry` so the user gets a specific diagnostic.
+///   * `sphere_radius` equals the (single) shared radius of all
+///     filleted incidents. Mixed radii across incidents are rejected
+///     upstream.
+#[derive(Debug, Clone)]
+struct VertexBlendContext {
+    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
+    vertex_id: VertexId,
+    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
+    vertex_position: Point3,
+    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
+    incidents: Vec<IncidentEdgeClassification>,
+    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
+    filleted_incidents: Vec<IncidentEdgeClassification>,
+    sphere_center: Point3,
+    sphere_radius: f64,
+}
+
+/// Classify the surface pair `(face1, face2)` adjacent to one edge.
+///
+/// Returns `Some(EdgeBlendDescriptor)` when exactly one of the two
+/// faces is a finite cylindrical surface — that face is the edge
+/// fillet just produced by `fillet_edges`, and its axis carries the
+/// information needed to place the corner sphere. Returns `None` when
+/// neither face is a recognized cylindrical blend (the incident edge
+/// was not filleted) and when both faces are cylinders (ambiguous —
+/// a fillet-of-fillet scenario, deferred to Task #102).
+fn classify_blend_for_edge(
+    model: &BRepModel,
+    face1: FaceId,
+    face2: FaceId,
+) -> Option<EdgeBlendDescriptor> {
+    let f1 = model.faces.get(face1)?;
+    let f2 = model.faces.get(face2)?;
+    let s1 = model.surfaces.get(f1.surface_id)?;
+    let s2 = model.surfaces.get(f2.surface_id)?;
+
+    let cyl1 = s1.as_any().downcast_ref::<Cylinder>();
+    let cyl2 = s2.as_any().downcast_ref::<Cylinder>();
+
+    match (cyl1, cyl2) {
+        (Some(c), None) => Some(EdgeBlendDescriptor {
+            face_id: face1,
+            axis: c.axis,
+            axis_origin: c.origin,
+            radius: c.radius,
+        }),
+        (None, Some(c)) => Some(EdgeBlendDescriptor {
+            face_id: face2,
+            axis: c.axis,
+            axis_origin: c.origin,
+            radius: c.radius,
+        }),
+        // Two cylinders or two non-cylinders both opt out of slice-1
+        // classification; slice 2 / Task #102 will broaden this.
+        _ => None,
+    }
+}
+
+/// Solve for the point closest to every axis line `(q_i, u_i)`.
+///
+/// Each filleted incident contributes an axis line `L_i = { q_i + t·u_i }`.
+/// A point C lies on `L_i` iff its projection onto the plane through
+/// `q_i` perpendicular to `u_i` coincides with `q_i`. The orthogonal
+/// projector onto that plane is `M_i = I − u_i u_iᵀ`, so the
+/// condition is `M_i (C − q_i) = 0`. Stacking that condition across
+/// every filleted incident gives an over-determined system whose
+/// normal equations are
+///
+/// ```text
+///     ( Σ M_i ) C = Σ M_i q_i
+/// ```
+///
+/// The 3×3 matrix `A = Σ M_i` is positive-semidefinite. It is
+/// invertible iff the axis directions `{u_i}` span ℝ³ — i.e. the
+/// filleted edges are not all parallel and not all coplanar. The
+/// rank-deficient cases are exactly the geometrically degenerate
+/// vertex-blend inputs (one or two filleted edges, or three parallel
+/// fillets); they are caught here by the `inverse()` error and turned
+/// into a precise `InvalidGeometry` upstream.
+fn compute_concurrent_axes_center(
+    filleted: &[IncidentEdgeClassification],
+    vertex_id: VertexId,
+) -> OperationResult<Point3> {
+    // Σ M_i and Σ M_i q_i.
+    let mut a = [0.0_f64; 9]; // column-major 3x3 accumulator
+    let mut b = Vector3::new(0.0, 0.0, 0.0);
+
+    for incident in filleted {
+        let blend = incident
+            .blend
+            .as_ref()
+            .ok_or_else(|| OperationError::InvalidGeometry(
+                "compute_concurrent_axes_center received an unclassified incident edge"
+                    .to_string(),
+            ))?;
+        let u = blend.axis;
+        let q = blend.axis_origin;
+
+        // M = I - u uᵀ. Column-major: m[col*3 + row].
+        let m00 = 1.0 - u.x * u.x;
+        let m11 = 1.0 - u.y * u.y;
+        let m22 = 1.0 - u.z * u.z;
+        let m01 = -u.x * u.y;
+        let m02 = -u.x * u.z;
+        let m12 = -u.y * u.z;
+
+        // Accumulate A += M. Symmetric, six unique entries.
+        a[0] += m00;
+        a[4] += m11;
+        a[8] += m22;
+        a[3] += m01; // col=1,row=0
+        a[1] += m01; // col=0,row=1
+        a[6] += m02; // col=2,row=0
+        a[2] += m02; // col=0,row=2
+        a[7] += m12; // col=2,row=1
+        a[5] += m12; // col=1,row=2
+
+        // M·q = q − (u·q) u.
+        let dot = u.x * q.x + u.y * q.y + u.z * q.z;
+        let mq = Vector3::new(q.x - dot * u.x, q.y - dot * u.y, q.z - dot * u.z);
+        b.x += mq.x;
+        b.y += mq.y;
+        b.z += mq.z;
+    }
+
+    let mat = Matrix3::from_cols(a);
+
+    // Rank-deficiency check tailored to the projector-sum problem.
+    //
+    // `Matrix3::inverse()` uses `f64::EPSILON` (~2.22e-16) as its
+    // singularity cutoff, which is too permissive here: a rank-2
+    // projector sum can have a floating-point-noise determinant of
+    // ~1e-17, sneak past that gate, and yield a nonsense pseudo-
+    // inverse. For our well-conditioned input scale (each M_i has
+    // trace 2, so A has trace 2·n_filleted ≤ ~20 for any realistic
+    // vertex) a rank-3 A has |det| on the order of 1.0; values
+    // below 1e-9 unambiguously signal linear dependence among the
+    // axis directions.
+    let det = mat.determinant();
+    if det.abs() < 1.0e-9 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "vertex {:?}: filleted-edge axes span at most 2 dimensions (|det| = \
+             {:.3e} below the 1e-9 rank-deficiency threshold) — corner sphere \
+             placement requires axes that span ℝ³",
+            vertex_id, det
+        )));
+    }
+
+    let inv = mat.inverse().map_err(|_| {
+        OperationError::InvalidGeometry(format!(
+            "vertex {:?}: filleted-edge normal-equations matrix is singular \
+             — corner sphere placement is undefined",
+            vertex_id
+        ))
+    })?;
+
+    let c = inv.transform_vector(&b);
+    Ok(Point3::new(c.x, c.y, c.z))
+}
+
+/// Gather the full classification context for a vertex blend.
+///
+/// Slice-1 invariants enforced here:
+///
+///   1. The vertex must have **at least three** incident edges
+///      (a convex corner of a polyhedron has ≥ 3; fewer indicates a
+///      seam or boundary vertex that does not admit a spherical
+///      corner blend).
+///   2. **At least three** of those incident edges must be filleted
+///      cylinder blends (sphere/cylinder/cylinder/cylinder is the
+///      minimal vertex-blend configuration; sphere/cylinder/cylinder
+///      degenerates to an edge-blend extension, Task #100).
+///   3. All filleted-incident radii must agree with the requested
+///      `radius` to within `1e-9`. Mixed-radius vertex blends are a
+///      separate kernel construct (rolling ball of varying radius)
+///      tracked under Task #99.
+///   4. The axis lines of the filleted incidents must be concurrent
+///      to within `1e-6` of the least-squares-best center. Non-
+///      concurrent axes signal a non-rectilinear corner whose
+///      single-radius vertex blend does not exist; the caller raises
+///      `InvalidGeometry`.
+fn gather_vertex_blend_context(
+    model: &BRepModel,
+    solid_id: SolidId,
+    vertex_id: VertexId,
+    requested_radius: f64,
+) -> OperationResult<VertexBlendContext> {
+    let vertex = model
+        .vertices
+        .get(vertex_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!(
+            "vertex {:?} not found",
+            vertex_id
+        )))?;
+    let vertex_position = Point3::new(
+        vertex.position[0],
+        vertex.position[1],
+        vertex.position[2],
+    );
+
+    let edge_ids = get_edges_at_vertex(model, solid_id, vertex_id)?;
+    if edge_ids.len() < 3 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "vertex {:?} has {} incident edge(s); vertex blend requires at \
+             least 3 incident edges (a 3-edge corner is the minimum that \
+             bounds a spherical patch)",
+            vertex_id,
+            edge_ids.len()
+        )));
+    }
+
+    let mut incidents = Vec::with_capacity(edge_ids.len());
+    let mut filleted = Vec::new();
+    for edge_id in edge_ids {
+        let adjacent_faces = get_adjacent_faces(model, solid_id, edge_id)?;
+        let blend = classify_blend_for_edge(model, adjacent_faces.0, adjacent_faces.1);
+        let classification = IncidentEdgeClassification {
+            edge_id,
+            adjacent_faces,
+            blend: blend.clone(),
+        };
+        if blend.is_some() {
+            filleted.push(classification.clone());
+        }
+        incidents.push(classification);
+    }
+
+    if filleted.len() < 3 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "vertex {:?} has only {} filleted incident edge(s); vertex blend \
+             requires at least 3 filleted incident edges meeting at the \
+             corner (apply fillet_edges to the 3+ edges that share the \
+             vertex before requesting fillet_vertices)",
+            vertex_id,
+            filleted.len()
+        )));
+    }
+
+    // Radius agreement: every filleted incident must carry the same
+    // radius (== requested_radius). Mixed radii are out of scope.
+    let radius_tol = 1.0e-9_f64.max(requested_radius * 1.0e-9);
+    for incident in &filleted {
+        // Safe: `filleted` only contains items with blend = Some.
+        #[allow(clippy::expect_used)]
+        // Reason: invariant established by the `if blend.is_some()` push above.
+        let blend = incident
+            .blend
+            .as_ref()
+            .expect("filleted incidents always carry a blend descriptor");
+        if (blend.radius - requested_radius).abs() > radius_tol {
+            return Err(OperationError::InvalidGeometry(format!(
+                "vertex {:?}: edge fillet on incident edge {:?} has radius \
+                 {} which does not match the requested vertex blend radius \
+                 {} (mixed-radius vertex blends are not supported in slice 1)",
+                vertex_id, incident.edge_id, blend.radius, requested_radius
+            )));
+        }
+    }
+
+    let sphere_center = compute_concurrent_axes_center(&filleted, vertex_id)?;
+
+    // Residual check: every axis line must pass through `sphere_center`
+    // within 1e-6 (plane units). The least-squares solver succeeds for
+    // any 3+ non-coplanar axes, so a finite residual here means the
+    // input axes literally do not meet — geometrically invalid.
+    let mut max_residual = 0.0_f64;
+    for incident in &filleted {
+        #[allow(clippy::expect_used)]
+        // Reason: filleted incidents always carry a blend (see above).
+        let blend = incident
+            .blend
+            .as_ref()
+            .expect("filleted incidents always carry a blend descriptor");
+        let d = sphere_center - blend.axis_origin;
+        // Distance from `sphere_center` to line (q, u): |d − (d·u) u|.
+        let proj = blend.axis.x * d.x + blend.axis.y * d.y + blend.axis.z * d.z;
+        let perp = Vector3::new(
+            d.x - proj * blend.axis.x,
+            d.y - proj * blend.axis.y,
+            d.z - proj * blend.axis.z,
+        );
+        let r = (perp.x * perp.x + perp.y * perp.y + perp.z * perp.z).sqrt();
+        if r > max_residual {
+            max_residual = r;
+        }
+    }
+    if max_residual > 1.0e-6 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "vertex {:?}: edge-fillet axes are not concurrent to within 1e-6 \
+             (max residual = {:.3e}); the corner does not admit a constant-\
+             radius spherical blend",
+            vertex_id, max_residual
+        )));
+    }
+
+    Ok(VertexBlendContext {
+        vertex_id,
+        vertex_position,
+        incidents,
+        filleted_incidents: filleted,
+        sphere_center,
+        sphere_radius: requested_radius,
+    })
+}
+
 /// Create spherical blend at a vertex.
 ///
-/// A complete vertex blend requires intersecting the spherical patch at
-/// the vertex against each adjacent edge-fillet surface (toroidal /
-/// cylindrical) to compute the trimming loop on the sphere, then
-/// re-trimming each adjacent fillet against the sphere. Without those
-/// trimming curves the resulting face has no loop and is topologically
-/// invalid: it cannot be tessellated, cannot be sewn into a shell, and
-/// silently breaks downstream operations (volume, surface area,
-/// boolean) that walk loops.
+/// Slice 1 (Task #104) implements the **classification + sphere
+/// placement** half of the vertex blend pipeline:
 ///
-/// Rather than emit a broken face we fail loudly with
-/// `OperationError::NotImplemented`. The caller (`fillet_vertices`)
-/// propagates the error so the user sees a precise diagnostic instead
-/// of a silently corrupt B-Rep. The validated input (vertex / edge /
-/// curve existence) is still checked here so the error path is honest.
+///   * Every incident edge at the vertex is looked up.
+///   * Each incident is classified as either a filleted edge-blend
+///     (one adjacent face is a cylindrical surface produced by a
+///     prior `fillet_edges` call) or an unfilleted edge.
+///   * The corner sphere's center is the point that lies on every
+///     filleted-incident's axis line, solved via the projector-matrix
+///     least-squares formulation in `compute_concurrent_axes_center`.
+///   * Pre-conditions (≥3 incidents, ≥3 filleted, matching radii,
+///     concurrent axes within 1e-6) are validated; failures surface
+///     as `InvalidGeometry` with a diagnostic that names the actual
+///     defect.
+///
+/// Slice 2 (Task #82, pending) will use the resulting
+/// `VertexBlendContext` to compute the sphere/cylinder SSI trimming
+/// curves, build the sphere face, re-trim the adjacent fillet faces,
+/// and stitch the patch into the shell. Until slice 2 lands, this
+/// function returns `OperationError::NotImplemented` after a
+/// successful classification — but the diagnostic now includes the
+/// concrete sphere center and radius, so the math is verifiable from
+/// the error message alone.
 fn create_vertex_blend(
     model: &mut BRepModel,
+    solid_id: SolidId,
     vertex_id: VertexId,
     edges: &[EdgeId],
     radius: f64,
 ) -> OperationResult<Vec<FaceId>> {
-    // Validate referenced topology is sound before reporting
-    // not-implemented — invalid input should surface as InvalidGeometry,
-    // not be masked behind the NotImplemented branch.
-    let _vertex = model
-        .vertices
-        .get(vertex_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
+    // Top-level radius guard. `validate_vertex_fillet_inputs` is the
+    // canonical gate for this in the public API, but `create_vertex_blend`
+    // also lives behind an internal call path that should not assume the
+    // public validator has run.
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(OperationError::InvalidRadius(radius));
+    }
 
+    // Validate referenced edge/curve topology up-front so invalid input
+    // surfaces as InvalidGeometry rather than being masked by the
+    // NotImplemented branch downstream.
     for &edge_id in edges {
         let edge = model
             .edges
@@ -1292,18 +1677,23 @@ fn create_vertex_blend(
             .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
     }
 
-    if !radius.is_finite() || radius <= 0.0 {
-        return Err(OperationError::InvalidRadius(radius));
-    }
+    let context = gather_vertex_blend_context(model, solid_id, vertex_id, radius)?;
 
+    // Slice 1 stops here: classification + sphere placement are done,
+    // but the sphere/cylinder SSI surgery is slice 2 (Task #82).
     Err(OperationError::NotImplemented(format!(
-        "Vertex blend (spherical corner fillet) at vertex {:?} with {} \
-         incident edges and radius {} requires sphere-fillet trimming \
-         curve computation against adjacent edge-fillet surfaces, which \
-         is not yet implemented. Apply edge fillets only.",
+        "Vertex blend at vertex {:?}: classified {} incident edge(s), {} of \
+         which are filleted cylinder blends; corner sphere center = \
+         ({:.6}, {:.6}, {:.6}), radius = {}. The sphere/cylinder SSI \
+         trimming and patch-stitching surgery is not yet implemented \
+         (tracked as Task #82). Apply edge fillets only.",
         vertex_id,
-        edges.len(),
-        radius
+        context.incidents.len(),
+        context.filleted_incidents.len(),
+        context.sphere_center.x,
+        context.sphere_center.y,
+        context.sphere_center.z,
+        context.sphere_radius
     )))
 }
 
@@ -3518,6 +3908,382 @@ mod tests {
     fn resample_radii_uniform_handles_empty_input() {
         let resampled = resample_radii_uniform(&[], 20);
         assert!(resampled.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Vertex-blend slice-1 (Task #104) math: concurrent-axes center.
+    //
+    // These tests target the pure-math helper `compute_concurrent_axes_center`
+    // directly, without any topology setup. The helper is the load-bearing
+    // numerical primitive for slice 2 (sphere/cylinder SSI) and any future
+    // multi-axis corner-blend variants.
+    // ------------------------------------------------------------------
+
+    fn make_incident(axis_origin: Point3, axis: Vector3) -> IncidentEdgeClassification {
+        IncidentEdgeClassification {
+            edge_id: 0,
+            adjacent_faces: (0, 0),
+            blend: Some(EdgeBlendDescriptor {
+                face_id: 0,
+                axis,
+                axis_origin,
+                radius: 0.5,
+            }),
+        }
+    }
+
+    /// Three mutually-perpendicular axes that all pass through (3.5, 3.5, 3.5)
+    /// — the canonical "convex corner of a box at (4,4,4) with edge fillets
+    /// of r=0.5" scenario. The corner sphere center must land exactly on
+    /// that point.
+    #[test]
+    fn concurrent_axes_center_box_corner() {
+        // Axis 1: parallel to X, offset from corner by (0, -0.5, -0.5)
+        //   → passes through (anything, 3.5, 3.5).
+        // Axis 2: parallel to Y, passes through (3.5, anything, 3.5).
+        // Axis 3: parallel to Z, passes through (3.5, 3.5, anything).
+        let incidents = vec![
+            make_incident(Point3::new(0.0, 3.5, 3.5), Vector3::new(1.0, 0.0, 0.0)),
+            make_incident(Point3::new(3.5, 0.0, 3.5), Vector3::new(0.0, 1.0, 0.0)),
+            make_incident(Point3::new(3.5, 3.5, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        ];
+        let center = compute_concurrent_axes_center(&incidents, 0)
+            .expect("three orthogonal axes through a common point must yield a center");
+        assert!((center.x - 3.5).abs() < 1e-9, "x = {}", center.x);
+        assert!((center.y - 3.5).abs() < 1e-9, "y = {}", center.y);
+        assert!((center.z - 3.5).abs() < 1e-9, "z = {}", center.z);
+    }
+
+    /// Three non-orthogonal but linearly-independent axes through (1, 2, 3).
+    /// The projector-matrix least-squares solver must recover the exact
+    /// concurrent point regardless of axis orientation, as long as the
+    /// directions span ℝ³.
+    #[test]
+    fn concurrent_axes_center_skew_axes() {
+        let p = Point3::new(1.0, 2.0, 3.0);
+        let dirs = [
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(0.0, 1.0, 1.0),
+            Vector3::new(1.0, 0.0, 1.0),
+        ];
+        let mut incidents = Vec::new();
+        for d in &dirs {
+            let n = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+            let u = Vector3::new(d.x / n, d.y / n, d.z / n);
+            // Pick an axis_origin = p + (offset along u), so the line
+            // passes through p but axis_origin is not p itself.
+            let q = Point3::new(p.x + 0.3 * u.x, p.y + 0.3 * u.y, p.z + 0.3 * u.z);
+            incidents.push(make_incident(q, u));
+        }
+        let center = compute_concurrent_axes_center(&incidents, 0)
+            .expect("three skew non-coplanar axes through a common point must solve");
+        assert!((center.x - 1.0).abs() < 1e-9, "x = {}", center.x);
+        assert!((center.y - 2.0).abs() < 1e-9, "y = {}", center.y);
+        assert!((center.z - 3.0).abs() < 1e-9, "z = {}", center.z);
+    }
+
+    /// Three parallel axes (all in the Z direction) leave the projector
+    /// sum rank-deficient (A has a Z-direction null space). The 3×3
+    /// inverse must fail; the helper turns that into InvalidGeometry.
+    #[test]
+    fn concurrent_axes_center_rejects_parallel_axes() {
+        let incidents = vec![
+            make_incident(Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+            make_incident(Point3::new(1.0, 0.0, 5.0), Vector3::new(0.0, 0.0, 1.0)),
+            make_incident(Point3::new(0.0, 1.0, -2.0), Vector3::new(0.0, 0.0, 1.0)),
+        ];
+        let err = compute_concurrent_axes_center(&incidents, 42)
+            .expect_err("parallel axes must be rejected as rank-deficient");
+        match err {
+            OperationError::InvalidGeometry(msg) => {
+                assert!(
+                    msg.contains("rank-deficiency") || msg.contains("span ℝ³"),
+                    "expected rank-deficiency / span-ℝ³ diagnostic; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidGeometry; got {other:?}"),
+        }
+    }
+
+    /// Two non-parallel axes (X and Y through origin) form a rank-3
+    /// projector sum: A = M_X + M_Y = diag(1, 1, 2), invertible. The
+    /// helper therefore *succeeds* and returns the least-squares-best
+    /// center — which, for axes that genuinely meet, is the exact
+    /// intersection. Slice 1's "≥3 incidents" rule is enforced by the
+    /// caller (`gather_vertex_blend_context`), not by the math helper.
+    #[test]
+    fn concurrent_axes_center_two_axes_solves_when_intersecting() {
+        let incidents = vec![
+            make_incident(Point3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)),
+            make_incident(Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0)),
+        ];
+        let center = compute_concurrent_axes_center(&incidents, 0)
+            .expect("two intersecting axes form an invertible normal-equations matrix");
+        assert!(center.x.abs() < 1e-12);
+        assert!(center.y.abs() < 1e-12);
+        assert!(center.z.abs() < 1e-12);
+    }
+
+    // ------------------------------------------------------------------
+    // Vertex-blend slice-1 property tests (Task #105).
+    //
+    // These exercise `compute_concurrent_axes_center` across the full
+    // input envelope rather than a fixed scenario. Each property
+    // encodes an *invariant* that must hold for every input drawn from
+    // the strategy:
+    //
+    //   1. **Round-trip recovery**: for any common point P and any
+    //      three linearly-independent unit axes through P, the solver
+    //      must recover P to within 1e-9. This catches sign errors,
+    //      transposed accumulators, and column/row major confusion in
+    //      the projector-matrix code.
+    //
+    //   2. **Rank-deficiency rejection**: for any set of axes all
+    //      parallel to a common direction, the solver must fail with
+    //      InvalidGeometry. Catches accidental regularization that
+    //      would silently produce a fake answer in the degenerate case.
+    //
+    //   3. **Translation invariance**: shifting every (axis_origin, P)
+    //      by the same vector must shift the recovered center by the
+    //      same vector. Catches absolute-position bias in the
+    //      least-squares formulation.
+    //
+    //   4. **Residual identity**: when the input axes really are
+    //      concurrent, the per-axis residual (distance from recovered
+    //      center to each axis line) must be ≤ 1e-9 — the same bound
+    //      the slice-1 wrapper's gate uses, with 3 orders of magnitude
+    //      of headroom over the 1e-6 production gate.
+    // ------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Strategy for a finite, well-conditioned 3D point in [-50, 50]³.
+    fn arb_point() -> impl Strategy<Value = Point3> {
+        (-50.0_f64..50.0, -50.0_f64..50.0, -50.0_f64..50.0)
+            .prop_map(|(x, y, z)| Point3::new(x, y, z))
+    }
+
+    /// Strategy for a unit vector whose components are not so small
+    /// that normalization loses precision. We reject candidates with
+    /// magnitude below 0.25 to keep the unit direction stable.
+    fn arb_unit_vector() -> impl Strategy<Value = Vector3> {
+        (-1.0_f64..1.0, -1.0_f64..1.0, -1.0_f64..1.0)
+            .prop_filter("reject near-zero vectors", |(x, y, z)| {
+                let m = (x * x + y * y + z * z).sqrt();
+                m > 0.25
+            })
+            .prop_map(|(x, y, z)| {
+                let m = (x * x + y * y + z * z).sqrt();
+                Vector3::new(x / m, y / m, z / m)
+            })
+    }
+
+    /// Strategy for three unit vectors whose Gram determinant exceeds
+    /// 0.1 — i.e. they span ℝ³ with a healthy margin. Filtering on
+    /// |det| > 0.1 prevents the least-squares system from being ill-
+    /// conditioned (which would still solve, but with a larger
+    /// numerical-rounding residual).
+    fn arb_three_independent_axes() -> impl Strategy<Value = (Vector3, Vector3, Vector3)> {
+        (arb_unit_vector(), arb_unit_vector(), arb_unit_vector()).prop_filter(
+            "axes must span ℝ³ with |det| > 0.1",
+            |(u, v, w)| {
+                // Determinant of the matrix [u | v | w] (column-stacked).
+                let det = u.x * (v.y * w.z - v.z * w.y)
+                    - u.y * (v.x * w.z - v.z * w.x)
+                    + u.z * (v.x * w.y - v.y * w.x);
+                det.abs() > 0.1
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            max_global_rejects: 4096,
+            ..ProptestConfig::default()
+        })]
+
+        /// Property 1: round-trip recovery. For any common point P and
+        /// three linearly-independent unit directions, build three
+        /// incidents whose lines all pass through P. The solver must
+        /// return P to within 1e-9.
+        #[test]
+        fn prop_axes_through_common_point_recover_it(
+            p in arb_point(),
+            (u1, u2, u3) in arb_three_independent_axes(),
+            t1 in -10.0_f64..10.0,
+            t2 in -10.0_f64..10.0,
+            t3 in -10.0_f64..10.0,
+        ) {
+            // Each axis_origin = P + t·u so the line through it in
+            // direction u definitionally passes through P.
+            let q1 = Point3::new(p.x + t1 * u1.x, p.y + t1 * u1.y, p.z + t1 * u1.z);
+            let q2 = Point3::new(p.x + t2 * u2.x, p.y + t2 * u2.y, p.z + t2 * u2.z);
+            let q3 = Point3::new(p.x + t3 * u3.x, p.y + t3 * u3.y, p.z + t3 * u3.z);
+            let incidents = vec![
+                make_incident(q1, u1),
+                make_incident(q2, u2),
+                make_incident(q3, u3),
+            ];
+            let center = compute_concurrent_axes_center(&incidents, 0)
+                .expect("axes through a common point are always rank-3");
+            prop_assert!(
+                (center.x - p.x).abs() < 1e-9,
+                "x recovered={} expected={}", center.x, p.x,
+            );
+            prop_assert!(
+                (center.y - p.y).abs() < 1e-9,
+                "y recovered={} expected={}", center.y, p.y,
+            );
+            prop_assert!(
+                (center.z - p.z).abs() < 1e-9,
+                "z recovered={} expected={}", center.z, p.z,
+            );
+        }
+
+        /// Property 2: rank-deficiency. Any three axes that all share
+        /// the same direction (regardless of axis_origin) must be
+        /// rejected with InvalidGeometry. Catches accidental
+        /// regularization or silent fall-through paths.
+        #[test]
+        fn prop_parallel_axes_always_rejected(
+            u in arb_unit_vector(),
+            q1 in arb_point(),
+            q2 in arb_point(),
+            q3 in arb_point(),
+        ) {
+            let incidents = vec![
+                make_incident(q1, u),
+                make_incident(q2, u),
+                make_incident(q3, u),
+            ];
+            let result = compute_concurrent_axes_center(&incidents, 0);
+            match result {
+                Err(OperationError::InvalidGeometry(_)) => {}
+                Err(other) => prop_assert!(
+                    false,
+                    "expected InvalidGeometry for parallel axes; got {other:?}"
+                ),
+                Ok(c) => prop_assert!(
+                    false,
+                    "expected rejection for parallel axes; got center {:?}", c
+                ),
+            }
+        }
+
+        /// Property 3: translation invariance. Translating every
+        /// (axis_origin) by a constant vector δ must translate the
+        /// recovered center by the same δ. Catches absolute-position
+        /// bias in the least-squares formulation — the normal
+        /// equations are affine-invariant, so a translation of the
+        /// inputs must come out as a translation of the output, with
+        /// no residual error introduced.
+        #[test]
+        fn prop_translation_invariance(
+            p in arb_point(),
+            (u1, u2, u3) in arb_three_independent_axes(),
+            delta in arb_point(),
+        ) {
+            let q1 = p;
+            let q2 = p;
+            let q3 = p;
+            let incidents_base = vec![
+                make_incident(q1, u1),
+                make_incident(q2, u2),
+                make_incident(q3, u3),
+            ];
+            let center_base = compute_concurrent_axes_center(&incidents_base, 0)
+                .expect("concurrent axes always solve");
+
+            let q1p = Point3::new(q1.x + delta.x, q1.y + delta.y, q1.z + delta.z);
+            let q2p = Point3::new(q2.x + delta.x, q2.y + delta.y, q2.z + delta.z);
+            let q3p = Point3::new(q3.x + delta.x, q3.y + delta.y, q3.z + delta.z);
+            let incidents_shifted = vec![
+                make_incident(q1p, u1),
+                make_incident(q2p, u2),
+                make_incident(q3p, u3),
+            ];
+            let center_shifted = compute_concurrent_axes_center(&incidents_shifted, 0)
+                .expect("translated concurrent axes still solve");
+
+            prop_assert!(
+                (center_shifted.x - center_base.x - delta.x).abs() < 1e-7,
+                "Δx invariance violated: {} vs {}",
+                center_shifted.x - center_base.x,
+                delta.x,
+            );
+            prop_assert!(
+                (center_shifted.y - center_base.y - delta.y).abs() < 1e-7,
+                "Δy invariance violated: {} vs {}",
+                center_shifted.y - center_base.y,
+                delta.y,
+            );
+            prop_assert!(
+                (center_shifted.z - center_base.z - delta.z).abs() < 1e-7,
+                "Δz invariance violated: {} vs {}",
+                center_shifted.z - center_base.z,
+                delta.z,
+            );
+        }
+
+        /// Property 4: residual identity. When the input axes really
+        /// are concurrent through P, the recovered center must lie on
+        /// every axis line. We measure this as the perpendicular
+        /// distance from `center` to each axis line; all three must
+        /// be ≤ 1e-9.
+        #[test]
+        fn prop_residual_zero_for_concurrent_inputs(
+            p in arb_point(),
+            (u1, u2, u3) in arb_three_independent_axes(),
+        ) {
+            let incidents = vec![
+                make_incident(p, u1),
+                make_incident(p, u2),
+                make_incident(p, u3),
+            ];
+            let center = compute_concurrent_axes_center(&incidents, 0)
+                .expect("concurrent axes always solve");
+
+            for (u, q) in [(u1, p), (u2, p), (u3, p)] {
+                let dx = center.x - q.x;
+                let dy = center.y - q.y;
+                let dz = center.z - q.z;
+                let proj = u.x * dx + u.y * dy + u.z * dz;
+                let perpx = dx - proj * u.x;
+                let perpy = dy - proj * u.y;
+                let perpz = dz - proj * u.z;
+                let dist = (perpx * perpx + perpy * perpy + perpz * perpz).sqrt();
+                prop_assert!(
+                    dist < 1e-9,
+                    "residual {:.3e} exceeds 1e-9 for axis through {:?} in direction {:?}",
+                    dist, q, u,
+                );
+            }
+        }
+    }
+
+    /// Two skew (non-intersecting, non-parallel) axes still solve, but
+    /// the result is the least-squares best point — the midpoint of
+    /// the common perpendicular. The residual check in
+    /// `gather_vertex_blend_context` rejects this case downstream; here
+    /// we only verify the helper does not panic and returns a finite
+    /// answer.
+    #[test]
+    fn concurrent_axes_center_two_skew_axes_returns_midpoint() {
+        // L1: x-axis through z = -1.
+        // L2: y-axis through z = +1.
+        // Common perpendicular is the z-axis; midpoint is the origin.
+        let incidents = vec![
+            make_incident(Point3::new(0.0, 0.0, -1.0), Vector3::new(1.0, 0.0, 0.0)),
+            make_incident(Point3::new(0.0, 0.0, 1.0), Vector3::new(0.0, 1.0, 0.0)),
+        ];
+        let center = compute_concurrent_axes_center(&incidents, 0)
+            .expect("two skew non-parallel axes give an invertible system");
+        assert!(center.x.abs() < 1e-12, "x = {}", center.x);
+        assert!(center.y.abs() < 1e-12, "y = {}", center.y);
+        assert!(center.z.abs() < 1e-12, "z = {}", center.z);
+        // Residual: distance from (0,0,0) to L1 is 1.0; the slice-1
+        // wrapper's 1e-6 residual gate would reject this case.
     }
 }
 

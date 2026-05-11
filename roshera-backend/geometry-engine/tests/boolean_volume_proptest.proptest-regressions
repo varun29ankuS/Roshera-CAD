@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 75d644b5cd50c0c421e834a17f45fc87728e7d1501d112af306faf738a38d64b # shrinks to b = (8.176449339734752, 17.60804717532201, 8.39212301438227)
+cc 99d1a1cfe036ef89a87c8c6bdd0c3305300482633b0eafcc1cb21876cb9f914a # shrinks to a_dims = (2.0, 2.0, 2.0), b_dims = (2.0, 2.0, 9.50295578854631), delta = Vector3 { x: 100.0, y: 100.0, z: 100.0 }
+cc ffa784b1f4e1c5b0690380411d83063b86191ba30a68aa885abf32a020ffdf78 # shrinks to small = (2.0, 2.0, 2.0)
+cc b2dedf962cc016de8694de2e00e14e33e084f5e376f5fb5bd327de3c23f48a14 # shrinks to a_dims = (2.0, 2.0, 7.096130025066592), b_dims = (3.637174705152189, 3.496304318528164, 2.0)
