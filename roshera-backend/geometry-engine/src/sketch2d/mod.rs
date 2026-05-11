@@ -68,13 +68,13 @@ pub use spline2d::{BSpline2d, NurbsCurve2d, Spline2d, Spline2dId};
 pub use constraint_solver::{ConstraintSolver, EntityState, SolverResult, SolverStatus};
 pub use constraints::{
     Constraint, ConstraintId, ConstraintPriority, ConstraintStatus, ConstraintType,
-    DimensionalConstraint, EntityRef, GeometricConstraint,
+    DimensionalConstraint, DimensionalUpdateError, EntityRef, GeometricConstraint,
 };
 pub use sketch_solver::{
     DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport, SolveOptions,
 };
 
-pub use sketch::{Sketch, SketchAnchor, SketchId};
+pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 
 // Error types for 2D operations
