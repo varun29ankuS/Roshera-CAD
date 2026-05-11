@@ -688,13 +688,29 @@ impl EdgeStore {
     /// Get edge by ID
     #[inline(always)]
     pub fn get(&self, id: EdgeId) -> Option<&Edge> {
-        self.edges.get(id as usize)
+        // Filter sentinels (edges removed via `remove`, which writes
+        // INVALID_EDGE_ID into the slot rather than truly deleting it
+        // — IDs are stable and slots are not reused). Without this
+        // filter `iter()` and `get()` disagree: callers that walk
+        // `iter` correctly skip removed edges, while callers that
+        // `.get(id)` after a remove get back a sentinel `Edge` with
+        // INVALID_VERTEX_ID/INVALID_EDGE_ID — silently corrupting any
+        // downstream logic that proceeds on the assumption that
+        // `Some(&Edge)` means "live edge". See Task #89: this caused
+        // the cylinder-rim fillet to leave the retired rim edge
+        // visible to topology queries even though `remove` had been
+        // called.
+        self.edges.get(id as usize).filter(|e| e.id != INVALID_EDGE_ID)
     }
 
     /// Get mutable edge by ID
     #[inline(always)]
     pub fn get_mut(&mut self, id: EdgeId) -> Option<&mut Edge> {
-        self.edges.get_mut(id as usize)
+        // Sentinel-filter parity with `get`. See the comment there for
+        // why removed slots must not surface through the lookup API.
+        self.edges
+            .get_mut(id as usize)
+            .filter(|e| e.id != INVALID_EDGE_ID)
     }
 
     /// Remove an edge from the store
@@ -1407,9 +1423,19 @@ mod tests {
         ));
         let removed = s.remove(id).expect("removed edge");
         assert_eq!(removed.start_vertex, 5);
-        // After removal, get returns the marker placeholder (id == INVALID_EDGE_ID).
-        let stub = s.get(id).expect("placeholder still indexed");
-        assert_eq!(stub.id, INVALID_EDGE_ID);
+        // After removal, `get` must return None — the lookup API is the
+        // public-facing contract for "is this edge live". Internally the
+        // slot is overwritten with an INVALID_EDGE_ID sentinel (IDs are
+        // stable, not reused), but `get` filters those sentinels so
+        // callers see consistent semantics with `iter` (which also
+        // skips them). See Task #89 for the bug this consistency fixes.
+        assert!(
+            s.get(id).is_none(),
+            "get(removed_id) must return None after remove"
+        );
+        // The underlying slot still exists with an INVALID_EDGE_ID
+        // sentinel — that's an internal detail, exposed only via the
+        // `total_deleted` counter, not via the lookup API.
         // Vertex index is cleared.
         assert!(!s.edges_at_vertex(5).contains(&id));
         // find_edge_between cache cleared.

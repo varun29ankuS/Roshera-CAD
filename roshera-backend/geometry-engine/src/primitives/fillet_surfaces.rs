@@ -23,27 +23,73 @@ fn newton_closest_point(
     point: &Point3,
     tolerance: Tolerance,
 ) -> MathResult<(f64, f64)> {
-    let mut u = 0.5;
-    let mut v = 0.5;
-    let eps = tolerance.distance();
-    let du = 1e-6;
-    let dv = 1e-6;
+    // Respect the surface's actual parameter bounds. Hard-coding [0,1]² is
+    // wrong for any surface whose NURBS knot vector is not normalized — e.g.
+    // VariableRadiusFillet ([0,17] × [0,3] from `KnotVector::uniform(3, 20)`
+    // and `(2, 5)` respectively). With [0,1] clamps the Newton search is
+    // confined to a 1/51 corner of the actual surface and never reaches
+    // points on the rest of it.
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let u_span = (u_max - u_min).max(1e-12);
+    let v_span = (v_max - v_min).max(1e-12);
 
-    for _ in 0..20 {
+    // Coarse grid scan to seed Newton. A fixed (0.5, 0.5) midpoint seed
+    // can fall into the wrong basin on curved fillet surfaces, and damped
+    // Newton with a 20-iteration budget is not enough to recover from a
+    // bad initial guess across a large parameter span. 5×5 = 25 evals is
+    // cheap and reliably lands us in the correct attraction basin.
+    let grid_n = 5;
+    let mut u = u_min + 0.5 * u_span;
+    let mut v = v_min + 0.5 * v_span;
+    let mut best_dist = f64::INFINITY;
+    for i in 0..grid_n {
+        for j in 0..grid_n {
+            let ug = u_min + (i as f64 / (grid_n - 1) as f64) * u_span;
+            let vg = v_min + (j as f64 / (grid_n - 1) as f64) * v_span;
+            if let Ok(sp) = surface.point_at(ug, vg) {
+                let d = (*point - sp).magnitude();
+                if d < best_dist {
+                    best_dist = d;
+                    u = ug;
+                    v = vg;
+                }
+            }
+        }
+    }
+
+    let eps = tolerance.distance();
+    // Finite-difference step scaled to the parameter span so the gradient
+    // estimate stays meaningful regardless of how the surface parameterizes.
+    let du_step_size = (1e-6 * u_span).max(1e-12);
+    let dv_step_size = (1e-6 * v_span).max(1e-12);
+
+    for _ in 0..50 {
         let sp = surface.point_at(u, v)?;
         let diff = *point - sp;
         let dist = diff.magnitude();
         if dist < eps {
             break;
         }
-        let sp_du = surface.point_at((u + du).min(1.0), v)?;
-        let sp_dv = surface.point_at(u, (v + dv).min(1.0))?;
-        let dpos_du = (sp_du - sp) / du;
-        let dpos_dv = (sp_dv - sp) / dv;
+        // One-sided differences, biased away from the upper bound so the
+        // sample stays within the parameter rectangle.
+        let u_probe = if u + du_step_size <= u_max {
+            u + du_step_size
+        } else {
+            u - du_step_size
+        };
+        let v_probe = if v + dv_step_size <= v_max {
+            v + dv_step_size
+        } else {
+            v - dv_step_size
+        };
+        let sp_du = surface.point_at(u_probe, v)?;
+        let sp_dv = surface.point_at(u, v_probe)?;
+        let dpos_du = (sp_du - sp) / (u_probe - u);
+        let dpos_dv = (sp_dv - sp) / (v_probe - v);
         let du_step = diff.dot(&dpos_du) / dpos_du.dot(&dpos_du).max(1e-30);
         let dv_step = diff.dot(&dpos_dv) / dpos_dv.dot(&dpos_dv).max(1e-30);
-        u = (u + du_step * 0.5).clamp(0.0, 1.0);
-        v = (v + dv_step * 0.5).clamp(0.0, 1.0);
+        u = (u + du_step * 0.5).clamp(u_min, u_max);
+        v = (v + dv_step * 0.5).clamp(v_min, v_max);
     }
     Ok((u, v))
 }
@@ -1193,29 +1239,56 @@ impl VariableRadiusFillet {
         for i in 0..NUM_U {
             let u = i as f64 / (NUM_U - 1) as f64;
             let spine_point = spine.evaluate(u)?.position;
-            let spine_tangent = spine.tangent_at(u)?;
             // Honor the caller-supplied radius for this sample exactly.
             let radius = radii[i];
 
-            let z_axis = spine_tangent.normalize().unwrap_or(Vector3::Z);
             let c1_point = contact1.evaluate(u)?.position;
             let c2_point = contact2.evaluate(u)?.position;
-            let raw_x = c1_point - spine_point;
-            let x_in_plane = raw_x - z_axis * raw_x.dot(&z_axis);
-            let x_axis = x_in_plane.normalize().unwrap_or_else(|_| {
-                if z_axis.cross(&Vector3::X).magnitude_squared() > 1e-6 {
-                    z_axis.cross(&Vector3::X).normalize().unwrap_or(Vector3::X)
-                } else {
-                    z_axis.cross(&Vector3::Y).normalize().unwrap_or(Vector3::Y)
-                }
-            });
-            let y_axis = z_axis.cross(&x_axis);
 
+            // Define the rolling-ball cross-section frame directly from the
+            // contact-spine vectors. These two vectors span the cross-section
+            // plane by construction (the rolling sphere touches face1 at c1,
+            // face2 at c2, with centre at spine; all three are coplanar in
+            // the plane spanned by the two face inward-normals).
+            //
+            // Using `spine_tangent` as the cross-section normal would be
+            // wrong for variable-radius fillets: when dr/du ≠ 0 the spine
+            // moves both along the edge and toward the surfaces, so
+            // spine_tangent acquires a component out of the contact plane.
+            // Projecting raw_x/raw_y perpendicular to spine_tangent would
+            // then shorten them, and the surface's u-iso boundary would
+            // miss c1/c2 by an O(dr/du) offset — exactly the bug the
+            // Task #84 cap-validation tests pin.
+            let raw_x = c1_point - spine_point;
             let raw_y = c2_point - spine_point;
-            let y_in_plane = raw_y - z_axis * raw_y.dot(&z_axis);
-            let cos_sweep =
-                (x_axis.dot(&y_in_plane) / y_in_plane.magnitude().max(1e-12)).clamp(-1.0, 1.0);
-            let sweep = cos_sweep.acos().clamp(1e-6, std::f64::consts::PI);
+            let raw_x_mag = raw_x.magnitude();
+            let raw_y_mag = raw_y.magnitude();
+            if raw_x_mag < 1e-12 || raw_y_mag < 1e-12 {
+                return Err(MathError::InvalidParameter(format!(
+                    "VariableRadiusFillet::with_radius_profile: degenerate \
+                     contact-spine vector at sample {} (|c1-spine|={}, \
+                     |c2-spine|={})",
+                    i, raw_x_mag, raw_y_mag
+                )));
+            }
+            let x_axis = raw_x / raw_x_mag;
+            let y_target = raw_y / raw_y_mag;
+            let cos_sweep = x_axis.dot(&y_target).clamp(-1.0, 1.0);
+            let sweep = cos_sweep.acos().max(1e-6);
+            let sin_sweep = sweep.sin();
+            if sin_sweep.abs() < 1e-12 {
+                return Err(MathError::InvalidParameter(format!(
+                    "VariableRadiusFillet::with_radius_profile: degenerate \
+                     sweep (cos={}, sin={}) at sample {} — c1, c2, and spine \
+                     are collinear",
+                    cos_sweep, sin_sweep, i
+                )));
+            }
+            // y_axis: unit vector perpendicular to x_axis within the
+            // (x_axis, y_target) plane, oriented toward y_target.
+            // Derivation: y_target = cos_sweep * x_axis + sin_sweep * y_axis,
+            // so y_axis = (y_target - cos_sweep * x_axis) / sin_sweep.
+            let y_axis = (y_target - x_axis * cos_sweep) / sin_sweep;
 
             for j in 0..NUM_V {
                 let v = j as f64 / (NUM_V - 1) as f64;
