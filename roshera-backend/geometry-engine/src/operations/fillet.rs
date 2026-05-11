@@ -205,9 +205,16 @@ pub fn fillet_edges(
 
     // Record for attached recorders. `inputs` lists the user-supplied
     // edges (not the propagated superset — that's a derived detail).
+    // `outputs` leads with `solid_id` so the lineage graph treats this
+    // fillet as the new "producer" of the modified body — downstream
+    // ops (shell-after-fillet, chamfer-after-fillet, …) then parent to
+    // this event instead of jumping past it back to the primitive. The
+    // generated fillet faces follow so the recorded op still names the
+    // topology it introduced.
     let mut inputs = input_edges_for_record;
     inputs.insert(0, solid_id as u64);
-    let fillet_face_ids: Vec<u64> = fillet_faces.iter().map(|&f| f as u64).collect();
+    let mut outputs: Vec<u64> = vec![solid_id as u64];
+    outputs.extend(fillet_faces.iter().map(|&f| f as u64));
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("fillet_edges")
             .with_parameters(serde_json::json!({
@@ -219,7 +226,7 @@ pub fn fillet_edges(
                 "quality": format!("{:?}", options.quality),
             }))
             .with_inputs(inputs)
-            .with_outputs(fillet_face_ids),
+            .with_outputs(outputs),
     );
 
     Ok(fillet_faces)

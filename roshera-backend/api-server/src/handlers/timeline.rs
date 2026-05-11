@@ -521,7 +521,7 @@ fn author_kind(author: &Author) -> String {
 }
 
 /// Event summary for history
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EventSummary {
     /// Event UUID
     pub id: String,
@@ -537,6 +537,343 @@ pub struct EventSummary {
     pub author: String,
     /// Author classification for UI tinting: "user" | "ai" | "system"
     pub author_kind: String,
+}
+
+// ─── Feature Tree (operation-graph browser) ─────────────────────────
+//
+// The Feature Tree is the kernel's authoritative answer to "what
+// operations stand on top of what". Every kernel call is recorded
+// through `OperationRecorder` carrying `inputs` (entity IDs the
+// operation consumed) and `outputs` (entity IDs it produced); the
+// timeline bridge encodes these as numbers inside
+// `Operation::Generic.parameters`. The hierarchy is reconstructed
+// here, on the kernel-adjacent layer, so every consumer (Roshera UI,
+// agent SDK, future replay tools) sees the same tree without
+// reimplementing the lineage rules.
+
+/// Node in the operation-graph hierarchy returned by
+/// `GET /api/feature-tree/{branch_id}`.
+#[derive(Serialize, Deserialize)]
+pub struct FeatureNode {
+    /// The recorded event this node represents.
+    pub event: EventSummary,
+    /// Entity IDs the operation consumed, as canonical decimal strings
+    /// (kernel `ObjectId` values are `u64`; we widen to `String` so
+    /// the wire shape stays open to UUID-keyed entities in slice 2+).
+    pub inputs: Vec<String>,
+    /// Entity IDs the operation produced.
+    pub outputs: Vec<String>,
+    /// Event UUID of this node's parent in the graph, or `None` for
+    /// roots. The parent is the earliest prior event that produced
+    /// any of `self.inputs`. Roots are events whose inputs reference
+    /// no in-window producer (sketches, datums, primitives, or
+    /// operations whose producer fell outside the 100-event window).
+    pub parent_event_id: Option<String>,
+    /// Per-kind running index in branch sequence order
+    /// (`create_box_3d`-1, `create_box_3d`-2, `fillet_edges`-1, …).
+    /// Counted on the raw `event.operation_type` so the kernel — not
+    /// the renderer — decides what counts as "the same kind".
+    pub kind_index: usize,
+    /// Children sorted by ascending sequence number, mirroring the
+    /// order the operations were applied.
+    pub children: Vec<FeatureNode>,
+}
+
+/// `GET /api/feature-tree/{branch_id}` — derived hierarchy of the
+/// branch's recorded operations.
+///
+/// Same data source as `get_history`, but the parent-child wiring is
+/// computed kernel-side so every client renders the exact same tree.
+/// The frontend `FeatureTree` panel is a pure renderer over this
+/// response — no derivation logic lives in TypeScript.
+pub async fn get_feature_tree(
+    State(state): State<AppState>,
+    Path(branch_id): Path<String>,
+) -> Result<Json<Vec<FeatureNode>>, StatusCode> {
+    let _ = state.timeline_recorder.flush().await;
+    let timeline = state.timeline.read().await;
+    let branch_id = resolve_branch_ref(&branch_id)?;
+
+    let events = timeline
+        .get_branch_events(&branch_id, Some(0), Some(100))
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let summaries: Vec<EventSummary> = events
+        .into_iter()
+        .map(|event| EventSummary {
+            id: event.id.to_string(),
+            sequence_number: event.sequence_number,
+            timestamp: event.timestamp.to_rfc3339(),
+            operation_type: operation_kind(&event.operation),
+            operation: serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null),
+            author: author_label(&event.author),
+            author_kind: author_kind(&event.author),
+        })
+        .collect();
+
+    Ok(Json(build_feature_tree(summaries)))
+}
+
+/// Canonical decimal/string form for an entity identifier. Returns
+/// `None` for everything that isn't a non-empty string or a finite
+/// integer — keeps fillet radii / angle parameters out of the lineage
+/// graph even when they live alongside legitimate id fields.
+fn entity_key(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(n) = value.as_u64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = value.as_i64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
+fn extract_id_list(value: &serde_json::Value) -> Vec<String> {
+    match value.as_array() {
+        Some(arr) => arr.iter().filter_map(entity_key).collect(),
+        None => Vec::new(),
+    }
+}
+
+#[derive(Default)]
+struct Lineage {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+}
+
+/// Extract `(inputs, outputs)` entity ids from an operation payload.
+///
+/// `Operation::Generic { parameters: { inputs, outputs, ... } }` (the
+/// path every kernel call takes via `TimelineRecorder`) is the fast
+/// path — we read the two array fields directly. For typed `Operation`
+/// variants that surface through the rebuild path we fall back to a
+/// recursive crawl that only picks up values at keys whose names imply
+/// "entity id" (`inputs`, `outputs`, `source`, `target`, `solid_id`,
+/// `face_id`, `edge_id`, `object_id`, `result_id`, `new_id`, …). This
+/// is the same rule the slice 1 frontend used, lifted verbatim so the
+/// two paths stay byte-equivalent during the migration.
+fn lineage_from_operation(op: &serde_json::Value) -> Lineage {
+    if let Some(params) = op.get("parameters").and_then(|p| p.as_object()) {
+        let inputs = params
+            .get("inputs")
+            .map(extract_id_list)
+            .unwrap_or_default();
+        let outputs = params
+            .get("outputs")
+            .map(extract_id_list)
+            .unwrap_or_default();
+        if !inputs.is_empty() || !outputs.is_empty() {
+            return Lineage { inputs, outputs };
+        }
+    }
+
+    let mut lineage = Lineage::default();
+    walk_for_lineage(op, &mut lineage);
+    lineage
+}
+
+fn walk_for_lineage(value: &serde_json::Value, lineage: &mut Lineage) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_for_lineage(item, lineage);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let kl = k.to_lowercase();
+                match kl.as_str() {
+                    "inputs" | "sources" | "source_ids" => {
+                        lineage.inputs.extend(extract_id_list(v));
+                    }
+                    "outputs" | "created" | "result_ids" => {
+                        lineage.outputs.extend(extract_id_list(v));
+                    }
+                    "source" | "target" | "target_id" | "solid_id" | "host_solid_id"
+                    | "face_id" | "edge_id" | "object_id" => {
+                        if let Some(key) = entity_key(v) {
+                            lineage.inputs.push(key);
+                        }
+                    }
+                    "result" | "result_id" | "new_id" => {
+                        if let Some(key) = entity_key(v) {
+                            lineage.outputs.push(key);
+                        }
+                    }
+                    _ => walk_for_lineage(v, lineage),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the operation-graph hierarchy from an ascending-sequence list
+/// of `EventSummary` rows.
+///
+/// Parent rule: among all events that produced any of *this* event's
+/// inputs, pick the earliest (smallest sequence_number). Earliest-wins
+/// matches user expectation for booleans — `box ∪ sphere` is parented
+/// to the box (created first) and the sphere remains a sibling root.
+/// Slice 2 will add a cross-link badge to the unselected operand.
+fn build_feature_tree(mut events: Vec<EventSummary>) -> Vec<FeatureNode> {
+    events.sort_by_key(|e| e.sequence_number);
+
+    // Lineage per event, captured up-front so we can reference it by
+    // index without re-extracting on every parent lookup.
+    let lineages: Vec<Lineage> = events
+        .iter()
+        .map(|e| lineage_from_operation(&e.operation))
+        .collect();
+
+    // All producers of each output id, with their sequence number.
+    //
+    // Before the slice-1 identity-preserving modify-op refactor the
+    // kernel never re-emitted an existing `SolidId` as output (chamfer
+    // / fillet / mirror / shell each swapped to a brand-new UUID on
+    // the api-server side, so output ids were unique by construction).
+    // Now that the kernel preserves `solid_id` across modifying ops —
+    // and those ops record `outputs: [solid_id, …new_face_ids]` so the
+    // lineage graph picks them up — the same id appears as an output
+    // on every event that touches the body. The parent-edge rule
+    // therefore needs to pick the *most recent* prior producer of a
+    // given input, not the first, otherwise a chain like
+    // `Box → Chamfer → Fillet` collapses to `Box → {Chamfer, Fillet}`.
+    let mut producers_by_output: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    for (i, lineage) in lineages.iter().enumerate() {
+        let event = &events[i];
+        for out in &lineage.outputs {
+            producers_by_output
+                .entry(out.clone())
+                .or_default()
+                .push((event.sequence_number, event.id.clone()));
+        }
+    }
+
+    // Build flat node list. `parent_event_id` and `kind_index` are
+    // assigned here; children are wired in a second pass below.
+    let mut kind_counts: HashMap<String, usize> = HashMap::new();
+
+    let mut flat: Vec<FeatureNode> = Vec::with_capacity(events.len());
+    for (i, event) in events.iter().enumerate() {
+        let lineage = &lineages[i];
+        let counter = kind_counts.entry(event.operation_type.clone()).or_insert(0);
+        *counter += 1;
+        let kind_index = *counter;
+
+        // Parent rule:
+        //   1. For each input id, find the most-recent producer event
+        //      whose sequence number is strictly less than ours
+        //      (`per_input_latest`).
+        //   2. Among those per-input latest producers, pick the one
+        //      with the *smallest* sequence number — earliest-among-
+        //      latest preserves the historical boolean behaviour
+        //      (`box ∪ sphere` parents to the box, with the sphere
+        //      remaining a sibling root).
+        let current_seq = event.sequence_number;
+        let mut parent_id: Option<String> = None;
+        let mut parent_seq: u64 = u64::MAX;
+        for input in &lineage.inputs {
+            let Some(producers) = producers_by_output.get(input) else {
+                continue;
+            };
+            let mut latest_seq: Option<u64> = None;
+            let mut latest_id: Option<&String> = None;
+            for (seq, id) in producers {
+                if *seq >= current_seq {
+                    continue;
+                }
+                if id == &event.id {
+                    continue;
+                }
+                if latest_seq.is_none_or(|s| *seq > s) {
+                    latest_seq = Some(*seq);
+                    latest_id = Some(id);
+                }
+            }
+            if let (Some(seq), Some(id)) = (latest_seq, latest_id) {
+                if seq < parent_seq {
+                    parent_seq = seq;
+                    parent_id = Some(id.clone());
+                }
+            }
+        }
+
+        flat.push(FeatureNode {
+            event: event.clone(),
+            inputs: lineage.inputs.clone(),
+            outputs: lineage.outputs.clone(),
+            parent_event_id: parent_id,
+            kind_index,
+            children: Vec::new(),
+        });
+    }
+
+    // Re-parent into a tree. Use a HashMap-keyed assembly so we can
+    // move owned `FeatureNode`s without cloning the entire subtree.
+    let mut children_by_parent: HashMap<Option<String>, Vec<String>> = HashMap::new();
+    for node in &flat {
+        children_by_parent
+            .entry(node.parent_event_id.clone())
+            .or_default()
+            .push(node.event.id.clone());
+    }
+
+    let mut nodes_by_id: HashMap<String, FeatureNode> = flat
+        .into_iter()
+        .map(|n| (n.event.id.clone(), n))
+        .collect();
+
+    let root_ids = children_by_parent
+        .get(&None)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut roots: Vec<FeatureNode> = Vec::with_capacity(root_ids.len());
+    for id in root_ids {
+        if let Some(node) = assemble_subtree(&id, &mut nodes_by_id, &children_by_parent) {
+            roots.push(node);
+        }
+    }
+
+    // Any node still left in `nodes_by_id` had a `parent_event_id`
+    // pointing at an event outside the 100-event window (or otherwise
+    // unresolvable). Promote it to a root so the user still sees it —
+    // dropping events here would silently hide kernel ops.
+    let orphans: Vec<String> = nodes_by_id.keys().cloned().collect();
+    for id in orphans {
+        if let Some(mut node) = nodes_by_id.remove(&id) {
+            node.parent_event_id = None;
+            roots.push(node);
+        }
+    }
+
+    roots.sort_by_key(|n| n.event.sequence_number);
+    roots
+}
+
+fn assemble_subtree(
+    id: &str,
+    nodes_by_id: &mut HashMap<String, FeatureNode>,
+    children_by_parent: &HashMap<Option<String>, Vec<String>>,
+) -> Option<FeatureNode> {
+    let mut node = nodes_by_id.remove(id)?;
+    let child_ids = children_by_parent
+        .get(&Some(id.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    for child_id in child_ids {
+        if let Some(child) = assemble_subtree(&child_id, nodes_by_id, children_by_parent) {
+            node.children.push(child);
+        }
+    }
+    node.children.sort_by_key(|n| n.event.sequence_number);
+    Some(node)
 }
 
 /// Checkpoint/tag a specific state
