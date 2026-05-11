@@ -355,7 +355,10 @@ fn create_constant_radius_fillet(
         OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
     })?;
 
-    // Create fillet face with proper trimming
+    // Create fillet face with proper trimming. Constant-radius rolling
+    // balls trace cylindrical or toroidal surfaces whose natural u=const
+    // cross-section is exactly a planar circular arc of the constant
+    // radius — so the default `Arc` cap is correct and `None` keeps it.
     create_trimmed_fillet_face(
         model,
         surface_id,
@@ -368,6 +371,7 @@ fn create_constant_radius_fillet(
         cap_v1_center,
         cap_v0_radius,
         cap_v1_radius,
+        None,
     )
 }
 
@@ -414,6 +418,29 @@ fn create_variable_radius_fillet(
 
     // Create variable radius fillet surface
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
+
+    // Build cap NURBS curves by sampling the surface's parametric
+    // boundary at u = u_min (cap V0) and u = u_max (cap V1), v running
+    // across the full v-domain. The previous implementation built a
+    // circular `Arc` in the plane perpendicular to the edge axis at
+    // each cap, which is only on-surface when `dr/du = 0`. For variable
+    // radii the surface's cross-section plane tilts in proportion to
+    // the radius gradient; sampling the actual iso-curve makes the cap
+    // sit on the surface boundary by construction.
+    //
+    // Orientation: the surface construction places the v=0 control
+    // points along contact1 and v=v_max along contact2. The blend-loop
+    // traversal needs cap_V0 to go from v_t2_start (contact2[0]) to
+    // v_t1_start (contact1[0]) — i.e. v_max → v_min at u_min — and
+    // cap_V1 to go from v_t1_end (contact1[N]) to v_t2_end
+    // (contact2[N]) — i.e. v_min → v_max at u_max.
+    let ((surf_u_min, surf_u_max), (surf_v_min, surf_v_max)) =
+        fillet_surface.parameter_bounds();
+    let cap_v0_curve =
+        sample_cap_iso_curve(&*fillet_surface, surf_u_min, surf_v_max, surf_v_min)?;
+    let cap_v1_curve =
+        sample_cap_iso_curve(&*fillet_surface, surf_u_max, surf_v_min, surf_v_max)?;
+
     let surface_id = model.surfaces.add(fillet_surface);
 
     // Create trimming curves
@@ -433,7 +460,7 @@ fn create_variable_radius_fillet(
         OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
     })?;
 
-    // Create fillet face
+    // Create fillet face with surface-sampled cap NURBS
     create_trimmed_fillet_face(
         model,
         surface_id,
@@ -446,6 +473,7 @@ fn create_variable_radius_fillet(
         cap_v1_center,
         cap_v0_radius,
         cap_v1_radius,
+        Some((cap_v0_curve, cap_v1_curve)),
     )
 }
 
@@ -1102,6 +1130,19 @@ fn create_function_radius_fillet(
     let rolling_ball_data =
         compute_function_rolling_ball_positions(model, &edge, face1_id, face2_id, &radii)?;
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
+
+    // Same surface-iso-curve cap-sampling as the linear variable-radius
+    // path — see the docstring there for the orientation rationale.
+    // A non-constant radius profile (function radius) makes the
+    // surface's cross-section plane tilt with `dr/du`, so the
+    // perpendicular-plane Arc cap drifts off the surface.
+    let ((surf_u_min, surf_u_max), (surf_v_min, surf_v_max)) =
+        fillet_surface.parameter_bounds();
+    let cap_v0_curve =
+        sample_cap_iso_curve(&*fillet_surface, surf_u_min, surf_v_max, surf_v_min)?;
+    let cap_v1_curve =
+        sample_cap_iso_curve(&*fillet_surface, surf_u_max, surf_v_min, surf_v_max)?;
+
     let surface_id = model.surfaces.add(fillet_surface);
 
     let (trim_curve1, trim_curve2) =
@@ -1132,6 +1173,7 @@ fn create_function_radius_fillet(
         cap_v1_center,
         cap_v0_radius,
         cap_v1_radius,
+        Some((cap_v0_curve, cap_v1_curve)),
     )
 }
 
@@ -2285,6 +2327,49 @@ fn build_cap_arc(
         .map_err(|e| OperationError::NumericalError(format!("Cap arc construction: {:?}", e)))
 }
 
+/// Sample an iso-parametric curve on a fillet surface as a `Box<dyn Curve>`,
+/// used to build cap edges on variable-radius / function-radius fillet
+/// blends where the swept-surface boundary at `u = u_min` / `u = u_max`
+/// is no longer a planar circular arc. When `dr/du ≠ 0` the rolling-ball
+/// cross-section plane tilts in proportion to the radius gradient and a
+/// perpendicular-plane `Arc` cap drifts off the surface. Sampling the
+/// actual surface iso-curve keeps the cap on the surface boundary by
+/// construction.
+///
+/// `v_start` / `v_end` may be supplied in either order so the caller can
+/// match the cap-edge orientation expected by the blend-loop traversal:
+/// the v-sweep walks linearly from `v_start` to `v_end`.
+fn sample_cap_iso_curve(
+    surface: &dyn Surface,
+    u_fixed: f64,
+    v_start: f64,
+    v_end: f64,
+) -> OperationResult<Box<dyn Curve>> {
+    // 31 samples along the v-iso-curve at fixed u. The cap is a short
+    // arc (rolling-ball cross-section, length ≈ r · π/2 ≈ 0.6-1.5 plane
+    // units for typical sub-mm-to-mm radii), so 31 samples ≈ 1 sample
+    // per 0.03 plane units. This gives the degree-3 NURBS least-squares
+    // fit enough constraints to hug the iso-curve to well within the
+    // 1e-3 surface-residence tolerance pinned by the cap-validation tests
+    // — `fit_to_points` is least-squares (not interpolation), so under-
+    // sampling lets the fit drift mid-cap even though both endpoints
+    // are pinned.
+    const NUM_SAMPLES: usize = 31;
+    let mut points = Vec::with_capacity(NUM_SAMPLES);
+    for i in 0..NUM_SAMPLES {
+        let s = i as f64 / (NUM_SAMPLES - 1) as f64;
+        let v = v_start + s * (v_end - v_start);
+        let p = surface.point_at(u_fixed, v).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Cap iso-curve sample at (u={u_fixed}, v={v}) failed: {:?}",
+                e
+            ))
+        })?;
+        points.push(p);
+    }
+    create_curve_from_points(&points)
+}
+
 /// Create trimmed fillet face.
 ///
 /// Returns `(face_id, surgery)` where `surgery` is `Some(BlendEdgeSurgery)`
@@ -2300,6 +2385,18 @@ fn build_cap_arc(
 /// blend face's natural boundary takes at each cap; the cap edges are
 /// constructed as those arcs so the loop boundary tracks the fillet
 /// surface instead of cutting a chord across it.
+///
+/// `cap_curve_overrides`: optional caller-supplied cap curves
+/// `(cap_v0_curve, cap_v1_curve)`. When `None`, the function builds a
+/// circular `Arc` cap in the plane perpendicular to the edge axis — the
+/// natural cross-section for a constant-radius rolling-ball sweep
+/// (cylindrical or toroidal fillet surface). When `Some`, the supplied
+/// curves are used verbatim. This is required for variable-radius and
+/// function-radius fillets where the rolling-ball cross-section plane
+/// tilts in proportion to `dr/du` and the swept-surface boundary at
+/// `u = u_min` / `u = u_max` is no longer a planar circular arc — the
+/// caller samples the surface's actual iso-curve and passes a NURBS so
+/// the cap stays on the surface boundary.
 fn create_trimmed_fillet_face(
     model: &mut BRepModel,
     surface_id: u32,
@@ -2312,6 +2409,7 @@ fn create_trimmed_fillet_face(
     cap_v1_center: Point3,
     cap_v0_radius: f64,
     cap_v1_radius: f64,
+    cap_curve_overrides: Option<(Box<dyn Curve>, Box<dyn Curve>)>,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     use crate::math::surface_intersection::intersection_curve_to_nurbs;
     use crate::primitives::r#loop::Loop;
@@ -2527,17 +2625,39 @@ fn create_trimmed_fillet_face(
 
         // Edge axis direction (V0 → V1). The cap arcs lie in planes
         // perpendicular to this direction — the cylinder/torus
-        // cross-section at each end of the rolling-ball sweep.
-        let axis_dir = (Point3::new(end_pos[0], end_pos[1], end_pos[2])
-            - Point3::new(start_pos[0], start_pos[1], start_pos[2]))
-        .normalize()
-        .map_err(|e| {
-            OperationError::NumericalError(format!("Edge axis normalize failed: {:?}", e))
-        })?;
+        // cross-section at each end of the rolling-ball sweep. Only
+        // used when `cap_curve_overrides` is None (constant-radius
+        // fillet). For variable / function radius, the caller has
+        // sampled the actual fillet surface boundary and passed
+        // explicit NURBS cap curves; the perpendicular-plane arc is
+        // wrong there because the surface's cross-section plane
+        // tilts in proportion to `dr/du`.
+        let (cap_v0_curve, cap_v1_curve): (Box<dyn Curve>, Box<dyn Curve>) =
+            if let Some((c0, c1)) = cap_curve_overrides {
+                (c0, c1)
+            } else {
+                let axis_dir = (Point3::new(end_pos[0], end_pos[1], end_pos[2])
+                    - Point3::new(start_pos[0], start_pos[1], start_pos[2]))
+                .normalize()
+                .map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "Edge axis normalize failed: {:?}",
+                        e
+                    ))
+                })?;
+                let v1_arc =
+                    build_cap_arc(cap_v1_center, axis_dir, cap_v1_radius, trim1_last, trim2_last)?;
+                let v0_arc = build_cap_arc(
+                    cap_v0_center,
+                    axis_dir,
+                    cap_v0_radius,
+                    trim2_first,
+                    trim1_first,
+                )?;
+                (Box::new(v0_arc), Box::new(v1_arc))
+            };
 
-        let cap_v1_curve =
-            build_cap_arc(cap_v1_center, axis_dir, cap_v1_radius, trim1_last, trim2_last)?;
-        let cap_v1_curve_id = model.curves.add(Box::new(cap_v1_curve));
+        let cap_v1_curve_id = model.curves.add(cap_v1_curve);
         let edge_cap_v1 = Edge::new(
             0,
             v_t1_end,
@@ -2548,9 +2668,7 @@ fn create_trimmed_fillet_face(
         );
         let edge_cap_v1_id = model.edges.add(edge_cap_v1);
 
-        let cap_v0_curve =
-            build_cap_arc(cap_v0_center, axis_dir, cap_v0_radius, trim2_first, trim1_first)?;
-        let cap_v0_curve_id = model.curves.add(Box::new(cap_v0_curve));
+        let cap_v0_curve_id = model.curves.add(cap_v0_curve);
         let edge_cap_v0 = Edge::new(
             0,
             v_t2_start,
