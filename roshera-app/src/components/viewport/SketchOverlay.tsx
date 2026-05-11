@@ -563,9 +563,16 @@ export function SketchOverlay() {
 
 /**
  * Render the closed polygon of every shape EXCEPT the last (active)
- * one. All committed loops draw in a faint neutral colour — outer-vs-
- * hole classification is decided geometrically at extrude time, so
- * tinting per-shape would lie about a state that doesn't exist yet.
+ * one. All committed loops draw in a saturated cyan so they read
+ * unambiguously as part of the live sketch — earlier versions used
+ * a desaturated steel-blue which made closed loops look "vanished"
+ * after the auto-commit pattern reset the active shape to empty.
+ *
+ * Each committed segment carries a read-only length label so the
+ * user keeps visual confirmation of their dimensions after closure.
+ * Editing committed-shape dimensions is the job of the constrained-
+ * sketch path (`csketch`) — this surface stays read-only because the
+ * legacy sketch session has no per-point set-by-shape endpoint.
  *
  * Shapes that don't yet materialise to a valid polygon (too few
  * points, degenerate radius, etc.) are skipped silently.
@@ -586,11 +593,45 @@ function CommittedShapesGuides() {
         const profile = buildProfile2D(shape.tool, shape.points, circleSegments)
         if (!profile || profile.length < 3) return null
         const world = profile.map((p) => uvToWorld(p, plane))
+        // Segment lengths + midpoint label positions, computed before
+        // we duplicate the first vertex to close the visual line.
+        // Circles tessellate into many short segments — labelling each
+        // would clutter the viewport, so we surface a single radius
+        // label at the rightmost vertex instead.
+        const isCircle = shape.tool === 'circle'
+        const labels: Array<{ pos: THREE.Vector3; text: string }> = []
+        if (isCircle && shape.points.length >= 2) {
+          const [cx, cy] = shape.points[0]
+          const [ex, ey] = shape.points[1]
+          const r = Math.hypot(ex - cx, ey - cy)
+          // Place the R-label at the edge anchor in plane space.
+          labels.push({
+            pos: uvToWorld([ex, ey], plane),
+            text: `R ${fmtLen(r)}`,
+          })
+        } else {
+          for (let i = 0; i < profile.length; i += 1) {
+            const a = profile[i]
+            const b = profile[(i + 1) % profile.length]
+            const len = Math.hypot(b[0] - a[0], b[1] - a[1])
+            if (len < 1e-6) continue
+            labels.push({
+              pos: uvToWorld([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], plane),
+              text: fmtLen(len),
+            })
+          }
+        }
         // Close the loop visually by duplicating the first point.
         world.push(world[0])
-        return { idx, points: world }
+        return { idx, points: world, labels }
       })
-      .filter((l): l is { idx: number; points: THREE.Vector3[] } => l !== null)
+      .filter(
+        (l): l is {
+          idx: number
+          points: THREE.Vector3[]
+          labels: Array<{ pos: THREE.Vector3; text: string }>
+        } => l !== null,
+      )
   }, [committed, plane, circleSegments])
 
   if (loops.length === 0) return null
@@ -598,18 +639,24 @@ function CommittedShapesGuides() {
   return (
     <group name="sketch-committed-shapes">
       {loops.map((l) => (
-        <Line
-          key={`committed-${l.idx}`}
-          points={l.points}
-          // Committed loops use a desaturated steel-blue so they read as
-          // "already drawn" against the brighter cyan of the active
-          // shape, but stay legible against the plane tint at typical
-          // working zoom levels.
-          color="#7dd3fc"
-          lineWidth={2}
-          opacity={0.85}
-          transparent
-        />
+        <group key={`committed-${l.idx}`}>
+          <Line
+            points={l.points}
+            // Bright cyan matches the active-shape preview so committed
+            // loops stay visually anchored as part of the sketch.
+            color="#3498db"
+            lineWidth={2}
+            opacity={0.95}
+            transparent
+          />
+          {l.labels.map((lab, i) => (
+            <DimLabel
+              key={`committed-${l.idx}-len-${i}`}
+              position={lab.pos}
+              text={lab.text}
+            />
+          ))}
+        </group>
       ))}
     </group>
   )
