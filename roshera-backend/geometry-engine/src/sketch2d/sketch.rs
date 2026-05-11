@@ -9,7 +9,7 @@
 
 use super::arc2d::ParametricArc2d;
 use super::circle2d::ParametricCircle2d;
-use super::constraints::{ConstraintStore, EntityRef};
+use super::constraints::{ConstraintStore, DimensionalUpdateError, EntityRef};
 use super::ellipse2d::ParametricEllipse2d;
 use super::line2d::ParametricLine2d;
 use super::point2d::ParametricPoint2d;
@@ -144,6 +144,24 @@ impl SketchAnchor {
     pub fn has_datum(&self) -> bool {
         self.datum_id != INVALID_DATUM_ID
     }
+}
+
+/// Solver-relevant geometry captured for revert-on-conflict flows.
+///
+/// Produced by [`Sketch::snapshot_entity_geometry`] and consumed by
+/// [`Sketch::restore_entity_geometry`]. The snapshot only carries
+/// fields the constraint solver writes back today: point positions,
+/// line geometry, arc parameters, circle parameters. Construction
+/// flags, constraint counts, and the entity ids themselves are
+/// preserved (the snapshot uses ids as keys), so the round-trip is
+/// idempotent against a sketch the user has not structurally edited
+/// between snapshot and restore.
+#[derive(Debug, Clone)]
+pub struct SketchGeometrySnapshot {
+    pub points: Vec<(Point2dId, Point2d)>,
+    pub lines: Vec<(Line2dId, super::line2d::LineGeometry)>,
+    pub arcs: Vec<(Arc2dId, Arc2d)>,
+    pub circles: Vec<(Circle2dId, Circle2d)>,
 }
 
 /// A 2D sketch containing entities and constraints
@@ -629,6 +647,85 @@ impl Sketch {
     /// Get constraints by entity
     pub fn get_constraints_by_entity(&self, entity: &EntityRef) -> Vec<Constraint> {
         self.constraints.get_entity_constraints(entity)
+    }
+
+    /// Edit the scalar value of an existing dimensional constraint.
+    ///
+    /// Mutates the constraint in place and resets its status to
+    /// `Satisfied` so a subsequent solve evaluates the new target with
+    /// a clean slate. The entity store is *not* touched — callers that
+    /// want the geometry to follow the new dimension must run
+    /// [`solve_constraints`](Self::solve_constraints) themselves and
+    /// decide what to do with the result (accept, revert, surface the
+    /// conflict to the user, etc).
+    ///
+    /// Returns the updated `Constraint` so callers can echo the new
+    /// value back to a client without an extra `get` round-trip.
+    pub fn update_dimensional_value(
+        &self,
+        id: &ConstraintId,
+        value: f64,
+    ) -> Result<Constraint, DimensionalUpdateError> {
+        self.constraints.update_dimensional_value(id, value)
+    }
+
+    /// Snapshot every solver-relevant entity field — point positions,
+    /// line geometry, arc geometry, circle geometry — so a caller can
+    /// run a solve and restore the previous state on conflict. The
+    /// snapshot does not include the constraint store or the entity
+    /// kinds the solver still skips (rectangles, ellipses, splines,
+    /// polylines: slices C-2 through C-5); those are immutable from
+    /// the solver's perspective today and don't need to round-trip.
+    pub fn snapshot_entity_geometry(&self) -> SketchGeometrySnapshot {
+        let points: Vec<(Point2dId, Point2d)> = self
+            .points
+            .iter()
+            .map(|e| (*e.key(), e.value().position))
+            .collect();
+        let lines: Vec<(Line2dId, super::line2d::LineGeometry)> = self
+            .lines
+            .iter()
+            .map(|e| (*e.key(), e.value().geometry))
+            .collect();
+        let arcs: Vec<(Arc2dId, Arc2d)> = self
+            .arcs
+            .iter()
+            .map(|e| (*e.key(), e.value().arc))
+            .collect();
+        let circles: Vec<(Circle2dId, Circle2d)> = self
+            .circles
+            .iter()
+            .map(|e| (*e.key(), e.value().circle))
+            .collect();
+        SketchGeometrySnapshot { points, lines, arcs, circles }
+    }
+
+    /// Restore a snapshot taken by
+    /// [`snapshot_entity_geometry`](Self::snapshot_entity_geometry).
+    /// Entities that have been deleted between the snapshot and the
+    /// restore are silently skipped — the solver has nothing to write
+    /// back to in that case.
+    pub fn restore_entity_geometry(&self, snapshot: &SketchGeometrySnapshot) {
+        for (id, pos) in &snapshot.points {
+            if let Some(mut entry) = self.points.get_mut(id) {
+                entry.value_mut().position = *pos;
+            }
+        }
+        for (id, geom) in &snapshot.lines {
+            if let Some(mut entry) = self.lines.get_mut(id) {
+                entry.value_mut().geometry = *geom;
+            }
+        }
+        for (id, arc) in &snapshot.arcs {
+            if let Some(mut entry) = self.arcs.get_mut(id) {
+                entry.value_mut().arc = *arc;
+            }
+        }
+        for (id, circle) in &snapshot.circles {
+            if let Some(mut entry) = self.circles.get_mut(id) {
+                entry.value_mut().circle = *circle;
+            }
+        }
     }
 
     /// Solve all constraints currently registered on this sketch and

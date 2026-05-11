@@ -48,8 +48,9 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::sketch2d::{
-    Constraint, ConstraintId, DofReport, DragTarget, EntityRef, Point2d, Point2dId, Sketch,
-    SketchAnchor, SketchId, SketchSolveError, SketchSolveReport, SolveOptions,
+    Constraint, ConstraintId, ConstraintType, DimensionalConstraint, DimensionalUpdateError,
+    DofReport, DragTarget, EntityRef, Point2d, Point2dId, Sketch, SketchAnchor, SketchId,
+    SketchSolveError, SketchSolveReport, SolveOptions, SolverStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

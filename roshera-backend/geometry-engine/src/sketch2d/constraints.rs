@@ -169,6 +169,123 @@ pub enum DimensionalConstraint {
     CenterOfMass { x: f64, y: f64 },
 }
 
+impl DimensionalConstraint {
+    /// Replace the scalar value carried by a single-value dimensional
+    /// constraint. Returns `Err(UnsupportedVariant)` for the two-field
+    /// `CenterOfMass` variant — that constraint carries `{x, y}` and
+    /// can't be re-targeted with a single scalar; updating it requires
+    /// a richer API surface that the editable-measurements UX doesn't
+    /// need today. Length-like values (distance, radius, perimeter,
+    /// etc.) reject non-positive inputs; signed-valued constraints
+    /// (XCoordinate, YCoordinate, Slope) accept any finite value.
+    pub fn set_scalar(&mut self, value: f64) -> Result<(), DimensionalUpdateError> {
+        if !value.is_finite() {
+            return Err(DimensionalUpdateError::InvalidValue {
+                value,
+                reason: "value must be a finite real number",
+            });
+        }
+        let require_positive = |v: f64,
+                                kind: &'static str|
+         -> Result<(), DimensionalUpdateError> {
+            if v <= 0.0 {
+                Err(DimensionalUpdateError::InvalidValue {
+                    value: v,
+                    reason: kind,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            DimensionalConstraint::Distance(v) => {
+                require_positive(value, "distance must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::Radius(v) => {
+                require_positive(value, "radius must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::Diameter(v) => {
+                require_positive(value, "diameter must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::Length(v) => {
+                require_positive(value, "length must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::Perimeter(v) => {
+                require_positive(value, "perimeter must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::Area(v) => {
+                require_positive(value, "area must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::ArcLength(v) => {
+                require_positive(value, "arc length must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::OffsetDistance(v) => {
+                require_positive(value, "offset distance must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::AspectRatio(v) => {
+                require_positive(value, "aspect ratio must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::MinDistance(v) => {
+                require_positive(value, "min distance must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::MaxDistance(v) => {
+                require_positive(value, "max distance must be > 0")?;
+                *v = value;
+            }
+            DimensionalConstraint::MomentOfInertia(v) => {
+                require_positive(value, "moment of inertia must be > 0")?;
+                *v = value;
+            }
+            // Signed values: any finite scalar is admissible.
+            DimensionalConstraint::Angle(v) => *v = value,
+            DimensionalConstraint::XCoordinate(v) => *v = value,
+            DimensionalConstraint::YCoordinate(v) => *v = value,
+            DimensionalConstraint::Curvature(v) => *v = value,
+            DimensionalConstraint::Slope(v) => *v = value,
+            DimensionalConstraint::CenterOfMass { .. } => {
+                return Err(DimensionalUpdateError::UnsupportedVariant {
+                    variant: "CenterOfMass",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Failure modes for `ConstraintStore::update_dimensional_value` and
+/// the upstream REST endpoint. Geometric-constraint updates aren't
+/// covered: they carry no editable scalar (the
+/// `GeometricConstraint::IntersectionAngle(f64)` variant has a value
+/// but it's a *property* of the relationship, not a dimension the
+/// user types — leave that to a follow-up if it ever ships through
+/// the UI).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DimensionalUpdateError {
+    /// No constraint with that id exists in the store.
+    #[error("constraint {0} not found")]
+    NotFound(ConstraintId),
+    /// The constraint exists but is geometric, not dimensional.
+    #[error("constraint {0} is geometric and has no scalar value to edit")]
+    NotDimensional(ConstraintId),
+    /// The dimensional variant does not carry a single scalar value
+    /// (e.g. `CenterOfMass { x, y }`).
+    #[error("constraint variant {variant} is not editable via a single scalar")]
+    UnsupportedVariant { variant: &'static str },
+    /// The input fails domain validation (non-finite, sign, etc.).
+    #[error("invalid value {value}: {reason}")]
+    InvalidValue { value: f64, reason: &'static str },
+}
+
 /// Combined constraint type
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ConstraintType {
@@ -386,6 +503,37 @@ impl ConstraintStore {
         if let Some(mut constraint) = self.constraints.get_mut(id) {
             constraint.status = status;
         }
+    }
+
+    /// Edit the scalar value of a dimensional constraint in place.
+    ///
+    /// On success the constraint's `constraint_type` carries the new
+    /// value and its `status` is reset to `Satisfied` so a subsequent
+    /// solve gets a clean slate — the previous violation report (if
+    /// any) belonged to the old target and would be misleading next to
+    /// a freshly-typed dimension.
+    ///
+    /// On failure the store is left untouched, including the existing
+    /// status and value, so callers can safely propagate the error to
+    /// the user without rolling anything back.
+    pub fn update_dimensional_value(
+        &self,
+        id: &ConstraintId,
+        value: f64,
+    ) -> Result<Constraint, DimensionalUpdateError> {
+        let mut entry = self
+            .constraints
+            .get_mut(id)
+            .ok_or(DimensionalUpdateError::NotFound(*id))?;
+        let dim = match &mut entry.constraint_type {
+            ConstraintType::Dimensional(d) => d,
+            ConstraintType::Geometric(_) => {
+                return Err(DimensionalUpdateError::NotDimensional(*id));
+            }
+        };
+        dim.set_scalar(value)?;
+        entry.status = ConstraintStatus::Satisfied;
+        Ok(entry.clone())
     }
 
     /// Get all constraints
