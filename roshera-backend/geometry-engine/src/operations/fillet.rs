@@ -420,6 +420,7 @@ fn create_variable_radius_fillet(
     let rolling_ball_data = compute_variable_rolling_ball_positions(
         model,
         &edge,
+        edge_id,
         face1_id,
         face2_id,
         start_radius,
@@ -1005,10 +1006,21 @@ fn cylinder_rim_fillet(
     Ok((blend_face_id, None))
 }
 
-/// Compute rolling ball positions for variable radius
+/// Compute rolling ball positions for variable radius.
+///
+/// Convexity classification is shared with `compute_rolling_ball_positions`
+/// — a single signed-dihedral measurement at the edge midpoint
+/// (`robust_face_angle` on outward-oriented normals + the loop-aligned
+/// tangent) determines whether the ball sits inside the solid (convex
+/// edge) or in the cavity (concave edge), and that classification is
+/// then committed to every sample along the edge. The previous
+/// `normal1·normal2 < 0` heuristic was orientation-dependent and
+/// flipped on perpendicular box edges (dot = 0 → wrong branch),
+/// producing concave fillets on edges that should have been convex.
 fn compute_variable_rolling_ball_positions(
     model: &BRepModel,
     edge: &Edge,
+    edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     start_radius: f64,
@@ -1023,30 +1035,38 @@ fn compute_variable_rolling_ball_positions(
         radii: Vec::with_capacity(num_samples + 1),
     };
 
-    // Get surfaces
-    let face1 = model
-        .faces
-        .get(face1_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face1 not found".to_string()))?;
-    let face2 = model
-        .faces
-        .get(face2_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
-
-    let surface1 = model
-        .surfaces
-        .get(face1.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
-    let surface2 = model
-        .surfaces
-        .get(face2.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;
+    // Signed-dihedral classification at midpoint — see the matching
+    // block in `compute_rolling_ball_positions` for the full
+    // derivation. Briefly: convex ⇒ ball inside solid along -bisector
+    // and contact = center + r·n; concave ⇒ ball in cavity along
+    // +bisector and contact = center - r·n.
+    let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
+    let face1_mid_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
+    let face2_mid_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
+    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })?;
+    let edge_tangent_in_loop = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
+    let dihedral_angle = robust_face_angle(
+        &face1_mid_normal,
+        &face2_mid_normal,
+        &edge_tangent_in_loop,
+        &Tolerance::default(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("Dihedral angle failed: {:?}", e)))?;
+    let (offset_sign, contact_sign) = if dihedral_angle > 0.0 {
+        (-1.0, 1.0)
+    } else {
+        (1.0, -1.0)
+    };
 
     for i in 0..=num_samples {
         let t = i as f64 / num_samples as f64;
         data.parameters.push(t);
 
-        // Interpolate radius
         let radius = start_radius + t * (end_radius - start_radius);
         data.radii.push(radius);
 
@@ -1055,28 +1075,25 @@ fn compute_variable_rolling_ball_positions(
         let edge_point = edge.evaluate(t, &model.curves)?;
         edge.tangent_at(t, &model.curves)?;
 
-        // Get surface normals
-        let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
-        let normal2 = get_surface_normal_at_point(surface2, &edge_point)?;
+        let normal1 = get_face_oriented_normal(model, face1_id, &edge_point)?;
+        let normal2 = get_face_oriented_normal(model, face2_id, &edge_point)?;
 
-        // Calculate fillet center
         let bisector = (normal1 + normal2).normalize().map_err(|e| {
             OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
         })?;
+        let bisector_dot_n1 = bisector.dot(&normal1);
+        if bisector_dot_n1.abs() < 1e-9 {
+            return Err(OperationError::NumericalError(
+                "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
+            ));
+        }
+        let offset_distance = radius / bisector_dot_n1;
 
-        let dot_product = normal1.dot(&normal2);
-        let offset_direction = if dot_product < 0.0 {
-            -bisector
-        } else {
-            bisector
-        };
-
-        let fillet_center = edge_point + offset_direction * radius;
+        let fillet_center = edge_point + bisector * (offset_sign * offset_distance);
         data.centers.push(fillet_center);
 
-        // Contact points
-        let contact1 = fillet_center - normal1 * radius;
-        let contact2 = fillet_center - normal2 * radius;
+        let contact1 = fillet_center + normal1 * (contact_sign * radius);
+        let contact2 = fillet_center + normal2 * (contact_sign * radius);
 
         data.contacts1.push(contact1);
         data.contacts2.push(contact2);
@@ -1138,7 +1155,7 @@ fn create_function_radius_fillet(
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
         .clone();
     let rolling_ball_data =
-        compute_function_rolling_ball_positions(model, &edge, face1_id, face2_id, &radii)?;
+        compute_function_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, &radii)?;
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
 
     // Same surface-iso-curve cap-sampling as the linear variable-radius
@@ -1194,6 +1211,7 @@ fn create_function_radius_fillet(
 fn compute_function_rolling_ball_positions(
     model: &BRepModel,
     edge: &Edge,
+    edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     radii: &[f64],
@@ -1207,22 +1225,31 @@ fn compute_function_rolling_ball_positions(
         radii: Vec::with_capacity(radii.len()),
     };
 
-    let face1 = model
-        .faces
-        .get(face1_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face1 not found".to_string()))?;
-    let face2 = model
-        .faces
-        .get(face2_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
-    let surface1 = model
-        .surfaces
-        .get(face1.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
-    let surface2 = model
-        .surfaces
-        .get(face2.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;
+    // Same midpoint signed-dihedral classification as the variable /
+    // constant paths — see `compute_rolling_ball_positions` for the
+    // geometric derivation.
+    let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
+    let face1_mid_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
+    let face2_mid_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
+    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })?;
+    let edge_tangent_in_loop = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
+    let dihedral_angle = robust_face_angle(
+        &face1_mid_normal,
+        &face2_mid_normal,
+        &edge_tangent_in_loop,
+        &Tolerance::default(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("Dihedral angle failed: {:?}", e)))?;
+    let (offset_sign, contact_sign) = if dihedral_angle > 0.0 {
+        (-1.0, 1.0)
+    } else {
+        (1.0, -1.0)
+    };
 
     for (i, &radius) in radii.iter().enumerate() {
         let t = i as f64 / num_samples as f64;
@@ -1232,23 +1259,26 @@ fn compute_function_rolling_ball_positions(
         let edge_point = edge.evaluate(t, &model.curves)?;
         edge.tangent_at(t, &model.curves)?;
 
-        let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
-        let normal2 = get_surface_normal_at_point(surface2, &edge_point)?;
+        let normal1 = get_face_oriented_normal(model, face1_id, &edge_point)?;
+        let normal2 = get_face_oriented_normal(model, face2_id, &edge_point)?;
 
         let bisector = (normal1 + normal2).normalize().map_err(|e| {
             OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
         })?;
-        let dot_product = normal1.dot(&normal2);
-        let offset_direction = if dot_product < 0.0 {
-            -bisector
-        } else {
-            bisector
-        };
+        let bisector_dot_n1 = bisector.dot(&normal1);
+        if bisector_dot_n1.abs() < 1e-9 {
+            return Err(OperationError::NumericalError(
+                "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
+            ));
+        }
+        let offset_distance = radius / bisector_dot_n1;
 
-        let fillet_center = edge_point + offset_direction * radius;
+        let fillet_center = edge_point + bisector * (offset_sign * offset_distance);
         data.centers.push(fillet_center);
-        data.contacts1.push(fillet_center - normal1 * radius);
-        data.contacts2.push(fillet_center - normal2 * radius);
+        data.contacts1
+            .push(fillet_center + normal1 * (contact_sign * radius));
+        data.contacts2
+            .push(fillet_center + normal2 * (contact_sign * radius));
     }
 
     Ok(data)
@@ -1835,20 +1865,18 @@ fn detect_dihedral_inflection(
         return Ok(false);
     }
 
-    let face1 = model
+    // The face/surface stores are still consulted here only for the
+    // existence check — actual normal evaluation goes through
+    // `get_face_oriented_normal` which re-fetches both per call so
+    // it can apply the face's orientation sign.
+    let _ = model
         .faces
         .get(face1_id)
         .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} missing", face1_id)))?;
-    let face2 = model
+    let _ = model
         .faces
         .get(face2_id)
         .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} missing", face2_id)))?;
-    let surface1 = model.surfaces.get(face1.surface_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!("Surface {} missing", face1.surface_id))
-    })?;
-    let surface2 = model.surfaces.get(face2.surface_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!("Surface {} missing", face2.surface_id))
-    })?;
     let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
         OperationError::InvalidGeometry(format!(
             "Edge {} not present in any loop of face {}",
@@ -1862,8 +1890,8 @@ fn detect_dihedral_inflection(
         // Uniform sweep across the parameter interval: t = i / (n-1).
         let t = i as f64 / (sample_count - 1) as f64;
         let p = edge.evaluate(t, &model.curves)?;
-        let n1 = get_surface_normal_at_point(surface1, &p)?;
-        let n2 = get_surface_normal_at_point(surface2, &p)?;
+        let n1 = get_face_oriented_normal(model, face1_id, &p)?;
+        let n2 = get_face_oriented_normal(model, face2_id, &p)?;
         let tangent = edge.tangent_at(t, &model.curves)? * face1_loop_sign;
         let angle = robust_face_angle(&n1, &n2, &tangent, &tol)?;
         signs.push(angle);
@@ -1900,30 +1928,27 @@ fn compute_rolling_ball_positions(
     face2_id: FaceId,
     radius: f64,
 ) -> OperationResult<RollingBallData> {
-    // Get face surfaces
-    let face1 = model
+    // Existence guard for both faces — `get_face_oriented_normal`
+    // re-fetches each face for every normal call (it has to: it
+    // needs `face.orientation.sign()`), so we don't keep the
+    // references here. Fail fast if either id is bogus.
+    let _ = model
         .faces
         .get(face1_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Face1 not found".to_string()))?;
-    let face2 = model
+    let _ = model
         .faces
         .get(face2_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
 
-    let surface1 = model
-        .surfaces
-        .get(face1.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
-    let surface2 = model
-        .surfaces
-        .get(face2.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;
-
     // Check for near-tangent case
-    // Compute face normals at midpoint of edge
+    // Compute face normals at midpoint of edge. Use the face-oriented
+    // helper so each normal points outward from the solid regardless
+    // of whether the face was constructed with `FaceOrientation::Forward`
+    // or `Backward` — both states are common in an extruded solid.
     let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
-    let face1_normal = get_surface_normal_at_point(surface1, &edge_midpoint)?;
-    let face2_normal = get_surface_normal_at_point(surface2, &edge_midpoint)?;
+    let face1_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
+    let face2_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
     let edge_tangent = edge.tangent_at(0.5, &model.curves)?;
 
     // Project the edge tangent into face1's loop-traversal direction.
@@ -2008,9 +2033,9 @@ fn compute_rolling_ball_positions(
         let edge_point = edge.evaluate(t, &model.curves)?;
         edge.tangent_at(t, &model.curves)?;
 
-        // Get surface normals at edge point (projected)
-        let normal1 = get_surface_normal_at_point(surface1, &edge_point)?;
-        let normal2 = get_surface_normal_at_point(surface2, &edge_point)?;
+        // Get surface normals at edge point (projected, face-oriented).
+        let normal1 = get_face_oriented_normal(model, face1_id, &edge_point)?;
+        let normal2 = get_face_oriented_normal(model, face2_id, &edge_point)?;
 
         // Calculate fillet center using rolling ball approach
         // The fillet center is offset from the edge by radius in the direction
@@ -2072,16 +2097,40 @@ fn compute_rolling_ball_positions(
     Ok(data)
 }
 
-/// Get surface normal at a point (robust approach)
-fn get_surface_normal_at_point(surface: &dyn Surface, point: &Point3) -> OperationResult<Vector3> {
-    // Project point onto surface to get accurate parameters
+/// Get the face's outward-oriented surface normal at a 3D point.
+///
+/// Half the faces of any solid have `FaceOrientation::Backward` —
+/// the kernel records the surface's parametric normal (from `du × dv`)
+/// and a per-face sign that says "this face flips it" so the *outward*
+/// normal is consistent across the solid. `Face::normal_at(u, v, …)`
+/// applies that flip; this helper does the same for code that has a
+/// `Point3` rather than `(u, v)`.
+///
+/// Every fillet path that computes a signed dihedral or a rolling-ball
+/// bisector relies on **outward** normals — calling
+/// `robust_surface_normal` directly on the raw surface was a latent
+/// bug that silently produced correct fillets for the half of faces
+/// whose orientation happens to be `Forward` and concave-flipped
+/// fillets for the other half. The user-visible symptom was "one edge
+/// fillets convex, the next is concave" on a freshly extruded box.
+fn get_face_oriented_normal(
+    model: &BRepModel,
+    face_id: FaceId,
+    point: &Point3,
+) -> OperationResult<Vector3> {
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} not found", face_id)))?;
+    let surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Surface {} not found", face.surface_id))
+    })?;
     let tolerance = &Tolerance::default();
     let (u, v) = project_point_to_surface(point, surface, (0.5, 0.5), tolerance, 100)?;
-
-    // Use robust normal computation
-    robust_surface_normal(surface, u, v, tolerance).map_err(|e| {
+    let normal = robust_surface_normal(surface, u, v, tolerance).map_err(|e| {
         OperationError::NumericalError(format!("Surface normal evaluation failed: {:?}", e))
-    })
+    })?;
+    Ok(normal * face.orientation.sign())
 }
 
 /// Create surface from rolling ball data
@@ -3299,41 +3348,41 @@ fn get_edges_at_vertex(
     Ok(seen.into_iter().collect())
 }
 
-/// Compute angle between faces at an edge
+/// Compute the signed dihedral angle between two faces at an edge.
+///
+/// The sign of the returned angle is a geometric invariant of the
+/// edge — positive ⇒ convex (solid sticks out), negative ⇒ concave
+/// (interior corner) — **iff** the inputs to `robust_face_angle` are
+/// (a) the outward face normals (not the raw surface normals) and
+/// (b) the edge tangent rotated into one face's CCW loop direction.
+/// Both corrections are applied here: normals come from
+/// `get_face_oriented_normal` which multiplies by
+/// `face.orientation.sign()`, and the tangent is multiplied by
+/// `face1_loop_sign` so its direction matches `face1`'s loop
+/// traversal regardless of which way the underlying curve happens to
+/// be parameterized.
 fn compute_face_angle(
     model: &BRepModel,
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
 ) -> OperationResult<f64> {
-    // Get edge and faces
     let edge = model
         .edges
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
-    let face1 = model
-        .faces
-        .get(face1_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face1 not found".to_string()))?;
-    let face2 = model
-        .faces
-        .get(face2_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
 
-    let surface1 = model
-        .surfaces
-        .get(face1.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface1 not found".to_string()))?;
-    let surface2 = model
-        .surfaces
-        .get(face2.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Surface2 not found".to_string()))?;
-
-    // Compute normals and tangent at edge midpoint
     let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
-    let face1_normal = get_surface_normal_at_point(surface1, &edge_midpoint)?;
-    let face2_normal = get_surface_normal_at_point(surface2, &edge_midpoint)?;
-    let edge_tangent = edge.tangent_at(0.5, &model.curves)?;
+    let face1_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
+    let face2_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
+
+    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })?;
+    let edge_tangent = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
 
     robust_face_angle(
         &face1_normal,
@@ -4639,6 +4688,77 @@ mod tests {
             1
         )
         .expect("sample_count = 1 must short-circuit to Ok(false)"));
+    }
+
+    // -------------------------------------------------------------------
+    // Regression: face-oriented normals across all 12 edges of a box
+    //
+    // Pins the fix for the "fillet rounds one direction wrong" bug:
+    // `get_face_oriented_normal` must apply `face.orientation.sign()` so
+    // that faces with `FaceOrientation::Backward` produce outward
+    // normals — otherwise half of the edges of an extruded box yield
+    // negative signed dihedrals and classify as concave, inverting the
+    // rolling-ball offset.
+    //
+    // Invariant exercised:
+    //   For a convex polyhedron (cube), every edge must have a positive
+    //   signed dihedral angle (`compute_face_angle > 0`) with magnitude
+    //   π/2 (perpendicular adjacent faces).
+    // -------------------------------------------------------------------
+    #[test]
+    fn unit_box_every_edge_classifies_as_convex_ninety_degrees() {
+        use std::collections::HashSet;
+
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+
+        // Collect the unique edge ids of the box by walking every face's
+        // outer loop. Each of the 12 edges appears twice (once per
+        // adjacent face) — the HashSet deduplicates.
+        let solid = model.solids.get(solid_id).expect("solid").clone();
+        let shell = model.shells.get(solid.outer_shell).expect("shell").clone();
+
+        let mut edge_ids: HashSet<EdgeId> = HashSet::new();
+        for face_id in &shell.faces {
+            let face = model.faces.get(*face_id).expect("face").clone();
+            let outer_loop = model.loops.get(face.outer_loop).expect("loop").clone();
+            for e in &outer_loop.edges {
+                edge_ids.insert(*e);
+            }
+        }
+        assert_eq!(
+            edge_ids.len(),
+            12,
+            "unit box must have exactly 12 unique edges, got {}",
+            edge_ids.len()
+        );
+
+        // Every box edge: adjacent faces meet at a 90° convex angle. The
+        // pre-fix code returned the wrong sign on roughly half of the
+        // edges because backward-oriented faces fed their parametric
+        // (non-outward) normal into `robust_face_angle`.
+        for edge_id in &edge_ids {
+            let (face1_id, face2_id) = get_adjacent_faces(&model, solid_id, *edge_id)
+                .unwrap_or_else(|e| panic!("adjacency for edge {edge_id}: {e:?}"));
+
+            let angle = compute_face_angle(&model, *edge_id, face1_id, face2_id)
+                .unwrap_or_else(|e| panic!("face angle for edge {edge_id}: {e:?}"));
+
+            assert!(
+                angle > 0.0,
+                "edge {edge_id} (faces {face1_id} & {face2_id}): expected positive \
+                 (convex) signed dihedral, got {angle}. This is the regression the \
+                 face-oriented-normal fix prevents."
+            );
+
+            let pi_over_two = std::f64::consts::FRAC_PI_2;
+            assert!(
+                (angle - pi_over_two).abs() < 1e-6,
+                "edge {edge_id} (faces {face1_id} & {face2_id}): expected π/2 = \
+                 {pi_over_two}, got {angle} (delta = {})",
+                (angle - pi_over_two).abs()
+            );
+        }
     }
 }
 
