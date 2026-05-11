@@ -28,13 +28,22 @@ import { Button } from '@/components/ui/button'
 import { useSceneStore, type SelectionMode } from '@/stores/scene-store'
 import { cn } from '@/lib/utils'
 
-export type ModifyMode = 'fillet' | 'chamfer' | 'shell'
+export type ModifyMode = 'fillet' | 'fillet-variable' | 'chamfer' | 'shell'
+
+/**
+ * Discriminated apply payload. `fillet-variable` carries a parallel
+ * `radii` array (one entry per picked edge, in pick order); every other
+ * mode keeps the single-value contract.
+ */
+export type ModifyApplyPayload =
+  | { mode: 'fillet' | 'chamfer' | 'shell'; value: number }
+  | { mode: 'fillet-variable'; radii: number[] }
 
 interface ModifyDialogProps {
   open: boolean
   mode: ModifyMode | null
   onOpenChange: (next: boolean) => void
-  onApply: (mode: ModifyMode, value: number) => void
+  onApply: (payload: ModifyApplyPayload) => void
 }
 
 interface ModeSpec {
@@ -43,6 +52,12 @@ interface ModeSpec {
   defaultValue: number
   /** Whether the operation needs picked edges (true) or just a solid (false). */
   needsEdges: boolean
+  /**
+   * Per-edge mode: when `true`, the dialog renders one numeric input per
+   * picked edge instead of a single shared value. Only `fillet-variable`
+   * sets this today.
+   */
+  perEdge: boolean
   okLabel: string
   /** Step for the +/- buttons in the numeric input. */
   step: number
@@ -54,6 +69,16 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     inputLabel: 'Radius',
     defaultValue: 2,
     needsEdges: true,
+    perEdge: false,
+    okLabel: 'OK',
+    step: 0.5,
+  },
+  'fillet-variable': {
+    title: 'Fillet (per-edge radii)',
+    inputLabel: 'Radius',
+    defaultValue: 2,
+    needsEdges: true,
+    perEdge: true,
     okLabel: 'OK',
     step: 0.5,
   },
@@ -62,6 +87,7 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     inputLabel: 'Distance',
     defaultValue: 1,
     needsEdges: true,
+    perEdge: false,
     okLabel: 'OK',
     step: 0.5,
   },
@@ -70,6 +96,7 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     inputLabel: 'Thickness',
     defaultValue: 1,
     needsEdges: false,
+    perEdge: false,
     okLabel: 'OK',
     step: 0.25,
   },
@@ -86,6 +113,11 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   const [valueRaw, setValueRaw] = useState<string>(
     spec ? String(spec.defaultValue) : '',
   )
+  // Per-edge radii — keyed by EdgeId (the `SubElementSelection.index`)
+  // so the entry survives selection reordering. Stored raw (as the
+  // user typed) mirroring `valueRaw` so the input round-trips and the
+  // user can see "1." mid-type without it parsing to 1 prematurely.
+  const [radiiRaw, setRadiiRaw] = useState<Map<number, string>>(() => new Map())
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   // Remember the prior selection mode so we can restore it on close —
@@ -124,16 +156,39 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
-  // Live count of picked edges scoped to the currently selected solid —
+  // Live picked-edge list scoped to the currently selected solid —
   // matches the filter `sendDirectFillet` applies before dispatching.
-  const edgeCount = useMemo(() => {
+  // We keep the full list (not just the count) because per-edge mode
+  // renders one input per edge keyed by `EdgeId`.
+  const pickedEdges = useMemo<number[]>(() => {
     const ids = Array.from(selectedIds)
-    if (ids.length !== 1) return 0
+    if (ids.length !== 1) return []
     const [object] = ids
-    return subElementSelections.filter(
-      (s) => s.type === 'edge' && s.objectId === object,
-    ).length
+    return subElementSelections
+      .filter((s) => s.type === 'edge' && s.objectId === object)
+      .map((s) => s.index)
   }, [selectedIds, subElementSelections])
+  const edgeCount = pickedEdges.length
+
+  // Sync `radiiRaw` against the live pick set whenever per-edge mode is
+  // active: insert default for newly-picked edges, drop entries for
+  // unpicked edges. Pick order (= array order of `pickedEdges`) is what
+  // we send to the backend, so the map only needs to track presence +
+  // value; reordering doesn't lose data because the key is `EdgeId`.
+  useEffect(() => {
+    if (!open || !spec?.perEdge) return
+    setRadiiRaw((prev) => {
+      const next = new Map(prev)
+      const wanted = new Set(pickedEdges)
+      for (const eid of pickedEdges) {
+        if (!next.has(eid)) next.set(eid, String(spec.defaultValue))
+      }
+      for (const eid of Array.from(next.keys())) {
+        if (!wanted.has(eid)) next.delete(eid)
+      }
+      return next
+    })
+  }, [open, spec, pickedEdges])
 
   const parsedValue = useMemo(() => {
     const trimmed = valueRaw.trim()
@@ -142,17 +197,41 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
     return Number.isFinite(n) ? n : Number.NaN
   }, [valueRaw])
 
+  // Parallel array of parsed per-edge radii in pick order. Used both
+  // for the apply payload and the canApply gate.
+  const parsedRadii = useMemo<number[]>(() => {
+    return pickedEdges.map((eid) => {
+      const raw = (radiiRaw.get(eid) ?? '').trim()
+      if (raw === '') return Number.NaN
+      const n = Number(raw)
+      return Number.isFinite(n) ? n : Number.NaN
+    })
+  }, [pickedEdges, radiiRaw])
+
   const valueValid = Number.isFinite(parsedValue) && parsedValue > 0
   const selectionValid =
     !spec?.needsEdges || (selectedIds.size === 1 && edgeCount > 0)
-  const canApply = valueValid && selectionValid
+  const allRadiiValid =
+    parsedRadii.length === pickedEdges.length &&
+    parsedRadii.every((n) => Number.isFinite(n) && n > 0)
+  const canApply = spec?.perEdge
+    ? selectionValid && allRadiiValid
+    : valueValid && selectionValid
 
   // Publish a live cross-section preview to the viewport. Only fillet
   // and chamfer participate — shell preview is whole-solid and would
-  // need a backend round-trip (see Task #85). The preview clears
-  // automatically when the dialog closes via the cleanup return.
+  // need a backend round-trip (see Task #85). Per-edge mode is also
+  // skipped: a single cross-section can't represent N different radii.
+  // The preview clears automatically when the dialog closes via the
+  // cleanup return.
   useEffect(() => {
-    if (!open || !mode || mode === 'shell' || !valueValid) {
+    if (
+      !open ||
+      !mode ||
+      mode === 'shell' ||
+      mode === 'fillet-variable' ||
+      !valueValid
+    ) {
       setModifyPreview(null)
       return
     }
@@ -164,9 +243,13 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
 
   const handleApply = useCallback(() => {
     if (!mode || !spec || !canApply) return
-    onApply(mode, parsedValue)
+    if (mode === 'fillet-variable') {
+      onApply({ mode, radii: parsedRadii })
+    } else {
+      onApply({ mode, value: parsedValue })
+    }
     close()
-  }, [mode, spec, canApply, parsedValue, onApply, close])
+  }, [mode, spec, canApply, parsedValue, parsedRadii, onApply, close])
 
   // Keyboard: Enter applies, Escape cancels.
   useEffect(() => {
@@ -198,6 +281,22 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
     // Trim float noise (`1.1 - 0.5 = 0.6000000000000001`) to 4 sig figs.
     const rounded = Math.round(next * 10000) / 10000
     setValueRaw(String(rounded))
+  }
+
+  // Per-edge stepper: nudges a single row's radius without disturbing
+  // the others. Same rounding policy as `stepValue`.
+  const stepRadius = (edgeId: number, delta: number) => {
+    setRadiiRaw((prev) => {
+      const raw = (prev.get(edgeId) ?? '').trim()
+      const curr = raw === '' ? Number.NaN : Number(raw)
+      const base = Number.isFinite(curr) ? curr : spec.defaultValue
+      const next = base + delta
+      if (next <= 0) return prev
+      const rounded = Math.round(next * 10000) / 10000
+      const map = new Map(prev)
+      map.set(edgeId, String(rounded))
+      return map
+    })
   }
 
   const selectionHint = (() => {
@@ -265,48 +364,123 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
           </div>
         )}
 
-        <Field label={spec.inputLabel}>
-          <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
-            <input
-              ref={inputRef}
-              type="text"
-              inputMode="decimal"
-              value={valueRaw}
-              onChange={(e) => setValueRaw(e.target.value)}
-              className={cn(
-                'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
-                !valueValid && 'text-destructive',
-              )}
-              placeholder={String(spec.defaultValue)}
-            />
-            <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
-              mm
-            </span>
-            <div className="flex flex-col border-l border-input">
-              <button
-                type="button"
-                onClick={() => stepValue(spec.step)}
-                className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                aria-label="Increase"
-              >
-                <ChevronUp className="h-3 w-3" />
-              </button>
-              <button
-                type="button"
-                onClick={() => stepValue(-spec.step)}
-                className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                aria-label="Decrease"
-              >
-                <ChevronDown className="h-3 w-3" />
-              </button>
+        {!spec.perEdge && (
+          <Field label={spec.inputLabel}>
+            <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+              <input
+                ref={inputRef}
+                type="text"
+                inputMode="decimal"
+                value={valueRaw}
+                onChange={(e) => setValueRaw(e.target.value)}
+                className={cn(
+                  'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                  !valueValid && 'text-destructive',
+                )}
+                placeholder={String(spec.defaultValue)}
+              />
+              <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
+                mm
+              </span>
+              <div className="flex flex-col border-l border-input">
+                <button
+                  type="button"
+                  onClick={() => stepValue(spec.step)}
+                  className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  aria-label="Increase"
+                >
+                  <ChevronUp className="h-3 w-3" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => stepValue(-spec.step)}
+                  className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  aria-label="Decrease"
+                >
+                  <ChevronDown className="h-3 w-3" />
+                </button>
+              </div>
             </div>
-          </div>
-          {!valueValid && (
-            <span className="text-[11px] font-mono text-destructive">
-              Must be a positive number.
-            </span>
-          )}
-        </Field>
+            {!valueValid && (
+              <span className="text-[11px] font-mono text-destructive">
+                Must be a positive number.
+              </span>
+            )}
+          </Field>
+        )}
+
+        {spec.perEdge && (
+          <Field label={`${spec.inputLabel} per edge`}>
+            {pickedEdges.length === 0 ? (
+              <span className="text-[11px] font-mono text-muted-foreground">
+                Pick edges in the viewport to set their radii.
+              </span>
+            ) : (
+              <div className="flex max-h-[200px] flex-col gap-1 overflow-y-auto pr-1">
+                {pickedEdges.map((eid, i) => {
+                  const raw = radiiRaw.get(eid) ?? ''
+                  const n = parsedRadii[i]
+                  const rowValid = Number.isFinite(n) && n > 0
+                  return (
+                    <div key={eid} className="flex items-stretch gap-1.5">
+                      <span className="flex h-8 w-10 shrink-0 items-center justify-center rounded-md border border-border bg-muted/30 font-mono text-[11px] text-muted-foreground">
+                        #{eid}
+                      </span>
+                      <div className="flex flex-1 items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                        <input
+                          ref={i === 0 ? inputRef : undefined}
+                          type="text"
+                          inputMode="decimal"
+                          value={raw}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            setRadiiRaw((prev) => {
+                              const map = new Map(prev)
+                              map.set(eid, v)
+                              return map
+                            })
+                          }}
+                          className={cn(
+                            'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                            !rowValid && 'text-destructive',
+                          )}
+                          placeholder={String(spec.defaultValue)}
+                          aria-label={`${spec.inputLabel} for edge ${eid}`}
+                        />
+                        <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
+                          mm
+                        </span>
+                        <div className="flex flex-col border-l border-input">
+                          <button
+                            type="button"
+                            onClick={() => stepRadius(eid, spec.step)}
+                            className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                            aria-label={`Increase radius for edge ${eid}`}
+                          >
+                            <ChevronUp className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => stepRadius(eid, -spec.step)}
+                            className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                            aria-label={`Decrease radius for edge ${eid}`}
+                          >
+                            <ChevronDown className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {pickedEdges.length > 0 && !allRadiiValid && (
+              <span className="text-[11px] font-mono text-destructive">
+                Every radius must be a positive number.
+              </span>
+            )}
+          </Field>
+        )}
       </div>
 
       {/* Footer */}

@@ -45,7 +45,11 @@ import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { cn } from '@/lib/utils'
-import { ModifyDialog, type ModifyMode } from '@/components/panels/ModifyDialog'
+import {
+  ModifyDialog,
+  type ModifyMode,
+  type ModifyApplyPayload,
+} from '@/components/panels/ModifyDialog'
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -395,6 +399,91 @@ async function sendDirectFillet(radius: number) {
     addMessage({
       role: 'assistant',
       content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at radius ${radius}.`,
+      objectsAffected: [String(data.object.id)],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
+ * Per-edge fillet — each picked edge gets its own constant radius.
+ * Mirrors `sendDirectFillet` but ships the new `radii` array shape
+ * that the api-server routes to a per-edge kernel dispatch loop.
+ *
+ * `radii` is expected to be parallel to the picked-edge list in pick
+ * order; ModifyDialog builds it that way. We re-read the live edge
+ * list here for defence-in-depth: if the selection changed between
+ * dialog construction and Apply, we surface a clear error instead of
+ * dispatching a mis-aligned payload.
+ */
+async function sendDirectFilletVariable(radii: number[]) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const sceneState = useSceneStore.getState()
+  const selectedIds = Array.from(sceneState.selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Fillet.',
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  const edges = sceneState.subElementSelections
+    .filter((s) => s.type === 'edge' && s.objectId === object)
+    .map((s) => s.index)
+
+  if (edges.length === 0) {
+    addMessage({
+      role: 'assistant',
+      content:
+        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+    })
+    return
+  }
+  if (radii.length !== edges.length) {
+    addMessage({
+      role: 'assistant',
+      content: `Per-edge fillet payload mismatch: ${radii.length} radii for ${edges.length} picked edges. Reopen the dialog and retry.`,
+    })
+    return
+  }
+  if (!radii.every((r) => Number.isFinite(r) && r > 0)) {
+    addMessage({
+      role: 'assistant',
+      content: 'Every per-edge radius must be a positive finite number.',
+    })
+    return
+  }
+
+  addMessage({
+    role: 'user',
+    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (per-edge radii [${radii.join(', ')}])`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/fillet`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ object, edges, radii }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with per-edge radii [${radii.join(', ')}].`,
       objectsAffected: [String(data.object.id)],
     })
   } catch (err) {
@@ -1004,10 +1093,21 @@ export function ToolBar() {
   // a time); the dialog renders nothing when `null`.
   const [modifyMode, setModifyMode] = useState<ModifyMode | null>(null)
 
-  const handleModifyApply = useCallback((mode: ModifyMode, value: number) => {
-    if (mode === 'fillet') sendDirectFillet(value)
-    else if (mode === 'chamfer') sendDirectChamfer(value)
-    else sendDirectShell(value)
+  const handleModifyApply = useCallback((payload: ModifyApplyPayload) => {
+    switch (payload.mode) {
+      case 'fillet':
+        sendDirectFillet(payload.value)
+        break
+      case 'fillet-variable':
+        sendDirectFilletVariable(payload.radii)
+        break
+      case 'chamfer':
+        sendDirectChamfer(payload.value)
+        break
+      case 'shell':
+        sendDirectShell(payload.value)
+        break
+    }
   }, [])
 
   const openModify = useCallback((mode: ModifyMode) => {
@@ -1136,6 +1236,11 @@ export function ToolBar() {
               icon: Disc,
               label: 'Fillet',
               action: () => openModify('fillet'),
+            },
+            {
+              icon: Disc,
+              label: 'Fillet (per-edge radii)',
+              action: () => openModify('fillet-variable'),
             },
             {
               icon: Hexagon,
