@@ -67,6 +67,30 @@ use thiserror::Error;
 /// callers cross-reference against the sketch's entity stores.
 pub type SkippedEntity = EntityRef;
 
+/// Drag target supplied to [`solve_drag`].
+///
+/// The shape of the target is keyed to the kind of the dragged
+/// entity. Slice B-2 supports dragging a [`EntityRef::Point`] to a
+/// 2D location; lines and circles will gain drag targets when the
+/// frontend grows handles for them. Mismatched (entity, target)
+/// pairs are rejected up-front by [`solve_drag`] with
+/// [`SketchSolveError::DragTargetKindMismatch`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DragTarget {
+    /// Pull a point toward `(x, y)` via least-squares X/Y residuals.
+    Point(Point2d),
+}
+
+impl DragTarget {
+    /// Human-readable kind tag (matches the EntityRef variant the
+    /// target binds to). Used in error messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DragTarget::Point(_) => "Point",
+        }
+    }
+}
+
 /// Tunables for a single solve invocation.
 ///
 /// Defaults match `ConstraintSolver::new()`:
@@ -74,9 +98,11 @@ pub type SkippedEntity = EntityRef;
 /// - `tolerance = 1e-10`
 /// - `damping_factor = 0.5`
 ///
-/// Slice B-2 will plumb a `SolveOptions::for_drag()` variant that
-/// fixes the dragged entity and tightens convergence; for slice B-1
-/// the default is sufficient.
+/// [`SolveOptions::for_drag`] returns a preset tuned for live-drag
+/// re-solve at ~60 fps: looser tolerance (`1e-6`, sub-pixel at
+/// reasonable zoom), fewer iterations (`30`), and tighter damping
+/// (`0.8`, closer to undamped Newton) so the dragged point tracks
+/// the cursor crisply without overshoot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolveOptions {
     /// Cap on Newton-Raphson iterations before declaring divergence.
@@ -106,6 +132,24 @@ impl SolveOptions {
             damping_factor,
         }
     }
+
+    /// Preset tuned for live-drag re-solve at interactive framerates.
+    ///
+    /// `tolerance = 1e-6` is sub-pixel at every reasonable sketch
+    /// zoom level, so converging tighter buys nothing the user can
+    /// see while spending iteration budget. `max_iterations = 30`
+    /// caps worst-case drag latency at ~3× the average solve cost
+    /// (most drag frames converge in 2-5 iterations from the prior
+    /// frame's warm start). `damping_factor = 0.8` is closer to a
+    /// pure Newton step than the conservative 0.5 default, so the
+    /// dragged point tracks the cursor without visible lag.
+    pub fn for_drag() -> Self {
+        Self {
+            max_iterations: 30,
+            tolerance: 1.0e-6,
+            damping_factor: 0.8,
+        }
+    }
 }
 
 /// Errors surfaced by the sketch ↔ solver bridge.
@@ -127,6 +171,22 @@ pub enum SketchSolveError {
     /// `SolveOptions::max_iterations` is zero.
     #[error("invalid max_iterations: must be > 0")]
     InvalidMaxIterations,
+    /// The `EntityRef` passed to [`solve_drag`] does not resolve to a
+    /// live entity in the sketch's entity stores.
+    #[error("drag entity {entity:?} not found in sketch")]
+    DragEntityNotFound { entity: EntityRef },
+    /// The dragged entity's kind has no compatible [`DragTarget`]
+    /// variant in this slice. Slice B-2 supports dragging
+    /// [`EntityRef::Point`] only; lines and circles will gain drag
+    /// targets when the frontend grows handles for them.
+    #[error(
+        "drag entity kind unsupported: {entity:?} cannot be dragged with a {target_kind} target \
+         in slice B-2"
+    )]
+    DragTargetKindMismatch {
+        entity: EntityRef,
+        target_kind: &'static str,
+    },
 }
 
 /// Snapshot of one solve invocation.
@@ -242,6 +302,99 @@ impl SketchSolveReport {
     }
 }
 
+/// Structural-DOF classification independent of the Newton-Raphson
+/// solve outcome.
+///
+/// `FullyConstrained` means free DOFs equals constraint DOFs removed;
+/// no residual freedom remains in the system. `UnderConstrained {
+/// dofs }` means the sketch has `dofs` more free parameters than
+/// constraints to pin them — the system has a manifold of valid
+/// solutions. `OverConstrained { conflicting_constraints }` means
+/// the system has `conflicting_constraints` more constraint DOFs
+/// than the sketch can absorb — at least that many constraints will
+/// fight each other.
+///
+/// This is the same DOF accounting the solver performs internally
+/// (`check_constraint_count`), but exposed without running the
+/// Newton-Raphson iteration, so the UI can update a "DOF: 3" badge
+/// reactively as constraints are added or removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DofStatus {
+    /// `total_free_dofs == constraint_dofs_removed`.
+    FullyConstrained,
+    /// `total_free_dofs > constraint_dofs_removed`. `dofs` is the
+    /// difference.
+    UnderConstrained { dofs: usize },
+    /// `total_free_dofs < constraint_dofs_removed`. `conflicting_constraints`
+    /// is the difference.
+    OverConstrained { conflicting_constraints: usize },
+}
+
+/// Output of [`analyze_dofs`].
+///
+/// Carries the raw DOF tallies for diagnostics on top of the
+/// derived [`DofStatus`] verdict. Mirrors the shape of
+/// [`SketchSolveReport`] for entity counting so the UI can use a
+/// single render path for "pre-solve summary" and "post-solve
+/// summary" panels.
+#[derive(Debug, Clone)]
+pub struct DofReport {
+    /// Total degrees of freedom across all analysable entities.
+    ///
+    /// Points contribute 2 (x, y), 0 if `is_fixed`.
+    /// Lines contribute 4 (px, py, dx, dy).
+    /// Circles contribute 3 (cx, cy, r).
+    /// Entities listed in `entities_skipped` contribute 0 (slice
+    /// B-1 limitation).
+    pub total_free_dofs: usize,
+    /// Sum of `degrees_of_freedom_removed()` across every active
+    /// constraint in the sketch. Constraints attached to a skipped
+    /// entity still count — they have a real DOF cost even though
+    /// their residual isn't currently evaluated by the solver.
+    pub constraint_dofs_removed: usize,
+    /// Derived verdict.
+    pub status: DofStatus,
+    /// Count of entities the analysis registered (points + lines +
+    /// circles, fixed or free).
+    pub entities_analysed: usize,
+    /// Count of constraints inspected.
+    pub constraints_analysed: usize,
+    /// Entities that cannot contribute DOFs in slice B-1 — same
+    /// list semantics as [`SketchSolveReport::entities_skipped`].
+    pub entities_skipped: Vec<SkippedEntity>,
+}
+
+impl DofReport {
+    /// Convenience: is the sketch structurally fully constrained?
+    pub fn is_fully_constrained(&self) -> bool {
+        matches!(self.status, DofStatus::FullyConstrained)
+    }
+    /// Convenience: is the sketch structurally under-constrained?
+    pub fn is_under_constrained(&self) -> bool {
+        matches!(self.status, DofStatus::UnderConstrained { .. })
+    }
+    /// Convenience: is the sketch structurally over-constrained?
+    pub fn is_over_constrained(&self) -> bool {
+        matches!(self.status, DofStatus::OverConstrained { .. })
+    }
+    /// Remaining DOFs when under-constrained; `None` otherwise.
+    pub fn remaining_dofs(&self) -> Option<usize> {
+        match self.status {
+            DofStatus::UnderConstrained { dofs } => Some(dofs),
+            _ => None,
+        }
+    }
+    /// Excess constraints when over-constrained; `None` otherwise.
+    pub fn excess_constraints(&self) -> Option<usize> {
+        match self.status {
+            DofStatus::OverConstrained {
+                conflicting_constraints,
+            } => Some(conflicting_constraints),
+            _ => None,
+        }
+    }
+}
+
 // ── Public entry points ────────────────────────────────────────────
 
 /// Solve a sketch's constraint system in place using default options.
@@ -271,6 +424,120 @@ pub fn solve_with_options(
     sketch: &Sketch,
     options: SolveOptions,
 ) -> Result<SketchSolveReport, SketchSolveError> {
+    solve_internal(sketch, options, Vec::new())
+}
+
+/// Drag a single entity toward a target position while honouring
+/// every other constraint in the sketch.
+///
+/// Uses [`SolveOptions::for_drag`] — the framerate-tuned preset
+/// (1e-6 tolerance, 30 iterations, 0.8 damping). Use
+/// [`solve_drag_with_options`] to override.
+///
+/// The drag is implemented as least-squares: a temporary
+/// `Required`-priority `XCoordinate(target.x)` and
+/// `YCoordinate(target.y)` pair is added to the constraint set for
+/// this solve invocation only — they are not persisted into the
+/// sketch's `ConstraintStore`. If the target is reachable, the
+/// dragged point lands on it; if not (e.g. the point is constrained
+/// to a fixed circle and the cursor is off the circle), Newton-
+/// Raphson finds the residual minimum, which is the closest
+/// reachable point. This matches the drag behaviour every modern
+/// parametric sketcher implements.
+///
+/// Returns the standard [`SketchSolveReport`]; the achieved
+/// position is read from the sketch's entity store after the call.
+pub fn solve_drag(
+    sketch: &Sketch,
+    dragged: EntityRef,
+    target: DragTarget,
+) -> Result<SketchSolveReport, SketchSolveError> {
+    solve_drag_with_options(sketch, dragged, target, SolveOptions::for_drag())
+}
+
+/// Drag with custom solver options. See [`solve_drag`].
+pub fn solve_drag_with_options(
+    sketch: &Sketch,
+    dragged: EntityRef,
+    target: DragTarget,
+    options: SolveOptions,
+) -> Result<SketchSolveReport, SketchSolveError> {
+    let extra = build_drag_constraints(sketch, dragged, target)?;
+    solve_internal(sketch, options, extra)
+}
+
+/// Analyse the sketch's structural degrees of freedom without
+/// running Newton-Raphson.
+///
+/// Returns a [`DofReport`] containing the same DOF accounting the
+/// solver does in its over/under-constrained detector, but computed
+/// in O(entities + constraints) so the UI can react to constraint
+/// additions in real time. Does not mutate the sketch.
+pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
+    use std::cmp::Ordering;
+
+    let mut total_free_dofs: usize = 0;
+    let mut entities_analysed: usize = 0;
+
+    // Points: 2 DOFs (x, y); 0 when fixed.
+    for entry in sketch.points().iter() {
+        entities_analysed += 1;
+        if !entry.value().is_fixed {
+            total_free_dofs += 2;
+        }
+    }
+    // Lines: 4 DOFs (px, py, dx, dy). No per-DOF fix flags today.
+    for _entry in sketch.lines().iter() {
+        entities_analysed += 1;
+        total_free_dofs += 4;
+    }
+    // Circles: 3 DOFs (cx, cy, r). No per-DOF fix flags today.
+    for _entry in sketch.circles().iter() {
+        entities_analysed += 1;
+        total_free_dofs += 3;
+    }
+
+    let entities_skipped = collect_unsupported(sketch);
+
+    let constraints = sketch.all_constraints();
+    let constraints_analysed = constraints.len();
+    let constraint_dofs_removed: usize =
+        constraints.iter().map(|c| c.degrees_of_freedom_removed()).sum();
+
+    let status = match constraint_dofs_removed.cmp(&total_free_dofs) {
+        Ordering::Equal => DofStatus::FullyConstrained,
+        Ordering::Less => DofStatus::UnderConstrained {
+            dofs: total_free_dofs - constraint_dofs_removed,
+        },
+        Ordering::Greater => DofStatus::OverConstrained {
+            conflicting_constraints: constraint_dofs_removed - total_free_dofs,
+        },
+    };
+
+    DofReport {
+        total_free_dofs,
+        constraint_dofs_removed,
+        status,
+        entities_analysed,
+        constraints_analysed,
+        entities_skipped,
+    }
+}
+
+// ── Internal: shared solve path + drag-constraint synthesis ────────
+
+/// Run the bridge with an optional list of additional constraints
+/// stacked on top of the sketch's persisted constraint set.
+///
+/// Extras are NOT persisted into the sketch — they exist for the
+/// duration of this call only, which is what makes least-squares
+/// drag transparent: the user's drag pull does not pollute the
+/// sketch's `ConstraintStore`.
+fn solve_internal(
+    sketch: &Sketch,
+    options: SolveOptions,
+    extra_constraints: Vec<super::constraints::Constraint>,
+) -> Result<SketchSolveReport, SketchSolveError> {
     validate_options(&options)?;
 
     let mut solver = ConstraintSolver::new();
@@ -281,7 +548,8 @@ pub fn solve_with_options(
     let entities_solved = populate_solver(sketch, &solver);
     let entities_skipped = collect_unsupported(sketch);
 
-    let constraints = sketch.all_constraints();
+    let mut constraints = sketch.all_constraints();
+    constraints.extend(extra_constraints);
     let constraints_solved = constraints.len();
     solver.set_constraints(constraints);
 
@@ -297,6 +565,43 @@ pub fn solve_with_options(
         constraints_solved,
         entities_skipped,
     })
+}
+
+/// Validate the (entity, target) pair and synthesise the temporary
+/// X/Y-coordinate constraints that pull `dragged` toward `target`.
+fn build_drag_constraints(
+    sketch: &Sketch,
+    dragged: EntityRef,
+    target: DragTarget,
+) -> Result<Vec<super::constraints::Constraint>, SketchSolveError> {
+    use super::constraints::{Constraint, ConstraintPriority, DimensionalConstraint};
+
+    match (dragged, target) {
+        (EntityRef::Point(point_id), DragTarget::Point(target_pos)) => {
+            if !sketch.points().contains_key(&point_id) {
+                return Err(SketchSolveError::DragEntityNotFound { entity: dragged });
+            }
+            let x_constraint = Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(target_pos.x),
+                vec![EntityRef::Point(point_id)],
+                ConstraintPriority::Required,
+            );
+            let y_constraint = Constraint::new_dimensional(
+                DimensionalConstraint::YCoordinate(target_pos.y),
+                vec![EntityRef::Point(point_id)],
+                ConstraintPriority::Required,
+            );
+            Ok(vec![x_constraint, y_constraint])
+        }
+        // Slice B-2 only supports dragging points. Lines/circles
+        // will gain drag targets when the frontend grows handles
+        // for them; for now we reject the call rather than silently
+        // produce a no-op solve.
+        (entity, _) => Err(SketchSolveError::DragTargetKindMismatch {
+            entity,
+            target_kind: target.kind(),
+        }),
+    }
 }
 
 // ── Internal helpers ───────────────────────────────────────────────
@@ -881,5 +1186,277 @@ mod tests {
             }
             _ => panic!("kind changed"),
         }
+    }
+
+    // ── B-2: drag preset ────────────────────────────────────────────
+
+    #[test]
+    fn for_drag_preset_uses_framerate_tuned_values() {
+        let opts = SolveOptions::for_drag();
+        assert_eq!(opts.max_iterations, 30);
+        assert_eq!(opts.tolerance, 1.0e-6);
+        assert_eq!(opts.damping_factor, 0.8);
+        // The preset is required to validate.
+        assert!(validate_options(&opts).is_ok());
+    }
+
+    // ── B-2: build_drag_constraints (synthesis + rejection) ─────────
+
+    #[test]
+    fn drag_constraints_synthesise_x_and_y_required_for_point() {
+        use super::super::constraints::{
+            ConstraintPriority, ConstraintType, DimensionalConstraint,
+        };
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+
+        let extras = build_drag_constraints(
+            &sketch,
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(2.5, -3.0)),
+        )
+        .expect("drag constraint synthesis succeeds for live point");
+
+        assert_eq!(extras.len(), 2, "expected X+Y pair");
+        for c in &extras {
+            assert_eq!(c.priority, ConstraintPriority::Required);
+            assert_eq!(c.entities.len(), 1);
+            assert_eq!(c.entities[0], EntityRef::Point(p));
+            match &c.constraint_type {
+                ConstraintType::Dimensional(DimensionalConstraint::XCoordinate(x)) => {
+                    assert_eq!(*x, 2.5);
+                }
+                ConstraintType::Dimensional(DimensionalConstraint::YCoordinate(y)) => {
+                    assert_eq!(*y, -3.0);
+                }
+                other => panic!("unexpected drag constraint kind: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn drag_rejects_missing_point_with_entity_not_found() {
+        use crate::sketch2d::point2d::Point2dId;
+
+        let sketch = fresh_sketch();
+        // Allocate an id without inserting the point so the bridge
+        // can detect the dangling reference.
+        let ghost = Point2dId::new();
+        let err = build_drag_constraints(
+            &sketch,
+            EntityRef::Point(ghost),
+            DragTarget::Point(Point2d::new(0.0, 0.0)),
+        )
+        .expect_err("ghost point must be rejected");
+
+        match err {
+            SketchSolveError::DragEntityNotFound { entity } => {
+                assert_eq!(entity, EntityRef::Point(ghost));
+            }
+            other => panic!("expected DragEntityNotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn drag_rejects_non_point_entity_with_kind_mismatch() {
+        let sketch = fresh_sketch();
+        let cid = sketch
+            .add_circle(Point2d::new(0.0, 0.0), 1.0)
+            .expect("circle");
+        let err = build_drag_constraints(
+            &sketch,
+            EntityRef::Circle(cid),
+            DragTarget::Point(Point2d::new(2.0, 0.0)),
+        )
+        .expect_err("dragging a circle with a Point target must be rejected");
+        match err {
+            SketchSolveError::DragTargetKindMismatch {
+                entity,
+                target_kind,
+            } => {
+                assert_eq!(entity, EntityRef::Circle(cid));
+                assert_eq!(target_kind, "Point");
+            }
+            other => panic!("expected DragTargetKindMismatch, got {:?}", other),
+        }
+    }
+
+    // ── B-2: solve_drag end-to-end ──────────────────────────────────
+
+    #[test]
+    fn solve_drag_pulls_free_point_onto_target() {
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+
+        let report = solve_drag(
+            &sketch,
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(4.0, -2.0)),
+        )
+        .expect("drag solve");
+        assert!(report.converged(), "status was {:?}", report.status);
+
+        let pos = sketch.points().get(&p).expect("p").value().position;
+        assert!((pos.x - 4.0).abs() < 1e-5, "x = {}", pos.x);
+        assert!((pos.y - (-2.0)).abs() < 1e-5, "y = {}", pos.y);
+    }
+
+    #[test]
+    fn solve_drag_does_not_persist_drag_constraints() {
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        let before = sketch.all_constraints().len();
+        let _ = solve_drag(
+            &sketch,
+            EntityRef::Point(p),
+            DragTarget::Point(Point2d::new(1.0, 1.0)),
+        )
+        .expect("drag");
+        let after = sketch.all_constraints().len();
+        assert_eq!(
+            before, after,
+            "drag must not pollute the sketch ConstraintStore"
+        );
+    }
+
+    #[test]
+    fn solve_drag_respects_existing_distance_constraint() {
+        // Pin `a` at the origin, constrain |ab|=5, then drag `b`
+        // toward (10, 0). The cursor is unreachable (10>5), so the
+        // solver should land `b` on the circle of radius 5 — the
+        // closest reachable point in the direction of the drag.
+        let sketch = fresh_sketch();
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(1.0, 0.0));
+        if let Some(mut e) = sketch.points().get_mut(&a) {
+            e.value_mut().fix();
+        } else {
+            panic!("a missing");
+        }
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ConstraintPriority::High,
+        ));
+
+        let _ = solve_drag(
+            &sketch,
+            EntityRef::Point(b),
+            DragTarget::Point(Point2d::new(10.0, 0.0)),
+        )
+        .expect("drag");
+
+        let pa = sketch.points().get(&a).expect("a").value().position;
+        let pb = sketch.points().get(&b).expect("b").value().position;
+        let d = ((pb.x - pa.x).powi(2) + (pb.y - pa.y).powi(2)).sqrt();
+        assert!(
+            (d - 5.0).abs() < 1e-4,
+            "|ab| should remain 5.0 (closest reachable), got {}",
+            d
+        );
+        // `a` must stay pinned at origin.
+        assert!(pa.x.abs() < 1e-10);
+        assert!(pa.y.abs() < 1e-10);
+    }
+
+    // ── B-2: analyze_dofs ───────────────────────────────────────────
+
+    #[test]
+    fn analyze_dofs_empty_sketch_is_fully_constrained() {
+        let sketch = fresh_sketch();
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 0);
+        assert_eq!(report.constraint_dofs_removed, 0);
+        assert_eq!(report.entities_analysed, 0);
+        assert_eq!(report.constraints_analysed, 0);
+        assert!(report.entities_skipped.is_empty());
+        assert!(report.is_fully_constrained());
+        assert!(!report.is_under_constrained());
+        assert!(!report.is_over_constrained());
+        assert_eq!(report.remaining_dofs(), None);
+        assert_eq!(report.excess_constraints(), None);
+    }
+
+    #[test]
+    fn analyze_dofs_counts_two_per_free_point() {
+        let sketch = fresh_sketch();
+        sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch.add_point(Point2d::new(1.0, 0.0));
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 4);
+        assert_eq!(report.entities_analysed, 2);
+        // 4 free, 0 removed → 4 DOF under-constrained.
+        assert!(report.is_under_constrained());
+        assert_eq!(report.remaining_dofs(), Some(4));
+    }
+
+    #[test]
+    fn analyze_dofs_fixed_points_contribute_zero_dofs() {
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        if let Some(mut e) = sketch.points().get_mut(&p) {
+            e.value_mut().fix();
+        } else {
+            panic!("p missing");
+        }
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 0);
+        assert_eq!(report.entities_analysed, 1);
+        assert!(report.is_fully_constrained());
+    }
+
+    #[test]
+    fn analyze_dofs_fully_constrained_point_with_x_and_y() {
+        // Free point + XCoordinate + YCoordinate = 2 DOFs, 2 removed.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(3.0, 4.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(4.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 2);
+        assert_eq!(report.constraint_dofs_removed, 2);
+        assert!(report.is_fully_constrained());
+        assert_eq!(report.constraints_analysed, 2);
+    }
+
+    #[test]
+    fn analyze_dofs_over_constrained_when_constraints_exceed_freedom() {
+        // 1 free point (2 DOF) + 3 dimensional constraints (3 DOF
+        // removed) → over-constrained by 1.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        for v in [0.0, 1.0, 2.0] {
+            sketch.add_constraint(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(v),
+                vec![EntityRef::Point(p)],
+                ConstraintPriority::Required,
+            ));
+        }
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 2);
+        assert_eq!(report.constraint_dofs_removed, 3);
+        assert!(report.is_over_constrained());
+        assert_eq!(report.excess_constraints(), Some(1));
+    }
+
+    #[test]
+    fn analyze_dofs_skips_unsupported_kinds_into_report() {
+        let sketch = fresh_sketch();
+        let rect_id = sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
+            .expect("rect");
+        let report = analyze_dofs(&sketch);
+        // Rectangle contributes 0 DOFs in slice B-2 and lands in
+        // entities_skipped so the UI can surface the gap.
+        assert_eq!(report.total_free_dofs, 0);
+        assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
     }
 }

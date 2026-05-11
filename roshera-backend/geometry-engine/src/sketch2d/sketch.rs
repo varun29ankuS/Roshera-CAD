@@ -662,6 +662,49 @@ impl Sketch {
         super::sketch_solver::solve_with_options(self, options)
     }
 
+    /// Drag a single entity toward a target position, re-solving the
+    /// rest of the sketch's constraint system to track it.
+    ///
+    /// Delegates to [`super::sketch_solver::solve_drag`]. The drag
+    /// target is a soft, least-squares pull (not a hard fix): if the
+    /// cursor position is unreachable given the rest of the
+    /// constraints, the solver lands on the closest reachable point.
+    /// The temporary X/Y constraints synthesised for the drag are
+    /// not persisted to the sketch's `ConstraintStore`.
+    ///
+    /// Uses the framerate-tuned [`super::sketch_solver::SolveOptions::for_drag`]
+    /// preset by default.
+    pub fn solve_drag(
+        &self,
+        dragged: super::constraints::EntityRef,
+        target: super::sketch_solver::DragTarget,
+    ) -> Result<super::sketch_solver::SketchSolveReport, super::sketch_solver::SketchSolveError>
+    {
+        super::sketch_solver::solve_drag(self, dragged, target)
+    }
+
+    /// Drag with custom solver options. See [`Sketch::solve_drag`].
+    pub fn solve_drag_with_options(
+        &self,
+        dragged: super::constraints::EntityRef,
+        target: super::sketch_solver::DragTarget,
+        options: super::sketch_solver::SolveOptions,
+    ) -> Result<super::sketch_solver::SketchSolveReport, super::sketch_solver::SketchSolveError>
+    {
+        super::sketch_solver::solve_drag_with_options(self, dragged, target, options)
+    }
+
+    /// Analyse the sketch's structural degrees of freedom without
+    /// running Newton-Raphson.
+    ///
+    /// Delegates to [`super::sketch_solver::analyze_dofs`]. Cost is
+    /// O(entities + constraints) — safe to call on every
+    /// constraint mutation so the UI can keep a "DOF: 3" badge
+    /// reactive without paying solve cost.
+    pub fn analyze_dofs(&self) -> super::sketch_solver::DofReport {
+        super::sketch_solver::analyze_dofs(self)
+    }
+
     // Delete operations
 
     /// Delete a point from the sketch
