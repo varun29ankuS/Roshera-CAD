@@ -378,17 +378,26 @@ fn get_solid_entities(model: &BRepModel, solid_id: SolidId) -> OperationResult<S
     let mut edges = HashSet::new();
     let faces = shell.faces.clone();
 
-    // Collect all edges and vertices
+    // Collect every edge / vertex reachable through *all* loops of every
+    // face — both the outer boundary and any interior (hole) loops. The
+    // earlier implementation walked only `face.outer_loop`, so faces with
+    // inner loops (e.g. an annular planar cap left by a boolean
+    // difference) had their hole edges and vertices skipped. Transforming
+    // such a solid would move the outer hull but leave the hole vertices
+    // sitting at the original position, producing a torn / self-
+    // intersecting model that broke downstream operations (booleans,
+    // fillet-of-fillet, mass-property integration).
     for &face_id in &faces {
         if let Some(face) = model.faces.get(face_id) {
-            // Get outer loop edges
-            if let Some(loop_data) = model.loops.get(face.outer_loop) {
-                for &edge_id in &loop_data.edges {
-                    edges.insert(edge_id);
+            for &loop_id in std::iter::once(&face.outer_loop).chain(face.inner_loops.iter()) {
+                if let Some(loop_data) = model.loops.get(loop_id) {
+                    for &edge_id in &loop_data.edges {
+                        edges.insert(edge_id);
 
-                    if let Some(edge) = model.edges.get(edge_id) {
-                        vertices.insert(edge.start_vertex);
-                        vertices.insert(edge.end_vertex);
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            vertices.insert(edge.start_vertex);
+                            vertices.insert(edge.end_vertex);
+                        }
                     }
                 }
             }
@@ -407,16 +416,20 @@ fn get_faces_entities(model: &BRepModel, face_ids: &[FaceId]) -> OperationResult
     let mut vertices = HashSet::new();
     let mut edges = HashSet::new();
 
+    // Walk every loop (outer + any inner / hole loops) on each face — see
+    // the rationale in `get_solid_entities` for why inner loops must be
+    // included.
     for &face_id in face_ids {
         if let Some(face) = model.faces.get(face_id) {
-            // Get outer loop edges
-            if let Some(loop_data) = model.loops.get(face.outer_loop) {
-                for &edge_id in &loop_data.edges {
-                    edges.insert(edge_id);
+            for &loop_id in std::iter::once(&face.outer_loop).chain(face.inner_loops.iter()) {
+                if let Some(loop_data) = model.loops.get(loop_id) {
+                    for &edge_id in &loop_data.edges {
+                        edges.insert(edge_id);
 
-                    if let Some(edge) = model.edges.get(edge_id) {
-                        vertices.insert(edge.start_vertex);
-                        vertices.insert(edge.end_vertex);
+                        if let Some(edge) = model.edges.get(edge_id) {
+                            vertices.insert(edge.start_vertex);
+                            vertices.insert(edge.end_vertex);
+                        }
                     }
                 }
             }
@@ -1379,5 +1392,192 @@ mod tests {
         let opts = TransformOptions::default();
         let res = transform_edges(&mut model, vec![], Matrix4::scale(0.0, 0.0, 0.0), opts);
         assert!(matches!(res, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    // ────────── Task #102: inner-loop coverage in entity collection ──────────
+
+    /// Attach a synthetic inner (hole-style) loop to the first face of
+    /// `solid_id`. The loop's four vertices live well outside the box
+    /// so they remain trivially distinguishable from the original eight
+    /// corner vertices. Returns the new vertex / edge IDs.
+    fn attach_synthetic_inner_loop(
+        model: &mut BRepModel,
+        solid_id: SolidId,
+    ) -> ([VertexId; 4], [EdgeId; 4]) {
+        use crate::primitives::curve::Line;
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+
+        let shell_id = model
+            .solids
+            .get(solid_id)
+            .expect("solid")
+            .outer_shell;
+        let face_id = *model
+            .shells
+            .get(shell_id)
+            .expect("shell")
+            .faces
+            .first()
+            .expect("shell has faces");
+
+        let h0 = model.vertices.add_or_find(10.0, 10.0, 10.0, 1e-9);
+        let h1 = model.vertices.add_or_find(11.0, 10.0, 10.0, 1e-9);
+        let h2 = model.vertices.add_or_find(11.0, 11.0, 10.0, 1e-9);
+        let h3 = model.vertices.add_or_find(10.0, 11.0, 10.0, 1e-9);
+
+        let c0 = model.curves.add(Box::new(Line::new(
+            Point3::new(10.0, 10.0, 10.0),
+            Point3::new(11.0, 10.0, 10.0),
+        )));
+        let c1 = model.curves.add(Box::new(Line::new(
+            Point3::new(11.0, 10.0, 10.0),
+            Point3::new(11.0, 11.0, 10.0),
+        )));
+        let c2 = model.curves.add(Box::new(Line::new(
+            Point3::new(11.0, 11.0, 10.0),
+            Point3::new(10.0, 11.0, 10.0),
+        )));
+        let c3 = model.curves.add(Box::new(Line::new(
+            Point3::new(10.0, 11.0, 10.0),
+            Point3::new(10.0, 10.0, 10.0),
+        )));
+
+        let e0 = model
+            .edges
+            .add(Edge::new_auto_range(0, h0, h1, c0, EdgeOrientation::Forward));
+        let e1 = model
+            .edges
+            .add(Edge::new_auto_range(0, h1, h2, c1, EdgeOrientation::Forward));
+        let e2 = model
+            .edges
+            .add(Edge::new_auto_range(0, h2, h3, c2, EdgeOrientation::Forward));
+        let e3 = model
+            .edges
+            .add(Edge::new_auto_range(0, h3, h0, c3, EdgeOrientation::Forward));
+
+        let mut inner = Loop::new(0, LoopType::Inner);
+        inner.add_edge(e0, true);
+        inner.add_edge(e1, true);
+        inner.add_edge(e2, true);
+        inner.add_edge(e3, true);
+        let inner_id = model.loops.add(inner);
+
+        model
+            .faces
+            .get_mut(face_id)
+            .expect("face exists")
+            .add_inner_loop(inner_id);
+
+        ([h0, h1, h2, h3], [e0, e1, e2, e3])
+    }
+
+    #[test]
+    fn get_solid_entities_walks_inner_loops() {
+        // Regression for Task #102: get_solid_entities used to walk only
+        // face.outer_loop, silently dropping every vertex and edge that
+        // lived on a face's inner (hole) loop. Transforming such a solid
+        // would leave hole geometry sitting at the original position
+        // while the outer hull moved, tearing the model.
+        let (mut model, sid) = unit_box();
+        let (hole_verts, hole_edges) = attach_synthetic_inner_loop(&mut model, sid);
+
+        let entities = get_solid_entities(&model, sid).expect("get_solid_entities");
+
+        for v in hole_verts {
+            assert!(
+                entities.vertices.contains(&v),
+                "inner-loop vertex {v} missing from collected solid entities"
+            );
+        }
+        for e in hole_edges {
+            assert!(
+                entities.edges.contains(&e),
+                "inner-loop edge {e} missing from collected solid entities"
+            );
+        }
+    }
+
+    #[test]
+    fn get_faces_entities_walks_inner_loops() {
+        // Same regression as above, exercised through the per-face
+        // entity collector used by `transform_faces`.
+        let (mut model, sid) = unit_box();
+        let (hole_verts, hole_edges) = attach_synthetic_inner_loop(&mut model, sid);
+
+        let face_ids: Vec<FaceId> = {
+            let shell = model
+                .solids
+                .get(sid)
+                .expect("solid")
+                .outer_shell;
+            model
+                .shells
+                .get(shell)
+                .expect("shell")
+                .faces
+                .clone()
+        };
+
+        let entities = get_faces_entities(&model, &face_ids).expect("get_faces_entities");
+
+        for v in hole_verts {
+            assert!(
+                entities.vertices.contains(&v),
+                "inner-loop vertex {v} missing from face entity collection"
+            );
+        }
+        for e in hole_edges {
+            assert!(
+                entities.edges.contains(&e),
+                "inner-loop edge {e} missing from face entity collection"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_solid_translates_inner_loop_vertices() {
+        // End-to-end regression: a translate applied to a solid whose
+        // faces carry inner (hole) loops must move the hole vertices
+        // by the same vector as the outer-hull vertices. Pre-fix this
+        // assertion failed because `get_solid_entities` never returned
+        // the inner-loop vertices, so `transform_vertices` skipped them.
+        let (mut model, sid) = unit_box();
+        let (hole_verts, _hole_edges) = attach_synthetic_inner_loop(&mut model, sid);
+
+        // Snapshot inner-loop vertex positions before the translate.
+        let before: Vec<[f64; 3]> = hole_verts
+            .iter()
+            .map(|&v| model.vertices.get(v).expect("vertex").position)
+            .collect();
+
+        let opts = TransformOptions {
+            common: CommonOptions {
+                // Skip post-validation: our synthetic inner loop is not a
+                // closed cycle on the cube's surface, so model-level
+                // B-Rep validation would (correctly) flag it. We're
+                // testing the entity-collection logic, not surface
+                // membership.
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            // Surface parameterization is irrelevant — we're checking
+            // vertex motion.
+            update_parameterization: false,
+        };
+        let _ = transform_solid(&mut model, sid, Matrix4::translation(2.0, 3.0, -5.0), opts)
+            .expect("transform_solid");
+
+        for (i, &v) in hole_verts.iter().enumerate() {
+            let after = model.vertices.get(v).expect("vertex").position;
+            assert!(
+                approx(after[0] - before[i][0], 2.0)
+                    && approx(after[1] - before[i][1], 3.0)
+                    && approx(after[2] - before[i][2], -5.0),
+                "inner-loop vertex {v} not translated: before={:?} after={:?}",
+                before[i],
+                after
+            );
+        }
     }
 }
