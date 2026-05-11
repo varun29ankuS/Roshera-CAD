@@ -1004,6 +1004,59 @@ fn default_consume() -> bool {
     false
 }
 
+/// `POST /api/sketch/{id}/extrude_cut` body. Same shape as
+/// `ExtrudeSketchBody` plus `target_id` — the UUID of the existing
+/// solid to subtract the extruded profile from. The cutter is built
+/// from the sketch profile and consumed by the boolean difference;
+/// the target solid is modified in place (identity-preserving).
+#[derive(Debug, Deserialize)]
+pub struct ExtrudeCutSketchBody {
+    pub distance: f64,
+    #[serde(default)]
+    pub direction: Option<[f64; 3]>,
+    /// UUID of the solid to cut. Required — we don't auto-detect the
+    /// intersecting body. Frontend resolves this from the user's
+    /// click target or the active part in the model tree.
+    pub target_id: Uuid,
+    #[serde(default = "default_consume")]
+    pub consume: bool,
+}
+
+/// `POST /api/sketch/{id}/revolve` body. The axis is supplied as a
+/// world-space origin + direction; the frontend computes these from
+/// the user-selected sketch line (typically the two endpoints, with
+/// `origin = first` and `direction = second - first`).
+#[derive(Debug, Deserialize)]
+pub struct RevolveSketchBody {
+    pub axis_origin: [f64; 3],
+    pub axis_direction: [f64; 3],
+    /// Revolution angle in radians. Default is full revolution
+    /// (`2π`) — most user sessions are "spin this profile around
+    /// the axis" rather than partial sweeps.
+    #[serde(default = "default_revolve_angle")]
+    pub angle: f64,
+    /// Discretisation segments. Higher = smoother but more triangles.
+    /// Default 32 matches the kernel's `RevolveOptions::default`.
+    #[serde(default = "default_revolve_segments")]
+    pub segments: u32,
+    /// Symmetric: extend equally in both directions from the axis.
+    /// Useful for partial revolutions centered on the profile plane.
+    #[serde(default)]
+    pub symmetric: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_consume")]
+    pub consume: bool,
+}
+
+fn default_revolve_angle() -> f64 {
+    std::f64::consts::TAU
+}
+
+fn default_revolve_segments() -> u32 {
+    32
+}
+
 /// `POST /api/sketch/{id}/shape` body. Adds a fresh shape to the
 /// session. The new shape becomes the active one (last in the vec)
 /// and starts with no points. There is no role field — outer/hole
@@ -1478,6 +1531,580 @@ pub async fn extrude_sketch(
             "id":         result_id_str,
             "name":       display_name,
             "objectType": "extrude",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
+/// `POST /api/sketch/{id}/extrude_cut` — extrude the sketch profile
+/// and subtract it from `target_id`.
+///
+/// The cutter solid is built exactly as in `extrude_sketch` (multi-shape
+/// materialise → region detection → per-shape extrude → outer-minus-holes
+/// fold). The cutter is then boolean-differenced from the named target
+/// solid; the target's UUID is preserved (identity-preserving modify)
+/// so frontend selection / timeline references survive the cut.
+pub async fn extrude_cut_sketch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ExtrudeCutSketchBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::operations::boolean::{
+        boolean_operation, BooleanOp, BooleanOptions,
+    };
+    use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let id = parse_uuid(&id)?;
+    if !body.distance.is_finite() || body.distance.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "distance must be non-zero and finite (got {})",
+                body.distance
+            ),
+        ));
+    }
+
+    let target_solid_id = state.get_local_id(&body.target_id).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for target {}", body.target_id),
+        )
+    })?;
+
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+
+    if session.shapes.is_empty() {
+        return Err(ApiError::from(SketchError::NoShapes(session.id)));
+    }
+
+    let direction = match body.direction {
+        Some([x, y, z]) => {
+            let v = Vector3::new(x, y, z);
+            if !v.x.is_finite() || !v.y.is_finite() || !v.z.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "direction components must all be finite numbers".to_string(),
+                ));
+            }
+            v
+        }
+        None => session.plane.normal(),
+    };
+
+    let tolerance = Tolerance::default();
+
+    let mut shape_polygons: Vec<(Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
+        Vec::with_capacity(session.shapes.len());
+    for shape in &session.shapes {
+        let polygon_2d = materialise_shape(shape, session.circle_segments)?;
+        let lifted = lift_polygon(&session, &polygon_2d);
+        shape_polygons.push((shape.id, shape.tool, polygon_2d, lifted));
+    }
+
+    let polygons_2d: Vec<&Vec<[f64; 2]>> =
+        shape_polygons.iter().map(|(_, _, p, _)| p).collect();
+    let regions = detect_regions(&polygons_2d).map_err(|e| {
+        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+    })?;
+    if regions.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch must contain at least one closed outer region to cut".to_string(),
+        ));
+    }
+
+    // Hold the model write lock across the whole "build cutter +
+    // subtract from target" sequence so the cutter solid is never
+    // observable in a partially-built state by a concurrent reader.
+    let result_solid_id = {
+        let mut model = state.model.write().await;
+
+        // Materialise the cutter the same way `extrude_sketch` does:
+        // one solid per shape, then fold outer-minus-holes per region,
+        // then union regions.
+        let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
+        for (shape_idx, (_shape_id, _tool, _polygon_2d, lifted)) in
+            shape_polygons.iter().enumerate()
+        {
+            let mut profile_edges = Vec::with_capacity(lifted.len());
+            for i in 0..lifted.len() {
+                let p_start = lifted[i];
+                let p_end = lifted[(i + 1) % lifted.len()];
+                let v_start = model.vertices.add_or_find(
+                    p_start.x,
+                    p_start.y,
+                    p_start.z,
+                    tolerance.distance(),
+                );
+                let v_end = model.vertices.add_or_find(
+                    p_end.x,
+                    p_end.y,
+                    p_end.z,
+                    tolerance.distance(),
+                );
+                if v_start == v_end {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!(
+                            "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
+                             to the same vertex under tolerance {}",
+                            (i + 1) % lifted.len(),
+                            tolerance.distance()
+                        ),
+                    ));
+                }
+                let line = Line::new(p_start, p_end);
+                let curve_id = model.curves.add(Box::new(line));
+                let edge = Edge::new(
+                    0,
+                    v_start,
+                    v_end,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                );
+                let edge_id = model.edges.add(edge);
+                profile_edges.push(edge_id);
+            }
+            let options = ExtrudeOptions {
+                direction,
+                distance: body.distance,
+                ..ExtrudeOptions::default()
+            };
+            let solid_id = extrude_profile(&mut model, profile_edges, options)
+                .map_err(ApiError::kernel_error)?;
+            shape_solids.push(solid_id);
+        }
+
+        let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
+        for region in &regions {
+            let mut acc = shape_solids[region.outer_shape_idx];
+            for &hole_idx in &region.hole_shape_idxs {
+                acc = boolean_operation(
+                    &mut model,
+                    acc,
+                    shape_solids[hole_idx],
+                    BooleanOp::Difference,
+                    BooleanOptions::default(),
+                )
+                .map_err(ApiError::kernel_error)?;
+            }
+            region_solids.push(acc);
+        }
+        let mut cutter = region_solids[0];
+        for &sid in &region_solids[1..] {
+            cutter = boolean_operation(
+                &mut model,
+                cutter,
+                sid,
+                BooleanOp::Union,
+                BooleanOptions::default(),
+            )
+            .map_err(ApiError::kernel_error)?;
+        }
+
+        // Now subtract the cutter from the target. The kernel's
+        // boolean_operation consumes both operands; the target's
+        // public UUID is re-pointed below to the result solid id.
+        boolean_operation(
+            &mut model,
+            target_solid_id,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .map_err(ApiError::kernel_error)?
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&tri_mesh);
+
+    // Identity-preserving modify: the user's intent is "cut this
+    // body". Re-point the target's UUID at whatever kernel solid id
+    // the boolean returned (often a fresh id) so frontend selection
+    // and timeline references stay intact.
+    if result_solid_id != target_solid_id {
+        state.unregister_id_mapping(&body.target_id);
+        state.register_id_mapping(body.target_id, result_solid_id);
+    }
+    let result_id_str = body.target_id.to_string();
+
+    let display_name = format!("Cut {result_solid_id}");
+
+    let shapes_descriptor: Vec<serde_json::Value> = shape_polygons
+        .iter()
+        .map(|(shape_id, tool, polygon_2d, _lifted)| {
+            serde_json::json!({
+                "id":      shape_id.to_string(),
+                "tool":    tool,
+                "polygon": polygon_2d,
+            })
+        })
+        .collect();
+
+    let parameters = serde_json::json!({
+        "sketch_id": session.id.to_string(),
+        "plane":     session.plane,
+        "shapes":    shapes_descriptor,
+        "direction": [direction.x, direction.y, direction.z],
+        "distance":  body.distance,
+        "target":    body.target_id.to_string(),
+    });
+
+    crate::broadcast_object_updated(
+        &result_id_str,
+        &display_name,
+        result_solid_id,
+        "extrude_cut",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    broadcast_sketch_extruded(&session, &result_id_str, result_solid_id);
+
+    let consumed = body.consume;
+    if consumed {
+        state.sketches.delete(&session.id);
+        broadcast_sketch_deleted(session.id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success":   true,
+        "sketch_id": session.id.to_string(),
+        "consumed":  consumed,
+        "target_id": body.target_id.to_string(),
+        "solid_id":  result_solid_id,
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
+/// `POST /api/sketch/{id}/revolve` — revolve the sketch profile
+/// around an axis to create a solid of revolution.
+///
+/// Profile materialisation mirrors `extrude_sketch` (multi-shape
+/// support, region detection). For each detected region the outer
+/// loop is revolved via `revolve_profile`; per-region holes are then
+/// subtracted via boolean difference; regions are unioned. This
+/// matches the extrude pipeline's region-fold so multi-loop sketches
+/// produce the same topology after revolve as they do after extrude.
+pub async fn revolve_sketch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RevolveSketchBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::operations::boolean::{
+        boolean_operation, BooleanOp, BooleanOptions,
+    };
+    use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let id = parse_uuid(&id)?;
+
+    let axis_origin = Point3::new(
+        body.axis_origin[0],
+        body.axis_origin[1],
+        body.axis_origin[2],
+    );
+    let axis_direction = Vector3::new(
+        body.axis_direction[0],
+        body.axis_direction[1],
+        body.axis_direction[2],
+    );
+    for c in [
+        axis_origin.x,
+        axis_origin.y,
+        axis_origin.z,
+        axis_direction.x,
+        axis_direction.y,
+        axis_direction.z,
+    ] {
+        if !c.is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "axis components must all be finite numbers".to_string(),
+            ));
+        }
+    }
+    if axis_direction.magnitude() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "axis_direction must have non-zero magnitude".to_string(),
+        ));
+    }
+    if !body.angle.is_finite() || body.angle.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "angle must be non-zero and finite (got {} rad)",
+                body.angle
+            ),
+        ));
+    }
+    if body.segments < 3 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "segments must be ≥3 for a valid revolution (got {})",
+                body.segments
+            ),
+        ));
+    }
+
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+
+    if session.shapes.is_empty() {
+        return Err(ApiError::from(SketchError::NoShapes(session.id)));
+    }
+
+    let tolerance = Tolerance::default();
+
+    let mut shape_polygons: Vec<(Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
+        Vec::with_capacity(session.shapes.len());
+    for shape in &session.shapes {
+        let polygon_2d = materialise_shape(shape, session.circle_segments)?;
+        let lifted = lift_polygon(&session, &polygon_2d);
+        shape_polygons.push((shape.id, shape.tool, polygon_2d, lifted));
+    }
+
+    let polygons_2d: Vec<&Vec<[f64; 2]>> =
+        shape_polygons.iter().map(|(_, _, p, _)| p).collect();
+    let regions = detect_regions(&polygons_2d).map_err(|e| {
+        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+    })?;
+    if regions.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch must contain at least one closed outer region to revolve".to_string(),
+        ));
+    }
+
+    let result_solid_id = {
+        let mut model = state.model.write().await;
+
+        // Build edges + revolve each shape into its own solid. Hole
+        // shapes are revolved into hole solids and subtracted from
+        // their outer in the region fold below.
+        let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
+        for (shape_idx, (_shape_id, _tool, _polygon_2d, lifted)) in
+            shape_polygons.iter().enumerate()
+        {
+            let mut profile_edges = Vec::with_capacity(lifted.len());
+            for i in 0..lifted.len() {
+                let p_start = lifted[i];
+                let p_end = lifted[(i + 1) % lifted.len()];
+                let v_start = model.vertices.add_or_find(
+                    p_start.x,
+                    p_start.y,
+                    p_start.z,
+                    tolerance.distance(),
+                );
+                let v_end = model.vertices.add_or_find(
+                    p_end.x,
+                    p_end.y,
+                    p_end.z,
+                    tolerance.distance(),
+                );
+                if v_start == v_end {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!(
+                            "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
+                             to the same vertex under tolerance {}",
+                            (i + 1) % lifted.len(),
+                            tolerance.distance()
+                        ),
+                    ));
+                }
+                let line = Line::new(p_start, p_end);
+                let curve_id = model.curves.add(Box::new(line));
+                let edge = Edge::new(
+                    0,
+                    v_start,
+                    v_end,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                );
+                let edge_id = model.edges.add(edge);
+                profile_edges.push(edge_id);
+            }
+            let options = RevolveOptions {
+                axis_origin,
+                axis_direction,
+                angle: body.angle,
+                symmetric: body.symmetric,
+                segments: body.segments,
+                ..RevolveOptions::default()
+            };
+            let solid_id = revolve_profile(&mut model, profile_edges, options)
+                .map_err(ApiError::kernel_error)?;
+            shape_solids.push(solid_id);
+        }
+
+        let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
+        for region in &regions {
+            let mut acc = shape_solids[region.outer_shape_idx];
+            for &hole_idx in &region.hole_shape_idxs {
+                acc = boolean_operation(
+                    &mut model,
+                    acc,
+                    shape_solids[hole_idx],
+                    BooleanOp::Difference,
+                    BooleanOptions::default(),
+                )
+                .map_err(ApiError::kernel_error)?;
+            }
+            region_solids.push(acc);
+        }
+        let mut accumulator = region_solids[0];
+        for &sid in &region_solids[1..] {
+            accumulator = boolean_operation(
+                &mut model,
+                accumulator,
+                sid,
+                BooleanOp::Union,
+                BooleanOptions::default(),
+            )
+            .map_err(ApiError::kernel_error)?;
+        }
+        accumulator
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let display_name = body
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Revolve {result_solid_id}"));
+
+    let shapes_descriptor: Vec<serde_json::Value> = shape_polygons
+        .iter()
+        .map(|(shape_id, tool, polygon_2d, _lifted)| {
+            serde_json::json!({
+                "id":      shape_id.to_string(),
+                "tool":    tool,
+                "polygon": polygon_2d,
+            })
+        })
+        .collect();
+
+    let parameters = serde_json::json!({
+        "sketch_id":      session.id.to_string(),
+        "plane":          session.plane,
+        "shapes":         shapes_descriptor,
+        "axis_origin":    [axis_origin.x, axis_origin.y, axis_origin.z],
+        "axis_direction": [axis_direction.x, axis_direction.y, axis_direction.z],
+        "angle":          body.angle,
+        "segments":       body.segments,
+        "symmetric":      body.symmetric,
+    });
+    crate::broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        result_solid_id,
+        "revolve",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    broadcast_sketch_extruded(&session, &result_id_str, result_solid_id);
+
+    let consumed = body.consume;
+    if consumed {
+        state.sketches.delete(&session.id);
+        broadcast_sketch_deleted(session.id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success":   true,
+        "sketch_id": session.id.to_string(),
+        "consumed":  consumed,
+        "solid_id":  result_solid_id,
+        "object": {
+            "id":         result_id_str,
+            "name":       display_name,
+            "objectType": "revolve",
             "mesh": {
                 "vertices": vertices,
                 "indices":  indices,
