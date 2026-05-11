@@ -1286,12 +1286,23 @@ pub async fn extrude_sketch(
     // collinear circle, …) fails the request before we touch the
     // BRepModel — keeping the kernel free of orphan vertices/edges
     // from a partial pipeline.
+    // Skip trailing empty shapes from the auto-commit pattern: when the
+    // user closes a polyline (or completes a rect/circle), the panel
+    // auto-creates a fresh empty shape ready for the next loop. That
+    // "on-deck" shape would otherwise fail `materialise_shape` with
+    // `PolylineTooShort(0)` and reject an otherwise-valid extrude.
     let mut shape_polygons: Vec<(Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
         Vec::with_capacity(session.shapes.len());
-    for shape in &session.shapes {
+    for shape in session.shapes.iter().filter(|s| !s.points.is_empty()) {
         let polygon_2d = materialise_shape(shape, session.circle_segments)?;
         let lifted = lift_polygon(&session, &polygon_2d);
         shape_polygons.push((shape.id, shape.tool, polygon_2d, lifted));
+    }
+    if shape_polygons.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch has no drawn shapes — finish at least one shape before extruding".to_string(),
+        ));
     }
 
     // Geometric region detection (SolidWorks/Fusion model): the user
@@ -1616,12 +1627,19 @@ pub async fn extrude_cut_sketch(
 
     let tolerance = Tolerance::default();
 
+    // See `extrude_sketch` for the trailing-empty-shape rationale.
     let mut shape_polygons: Vec<(Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
         Vec::with_capacity(session.shapes.len());
-    for shape in &session.shapes {
+    for shape in session.shapes.iter().filter(|s| !s.points.is_empty()) {
         let polygon_2d = materialise_shape(shape, session.circle_segments)?;
         let lifted = lift_polygon(&session, &polygon_2d);
         shape_polygons.push((shape.id, shape.tool, polygon_2d, lifted));
+    }
+    if shape_polygons.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch has no drawn shapes — finish at least one shape before cutting".to_string(),
+        ));
     }
 
     let polygons_2d: Vec<&Vec<[f64; 2]>> =
@@ -1913,12 +1931,19 @@ pub async fn revolve_sketch(
 
     let tolerance = Tolerance::default();
 
+    // See `extrude_sketch` for the trailing-empty-shape rationale.
     let mut shape_polygons: Vec<(Uuid, SketchTool, Vec<[f64; 2]>, Vec<Point3>)> =
         Vec::with_capacity(session.shapes.len());
-    for shape in &session.shapes {
+    for shape in session.shapes.iter().filter(|s| !s.points.is_empty()) {
         let polygon_2d = materialise_shape(shape, session.circle_segments)?;
         let lifted = lift_polygon(&session, &polygon_2d);
         shape_polygons.push((shape.id, shape.tool, polygon_2d, lifted));
+    }
+    if shape_polygons.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch has no drawn shapes — finish at least one shape before revolving".to_string(),
+        ));
     }
 
     let polygons_2d: Vec<&Vec<[f64; 2]>> =

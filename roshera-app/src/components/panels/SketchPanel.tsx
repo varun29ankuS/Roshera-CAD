@@ -151,13 +151,28 @@ export function SketchPanel() {
     // Backend re-validates per shape (the source of truth), so this
     // is just to surface "shape #2 has only 1 point" as a panel error
     // before the round-trip rather than after.
+    //
+    // Trailing empty shapes (the auto-commit "on-deck" shape the
+    // overlay creates after polyline closure or rect/circle complete)
+    // are filtered out — they exist only as drawing affordances and
+    // the backend now skips them too. Without this filter, hitting
+    // Enter right after closing a loop would surface a confusing
+    // "Shape 2 needs more points" error for a shape the user never
+    // intended to draw.
+    let drawn = 0
     for (let i = 0; i < sketch.shapes.length; i += 1) {
       const s = sketch.shapes[i]
+      if (s.points.length === 0) continue
       const profile = buildProfile2D(s.tool, s.points, sketch.circleSegments)
       if (!profile) {
         setError(`Shape ${i + 1} needs more points`)
         return
       }
+      drawn += 1
+    }
+    if (drawn === 0) {
+      setError('Draw at least one closed shape before finishing.')
+      return
     }
     setBusy(true)
     let serverId: string
@@ -368,6 +383,20 @@ export function SketchPanel() {
     return { count: profile.length, perimeter: peri, area, closed }
   }, [sketch.tool, sketch.points, sketch.circleSegments])
 
+  // Whether Finish is allowed: at least one shape (active or already
+  // committed) materialises to a valid polygon. Tracks the same
+  // "skip empty trailing shapes" rule `handleFinish` applies, so a
+  // closed polyline followed by the auto-created on-deck shape still
+  // enables the button.
+  const hasFinishableShape = useMemo(() => {
+    for (const s of sketch.shapes) {
+      if (s.points.length === 0) continue
+      const profile = buildProfile2D(s.tool, s.points, sketch.circleSegments)
+      if (profile) return true
+    }
+    return false
+  }, [sketch.shapes, sketch.circleSegments])
+
   if (!sketch.active) return null
 
   // Hints surface the multi-shape flow: completing a shape rolls
@@ -377,8 +406,16 @@ export function SketchPanel() {
   // first point (snap engine already attracts the cursor there);
   // for rectangle / circle the next click after the second anchor
   // commits and starts a fresh shape.
-  const hint =
-    sketch.tool === 'polyline'
+  // After a polyline closes (or rect/circle completes), the active
+  // shape is reset to empty and `hasFinishableShape` is true thanks
+  // to the just-committed loop. Surface that state explicitly so the
+  // user doesn't think "Click 3 more points" means their previous
+  // loop didn't register.
+  const justClosed =
+    sketch.points.length === 0 && hasFinishableShape
+  const hint = justClosed
+    ? 'Loop closed · keep drawing or press Enter to finish & extrude'
+    : sketch.tool === 'polyline'
       ? sketch.points.length < 3
         ? `Click ${3 - sketch.points.length} more point${sketch.points.length === 2 ? '' : 's'} · Enter to finish & extrude`
         : 'Click first point to close loop · Enter to finish & extrude'
@@ -616,10 +653,13 @@ export function SketchPanel() {
           onClick={() => void handleFinish()}
           disabled={
             busy ||
-            // Active shape must have at least 2 points (the minimum
-            // any of our tools accepts). Other shapes are validated
-            // inside `handleFinish` before the round-trip.
-            sketch.points.length < 2 ||
+            // At least one shape across the whole session must be
+            // finishable — i.e. materialise to a valid polygon. The
+            // active shape can legitimately be empty right after the
+            // user closes a polyline (the auto-commit pattern creates
+            // a fresh on-deck shape); in that case the committed loop
+            // is still extrudable and the button should stay live.
+            !hasFinishableShape ||
             (finishOp === 'extrude_cut' && cutTargetId === null)
           }
           className={cn(
