@@ -246,18 +246,24 @@ function SelectionMark({
   if (type === 'face') {
     return <FaceMark triangles={triangles} color={colors.face} hover={hover} />
   }
-  if (type === 'edge' && polyline && polyline.length >= 2) {
+  if (type === 'edge') {
+    // Slice α (kernel Polyline curve type) makes `sample_edge_polyline`
+    // ship a real per-edge polyline for every kernel edge — including
+    // sketched polyline shapes, where N segment-edges now share one
+    // composite `Polyline` curve. If `polyline` is missing or
+    // degenerate here the frame is malformed; render nothing rather
+    // than fall back to a triangle outline (the previous fallback
+    // drew a single tessellation triangle border and was the root
+    // cause of the "selecting an edge highlights a triangle" bug).
+    if (!polyline || polyline.length < 2) return null
     return <EdgePolyline points={polyline} color={colors.edge} hover={hover} />
   }
-  // Edge fallback / vertex: operate on the single picked triangle.
+  // Vertex: operate on the single picked triangle.
   const tri = triangles[0]
   if (!tri) return null
   const ao = inflate(tri.a, tri.normal)
   const bo = inflate(tri.b, tri.normal)
   const co = inflate(tri.c, tri.normal)
-  if (type === 'edge') {
-    return <EdgeMark ao={ao} bo={bo} co={co} color={colors.edge} hover={hover} />
-  }
   return <VertexMark ao={ao} bo={bo} co={co} color={colors.vertex} hover={hover} />
 }
 
@@ -333,44 +339,6 @@ function FaceMark({ triangles, color, hover }: FaceMarkProps) {
         depthWrite={false}
       />
     </mesh>
-  )
-}
-
-interface EdgeMarkProps {
-  ao: THREE.Vector3
-  bo: THREE.Vector3
-  co: THREE.Vector3
-  color: string
-  hover: boolean
-}
-
-function EdgeMark({ ao, bo, co, color, hover }: EdgeMarkProps) {
-  // Triangle outline rendered with three drei Line segments so the
-  // pixel width is honoured (plain WebGL lines cap at 1px). Used only
-  // as a legacy-frame fallback when the backend frame doesn't carry a
-  // kernel-sampled polyline.
-  const segments = useMemo<Array<[THREE.Vector3, THREE.Vector3]>>(
-    () => [
-      [ao, bo],
-      [bo, co],
-      [co, ao],
-    ],
-    [ao, bo, co],
-  )
-  return (
-    <group>
-      {segments.map(([p0, p1], i) => (
-        <Line
-          key={`${i}-${color}`}
-          points={[p0, p1]}
-          color={color}
-          lineWidth={hover ? 2 : 3}
-          depthTest={false}
-          transparent
-          opacity={hover ? 0.5 : 1}
-        />
-      ))}
-    </group>
   )
 }
 

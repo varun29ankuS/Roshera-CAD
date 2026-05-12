@@ -3977,6 +3977,589 @@ impl Curve for Ellipse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Polyline — piecewise-linear composite curve through N+1 vertices.
+//
+// Background. Sketcher polylines used to lower to N independent `Line`
+// edges. After extrusion that produces 3N short edges per loop (N bottom,
+// N top, N vertical), and each horizontal edge spans a single segment.
+// Highlighting one of those edges via `sample_edge_polyline` returns 32
+// points along a single short segment — visually indistinguishable from
+// a single tessellation triangle's edge, which made hover/select feedback
+// on polyline extrusions look broken.
+//
+// Sharing one `Polyline` curve across all N edges of a loop lets the WS
+// edge-highlight path walk the full parameter range and return samples
+// for the entire outline regardless of which segment the user picked.
+// The edges themselves remain (so corner vertices stay snappable and
+// per-segment side faces still partition cleanly), but the geometry they
+// reference is a single composite curve.
+// ---------------------------------------------------------------------------
+
+/// Piecewise-linear curve through an ordered sequence of vertices.
+///
+/// A polyline carries N segments between N+1 vertices. Parameterised
+/// `[0, 1]` with uniform parameter spacing across segments — i.e.
+/// `t = i / N` lands exactly on `vertices[i]`. Closed polylines repeat
+/// the first vertex as the last; `is_closed()` detects this.
+#[derive(Debug, Clone)]
+pub struct Polyline {
+    pub vertices: Vec<Point3>,
+    pub range: ParameterRange,
+}
+
+impl Polyline {
+    /// Create a polyline from at least two vertices.
+    pub fn new(vertices: Vec<Point3>) -> MathResult<Self> {
+        if vertices.len() < 2 {
+            return Err(MathError::InvalidParameter(format!(
+                "Polyline requires at least 2 vertices, got {}",
+                vertices.len()
+            )));
+        }
+        Ok(Self {
+            vertices,
+            range: ParameterRange::unit(),
+        })
+    }
+
+    /// Number of straight segments in the polyline.
+    #[inline]
+    pub fn segment_count(&self) -> usize {
+        // Constructor guarantees `vertices.len() >= 2`, so this is ≥ 1.
+        self.vertices.len() - 1
+    }
+
+    /// Length of the i-th segment (panics if `i` out of range — caller's
+    /// responsibility, mirrors the curve module's indexing convention
+    /// noted at the top of this file).
+    #[inline]
+    fn segment_length(&self, i: usize) -> f64 {
+        (self.vertices[i + 1] - self.vertices[i]).magnitude()
+    }
+
+    /// Sum of all segment lengths.
+    fn total_length(&self) -> f64 {
+        (0..self.segment_count()).map(|i| self.segment_length(i)).sum()
+    }
+
+    /// Map `t ∈ [0, 1]` to `(segment_index, local_t ∈ [0, 1])`.
+    ///
+    /// Uniform parameter distribution: each segment owns an equal slice
+    /// `[i/N, (i+1)/N]` of the global parameter regardless of segment
+    /// length. This matches the typical sketcher mental model (vertex
+    /// indices are equally spaced in t) and keeps `evaluate` cheap.
+    fn locate(&self, t: f64) -> (usize, f64) {
+        let n = self.segment_count();
+        let t = t.clamp(0.0, 1.0);
+        let scaled = t * n as f64;
+        let mut idx = scaled.floor() as usize;
+        if idx >= n {
+            idx = n - 1;
+        }
+        let local = scaled - idx as f64;
+        (idx, local)
+    }
+}
+
+impl Curve for Polyline {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn evaluate(&self, t: f64) -> MathResult<CurvePoint> {
+        let t = self.range.clamp(t);
+        let (idx, local) = self.locate(t);
+        let p0 = self.vertices[idx];
+        let p1 = self.vertices[idx + 1];
+        let dir = p1 - p0;
+        // First-derivative wrt outer `t`: chain rule scales by N because
+        // each segment owns `1/N` of the parameter range.
+        let outer_deriv = dir * self.segment_count() as f64;
+        Ok(CurvePoint {
+            position: p0 + dir * local,
+            derivative1: outer_deriv,
+            derivative2: Some(Vector3::ZERO),
+            derivative3: Some(Vector3::ZERO),
+        })
+    }
+
+    fn evaluate_derivatives(&self, t: f64, order: usize) -> MathResult<Vec<Vector3>> {
+        let point = self.evaluate(t)?;
+        let mut result = vec![point.position];
+        if order >= 1 {
+            result.push(point.derivative1);
+        }
+        for _ in 2..=order {
+            result.push(Vector3::ZERO);
+        }
+        Ok(result)
+    }
+
+    fn parameter_range(&self) -> ParameterRange {
+        self.range
+    }
+
+    fn is_closed(&self) -> bool {
+        // Closed when the polyline's first and last vertices coincide
+        // (typical for sketcher loops that wrap around).
+        let first = self.vertices[0];
+        let last = self.vertices[self.vertices.len() - 1];
+        (first - last).magnitude() < consts::EPSILON
+    }
+
+    fn is_linear(&self, tolerance: Tolerance) -> bool {
+        // Linear iff every interior vertex lies on the chord from the
+        // first to the last vertex (within tolerance).
+        let first = self.vertices[0];
+        let last = self.vertices[self.vertices.len() - 1];
+        let chord = last - first;
+        let chord_len_sq = chord.magnitude_squared();
+        if chord_len_sq < consts::EPSILON {
+            // Degenerate; treat as linear iff every vertex coincides.
+            return self
+                .vertices
+                .iter()
+                .all(|v| (*v - first).magnitude() < tolerance.distance());
+        }
+        for v in &self.vertices[1..self.vertices.len() - 1] {
+            let to_v = *v - first;
+            let t = to_v.dot(&chord) / chord_len_sq;
+            let projected = first + chord * t;
+            if (*v - projected).magnitude() > tolerance.distance() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn is_planar(&self, tolerance: Tolerance) -> bool {
+        // 2 or 3 points are trivially planar.
+        if self.vertices.len() <= 3 {
+            return true;
+        }
+        // Find a non-degenerate triangle from the first three distinct
+        // points; that triangle defines the candidate plane.
+        let p0 = self.vertices[0];
+        let mut p1_idx = 1;
+        while p1_idx < self.vertices.len()
+            && (self.vertices[p1_idx] - p0).magnitude() < consts::EPSILON
+        {
+            p1_idx += 1;
+        }
+        if p1_idx >= self.vertices.len() {
+            return true; // All points coincident.
+        }
+        let p1 = self.vertices[p1_idx];
+        let mut normal = Vector3::ZERO;
+        for i in (p1_idx + 1)..self.vertices.len() {
+            let cand = (p1 - p0).cross(&(self.vertices[i] - p0));
+            if cand.magnitude() > consts::EPSILON {
+                normal = cand;
+                break;
+            }
+        }
+        if normal.magnitude() < consts::EPSILON {
+            return true; // All collinear ⇒ planar (any plane through the line).
+        }
+        let normal = match normal.normalize() {
+            Ok(n) => n,
+            Err(_) => return true,
+        };
+        for v in &self.vertices {
+            if (*v - p0).dot(&normal).abs() > tolerance.distance() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn get_plane(&self, tolerance: Tolerance) -> Option<crate::primitives::surface::Plane> {
+        if !self.is_planar(tolerance) {
+            return None;
+        }
+        // Fit a plane through the polyline via Newell's method (robust to
+        // collinear runs in the way a single-triangle cross product is
+        // not).
+        let mut centroid = Vector3::ZERO;
+        for v in &self.vertices {
+            centroid = centroid + *v;
+        }
+        let inv_n = 1.0 / self.vertices.len() as f64;
+        let centroid = centroid * inv_n;
+        let mut nx = 0.0;
+        let mut ny = 0.0;
+        let mut nz = 0.0;
+        for i in 0..self.vertices.len() {
+            let curr = self.vertices[i];
+            let next = self.vertices[(i + 1) % self.vertices.len()];
+            nx += (curr.y - next.y) * (curr.z + next.z);
+            ny += (curr.z - next.z) * (curr.x + next.x);
+            nz += (curr.x - next.x) * (curr.y + next.y);
+        }
+        let raw = Vector3::new(nx, ny, nz);
+        let normal = raw.normalize().ok()?;
+        crate::primitives::surface::Plane::from_point_normal(centroid, normal).ok()
+    }
+
+    fn reversed(&self) -> Box<dyn Curve> {
+        let mut reversed = self.vertices.clone();
+        reversed.reverse();
+        Box::new(Polyline {
+            vertices: reversed,
+            range: self.range,
+        })
+    }
+
+    fn transform(&self, matrix: &Matrix4) -> Box<dyn Curve> {
+        let vertices = self
+            .vertices
+            .iter()
+            .map(|v| matrix.transform_point(v))
+            .collect();
+        Box::new(Polyline {
+            vertices,
+            range: self.range,
+        })
+    }
+
+    fn arc_length_between(&self, t1: f64, t2: f64, _tolerance: Tolerance) -> MathResult<f64> {
+        let (a, b) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
+        let a = self.range.clamp(a);
+        let b = self.range.clamp(b);
+        let n = self.segment_count();
+        let (a_idx, a_local) = self.locate(a);
+        let (b_idx, b_local) = self.locate(b);
+        let mut length = 0.0;
+        if a_idx == b_idx {
+            length += self.segment_length(a_idx) * (b_local - a_local);
+        } else {
+            length += self.segment_length(a_idx) * (1.0 - a_local);
+            for i in (a_idx + 1)..b_idx {
+                if i < n {
+                    length += self.segment_length(i);
+                }
+            }
+            length += self.segment_length(b_idx) * b_local;
+        }
+        Ok(length)
+    }
+
+    fn parameter_at_length(&self, length: f64, _tolerance: Tolerance) -> MathResult<f64> {
+        let total = self.total_length();
+        if total < consts::EPSILON {
+            return Ok(0.0);
+        }
+        let target = length.clamp(0.0, total);
+        let n = self.segment_count();
+        let mut accumulated = 0.0;
+        for i in 0..n {
+            let seg_len = self.segment_length(i);
+            if accumulated + seg_len >= target {
+                let local = if seg_len < consts::EPSILON {
+                    0.0
+                } else {
+                    (target - accumulated) / seg_len
+                };
+                return Ok((i as f64 + local) / n as f64);
+            }
+            accumulated += seg_len;
+        }
+        Ok(1.0)
+    }
+
+    fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, Point3)> {
+        let n = self.segment_count();
+        let mut best_dist_sq = f64::INFINITY;
+        let mut best_t = 0.0;
+        let mut best_point = self.vertices[0];
+        for i in 0..n {
+            let p0 = self.vertices[i];
+            let p1 = self.vertices[i + 1];
+            let dir = p1 - p0;
+            let dir_mag_sq = dir.magnitude_squared();
+            let local = if dir_mag_sq < consts::EPSILON {
+                0.0
+            } else {
+                ((*point - p0).dot(&dir) / dir_mag_sq).clamp(0.0, 1.0)
+            };
+            let candidate = p0 + dir * local;
+            let dist_sq = (*point - candidate).magnitude_squared();
+            if dist_sq < best_dist_sq {
+                best_dist_sq = dist_sq;
+                best_t = (i as f64 + local) / n as f64;
+                best_point = candidate;
+            }
+        }
+        Ok((best_t, best_point))
+    }
+
+    fn parameters_at_point(&self, point: &Point3, tolerance: Tolerance) -> Vec<f64> {
+        let n = self.segment_count();
+        let mut hits = Vec::new();
+        for i in 0..n {
+            let p0 = self.vertices[i];
+            let p1 = self.vertices[i + 1];
+            let dir = p1 - p0;
+            let dir_mag_sq = dir.magnitude_squared();
+            let local = if dir_mag_sq < consts::EPSILON {
+                0.0
+            } else {
+                ((*point - p0).dot(&dir) / dir_mag_sq).clamp(0.0, 1.0)
+            };
+            let candidate = p0 + dir * local;
+            if (*point - candidate).magnitude() < tolerance.distance() {
+                hits.push((i as f64 + local) / n as f64);
+            }
+        }
+        hits
+    }
+
+    fn split(&self, t: f64) -> MathResult<(Box<dyn Curve>, Box<dyn Curve>)> {
+        let t = self.range.clamp(t);
+        let mid = self.point_at(t)?;
+        let (idx, local) = self.locate(t);
+
+        let mut first_verts = self.vertices[..=idx].to_vec();
+        // If the split lands strictly inside a segment, the split point
+        // becomes the closing vertex of the first half and the opening
+        // vertex of the second half. If it lands exactly on a vertex,
+        // avoid duplicating it.
+        if local > consts::EPSILON {
+            first_verts.push(mid);
+        }
+        let mut second_verts = Vec::with_capacity(self.vertices.len() - idx);
+        if local < 1.0 - consts::EPSILON {
+            second_verts.push(mid);
+        }
+        for v in &self.vertices[idx + 1..] {
+            second_verts.push(*v);
+        }
+
+        // A 1-vertex tail can happen if the user splits exactly at the
+        // last vertex; pad it to keep the constructor invariant.
+        if first_verts.len() < 2 {
+            first_verts.push(mid);
+        }
+        if second_verts.len() < 2 {
+            second_verts.insert(0, mid);
+        }
+
+        let first = Polyline::new(first_verts)?;
+        let second = Polyline::new(second_verts)?;
+        Ok((Box::new(first), Box::new(second)))
+    }
+
+    fn subcurve(&self, t1: f64, t2: f64) -> MathResult<Box<dyn Curve>> {
+        let (a, b) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
+        let a = self.range.clamp(a);
+        let b = self.range.clamp(b);
+        let p_start = self.point_at(a)?;
+        let p_end = self.point_at(b)?;
+        let (a_idx, a_local) = self.locate(a);
+        let (b_idx, b_local) = self.locate(b);
+
+        let mut verts = Vec::new();
+        verts.push(p_start);
+        if a_idx == b_idx {
+            // Single-segment subcurve.
+        } else {
+            // Include every interior vertex between the two segments.
+            if a_local < 1.0 - consts::EPSILON {
+                verts.push(self.vertices[a_idx + 1]);
+            }
+            for i in (a_idx + 1)..b_idx {
+                verts.push(self.vertices[i + 1]);
+            }
+            if b_local > consts::EPSILON {
+                verts.push(p_end);
+            }
+        }
+        if verts.len() < 2 {
+            verts.push(p_end);
+        }
+        let sub = Polyline::new(verts)?;
+        Ok(Box::new(sub))
+    }
+
+    fn check_continuity(
+        &self,
+        other: &dyn Curve,
+        at_end: bool,
+        tolerance: Tolerance,
+    ) -> Continuity {
+        let my_t = if at_end { 1.0 } else { 0.0 };
+        let other_t = if at_end { 0.0 } else { 1.0 };
+
+        let my_point = match self.evaluate(my_t) {
+            Ok(p) => p,
+            Err(_) => return Continuity::Unknown,
+        };
+        let other_point = match other.evaluate(other_t) {
+            Ok(p) => p,
+            Err(_) => return Continuity::Unknown,
+        };
+
+        if my_point.position.distance(&other_point.position) > tolerance.distance() {
+            return Continuity::G0;
+        }
+
+        let my_tangent = match my_point.tangent() {
+            Ok(t) => t,
+            Err(_) => return Continuity::G0,
+        };
+        let other_tangent = match other_point.tangent() {
+            Ok(t) => t,
+            Err(_) => return Continuity::G0,
+        };
+        if (my_tangent - other_tangent).magnitude() > tolerance.chord_threshold() {
+            return Continuity::G0;
+        }
+        // Polylines have zero second-derivative within a segment, so
+        // curvature continuity depends entirely on the other curve.
+        if let Some(other_curvature) = other_point.curvature() {
+            if other_curvature.abs() > tolerance.distance() {
+                return Continuity::G1;
+            }
+        }
+        Continuity::G2
+    }
+
+    fn to_nurbs(&self) -> NurbsCurve {
+        // Degree-1 NURBS through every vertex. Knot vector for degree 1
+        // with N+1 control points uses N+3 knots:
+        // [0, 0, 1/N, 2/N, ..., (N-1)/N, 1, 1].
+        let n = self.segment_count();
+        let mut knots = Vec::with_capacity(n + 3);
+        knots.push(0.0);
+        knots.push(0.0);
+        for i in 1..n {
+            knots.push(i as f64 / n as f64);
+        }
+        knots.push(1.0);
+        knots.push(1.0);
+        NurbsCurve {
+            degree: 1,
+            control_points: self.vertices.clone(),
+            weights: vec![1.0; self.vertices.len()],
+            knots,
+            range: self.range,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        "Polyline"
+    }
+
+    fn bounding_box(&self) -> (Point3, Point3) {
+        let mut min = self.vertices[0];
+        let mut max = min;
+        for v in &self.vertices[1..] {
+            min.x = min.x.min(v.x);
+            min.y = min.y.min(v.y);
+            min.z = min.z.min(v.z);
+            max.x = max.x.max(v.x);
+            max.y = max.y.max(v.y);
+            max.z = max.z.max(v.z);
+        }
+        (min, max)
+    }
+
+    fn intersect_curve(&self, other: &dyn Curve, tolerance: Tolerance) -> Vec<CurveIntersection> {
+        // Per-segment intersection: build a transient Line for each
+        // segment and delegate to its `intersect_curve` (Line already
+        // handles Line/Arc analytically and falls back to sampling for
+        // anything else). Map the per-segment parameter back to the
+        // polyline's global parameter.
+        let n = self.segment_count();
+        let mut out = Vec::new();
+        for i in 0..n {
+            let seg = Line::new(self.vertices[i], self.vertices[i + 1]);
+            for hit in seg.intersect_curve(other, tolerance) {
+                let global_t = (i as f64 + hit.t1) / n as f64;
+                out.push(CurveIntersection {
+                    t1: global_t,
+                    t2: hit.t2,
+                    point: hit.point,
+                    intersection_type: hit.intersection_type,
+                });
+            }
+        }
+        out
+    }
+
+    fn intersect_plane(
+        &self,
+        plane: &crate::primitives::surface::Plane,
+        tolerance: Tolerance,
+    ) -> Vec<f64> {
+        let n = self.segment_count();
+        let mut out = Vec::new();
+        for i in 0..n {
+            let seg = Line::new(self.vertices[i], self.vertices[i + 1]);
+            for hit in seg.intersect_plane(plane, tolerance) {
+                out.push((i as f64 + hit) / n as f64);
+            }
+        }
+        out
+    }
+
+    fn project_point(&self, point: &Point3, tolerance: Tolerance) -> Vec<(f64, Point3)> {
+        match self.closest_point(point, tolerance) {
+            Ok(hit) => vec![hit],
+            Err(_) => vec![],
+        }
+    }
+
+    fn offset(&self, distance: f64, normal: &Vector3) -> MathResult<Box<dyn Curve>> {
+        // Offset each vertex by the in-plane perpendicular at that
+        // vertex. For an interior vertex the perpendicular is the
+        // average of the two adjacent segment perpendiculars, scaled
+        // so the offset matches `distance` (miter join).
+        let n = self.segment_count();
+        if n == 0 {
+            return Err(MathError::InvalidParameter(
+                "Cannot offset an empty polyline".to_string(),
+            ));
+        }
+        let mut perps: Vec<Vector3> = Vec::with_capacity(n);
+        for i in 0..n {
+            let dir = (self.vertices[i + 1] - self.vertices[i]).normalize()?;
+            perps.push(normal.cross(&dir).normalize()?);
+        }
+        let m = self.vertices.len();
+        let mut offset_verts = Vec::with_capacity(m);
+        for i in 0..m {
+            let perp = if i == 0 {
+                perps[0]
+            } else if i == m - 1 {
+                perps[n - 1]
+            } else {
+                // Miter: bisector of incoming and outgoing perpendiculars.
+                let sum = perps[i - 1] + perps[i];
+                match sum.normalize() {
+                    Ok(b) => {
+                        let cos_half = b.dot(&perps[i]);
+                        if cos_half.abs() < consts::EPSILON {
+                            perps[i]
+                        } else {
+                            b * (1.0 / cos_half)
+                        }
+                    }
+                    Err(_) => perps[i],
+                }
+            };
+            offset_verts.push(self.vertices[i] + perp * distance);
+        }
+        let offset = Polyline::new(offset_verts)?;
+        Ok(Box::new(offset))
+    }
+
+    fn clone_box(&self) -> Box<dyn Curve> {
+        Box::new(self.clone())
+    }
+}
+
 // #[cfg(test)]
 // mod tests {
 //     use super::*;

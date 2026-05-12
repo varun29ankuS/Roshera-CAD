@@ -694,6 +694,115 @@ fn materialise_circle(points: &[[f64; 2]], segments: u32) -> Result<Vec<[f64; 2]
     Ok(polygon)
 }
 
+/// Build the B-Rep edge chain for one closed loop of lifted (world-space)
+/// vertices, registering the underlying curves on `model`.
+///
+/// For `SketchTool::Polyline` shapes a **single** composite `Polyline`
+/// curve is registered for the whole loop (with the wrap-around vertex
+/// appended explicitly) and every per-segment edge references that one
+/// curve_id with its own sub-range `[i/N, (i+1)/N]`. The downstream
+/// `sample_edge_polyline` (websocket message handler) walks the
+/// curve's full parameter range when hover/pick traffic arrives, so
+/// any of the N edges yields the entire polyline outline as a single
+/// highlight rather than the one short segment that used to look
+/// identical to a tessellation triangle edge.
+///
+/// For other tools (rectangle, circle, …) each segment keeps its own
+/// distinct `Line` curve — those tools already produce edges that the
+/// frontend cannot mistake for triangle borders, and a composite
+/// curve would force a change to the constraint / dimensioning
+/// surfaces that consume them.
+///
+/// Per-segment edges (rather than one mega-edge per loop) are kept in
+/// both cases so corner vertices remain snappable for the constraint
+/// solver and the downstream extrusion still produces N partitioned
+/// side faces.
+pub(crate) fn build_loop_edges(
+    model: &mut BRepModel,
+    shape_idx: usize,
+    tool: SketchTool,
+    lifted: &[Point3],
+    tolerance: geometry_engine::math::Tolerance,
+) -> Result<Vec<geometry_engine::primitives::edge::EdgeId>, ApiError> {
+    use geometry_engine::primitives::curve::{Line, ParameterRange, Polyline};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+
+    let n = lifted.len();
+    if n < 2 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("shape[{shape_idx}] lifted polygon has {n} vertices (need ≥2)"),
+        ));
+    }
+
+    // Closed-loop polyline curve: include the wrap-around vertex
+    // explicitly so `Polyline::evaluate` covers the full outline.
+    let shared_curve_id = if tool == SketchTool::Polyline {
+        let mut verts = Vec::with_capacity(n + 1);
+        verts.extend_from_slice(lifted);
+        verts.push(lifted[0]);
+        let polyline = Polyline::new(verts).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("shape[{shape_idx}] polyline curve: {e:?}"),
+            )
+        })?;
+        Some(model.curves.add(Box::new(polyline)))
+    } else {
+        None
+    };
+
+    let mut edges = Vec::with_capacity(n);
+    let n_f = n as f64;
+    for i in 0..n {
+        let p_start = lifted[i];
+        let p_end = lifted[(i + 1) % n];
+        let v_start = model.vertices.add_or_find(
+            p_start.x,
+            p_start.y,
+            p_start.z,
+            tolerance.distance(),
+        );
+        let v_end = model.vertices.add_or_find(
+            p_end.x,
+            p_end.y,
+            p_end.z,
+            tolerance.distance(),
+        );
+        if v_start == v_end {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
+                     to the same vertex under tolerance {}",
+                    (i + 1) % n,
+                    tolerance.distance()
+                ),
+            ));
+        }
+        let (curve_id, param_range) = match shared_curve_id {
+            Some(cid) => (
+                cid,
+                ParameterRange::new(i as f64 / n_f, (i as f64 + 1.0) / n_f),
+            ),
+            None => {
+                let line = Line::new(p_start, p_end);
+                (model.curves.add(Box::new(line)), ParameterRange::new(0.0, 1.0))
+            }
+        };
+        let edge = Edge::new(
+            0,
+            v_start,
+            v_end,
+            curve_id,
+            EdgeOrientation::Forward,
+            param_range,
+        );
+        edges.push(model.edges.add(edge));
+    }
+    Ok(edges)
+}
+
 // ─── Region detection ───────────────────────────────────────────────
 //
 // Geometric outer/hole classification, SolidWorks-style: the user
@@ -1372,8 +1481,6 @@ pub async fn extrude_sketch(
     use geometry_engine::operations::extrude::{
         create_face_from_profile, extrude_face, ExtrudeOptions,
     };
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
     use geometry_engine::primitives::r#loop::{Loop, LoopType};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -1472,59 +1579,22 @@ pub async fn extrude_sketch(
         // boolean fold needed. Multi-region sketches (disjoint outers)
         // still Union at the end; Slice C makes that succeed for
         // coplanar disjoint inputs.
-        let mut build_loop_edges =
-            |model: &mut BRepModel,
-             shape_idx: usize,
-             lifted: &[Point3]|
-             -> Result<Vec<EdgeId>, ApiError> {
-                let mut edges = Vec::with_capacity(lifted.len());
-                for i in 0..lifted.len() {
-                    let p_start = lifted[i];
-                    let p_end = lifted[(i + 1) % lifted.len()];
-                    let v_start = model.vertices.add_or_find(
-                        p_start.x,
-                        p_start.y,
-                        p_start.z,
-                        tolerance.distance(),
-                    );
-                    let v_end = model.vertices.add_or_find(
-                        p_end.x,
-                        p_end.y,
-                        p_end.z,
-                        tolerance.distance(),
-                    );
-                    if v_start == v_end {
-                        return Err(ApiError::new(
-                            ErrorCode::InvalidParameter,
-                            format!(
-                                "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
-                                 to the same vertex under tolerance {}",
-                                (i + 1) % lifted.len(),
-                                tolerance.distance()
-                            ),
-                        ));
-                    }
-                    let line = Line::new(p_start, p_end);
-                    let curve_id = model.curves.add(Box::new(line));
-                    let edge = Edge::new(
-                        0,
-                        v_start,
-                        v_end,
-                        curve_id,
-                        EdgeOrientation::Forward,
-                        ParameterRange::new(0.0, 1.0),
-                    );
-                    edges.push(model.edges.add(edge));
-                }
-                Ok(edges)
-            };
-
+        //
+        // `build_loop_edges` (module-level) is the single source of
+        // truth for the per-segment edge / shared-Polyline-curve
+        // construction shared by extrude, extrude_cut, and revolve.
         let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
         for region in &regions {
             // Outer loop → planar face via the standard profile factory.
+            let outer_tool = shape_polygons[region.outer_shape_idx].1;
             let outer_lifted = &shape_polygons[region.outer_shape_idx].3;
-            let outer_edges =
-                build_loop_edges(&mut model, region.outer_shape_idx, outer_lifted)?;
+            let outer_edges = build_loop_edges(
+                &mut model,
+                region.outer_shape_idx,
+                outer_tool,
+                outer_lifted,
+                tolerance,
+            )?;
             let face_id = create_face_from_profile(&mut model, outer_edges)
                 .map_err(ApiError::kernel_error)?;
 
@@ -1533,8 +1603,15 @@ pub async fn extrude_sketch(
             // `create_fresh_extrusion` (Slice A) walks every inner loop
             // and builds matching side walls + top-cap hole topology.
             for &hole_idx in &region.hole_shape_idxs {
+                let hole_tool = shape_polygons[hole_idx].1;
                 let hole_lifted = &shape_polygons[hole_idx].3;
-                let hole_edges = build_loop_edges(&mut model, hole_idx, hole_lifted)?;
+                let hole_edges = build_loop_edges(
+                    &mut model,
+                    hole_idx,
+                    hole_tool,
+                    hole_lifted,
+                    tolerance,
+                )?;
                 let mut inner_loop = Loop::new(0, LoopType::Inner);
                 for edge_id in &hole_edges {
                     inner_loop.add_edge(*edge_id, true);
@@ -1738,8 +1815,6 @@ pub async fn extrude_cut_sketch(
         boolean_operation, BooleanOp, BooleanOptions,
     };
     use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -1823,49 +1898,11 @@ pub async fn extrude_cut_sketch(
         // one solid per shape, then fold outer-minus-holes per region,
         // then union regions.
         let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
-        for (shape_idx, (_shape_id, _tool, _polygon_2d, lifted)) in
+        for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in
             shape_polygons.iter().enumerate()
         {
-            let mut profile_edges = Vec::with_capacity(lifted.len());
-            for i in 0..lifted.len() {
-                let p_start = lifted[i];
-                let p_end = lifted[(i + 1) % lifted.len()];
-                let v_start = model.vertices.add_or_find(
-                    p_start.x,
-                    p_start.y,
-                    p_start.z,
-                    tolerance.distance(),
-                );
-                let v_end = model.vertices.add_or_find(
-                    p_end.x,
-                    p_end.y,
-                    p_end.z,
-                    tolerance.distance(),
-                );
-                if v_start == v_end {
-                    return Err(ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        format!(
-                            "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
-                             to the same vertex under tolerance {}",
-                            (i + 1) % lifted.len(),
-                            tolerance.distance()
-                        ),
-                    ));
-                }
-                let line = Line::new(p_start, p_end);
-                let curve_id = model.curves.add(Box::new(line));
-                let edge = Edge::new(
-                    0,
-                    v_start,
-                    v_end,
-                    curve_id,
-                    EdgeOrientation::Forward,
-                    ParameterRange::new(0.0, 1.0),
-                );
-                let edge_id = model.edges.add(edge);
-                profile_edges.push(edge_id);
-            }
+            let profile_edges =
+                build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
             let options = ExtrudeOptions {
                 direction,
                 distance: body.distance,
@@ -2022,8 +2059,6 @@ pub async fn revolve_sketch(
         boolean_operation, BooleanOp, BooleanOptions,
     };
     use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -2124,49 +2159,11 @@ pub async fn revolve_sketch(
         // shapes are revolved into hole solids and subtracted from
         // their outer in the region fold below.
         let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
-        for (shape_idx, (_shape_id, _tool, _polygon_2d, lifted)) in
+        for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in
             shape_polygons.iter().enumerate()
         {
-            let mut profile_edges = Vec::with_capacity(lifted.len());
-            for i in 0..lifted.len() {
-                let p_start = lifted[i];
-                let p_end = lifted[(i + 1) % lifted.len()];
-                let v_start = model.vertices.add_or_find(
-                    p_start.x,
-                    p_start.y,
-                    p_start.z,
-                    tolerance.distance(),
-                );
-                let v_end = model.vertices.add_or_find(
-                    p_end.x,
-                    p_end.y,
-                    p_end.z,
-                    tolerance.distance(),
-                );
-                if v_start == v_end {
-                    return Err(ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        format!(
-                            "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
-                             to the same vertex under tolerance {}",
-                            (i + 1) % lifted.len(),
-                            tolerance.distance()
-                        ),
-                    ));
-                }
-                let line = Line::new(p_start, p_end);
-                let curve_id = model.curves.add(Box::new(line));
-                let edge = Edge::new(
-                    0,
-                    v_start,
-                    v_end,
-                    curve_id,
-                    EdgeOrientation::Forward,
-                    ParameterRange::new(0.0, 1.0),
-                );
-                let edge_id = model.edges.add(edge);
-                profile_edges.push(edge_id);
-            }
+            let profile_edges =
+                build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
             let options = RevolveOptions {
                 axis_origin,
                 axis_direction,

@@ -200,6 +200,11 @@ fn create_top_face_shared(
         .ok_or_else(|| OperationError::InvalidGeometry("Surface not found".to_string()))?;
     let translated_surface =
         original_surface.transform(&Matrix4::from_translation(&(direction * distance)));
+    // Pick the orientation that lifts the (possibly winding-dependent)
+    // surface normal to +direction — the outward direction for the top
+    // cap. Computed before the surface is moved into the store so we
+    // don't need a second lookup.
+    let new_orientation = orientation_for_target(translated_surface.as_ref(), direction)?;
     let new_surface_id = model.surfaces.add(translated_surface);
 
     if base_loop.edges.len() != topology.top_edges.len() {
@@ -233,19 +238,48 @@ fn create_top_face_shared(
         inner_loop_ids.push(model.loops.add(inner_top_loop));
     }
 
-    // Top cap normal points opposite to the base face — its outward
-    // direction is along `direction`, while the base face's outward
-    // direction is `-direction`.
-    let new_orientation = match base_face.orientation {
-        FaceOrientation::Forward => FaceOrientation::Backward,
-        FaceOrientation::Backward => FaceOrientation::Forward,
-    };
     let mut face =
         Face::with_capacity(0, new_surface_id, outer_loop_id, new_orientation, inner_loop_ids.len());
     for loop_id in inner_loop_ids {
         face.add_inner_loop(loop_id);
     }
     Ok(model.faces.add(face))
+}
+
+/// Pick the `FaceOrientation` that aligns the face's oriented outward
+/// normal (`surface_normal × orientation.sign()`) with `target`.
+///
+/// Required because `create_face_from_profile` (and other profile-from-
+/// edges builders) always emit `FaceOrientation::Forward` while the
+/// underlying Newell's-method plane normal direction depends on the
+/// polygon's winding — CCW polygons get a `+Z` normal, CW polygons
+/// get `-Z`. Without this fix, the bottom cap of a CCW + +Z extrusion
+/// has its oriented normal pointing INTO the solid, which inverts the
+/// signed dihedral at every rim edge and makes fillet / chamfer
+/// remove material from the wrong side. The cylinder primitive avoids
+/// this by hand-building its caps with `Plane::from_point_normal(_,
+/// -axis)` / `+axis`; this helper is the same fix factored as a
+/// reusable post-build adjustment.
+///
+/// Sampled at the surface's parametric midpoint — sufficient for the
+/// planar caps this is currently called on. If the target and surface
+/// normal are exactly perpendicular at the sample point (oblique
+/// extrusion edge case) the helper prefers `Forward` deterministically.
+fn orientation_for_target(
+    surface: &dyn Surface,
+    target: Vector3,
+) -> OperationResult<FaceOrientation> {
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let u_mid = 0.5 * (u_min + u_max);
+    let v_mid = 0.5 * (v_min + v_max);
+    let n = surface
+        .normal_at(u_mid, v_mid)
+        .map_err(|e| OperationError::NumericalError(format!("Surface normal failed: {:?}", e)))?;
+    if n.dot(&target) >= 0.0 {
+        Ok(FaceOrientation::Forward)
+    } else {
+        Ok(FaceOrientation::Backward)
+    }
 }
 
 /// Find the solid that contains the given face
@@ -570,11 +604,32 @@ fn create_fresh_extrusion(
 
     let mut unified_faces: Vec<FaceId> = Vec::new();
 
-    // Bottom cap = the original base face, reversed so its outward normal
-    // points away from the extrusion direction. The base face already
-    // references its inner loops by value, so the bottom cap is multi-loop
+    // Bottom cap = the original base face, with its orientation set so
+    // the oriented outward normal points opposite to `direction` (i.e.
+    // away from the extrusion volume). `create_face_from_profile`
+    // always emits `FaceOrientation::Forward`, but Newell's-method
+    // plane normals follow the polygon winding — so the correct
+    // orientation depends on whether the base surface normal points
+    // along or against `direction`. The base face already references
+    // its inner loops by value, so the bottom cap is multi-loop
     // automatically without any extra work here.
     if cap_ends {
+        // Scope the immutable borrow on `model.surfaces` so the
+        // subsequent mutable borrow on `model.faces` is unambiguous to
+        // the borrow checker — even though the two stores are disjoint
+        // fields of `BRepModel`.
+        let correct_orientation = {
+            let base_surface = model
+                .surfaces
+                .get(base_face.surface_id)
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry("Base surface not found".to_string())
+                })?;
+            orientation_for_target(base_surface, -direction)?
+        };
+        if let Some(face_mut) = model.faces.get_mut(base_face_id) {
+            face_mut.orientation = correct_orientation;
+        }
         unified_faces.push(base_face_id);
     }
 

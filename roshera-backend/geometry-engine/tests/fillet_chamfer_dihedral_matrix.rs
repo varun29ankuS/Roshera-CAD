@@ -1149,3 +1149,219 @@ fn box_convex_edge_chamfer_still_removes_material_after_matrix_changes() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// 7. Extruded-prism RIM edges — pins the cap-face orientation bug.
+//
+// `create_face_from_profile` always emits `FaceOrientation::Forward`,
+// while Newell's-method plane normal direction depends on the polygon
+// winding. For a CCW polygon on +XY extruded +Z, that puts the bottom
+// cap's oriented normal at +Z (INTO the solid, not -Z outward) and
+// the top cap's at -Z (also INTO the solid). At a top/bottom RIM
+// edge — where one of the meeting faces is the cap — the signed
+// dihedral computed by `robust_face_angle` is inverted, so the convex
+// rim looks concave to the fillet/chamfer classifier and material is
+// added instead of removed. The vertical-edge matrix above does NOT
+// exercise this code path because both faces at a vertical edge are
+// side faces (built via `create_side_face_shared` with correct
+// outward normals). These tests do.
+//
+// The fix in `extrude.rs::create_top_face_shared` /
+// `create_fresh_extrusion` picks the cap orientation that aligns the
+// oriented normal with the outward direction (+direction for top,
+// -direction for bottom) instead of always-Forward.
+// ---------------------------------------------------------------------
+
+/// Find every edge whose endpoints both sit (within `1e-7`) at `z`.
+/// For an extrusion along +Z this picks out the bottom rim (`z = 0`)
+/// or top rim (`z = height`) horizontal edges.
+fn horizontal_edges_at_z(model: &BRepModel, z: f64) -> Vec<EdgeId> {
+    let mut result = Vec::new();
+    for (id, edge) in model.edges.iter() {
+        let s = match model.vertices.get(edge.start_vertex) {
+            Some(v) => v.position,
+            None => continue,
+        };
+        let e = match model.vertices.get(edge.end_vertex) {
+            Some(v) => v.position,
+            None => continue,
+        };
+        if (s[2] - z).abs() < 1e-7 && (e[2] - z).abs() < 1e-7 {
+            result.push(id);
+        }
+    }
+    result
+}
+
+#[test]
+fn fillet_on_top_rim_of_extruded_box_removes_material() {
+    // Extruded 4×4×3 box. Top rim is at z = 3. Every top-rim edge
+    // is convex (π/2 dihedral between top cap and a side face), so
+    // a fillet must REMOVE material. Before the cap-orientation fix
+    // the bottom and top caps' oriented normals pointed into the
+    // solid, the fillet classifier read those rims as concave, and
+    // material was added — the user-reported symptom.
+    let ring = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+    let height = 3.0;
+    let radius = 0.2;
+    let mut model = BRepModel::new();
+    let solid = extrude_polygon(&mut model, &ring, height);
+    let v0 = model
+        .calculate_solid_volume(solid)
+        .expect("baseline volume");
+    let rim_edges = horizontal_edges_at_z(&model, height);
+    assert!(
+        !rim_edges.is_empty(),
+        "extruded box must expose at least one horizontal top-rim edge"
+    );
+
+    let edge = rim_edges[0];
+    let r = fillet_edges(
+        &mut model,
+        solid,
+        vec![edge],
+        FilletOptions {
+            fillet_type: FilletType::Constant(radius),
+            radius,
+            propagation: FilletProp::None,
+            preserve_edges: true,
+            quality: FilletQuality::Standard,
+            ..Default::default()
+        },
+    );
+    match r {
+        Ok(_) => {
+            if let Err(msg) = validate_solid_ok(&model, solid) {
+                panic!("extruded box top-rim fillet produced invalid B-Rep: {msg}");
+            }
+            let vf = model
+                .calculate_solid_volume(solid)
+                .expect("post-fillet volume");
+            assert!(
+                vf < v0,
+                "extruded box top-rim fillet ADDED material \
+                 (v0={v0}, vf={vf}, Δ={}) — cap-orientation bug",
+                vf - v0,
+            );
+        }
+        // A typed error is acceptable until every rim configuration is
+        // supported, but the kernel must never succeed-and-corrupt
+        // (validated above) and the bug we're pinning manifests as a
+        // material-direction error on a successful call.
+        Err(e) => eprintln!(
+            "extruded box top-rim fillet errored (acceptable): {:?}",
+            e
+        ),
+    }
+}
+
+#[test]
+fn fillet_on_bottom_rim_of_extruded_box_removes_material() {
+    // Symmetric pin for the bottom cap: bottom rim is at z = 0 in our
+    // extrusion convention. Like the top rim, it's convex π/2 and a
+    // fillet must remove material.
+    let ring = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+    let height = 3.0;
+    let radius = 0.2;
+    let mut model = BRepModel::new();
+    let solid = extrude_polygon(&mut model, &ring, height);
+    let v0 = model
+        .calculate_solid_volume(solid)
+        .expect("baseline volume");
+    let rim_edges = horizontal_edges_at_z(&model, 0.0);
+    assert!(
+        !rim_edges.is_empty(),
+        "extruded box must expose at least one horizontal bottom-rim edge"
+    );
+
+    let edge = rim_edges[0];
+    let r = fillet_edges(
+        &mut model,
+        solid,
+        vec![edge],
+        FilletOptions {
+            fillet_type: FilletType::Constant(radius),
+            radius,
+            propagation: FilletProp::None,
+            preserve_edges: true,
+            quality: FilletQuality::Standard,
+            ..Default::default()
+        },
+    );
+    match r {
+        Ok(_) => {
+            if let Err(msg) = validate_solid_ok(&model, solid) {
+                panic!("extruded box bottom-rim fillet produced invalid B-Rep: {msg}");
+            }
+            let vf = model
+                .calculate_solid_volume(solid)
+                .expect("post-fillet volume");
+            assert!(
+                vf < v0,
+                "extruded box bottom-rim fillet ADDED material \
+                 (v0={v0}, vf={vf}, Δ={}) — cap-orientation bug",
+                vf - v0,
+            );
+        }
+        Err(e) => eprintln!(
+            "extruded box bottom-rim fillet errored (acceptable): {:?}",
+            e
+        ),
+    }
+}
+
+#[test]
+fn chamfer_on_top_rim_of_extruded_box_removes_material() {
+    // Chamfer counterpart of the fillet pin above. Chamfer's dihedral
+    // classification uses interior-angle = π − signed_dihedral; the
+    // same cap-orientation inversion flips its classifier too.
+    let ring = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+    let height = 3.0;
+    let distance = 0.2;
+    let mut model = BRepModel::new();
+    let solid = extrude_polygon(&mut model, &ring, height);
+    let v0 = model
+        .calculate_solid_volume(solid)
+        .expect("baseline volume");
+    let rim_edges = horizontal_edges_at_z(&model, height);
+    assert!(
+        !rim_edges.is_empty(),
+        "extruded box must expose at least one horizontal top-rim edge"
+    );
+
+    let edge = rim_edges[0];
+    let r = chamfer_edges(
+        &mut model,
+        solid,
+        vec![edge],
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(distance),
+            distance1: distance,
+            distance2: distance,
+            symmetric: true,
+            propagation: ChamferProp::None,
+            preserve_edges: false,
+            ..Default::default()
+        },
+    );
+    match r {
+        Ok(_) => {
+            if let Err(msg) = validate_solid_ok(&model, solid) {
+                panic!("extruded box top-rim chamfer produced invalid B-Rep: {msg}");
+            }
+            let vc = model
+                .calculate_solid_volume(solid)
+                .expect("post-chamfer volume");
+            assert!(
+                vc < v0,
+                "extruded box top-rim chamfer ADDED material \
+                 (v0={v0}, vc={vc}, Δ={}) — cap-orientation bug",
+                vc - v0,
+            );
+        }
+        Err(e) => eprintln!(
+            "extruded box top-rim chamfer errored (acceptable): {:?}",
+            e
+        ),
+    }
+}
