@@ -48,9 +48,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::sketch2d::{
-    Constraint, ConstraintId, ConstraintType, DimensionalConstraint, DimensionalUpdateError,
-    DofReport, DragTarget, EntityRef, Point2d, Point2dId, Sketch, SketchAnchor, SketchId,
-    SketchSolveError, SketchSolveReport, SolveOptions, SolverStatus,
+    infer_constraints, Constraint, ConstraintId, ConstraintType, DimensionalConstraint,
+    DimensionalUpdateError, DofReport, DraftEntity, DragTarget, EntityRef, InferenceTolerance,
+    Point2d, Point2dId, ProposedConstraint, Sketch, SketchAnchor, SketchId, SketchSolveError,
+    SketchSolveReport, SnapCandidate, SolveOptions, SolverStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -205,6 +206,27 @@ pub struct DragRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstraintIdResponse {
     pub id: Uuid,
+}
+
+/// Request body for `POST /api/csketch/{id}/snap`. The cursor is in
+/// the sketch's local 2D coordinate system; the radius is the maximum
+/// Euclidean distance to consider. A non-finite or negative radius
+/// produces an empty result (kernel-level invariant).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapRequest {
+    pub cursor: Point2d,
+    pub radius: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/infer-constraints`. The
+/// draft is the in-flight entity being drawn (a line being dragged,
+/// a circle being sized, a standalone point). `tolerance` is
+/// optional and defaults to [`InferenceTolerance::defaults`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InferConstraintsRequest {
+    pub draft: DraftEntity,
+    #[serde(default)]
+    pub tolerance: Option<InferenceTolerance>,
 }
 
 /// Request body for `PATCH /api/csketch/{id}/constraint/{cid}/value`.
@@ -836,6 +858,40 @@ pub async fn dof(
     Ok(Json(sketch.analyze_dofs()))
 }
 
+/// `POST /api/csketch/{id}/snap` — proximity candidates for cursor →
+/// entity snapping. Returns the ranked list from
+/// [`Sketch::find_snap_candidates`]; the head is the best snap and
+/// callers may also use [`Sketch::best_snap`] equivalently.
+///
+/// Read-only. Allocates one `Vec<SnapCandidate>`; cost is O(N) over
+/// the sketch's entities.
+pub async fn snap(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SnapRequest>,
+) -> Result<Json<Vec<SnapCandidate>>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    Ok(Json(sketch.find_snap_candidates(req.cursor, req.radius)))
+}
+
+/// `POST /api/csketch/{id}/infer-constraints` — propose
+/// `GeometricConstraint`s for an in-flight draft entity. Returns the
+/// proposals from [`infer_constraints`]; the frontend surfaces these
+/// as soft glyphs near the cursor and the auto-constrain layer (D-2)
+/// promotes accepted ones to real constraints on commit.
+///
+/// Read-only. Cost is O(N) snap walk + O(L) line walk for parallel/
+/// perpendicular checks where L = number of existing lines.
+pub async fn infer_constraints_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<InferConstraintsRequest>,
+) -> Result<Json<Vec<ProposedConstraint>>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    let tol = req.tolerance.unwrap_or_default();
+    Ok(Json(infer_constraints(&sketch, &req.draft, tol)))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Does the sketch contain the entity referenced by `entity_ref`?
@@ -1377,5 +1433,106 @@ mod tests {
             "distance should be ~10, got {d} (b at {:?})",
             resolved
         );
+    }
+
+    // ── D-1-c: snap + infer-constraints wire-shape tests ────────────
+
+    #[test]
+    fn snap_request_deserialises_from_canonical_json() {
+        let body = r#"{"cursor":{"x":1.5,"y":-2.0},"radius":5.0}"#;
+        let req: SnapRequest =
+            serde_json::from_str(body).expect("snap request must deserialise");
+        assert_eq!(req.cursor.x, 1.5);
+        assert_eq!(req.cursor.y, -2.0);
+        assert_eq!(req.radius, 5.0);
+    }
+
+    #[test]
+    fn infer_constraints_request_deserialises_line_draft_default_tolerance() {
+        let body = r#"{
+            "draft": {
+                "kind": "line",
+                "start": {"x": 0.0, "y": 0.0},
+                "end":   {"x": 10.0, "y": 0.1}
+            }
+        }"#;
+        let req: InferConstraintsRequest =
+            serde_json::from_str(body).expect("request must deserialise");
+        assert!(req.tolerance.is_none(), "default tolerance is None");
+        match req.draft {
+            DraftEntity::Line { start, end } => {
+                assert_eq!(start.x, 0.0);
+                assert_eq!(end.x, 10.0);
+            }
+            other => panic!("expected Line draft, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn infer_constraints_request_deserialises_circle_draft_with_tolerance() {
+        let body = r#"{
+            "draft": {
+                "kind": "circle",
+                "center": {"x": 5.0, "y": 5.0},
+                "radius": 3.0
+            },
+            "tolerance": {
+                "angle_tol": 0.0524,
+                "snap_radius": 10.0,
+                "equal_radius_tol": 0.25
+            }
+        }"#;
+        let req: InferConstraintsRequest =
+            serde_json::from_str(body).expect("request must deserialise");
+        let tol = req.tolerance.expect("explicit tolerance present");
+        assert!((tol.angle_tol - 0.0524).abs() < 1e-6);
+        assert_eq!(tol.snap_radius, 10.0);
+        assert_eq!(tol.equal_radius_tol, 0.25);
+    }
+
+    #[test]
+    fn infer_constraints_request_deserialises_point_draft() {
+        let body = r#"{
+            "draft": {"kind": "point", "position": {"x": 3.0, "y": 4.0}}
+        }"#;
+        let req: InferConstraintsRequest =
+            serde_json::from_str(body).expect("request must deserialise");
+        match req.draft {
+            DraftEntity::Point { position } => {
+                assert_eq!(position.x, 3.0);
+                assert_eq!(position.y, 4.0);
+            }
+            other => panic!("expected Point draft, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn snap_handler_path_returns_candidates_for_known_sketch() {
+        // Exercise the same code the handler calls — `require_sketch`
+        // plus `Sketch::find_snap_candidates` — without spinning up
+        // an Axum router.
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        sketch.add_point(Point2d::new(0.1, 0.0));
+
+        let cands = sketch.find_snap_candidates(Point2d::new(0.0, 0.0), 1.0);
+        assert_eq!(cands.len(), 1);
+    }
+
+    #[test]
+    fn infer_constraints_path_emits_horizontal_for_axis_aligned_line() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let draft = DraftEntity::Line {
+            start: Point2d::new(0.0, 0.0),
+            end: Point2d::new(10.0, 0.0),
+        };
+        let out = infer_constraints(&sketch, &draft, InferenceTolerance::defaults());
+        assert!(out.iter().any(|p| matches!(
+            p.constraint,
+            geometry_engine::sketch2d::GeometricConstraint::Horizontal
+        )));
     }
 }

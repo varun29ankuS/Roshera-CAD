@@ -5095,6 +5095,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/csketch/{id}/solve", post(csketch::solve))
         .route("/api/csketch/{id}/drag", post(csketch::drag))
         .route("/api/csketch/{id}/dof", get(csketch::dof))
+        .route("/api/csketch/{id}/snap", post(csketch::snap))
+        .route(
+            "/api/csketch/{id}/infer-constraints",
+            post(csketch::infer_constraints_handler),
+        )
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
         // operations exist and the exact parameter contract for each.
