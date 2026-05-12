@@ -33,13 +33,14 @@ import {
   type InferenceAxis,
 } from '@/stores/scene-store'
 import { buildProfile2D } from '@/lib/sketch-extrude'
-import type {
-  Constraint,
-  CSketchCircleSummary,
-  CSketchLineSummary,
-  CSketchPointSummary,
-  CSketchSummary,
-  EntityRef,
+import {
+  CSketchConstraintConflictError,
+  type Constraint,
+  type CSketchCircleSummary,
+  type CSketchLineSummary,
+  type CSketchPointSummary,
+  type CSketchSummary,
+  type EntityRef,
 } from '@/lib/csketch-api'
 
 const PLANE_SIZE = 400 // world units; large enough that the user
@@ -744,13 +745,14 @@ function CSketchDimensions({ plane }: { plane: SketchPlane }) {
     s.csketch.activeId ? s.csketch.summaries.get(s.csketch.activeId) ?? null : null,
   )
   const constraints = useSceneStore((s) => s.csketch.activeConstraints)
+  const updateValue = useSceneStore((s) => s.updateCSketchConstraintValue)
 
   const labels = useMemo(() => {
     if (!activeId || !summary) return []
     return buildCSketchDimensionLabels(summary, constraints, plane)
   }, [activeId, summary, constraints, plane])
 
-  if (labels.length === 0) return null
+  if (labels.length === 0 || !activeId) return null
 
   return (
     <group name="csketch-dimensions">
@@ -760,6 +762,27 @@ function CSketchDimensions({ plane }: { plane: SketchPlane }) {
           position={l.position}
           text={l.text}
           variant={l.variant}
+          value={l.displayValue}
+          onCommit={(next) => {
+            // For angle constraints the displayed unit is degrees but
+            // the kernel stores radians — round-trip through the
+            // angle's native unit on the wire.
+            const payload = l.variant === 'angle' ? (next * Math.PI) / 180 : next
+            updateValue(activeId, l.constraintId, payload).catch((err) => {
+              if (err instanceof CSketchConstraintConflictError) {
+                // Server already reverted to the pre-edit value; the
+                // refreshed summary will arrive via the conflict
+                // payload's revert. Surface to the console until
+                // slice H's diagnosis panel exists.
+                console.warn(
+                  `csketch constraint ${l.constraintId} conflict:`,
+                  err.conflict,
+                )
+              } else {
+                console.error('csketch constraint update failed:', err)
+              }
+            })
+          }}
         />
       ))}
     </group>
@@ -767,10 +790,22 @@ function CSketchDimensions({ plane }: { plane: SketchPlane }) {
 }
 
 interface CSketchDimensionLabel {
+  /** Stable React key; equals the constraint id. */
   key: string
+  /** Same as `key` but typed for the API call. */
+  constraintId: string
   position: THREE.Vector3
   text: string
   variant: 'length' | 'angle'
+  /**
+   * Numeric value shown to the user when the label enters edit mode.
+   * Length constraints carry the raw scalar (mm / model units);
+   * angle constraints carry **degrees** (the same unit the read-only
+   * text displays), so the input the user types matches what they
+   * see. The `onCommit` callback converts back to radians on the
+   * wire before hitting the API.
+   */
+  displayValue: number
 }
 
 /**
@@ -806,9 +841,11 @@ function buildCSketchDimensionLabels(
       if (!placement) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(placement, plane),
         text: fmtLen(d.Distance),
         variant: 'length',
+        displayValue: d.Distance,
       })
       continue
     }
@@ -817,9 +854,11 @@ function buildCSketchDimensionLabels(
       if (!uv) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(uv, plane),
         text: fmtLen(d.Length),
         variant: 'length',
+        displayValue: d.Length,
       })
       continue
     }
@@ -828,9 +867,11 @@ function buildCSketchDimensionLabels(
       if (!placement) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(placement, plane),
         text: `R ${fmtLen(d.Radius)}`,
         variant: 'length',
+        displayValue: d.Radius,
       })
       continue
     }
@@ -839,9 +880,11 @@ function buildCSketchDimensionLabels(
       if (!placement) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(placement, plane),
         text: `\u2300 ${fmtLen(d.Diameter)}`,
         variant: 'length',
+        displayValue: d.Diameter,
       })
       continue
     }
@@ -850,9 +893,14 @@ function buildCSketchDimensionLabels(
       if (!uv) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(uv, plane),
         text: fmtAngle(d.Angle),
         variant: 'angle',
+        // The kernel stores radians; the editor shows degrees so the
+        // input matches the visible text. `CSketchDimensions`
+        // converts back to radians before PATCH.
+        displayValue: (d.Angle * 180) / Math.PI,
       })
       continue
     }
@@ -861,9 +909,11 @@ function buildCSketchDimensionLabels(
       if (!uv) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(uv, plane),
         text: `x ${fmtLen(d.XCoordinate)}`,
         variant: 'length',
+        displayValue: d.XCoordinate,
       })
       continue
     }
@@ -872,9 +922,11 @@ function buildCSketchDimensionLabels(
       if (!uv) continue
       out.push({
         key: c.id,
+        constraintId: c.id,
         position: uvToWorld(uv, plane),
         text: `y ${fmtLen(d.YCoordinate)}`,
         variant: 'length',
+        displayValue: d.YCoordinate,
       })
       continue
     }
