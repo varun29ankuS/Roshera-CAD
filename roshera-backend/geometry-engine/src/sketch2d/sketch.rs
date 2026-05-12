@@ -16,7 +16,7 @@ use super::point2d::ParametricPoint2d;
 use super::polyline2d::ParametricPolyline2d;
 use super::rectangle2d::ParametricRectangle2d;
 use super::sketch_plane::PlaneOrientation;
-use super::spline2d::{BSpline2d, ParametricSpline2d};
+use super::spline2d::{BSpline2d, NurbsCurve2d, ParametricSpline2d};
 use super::{
     Arc2d, Arc2dId, Circle2d, Circle2dId, Constraint, ConstraintId, Ellipse2d, Ellipse2dId, Line2d,
     Line2dId, LineSegment2d, Point2d, Point2dId, Polyline2d, Polyline2dId, Rectangle2d,
@@ -491,6 +491,32 @@ impl Sketch {
     ) -> Sketch2dResult<Spline2dId> {
         let bspline = BSpline2d::new(degree, control_points, knots)?;
         let spline = Spline2d::BSpline(bspline);
+        let param_spline = ParametricSpline2d::new(spline);
+        let id = param_spline.id;
+
+        let (min, max) = param_spline.bounding_box();
+        self.update_spatial_index(EntityRef::Spline(id), min, max);
+
+        self.splines.insert(id, param_spline);
+
+        Ok(id)
+    }
+
+    /// Add a rational NURBS curve to the sketch. Mirrors
+    /// [`add_bspline`] for the rational variant — the constraint
+    /// solver dispatches on `Spline2d::is_rational()` and uses the
+    /// rational `closest_point` / `tangent` path on `NurbsCurve2d`,
+    /// so weights are preserved through every solve / write-back
+    /// round-trip.
+    pub fn add_nurbs(
+        &self,
+        degree: usize,
+        control_points: Vec<Point2d>,
+        weights: Vec<f64>,
+        knots: Vec<f64>,
+    ) -> Sketch2dResult<Spline2dId> {
+        let nurbs = NurbsCurve2d::new(degree, control_points, weights, knots)?;
+        let spline = Spline2d::Nurbs(nurbs);
         let param_spline = ParametricSpline2d::new(spline);
         let id = param_spline.id;
 

@@ -51,7 +51,7 @@ use geometry_engine::sketch2d::{
     infer_constraints, Constraint, ConstraintId, ConstraintType, DimensionalConstraint,
     DimensionalUpdateError, DofReport, DraftEntity, DragTarget, EntityRef, InferenceTolerance,
     Point2d, Point2dId, ProposedConstraint, Sketch, SketchAnchor, SketchId, SketchSolveError,
-    SketchSolveReport, SnapCandidate, SolveOptions, SolverStatus,
+    SketchSolveReport, SnapCandidate, SolveOptions, SolverStatus, Spline2d,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -138,6 +138,23 @@ pub struct CircleSummary {
     pub is_construction: bool,
 }
 
+/// Wire form of a `ParametricSpline2d`. The shape mirrors what the
+/// constraint solver pins as `SplineMetadata`: degree, knot vector,
+/// and (for rational NURBS) per-control-point weights. `weights` is
+/// `None` for a non-rational B-Spline so callers can dispatch the
+/// render path without re-inspecting the curve. Control points
+/// round-trip as flat `[x, y]` pairs because the kernel never
+/// promotes the third coordinate for 2D splines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplineSummary {
+    pub id: Uuid,
+    pub degree: usize,
+    pub control_points: Vec<[f64; 2]>,
+    pub knots: Vec<f64>,
+    pub weights: Option<Vec<f64>>,
+    pub is_construction: bool,
+}
+
 /// Snapshot of the whole sketch for the `GET /api/csketch/{id}` and
 /// initial-paint paths. Entities only — constraints are exposed via
 /// their own endpoint to keep this payload small for sketches with
@@ -148,6 +165,7 @@ pub struct CSketchSummary {
     pub points: Vec<PointSummary>,
     pub lines: Vec<LineSummary>,
     pub circles: Vec<CircleSummary>,
+    pub splines: Vec<SplineSummary>,
     pub constraint_count: usize,
 }
 
@@ -182,6 +200,29 @@ pub struct AddCircleRequest {
     pub cx: f64,
     pub cy: f64,
     pub radius: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/spline`. Adds either a
+/// non-rational B-Spline (`weights == None`) or a rational NURBS
+/// (`weights == Some(_)`) — the kernel dispatch on
+/// [`Spline2d::is_rational`] keeps both paths first-class through
+/// the solver and write-back.
+///
+/// `control_points` carries flat `[x, y]` pairs (the kernel never
+/// promotes the third coordinate for 2D splines). `knots` and
+/// `weights` validation lives in `BSpline2d::new` /
+/// `NurbsCurve2d::new`; this handler forwards their errors as 400s.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddSplineRequest {
+    pub degree: usize,
+    pub control_points: Vec<[f64; 2]>,
+    pub knots: Vec<f64>,
+    /// Per-control-point weights. Omitted (or `None`) selects the
+    /// non-rational B-Spline path. Present selects the rational
+    /// NURBS path — every weight must be strictly positive and the
+    /// length must equal `control_points.len()`.
+    #[serde(default)]
+    pub weights: Option<Vec<f64>>,
 }
 
 /// Request body for `POST /api/csketch/{id}/solve`. Optional —
@@ -429,11 +470,48 @@ fn summarise(sketch: &Sketch) -> CSketchSummary {
         .collect();
     circles.sort_by_key(|c| c.id);
 
+    let mut splines: Vec<SplineSummary> = sketch
+        .splines()
+        .iter()
+        .map(|e| {
+            let is_construction = e.value().is_construction;
+            let summary = match &e.value().spline {
+                Spline2d::BSpline(bs) => SplineSummary {
+                    id: e.key().0,
+                    degree: bs.degree,
+                    control_points: bs
+                        .control_points
+                        .iter()
+                        .map(|p| [p.x, p.y])
+                        .collect(),
+                    knots: bs.knots.clone(),
+                    weights: None,
+                    is_construction,
+                },
+                Spline2d::Nurbs(nurbs) => SplineSummary {
+                    id: e.key().0,
+                    degree: nurbs.degree,
+                    control_points: nurbs
+                        .control_points
+                        .iter()
+                        .map(|p| [p.x, p.y])
+                        .collect(),
+                    knots: nurbs.knots.clone(),
+                    weights: Some(nurbs.weights.clone()),
+                    is_construction,
+                },
+            };
+            summary
+        })
+        .collect();
+    splines.sort_by_key(|s| s.id);
+
     CSketchSummary {
         id: sketch.id.0,
         points,
         lines,
         circles,
+        splines,
         constraint_count: sketch.all_constraints().len(),
     }
 }
@@ -541,6 +619,67 @@ pub async fn add_circle(
         .add_circle(Point2d::new(req.cx, req.cy), req.radius)
         .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
     Ok(Json(EntityIdResponse { id: cid.0 }))
+}
+
+/// `POST /api/csketch/{id}/spline` — add a B-Spline (or rational
+/// NURBS when `weights` is supplied) to the sketch. The created
+/// spline participates in the constraint solver (PointOnCurve) and
+/// is surfaced in subsequent `CSketchSummary` payloads as a
+/// [`SplineSummary`].
+pub async fn add_spline(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddSplineRequest>,
+) -> Result<Json<EntityIdResponse>, ApiError> {
+    // Pre-validate finiteness so we fail fast with a clear message
+    // before reaching the kernel's structural checks (degree, knot
+    // count, monotonicity). Non-finite floats in the input are
+    // never a legitimate request shape; rejecting them early avoids
+    // surfacing a confusing "control_points value: NaN" error from
+    // deep inside the curve constructor.
+    for (i, p) in req.control_points.iter().enumerate() {
+        if !p[0].is_finite() || !p[1].is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("control_points[{}] must be finite", i),
+            ));
+        }
+    }
+    for (i, k) in req.knots.iter().enumerate() {
+        if !k.is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("knots[{}] must be finite", i),
+            ));
+        }
+    }
+    if let Some(weights) = &req.weights {
+        for (i, w) in weights.iter().enumerate() {
+            if !w.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("weights[{}] must be finite", i),
+                ));
+            }
+        }
+    }
+
+    let control_points: Vec<Point2d> = req
+        .control_points
+        .iter()
+        .map(|p| Point2d::new(p[0], p[1]))
+        .collect();
+
+    let sketch = require_sketch(&state, id)?;
+    let sid = match req.weights {
+        Some(weights) => sketch
+            .add_nurbs(req.degree, control_points, weights, req.knots)
+            .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?,
+        None => sketch
+            .add_bspline(req.degree, control_points, req.knots)
+            .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?,
+    };
+    Ok(Json(EntityIdResponse { id: sid.0 }))
 }
 
 /// `POST /api/csketch/{id}/constraint` — add a constraint.
