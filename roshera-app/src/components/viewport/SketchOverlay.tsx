@@ -46,6 +46,7 @@ import {
   type EntityRef,
   type SnapCandidate,
 } from '@/lib/csketch-api'
+import { applyInferredConstraints } from '@/lib/csketch-inference'
 
 const PLANE_SIZE = 400 // world units; large enough that the user
                        // cannot click off-plane in normal use.
@@ -382,6 +383,7 @@ export function SketchOverlay() {
   const addCSketchPoint = useSceneStore((s) => s.addCSketchPoint)
   const addCSketchLine = useSceneStore((s) => s.addCSketchLine)
   const addCSketchCircle = useSceneStore((s) => s.addCSketchCircle)
+  const addCSketchConstraint = useSceneStore((s) => s.addCSketchConstraint)
   // `pid` is set when the first click of a line gesture landed on
   // an existing csketch point (via D-2-c snap reuse). Carrying it
   // through to the second-click commit lets us skip the redundant
@@ -621,7 +623,25 @@ export function SketchOverlay() {
             // would just over-constrain the sketch. Treat the
             // click as a no-op in that case.
             if (reusePid !== null) return
-            void addCSketchPoint(id, { x: clickUv[0], y: clickUv[1] })
+            void (async () => {
+              const pid = await addCSketchPoint(id, {
+                x: clickUv[0],
+                y: clickUv[1],
+              })
+              // D-2-d: auto-apply inference proposals against the
+              // just-committed point. Coincident /
+              // PointOnCurve / Midpoint are the common picks; all
+              // arrive via `point_self`.
+              await applyInferredConstraints(
+                id,
+                {
+                  kind: 'point',
+                  position: { x: clickUv[0], y: clickUv[1] },
+                },
+                { point_self: pid },
+                addCSketchConstraint,
+              )
+            })()
             return
           }
           if (csketchActiveTool === 'line') {
@@ -658,7 +678,30 @@ export function SketchOverlay() {
                   y: clickUv[1],
                 }))
               if (p1 === p2) return
-              await addCSketchLine(id, { start: p1, end: p2 })
+              const lineId = await addCSketchLine(id, { start: p1, end: p2 })
+              // D-2-d: line inference covers Horizontal /
+              // Vertical (unary, `line_self`), Parallel /
+              // Perpendicular / Tangent (binary, `line_self`),
+              // plus Coincident proposals targeting either
+              // endpoint (`line_start` / `line_end`). The kernel
+              // dedupes against constraints already applied via
+              // snap-driven point reuse, so calling this even
+              // when both endpoints came from existing points
+              // (`first.pid` + `reusePid`) stays cheap.
+              await applyInferredConstraints(
+                id,
+                {
+                  kind: 'line',
+                  start: { x: first.uv[0], y: first.uv[1] },
+                  end: { x: clickUv[0], y: clickUv[1] },
+                },
+                {
+                  line_self: lineId,
+                  line_start: p1,
+                  line_end: p2,
+                },
+                addCSketchConstraint,
+              )
             })()
             return
           }
@@ -680,11 +723,28 @@ export function SketchOverlay() {
             // Below the kernel's positive-radius guard — silently
             // drop, the user will click again to restart.
             if (radius <= 1e-9) return
-            void addCSketchCircle(id, {
-              cx: first.uv[0],
-              cy: first.uv[1],
-              radius,
-            })
+            void (async () => {
+              const cid = await addCSketchCircle(id, {
+                cx: first.uv[0],
+                cy: first.uv[1],
+                radius,
+              })
+              // D-2-d: circle inference primarily surfaces
+              // Concentric / Equal proposals against existing
+              // circles, both arriving via `circle_self`.
+              // `circle_center` proposals are dropped inside the
+              // helper — see csketch-inference.ts module doc.
+              await applyInferredConstraints(
+                id,
+                {
+                  kind: 'circle',
+                  center: { x: first.uv[0], y: first.uv[1] },
+                  radius,
+                },
+                { circle_self: cid },
+                addCSketchConstraint,
+              )
+            })()
             return
           }
         }
@@ -755,6 +815,7 @@ export function SketchOverlay() {
       addCSketchPoint,
       addCSketchLine,
       addCSketchCircle,
+      addCSketchConstraint,
     ],
   )
 
