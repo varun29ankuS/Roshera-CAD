@@ -14,13 +14,11 @@
 //! # Coverage
 //!
 //! [`solve`] translates the sketch's points, lines, circles, arcs,
-//! and rectangles into solver `EntityState`s, runs the existing
-//! solver, and writes the result back onto the parametric entities.
-//! These five kinds are the ones the solver exposes public
-//! `EntityState` constructors for (`EntityState::point`, `::line`,
-//! `::circle`, `::arc`, `::rectangle`); ellipses, splines, and
-//! polylines pass through unsolved (slices C-3 through C-5 lift the
-//! remaining kinds).
+//! rectangles, ellipses, and splines (both non-rational B-Spline
+//! and rational NURBS) into solver `EntityState`s, runs the
+//! existing solver, and writes the result back onto the parametric
+//! entities. Polylines pass through unsolved (slice C-5 lifts the
+//! remaining kind).
 //!
 //! For arcs the bridge solves the 5-parameter state
 //! `[center.x, center.y, radius, start_angle, end_angle]`. The `ccw`
@@ -61,6 +59,7 @@ use super::line2d::{LineGeometry, ParametricLine2d};
 use super::point2d::ParametricPoint2d;
 use super::rectangle2d::{ParametricRectangle2d, Rectangle2d};
 use super::sketch::Sketch;
+use super::spline2d::{BSpline2d, NurbsCurve2d, ParametricSpline2d, Spline2d};
 use super::{Circle2d, Line2d, LineSegment2d, Point2d, Ray2d, Vector2d};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -69,8 +68,8 @@ use thiserror::Error;
 /// have a public `EntityState` constructor for its kind.
 ///
 /// Surfaced in [`SketchSolveReport::entities_skipped`] so the UI can
-/// highlight specifically which arcs / splines / rectangles will
-/// remain unsolved until the relevant slice (C for arcs/splines) lands.
+/// highlight specifically which polylines will remain unsolved until
+/// slice C-5 lands.
 /// Reporting the [`EntityRef`] (not just a count) lets downstream
 /// callers cross-reference against the sketch's entity stores.
 pub type SkippedEntity = EntityRef;
@@ -233,8 +232,8 @@ pub struct SketchSolveReport {
     pub constraints_solved: usize,
     /// Entity references the bridge could not address through the
     /// public `EntityState` constructors and therefore excluded from
-    /// the solve. As of slice C-3 the remaining unsupported kinds
-    /// are splines and polylines (slices C-4 and C-5).
+    /// the solve. As of slice C-4 the remaining unsupported kind is
+    /// polylines (slice C-5).
     /// Reporting the [`EntityRef`] (not just a count) lets the UI
     /// highlight exactly which entities went unsolved.
     pub entities_skipped: Vec<SkippedEntity>,
@@ -314,7 +313,7 @@ impl SketchSolveReport {
 
     /// Count of entities the bridge could not register with the
     /// solver because their kind has no public `EntityState`
-    /// constructor yet (spline / polyline).
+    /// constructor yet (polyline).
     /// Equivalent to `entities_skipped.len()`.
     pub fn skipped_count(&self) -> usize {
         self.entities_skipped.len()
@@ -367,8 +366,11 @@ pub struct DofReport {
     /// Arcs contribute 5 (cx, cy, r, start_angle, end_angle).
     /// Rectangles contribute 5 (cx, cy, width, height, rotation).
     /// Ellipses contribute 5 (cx, cy, semi_major, semi_minor, rotation).
-    /// Entities listed in `entities_skipped` contribute 0 — slices
-    /// C-4 and C-5 lift this for splines and polylines.
+    /// Splines (B-Spline and NURBS) contribute 2n where n is the
+    /// control-point count — knots and weights are pinned as
+    /// structural metadata, so only CP coordinates are free DOFs.
+    /// Entities listed in `entities_skipped` contribute 0 — slice
+    /// C-5 lifts this for polylines.
     pub total_free_dofs: usize,
     /// Sum of `degrees_of_freedom_removed()` across constraints
     /// whose entire entity set is supported by the current bridge
@@ -388,8 +390,8 @@ pub struct DofReport {
     /// Count of constraints excluded from the DOF accounting because
     /// at least one referenced entity is in `entities_skipped`.
     /// Non-zero values tell the UI the verdict is over a partial
-    /// view of the sketch — slice C lifts this by adding solver
-    /// support for ellipses / splines / polylines.
+    /// view of the sketch — slice C-5 lifts the remaining gap for
+    /// polylines.
     pub constraints_skipped: usize,
     /// Entities that cannot contribute DOFs in slice B-2 — same
     /// list semantics as [`SketchSolveReport::entities_skipped`].
@@ -930,13 +932,44 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         registered += 1;
     }
 
+    for entry in sketch.splines().iter() {
+        let id = *entry.key();
+        let spline: &ParametricSpline2d = entry.value();
+        // Spline registration (slice C-4-b). The solver's parameter
+        // pack is 2n entries regardless of rationality — weights and
+        // knots are pinned in `SplineMetadata`, so the solver only
+        // moves control-point coordinates. NURBS uses the rational
+        // dispatch path (`NurbsCurve2d::closest_point` + `tangent`);
+        // B-Spline uses the non-rational path. Per-CP fix flags are
+        // not yet exposed; every CP starts free and can be pinned by
+        // explicit Coincident-to-fixed-point constraints downstream.
+        let state = match &spline.spline {
+            Spline2d::BSpline(bs) => EntityState::spline_bspline(
+                bs.degree,
+                bs.control_points.clone(),
+                bs.knots.clone(),
+                false,
+            ),
+            Spline2d::Nurbs(nurbs) => EntityState::spline_nurbs(
+                nurbs.degree,
+                nurbs.control_points.clone(),
+                nurbs.weights.clone(),
+                nurbs.knots.clone(),
+                false,
+            ),
+        };
+        solver.add_entity(EntityRef::Spline(id), state);
+        registered += 1;
+    }
+
     registered
 }
 
 /// Collect `EntityRef`s for entities whose kinds are unsupported by
-/// the current bridge (splines / polylines).
+/// the current bridge — polylines (slice C-5).
 /// Arcs are supported as of slice C-1; rectangles as of slice C-2;
-/// ellipses as of slice C-3 — none of them appears here. The
+/// ellipses as of slice C-3; splines (both B-Spline and rational
+/// NURBS) as of slice C-4 — none of those appears here. The
 /// returned vector is in DashMap iteration order; callers that need
 /// a stable order should sort after collection.
 ///
@@ -945,9 +978,6 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
 /// slices add `EntityState` constructors for their kinds.
 fn collect_unsupported(sketch: &Sketch) -> Vec<EntityRef> {
     let mut skipped: Vec<EntityRef> = Vec::new();
-    for entry in sketch.splines().iter() {
-        skipped.push(EntityRef::Spline(*entry.key()));
-    }
     for entry in sketch.polylines().iter() {
         skipped.push(EntityRef::Polyline(*entry.key()));
     }
@@ -979,7 +1009,7 @@ fn line_to_point_direction(geometry: &LineGeometry) -> (Point2d, Vector2d) {
 /// Entity IDs are preserved; only the geometric fields are updated.
 /// For arcs the `ccw` orientation bit is preserved as well — the
 /// solver does not own it. Updates for kinds the bridge did not
-/// register (rectangle/ellipse/spline/polyline) cannot appear here
+/// register (polyline) cannot appear here
 /// because we never called `add_entity` for them; defensive matches
 /// are still in place to avoid panics if the solver ever starts
 /// returning them.
@@ -1040,6 +1070,62 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
                         Rectangle2d::new_rotated(*center, *width, *height, *rotation)
                     {
                         entry.value_mut().rectangle = updated;
+                    }
+                }
+            }
+            (EntityRef::Spline(id), EntityUpdate::Parameters(params)) => {
+                if let Some(mut entry) = sketch.splines().get_mut(id) {
+                    // Solver returns a flat `[x0, y0, x1, y1, …]`
+                    // pack — same layout the registration loop
+                    // packed control points into. Degree, knots, and
+                    // (for NURBS) weights are pinned in
+                    // `SplineMetadata` on the solver side, so they
+                    // are preserved here by reading them from the
+                    // prior geometry rather than the update payload.
+                    //
+                    // A parameter-count mismatch (e.g. the solver
+                    // returning fewer/more floats than the current
+                    // CP count) or a curve-validation failure on
+                    // reconstruction leaves the prior geometry
+                    // intact — same "preserve identity, never poison
+                    // the store" convention used for rectangle /
+                    // ellipse write-back.
+                    if params.len() % 2 != 0 {
+                        continue;
+                    }
+                    let expected_cps = params.len() / 2;
+                    let mut new_ctrl = Vec::with_capacity(expected_cps);
+                    for i in 0..expected_cps {
+                        let base = i * 2;
+                        new_ctrl.push(Point2d::new(params[base], params[base + 1]));
+                    }
+                    let updated = match &entry.value().spline {
+                        Spline2d::BSpline(bs) => {
+                            if new_ctrl.len() != bs.control_points.len() {
+                                None
+                            } else {
+                                BSpline2d::new(bs.degree, new_ctrl, bs.knots.clone())
+                                    .ok()
+                                    .map(Spline2d::BSpline)
+                            }
+                        }
+                        Spline2d::Nurbs(nurbs) => {
+                            if new_ctrl.len() != nurbs.control_points.len() {
+                                None
+                            } else {
+                                NurbsCurve2d::new(
+                                    nurbs.degree,
+                                    new_ctrl,
+                                    nurbs.weights.clone(),
+                                    nurbs.knots.clone(),
+                                )
+                                .ok()
+                                .map(Spline2d::Nurbs)
+                            }
+                        }
+                    };
+                    if let Some(s) = updated {
+                        entry.value_mut().spline = s;
                     }
                 }
             }
@@ -2432,5 +2518,89 @@ mod tests {
             sketch.points().contains_key(&p),
             "drag must preserve entity id"
         );
+    }
+
+    // ── C-4-b: spline registration + write-back ────────────────────
+
+    /// Build the clamped-uniform B-spline used by the spline bridge
+    /// tests: degree-2, four control points at (0,0), (1,2), (2,0),
+    /// (3,2), open-uniform knot vector `[0,0,0,0.5,1,1,1]`. Mirrors
+    /// the `sample_bspline_state` helper in `constraint_solver.rs`
+    /// so the bridge-level tests exercise the same curve shape as
+    /// the unit-level `point_on_bspline_*` tests.
+    fn sample_bspline_inputs() -> (usize, Vec<Point2d>, Vec<f64>) {
+        let control_points = vec![
+            Point2d::new(0.0, 0.0),
+            Point2d::new(1.0, 2.0),
+            Point2d::new(2.0, 0.0),
+            Point2d::new(3.0, 2.0),
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0];
+        (2, control_points, knots)
+    }
+
+    #[test]
+    fn bspline_registers_into_solver_not_skipped() {
+        // C-4-b promotes splines from `entities_skipped` to
+        // `entities_solved`. Empty constraint set → solve trivially
+        // converges; the only assertion is that the spline made it
+        // through the bridge.
+        let sketch = fresh_sketch();
+        let (degree, ctrl, knots) = sample_bspline_inputs();
+        sketch
+            .add_bspline(degree, ctrl, knots)
+            .expect("add_bspline");
+        let report = solve(&sketch).expect("solve");
+        assert_eq!(report.entities_solved, 1);
+        assert_eq!(report.skipped_count(), 0);
+        assert!(report.entities_skipped.is_empty());
+    }
+
+    #[test]
+    fn bspline_contributes_two_dofs_per_control_point() {
+        // 4 CPs × 2 free coords = 8 DOFs (knots are pinned in
+        // `SplineMetadata`, so only control-point coordinates move).
+        // Matches `ParametricSpline2d::degrees_of_freedom` for the
+        // non-rational case.
+        let sketch = fresh_sketch();
+        let (degree, ctrl, knots) = sample_bspline_inputs();
+        sketch
+            .add_bspline(degree, ctrl, knots)
+            .expect("add_bspline");
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 8);
+        assert_eq!(report.entities_analysed, 1);
+        assert!(report.entities_skipped.is_empty());
+    }
+
+    #[test]
+    fn bspline_writeback_preserves_id_and_structural_metadata() {
+        // Solve a sketch carrying just a B-spline (no constraints
+        // means no parameter pull — but the write-back path still
+        // runs on every solve via `apply_solver_result`). After the
+        // solve, the spline id, degree, and knot vector must be
+        // untouched; only control-point coordinates are permitted
+        // to change, and even those should be at numerical-noise
+        // distance from the originals when no constraint pulls on
+        // them.
+        let sketch = fresh_sketch();
+        let (degree, ctrl, knots) = sample_bspline_inputs();
+        let id = sketch
+            .add_bspline(degree, ctrl.clone(), knots.clone())
+            .expect("add_bspline");
+        let _ = solve(&sketch).expect("solve");
+        let entry = sketch.splines().get(&id).expect("spline survives id");
+        match &entry.value().spline {
+            Spline2d::BSpline(bs) => {
+                assert_eq!(bs.degree, degree);
+                assert_eq!(bs.knots, knots);
+                assert_eq!(bs.control_points.len(), ctrl.len());
+                for (got, want) in bs.control_points.iter().zip(ctrl.iter()) {
+                    assert!((got.x - want.x).abs() < 1e-9);
+                    assert!((got.y - want.y).abs() < 1e-9);
+                }
+            }
+            Spline2d::Nurbs(_) => panic!("BSpline must round-trip as BSpline"),
+        }
     }
 }
