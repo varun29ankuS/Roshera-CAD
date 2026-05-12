@@ -13,13 +13,14 @@
 //!
 //! # Coverage
 //!
-//! [`solve`] translates the sketch's points, lines, circles, and arcs
-//! into solver `EntityState`s, runs the existing solver, and writes
-//! the result back onto the parametric entities. These four kinds are
-//! the ones the solver exposes public `EntityState` constructors for
-//! (`EntityState::point`, `::line`, `::circle`, `::arc`); rectangles,
-//! ellipses, splines, and polylines pass through unsolved (slices C-2
-//! through C-5 lift the remaining kinds).
+//! [`solve`] translates the sketch's points, lines, circles, arcs,
+//! and rectangles into solver `EntityState`s, runs the existing
+//! solver, and writes the result back onto the parametric entities.
+//! These five kinds are the ones the solver exposes public
+//! `EntityState` constructors for (`EntityState::point`, `::line`,
+//! `::circle`, `::arc`, `::rectangle`); ellipses, splines, and
+//! polylines pass through unsolved (slices C-3 through C-5 lift the
+//! remaining kinds).
 //!
 //! For arcs the bridge solves the 5-parameter state
 //! `[center.x, center.y, radius, start_angle, end_angle]`. The `ccw`
@@ -57,6 +58,7 @@ use super::constraint_solver::{
 use super::constraints::{ConstraintId, EntityRef};
 use super::line2d::{LineGeometry, ParametricLine2d};
 use super::point2d::ParametricPoint2d;
+use super::rectangle2d::{ParametricRectangle2d, Rectangle2d};
 use super::sketch::Sketch;
 use super::{Circle2d, Line2d, LineSegment2d, Point2d, Ray2d, Vector2d};
 use serde::{Deserialize, Serialize};
@@ -221,7 +223,8 @@ pub struct SketchSolveReport {
     /// Wall-clock cost of the solve, in milliseconds.
     pub solve_time_ms: f64,
     /// Number of entities the bridge registered with the solver
-    /// before invoking it (= points + lines + circles + arcs).
+    /// before invoking it (= points + lines + circles + arcs +
+    /// rectangles).
     pub entities_solved: usize,
     /// Number of constraints registered with the solver. Includes
     /// constraints whose entity kind is unsupported in v1 (they are
@@ -229,10 +232,10 @@ pub struct SketchSolveReport {
     pub constraints_solved: usize,
     /// Entity references the bridge could not address through the
     /// public `EntityState` constructors and therefore excluded from
-    /// the solve. As of slice C-1 the only unsupported kinds are
-    /// rectangles, ellipses, splines, and polylines (slices C-2
-    /// through C-5). Reporting the [`EntityRef`] (not just a count)
-    /// lets the UI highlight exactly which entities went unsolved.
+    /// the solve. As of slice C-2 the remaining unsupported kinds are
+    /// ellipses, splines, and polylines (slices C-3 through C-5).
+    /// Reporting the [`EntityRef`] (not just a count) lets the UI
+    /// highlight exactly which entities went unsolved.
     pub entities_skipped: Vec<SkippedEntity>,
 }
 
@@ -383,7 +386,7 @@ pub struct DofReport {
     /// at least one referenced entity is in `entities_skipped`.
     /// Non-zero values tell the UI the verdict is over a partial
     /// view of the sketch — slice C lifts this by adding solver
-    /// support for arcs / splines / rectangles.
+    /// support for ellipses / splines / polylines.
     pub constraints_skipped: usize,
     /// Entities that cannot contribute DOFs in slice B-2 — same
     /// list semantics as [`SketchSolveReport::entities_skipped`].
@@ -565,6 +568,15 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // `EntityState::arc` parameter layout. `ccw` is not a solver
     // DOF — orientation is a discrete bit.
     for _entry in sketch.arcs().iter() {
+        entities_analysed += 1;
+        total_free_dofs += 5;
+    }
+    // Rectangles: 5 DOFs (cx, cy, width, height, rotation). Matches
+    // the solver-side `EntityState::rectangle` parameter layout
+    // introduced in slice C-2. `ParametricRectangle2d` carries no
+    // per-DOF fix flag today; the four corners are derived from
+    // (center, width, height, rotation) on every read.
+    for _entry in sketch.rectangles().iter() {
         entities_analysed += 1;
         total_free_dofs += 5;
     }
@@ -849,23 +861,44 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         registered += 1;
     }
 
+    for entry in sketch.rectangles().iter() {
+        let id = *entry.key();
+        let rect: &ParametricRectangle2d = entry.value();
+        // Rectangles have no per-DOF fix flags on the parametric
+        // wrapper (only `is_construction`), matching the line / circle
+        // / arc convention. All five DOFs (center.x, center.y, width,
+        // height, rotation) start free; explicit dimensional or
+        // positional constraints can pin them downstream.
+        solver.add_entity(
+            EntityRef::Rectangle(id),
+            EntityState::rectangle(
+                rect.rectangle.center,
+                rect.rectangle.width,
+                rect.rectangle.height,
+                rect.rectangle.rotation,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        registered += 1;
+    }
+
     registered
 }
 
 /// Collect `EntityRef`s for entities whose kinds are unsupported by
-/// the current bridge (rectangles / ellipses / splines / polylines).
-/// Arcs are supported as of slice C-1 and no longer appear here.
-/// The returned vector is in DashMap iteration order; callers that
-/// need a stable order should sort after collection.
+/// the current bridge (ellipses / splines / polylines).
+/// Arcs are supported as of slice C-1; rectangles as of slice C-2 —
+/// neither appears here. The returned vector is in DashMap iteration
+/// order; callers that need a stable order should sort after collection.
 ///
 /// Returning the IDs (not just a count) lets the UI highlight
 /// specifically which entities will remain unsolved until later
 /// slices add `EntityState` constructors for their kinds.
 fn collect_unsupported(sketch: &Sketch) -> Vec<EntityRef> {
     let mut skipped: Vec<EntityRef> = Vec::new();
-    for entry in sketch.rectangles().iter() {
-        skipped.push(EntityRef::Rectangle(*entry.key()));
-    }
     for entry in sketch.ellipses().iter() {
         skipped.push(EntityRef::Ellipse(*entry.key()));
     }
@@ -943,6 +976,28 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
                     arc.radius = *radius;
                     arc.start_angle = *start_angle;
                     arc.end_angle = *end_angle;
+                }
+            }
+            (
+                EntityRef::Rectangle(id),
+                EntityUpdate::Rectangle(center, width, height, rotation),
+            ) => {
+                if let Some(mut entry) = sketch.rectangles().get_mut(id) {
+                    // Use `Rectangle2d::new_rotated` rather than
+                    // mutating the struct in place so the
+                    // width > tolerance / height > tolerance
+                    // invariants live in one place. If the solver
+                    // pushes the dimensions through zero (which would
+                    // happen on a wildly under-constrained sketch),
+                    // the constructor returns Err and we leave the
+                    // prior geometry intact — better UX than a
+                    // panic and aligns with the "preserve identity,
+                    // never poison the store" convention.
+                    if let Ok(updated) =
+                        Rectangle2d::new_rotated(*center, *width, *height, *rotation)
+                    {
+                        entry.value_mut().rectangle = updated;
+                    }
                 }
             }
             // The remaining entity kinds are not registered by
@@ -1117,15 +1172,22 @@ mod tests {
         sketch
             .add_circle(Point2d::new(1.0, 1.0), 0.5)
             .expect("c");
-        let rect_id = sketch
+        sketch
             .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(2.0, 1.0))
             .expect("rect");
+        let ellipse_id = sketch
+            .add_ellipse(Point2d::new(3.0, 3.0), 2.0, 1.0, 0.0)
+            .expect("ellipse");
 
         let report = solve(&sketch).expect("solve");
-        // 1 point + 1 circle = 2 supported; rectangle skipped.
-        assert_eq!(report.entities_solved, 2);
+        // 1 point + 1 circle + 1 rectangle = 3 supported; ellipse
+        // skipped (slice C-3 will land it).
+        assert_eq!(report.entities_solved, 3);
         assert_eq!(report.skipped_count(), 1);
-        assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
+        assert_eq!(
+            report.entities_skipped,
+            vec![EntityRef::Ellipse(ellipse_id)]
+        );
     }
 
     // ── Write-back correctness ─────────────────────────────────────
@@ -1301,6 +1363,175 @@ mod tests {
         let report = solve(&sketch).expect("solve");
         assert_eq!(report.entities_solved, 2);
         assert_eq!(report.entities_skipped, vec![EntityRef::Ellipse(ellipse_id)]);
+    }
+
+    // ── C-2: rectangle bridge ──────────────────────────────────────
+
+    #[test]
+    fn rectangle_geometry_round_trips_unchanged_with_no_constraints() {
+        // Slice C-2: rectangles are first-class solver entities.
+        // With no constraints the bridge must register the rectangle,
+        // run the solver (which converges trivially), and write back
+        // the identical parameters — preserving id, center, width,
+        // height, and rotation.
+        let sketch = fresh_sketch();
+        let id = sketch
+            .add_rectangle_rotated(
+                Point2d::new(2.0, -1.0),
+                3.0,
+                1.5,
+                std::f64::consts::PI / 6.0,
+            )
+            .expect("rect");
+
+        let report = solve(&sketch).expect("solve");
+        assert!(
+            !report
+                .entities_skipped
+                .iter()
+                .any(|e| matches!(e, EntityRef::Rectangle(_))),
+            "rectangle must not appear in entities_skipped: {:?}",
+            report.entities_skipped,
+        );
+        assert_eq!(report.entities_solved, 1);
+
+        let entry = sketch.rectangles().get(&id).expect("rect survives");
+        let r = &entry.value().rectangle;
+        assert!((r.center.x - 2.0).abs() < 1e-10);
+        assert!((r.center.y - (-1.0)).abs() < 1e-10);
+        assert!((r.width - 3.0).abs() < 1e-10);
+        assert!((r.height - 1.5).abs() < 1e-10);
+        assert!((r.rotation - std::f64::consts::PI / 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rectangle_contributes_five_dofs_to_analysis() {
+        // EntityState::rectangle parameter layout:
+        // [center.x, center.y, width, height, rotation] → 5 DOFs.
+        let sketch = fresh_sketch();
+        sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(2.0, 1.0))
+            .expect("rect");
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 5);
+        assert_eq!(report.entities_analysed, 1);
+        assert!(report.entities_skipped.is_empty());
+    }
+
+    #[test]
+    fn rectangle_center_pinned_by_x_and_y_coordinate_dimensions() {
+        // Drive the rectangle's center to (3, -2) using a pair of
+        // dimensional constraints. EntityState::rectangle places
+        // center at params[0..2] so the solver's generic
+        // `get_point_position` path applies without dispatch
+        // changes.
+        let sketch = fresh_sketch();
+        let id = sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
+            .expect("rect");
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Rectangle(id)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(-2.0),
+            vec![EntityRef::Rectangle(id)],
+            ConstraintPriority::Required,
+        ));
+
+        let report = solve(&sketch).expect("solve");
+        assert!(report.converged(), "status was {:?}", report.status);
+
+        let entry = sketch.rectangles().get(&id).expect("rect");
+        let r = &entry.value().rectangle;
+        assert!((r.center.x - 3.0).abs() < 1e-8);
+        assert!((r.center.y - (-2.0)).abs() < 1e-8);
+    }
+
+    #[test]
+    fn coincident_constraint_aligns_two_rectangle_centers() {
+        // Pin one rectangle's center to (0, 0) via dimensional
+        // constraints, then constrain a second rectangle to be
+        // coincident with it. The bridge's `get_point_position`
+        // helper treats rectangle params[0..2] as the centre, so
+        // Coincident over two rectangles must collapse their
+        // centres to the same point.
+        let sketch = fresh_sketch();
+        let pinned = sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
+            .expect("a");
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![EntityRef::Rectangle(pinned)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Rectangle(pinned)],
+            ConstraintPriority::Required,
+        ));
+        let free = sketch
+            .add_rectangle(Point2d::new(4.0, 5.0), Point2d::new(6.0, 7.0))
+            .expect("b");
+        sketch.add_constraint(Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![
+                EntityRef::Rectangle(pinned),
+                EntityRef::Rectangle(free),
+            ],
+            ConstraintPriority::High,
+        ));
+
+        let report = solve(&sketch).expect("solve");
+        assert!(report.converged(), "status was {:?}", report.status);
+
+        let entry = sketch.rectangles().get(&free).expect("rect");
+        let r = &entry.value().rectangle;
+        assert!(r.center.x.abs() < 1e-8, "center.x was {}", r.center.x);
+        assert!(r.center.y.abs() < 1e-8, "center.y was {}", r.center.y);
+    }
+
+    #[test]
+    fn equal_constraint_collapses_rectangle_dimensions() {
+        // Equal(Rectangle, Rectangle) is a 2-residual constraint
+        // (width AND height must match — rotation is independent).
+        // Pin the first rectangle's dimensions via two distance-style
+        // dimensional constraints would be circular; instead we
+        // assert the converged solution agrees on (width, height)
+        // without prescribing the absolute value.
+        let sketch = fresh_sketch();
+        let a = sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(3.0, 2.0))
+            .expect("a");
+        let b = sketch
+            .add_rectangle(Point2d::new(10.0, 10.0), Point2d::new(15.0, 12.0))
+            .expect("b");
+        sketch.add_constraint(Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![EntityRef::Rectangle(a), EntityRef::Rectangle(b)],
+            ConstraintPriority::Required,
+        ));
+
+        let report = solve(&sketch).expect("solve");
+        assert!(report.converged(), "status was {:?}", report.status);
+
+        let ra = sketch.rectangles().get(&a).expect("a");
+        let rb = sketch.rectangles().get(&b).expect("b");
+        let ra = &ra.value().rectangle;
+        let rb = &rb.value().rectangle;
+        assert!(
+            (ra.width - rb.width).abs() < 1e-8,
+            "widths diverged: {} vs {}",
+            ra.width,
+            rb.width,
+        );
+        assert!(
+            (ra.height - rb.height).abs() < 1e-8,
+            "heights diverged: {} vs {}",
+            ra.height,
+            rb.height,
+        );
     }
 
     #[test]
@@ -1735,14 +1966,19 @@ mod tests {
     #[test]
     fn analyze_dofs_skips_unsupported_kinds_into_report() {
         let sketch = fresh_sketch();
-        let rect_id = sketch
-            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
-            .expect("rect");
+        let ellipse_id = sketch
+            .add_ellipse(Point2d::new(0.0, 0.0), 2.0, 1.0, 0.0)
+            .expect("ellipse");
         let report = analyze_dofs(&sketch);
-        // Rectangle contributes 0 DOFs in slice B-2 and lands in
-        // entities_skipped so the UI can surface the gap.
+        // Ellipse contributes 0 DOFs until slice C-3 lands and is
+        // surfaced via entities_skipped so the UI can highlight the
+        // gap. (Rectangles became supported in slice C-2 and so no
+        // longer land here.)
         assert_eq!(report.total_free_dofs, 0);
-        assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
+        assert_eq!(
+            report.entities_skipped,
+            vec![EntityRef::Ellipse(ellipse_id)]
+        );
         // Empty constraint list → no skipped constraints.
         assert_eq!(report.constraints_skipped, 0);
         assert!(!report.has_skipped_constraints());
@@ -1750,20 +1986,20 @@ mod tests {
 
     #[test]
     fn analyze_dofs_excludes_constraints_touching_unsupported_entities() {
-        // 1 point (2 free DOFs) + 1 rectangle (skipped) +
-        // Coincident(Point, RectangleVertex via EntityRef::Rectangle).
+        // 1 point (2 free DOFs) + 1 ellipse (skipped until C-3) +
+        // Coincident(Point, EllipseCenter via EntityRef::Ellipse).
         // Without filtering, we'd count 2 DOFs removed and report
         // FullyConstrained — a lie, because the constraint can't
         // be evaluated. With filtering: 2 free, 0 removed →
         // UnderConstrained, plus constraints_skipped = 1.
         let sketch = fresh_sketch();
         let p = sketch.add_point(Point2d::new(0.0, 0.0));
-        let rect = sketch
-            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
-            .expect("rect");
+        let ellipse = sketch
+            .add_ellipse(Point2d::new(1.0, 1.0), 2.0, 1.0, 0.0)
+            .expect("ellipse");
         sketch.add_constraint(Constraint::new_geometric(
             GeometricConstraint::Coincident,
-            vec![EntityRef::Point(p), EntityRef::Rectangle(rect)],
+            vec![EntityRef::Point(p), EntityRef::Ellipse(ellipse)],
             ConstraintPriority::High,
         ));
 
@@ -1771,7 +2007,7 @@ mod tests {
         assert_eq!(report.total_free_dofs, 2);
         assert_eq!(
             report.constraint_dofs_removed, 0,
-            "constraint must be skipped because rectangle is unsupported"
+            "constraint must be skipped because ellipse is unsupported"
         );
         assert_eq!(report.constraints_analysed, 0);
         assert_eq!(report.constraints_skipped, 1);

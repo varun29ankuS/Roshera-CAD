@@ -661,19 +661,44 @@ impl ConstraintSolver {
         }
     }
 
-    /// Get circle center from entity state
+    /// Get circle center from entity state.
+    ///
+    /// Also returns the center of a `Rectangle` entity since rectangles
+    /// store `[center.x, center.y, ...]` in the same leading two
+    /// parameter slots. This lets `Concentric` constraints work
+    /// between any pair of {Circle, Arc, Rectangle} without
+    /// dispatching on entity-kind combinations.
     fn get_circle_center(&self, entity: &EntityRef) -> Option<Point2d> {
         match entity {
-            EntityRef::Circle(_) | EntityRef::Arc(_) => {
+            EntityRef::Circle(_) | EntityRef::Arc(_) | EntityRef::Rectangle(_) => {
                 self.entity_state.get(entity).and_then(|state| {
                     if state.parameters.len() >= 2 {
-                        // Parameters: center.x, center.y, radius
+                        // Parameters: center.x, center.y, ...
                         Some(Point2d::new(state.parameters[0], state.parameters[1]))
                     } else {
                         None
                     }
                 })
             }
+            _ => None,
+        }
+    }
+
+    /// Get rectangle (width, height) from entity state.
+    ///
+    /// Returns `None` for non-rectangle entities. Used by the `Equal`
+    /// constraint evaluator to compare both scalar dimensions when
+    /// equating two rectangles.
+    fn get_rectangle_dimensions(&self, entity: &EntityRef) -> Option<(f64, f64)> {
+        match entity {
+            EntityRef::Rectangle(_) => self.entity_state.get(entity).and_then(|state| {
+                if state.parameters.len() >= 4 {
+                    // Parameters: center.x, center.y, width, height, rotation
+                    Some((state.parameters[2], state.parameters[3]))
+                } else {
+                    None
+                }
+            }),
             _ => None,
         }
     }
@@ -873,7 +898,13 @@ impl ConstraintSolver {
         }
     }
 
-    /// Count error components for a constraint
+    /// Count error components for a constraint.
+    ///
+    /// Most constraints contribute a fixed number of residual rows
+    /// driven only by their constraint variant. A small number depend
+    /// on the entity kinds in `constraint.entities`:
+    /// - `Equal` between two rectangles produces 2 residuals (width
+    ///   diff + height diff); every other `Equal` pair produces 1.
     fn constraint_error_count(&self, constraint: &Constraint) -> usize {
         match &constraint.constraint_type {
             ConstraintType::Geometric(gc) => match gc {
@@ -882,6 +913,16 @@ impl ConstraintSolver {
                 GeometricConstraint::Perpendicular => 1,
                 GeometricConstraint::Horizontal => 1,
                 GeometricConstraint::Vertical => 1,
+                GeometricConstraint::Equal => {
+                    if constraint.entities.len() == 2
+                        && matches!(constraint.entities[0], EntityRef::Rectangle(_))
+                        && matches!(constraint.entities[1], EntityRef::Rectangle(_))
+                    {
+                        2
+                    } else {
+                        1
+                    }
+                }
                 _ => 1,
             },
             ConstraintType::Dimensional(_) => 1,
@@ -1167,6 +1208,22 @@ impl ConstraintSolver {
                     vec![r1 - r2]
                 } else {
                     vec![0.0]
+                }
+            }
+            (EntityRef::Rectangle(_), EntityRef::Rectangle(_)) => {
+                // Equal dimensions: both width AND height must match.
+                // Equating only the area or only one dimension would
+                // leave one DOF un-pinned, which would surprise users
+                // who expect "same rectangle shape". The 2-residual
+                // shape is reported by `constraint_error_count` so the
+                // Jacobian allocates the right row budget.
+                if let (Some((w1, h1)), Some((w2, h2))) = (
+                    self.get_rectangle_dimensions(entity1),
+                    self.get_rectangle_dimensions(entity2),
+                ) {
+                    vec![w1 - w2, h1 - h2]
+                } else {
+                    vec![0.0, 0.0]
                 }
             }
             _ => vec![0.0],
@@ -1521,6 +1578,46 @@ impl EntityState {
             ],
         }
     }
+
+    /// Create state for a rectangle.
+    ///
+    /// Parameter layout is `[center.x, center.y, width, height,
+    /// rotation]` — matches `EntityUpdate::Rectangle(center, width,
+    /// height, rotation)` and the emission path in
+    /// `get_entity_updates`. Because the layout puts the center at
+    /// `params[0..=1]`, `get_point_position` already returns the
+    /// rectangle's center, which means `Coincident`, `Distance`,
+    /// `XCoordinate`, and `YCoordinate` constraints work for
+    /// rectangles without any further dispatch.
+    ///
+    /// Four fix flags:
+    /// - `center_fixed` pins both x and y of the center together.
+    /// - `width_fixed` / `height_fixed` pin the scalar dimensions
+    ///   independently — a rectangle with width fixed can still flex
+    ///   in height, which is what the snap engine wants when an
+    ///   Equal constraint propagates only one dimension.
+    /// - `rotation_fixed` pins the rotation angle.
+    pub fn rectangle(
+        center: Point2d,
+        width: f64,
+        height: f64,
+        rotation: f64,
+        center_fixed: bool,
+        width_fixed: bool,
+        height_fixed: bool,
+        rotation_fixed: bool,
+    ) -> Self {
+        Self {
+            parameters: vec![center.x, center.y, width, height, rotation],
+            fixed_mask: vec![
+                center_fixed,
+                center_fixed,
+                width_fixed,
+                height_fixed,
+                rotation_fixed,
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1548,7 +1645,7 @@ mod tests {
 
     use super::*;
     use crate::sketch2d::constraints::{ConstraintPriority, ConstraintType};
-    use crate::sketch2d::{Circle2dId, Line2dId, Point2dId};
+    use crate::sketch2d::{Circle2dId, Line2dId, Point2dId, Rectangle2dId};
 
     // ────────────────────────────── helpers ───────────────────────────
 
@@ -1566,6 +1663,10 @@ mod tests {
 
     fn circle_ref() -> EntityRef {
         EntityRef::Circle(Circle2dId::new())
+    }
+
+    fn rect_ref() -> EntityRef {
+        EntityRef::Rectangle(Rectangle2dId::new())
     }
 
     fn coincident(p1: EntityRef, p2: EntityRef) -> Constraint {
@@ -2848,6 +2949,243 @@ mod tests {
         let st = EntityState::circle(Point2d::new(5.0, 6.0), 7.0, true, false);
         assert_eq!(st.parameters, vec![5.0, 6.0, 7.0]);
         assert_eq!(st.fixed_mask, vec![true, true, false]);
+    }
+
+    // ── C-2: Rectangle entity ─────────────────────────────────────
+
+    #[test]
+    fn entity_state_rectangle_layout() {
+        // Parameter order is [center.x, center.y, width, height,
+        // rotation] so that params[0..2] aligns with the generic
+        // `get_point_position` dispatch (which reads slot 0/1 from
+        // any entity it understands).
+        let st = EntityState::rectangle(
+            Point2d::new(1.0, 2.0),
+            3.0,
+            4.0,
+            std::f64::consts::FRAC_PI_4,
+            false,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(
+            st.parameters,
+            vec![1.0, 2.0, 3.0, 4.0, std::f64::consts::FRAC_PI_4]
+        );
+        // `center_fixed = false` flows into BOTH x and y slots.
+        assert_eq!(
+            st.fixed_mask,
+            vec![false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn entity_state_rectangle_fixed_center_pins_both_axes() {
+        let st = EntityState::rectangle(
+            Point2d::new(0.0, 0.0),
+            1.0,
+            1.0,
+            0.0,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(st.fixed_mask, vec![true, true, false, false, false]);
+    }
+
+    #[test]
+    fn equal_rectangles_error_is_width_and_height_diff() {
+        // Equal(Rectangle, Rectangle) is a 2-residual constraint:
+        // r0 = w1 - w2, r1 = h1 - h2. Rotation is independent.
+        let mut s = ConstraintSolver::new();
+        let r1 = rect_ref();
+        let r2 = rect_ref();
+        s.add_entity(
+            r1,
+            EntityState::rectangle(
+                Point2d::ORIGIN, 5.0, 3.0, 0.0, false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::ORIGIN, 2.0, 7.0, 0.0, false, false, false, false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Equal,
+            &[r1, r2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], 3.0, 1e-12));
+        assert!(approx_eq(errs[1], -4.0, 1e-12));
+    }
+
+    #[test]
+    fn coincident_rectangles_error_is_center_diff() {
+        // get_point_position must read rectangle params[0..2] as
+        // (center.x, center.y) so Coincident over two rectangles
+        // measures center-to-center displacement.
+        let mut s = ConstraintSolver::new();
+        let r1 = rect_ref();
+        let r2 = rect_ref();
+        s.add_entity(
+            r1,
+            EntityState::rectangle(
+                Point2d::new(1.0, 2.0), 1.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::new(4.0, -1.0), 1.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Coincident,
+            &[r1, r2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], -3.0, 1e-12));
+        assert!(approx_eq(errs[1], 3.0, 1e-12));
+    }
+
+    #[test]
+    fn concentric_rectangles_error_is_center_diff() {
+        // get_circle_center treats Rectangle alongside Circle/Arc so
+        // Concentric works between any pair of (Circle, Arc, Rectangle).
+        let mut s = ConstraintSolver::new();
+        let r1 = rect_ref();
+        let r2 = rect_ref();
+        s.add_entity(
+            r1,
+            EntityState::rectangle(
+                Point2d::new(2.0, 5.0), 1.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::new(2.0, 5.0), 4.0, 7.0, 1.0,
+                false, false, false, false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Concentric,
+            &[r1, r2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+        assert!(approx_eq(errs[1], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn concentric_rectangle_with_circle_uses_centers() {
+        let mut s = ConstraintSolver::new();
+        let rect = rect_ref();
+        let circ = circle_ref();
+        s.add_entity(
+            rect,
+            EntityState::rectangle(
+                Point2d::new(1.0, 1.0), 2.0, 2.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            circ,
+            EntityState::circle(Point2d::new(4.0, 5.0), 1.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Concentric,
+            &[rect, circ],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], -3.0, 1e-12));
+        assert!(approx_eq(errs[1], -4.0, 1e-12));
+    }
+
+    #[test]
+    fn get_entity_updates_returns_rectangle_variant_for_rect_ref() {
+        let s = ConstraintSolver::new();
+        let r = rect_ref();
+        s.add_entity(
+            r,
+            EntityState::rectangle(
+                Point2d::new(1.5, 2.5), 3.5, 4.5,
+                std::f64::consts::FRAC_PI_3,
+                false, false, false, false,
+            ),
+        );
+        let updates = s.get_entity_updates();
+        match updates.get(&r).expect("present") {
+            EntityUpdate::Rectangle(center, w, h, rot) => {
+                assert_eq!(center.x, 1.5);
+                assert_eq!(center.y, 2.5);
+                assert_eq!(*w, 3.5);
+                assert_eq!(*h, 4.5);
+                assert!(approx_eq(*rot, std::f64::consts::FRAC_PI_3, 1e-12));
+            }
+            other => panic!("expected Rectangle variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn constraint_error_count_equal_two_rectangles_is_two() {
+        // The dimension of the residual for Equal depends on the
+        // entity kinds it ranges over. For two rectangles the
+        // residual is (Δw, Δh) → 2 rows; the Jacobian must size
+        // itself accordingly or the solver will silently drop or
+        // overcount rows.
+        let mut s = ConstraintSolver::new();
+        let r1 = rect_ref();
+        let r2 = rect_ref();
+        s.add_entity(
+            r1,
+            EntityState::rectangle(
+                Point2d::ORIGIN, 1.0, 1.0, 0.0, false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::ORIGIN, 2.0, 2.0, 0.0, false, false, false, false,
+            ),
+        );
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![r1, r2],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&c), 2);
+    }
+
+    #[test]
+    fn constraint_error_count_equal_two_circles_is_one() {
+        // Sanity counter-check: Equal over two circles is a single
+        // radius residual. The rectangle-specific branch must not
+        // bleed into other kinds.
+        let mut s = ConstraintSolver::new();
+        let c1 = circle_ref();
+        let c2 = circle_ref();
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::ORIGIN, 1.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::ORIGIN, 2.0, false, false),
+        );
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![c1, c2],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&c), 1);
     }
 
     #[test]
