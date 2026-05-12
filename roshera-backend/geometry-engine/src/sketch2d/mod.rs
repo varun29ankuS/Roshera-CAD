@@ -51,6 +51,9 @@ pub mod sketch_solver;
 pub mod sketch;
 pub mod sketch_plane;
 
+// Snap engine: cursor → entity feature proximity (D-1-a).
+pub mod snap;
+
 // Utilities
 pub mod sketch_topology;
 pub mod sketch_validation;
@@ -78,6 +81,7 @@ pub use sketch_solver::{
 
 pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
+pub use snap::{SnapCandidate, SnapKind};
 
 // Error types for 2D operations
 use thiserror::Error;
