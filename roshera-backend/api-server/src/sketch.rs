@@ -1234,9 +1234,12 @@ pub async fn extrude_sketch(
     use geometry_engine::operations::boolean::{
         boolean_operation, BooleanOp, BooleanOptions,
     };
-    use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
+    use geometry_engine::operations::extrude::{
+        create_face_from_profile, extrude_face, ExtrudeOptions,
+    };
     use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
+    use geometry_engine::primitives::r#loop::{Loop, LoopType};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -1326,83 +1329,104 @@ pub async fn extrude_sketch(
     let result_solid_id = {
         let mut model = state.model.write().await;
 
-        // Extrude each shape independently into its own solid. The
-        // kernel's `create_fresh_extrusion` does not honor a face's
-        // inner_loops on the side-face / top-cap walks, so we don't
-        // try to build a multi-loop profile here. Instead we fold
-        // separately-extruded solids via `boolean_operation`:
-        // per-region the outer is unioned into the accumulator, then
-        // each of its holes is subtracted; finally regions are
-        // unioned. This produces the correct trimmed body (e.g.
-        // bracket-with-holes) using the well-tested boolean pipeline.
-        let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
-        for (shape_idx, (_shape_id, _tool, _polygon_2d, lifted)) in
-            shape_polygons.iter().enumerate()
-        {
-            let mut profile_edges = Vec::with_capacity(lifted.len());
-            for i in 0..lifted.len() {
-                let p_start = lifted[i];
-                let p_end = lifted[(i + 1) % lifted.len()];
-                let v_start = model.vertices.add_or_find(
-                    p_start.x,
-                    p_start.y,
-                    p_start.z,
-                    tolerance.distance(),
-                );
-                let v_end = model
-                    .vertices
-                    .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
-                if v_start == v_end {
-                    return Err(ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        format!(
-                            "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
-                             to the same vertex under tolerance {}",
-                            (i + 1) % lifted.len(),
-                            tolerance.distance()
-                        ),
-                    ));
+        // Per-region multi-loop face construction: build one Face per
+        // region with the outer shape's edges as the outer loop and
+        // each hole shape's edges as an inner loop, then extrude that
+        // face once via the kernel's `extrude_face`. The kernel handles
+        // inner_loops natively post-Slice A — no per-region Difference
+        // boolean fold needed. Multi-region sketches (disjoint outers)
+        // still Union at the end; Slice C makes that succeed for
+        // coplanar disjoint inputs.
+        let mut build_loop_edges =
+            |model: &mut BRepModel,
+             shape_idx: usize,
+             lifted: &[Point3]|
+             -> Result<Vec<EdgeId>, ApiError> {
+                let mut edges = Vec::with_capacity(lifted.len());
+                for i in 0..lifted.len() {
+                    let p_start = lifted[i];
+                    let p_end = lifted[(i + 1) % lifted.len()];
+                    let v_start = model.vertices.add_or_find(
+                        p_start.x,
+                        p_start.y,
+                        p_start.z,
+                        tolerance.distance(),
+                    );
+                    let v_end = model.vertices.add_or_find(
+                        p_end.x,
+                        p_end.y,
+                        p_end.z,
+                        tolerance.distance(),
+                    );
+                    if v_start == v_end {
+                        return Err(ApiError::new(
+                            ErrorCode::InvalidParameter,
+                            format!(
+                                "shape[{shape_idx}] polygon[{i}] and polygon[{}] collapse \
+                                 to the same vertex under tolerance {}",
+                                (i + 1) % lifted.len(),
+                                tolerance.distance()
+                            ),
+                        ));
+                    }
+                    let line = Line::new(p_start, p_end);
+                    let curve_id = model.curves.add(Box::new(line));
+                    let edge = Edge::new(
+                        0,
+                        v_start,
+                        v_end,
+                        curve_id,
+                        EdgeOrientation::Forward,
+                        ParameterRange::new(0.0, 1.0),
+                    );
+                    edges.push(model.edges.add(edge));
                 }
-                let line = Line::new(p_start, p_end);
-                let curve_id = model.curves.add(Box::new(line));
-                let edge = Edge::new(
-                    0,
-                    v_start,
-                    v_end,
-                    curve_id,
-                    EdgeOrientation::Forward,
-                    ParameterRange::new(0.0, 1.0),
-                );
-                let edge_id = model.edges.add(edge);
-                profile_edges.push(edge_id);
+                Ok(edges)
+            };
+
+        let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
+        for region in &regions {
+            // Outer loop → planar face via the standard profile factory.
+            let outer_lifted = &shape_polygons[region.outer_shape_idx].3;
+            let outer_edges =
+                build_loop_edges(&mut model, region.outer_shape_idx, outer_lifted)?;
+            let face_id = create_face_from_profile(&mut model, outer_edges)
+                .map_err(ApiError::kernel_error)?;
+
+            // Inner loops → one `LoopType::Inner` per hole, registered
+            // on the face via `add_inner_loop`. The kernel's
+            // `create_fresh_extrusion` (Slice A) walks every inner loop
+            // and builds matching side walls + top-cap hole topology.
+            for &hole_idx in &region.hole_shape_idxs {
+                let hole_lifted = &shape_polygons[hole_idx].3;
+                let hole_edges = build_loop_edges(&mut model, hole_idx, hole_lifted)?;
+                let mut inner_loop = Loop::new(0, LoopType::Inner);
+                for edge_id in &hole_edges {
+                    inner_loop.add_edge(*edge_id, true);
+                }
+                let inner_loop_id = model.loops.add(inner_loop);
+                let face = model.faces.get_mut(face_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("face {face_id} disappeared between create_face_from_profile and add_inner_loop"),
+                    )
+                })?;
+                face.add_inner_loop(inner_loop_id);
             }
+
             let options = ExtrudeOptions {
                 direction,
                 distance: body.distance,
                 ..ExtrudeOptions::default()
             };
-            let solid_id = extrude_profile(&mut model, profile_edges, options)
-                .map_err(ApiError::kernel_error)?;
-            shape_solids.push(solid_id);
+            let region_solid_id =
+                extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?;
+            region_solids.push(region_solid_id);
         }
 
-        // Build per-region trimmed solids: outer minus its holes.
-        // Then union all regions to form the final body.
-        let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
-        for region in &regions {
-            let mut acc = shape_solids[region.outer_shape_idx];
-            for &hole_idx in &region.hole_shape_idxs {
-                acc = boolean_operation(
-                    &mut model,
-                    acc,
-                    shape_solids[hole_idx],
-                    BooleanOp::Difference,
-                    BooleanOptions::default(),
-                )
-                .map_err(ApiError::kernel_error)?;
-            }
-            region_solids.push(acc);
-        }
+        // Multi-region sketches (disjoint coplanar outers) Union into
+        // one body. With Slice C, this succeeds for disjoint coplanar
+        // inputs — and with Slice E, for overlapping coplanar inputs too.
         let mut accumulator = region_solids[0];
         for &sid in &region_solids[1..] {
             accumulator = boolean_operation(
@@ -2729,6 +2753,271 @@ mod tests {
             let back: SketchPlane = serde_json::from_str(&s).expect("de");
             assert_eq!(plane, back);
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Slice B — per-region multi-loop face construction
+    //
+    // Exercises the same kernel-level orchestration the `extrude_sketch`
+    // handler performs after `detect_regions` returns the region table.
+    // We bypass the AppState/REST stack because api-server is a binary
+    // crate (no `[lib]` target — see `Cargo.toml`); validating the
+    // orchestration at the kernel API level is the established pattern
+    // for this file (cf. `lift_polygon_routes_uv_to_world_axes` and the
+    // existing `detect_regions_*` tests above).
+    //
+    // What's specifically covered here that Slice A's
+    // `multi_loop_extrude.rs` does not:
+    //   • the wiring from `materialise_shape` + `lift_polygon` +
+    //     `detect_regions` → per-region multi-loop face build →
+    //     `extrude_face` — i.e. the contract the REST handler honours.
+    //
+    // Slice C (boolean face-overlap check on coincident planes) is a
+    // prerequisite for the multi-region disjoint case to Union cleanly,
+    // so the "rectangle + disjoint circle" smoke test lives in the
+    // Slice C verification pass, not here.
+    // ---------------------------------------------------------------
+
+    use geometry_engine::operations::extrude::{
+        create_face_from_profile, extrude_face, ExtrudeOptions,
+    };
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::primitives::r#loop::{Loop as TopoLoop, LoopType};
+    use geometry_engine::primitives::topology_builder::BRepModel;
+
+    /// Build edges for one closed polygon (in world space) using the
+    /// same `add_or_find` + `Line` + `Edge` recipe the production
+    /// handler uses, so any vertex-merge / parameter-range subtlety
+    /// in the handler is mirrored 1:1 here.
+    fn build_loop_edges_for_test(
+        model: &mut BRepModel,
+        lifted: &[Point3],
+        tolerance: f64,
+    ) -> Vec<geometry_engine::primitives::edge::EdgeId> {
+        let mut edges = Vec::with_capacity(lifted.len());
+        for i in 0..lifted.len() {
+            let p_start = lifted[i];
+            let p_end = lifted[(i + 1) % lifted.len()];
+            let v_start =
+                model.vertices.add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
+            let v_end = model.vertices.add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
+            assert_ne!(v_start, v_end, "polygon must not self-collapse under tolerance");
+            let line = Line::new(p_start, p_end);
+            let curve_id = model.curves.add(Box::new(line));
+            let edge = Edge::new(
+                0,
+                v_start,
+                v_end,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            edges.push(model.edges.add(edge));
+        }
+        edges
+    }
+
+    /// Replays the per-region multi-loop face build + extrude pipeline
+    /// from `extrude_sketch`, against a SketchSession the test owns.
+    /// Returns the final solid id (single region) or after-Union id
+    /// (would-be-multi-region — Slice C dependency, not exercised here).
+    fn extrude_session_via_kernel(
+        session: &SketchSession,
+        direction: Vector3,
+        distance: f64,
+    ) -> (BRepModel, u32) {
+        let tolerance = geometry_engine::math::Tolerance::default();
+
+        let mut shape_polygons: Vec<Vec<Point3>> =
+            Vec::with_capacity(session.shapes.len());
+        let mut shape_polygons_2d: Vec<Vec<[f64; 2]>> =
+            Vec::with_capacity(session.shapes.len());
+        for shape in session.shapes.iter().filter(|s| !s.points.is_empty()) {
+            let polygon_2d =
+                materialise_shape(shape, session.circle_segments).expect("materialise");
+            let lifted = lift_polygon(session, &polygon_2d);
+            shape_polygons.push(lifted);
+            shape_polygons_2d.push(polygon_2d);
+        }
+
+        let polygons_ref: Vec<&Vec<[f64; 2]>> = shape_polygons_2d.iter().collect();
+        let regions = detect_regions(&polygons_ref).expect("regions detect");
+        assert!(!regions.is_empty(), "test session must have ≥1 region");
+
+        let mut model = BRepModel::new();
+        let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
+        for region in &regions {
+            let outer_lifted = &shape_polygons[region.outer_shape_idx];
+            let outer_edges =
+                build_loop_edges_for_test(&mut model, outer_lifted, tolerance.distance());
+            let face_id = create_face_from_profile(&mut model, outer_edges)
+                .expect("create_face_from_profile");
+
+            for &hole_idx in &region.hole_shape_idxs {
+                let hole_lifted = &shape_polygons[hole_idx];
+                let hole_edges =
+                    build_loop_edges_for_test(&mut model, hole_lifted, tolerance.distance());
+                let mut inner_loop = TopoLoop::new(0, LoopType::Inner);
+                for edge_id in &hole_edges {
+                    inner_loop.add_edge(*edge_id, true);
+                }
+                let inner_loop_id = model.loops.add(inner_loop);
+                let face = model.faces.get_mut(face_id).expect("face stored");
+                face.add_inner_loop(inner_loop_id);
+            }
+
+            let options = ExtrudeOptions {
+                direction,
+                distance,
+                common: geometry_engine::operations::CommonOptions {
+                    validate_result: false,
+                    ..Default::default()
+                },
+                ..ExtrudeOptions::default()
+            };
+            let solid_id =
+                extrude_face(&mut model, face_id, options).expect("extrude_face");
+            region_solids.push(solid_id);
+        }
+
+        // Single-region path — the only one Slice B exercises without
+        // Slice C's coplanar-disjoint Union support.
+        assert_eq!(
+            region_solids.len(),
+            1,
+            "tests pinned at one region; multi-region needs Slice C"
+        );
+        (model, region_solids[0])
+    }
+
+    #[test]
+    fn slice_b_extrudes_rectangle_with_circle_hole_inside_single_region() {
+        // Real-world workflow: rectangle outer + circle in the centre,
+        // both drawn in one sketch. After `detect_regions`, this is a
+        // single region with one outer and one hole. The handler must
+        // build a face with one inner_loop and extrude it once — no
+        // per-region Difference boolean.
+        let session = SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::XY,
+            shapes: vec![
+                // 10×10 rectangle centred at (5,5).
+                SketchShape {
+                    id: Uuid::new_v4(),
+                    tool: SketchTool::Rectangle,
+                    points: vec![[0.0, 0.0], [10.0, 10.0]],
+                },
+                // Circle r=2 at (5,5).
+                SketchShape {
+                    id: Uuid::new_v4(),
+                    tool: SketchTool::Circle,
+                    points: vec![[5.0, 5.0], [7.0, 5.0]],
+                },
+            ],
+            circle_segments: 32,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let (model, solid_id) =
+            extrude_session_via_kernel(&session, Vector3::Z, 5.0);
+        let solid = model.solids.get(solid_id).expect("solid stored");
+        let shell = model.shells.get(solid.outer_shell).expect("shell stored");
+
+        // 4 outer-rectangle side faces + 32 circle-hole side faces +
+        // bottom cap + top cap = 38 faces.
+        assert_eq!(
+            shell.faces.len(),
+            4 + 32 + 2,
+            "rect-with-circular-hole extrudes to 4+32+2 faces"
+        );
+
+        // Top cap mirrors the bottom's multi-loop structure.
+        let top_face_id = *shell.faces.last().expect("top cap");
+        let top_face = model.faces.get(top_face_id).expect("top face");
+        assert_eq!(
+            top_face.inner_loops.len(),
+            1,
+            "top cap must carry the circle hole as one inner loop"
+        );
+    }
+
+    #[test]
+    fn slice_b_single_rectangle_unchanged_behavior_one_loop_no_holes() {
+        // Regression: a single-shape sketch (the most common case)
+        // must still produce a plain six-face box without any inner
+        // loops. Verifies the handler's no-hole path through the new
+        // multi-loop pipeline matches the pre-Slice-B six-face box.
+        let session = SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::XY,
+            shapes: vec![SketchShape {
+                id: Uuid::new_v4(),
+                tool: SketchTool::Rectangle,
+                points: vec![[0.0, 0.0], [4.0, 3.0]],
+            }],
+            circle_segments: 32,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let (model, solid_id) =
+            extrude_session_via_kernel(&session, Vector3::Z, 2.0);
+        let solid = model.solids.get(solid_id).expect("solid stored");
+        let shell = model.shells.get(solid.outer_shell).expect("shell stored");
+        assert_eq!(shell.faces.len(), 6, "single rectangle extrudes to 6 faces");
+
+        let top_face = model
+            .faces
+            .get(*shell.faces.last().expect("top cap"))
+            .expect("top face");
+        assert!(top_face.inner_loops.is_empty(), "no holes ⇒ no inner loops");
+    }
+
+    #[test]
+    fn slice_b_rectangle_with_two_rectangular_holes_single_region() {
+        // Two holes inside one outer — detect_regions must collapse
+        // both inner polygons into the same Region.hole_shape_idxs,
+        // and the handler must register two `LoopType::Inner` loops
+        // on the face before extruding.
+        let session = SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::XY,
+            shapes: vec![
+                SketchShape {
+                    id: Uuid::new_v4(),
+                    tool: SketchTool::Rectangle,
+                    points: vec![[0.0, 0.0], [20.0, 10.0]],
+                },
+                SketchShape {
+                    id: Uuid::new_v4(),
+                    tool: SketchTool::Rectangle,
+                    points: vec![[2.0, 2.0], [4.0, 8.0]],
+                },
+                SketchShape {
+                    id: Uuid::new_v4(),
+                    tool: SketchTool::Rectangle,
+                    points: vec![[12.0, 2.0], [14.0, 8.0]],
+                },
+            ],
+            circle_segments: 32,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let (model, solid_id) =
+            extrude_session_via_kernel(&session, Vector3::Z, 3.0);
+        let solid = model.solids.get(solid_id).expect("solid stored");
+        let shell = model.shells.get(solid.outer_shell).expect("shell stored");
+        // 4 outer + 4 + 4 inner walls + bottom + top = 14 faces.
+        assert_eq!(shell.faces.len(), 14, "rect + two rect holes ⇒ 14 faces");
+
+        let top_face = model
+            .faces
+            .get(*shell.faces.last().expect("top cap"))
+            .expect("top face");
+        assert_eq!(top_face.inner_loops.len(), 2, "top cap carries both holes");
     }
 
 }
