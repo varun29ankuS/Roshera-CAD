@@ -1652,7 +1652,17 @@ export const useSceneStore = create<SceneState>()(
     refreshCSketch: async (id) => {
       const summary = await csketchApi.get(id)
       const isActive = get().csketch.activeId === id
-      const constraints = isActive ? await csketchApi.listConstraints(id) : null
+      // For the active csketch we additionally pull the constraint
+      // list AND the DOF report so any UI bound to either updates in
+      // the same tick. Without the DOF refresh, the floating HUD
+      // would lag mutations by a full pointer-up cycle. The two
+      // GETs are independent → fire them in parallel.
+      const [constraints, dofReport] = isActive
+        ? await Promise.all([
+            csketchApi.listConstraints(id),
+            csketchApi.dof(id),
+          ])
+        : [null, null]
       set((state) => {
         const summaries = new Map(state.csketch.summaries)
         summaries.set(id, summary)
@@ -1661,6 +1671,9 @@ export const useSceneStore = create<SceneState>()(
             ...state.csketch,
             summaries,
             activeConstraints: constraints ?? state.csketch.activeConstraints,
+            lastDofReport: isActive
+              ? dofReport
+              : state.csketch.lastDofReport,
           },
         }
       })
