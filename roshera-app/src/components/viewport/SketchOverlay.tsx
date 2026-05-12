@@ -21,7 +21,7 @@
 
 import { useCallback, useMemo, useState, useEffect, useRef } from 'react'
 import { Html, Line } from '@react-three/drei'
-import type { ThreeEvent } from '@react-three/fiber'
+import { useThree, type ThreeEvent } from '@react-three/fiber'
 import * as THREE from 'three'
 import {
   isStandardPlane,
@@ -35,6 +35,7 @@ import {
 import { buildProfile2D } from '@/lib/sketch-extrude'
 import {
   CSketchConstraintConflictError,
+  pointRef,
   type Constraint,
   type CSketchCircleSummary,
   type CSketchLineSummary,
@@ -582,6 +583,15 @@ export function SketchOverlay() {
           `redundant` so the H-slice diagnosis surfaces visually
           without an extra panel. */}
       <CSketchGeometricBadges plane={sketch.plane} />
+
+      {/* Draggable disc handles for every csketch point (D-3c).
+          Picks bypass the capture-plane click handler via
+          `stopPropagation`. While a drag is in flight, a throttled
+          POST /csketch/:id/drag streams new (x, y) targets — the
+          solver pins everything else and minimises movement of the
+          unconstrained DOFs, so dragging one point re-solves the
+          rest of the sketch in real time. */}
+      <CSketchPoints plane={sketch.plane} />
 
       <SketchPreview showMeasure={showMeasure} />
 
@@ -1292,6 +1302,271 @@ function CSketchGeometricBadges({ plane }: { plane: SketchPlane }) {
           </div>
         </Html>
       ))}
+    </group>
+  )
+}
+
+// ─── Draggable csketch point handles ─────────────────────────────────
+
+/**
+ * Build a `THREE.Plane` representing the active sketch plane in world
+ * coordinates. Mirrors the `pointToPlaneUV` / `uvToWorld` convention:
+ *   xy → origin (0,0,0), normal +Z
+ *   xz → origin (0,0,0), normal +Y
+ *   yz → origin (0,0,0), normal +X
+ *   custom → origin = plane.origin, normal = u_axis × v_axis (which
+ *            the backend guarantees orthonormal so the cross is unit).
+ *
+ * Pure function of the input plane; safe to call inside event handlers.
+ */
+function sketchPlaneAsThreePlane(plane: SketchPlane): THREE.Plane {
+  const normal = new THREE.Vector3()
+  const origin = new THREE.Vector3()
+  if (isStandardPlane(plane)) {
+    switch (plane) {
+      case 'xy': normal.set(0, 0, 1); break
+      case 'xz': normal.set(0, 1, 0); break
+      case 'yz': normal.set(1, 0, 0); break
+    }
+  } else {
+    origin.set(...plane.origin)
+    normal
+      .crossVectors(
+        new THREE.Vector3(...plane.u_axis),
+        new THREE.Vector3(...plane.v_axis),
+      )
+      .normalize()
+  }
+  return new THREE.Plane().setFromNormalAndCoplanarPoint(normal, origin)
+}
+
+/**
+ * Visible disc handle plus per-point drag-on-pointerdown gesture.
+ * Renders nothing if there is no active csketch. The capture-plane
+ * pointerdown handler does NOT fire on point picks because each
+ * handle calls `e.stopPropagation()` — the click-to-place flow on the
+ * sketch plane is therefore unaffected.
+ *
+ * Drag pipeline (per point):
+ *   1. pointerdown on the disc → suppress orbit (`gizmoDragging=true`),
+ *      record pointer-down NDC, install window pointermove + pointerup.
+ *   2. pointermove → raycast cursor onto the sketch plane, project to
+ *      (u, v). Only fires the backend call once travel exceeds the
+ *      4-px click-vs-drag budget (matches Fusion / Onshape).
+ *   3. Backend call is throttled to "one in flight at a time"; later
+ *      moves overwrite a `pendingUV` so the final position is always
+ *      delivered, but we never stack requests on a slow solver.
+ *   4. pointerup → release suppression, run the trailing pendingUV
+ *      (if any), drop the window listeners.
+ *
+ * Fixed points (`is_fixed == true`) render as a smaller grey disc with
+ * no pointer handlers — the solver pins them and dragging them would
+ * either fail constraint-check or be a no-op, neither of which is
+ * useful UX.
+ */
+function CSketchPoints({ plane }: { plane: SketchPlane }) {
+  const activeId = useSceneStore((s) => s.csketch.activeId)
+  const summary = useSceneStore((s) =>
+    s.csketch.activeId ? s.csketch.summaries.get(s.csketch.activeId) ?? null : null,
+  )
+  const dragCSketch = useSceneStore((s) => s.dragCSketch)
+  const setGizmoDragging = useSceneStore((s) => s.setGizmoDragging)
+  const { camera, gl } = useThree()
+
+  // `null` = no drag, `{...}` = drag in progress. Stored in a ref so
+  // updates don't trigger re-renders mid-gesture.
+  const dragRef = useRef<{
+    pointId: string
+    downX: number
+    downY: number
+    started: boolean
+    inFlight: boolean
+    pendingUV: [number, number] | null
+  } | null>(null)
+  const [hoverId, setHoverId] = useState<string | null>(null)
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+
+  // Trailing-throttle dispatcher: at most one drag POST in flight per
+  // point. When a move arrives during an in-flight request we cache
+  // the latest UV in `pendingUV`; the `.finally()` chain flushes that
+  // cached value, guaranteeing the final cursor position always wins.
+  const dispatchDrag = useCallback(
+    (pointId: string, uv: [number, number]) => {
+      if (!activeId) return
+      const drag = dragRef.current
+      if (!drag || drag.pointId !== pointId) return
+      if (drag.inFlight) {
+        drag.pendingUV = uv
+        return
+      }
+      drag.inFlight = true
+      const fire = (target: [number, number]) => {
+        return dragCSketch(activeId, {
+          entity: pointRef(pointId),
+          target: { kind: 'point', params: { x: target[0], y: target[1] } },
+        }).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error('[CSketchPoints] drag failed:', err)
+        })
+      }
+      const chain = (uvNow: [number, number]) => {
+        fire(uvNow).finally(() => {
+          const live = dragRef.current
+          if (!live || live.pointId !== pointId) {
+            // Drag ended before this request returned — done.
+            if (drag) drag.inFlight = false
+            return
+          }
+          if (live.pendingUV) {
+            const next = live.pendingUV
+            live.pendingUV = null
+            chain(next)
+          } else {
+            live.inFlight = false
+          }
+        })
+      }
+      chain(uv)
+    },
+    [activeId, dragCSketch],
+  )
+
+  // Window-level pointer listeners for the duration of a drag.
+  // Registered only while `draggingId` is set so non-dragging time
+  // costs no event-loop work.
+  useEffect(() => {
+    if (!draggingId) return
+
+    const ndc = new THREE.Vector2()
+    const raycaster = new THREE.Raycaster()
+    const intersection = new THREE.Vector3()
+    const worldPlane = sketchPlaneAsThreePlane(plane)
+
+    const onMove = (e: PointerEvent) => {
+      const drag = dragRef.current
+      if (!drag) return
+      const dx = e.clientX - drag.downX
+      const dy = e.clientY - drag.downY
+      if (!drag.started && dx * dx + dy * dy < 16) {
+        // Below the 4-px click-vs-drag threshold — don't emit yet.
+        return
+      }
+      drag.started = true
+      const rect = gl.domElement.getBoundingClientRect()
+      ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
+      ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+      raycaster.setFromCamera(ndc, camera)
+      if (!raycaster.ray.intersectPlane(worldPlane, intersection)) return
+      const uv = pointToPlaneUV(intersection, plane)
+      dispatchDrag(drag.pointId, uv)
+    }
+
+    const onUp = () => {
+      const drag = dragRef.current
+      dragRef.current = null
+      setDraggingId(null)
+      setGizmoDragging(false)
+      if (drag && drag.started && drag.pendingUV) {
+        // Final flush — pendingUV captured during in-flight request
+        // never made it to the wire. Send it now so the resting
+        // position matches the last cursor pose.
+        const final = drag.pendingUV
+        drag.pendingUV = null
+        if (activeId) {
+          void dragCSketch(activeId, {
+            entity: pointRef(drag.pointId),
+            target: { kind: 'point', params: { x: final[0], y: final[1] } },
+          }).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error('[CSketchPoints] final drag failed:', err)
+          })
+        }
+      }
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    return () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+  }, [draggingId, plane, camera, gl, dispatchDrag, dragCSketch, setGizmoDragging, activeId])
+
+  const handlePointerDown = useCallback(
+    (point: CSketchPointSummary) => (e: ThreeEvent<PointerEvent>) => {
+      if (point.is_fixed) return
+      if (e.nativeEvent.button !== 0) return
+      e.stopPropagation()
+      dragRef.current = {
+        pointId: point.id,
+        downX: e.nativeEvent.clientX,
+        downY: e.nativeEvent.clientY,
+        started: false,
+        inFlight: false,
+        pendingUV: null,
+      }
+      setDraggingId(point.id)
+      setGizmoDragging(true)
+    },
+    [setGizmoDragging],
+  )
+
+  const handlePointerOver = useCallback(
+    (point: CSketchPointSummary) => (e: ThreeEvent<PointerEvent>) => {
+      if (point.is_fixed) return
+      e.stopPropagation()
+      setHoverId(point.id)
+    },
+    [],
+  )
+
+  const handlePointerOut = useCallback(
+    (point: CSketchPointSummary) => () => {
+      if (point.is_fixed) return
+      setHoverId((prev) => (prev === point.id ? null : prev))
+    },
+    [],
+  )
+
+  if (!activeId || !summary || summary.points.length === 0) return null
+
+  return (
+    <group name="csketch-points">
+      {summary.points.map((p) => {
+        const world = uvToWorld([p.x, p.y], plane)
+        const isDragging = draggingId === p.id
+        const isHover = hoverId === p.id
+        // Visual states — order matters: dragging beats hover beats
+        // construction, all override the default solid white.
+        const color = p.is_fixed
+          ? '#6b7280' // gray-500 — pinned, not draggable
+          : isDragging
+            ? '#fb923c' // orange-400 — live drag
+            : isHover
+              ? '#22d3ee' // cyan-400 — hover lock-on
+              : p.is_construction
+                ? '#a78bfa' // violet-400 — construction-only point
+                : '#f5f5f5' // neutral-100 — default
+        const radius = p.is_fixed ? 0.18 : 0.24
+        return (
+          <mesh
+            key={p.id}
+            position={world}
+            onPointerDown={p.is_fixed ? undefined : handlePointerDown(p)}
+            onPointerOver={p.is_fixed ? undefined : handlePointerOver(p)}
+            onPointerOut={p.is_fixed ? undefined : handlePointerOut(p)}
+          >
+            <sphereGeometry args={[radius, 12, 12]} />
+            <meshBasicMaterial
+              color={color}
+              transparent
+              opacity={p.is_fixed ? 0.7 : 0.95}
+              depthTest={false}
+              depthWrite={false}
+            />
+          </mesh>
+        )
+      })}
     </group>
   )
 }
