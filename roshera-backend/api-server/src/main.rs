@@ -5076,6 +5076,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/csketch/{id}/point", post(csketch::add_point))
         .route("/api/csketch/{id}/line", post(csketch::add_line))
         .route("/api/csketch/{id}/circle", post(csketch::add_circle))
+        .route("/api/csketch/{id}/spline", post(csketch::add_spline))
         .route(
             "/api/csketch/{id}/constraint",
             post(csketch::add_constraint),
