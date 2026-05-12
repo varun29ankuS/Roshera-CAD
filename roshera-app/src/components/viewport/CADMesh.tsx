@@ -30,6 +30,12 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   const editingSketch = useSceneStore(
     (s) => s.sketch.active && s.sketch.serverId !== null,
   )
+  // Any active sketch session — including a fresh-from-scratch sketch
+  // (serverId === null) — must let pointer events fall through to the
+  // SketchOverlay capture plane behind the solids. Otherwise the
+  // raycaster hits CAD geometry first, this mesh's handlers fire with
+  // e.stopPropagation(), and the user can only click in empty space.
+  const sketchActive = useSceneStore((s) => s.sketch.active)
   const sectionView = useSceneStore((s) => s.sectionView)
 
   const { defaultEdgeHex, accentEdgeHex } = useMemo(() => {
@@ -132,6 +138,10 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
 
   const handleClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
+      // While a sketch is active, the SketchOverlay capture plane owns
+      // left-click. Bail without stopPropagation so R3F continues
+      // dispatching the event to the next intersected mesh (the plane).
+      if (sketchActive) return
       e.stopPropagation()
 
       if (selectionMode === 'object') {
@@ -174,7 +184,7 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
         request_id: `pick-${object.id}-${elementIndex}-${Date.now()}`,
       })
     },
-    [selectObject, toggleSubElementSelection, resolveFaceId, object.id, selectionMode],
+    [sketchActive, selectObject, toggleSubElementSelection, resolveFaceId, object.id, selectionMode],
   )
 
   const setHoveredSubElement = useSceneStore((s) => s.setHoveredSubElement)
@@ -209,17 +219,23 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
 
   const handlePointerOver = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
+      // Sketch active → let hover fall through to the capture plane
+      // (which manages its own crosshair cursor and snap state). If we
+      // ran the body, body.cursor would oscillate between 'pointer' and
+      // 'crosshair' as the user moved on/off CAD meshes.
+      if (sketchActive) return
       e.stopPropagation()
       setHovered(object.id)
       document.body.style.cursor = selectionMode === 'face' ? 'cell'
         : selectionMode === 'edge' || selectionMode === 'vertex' ? 'crosshair'
         : 'pointer'
     },
-    [setHovered, object.id, selectionMode],
+    [sketchActive, setHovered, object.id, selectionMode],
   )
 
   const handlePointerMove = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
+      if (sketchActive) return
       if (selectionMode === 'object') return
       e.stopPropagation()
       const faceIndex = e.faceIndex ?? 0
@@ -230,14 +246,15 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
         index: faceIndex,
       })
     },
-    [selectionMode, object.id, setHoveredSubElement],
+    [sketchActive, selectionMode, object.id, setHoveredSubElement],
   )
 
   const handlePointerOut = useCallback(() => {
+    if (sketchActive) return
     setHovered(null)
     setHoveredSubElement(null)
     document.body.style.cursor = 'default'
-  }, [setHovered, setHoveredSubElement])
+  }, [sketchActive, setHovered, setHoveredSubElement])
 
   return (
     <mesh
