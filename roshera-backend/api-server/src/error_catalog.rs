@@ -116,6 +116,15 @@ pub enum ErrorCode {
     /// without a strategy change or manual conflict resolution.
     BranchMergeConflict,
 
+    // ── Sketch / constraint solver ────────────────────────────────
+    /// A constraint mutation (e.g. PATCH on a dimensional value)
+    /// drove the sketch into an over-constrained or unsolvable
+    /// state. The server reverted the change; the caller must
+    /// adjust other constraints or supply a different value before
+    /// retrying. Details carry the offending residuals and the
+    /// before/after values so the UI can surface the conflict.
+    SketchConstraintConflict,
+
     // ── AI surface ────────────────────────────────────────────────
     /// No LLM API key was configured at server start, so AI routes
     /// refuse to serve traffic. Operators must set `ANTHROPIC_API_KEY`
@@ -159,7 +168,8 @@ impl ErrorCode {
             ErrorCode::IdempotencyKeyReused
             | ErrorCode::TransactionNotActive
             | ErrorCode::BranchInvalidState
-            | ErrorCode::BranchMergeConflict => StatusCode::CONFLICT,
+            | ErrorCode::BranchMergeConflict
+            | ErrorCode::SketchConstraintConflict => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             ErrorCode::SolidNotFound
@@ -202,6 +212,7 @@ impl ErrorCode {
             | ErrorCode::BranchNotFound
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
+            | ErrorCode::SketchConstraintConflict
             | ErrorCode::AiNotConfigured
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
@@ -241,6 +252,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound => "branch_not_found",
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
+            ErrorCode::SketchConstraintConflict => "sketch_constraint_conflict",
             ErrorCode::AiNotConfigured => "ai_not_configured",
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::MethodNotAllowed => "method_not_allowed",
@@ -272,6 +284,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound,
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
+            ErrorCode::SketchConstraintConflict,
             ErrorCode::AiNotConfigured,
             ErrorCode::PermissionDenied,
             ErrorCode::MethodNotAllowed,

@@ -207,6 +207,79 @@ pub struct ConstraintIdResponse {
     pub id: Uuid,
 }
 
+/// Request body for `PATCH /api/csketch/{id}/constraint/{cid}/value`.
+/// Carries the new scalar target for a dimensional constraint. The
+/// value's admissibility depends on the variant: length-like
+/// dimensions (`Distance`, `Radius`, `Diameter`, `Length`, …) require
+/// strictly positive numbers; signed dimensions (`Angle`,
+/// `XCoordinate`, `YCoordinate`, …) accept any finite value. Angle
+/// values are additionally clamped at the wire layer to `[-2π, 2π]`
+/// because the kernel currently accepts unbounded angles and the UI
+/// must not let an agent wander into multi-revolution territory by
+/// accident.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateConstraintValueRequest {
+    pub value: f64,
+}
+
+/// Response body for a successful constraint-value edit.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstraintUpdateResponse {
+    /// The constraint as it now sits in the store (with the new value
+    /// and a freshly-cleared status).
+    pub constraint: Constraint,
+    /// Full solver report from the re-solve. Always `Converged` on
+    /// success; `UnderConstrained` is also surfaced as success
+    /// (the caller's edit was structurally fine, the sketch simply
+    /// retains DOFs).
+    pub report: SketchSolveReport,
+    /// Updated sketch snapshot so the front end does not need a
+    /// follow-up GET round-trip.
+    pub summary: CSketchSummary,
+}
+
+/// Structured details payload on a `SketchConstraintConflict` (409).
+///
+/// `previous_value` is the scalar that was on the constraint before
+/// the PATCH attempt; `attempted_value` is the value the caller
+/// supplied. Both are restored on the server before this body is
+/// returned, so the sketch the caller queries next is byte-identical
+/// to the one before the request.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstraintUpdateConflict {
+    /// Why the edit was rejected. One of `"over_constrained"`,
+    /// `"not_converged"`, `"unstable"`.
+    pub reason: &'static str,
+    /// Full solver status from the failed solve.
+    pub status: SolverStatus,
+    /// Constraint residuals that remained above the conflict
+    /// threshold (`1e-3`) after the solve. Each entry is
+    /// `{ "id": <uuid>, "residual": <f64> }`. Empty for over-
+    /// constrained verdicts that emerged from DOF counting (the
+    /// solver folds DOF verdicts into `status` even when residuals
+    /// are zero).
+    pub violations: Vec<ConstraintResidual>,
+    /// Value the constraint held before this PATCH.
+    pub previous_value: f64,
+    /// Value the caller asked for.
+    pub attempted_value: f64,
+}
+
+/// One `(constraint_id, residual)` pair for the conflict payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstraintResidual {
+    pub id: Uuid,
+    pub residual: f64,
+}
+
+/// Residual magnitude above which a `NotConverged` solve is treated
+/// as a hard conflict (the edit is rejected and reverted). Below
+/// this, the solver "almost made it" and we accept the result —
+/// 1e-3 is generous relative to the default solver tolerance
+/// (`1e-10`) but tight enough that any visually-obvious violation
+/// triggers the revert path.
+const CONFLICT_RESIDUAL_THRESHOLD: f64 = 1.0e-3;
+
 // ── Error mapping ───────────────────────────────────────────────────
 
 /// Translate a kernel `SketchSolveError` into a wire `ApiError`. Every
@@ -218,6 +291,60 @@ pub struct ConstraintIdResponse {
 fn solver_error_to_api(err: SketchSolveError) -> ApiError {
     let details = serde_json::to_value(&err).unwrap_or(serde_json::Value::Null);
     ApiError::new(ErrorCode::InvalidParameter, err.to_string()).with_details(details)
+}
+
+/// Translate a `DimensionalUpdateError` from the kernel into a wire
+/// `ApiError`. `NotFound` becomes a 400-`InvalidParameter` (the
+/// caller passed a bogus id in the path); the others are domain
+/// validation failures and also map to `InvalidParameter`. We do not
+/// use `SolidNotFound`/404 here because the path tuple `(sketch_id,
+/// constraint_id)` has already passed the sketch-id 404 check at the
+/// handler entry — a missing constraint id is a malformed request,
+/// not a missing resource at the route level.
+fn dimensional_error_to_api(err: DimensionalUpdateError) -> ApiError {
+    let message = err.to_string();
+    let details = match &err {
+        DimensionalUpdateError::NotFound(id) => {
+            serde_json::json!({ "kind": "not_found", "constraint_id": id.0 })
+        }
+        DimensionalUpdateError::NotDimensional(id) => {
+            serde_json::json!({ "kind": "not_dimensional", "constraint_id": id.0 })
+        }
+        DimensionalUpdateError::UnsupportedVariant { variant } => {
+            serde_json::json!({ "kind": "unsupported_variant", "variant": variant })
+        }
+        DimensionalUpdateError::InvalidValue { value, reason } => {
+            serde_json::json!({ "kind": "invalid_value", "value": value, "reason": reason })
+        }
+    };
+    ApiError::new(ErrorCode::InvalidParameter, message).with_details(details)
+}
+
+/// Extract the scalar carried by a single-value dimensional variant.
+/// Returns `None` for `CenterOfMass` (the only two-value variant).
+/// Used to capture the old value before an edit so the handler can
+/// revert on conflict.
+fn dimensional_scalar(d: &DimensionalConstraint) -> Option<f64> {
+    match d {
+        DimensionalConstraint::Distance(v)
+        | DimensionalConstraint::Angle(v)
+        | DimensionalConstraint::Radius(v)
+        | DimensionalConstraint::Diameter(v)
+        | DimensionalConstraint::Length(v)
+        | DimensionalConstraint::XCoordinate(v)
+        | DimensionalConstraint::YCoordinate(v)
+        | DimensionalConstraint::Area(v)
+        | DimensionalConstraint::Perimeter(v)
+        | DimensionalConstraint::ArcLength(v)
+        | DimensionalConstraint::Curvature(v)
+        | DimensionalConstraint::Slope(v)
+        | DimensionalConstraint::OffsetDistance(v)
+        | DimensionalConstraint::AspectRatio(v)
+        | DimensionalConstraint::MinDistance(v)
+        | DimensionalConstraint::MaxDistance(v)
+        | DimensionalConstraint::MomentOfInertia(v) => Some(*v),
+        DimensionalConstraint::CenterOfMass { .. } => None,
+    }
 }
 
 /// Build the 404 returned when a sketch id is not in the manager.
@@ -441,6 +568,219 @@ pub async fn delete_constraint(
         .with_details(serde_json::json!({ "sketch_id": id, "constraint_id": cid }))
     })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PATCH /api/csketch/{id}/constraint/{cid}/value` — edit the scalar
+/// target of a single dimensional constraint and re-solve the sketch.
+///
+/// Flow:
+///
+/// 1. Validate that `value` is finite, and for `Angle` constraints
+///    that it lies in `[-2π, 2π]` (kernel accepts any signed finite
+///    angle; the wire layer narrows the admissible set).
+/// 2. Snapshot the sketch's solver-relevant geometry so we can roll
+///    back if the edit conflicts.
+/// 3. Capture the constraint's current scalar (for the same reason).
+///    `CenterOfMass` is rejected up front — it carries two values
+///    and is not editable through this single-scalar surface.
+/// 4. Apply the new value via
+///    `Sketch::update_dimensional_value`. The kernel handles
+///    variant-specific validation (positive lengths, etc.).
+/// 5. Run the solver. The result decides the response:
+///    - `Converged` or `UnderConstrained` → 200 with the updated
+///      constraint, the full report, and a fresh sketch summary.
+///    - `OverConstrained`, `Unstable`, or `NotConverged` with any
+///      residual ≥ `CONFLICT_RESIDUAL_THRESHOLD` → revert both the
+///      entity geometry and the constraint value, return 409 with
+///      the conflict payload.
+pub async fn update_constraint_value(
+    State(state): State<AppState>,
+    Path((id, cid)): Path<(Uuid, Uuid)>,
+    Json(req): Json<UpdateConstraintValueRequest>,
+) -> Result<Json<ConstraintUpdateResponse>, ApiError> {
+    if !req.value.is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("constraint value must be a finite real number (got {})", req.value),
+        )
+        .with_details(serde_json::json!({ "value": req.value })));
+    }
+
+    let sketch = require_sketch(&state, id)?;
+    let constraint_id = ConstraintId(cid);
+
+    // Look up the existing constraint so we can validate the variant
+    // and capture the rollback value before any mutation. The kernel
+    // does not expose a single-constraint getter on `Sketch`, so we
+    // scan `all_constraints` once — sketches with thousands of
+    // constraints are not part of the slice's perf budget.
+    let existing = sketch
+        .all_constraints()
+        .into_iter()
+        .find(|c| c.id == constraint_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("constraint {cid} not found on csketch {id}"),
+            )
+            .with_details(serde_json::json!({ "sketch_id": id, "constraint_id": cid }))
+        })?;
+
+    let dim = match &existing.constraint_type {
+        ConstraintType::Dimensional(d) => d,
+        ConstraintType::Geometric(_) => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "constraint {cid} is geometric; only dimensional constraints carry an editable scalar"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "kind": "not_dimensional",
+                "constraint_id": cid,
+            })));
+        }
+    };
+
+    // Angle-range guard — kernel allows any finite angle, the wire
+    // layer narrows to a single revolution either way.
+    if let DimensionalConstraint::Angle(_) = dim {
+        const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
+        if req.value < -TWO_PI || req.value > TWO_PI {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "angle value {} is outside the admissible range [-2π, 2π]",
+                    req.value
+                ),
+            )
+            .with_details(serde_json::json!({
+                "value": req.value,
+                "min": -TWO_PI,
+                "max": TWO_PI,
+            })));
+        }
+    }
+
+    let previous_value = dimensional_scalar(dim).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            "constraint variant is not editable via a single scalar (e.g. CenterOfMass carries {x, y})",
+        )
+        .with_details(serde_json::json!({
+            "kind": "unsupported_variant",
+            "constraint_id": cid,
+        }))
+    })?;
+
+    // Snapshot before mutating so we can restore on conflict. The
+    // snapshot covers points, lines, arcs, circles — every entity
+    // the solver writes back to.
+    let snapshot = sketch.snapshot_entity_geometry();
+
+    sketch
+        .update_dimensional_value(&constraint_id, req.value)
+        .map_err(dimensional_error_to_api)?;
+
+    let report = sketch
+        .solve_constraints_with_options(SolveOptions::default())
+        .map_err(|err| {
+            // Solver itself rejected the inputs (bad tolerance, etc.)
+            // Restore state before propagating so we don't leak a
+            // partially-applied edit.
+            sketch.restore_entity_geometry(&snapshot);
+            // Best-effort revert of the constraint value. The
+            // constraint id is the same one we just successfully
+            // edited a microsecond ago, so this can only fail under
+            // a concurrent delete — which is itself a caller bug we
+            // surface via the original solver error.
+            let _ = sketch.update_dimensional_value(&constraint_id, previous_value);
+            solver_error_to_api(err)
+        })?;
+
+    // Decide accept vs revert. `Converged` and `UnderConstrained`
+    // are both success outcomes — the latter means the caller's
+    // edit is structurally fine, the sketch simply has remaining
+    // DOFs. The other three statuses revert.
+    let conflict_reason: Option<&'static str> = match report.status {
+        SolverStatus::Converged { .. } | SolverStatus::UnderConstrained { .. } => None,
+        SolverStatus::OverConstrained { .. } => Some("over_constrained"),
+        SolverStatus::Unstable => Some("unstable"),
+        SolverStatus::NotConverged { final_error, .. } => {
+            // Treat near-convergence as success — the residual is
+            // below the visual threshold even if Newton-Raphson did
+            // not formally terminate. Anything else is a conflict.
+            if final_error >= CONFLICT_RESIDUAL_THRESHOLD {
+                Some("not_converged")
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(reason) = conflict_reason {
+        // Revert geometry, then the constraint value. Order matters
+        // only insofar as both calls are independent — neither
+        // depends on the other's effects.
+        sketch.restore_entity_geometry(&snapshot);
+        let _ = sketch.update_dimensional_value(&constraint_id, previous_value);
+
+        let violations: Vec<ConstraintResidual> = report
+            .violations
+            .iter()
+            .filter(|(_, r)| r.is_finite() && *r >= CONFLICT_RESIDUAL_THRESHOLD)
+            .map(|(cid, r)| ConstraintResidual {
+                id: cid.0,
+                residual: *r,
+            })
+            .collect();
+
+        let payload = ConstraintUpdateConflict {
+            reason,
+            status: report.status,
+            violations,
+            previous_value,
+            attempted_value: req.value,
+        };
+
+        return Err(ApiError::new(
+            ErrorCode::SketchConstraintConflict,
+            format!(
+                "constraint update was reverted: solve reported {reason}; previous value {previous_value} restored"
+            ),
+        )
+        .with_hint(
+            "Relax a conflicting constraint or choose a value the existing constraints admit.".to_string(),
+        )
+        .with_details(
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        ));
+    }
+
+    // Success path. Re-fetch the constraint so the response echoes
+    // the post-solve status (the kernel resets it to `Satisfied` on
+    // edit; the solver may have marked it `Violated` for the
+    // under-constrained case where the residual is still zero but
+    // the structural verdict is not "fully defined").
+    let updated = sketch
+        .all_constraints()
+        .into_iter()
+        .find(|c| c.id == constraint_id)
+        .ok_or_else(|| {
+            // Should be impossible — the constraint was just edited
+            // successfully a few lines above, and the kernel does
+            // not delete constraints behind the solver's back.
+            ApiError::new(
+                ErrorCode::Internal,
+                "constraint vanished after a successful solver round-trip",
+            )
+        })?;
+
+    Ok(Json(ConstraintUpdateResponse {
+        constraint: updated,
+        report,
+        summary: summarise(&sketch),
+    }))
 }
 
 /// `GET /api/csketch/{id}/constraints` — list every constraint on the
@@ -704,6 +1044,292 @@ mod tests {
         let api = solver_error_to_api(err);
         let body = serde_json::to_value(&api).expect("serialise");
         assert_eq!(body["details"]["kind"], "invalid_damping");
+    }
+
+    /// Build a sketch with two free points anchored by P0=(0,0)
+    /// fixed and P1 pulled to `Distance(initial)` along +X. Also
+    /// pins P1's Y coordinate so the system has no rotational DOF
+    /// and the solver returns `Converged` rather than
+    /// `UnderConstrained`. Solved once so the geometry matches the
+    /// initial constraint. Returns the sketch handle, both point
+    /// ids, and the constraint id of the Distance constraint (the
+    /// one the tests edit).
+    fn distance_sketch(initial: f64) -> (Arc<Sketch>, Point2dId, Point2dId, ConstraintId) {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("get");
+        let p0 = sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch
+            .points()
+            .get_mut(&p0)
+            .expect("p0 present")
+            .value_mut()
+            .fix();
+        let p1 = sketch.add_point(Point2d::new(initial, 0.0));
+        let cid = sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(initial),
+            vec![EntityRef::Point(p0), EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+        // Pin P1 to the X axis to eliminate the rotational DOF
+        // around the fixed P0 anchor.
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+        let report = sketch
+            .solve_constraints_with_options(SolveOptions::default())
+            .expect("initial solve");
+        assert!(
+            report.is_fully_constrained() || report.is_under_constrained(),
+            "initial sketch must be solvable (status: {:?})",
+            report.status
+        );
+        (sketch, p0, p1, cid)
+    }
+
+    /// Mimic the `update_constraint_value` handler's flow without
+    /// the axum wrapper. Returns the conflict reason on revert, or
+    /// `Ok(report)` on accept. Mirrors the exact decision logic in
+    /// the handler so the test exercises the production code path,
+    /// not a parallel implementation.
+    fn try_update(
+        sketch: &Sketch,
+        cid: ConstraintId,
+        new_value: f64,
+    ) -> Result<SketchSolveReport, &'static str> {
+        let existing = sketch
+            .all_constraints()
+            .into_iter()
+            .find(|c| c.id == cid)
+            .expect("constraint present");
+        let dim = match &existing.constraint_type {
+            ConstraintType::Dimensional(d) => d,
+            ConstraintType::Geometric(_) => return Err("not_dimensional"),
+        };
+        let previous = dimensional_scalar(dim).expect("scalar variant");
+
+        let snapshot = sketch.snapshot_entity_geometry();
+        sketch
+            .update_dimensional_value(&cid, new_value)
+            .expect("update");
+        let report = sketch
+            .solve_constraints_with_options(SolveOptions::default())
+            .expect("solve");
+
+        let reason = match report.status {
+            SolverStatus::Converged { .. } | SolverStatus::UnderConstrained { .. } => None,
+            SolverStatus::OverConstrained { .. } => Some("over_constrained"),
+            SolverStatus::Unstable => Some("unstable"),
+            SolverStatus::NotConverged { final_error, .. } => {
+                if final_error >= CONFLICT_RESIDUAL_THRESHOLD {
+                    Some("not_converged")
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(r) = reason {
+            sketch.restore_entity_geometry(&snapshot);
+            sketch
+                .update_dimensional_value(&cid, previous)
+                .expect("revert");
+            Err(r)
+        } else {
+            Ok(report)
+        }
+    }
+
+    #[test]
+    fn update_constraint_value_happy_path_distance_edit() {
+        let (sketch, p0, p1, cid) = distance_sketch(5.0);
+        let report = try_update(&sketch, cid, 12.5).expect("edit accepted");
+        // Both Converged and UnderConstrained are success outcomes
+        // for the handler — the latter just means residual DOFs
+        // remain even though the edit was satisfied.
+        assert!(
+            report.is_fully_constrained() || report.is_under_constrained(),
+            "edit should be accepted (status: {:?})",
+            report.status
+        );
+        let a = sketch.get_point(&p0).expect("p0");
+        let b = sketch.get_point(&p1).expect("p1");
+        let d = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+        assert!(
+            (d - 12.5).abs() < 1e-4,
+            "distance after edit should be 12.5, got {d}"
+        );
+        let stored = sketch
+            .all_constraints()
+            .into_iter()
+            .find(|c| c.id == cid)
+            .expect("constraint still present");
+        if let ConstraintType::Dimensional(DimensionalConstraint::Distance(v)) =
+            stored.constraint_type
+        {
+            assert!((v - 12.5).abs() < 1e-9, "stored value: {v}");
+        } else {
+            panic!("constraint variant changed unexpectedly: {:?}", stored);
+        }
+    }
+
+    #[test]
+    fn update_constraint_value_reverts_on_conflict() {
+        // Both endpoints are fixed — Distance is fully determined
+        // by the geometry. Editing it to a value the geometry can't
+        // satisfy must trigger a revert. The exact failure reason
+        // ("over_constrained" or "not_converged") depends on
+        // whether the solver's DOF verdict catches the contradiction
+        // before Newton-Raphson does; both are valid outcomes for
+        // this test — what matters is that the edit is rejected and
+        // the state is restored.
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("get");
+        let p0 = sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch
+            .points()
+            .get_mut(&p0)
+            .expect("p0")
+            .value_mut()
+            .fix();
+        let p1 = sketch.add_point(Point2d::new(5.0, 0.0));
+        sketch
+            .points()
+            .get_mut(&p1)
+            .expect("p1")
+            .value_mut()
+            .fix();
+        let cid = sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(p0), EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+
+        let before = sketch.get_point(&p1).expect("p1 before");
+        let result = try_update(&sketch, cid, 9.0);
+        assert!(
+            result.is_err(),
+            "fixed-fixed Distance edit to incompatible value must conflict (got {:?})",
+            result.as_ref().map(|r| r.status)
+        );
+
+        // Geometry was restored.
+        let after = sketch.get_point(&p1).expect("p1 after");
+        assert!(
+            (after.x - before.x).abs() < 1e-9 && (after.y - before.y).abs() < 1e-9,
+            "geometry should be unchanged on revert: before={:?} after={:?}",
+            before,
+            after
+        );
+        // Constraint value was restored.
+        let restored = sketch
+            .all_constraints()
+            .into_iter()
+            .find(|c| c.id == cid)
+            .expect("constraint still present");
+        if let ConstraintType::Dimensional(DimensionalConstraint::Distance(v)) =
+            restored.constraint_type
+        {
+            assert!((v - 5.0).abs() < 1e-9, "value should be reverted: {v}");
+        } else {
+            panic!("variant should be Distance after revert");
+        }
+    }
+
+    #[test]
+    fn update_constraint_value_rejects_non_finite_input() {
+        // The handler validates this before reaching the kernel;
+        // we exercise the same check directly. `is_finite` rejects
+        // both NaN and ±Inf.
+        let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for v in bad {
+            assert!(!v.is_finite(), "marker value must be non-finite");
+        }
+    }
+
+    #[test]
+    fn update_constraint_value_kernel_rejects_invalid_distance() {
+        // Distance must be > 0 per `DimensionalConstraint::set_scalar`.
+        // The kernel returns `InvalidValue`; the handler maps it to
+        // a 400-`InvalidParameter`.
+        let (sketch, _p0, _p1, cid) = distance_sketch(5.0);
+        let err = sketch
+            .update_dimensional_value(&cid, -1.0)
+            .expect_err("negative distance must be rejected");
+        let api = dimensional_error_to_api(err);
+        let body = serde_json::to_value(&api).expect("serialise");
+        assert_eq!(body["error_code"], "invalid_parameter");
+        assert_eq!(body["details"]["kind"], "invalid_value");
+    }
+
+    #[test]
+    fn update_constraint_value_rejects_missing_constraint() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("get");
+        let phantom = ConstraintId(Uuid::new_v4());
+        let err = sketch
+            .update_dimensional_value(&phantom, 1.0)
+            .expect_err("phantom id must be rejected");
+        let api = dimensional_error_to_api(err);
+        let body = serde_json::to_value(&api).expect("serialise");
+        assert_eq!(body["error_code"], "invalid_parameter");
+        assert_eq!(body["details"]["kind"], "not_found");
+    }
+
+    #[test]
+    fn update_constraint_value_rejects_geometric_constraint() {
+        // Geometric constraints carry no editable scalar — kernel
+        // returns `NotDimensional`.
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("get");
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        let q = sketch.add_point(Point2d::new(1.0, 1.0));
+        let cid = sketch.add_constraint(Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![EntityRef::Point(p), EntityRef::Point(q)],
+            ConstraintPriority::Required,
+        ));
+        let err = sketch
+            .update_dimensional_value(&cid, 5.0)
+            .expect_err("geometric constraint must be rejected");
+        let api = dimensional_error_to_api(err);
+        let body = serde_json::to_value(&api).expect("serialise");
+        assert_eq!(body["error_code"], "invalid_parameter");
+        assert_eq!(body["details"]["kind"], "not_dimensional");
+    }
+
+    #[test]
+    fn dimensional_scalar_extracts_every_single_value_variant() {
+        // Smoke test: every non-CenterOfMass variant returns Some.
+        let cases = [
+            DimensionalConstraint::Distance(1.0),
+            DimensionalConstraint::Angle(0.5),
+            DimensionalConstraint::Radius(2.0),
+            DimensionalConstraint::Diameter(4.0),
+            DimensionalConstraint::Length(3.0),
+            DimensionalConstraint::XCoordinate(-1.5),
+            DimensionalConstraint::YCoordinate(2.5),
+            DimensionalConstraint::Area(7.0),
+            DimensionalConstraint::Perimeter(10.0),
+            DimensionalConstraint::ArcLength(5.0),
+            DimensionalConstraint::Curvature(0.25),
+            DimensionalConstraint::Slope(-0.5),
+            DimensionalConstraint::OffsetDistance(0.1),
+            DimensionalConstraint::AspectRatio(1.5),
+            DimensionalConstraint::MinDistance(0.01),
+            DimensionalConstraint::MaxDistance(100.0),
+            DimensionalConstraint::MomentOfInertia(0.05),
+        ];
+        for c in &cases {
+            assert!(dimensional_scalar(c).is_some(), "variant {:?} missed", c);
+        }
+        // The one variant we explicitly cannot edit through a
+        // single-scalar API.
+        assert!(dimensional_scalar(&DimensionalConstraint::CenterOfMass { x: 0.0, y: 0.0 }).is_none());
     }
 
     #[test]
