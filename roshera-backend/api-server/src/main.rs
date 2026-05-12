@@ -5025,6 +5025,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/sketch/{id}/revolve", post(sketch::revolve_sketch))
         .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
+        // Region preview — server-authoritative outer/hole topology
+        // classification for the multi-shape extrusion workflow. The
+        // GET form reads the regions for a stored session; the POST
+        // form is stateless (caller supplies polygons directly) for
+        // clients that materialise their own shapes. WS clients also
+        // receive `SketchRegionsUpdated` frames on every mutation,
+        // so polling these endpoints is not required.
+        .route(
+            "/api/sketch/{id}/regions",
+            get(sketch::get_sketch_regions),
+        )
+        .route(
+            "/api/sketch/regions/preview",
+            post(sketch::preview_regions),
+        )
         // Multi-shape control — a sketch session may carry multiple
         // shapes; outer/hole classification is decided geometrically
         // at extrude time, so there is no per-shape role tag. The
