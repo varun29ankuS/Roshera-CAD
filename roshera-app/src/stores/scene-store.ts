@@ -6,6 +6,18 @@ import {
   type ServerSketchSession,
   type ServerSketchShape,
 } from '@/lib/sketch-api'
+import {
+  csketchApi,
+  type AddCircleRequest,
+  type AddLineRequest,
+  type AddPointRequest,
+  type Constraint,
+  type CSketchSummary,
+  type DofReport,
+  type DragRequest,
+  type SketchSolveReport,
+  type SolveOptions,
+} from '@/lib/csketch-api'
 
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
@@ -377,6 +389,60 @@ export interface SketchState {
   inferenceAxis: InferenceAxis | null
 }
 
+// ─── Constrained sketch (csketch) state ──────────────────────────────
+//
+// The constrained sketch is the parametric Newton-Raphson sketcher
+// (kernel `Sketch` over `/api/csketch/*`). It is intentionally a
+// separate state slice from the click-to-place `sketch` above: the
+// two surfaces speak different REST APIs, hold different entity
+// shapes, and serve different user flows. Bundling them would force
+// every consumer to discriminate on a "mode" tag at every access.
+//
+// The frontend never mutates a csketch optimistically. Every action
+// dispatches a REST call and then folds the response (or a follow-up
+// `get` / `listConstraints`) into the slice. WebSocket sync for
+// csketches is not wired in this slice — the editing surface is
+// strictly request/response — so a peer-side edit will not surface
+// until the local view explicitly refreshes. Slice N-3 / D-3 will
+// revisit this once the editor has live-collaboration value.
+export interface CSketchState {
+  /**
+   * Every known csketch keyed by server id, populated by
+   * `refreshCSketches`, `createCSketch`, and per-mutation refreshes.
+   * Used by the model tree / pickers to list every live csketch
+   * without forcing the caller to hold a separate cache.
+   */
+  summaries: Map<string, CSketchSummary>
+  /**
+   * Server id of the csketch the editor is currently bound to.
+   * `null` when no csketch is open. Mutations target this id; the
+   * caller must `openCSketch(id)` before they can dispatch.
+   */
+  activeId: string | null
+  /**
+   * Constraints of the active csketch. Mirrors `GET
+   * /api/csketch/{id}/constraints`. Empty when no csketch is open
+   * or the active one has zero constraints.
+   */
+  activeConstraints: Constraint[]
+  /**
+   * Most recent solver verdict on the active csketch, or `null`
+   * when the editor has not solved since opening it. Carries the
+   * status (converged / under-/over-constrained / unstable), the
+   * residuals, and the wall-clock cost. Updated by every
+   * `solveCSketch` and `dragCSketch` call; also updated by
+   * `updateCSketchConstraintValue` on the success path (the server
+   * returns the full report in the same response).
+   */
+  lastReport: SketchSolveReport | null
+  /**
+   * Structural-DOF analysis for the active csketch, or `null` when
+   * the editor has not requested one. Cheap (no Newton-Raphson),
+   * suitable for refresh on every constraint add / remove.
+   */
+  lastDofReport: DofReport | null
+}
+
 // ─── Scene store ─────────────────────────────────────────────────────
 interface SceneState {
   // Objects
@@ -609,6 +675,103 @@ interface SceneState {
    * the local `sketch.points` from the server snapshot.
    */
   editServerSketch: (id: string) => void
+
+  // ─── Constrained sketch (csketch) ──────────────────────────────────
+  /**
+   * The constrained-sketch slice. See {@link CSketchState}. Mutations
+   * flow exclusively through the `*CSketch*` actions below — never
+   * patch this object directly.
+   */
+  csketch: CSketchState
+  /**
+   * Create a fresh empty csketch on the server, refresh the summary
+   * map, and make it the active csketch. Returns the new id so
+   * callers can chain follow-up dispatches without re-reading state.
+   */
+  createCSketch: () => Promise<string>
+  /**
+   * Load an existing csketch as active. Fetches the entity summary
+   * and the full constraint list in parallel; clears `lastReport`
+   * and `lastDofReport` because both belonged to the previous
+   * active csketch. Throws if the server returns 404.
+   */
+  openCSketch: (id: string) => Promise<void>
+  /**
+   * Clear `activeId`, `activeConstraints`, `lastReport`,
+   * `lastDofReport`. Does not delete the csketch on the server.
+   */
+  closeCSketch: () => void
+  /**
+   * Delete a csketch on the server, drop it from `summaries`, and —
+   * if it was the active one — clear all active-csketch state.
+   */
+  deleteCSketch: (id: string) => Promise<void>
+  /**
+   * Re-fetch every live csketch id from the server and replace the
+   * `summaries` map. Each id is paid one `GET /csketch/{id}` so the
+   * map stays full-fidelity. Intended as a connect-time hydration
+   * call, not a hot-path action.
+   */
+  refreshCSketches: () => Promise<void>
+  /**
+   * Re-fetch a single csketch's summary (and, when it is the active
+   * one, its constraints). Cheaper than `refreshCSketches` for
+   * post-mutation reconciliation.
+   */
+  refreshCSketch: (id: string) => Promise<void>
+  /**
+   * Add a point to the csketch identified by `id`. Returns the new
+   * point's UUID once the round-trip resolves; the summary is
+   * refreshed before this resolves so observers reading state see
+   * the new point.
+   */
+  addCSketchPoint: (id: string, body: AddPointRequest) => Promise<string>
+  /** Add a line segment between two existing points. */
+  addCSketchLine: (id: string, body: AddLineRequest) => Promise<string>
+  /** Add a circle by centre + radius. */
+  addCSketchCircle: (id: string, body: AddCircleRequest) => Promise<string>
+  /**
+   * Add a fully-formed kernel constraint. The caller is responsible
+   * for filling in `id` (typically `crypto.randomUUID()`), the
+   * `constraint_type`, the involved `entities`, the `priority`, and
+   * the initial `status`. `name` may be `null`.
+   */
+  addCSketchConstraint: (id: string, constraint: Constraint) => Promise<string>
+  /** Remove a constraint by id. */
+  deleteCSketchConstraint: (id: string, cid: string) => Promise<void>
+  /**
+   * Edit the scalar target of a dimensional constraint and re-solve.
+   * The success response carries an up-to-date summary and the
+   * solver report, both of which are folded into the slice. On a
+   * 409 the server has already reverted; the typed
+   * `CSketchConstraintConflictError` thrown by the API client is
+   * re-thrown so the caller can surface it in the UI.
+   */
+  updateCSketchConstraintValue: (
+    id: string,
+    cid: string,
+    value: number,
+  ) => Promise<SketchSolveReport>
+  /**
+   * Run the Newton-Raphson solver. Pass `undefined` to use server
+   * defaults (`max_iterations=100`, `tolerance=1e-10`,
+   * `damping_factor=0.5`). The report is stored in `lastReport` and
+   * the summary is refreshed (the solver may have moved entities).
+   */
+  solveCSketch: (id: string, options?: SolveOptions) => Promise<SketchSolveReport>
+  /**
+   * Drag a single entity toward a target while honouring every
+   * other constraint. Stores the resulting report and refreshes the
+   * summary.
+   */
+  dragCSketch: (id: string, body: DragRequest) => Promise<SketchSolveReport>
+  /**
+   * Run the cheap structural-DOF analysis (no Newton-Raphson). The
+   * result is stored in `lastDofReport`. Safe to call after every
+   * constraint add / remove for a reactive "DOF: 3" badge.
+   */
+  analyseCSketchDof: (id: string) => Promise<DofReport>
+
   setSceneRef: (scene: THREE.Scene | null) => void
   setCameraRef: (camera: THREE.Camera | null) => void
   setGlRef: (gl: THREE.WebGLRenderer | null) => void
@@ -672,6 +835,13 @@ export const useSceneStore = create<SceneState>()(
       inferenceAxis: null,
     },
     serverSketches: new Map(),
+    csketch: {
+      summaries: new Map(),
+      activeId: null,
+      activeConstraints: [],
+      lastReport: null,
+      lastDofReport: null,
+    },
     sceneRef: null,
     cameraRef: null,
     glRef: null,
@@ -1377,6 +1547,234 @@ export const useSceneStore = create<SceneState>()(
         cameraPreset: presetKey,
         pendingCameraPreset: preset ?? state.pendingCameraPreset,
       }))
+    },
+
+    // ─── Constrained sketch actions ─────────────────────────────────
+    //
+    // Every mutating action follows the same shape: dispatch the REST
+    // call, then refresh the local mirror from the server's response
+    // (either the response body itself when it carries a `summary` —
+    // `updateCSketchConstraintValue` does — or a follow-up GET).
+    // There is no optimistic local mutation; the backend is the only
+    // source of truth, matching the architectural rule the
+    // click-to-place sketch follows.
+    createCSketch: async () => {
+      const { id } = await csketchApi.create()
+      const summary = await csketchApi.get(id)
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.set(id, summary)
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            activeId: id,
+            activeConstraints: [],
+            lastReport: null,
+            lastDofReport: null,
+          },
+        }
+      })
+      return id
+    },
+
+    openCSketch: async (id) => {
+      // Fetch summary + constraints in parallel — they are
+      // independent endpoints and the round-trip latency dominates
+      // either call on its own.
+      const [summary, constraints] = await Promise.all([
+        csketchApi.get(id),
+        csketchApi.listConstraints(id),
+      ])
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.set(id, summary)
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            activeId: id,
+            activeConstraints: constraints,
+            lastReport: null,
+            lastDofReport: null,
+          },
+        }
+      })
+    },
+
+    closeCSketch: () => {
+      set((state) => ({
+        csketch: {
+          ...state.csketch,
+          activeId: null,
+          activeConstraints: [],
+          lastReport: null,
+          lastDofReport: null,
+        },
+      }))
+    },
+
+    deleteCSketch: async (id) => {
+      await csketchApi.delete(id)
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.delete(id)
+        const wasActive = state.csketch.activeId === id
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            activeId: wasActive ? null : state.csketch.activeId,
+            activeConstraints: wasActive ? [] : state.csketch.activeConstraints,
+            lastReport: wasActive ? null : state.csketch.lastReport,
+            lastDofReport: wasActive ? null : state.csketch.lastDofReport,
+          },
+        }
+      })
+    },
+
+    refreshCSketches: async () => {
+      const ids = await csketchApi.list()
+      // Pay one `GET /csketch/{id}` per id so the map stays
+      // full-fidelity. The list endpoint itself returns only ids by
+      // design — sketches with many entities would otherwise force a
+      // heavy payload on every reconnect.
+      const summaries = await Promise.all(ids.map((id) => csketchApi.get(id)))
+      set((state) => {
+        const next = new Map<string, CSketchSummary>()
+        for (const s of summaries) next.set(s.id, s)
+        return {
+          csketch: { ...state.csketch, summaries: next },
+        }
+      })
+    },
+
+    refreshCSketch: async (id) => {
+      const summary = await csketchApi.get(id)
+      const isActive = get().csketch.activeId === id
+      const constraints = isActive ? await csketchApi.listConstraints(id) : null
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.set(id, summary)
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            activeConstraints: constraints ?? state.csketch.activeConstraints,
+          },
+        }
+      })
+    },
+
+    addCSketchPoint: async (id, body) => {
+      const { id: pid } = await csketchApi.addPoint(id, body)
+      await get().refreshCSketch(id)
+      return pid
+    },
+
+    addCSketchLine: async (id, body) => {
+      const { id: lid } = await csketchApi.addLine(id, body)
+      await get().refreshCSketch(id)
+      return lid
+    },
+
+    addCSketchCircle: async (id, body) => {
+      const { id: cid } = await csketchApi.addCircle(id, body)
+      await get().refreshCSketch(id)
+      return cid
+    },
+
+    addCSketchConstraint: async (id, constraint) => {
+      const { id: cid } = await csketchApi.addConstraint(id, constraint)
+      await get().refreshCSketch(id)
+      return cid
+    },
+
+    deleteCSketchConstraint: async (id, cid) => {
+      await csketchApi.deleteConstraint(id, cid)
+      await get().refreshCSketch(id)
+    },
+
+    updateCSketchConstraintValue: async (id, cid, value) => {
+      // The PATCH response carries summary + report + constraint in a
+      // single payload, so no follow-up GETs are needed. Conflicts
+      // throw `CSketchConstraintConflictError` — propagate untouched.
+      const resp = await csketchApi.updateConstraintValue(id, cid, value)
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.set(id, resp.summary)
+        const isActive = state.csketch.activeId === id
+        // Splice the updated constraint into `activeConstraints` if
+        // we hold a copy. Use a stable in-place replace so unrelated
+        // entries' identity is preserved (helps React memo paths in
+        // the constraint list view).
+        const activeConstraints = isActive
+          ? state.csketch.activeConstraints.map((c) =>
+              c.id === resp.constraint.id ? resp.constraint : c,
+            )
+          : state.csketch.activeConstraints
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            activeConstraints,
+            lastReport: isActive ? resp.report : state.csketch.lastReport,
+          },
+        }
+      })
+      return resp.report
+    },
+
+    solveCSketch: async (id, options) => {
+      const report = await csketchApi.solve(id, options)
+      // The solver may have moved entities; refresh the summary so
+      // any downstream renderer sees the new positions.
+      const summary = await csketchApi.get(id)
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.set(id, summary)
+        const isActive = state.csketch.activeId === id
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            lastReport: isActive ? report : state.csketch.lastReport,
+          },
+        }
+      })
+      return report
+    },
+
+    dragCSketch: async (id, body) => {
+      const report = await csketchApi.drag(id, body)
+      const summary = await csketchApi.get(id)
+      set((state) => {
+        const summaries = new Map(state.csketch.summaries)
+        summaries.set(id, summary)
+        const isActive = state.csketch.activeId === id
+        return {
+          csketch: {
+            ...state.csketch,
+            summaries,
+            lastReport: isActive ? report : state.csketch.lastReport,
+          },
+        }
+      })
+      return report
+    },
+
+    analyseCSketchDof: async (id) => {
+      const report = await csketchApi.dof(id)
+      set((state) => {
+        const isActive = state.csketch.activeId === id
+        return {
+          csketch: {
+            ...state.csketch,
+            lastDofReport: isActive ? report : state.csketch.lastDofReport,
+          },
+        }
+      })
+      return report
     },
 
     setSceneRef: (scene) => set({ sceneRef: scene }),
