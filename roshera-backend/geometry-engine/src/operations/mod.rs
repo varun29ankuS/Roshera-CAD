@@ -39,6 +39,11 @@ pub mod sew;
 // Not part of the public API — used by `boolean::split_face_by_curves` only.
 pub(crate) mod face_arrangement;
 
+// Internal helper for 2D polygon-polygon clipping used by the
+// coplanar-face overlap branch of the boolean pipeline (Slice E
+// imprint-merge). Not part of the public API.
+pub(crate) mod polygon_clip;
+
 // Internal helper for fillet/chamfer topology surgery — re-stitches the
 // 4-face neighbourhood (F1, F2, F3, F4) around a freshly created blend
 // face so the resulting B-Rep is watertight.
