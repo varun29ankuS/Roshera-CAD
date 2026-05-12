@@ -36,6 +36,7 @@ import { buildProfile2D } from '@/lib/sketch-extrude'
 import { ExtrudeRegionPreview } from './ExtrudeRegionPreview'
 import {
   CSketchConstraintConflictError,
+  csketchApi,
   pointRef,
   type Constraint,
   type CSketchCircleSummary,
@@ -43,10 +44,17 @@ import {
   type CSketchPointSummary,
   type CSketchSummary,
   type EntityRef,
+  type SnapCandidate,
 } from '@/lib/csketch-api'
 
 const PLANE_SIZE = 400 // world units; large enough that the user
                        // cannot click off-plane in normal use.
+
+// D-2-c snap-search radius in plane (u, v) units. Matches the
+// visual scale of `CSKETCH_GLYPH_SIZE` so the snap engine only
+// engages within a glyph-width of an existing entity — the same
+// "feel" as Fusion's hover-on-vertex magnetism.
+const CSKETCH_SNAP_RADIUS = 1.5
 
 /** Project a world-space `THREE.Vector3` onto the chosen sketch plane. */
 function pointToPlaneUV(
@@ -374,13 +382,105 @@ export function SketchOverlay() {
   const addCSketchPoint = useSceneStore((s) => s.addCSketchPoint)
   const addCSketchLine = useSceneStore((s) => s.addCSketchLine)
   const addCSketchCircle = useSceneStore((s) => s.addCSketchCircle)
-  const csketchDraftRef = useRef<{ uv: [number, number] } | null>(null)
+  // `pid` is set when the first click of a line gesture landed on
+  // an existing csketch point (via D-2-c snap reuse). Carrying it
+  // through to the second-click commit lets us skip the redundant
+  // addPoint call and reference the existing entity directly,
+  // avoiding stacked-point duplicates at shared vertices.
+  const csketchDraftRef = useRef<
+    { uv: [number, number]; pid: string | null } | null
+  >(null)
   // Whenever the user switches tool (or closes the csketch), forget
   // any half-committed first click — otherwise a stale anchor leaks
   // into the next gesture.
   useEffect(() => {
     csketchDraftRef.current = null
   }, [csketchActiveTool, csketchActiveId])
+
+  // D-2-c: snap glyphs while a csketch draw tool is active.
+  // POST /csketch/:id/snap returns candidates sorted by (priority,
+  // distance); we keep only [0]. The candidate lives in a ref so
+  // the click handler can read the latest without React re-renders
+  // shifting the resolved point mid-gesture; it is also mirrored
+  // into state so the kind-aware glyph re-renders.
+  //
+  // A generation counter ensures stale responses arriving after a
+  // tool/csketch switch are dropped instead of overwriting the
+  // freshly-cleared state.
+  const csketchSnapRef = useRef<SnapCandidate | null>(null)
+  const [csketchSnapBest, setCSketchSnapBest] =
+    useState<SnapCandidate | null>(null)
+  const csketchSnapDispatchRef = useRef<{
+    inFlight: boolean
+    pendingUV: [number, number] | null
+  } | null>(null)
+  const csketchSnapGenRef = useRef(0)
+
+  useEffect(() => {
+    csketchSnapGenRef.current += 1
+    csketchSnapRef.current = null
+    csketchSnapDispatchRef.current = null
+    // Cleanup-on-deps-change is the textbook use of effect-driven
+    // setState — there is no render-time derivation that can wipe
+    // a stale async result. The lint rule overfits to the
+    // "derive instead" case so we suppress with intent.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setCSketchSnapBest(null)
+  }, [csketchActiveId, csketchActiveTool])
+
+  // Trailing-throttle dispatcher (same shape as `CSketchPoints`'
+  // `dispatchDrag`): at most one snap request in flight; the
+  // freshest cursor wins via `pendingUV` + `.finally()` chain.
+  const dispatchCSketchSnap = useCallback(
+    (uv: [number, number]) => {
+      const id = csketchActiveId
+      if (id === null) return
+      if (!csketchSnapDispatchRef.current) {
+        csketchSnapDispatchRef.current = { inFlight: false, pendingUV: null }
+      }
+      const d = csketchSnapDispatchRef.current
+      if (d.inFlight) {
+        d.pendingUV = uv
+        return
+      }
+      const myGen = csketchSnapGenRef.current
+      d.inFlight = true
+      const fire = (target: [number, number]) =>
+        csketchApi
+          .snap(id, {
+            cursor: { x: target[0], y: target[1] },
+            radius: CSKETCH_SNAP_RADIUS,
+          })
+          .then((cands) => {
+            // Drop stale responses arriving after a tool/csketch
+            // switch — the cleanup effect above already wiped the
+            // visible state, and resurrecting it here would flash a
+            // ghost glyph for a frame.
+            if (csketchSnapGenRef.current !== myGen) return
+            const best = cands.length > 0 ? cands[0] : null
+            csketchSnapRef.current = best
+            setCSketchSnapBest(best)
+          })
+          .catch((err) => {
+            console.error('[CSketchOverlay] snap failed:', err)
+          })
+      const chain = (uvNow: [number, number]) => {
+        fire(uvNow).finally(() => {
+          const live = csketchSnapDispatchRef.current
+          if (!live) return
+          if (live.pendingUV) {
+            const next = live.pendingUV
+            live.pendingUV = null
+            chain(next)
+          } else {
+            live.inFlight = false
+          }
+        })
+      }
+      chain(uv)
+    },
+    [csketchActiveId],
+  )
 
   // Magnetic snap targets recomputed from committed shapes only when
   // the shape list actually changes — pointermove never re-derives
@@ -428,6 +528,14 @@ export function SketchOverlay() {
       if (!sketch.active) return
       e.stopPropagation()
       const rawUv = pointToPlaneUV(e.point, sketch.plane)
+      // D-2-c: while a csketch draw tool is active, fire the
+      // kernel snap query alongside the legacy local snap so the
+      // glyph below can render the locked-on target. The dispatch
+      // is in-flight-throttled — no event-loop pressure even at
+      // 240 Hz pointermove.
+      if (csketchActiveId !== null && csketchActiveTool !== null) {
+        dispatchCSketchSnap(rawUv)
+      }
       const result = computeSnap(rawUv)
       setSketchHover(result.uv)
       setSketchSnapState({
@@ -435,13 +543,27 @@ export function SketchOverlay() {
         inferenceAxis: result.inferenceAxis,
       })
     },
-    [sketch.active, sketch.plane, computeSnap, setSketchHover, setSketchSnapState],
+    [
+      sketch.active,
+      sketch.plane,
+      computeSnap,
+      setSketchHover,
+      setSketchSnapState,
+      csketchActiveId,
+      csketchActiveTool,
+      dispatchCSketchSnap,
+    ],
   )
 
   const handlePointerOut = useCallback(() => {
     if (!sketch.active) return
     setSketchHover(null)
     setSketchSnapState({ snapTarget: null, inferenceAxis: null })
+    // D-2-c: clear the csketch snap glyph when the cursor leaves
+    // the capture plane — otherwise the marker lingers at the last
+    // known position even though the user has moved away.
+    csketchSnapRef.current = null
+    setCSketchSnapBest(null)
   }, [sketch.active, setSketchHover, setSketchSnapState])
 
   // Click vs. drag arbitration on the sketch capture plane.
@@ -476,35 +598,66 @@ export function SketchOverlay() {
 
         // D-2-b: when a csketch tool is selected, capture-plane
         // clicks dispatch through `csketchApi.{addPoint,addLine,
-        // addCircle}` instead of the legacy sketch handler. Snap +
-        // inference layer integration land in D-2-c / D-2-d; for
-        // now we feed the raw plane (u, v).
+        // addCircle}` instead of the legacy sketch handler.
+        // D-2-c: the snap layer above has resolved the cursor to
+        // its best attachment (vertex / midpoint / centre /
+        // quadrant / on-curve), so we commit the snapped point —
+        // never the raw cursor. For line endpoints that snap to an
+        // existing csketch point we additionally reuse the point's
+        // id instead of spawning a duplicate stacked on top.
         if (csketchActiveId !== null && csketchActiveTool !== null) {
           const id = csketchActiveId
+          const snap = csketchSnapRef.current
+          const clickUv: [number, number] =
+            snap !== null ? [snap.point.x, snap.point.y] : [downUv[0], downUv[1]]
+          const reusePid: string | null =
+            snap !== null && snap.kind === 'point' && 'Point' in snap.entity
+              ? snap.entity.Point
+              : null
+
           if (csketchActiveTool === 'point') {
-            void addCSketchPoint(id, { x: downUv[0], y: downUv[1] })
+            // If the cursor latched onto an existing point, the
+            // user almost certainly meant to keep it — a duplicate
+            // would just over-constrain the sketch. Treat the
+            // click as a no-op in that case.
+            if (reusePid !== null) return
+            void addCSketchPoint(id, { x: clickUv[0], y: clickUv[1] })
             return
           }
           if (csketchActiveTool === 'line') {
             // First click anchors a draft endpoint; second click
-            // commits two new points + the line connecting them.
-            // Splitting commit into the second click avoids leaving
-            // an orphan point if the user changes tool mid-gesture.
+            // commits the line. Each endpoint is either an
+            // existing point id (snap-reuse) or a fresh point
+            // committed inline.
             const first = csketchDraftRef.current
             if (first === null) {
-              csketchDraftRef.current = { uv: [downUv[0], downUv[1]] }
+              csketchDraftRef.current = { uv: clickUv, pid: reusePid }
               return
             }
             csketchDraftRef.current = null
+            // Same-vertex degenerate gesture — the kernel rejects
+            // zero-length lines anyway; silently drop.
+            if (
+              first.pid !== null &&
+              reusePid !== null &&
+              first.pid === reusePid
+            ) {
+              return
+            }
             void (async () => {
-              const p1 = await addCSketchPoint(id, {
-                x: first.uv[0],
-                y: first.uv[1],
-              })
-              const p2 = await addCSketchPoint(id, {
-                x: downUv[0],
-                y: downUv[1],
-              })
+              const p1 =
+                first.pid ??
+                (await addCSketchPoint(id, {
+                  x: first.uv[0],
+                  y: first.uv[1],
+                }))
+              const p2 =
+                reusePid ??
+                (await addCSketchPoint(id, {
+                  x: clickUv[0],
+                  y: clickUv[1],
+                }))
+              if (p1 === p2) return
               await addCSketchLine(id, { start: p1, end: p2 })
             })()
             return
@@ -512,15 +665,17 @@ export function SketchOverlay() {
           if (csketchActiveTool === 'circle') {
             // First click anchors a centre; second click commits a
             // circle whose radius is the Euclidean distance between
-            // the two clicks.
+            // the two clicks. addCSketchCircle takes raw (cx, cy,
+            // r) — the kernel materialises the centre internally,
+            // so there is no entity-reuse opportunity here.
             const first = csketchDraftRef.current
             if (first === null) {
-              csketchDraftRef.current = { uv: [downUv[0], downUv[1]] }
+              csketchDraftRef.current = { uv: clickUv, pid: null }
               return
             }
             csketchDraftRef.current = null
-            const ddu = downUv[0] - first.uv[0]
-            const ddv = downUv[1] - first.uv[1]
+            const ddu = clickUv[0] - first.uv[0]
+            const ddv = clickUv[1] - first.uv[1]
             const radius = Math.sqrt(ddu * ddu + ddv * ddv)
             // Below the kernel's positive-radius guard — silently
             // drop, the user will click again to restart.
@@ -710,6 +865,17 @@ export function SketchOverlay() {
           visual lock-on cue before they click. */}
       {sketch.snapTarget && (
         <SnapMarker target={sketch.snapTarget} plane={sketch.plane} />
+      )}
+
+      {/* D-2-c: kind-aware glyph at the kernel-resolved csketch
+          snap point. Only renders when a csketch draw tool is
+          active AND the snap engine returned a candidate within
+          `CSKETCH_SNAP_RADIUS`. */}
+      {csketchSnapBest && (
+        <CSketchSnapMarker
+          candidate={csketchSnapBest}
+          plane={sketch.plane}
+        />
       )}
     </group>
   )
@@ -2349,6 +2515,129 @@ function SnapMarker({ target, plane }: SnapMarkerProps) {
       <torusGeometry args={[0.32, 0.045, 8, 24]} />
       <meshBasicMaterial color={color} depthTest={false} transparent opacity={0.9} />
     </mesh>
+  )
+}
+
+// ─── csketch snap glyph (D-2-c) ──────────────────────────────────────
+
+const CSKETCH_GLYPH_SIZE = 0.5
+
+interface CSketchSnapMarkerProps {
+  candidate: SnapCandidate
+  plane: SketchPlane
+}
+
+/**
+ * Kind-aware glyph at the locked csketch snap point. The kernel's
+ * `SnapKind::priority()` partitions variants into three tiers:
+ *
+ *   - 0 (vertex-like)     → filled square
+ *   - 1 (centre)          → ring
+ *   - 1 (mid / quadrant)  → diamond
+ *   - 2 (on-curve)        → small cross
+ *
+ * Tier 0/1 glyphs read as "discrete attachment" while tier-2
+ * reads as "anywhere along this curve". Colour is uniform cyan so
+ * the tier hierarchy travels through shape alone (matches the
+ * legacy `SnapMarker` palette).
+ */
+function CSketchSnapMarker({ candidate, plane }: CSketchSnapMarkerProps) {
+  const pos = uvToWorld([candidate.point.x, candidate.point.y], plane)
+  const quat = planeMeshQuaternion(plane)
+  const color = '#22d3ee' // cyan-400
+  const S = CSKETCH_GLYPH_SIZE
+
+  const glyphCategory = ((): 'vertex' | 'centre' | 'midquad' | 'oncurve' => {
+    switch (candidate.kind) {
+      case 'point':
+      case 'line_endpoint':
+      case 'arc_endpoint':
+      case 'rectangle_corner':
+        return 'vertex'
+      case 'circle_center':
+      case 'arc_center':
+      case 'ellipse_center':
+      case 'rectangle_center':
+        return 'centre'
+      case 'line_midpoint':
+      case 'arc_midpoint':
+      case 'circle_quadrant':
+      case 'ellipse_quadrant':
+      case 'rectangle_edge_midpoint':
+        return 'midquad'
+      case 'on_line':
+      case 'on_circle':
+      case 'on_arc':
+      case 'on_ellipse':
+        return 'oncurve'
+    }
+  })()
+
+  // All glyphs share the in-plane orientation. depthTest off so
+  // the marker draws on top of already-committed csketch geometry
+  // — same convention as the legacy `SnapMarker` ring.
+  return (
+    <group position={pos} quaternion={quat}>
+      {glyphCategory === 'vertex' && (
+        <mesh>
+          <planeGeometry args={[S, S]} />
+          <meshBasicMaterial
+            color={color}
+            depthTest={false}
+            transparent
+            opacity={0.9}
+            side={THREE.DoubleSide}
+          />
+        </mesh>
+      )}
+      {glyphCategory === 'centre' && (
+        <mesh>
+          <torusGeometry args={[S * 0.55, S * 0.08, 8, 24]} />
+          <meshBasicMaterial
+            color={color}
+            depthTest={false}
+            transparent
+            opacity={0.9}
+          />
+        </mesh>
+      )}
+      {glyphCategory === 'midquad' && (
+        <mesh rotation={[0, 0, Math.PI / 4]}>
+          <planeGeometry args={[S * 0.85, S * 0.85]} />
+          <meshBasicMaterial
+            color={color}
+            depthTest={false}
+            transparent
+            opacity={0.9}
+            side={THREE.DoubleSide}
+          />
+        </mesh>
+      )}
+      {glyphCategory === 'oncurve' && (
+        <>
+          <mesh rotation={[0, 0, Math.PI / 4]}>
+            <planeGeometry args={[S * 0.9, S * 0.14]} />
+            <meshBasicMaterial
+              color={color}
+              depthTest={false}
+              transparent
+              opacity={0.9}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+          <mesh rotation={[0, 0, -Math.PI / 4]}>
+            <planeGeometry args={[S * 0.9, S * 0.14]} />
+            <meshBasicMaterial
+              color={color}
+              depthTest={false}
+              transparent
+              opacity={0.9}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+        </>
+      )}
+    </group>
   )
 }
 
