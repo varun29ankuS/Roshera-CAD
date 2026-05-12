@@ -363,6 +363,25 @@ export function SketchOverlay() {
   const showMeasure = sketch.measure
   const snapStep = sketch.snapStep
 
+  // Constrained-sketch draw routing (D-2-b). When a csketch is open
+  // and the user has picked a `point` / `line` / `circle` tool from
+  // the panel, capture-plane clicks are dispatched through the
+  // csketch REST surface instead of the legacy `addSketchPoint`.
+  // Line and circle tools are stateful (2 clicks each) — `csketchDraftRef`
+  // holds the first click's (u, v) until the second click lands.
+  const csketchActiveId = useSceneStore((s) => s.csketch.activeId)
+  const csketchActiveTool = useSceneStore((s) => s.csketch.activeTool)
+  const addCSketchPoint = useSceneStore((s) => s.addCSketchPoint)
+  const addCSketchLine = useSceneStore((s) => s.addCSketchLine)
+  const addCSketchCircle = useSceneStore((s) => s.addCSketchCircle)
+  const csketchDraftRef = useRef<{ uv: [number, number] } | null>(null)
+  // Whenever the user switches tool (or closes the csketch), forget
+  // any half-committed first click — otherwise a stale anchor leaks
+  // into the next gesture.
+  useEffect(() => {
+    csketchDraftRef.current = null
+  }, [csketchActiveTool, csketchActiveId])
+
   // Magnetic snap targets recomputed from committed shapes only when
   // the shape list actually changes — pointermove never re-derives
   // them. The active polyline's confirmed points are also exposed so
@@ -455,6 +474,66 @@ export function SketchOverlay() {
         // 16 = 4²; the conventional click-vs-drag threshold.
         if (dx * dx + dy * dy > 16) return
 
+        // D-2-b: when a csketch tool is selected, capture-plane
+        // clicks dispatch through `csketchApi.{addPoint,addLine,
+        // addCircle}` instead of the legacy sketch handler. Snap +
+        // inference layer integration land in D-2-c / D-2-d; for
+        // now we feed the raw plane (u, v).
+        if (csketchActiveId !== null && csketchActiveTool !== null) {
+          const id = csketchActiveId
+          if (csketchActiveTool === 'point') {
+            void addCSketchPoint(id, { x: downUv[0], y: downUv[1] })
+            return
+          }
+          if (csketchActiveTool === 'line') {
+            // First click anchors a draft endpoint; second click
+            // commits two new points + the line connecting them.
+            // Splitting commit into the second click avoids leaving
+            // an orphan point if the user changes tool mid-gesture.
+            const first = csketchDraftRef.current
+            if (first === null) {
+              csketchDraftRef.current = { uv: [downUv[0], downUv[1]] }
+              return
+            }
+            csketchDraftRef.current = null
+            void (async () => {
+              const p1 = await addCSketchPoint(id, {
+                x: first.uv[0],
+                y: first.uv[1],
+              })
+              const p2 = await addCSketchPoint(id, {
+                x: downUv[0],
+                y: downUv[1],
+              })
+              await addCSketchLine(id, { start: p1, end: p2 })
+            })()
+            return
+          }
+          if (csketchActiveTool === 'circle') {
+            // First click anchors a centre; second click commits a
+            // circle whose radius is the Euclidean distance between
+            // the two clicks.
+            const first = csketchDraftRef.current
+            if (first === null) {
+              csketchDraftRef.current = { uv: [downUv[0], downUv[1]] }
+              return
+            }
+            csketchDraftRef.current = null
+            const ddu = downUv[0] - first.uv[0]
+            const ddv = downUv[1] - first.uv[1]
+            const radius = Math.sqrt(ddu * ddu + ddv * ddv)
+            // Below the kernel's positive-radius guard — silently
+            // drop, the user will click again to restart.
+            if (radius <= 1e-9) return
+            void addCSketchCircle(id, {
+              cx: first.uv[0],
+              cy: first.uv[1],
+              radius,
+            })
+            return
+          }
+        }
+
         const { uv: snapped } = computeSnap(downUv)
 
         // Multi-shape sketch flow: a single sketch session can carry
@@ -516,6 +595,11 @@ export function SketchOverlay() {
       addSketchPoint,
       addNewSketchShape,
       computeSnap,
+      csketchActiveId,
+      csketchActiveTool,
+      addCSketchPoint,
+      addCSketchLine,
+      addCSketchCircle,
     ],
   )
 
@@ -589,6 +673,16 @@ export function SketchOverlay() {
           `redundant` so the H-slice diagnosis surfaces visually
           without an extra panel. */}
       <CSketchGeometricBadges plane={sketch.plane} />
+
+      {/* Read-only csketch line + circle visuals (D-2-b). Mounted
+          alongside `CSketchPoints` so a freshly committed entity
+          shows up the instant the panel's tool row dispatches its
+          REST call. Lines render as crisp drei `<Line>` segments;
+          circles as 64-sample closed polylines. Construction
+          entities render in violet, regular ones in neutral white,
+          matching the point conventions. */}
+      <CSketchLines plane={sketch.plane} />
+      <CSketchCircles plane={sketch.plane} />
 
       {/* Draggable disc handles for every csketch point (D-3c).
           Picks bypass the capture-plane click handler via
@@ -1571,6 +1665,104 @@ function CSketchPoints({ plane }: { plane: SketchPlane }) {
               depthWrite={false}
             />
           </mesh>
+        )
+      })}
+    </group>
+  )
+}
+
+// ─── csketch line + circle visuals (D-2-b) ──────────────────────────
+//
+// Read-only renderers for the active csketch's lines and circles.
+// Mirrors the `CSketchPoints` discipline: subscribe to the active
+// summary, lift each (u, v) to world space, render with drei's
+// `<Line>` for crisp resolution-independent strokes. Construction
+// entities use a softer violet, regular ones use neutral white so
+// they read clearly against the sketch plane tint.
+
+const CSKETCH_CIRCLE_SEGMENTS = 64
+
+/**
+ * Render every `LineSegment2d` from the active csketch summary. Lines
+ * whose `geometry` is `Infinite` or `Ray` are skipped — they have no
+ * intrinsic endpoints to draw without clipping against the sketch
+ * plane border, and the existing csketch entry points only ever
+ * produce `Segment` lines. When that changes a future slice can add
+ * the clip path.
+ */
+function CSketchLines({ plane }: { plane: SketchPlane }) {
+  const activeId = useSceneStore((s) => s.csketch.activeId)
+  const summary = useSceneStore((s) =>
+    s.csketch.activeId
+      ? s.csketch.summaries.get(s.csketch.activeId) ?? null
+      : null,
+  )
+  if (!activeId || !summary || summary.lines.length === 0) return null
+
+  return (
+    <group name="csketch-lines">
+      {summary.lines.map((l) => {
+        if (!('Segment' in l.geometry)) return null
+        const seg = l.geometry.Segment
+        const a = uvToWorld([seg.start.x, seg.start.y], plane)
+        const b = uvToWorld([seg.end.x, seg.end.y], plane)
+        const color = l.is_construction ? '#a78bfa' : '#f5f5f5'
+        return (
+          <Line
+            key={l.id}
+            points={[a, b]}
+            color={color}
+            lineWidth={1.5}
+            transparent
+            opacity={l.is_construction ? 0.7 : 0.95}
+            depthTest={false}
+            depthWrite={false}
+          />
+        )
+      })}
+    </group>
+  )
+}
+
+/**
+ * Render every csketch circle as a closed 64-segment polyline lifted
+ * onto the active sketch plane. The kernel does not pre-tessellate
+ * circles — they're parametric (centre + radius) on the wire — so
+ * we sample at draw time. 64 segments is the same fidelity the
+ * legacy click-to-place circle uses for its extrude profile and
+ * keeps a 10-unit-radius circle visibly smooth at default zoom.
+ */
+function CSketchCircles({ plane }: { plane: SketchPlane }) {
+  const activeId = useSceneStore((s) => s.csketch.activeId)
+  const summary = useSceneStore((s) =>
+    s.csketch.activeId
+      ? s.csketch.summaries.get(s.csketch.activeId) ?? null
+      : null,
+  )
+  if (!activeId || !summary || summary.circles.length === 0) return null
+
+  return (
+    <group name="csketch-circles">
+      {summary.circles.map((c) => {
+        const pts: Array<[number, number, number]> = []
+        for (let i = 0; i <= CSKETCH_CIRCLE_SEGMENTS; i++) {
+          const t = (i / CSKETCH_CIRCLE_SEGMENTS) * Math.PI * 2
+          const u = c.cx + c.radius * Math.cos(t)
+          const v = c.cy + c.radius * Math.sin(t)
+          pts.push(uvToWorld([u, v], plane))
+        }
+        const color = c.is_construction ? '#a78bfa' : '#f5f5f5'
+        return (
+          <Line
+            key={c.id}
+            points={pts}
+            color={color}
+            lineWidth={1.5}
+            transparent
+            opacity={c.is_construction ? 0.7 : 0.95}
+            depthTest={false}
+            depthWrite={false}
+          />
         )
       })}
     </group>

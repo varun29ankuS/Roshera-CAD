@@ -31,10 +31,13 @@ import {
   X,
   Scissors,
   RotateCw,
+  Dot,
+  Minus,
 } from 'lucide-react'
 import {
   isStandardPlane,
   useSceneStore,
+  type CSketchTool,
   type SketchPlane,
   type SketchTool,
   type StandardPlane,
@@ -76,6 +79,25 @@ const TOOL_OPTIONS: Array<{
 ]
 
 /**
+ * Draw tools for the parametric csketch (D-2-b). These speak the
+ * `/api/csketch/{id}/{point,line,circle}` REST surface — distinct
+ * from the legacy click-to-place TOOL_OPTIONS above which target
+ * `/api/sketch`. The row only renders when a csketch is open
+ * (`csketch.activeId !== null`); the buttons toggle on click so
+ * clicking the active tool again returns the editor to read-only /
+ * drag mode.
+ */
+const CSKETCH_TOOL_OPTIONS: Array<{
+  value: CSketchTool
+  label: string
+  icon: typeof PenTool
+}> = [
+  { value: 'point', label: 'Point', icon: Dot },
+  { value: 'line', label: 'Line', icon: Minus },
+  { value: 'circle', label: 'Circle', icon: CircleIcon },
+]
+
+/**
  * Three ways to finalise a sketch into 3D geometry. `extrude` is the
  * existing default (build a prism from the profile). `extrude_cut`
  * builds the same prism but boolean-subtracts it from the selected
@@ -112,6 +134,13 @@ export function SketchPanel() {
   // user mental model of "I just drew this, now cut from it").
   const selectedIds = useSceneStore((s) => s.selectedIds)
   const objectOrder = useSceneStore((s) => s.objectOrder)
+
+  // Constrained-sketch (csketch) tool state (D-2-b). The csketch tool
+  // row only renders when a csketch is open; toggling the active tool
+  // returns the editor to read-only / drag mode.
+  const csketchActiveId = useSceneStore((s) => s.csketch.activeId)
+  const csketchActiveTool = useSceneStore((s) => s.csketch.activeTool)
+  const setCSketchTool = useSceneStore((s) => s.setCSketchTool)
 
   const [busy, setBusy] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -534,6 +563,44 @@ export function SketchPanel() {
           </button>
         </div>
       </div>
+
+      {/* Constrained-sketch (csketch) tool row (D-2-b). Renders only
+          when a csketch is open. Clicking the active tool again
+          deselects it (toggle behaviour) and returns the editor to
+          read-only / drag mode. Selecting a tool routes capture-plane
+          clicks through `csketchApi.addPoint` / `addLine` /
+          `addCircle` instead of the legacy sketch handler. */}
+      {csketchActiveId !== null && (
+        <div className="flex items-center gap-1">
+          <span className="text-[10px] text-muted-foreground/80 mr-1">
+            cSketch
+          </span>
+          {CSKETCH_TOOL_OPTIONS.map((opt) => {
+            const Icon = opt.icon
+            const active = csketchActiveTool === opt.value
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() =>
+                  setCSketchTool(active ? null : opt.value)
+                }
+                className={cn(
+                  'flex items-center gap-1.5 px-2 py-1 border text-[10px] transition-colors',
+                  active
+                    ? 'border-sky-400/60 text-sky-300 bg-sky-500/10'
+                    : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
+                )}
+                title={`Constrained ${opt.label.toLowerCase()}`}
+                aria-pressed={active}
+              >
+                <Icon className="w-3 h-3" />
+                <span>{opt.label}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
 
       {/* Multi-loop shapes are an implementation detail of the kernel —
           they exist so the extrude pipeline can classify outer vs hole
