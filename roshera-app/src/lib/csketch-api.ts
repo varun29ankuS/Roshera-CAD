@@ -285,6 +285,25 @@ export interface DofReport {
   constraints_analysed: number
   constraints_skipped: number
   entities_skipped: EntityRef[]
+  /**
+   * Constraint ids the diagnose pass classified as linearly
+   * dependent on an earlier row AND whose post-solve residual is
+   * within tolerance — i.e. duplicates of an already-satisfied
+   * constraint. Removing them does not change the solution. Empty
+   * when the structural verdict is `fully_constrained` (the rank
+   * pass is O(rows²·cols) and is skipped on the fast path).
+   *
+   * Slice H, added 2026-05-12.
+   */
+  redundant: string[]
+  /**
+   * Constraint ids the diagnose pass classified as linearly
+   * dependent AND whose post-solve residual exceeds tolerance —
+   * i.e. constraints that are inconsistent with the ones already
+   * accepted (e.g. two `X = 3` and `X = 7` constraints on the
+   * same point). Removing them removes the inconsistency.
+   */
+  conflicts: string[]
 }
 
 /** Output of `POST /api/csketch/{id}/solve` and `/drag`. */

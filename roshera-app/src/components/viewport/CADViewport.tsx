@@ -106,6 +106,7 @@ export function CADViewport() {
       <SectionViewPanel />
       <ViewportContextMenu />
       <ExtrudeHoverTooltip />
+      <CSketchDofHud />
       <SketchPanel />
     </div>
   )
@@ -190,6 +191,106 @@ function SketchCoordReadout() {
           </span>
         </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * Floating HUD that reports the constraint-solver verdict for the
+ * **active csketch** (`csketch.activeId`). Hidden when there is no
+ * active csketch or no `lastDofReport` has been pulled yet.
+ *
+ * The DOF report is refreshed in `refreshCSketch` (in the scene
+ * store), which is called after every mutation that touches
+ * entities or constraints, so the HUD stays in lock-step with the
+ * user's edits without needing its own polling loop.
+ *
+ * Three pieces of state are surfaced:
+ *
+ *   1. **Structural verdict** — `fully_constrained` / `under_…` /
+ *      `over_…`. Determines the pill colour (positive / neutral /
+ *      negative) and the headline number (free dofs vs excess).
+ *   2. **Conflicts** — `redundant`/`conflicts` from slice H
+ *      (`/api/csketch/{id}/dof` carries them under `#[serde(default)]`
+ *      so old payloads silently degrade to empty arrays).
+ *   3. **Skipped** — count of constraints the analyser had to drop
+ *      because they touched unsupported entity kinds (rectangles
+ *      pending C-2 etc.). Surfaced so the user knows the verdict
+ *      is partial.
+ *
+ * Slice D-3a, added 2026-05-12.
+ */
+function CSketchDofHud() {
+  const activeId = useSceneStore((s) => s.csketch.activeId)
+  const report = useSceneStore((s) => s.csketch.lastDofReport)
+
+  if (!activeId || !report) return null
+
+  // Headline pill: derived from the structural status. Colours match
+  // the rest of the viewport HUD vocabulary — foreground/background
+  // accents drive the eye toward the over-constrained case which is
+  // the only one that needs the user to act.
+  let statusLabel: string
+  let statusTone: 'positive' | 'neutral' | 'negative'
+  switch (report.status.kind) {
+    case 'fully_constrained':
+      statusLabel = 'FULLY CONSTRAINED'
+      statusTone = 'positive'
+      break
+    case 'under_constrained':
+      statusLabel = `FREE DOFs: ${report.status.dofs}`
+      statusTone = 'neutral'
+      break
+    case 'over_constrained':
+      statusLabel = `EXCESS: ${report.status.conflicting_constraints}`
+      statusTone = 'negative'
+      break
+  }
+  const statusClass =
+    statusTone === 'positive'
+      ? 'text-emerald-400'
+      : statusTone === 'negative'
+        ? 'text-rose-400'
+        : 'text-amber-300'
+
+  const conflictCount = report.conflicts.length
+  const redundantCount = report.redundant.length
+  const skippedCount = report.constraints_skipped
+
+  return (
+    <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[180px]">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">DOF</span>
+        <span className={`${statusClass} font-semibold`}>{statusLabel}</span>
+      </div>
+      {(conflictCount > 0 || redundantCount > 0 || skippedCount > 0) && (
+        <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
+          {conflictCount > 0 && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">Conflicts</span>
+              <span className="text-rose-400 font-semibold tabular-nums">
+                {conflictCount}
+              </span>
+            </div>
+          )}
+          {redundantCount > 0 && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">Redundant</span>
+              <span className="text-amber-300 font-semibold tabular-nums">
+                {redundantCount}
+              </span>
+            </div>
+          )}
+          {skippedCount > 0 && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground/70">Skipped</span>
+              <span className="text-muted-foreground tabular-nums">
+                {skippedCount}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
