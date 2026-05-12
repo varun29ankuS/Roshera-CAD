@@ -80,6 +80,64 @@ impl TessellationParams {
     }
 }
 
+/// Bridge from the wire-level `shared_types::DisplayQuality` enum
+/// (carried in REST query strings and `ExportRequest` JSON) to the
+/// kernel-level `TessellationParams`. This is the canonical place
+/// callers translate the user-facing knob into something the
+/// tessellator actually understands.
+///
+/// `Low` / `Medium` / `High` map to the existing `coarse` / `default`
+/// / `fine` presets so behaviour is identical to a caller that
+/// already constructs these directly. `Custom` carries the three
+/// per-quality knobs over the wire (`max_edge_length`,
+/// `max_angle_deviation`, `chord_tolerance`); `min_segments` and
+/// `max_segments` aren't on the wire, so we derive sensible bounds
+/// from `chord_tolerance`: tighter tolerance → more segments allowed.
+/// This keeps the wire format minimal while letting the adaptive
+/// quadtree (T-1/T-2) refine as much as the chord guard demands.
+impl From<shared_types::DisplayQuality> for TessellationParams {
+    fn from(quality: shared_types::DisplayQuality) -> Self {
+        match quality {
+            shared_types::DisplayQuality::Low => Self::coarse(),
+            shared_types::DisplayQuality::Medium => Self::default(),
+            shared_types::DisplayQuality::High => Self::fine(),
+            shared_types::DisplayQuality::Custom {
+                max_edge_length,
+                max_angle_deviation,
+                chord_tolerance,
+            } => {
+                // Derive segment bounds from chord_tolerance: a tighter
+                // chord guard means a finer mesh is being requested, so
+                // raise the segment ceiling proportionally. Floor stays
+                // at 3 (minimum for a non-degenerate quad). Ceiling is
+                // capped at 1000 to defend against pathological inputs
+                // (`chord_tolerance = 1e-20`) that would otherwise let
+                // a single face emit millions of triangles.
+                let max_segments = if chord_tolerance > 0.0 {
+                    ((0.1 / chord_tolerance).sqrt() * 64.0)
+                        .ceil()
+                        .clamp(20.0, 1000.0) as usize
+                } else {
+                    200
+                };
+                Self {
+                    max_edge_length,
+                    max_angle_deviation,
+                    chord_tolerance,
+                    min_segments: 3,
+                    max_segments,
+                }
+            }
+        }
+    }
+}
+
+impl From<&shared_types::DisplayQuality> for TessellationParams {
+    fn from(quality: &shared_types::DisplayQuality) -> Self {
+        (*quality).into()
+    }
+}
+
 /// Tessellate a solid into a triangle mesh
 pub fn tessellate_solid(
     solid: &Solid,

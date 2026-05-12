@@ -93,6 +93,12 @@ pub struct ExportRequest {
     /// Export options
     #[serde(default)]
     pub options: ExportOptions,
+    /// Tessellation quality preset. Defaults to `Medium` (matches the
+    /// kernel's `TessellationParams::default()`). Set to `High` for
+    /// publication-grade STL/OBJ output and `Low` for fast preview
+    /// exports.
+    #[serde(default)]
+    pub quality: crate::DisplayQuality,
 }
 
 /// Response for export operation
