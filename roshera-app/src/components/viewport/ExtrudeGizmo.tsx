@@ -144,13 +144,20 @@ export function ExtrudeGizmo() {
 
   // Reset live distance whenever the selection target changes — the
   // gizmo always starts at zero relative offset for the currently-
-  // selected face.
+  // selected face. CRITICAL: also release `gizmoDragging` here. If the
+  // selection changes mid-drag (e.g. a backend rebroadcast clears
+  // `subElementSelections`), the window-level pointerup handler that
+  // normally clears the flag is removed when `active` flips false and
+  // the drag-cleanup effect unmounts its listeners — leaving
+  // `gizmoDragging` stuck at `true` forever, which permanently
+  // disables LMB camera orbit. See CameraController.tsx.
   useEffect(() => {
     setDistance(0)
     setPickedDirection(null)
     dragRef.current = null
     setActive(false)
-  }, [sel?.objectId, sel?.index])
+    setGizmoDragging(false)
+  }, [sel?.objectId, sel?.index, setGizmoDragging])
 
   // Window-level pointer listeners while dragging. Three-fiber's event
   // system would lose the pointer once it leaves the arrow geometry;
