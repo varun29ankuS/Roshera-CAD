@@ -38,6 +38,29 @@ export interface ServerSketchSession {
   updated_at: number
 }
 
+/**
+ * Backend `Region` wire shape (`api-server/src/sketch.rs::Region`).
+ * Outer / hole roles are inferred geometrically — `outer_shape_idx`
+ * indexes into the session's `shapes` array, and `hole_shape_idxs`
+ * lists the shape indices the kernel will subtract from that outer.
+ */
+export interface SketchRegion {
+  outer_shape_idx: number
+  hole_shape_idxs: number[]
+  area: number
+}
+
+/**
+ * Response from `GET /api/sketch/{id}/regions` and
+ * `POST /api/sketch/regions/preview`. `region_error` is non-null when
+ * the kernel rejected the shape layout (e.g. island-in-a-hole, too
+ * few points to materialise) and `regions` is then empty.
+ */
+export interface SketchRegionsResponse {
+  regions: SketchRegion[]
+  region_error: string | null
+}
+
 export interface ExtrudeSketchResponse {
   success: boolean
   sketch_id: string
@@ -220,5 +243,25 @@ export const sketchApi = {
     },
   ): Promise<ExtrudeSketchResponse> {
     return request('POST', `/sketch/${id}/revolve`, body)
+  },
+  /**
+   * Server-authoritative region decomposition for the given session
+   * (Slice D). Backend materialises every shape into a polygon and
+   * runs the same outer/hole containment classifier the extrude path
+   * uses, returning the result so the overlay can preview "what will
+   * be extruded" before the user commits.
+   */
+  getRegions(id: string): Promise<SketchRegionsResponse> {
+    return request('GET', `/sketch/${id}/regions`)
+  },
+  /**
+   * Stateless region decomposition for a list of raw polygons in
+   * plane-local (u, v). Used by AI / scripting clients that hold the
+   * polygons themselves and don't have a server session.
+   */
+  previewRegions(
+    polygons: Array<Array<[number, number]>>,
+  ): Promise<SketchRegionsResponse> {
+    return request('POST', `/sketch/regions/preview`, { polygons })
   },
 }

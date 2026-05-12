@@ -33,6 +33,7 @@ import {
   type InferenceAxis,
 } from '@/stores/scene-store'
 import { buildProfile2D } from '@/lib/sketch-extrude'
+import { ExtrudeRegionPreview } from './ExtrudeRegionPreview'
 import {
   CSketchConstraintConflictError,
   pointRef,
@@ -71,7 +72,7 @@ function pointToPlaneUV(
 }
 
 /** Inverse of `pointToPlaneUV` — lift a (u, v) onto the world plane. */
-function uvToWorld(
+export function uvToWorld(
   point: [number, number],
   plane: SketchPlane,
 ): THREE.Vector3 {
@@ -569,6 +570,11 @@ export function SketchOverlay() {
           loops behind the active drawing so the user sees the bracket
           outline while laying out hole circles inside it. */}
       <CommittedShapesGuides />
+
+      {/* Hover-time region-decomposition preview (Slice D). Renders
+          server-authoritative outer/hole loops in blue/red whenever
+          the SketchPanel's Finish & Extrude button is hovered. */}
+      <ExtrudeRegionPreview />
 
       {/* Dimensional-constraint labels for the active csketch (N-3).
           Read-only in this slice — N-4 will rewire the same labels

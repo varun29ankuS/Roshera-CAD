@@ -239,6 +239,26 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('SketchDeleted'),
     payload: z.object({ id: z.string() }),
   }),
+  // Region-decomposition update for an in-progress sketch (Slice D).
+  // Backend broadcasts this alongside every `SketchCreated` /
+  // `SketchUpdated` so the extrude-hover overlay can preview "what
+  // will be extruded" without an extra REST round-trip. `region_error`
+  // is non-null when the kernel rejects the shape layout (e.g.
+  // island-in-a-hole); `regions` is then empty.
+  z.object({
+    type: z.literal('SketchRegionsUpdated'),
+    payload: z.object({
+      sketch_id: z.string(),
+      regions: z.array(
+        z.object({
+          outer_shape_idx: z.number().int().nonnegative(),
+          hole_shape_idxs: z.array(z.number().int().nonnegative()),
+          area: z.number(),
+        }),
+      ),
+      region_error: z.string().nullable(),
+    }),
+  }),
   z.object({
     type: z.literal('SketchExtruded'),
     payload: z.object({

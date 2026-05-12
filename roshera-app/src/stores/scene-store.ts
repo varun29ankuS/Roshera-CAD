@@ -5,6 +5,7 @@ import {
   sketchApi,
   type ServerSketchSession,
   type ServerSketchShape,
+  type SketchRegion,
 } from '@/lib/sketch-api'
 import {
   csketchApi,
@@ -22,7 +23,7 @@ import {
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
 // of the sketch types from.
-export type { ServerSketchShape } from '@/lib/sketch-api'
+export type { ServerSketchShape, SketchRegion } from '@/lib/sketch-api'
 
 // ─── Selection granularity ───────────────────────────────────────────
 export type SelectionMode = 'object' | 'face' | 'edge' | 'vertex'
@@ -387,6 +388,31 @@ export interface SketchState {
    * construction line through the anchor. `null` when not inferring.
    */
   inferenceAxis: InferenceAxis | null
+  /**
+   * Server-authoritative region decomposition for the active sketch
+   * (Slice D). Each entry pairs an outer-shape index with the indices
+   * of the shapes the kernel will subtract as holes — i.e. exactly
+   * what `extrude_sketch` will pass to `extrude_face`. Populated by
+   * the `SketchRegionsUpdated` WS frame, refreshed on every shape /
+   * point mutation. Empty when the sketch has no extrudable shapes
+   * (and also empty when `regionError` is non-null).
+   */
+  regions: SketchRegion[]
+  /**
+   * Kernel diagnostic for the region classifier — `null` on success,
+   * a short message (e.g. "island-in-hole nesting not supported")
+   * when the layout is unextrudable. The overlay surfaces this so the
+   * user knows hovering Extrude won't succeed.
+   */
+  regionError: string | null
+  /**
+   * Pure UX flag set by `onPointerEnter`/`onPointerLeave` on the
+   * Finish & Extrude button. When `active`, the in-canvas overlay
+   * paints the region preview (blue outer loops, red holes) so the
+   * user sees "what will be extruded" before committing. Never
+   * serialised; lives purely in the local store.
+   */
+  extrudeHover: { active: boolean }
 }
 
 // ─── Constrained sketch (csketch) state ──────────────────────────────
@@ -654,6 +680,21 @@ interface SceneState {
    */
   applyServerSketchSnapshot: (session: ServerSketchSession) => void
   /**
+   * Apply a `SketchRegionsUpdated` payload to the local store. Only
+   * updates the active session's `regions` / `regionError`; payloads
+   * for other sessions are dropped (the overlay never paints them).
+   */
+  applySketchRegions: (payload: {
+    sketch_id: string
+    regions: SketchRegion[]
+    region_error: string | null
+  }) => void
+  /**
+   * Toggle the extrude-hover overlay. Pure UX state; wired to
+   * `onPointerEnter`/`onPointerLeave` on the Finish & Extrude button.
+   */
+  setExtrudeHover: (active: boolean) => void
+  /**
    * Drop a server-side session id from the local store. Called by
    * `ws-bridge` on `SketchDeleted` (so peer-initiated deletes flow
    * through correctly) and by `extrude` flows after `consume=true`
@@ -833,6 +874,9 @@ export const useSceneStore = create<SceneState>()(
       editingSourceObjectId: null,
       snapTarget: null,
       inferenceAxis: null,
+      regions: [],
+      regionError: null,
+      extrudeHover: { active: false },
     },
     serverSketches: new Map(),
     csketch: {
@@ -1084,6 +1128,11 @@ export const useSceneStore = create<SceneState>()(
           editingSourceObjectId: null,
           snapTarget: null,
           inferenceAxis: null,
+          // Region preview is server-authoritative — clear until the
+          // first `SketchRegionsUpdated` frame for this session lands.
+          regions: [],
+          regionError: null,
+          extrudeHover: { active: false },
         },
         // Drop any object/sub-element selection so the picker can't fire
         // beneath the sketch overlay.
@@ -1150,6 +1199,9 @@ export const useSceneStore = create<SceneState>()(
           editingSourceObjectId: null,
           snapTarget: null,
           inferenceAxis: null,
+          regions: [],
+          regionError: null,
+          extrudeHover: { active: false },
         },
       }))
       // Best-effort delete on the backend. If the session never
@@ -1290,6 +1342,34 @@ export const useSceneStore = create<SceneState>()(
     setSketchHover: (point) =>
       // Hover position is local-only UX — never sent to the backend.
       set((state) => ({ sketch: { ...state.sketch, hover: point } })),
+
+    applySketchRegions: (payload) =>
+      // Mirror the backend's region decomposition for the active
+      // session only. Peer-edited sketches push their own frames; we
+      // drop them because the overlay only ever paints the user's
+      // current edit. When the local sketch hasn't yet acquired its
+      // `serverId` (the create round-trip is mid-flight) we also drop
+      // — the next snapshot from `applyServerSketchSnapshot` will be
+      // followed by a fresh regions frame for the live session.
+      set((state) => {
+        if (state.sketch.serverId !== payload.sketch_id) {
+          return state
+        }
+        return {
+          sketch: {
+            ...state.sketch,
+            regions: payload.regions,
+            regionError: payload.region_error,
+          },
+        }
+      }),
+
+    setExtrudeHover: (active) =>
+      // Pure UX toggle for the in-canvas region preview. Wired to
+      // the Finish & Extrude button's pointer-enter/leave.
+      set((state) => ({
+        sketch: { ...state.sketch, extrudeHover: { active } },
+      })),
 
     setSketchSnapState: ({ snapTarget, inferenceAxis }) =>
       // Snap target + inference axis are pure UX descriptors recomputed
@@ -1448,6 +1528,10 @@ export const useSceneStore = create<SceneState>()(
             // SketchDeleted frame, so we mustn't tear down `active`
             // here unless the user explicitly exits.
             serverId: null,
+            // Region cache is keyed to a specific server id; the next
+            // session's `SketchRegionsUpdated` will repopulate.
+            regions: [],
+            regionError: null,
           },
         }
       }),
