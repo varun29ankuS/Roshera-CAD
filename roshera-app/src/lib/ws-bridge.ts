@@ -319,6 +319,14 @@ function handleServerMessage(msg: ServerMessage) {
       scene.clearServerSketchId(msg.payload.id)
       break
     }
+    case 'SketchRegionsUpdated': {
+      // Per-sketch region decomposition. The local store only mirrors
+      // regions for the user's currently-active session; peer-edited
+      // sketches don't need a regions cache because the overlay only
+      // paints the active session anyway.
+      scene.applySketchRegions(msg.payload)
+      break
+    }
     case 'SketchExtruded': {
       // The actual mesh arrives via `ObjectCreated` (broadcast just
       // before this frame). Nothing to wire into the scene store yet —

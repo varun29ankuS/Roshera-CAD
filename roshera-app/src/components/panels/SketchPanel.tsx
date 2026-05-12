@@ -104,6 +104,7 @@ export function SketchPanel() {
   const clearSketchPoints = useSceneStore((s) => s.clearSketchPoints)
   const exitSketch = useSceneStore((s) => s.exitSketch)
   const setSketchView = useSceneStore((s) => s.setSketchView)
+  const setExtrudeHover = useSceneStore((s) => s.setExtrudeHover)
   const setSketchPoint = useSceneStore((s) => s.setSketchPoint)
   const awaitSketchReady = useSceneStore((s) => s.awaitSketchReady)
   // Cut target resolution: first selection wins; falls back to the
@@ -651,6 +652,8 @@ export function SketchPanel() {
         <button
           type="button"
           onClick={() => void handleFinish()}
+          onPointerEnter={() => setExtrudeHover(true)}
+          onPointerLeave={() => setExtrudeHover(false)}
           disabled={
             busy ||
             // At least one shape across the whole session must be
