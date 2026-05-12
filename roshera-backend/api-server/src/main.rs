@@ -5070,6 +5070,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             delete(csketch::delete_constraint),
         )
         .route(
+            "/api/csketch/{id}/constraint/{cid}/value",
+            axum::routing::patch(csketch::update_constraint_value),
+        )
+        .route(
             "/api/csketch/{id}/constraints",
             get(csketch::list_constraints),
         )
