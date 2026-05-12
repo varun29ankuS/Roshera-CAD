@@ -409,6 +409,135 @@ export interface UpdateConstraintValueRequest {
   value: number
 }
 
+// ── Snap + inference wire types (D-1) ───────────────────────────────
+
+/**
+ * Kind tag on a `SnapCandidate`. Mirrors the kernel enum (every
+ * variant is unit, `#[serde(rename_all = "snake_case")]`), so each
+ * value travels on the wire as a plain string — no payload, no
+ * outer key.
+ *
+ * Two-level ranking inside the kernel: `priority()` returns 0 for
+ * the discrete vertex-like kinds (`point`, `line_endpoint`,
+ * `arc_endpoint`, `rectangle_corner`), 1 for the discrete
+ * mid/centre/quadrant kinds (`line_midpoint`, `circle_center`,
+ * `circle_quadrant`, `arc_center`, `arc_midpoint`,
+ * `rectangle_edge_midpoint`, `rectangle_center`, `ellipse_center`,
+ * `ellipse_quadrant`), and 2 for the continuous on-curve kinds
+ * (`on_line`, `on_circle`, `on_arc`, `on_ellipse`). Lower priority
+ * wins ties; within a tier the smaller Euclidean distance wins.
+ */
+export type SnapKind =
+  | 'point'
+  | 'line_endpoint'
+  | 'line_midpoint'
+  | 'on_line'
+  | 'circle_center'
+  | 'circle_quadrant'
+  | 'on_circle'
+  | 'arc_center'
+  | 'arc_endpoint'
+  | 'arc_midpoint'
+  | 'on_arc'
+  | 'rectangle_corner'
+  | 'rectangle_edge_midpoint'
+  | 'rectangle_center'
+  | 'ellipse_center'
+  | 'ellipse_quadrant'
+  | 'on_ellipse'
+
+/**
+ * One snap result from `POST /api/csketch/{id}/snap`. The full
+ * response is `SnapCandidate[]` sorted by (priority, distance), so
+ * `[0]` is the best snap.
+ */
+export interface SnapCandidate {
+  entity: EntityRef
+  point: Point2d
+  distance: number
+  kind: SnapKind
+}
+
+/** Body of `POST /api/csketch/{id}/snap`. */
+export interface SnapRequest {
+  cursor: Point2d
+  radius: number
+}
+
+/**
+ * In-flight draft entity for inference. Tagged via
+ * `#[serde(tag = "kind", rename_all = "snake_case")]` — the
+ * discriminator field is literally `kind`, no outer wrapping.
+ *
+ * Draft entities are NOT inserted into the sketch; they exist only
+ * inside the inference pipeline. Lines carry two cursor endpoints,
+ * circles carry a centre + radius, points carry a position.
+ */
+export type DraftEntity =
+  | { kind: 'line'; start: Point2d; end: Point2d }
+  | { kind: 'circle'; center: Point2d; radius: number }
+  | { kind: 'point'; position: Point2d }
+
+/**
+ * Which part of a `DraftEntity` a `ProposedConstraint` applies to.
+ * Unit enum, `#[serde(rename_all = "snake_case")]`, so the wire
+ * form is a plain string.
+ */
+export type DraftSlot =
+  | 'line_start'
+  | 'line_end'
+  | 'line_self'
+  | 'circle_center'
+  | 'circle_self'
+  | 'point_self'
+
+/**
+ * One inferred constraint proposal from
+ * `POST /api/csketch/{id}/infer-constraints`. The `constraint`
+ * carries the kernel's `GeometricConstraint` directly (re-uses the
+ * existing type at the top of this file — every variant except
+ * `IntersectionAngle` is a plain string). `target` is `null` for
+ * unary proposals (Horizontal / Vertical), otherwise the existing
+ * sketch entity the constraint pairs with.
+ *
+ * `confidence` is in `[0, 1]`: 1.0 for snap-driven proposals (the
+ * draft endpoint coincides exactly with an existing feature),
+ * `1 - misalignment / angle_tol` for direction-driven proposals
+ * (Horizontal, Parallel, …).
+ *
+ * `reason` is a short human-readable tag from a fixed kernel-side
+ * set, suitable as a tooltip without further translation.
+ */
+export interface ProposedConstraint {
+  constraint: GeometricConstraint
+  draft_slot: DraftSlot
+  target: EntityRef | null
+  confidence: number
+  reason: string
+}
+
+/**
+ * Tolerances for inference. Pass `undefined` (or omit the field) to
+ * use the kernel defaults: `angle_tol = 3° in radians`,
+ * `snap_radius = 5`, `equal_radius_tol = 0.5`.
+ *
+ * Callers driving inference from a zoomed viewport should scale
+ * `snap_radius` and `equal_radius_tol` by the inverse of the
+ * current viewport zoom so the world-space catch radius stays
+ * constant in screen pixels.
+ */
+export interface InferenceTolerance {
+  angle_tol: number
+  snap_radius: number
+  equal_radius_tol: number
+}
+
+/** Body of `POST /api/csketch/{id}/infer-constraints`. */
+export interface InferConstraintsRequest {
+  draft: DraftEntity
+  tolerance?: InferenceTolerance
+}
+
 // ── Wire-level entity-id response ───────────────────────────────────
 
 /** Response shape for `POST /point` / `/line` / `/circle`. */
@@ -564,6 +693,36 @@ export const csketchApi = {
    */
   dof(id: string): Promise<DofReport> {
     return request('GET', `/csketch/${id}/dof`)
+  },
+  /**
+   * Find snap candidates near `cursor` within `radius` sketch
+   * units. Results are pre-sorted by (priority, distance) — the
+   * first element, if any, is the best snap.
+   *
+   * Safe to call at viewport-pointermove cadence: the kernel walks
+   * every entity store linearly but the work stays well under a
+   * millisecond for sketches under ~1k entities.
+   */
+  snap(id: string, body: SnapRequest): Promise<SnapCandidate[]> {
+    return request('POST', `/csketch/${id}/snap`, body)
+  },
+  /**
+   * Propose `GeometricConstraint`s for an in-flight `DraftEntity`.
+   * Used by the draw tools to render auto-constrain glyphs near the
+   * cursor (⊥, ∥, ⊙, =) while the user drags out a line / circle /
+   * point. Pass `tolerance` to override the kernel defaults
+   * (3°, 5-unit snap radius, 0.5-unit equal-radius tol).
+   *
+   * Returns the proposal list in declaration order — caller is
+   * expected to filter by `confidence` (≥ 0.6 is the
+   * auto-constrain threshold) before promoting any to real
+   * constraints on commit.
+   */
+  inferConstraints(
+    id: string,
+    body: InferConstraintsRequest,
+  ): Promise<ProposedConstraint[]> {
+    return request('POST', `/csketch/${id}/infer-constraints`, body)
   },
 }
 
