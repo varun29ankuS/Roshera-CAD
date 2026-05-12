@@ -33,6 +33,14 @@ import {
   type InferenceAxis,
 } from '@/stores/scene-store'
 import { buildProfile2D } from '@/lib/sketch-extrude'
+import type {
+  Constraint,
+  CSketchCircleSummary,
+  CSketchLineSummary,
+  CSketchPointSummary,
+  CSketchSummary,
+  EntityRef,
+} from '@/lib/csketch-api'
 
 const PLANE_SIZE = 400 // world units; large enough that the user
                        // cannot click off-plane in normal use.
@@ -414,65 +422,88 @@ export function SketchOverlay() {
     setSketchSnapState({ snapTarget: null, inferenceAxis: null })
   }, [sketch.active, setSketchHover, setSketchSnapState])
 
-  const handleClick = useCallback(
-    (e: ThreeEvent<MouseEvent>) => {
+  // Click vs. drag arbitration on the sketch capture plane.
+  //
+  // OrbitControls now keeps LMB-orbit enabled while sketching so the
+  // user has a way to reorient the view mid-draw. That means a bare
+  // R3F `onClick` would also fire at the end of every orbit gesture
+  // that started or ended over the plane, producing spurious sketch
+  // points. We replace it with a manual pointerdown handler that
+  // registers a one-shot window-level pointerup listener and only
+  // places a point when total pointer travel stays under the 4 px
+  // budget desktop UIs use for "click vs. drag" (matches Fusion /
+  // Onshape behaviour). pointerup is registered on `window` rather
+  // than the mesh so the gesture is resilient to the camera moving
+  // mid-drag — by the time the user releases, the raycaster may have
+  // long lost the plane.
+  const handlePointerDown = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
       if (!sketch.active) return
-      // Suppress the orbit-controls click and any object pickers below.
-      e.stopPropagation()
-      const native = e.nativeEvent
-      // Only react to left-click; right-click is intentionally
-      // un-routed so OrbitControls / future menus stay free.
-      if (native.button !== 0) return
-      const rawUv = pointToPlaneUV(e.point, sketch.plane)
-      const { uv: snapped } = computeSnap(rawUv)
+      if (e.nativeEvent.button !== 0) return
+      const downX = e.nativeEvent.clientX
+      const downY = e.nativeEvent.clientY
+      const downUv = pointToPlaneUV(e.point, sketch.plane)
 
-      // Multi-shape sketch flow: a single sketch session can carry
-      // multiple closed loops, each becoming its own ServerSketchShape.
-      // The user should never have to reach for "Add shape" — every
-      // completed loop rolls into a new shape automatically, and the
-      // sketch only ends when the user explicitly Finishes or Cancels.
-      // Three completion triggers, one per tool:
-      //
-      //   - Rectangle / circle: each tool consumes exactly 2 clicks.
-      //     A 3rd click on the same plane means "I'm done with this
-      //     one, start another" — auto-commit the current shape and
-      //     drop this click as the first point of a new shape with
-      //     the same tool.
-      //
-      //   - Polyline: the user signals "close this loop" by clicking
-      //     back at the first vertex (which the snap engine already
-      //     attracts the cursor to as a magnetic target). The clicked
-      //     point is NOT appended — the polygon naturally closes via
-      //     the first→last edge — and we auto-commit + start a fresh
-      //     polyline ready for the next loop.
-      const tool: SketchTool = sketch.tool
-      const pts = sketch.points
+      const onUp = (upEv: PointerEvent) => {
+        window.removeEventListener('pointerup', onUp)
+        if (upEv.button !== 0) return
+        const dx = upEv.clientX - downX
+        const dy = upEv.clientY - downY
+        // 16 = 4²; the conventional click-vs-drag threshold.
+        if (dx * dx + dy * dy > 16) return
 
-      if (tool === 'polyline' && pts.length >= 3) {
-        const p0 = pts[0]
-        const dx = snapped[0] - p0[0]
-        const dy = snapped[1] - p0[1]
-        // Tolerance matches the snap-target rounding in snapToGeometry:
-        // when the cursor latches onto the first vertex, the snapped
-        // uv is the exact stored point, so any difference > epsilon
-        // means the user clicked somewhere else.
-        if (dx * dx + dy * dy < 1e-12) {
+        const { uv: snapped } = computeSnap(downUv)
+
+        // Multi-shape sketch flow: a single sketch session can carry
+        // multiple closed loops, each becoming its own ServerSketchShape.
+        // The user should never have to reach for "Add shape" — every
+        // completed loop rolls into a new shape automatically, and the
+        // sketch only ends when the user explicitly Finishes or Cancels.
+        // Three completion triggers, one per tool:
+        //
+        //   - Rectangle / circle: each tool consumes exactly 2 clicks.
+        //     A 3rd click on the same plane means "I'm done with this
+        //     one, start another" — auto-commit the current shape and
+        //     drop this click as the first point of a new shape with
+        //     the same tool.
+        //
+        //   - Polyline: the user signals "close this loop" by clicking
+        //     back at the first vertex (which the snap engine already
+        //     attracts the cursor to as a magnetic target). The clicked
+        //     point is NOT appended — the polygon naturally closes via
+        //     the first→last edge — and we auto-commit + start a fresh
+        //     polyline ready for the next loop.
+        const tool: SketchTool = sketch.tool
+        const pts = sketch.points
+
+        if (tool === 'polyline' && pts.length >= 3) {
+          const p0 = pts[0]
+          const ddx = snapped[0] - p0[0]
+          const ddy = snapped[1] - p0[1]
+          // Tolerance matches the snap-target rounding in snapToGeometry:
+          // when the cursor latches onto the first vertex, the snapped
+          // uv is the exact stored point, so any difference > epsilon
+          // means the user clicked somewhere else.
+          if (ddx * ddx + ddy * ddy < 1e-12) {
+            addNewSketchShape(tool)
+            return
+          }
+        }
+
+        if ((tool === 'rectangle' || tool === 'circle') && pts.length >= 2) {
+          // The current rectangle / circle has both anchor points, so
+          // it's a complete shape on the backend's terms. Commit it,
+          // start a fresh shape with the same tool, and use this click
+          // as that new shape's first anchor — all in one gesture.
           addNewSketchShape(tool)
+          addSketchPoint(snapped)
           return
         }
-      }
 
-      if ((tool === 'rectangle' || tool === 'circle') && pts.length >= 2) {
-        // The current rectangle / circle has both anchor points, so
-        // it's a complete shape on the backend's terms. Commit it,
-        // start a fresh shape with the same tool, and use this click
-        // as that new shape's first anchor — all in one gesture.
-        addNewSketchShape(tool)
         addSketchPoint(snapped)
-        return
       }
 
-      addSketchPoint(snapped)
+      window.addEventListener('pointerup', onUp)
     },
     [
       sketch.active,
@@ -508,7 +539,7 @@ export function SketchOverlay() {
         quaternion={planeMeshQuaternion(sketch.plane)}
         onPointerMove={handlePointerMove}
         onPointerOut={handlePointerOut}
-        onClick={handleClick}
+        onPointerDown={handlePointerDown}
       >
         <planeGeometry args={[PLANE_SIZE, PLANE_SIZE]} />
         <meshBasicMaterial
@@ -536,6 +567,13 @@ export function SketchOverlay() {
           loops behind the active drawing so the user sees the bracket
           outline while laying out hole circles inside it. */}
       <CommittedShapesGuides />
+
+      {/* Dimensional-constraint labels for the active csketch (N-3).
+          Read-only in this slice — N-4 will rewire the same labels
+          through `updateCSketchConstraintValue` for double-click
+          editing. Renders nothing unless there is both an active
+          csketch and an active sketch plane to project onto. */}
+      <CSketchDimensions plane={sketch.plane} />
 
       <SketchPreview showMeasure={showMeasure} />
 
@@ -660,6 +698,302 @@ function CommittedShapesGuides() {
       ))}
     </group>
   )
+}
+
+// ─── Constrained-sketch dimension labels (N-3) ───────────────────────
+
+/**
+ * Render a read-only label for every persisted `DimensionalConstraint`
+ * on the active csketch. Renders nothing unless `csketch.activeId` is
+ * set and an entity summary for that id is in the store — both are
+ * guaranteed by `openCSketch`, so a freshly-opened csketch yields
+ * labels on the next render.
+ *
+ * Coordinate convention: the kernel csketch lives in a pure 2D (u, v)
+ * frame with no embedded plane of its own. We lift each label onto
+ * the active sketch's plane via `uvToWorld`, matching the conceptual
+ * UX where the csketch and the click-to-place sketch share a working
+ * plane. When the live editor is not bound to a plane the labels are
+ * still useful as flat-projected annotations on the xy-plane — but
+ * for slice N-3 we gate on `sketch.active` so the labels only appear
+ * while the user is in a sketching context.
+ *
+ * Placement rules per dimensional kind:
+ *   - Distance(p1, p2)         → midpoint of the two points
+ *   - Distance(p,  l) / (l, p) → projection of `p` onto `l`'s midpoint
+ *   - Distance(l1, l2)         → midpoint of l1 (parallel offset)
+ *   - Length(line)             → midpoint of the line segment
+ *   - Radius(circle)           → rightmost point on the circle
+ *   - Diameter(circle)         → rightmost point, prefixed "⌀"
+ *   - Angle(line1, line2)      → midpoint of the first line as anchor
+ *   - XCoordinate(point)       → at the point (small "x = …" badge)
+ *   - YCoordinate(point)       → at the point (small "y = …" badge)
+ *
+ * Variants without a single natural placement (Perimeter, Area,
+ * MomentOfInertia, CenterOfMass, AspectRatio, …) are skipped here;
+ * they will surface in slice H's constraint-diagnosis panel instead.
+ *
+ * `Conflicting` and `Violated` constraints are still rendered — the
+ * label colour reflects the status so the user sees which dimension
+ * the solver could not satisfy without having to open a diagnostics
+ * panel.
+ */
+function CSketchDimensions({ plane }: { plane: SketchPlane }) {
+  const activeId = useSceneStore((s) => s.csketch.activeId)
+  const summary = useSceneStore((s) =>
+    s.csketch.activeId ? s.csketch.summaries.get(s.csketch.activeId) ?? null : null,
+  )
+  const constraints = useSceneStore((s) => s.csketch.activeConstraints)
+
+  const labels = useMemo(() => {
+    if (!activeId || !summary) return []
+    return buildCSketchDimensionLabels(summary, constraints, plane)
+  }, [activeId, summary, constraints, plane])
+
+  if (labels.length === 0) return null
+
+  return (
+    <group name="csketch-dimensions">
+      {labels.map((l) => (
+        <DimLabel
+          key={l.key}
+          position={l.position}
+          text={l.text}
+          variant={l.variant}
+        />
+      ))}
+    </group>
+  )
+}
+
+interface CSketchDimensionLabel {
+  key: string
+  position: THREE.Vector3
+  text: string
+  variant: 'length' | 'angle'
+}
+
+/**
+ * Pure derivation: given a csketch entity summary, its constraint
+ * list, and the active sketch plane, produce one positioned label
+ * per renderable dimensional constraint. Skips constraints whose
+ * referenced entities are absent from the summary (the summary may
+ * lag a constraint add by one render frame — graceful skip avoids
+ * crashing on the transient missing-id).
+ *
+ * Exported (file-local) so a future N-3.5 test harness can pin the
+ * label-placement geometry without mounting React.
+ */
+function buildCSketchDimensionLabels(
+  summary: CSketchSummary,
+  constraints: Constraint[],
+  plane: SketchPlane,
+): CSketchDimensionLabel[] {
+  const pointsById = new Map<string, CSketchPointSummary>()
+  for (const p of summary.points) pointsById.set(p.id, p)
+  const linesById = new Map<string, CSketchLineSummary>()
+  for (const l of summary.lines) linesById.set(l.id, l)
+  const circlesById = new Map<string, CSketchCircleSummary>()
+  for (const c of summary.circles) circlesById.set(c.id, c)
+
+  const out: CSketchDimensionLabel[] = []
+  for (const c of constraints) {
+    if (!('Dimensional' in c.constraint_type)) continue
+    const d = c.constraint_type.Dimensional
+
+    if ('Distance' in d) {
+      const placement = distancePlacement(c.entities, pointsById, linesById)
+      if (!placement) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(placement, plane),
+        text: fmtLen(d.Distance),
+        variant: 'length',
+      })
+      continue
+    }
+    if ('Length' in d) {
+      const uv = lineMidpoint(c.entities, linesById)
+      if (!uv) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(uv, plane),
+        text: fmtLen(d.Length),
+        variant: 'length',
+      })
+      continue
+    }
+    if ('Radius' in d) {
+      const placement = circleRightmost(c.entities, circlesById)
+      if (!placement) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(placement, plane),
+        text: `R ${fmtLen(d.Radius)}`,
+        variant: 'length',
+      })
+      continue
+    }
+    if ('Diameter' in d) {
+      const placement = circleRightmost(c.entities, circlesById)
+      if (!placement) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(placement, plane),
+        text: `\u2300 ${fmtLen(d.Diameter)}`,
+        variant: 'length',
+      })
+      continue
+    }
+    if ('Angle' in d) {
+      const uv = anglePlacement(c.entities, linesById)
+      if (!uv) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(uv, plane),
+        text: fmtAngle(d.Angle),
+        variant: 'angle',
+      })
+      continue
+    }
+    if ('XCoordinate' in d) {
+      const uv = singlePoint(c.entities, pointsById)
+      if (!uv) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(uv, plane),
+        text: `x ${fmtLen(d.XCoordinate)}`,
+        variant: 'length',
+      })
+      continue
+    }
+    if ('YCoordinate' in d) {
+      const uv = singlePoint(c.entities, pointsById)
+      if (!uv) continue
+      out.push({
+        key: c.id,
+        position: uvToWorld(uv, plane),
+        text: `y ${fmtLen(d.YCoordinate)}`,
+        variant: 'length',
+      })
+      continue
+    }
+    // Perimeter / Area / MomentOfInertia / CenterOfMass / AspectRatio /
+    // MinDistance / MaxDistance / ArcLength / Curvature / Slope /
+    // OffsetDistance — no single natural placement in the viewport;
+    // surfaced by the constraint-list panel instead.
+  }
+  return out
+}
+
+/** Centre of a `LineGeometry`'s natural representative point. */
+function lineRepresentative(line: CSketchLineSummary): [number, number] {
+  const g = line.geometry
+  if ('Segment' in g) {
+    return [(g.Segment.start.x + g.Segment.end.x) / 2, (g.Segment.start.y + g.Segment.end.y) / 2]
+  }
+  if ('Ray' in g) {
+    return [g.Ray.origin.x, g.Ray.origin.y]
+  }
+  return [g.Infinite.point.x, g.Infinite.point.y]
+}
+
+function entityPoint(
+  ref: EntityRef,
+  points: Map<string, CSketchPointSummary>,
+): [number, number] | null {
+  if (!('Point' in ref)) return null
+  const p = points.get(ref.Point)
+  return p ? [p.x, p.y] : null
+}
+
+function entityLine(
+  ref: EntityRef,
+  lines: Map<string, CSketchLineSummary>,
+): CSketchLineSummary | null {
+  if (!('Line' in ref)) return null
+  return lines.get(ref.Line) ?? null
+}
+
+function entityCircle(
+  ref: EntityRef,
+  circles: Map<string, CSketchCircleSummary>,
+): CSketchCircleSummary | null {
+  if (!('Circle' in ref)) return null
+  return circles.get(ref.Circle) ?? null
+}
+
+function singlePoint(
+  refs: EntityRef[],
+  points: Map<string, CSketchPointSummary>,
+): [number, number] | null {
+  if (refs.length === 0) return null
+  return entityPoint(refs[0], points)
+}
+
+function lineMidpoint(
+  refs: EntityRef[],
+  lines: Map<string, CSketchLineSummary>,
+): [number, number] | null {
+  if (refs.length === 0) return null
+  const l = entityLine(refs[0], lines)
+  return l ? lineRepresentative(l) : null
+}
+
+/**
+ * Place a `Distance` label sensibly across the (point, line) variants
+ * the kernel allows. `point–point` is the dominant case; `point–line`
+ * and `line–line` fall back to the most readable midpoint.
+ */
+function distancePlacement(
+  refs: EntityRef[],
+  points: Map<string, CSketchPointSummary>,
+  lines: Map<string, CSketchLineSummary>,
+): [number, number] | null {
+  if (refs.length < 2) return null
+  const a = entityPoint(refs[0], points)
+  const b = entityPoint(refs[1], points)
+  if (a && b) return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+  // point–line: anchor on the point so the label tracks the visible
+  // dimension's natural endpoint.
+  if (a) {
+    const lb = entityLine(refs[1], lines)
+    if (lb) {
+      const mid = lineRepresentative(lb)
+      return [(a[0] + mid[0]) / 2, (a[1] + mid[1]) / 2]
+    }
+    return a
+  }
+  if (b) {
+    const la = entityLine(refs[0], lines)
+    if (la) {
+      const mid = lineRepresentative(la)
+      return [(b[0] + mid[0]) / 2, (b[1] + mid[1]) / 2]
+    }
+    return b
+  }
+  // line–line: parallel-offset case; place at the first line's midpoint.
+  const la = entityLine(refs[0], lines)
+  return la ? lineRepresentative(la) : null
+}
+
+function anglePlacement(
+  refs: EntityRef[],
+  lines: Map<string, CSketchLineSummary>,
+): [number, number] | null {
+  if (refs.length === 0) return null
+  const la = entityLine(refs[0], lines)
+  return la ? lineRepresentative(la) : null
+}
+
+/** Rightmost point on a circle in (u, v) — `cx + r, cy`. */
+function circleRightmost(
+  refs: EntityRef[],
+  circles: Map<string, CSketchCircleSummary>,
+): [number, number] | null {
+  if (refs.length === 0) return null
+  const c = entityCircle(refs[0], circles)
+  return c ? [c.cx + c.radius, c.cy] : null
 }
 
 // ─── Preview + dimensions ────────────────────────────────────────────
