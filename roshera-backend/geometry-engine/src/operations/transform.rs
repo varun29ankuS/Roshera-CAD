@@ -79,6 +79,12 @@ pub fn transform_solid(
     // descriptor stale.
     model.location_cache.invalidate(solid_id);
 
+    // Vertices moved → cached volume/COM/inertia on the Solid are stale.
+    // Same contract as fillet_edges / chamfer_edges / extrude_face.
+    if let Some(solid) = model.solids.get_mut(solid_id) {
+        solid.invalidate_mass_props_cache();
+    }
+
     // Record the operation for timeline / event-sourcing consumers.
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("transform_solid")

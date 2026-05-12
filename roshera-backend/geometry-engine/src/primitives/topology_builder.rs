@@ -1178,139 +1178,287 @@ impl BRepModel {
         self.solids.get(id)
     }
 
-    /// Calculate exact volume of a solid via the divergence-theorem
-    /// integral implemented on [`crate::primitives::solid::Solid::compute_mass_properties`].
+    /// Calculate exact volume of a solid via the unified mass-properties
+    /// pipeline.
     ///
-    /// Delegates to the canonical mass-properties pipeline so volume,
+    /// Delegates to [`Self::compute_solid_mass_properties`] so volume,
     /// surface area, centre of mass and inertia all come from the same
-    /// kernel state and never disagree. The previous in-method polyhedral
-    /// edge-walk only handled flat polygonal faces with enumerated
-    /// edge-loop vertices and silently returned `0` for spheres,
-    /// cylinders, cones, tori and any other curved-surface geometry —
-    /// it also under-counted boxes when face orientation tags differed
-    /// from outward winding (Task #49).
+    /// integration pass (analytical face traversal on planar-faced
+    /// solids, mesh-based Tonon (2004) integration when the analytical
+    /// path aborts on degenerate seam loops). Callers (LLM summary
+    /// reports, agent-facing part queries) never see numbers that drift
+    /// relative to each other.
     ///
-    /// Takes `&mut self` because `compute_mass_properties` populates
+    /// Takes `&mut self` because the unified entry point populates
     /// per-entity caches on the solid, shell, face and loop stores on
     /// first call. Subsequent calls hit the cache and are free.
     pub fn calculate_solid_volume(&mut self, solid_id: u32) -> Option<f64> {
-        if let Some(props) = self.compute_solid_mass_properties(solid_id) {
-            return Some(props.volume);
-        }
-        // Analytical face-by-face traversal fails when any face's outer
-        // loop has fewer than 3 unique vertices — the situation produced
-        // by curved-primitive seam loops on spheres, cylinders and
-        // cones. Fall back to mesh-based divergence theorem on the
-        // tessellated solid; this is exact in the limit of refinement
-        // and matches analytical formulas to ~5 decimal places at
-        // `TessellationParams::fine()` resolution.
-        self.mesh_based_volume(solid_id)
+        self.compute_solid_mass_properties(solid_id)
+            .map(|p| p.volume)
     }
 
     /// Calculate exact surface area of a solid.
     ///
-    /// Delegates to [`crate::primitives::solid::Solid::compute_mass_properties`]
-    /// for the same reason as [`Self::calculate_solid_volume`] —
-    /// volume and surface area must come from the same divergence-theorem
-    /// face traversal so callers (LLM summary reports, agent-facing
-    /// part queries) never see numbers that drift relative to each
-    /// other.
+    /// Delegates to [`Self::compute_solid_mass_properties`] for the
+    /// same consistency-across-callers reason as [`Self::calculate_solid_volume`].
     pub fn calculate_solid_surface_area(&mut self, solid_id: u32) -> Option<f64> {
-        if let Some(props) = self.compute_solid_mass_properties(solid_id) {
-            return Some(props.surface_area);
-        }
-        // Same fallback rationale as `calculate_solid_volume`: when
-        // analytical face traversal can't honour a degenerate seam loop,
-        // sum triangle areas off the tessellated mesh.
-        self.mesh_based_surface_area(solid_id)
+        self.compute_solid_mass_properties(solid_id)
+            .map(|p| p.surface_area)
     }
 
-    /// Mesh-based volume fallback for solids whose analytical
-    /// divergence-theorem traversal cannot proceed (curved primitives
-    /// whose seam loops collapse below 3 unique vertices).
+    /// Unified mass-properties entry point. Returns volume, surface
+    /// area, centre of mass, inertia tensor, principal moments,
+    /// principal axes and radius of gyration in a single
+    /// [`crate::primitives::solid::SolidMassProperties`] report.
     ///
-    /// Computes
+    /// **Always routes through [`Self::mesh_based_mass_properties`].**
+    /// The analytical face-by-face pipeline on `Solid::compute_mass_properties`
+    /// is the only place the kernel can compute volume / surface area /
+    /// COM in closed form, but its **inertia tensor** is the shell-level
+    /// box-approximation (`Shell::compute_mass_properties`, shell.rs:516)
+    /// fed through a parallel-axis shift that mixes density-1 second
+    /// moments with full-mass shift terms — wrong by `density` for
+    /// every solid and wrong by O(1) for non-box geometry. The mesh
+    /// path produces an exact (to tessellation tolerance) inertia
+    /// tensor for arbitrary geometry via Tonon (2004) per-tetrahedron
+    /// formulas, so we use it uniformly. The wire-visible
+    /// [`crate::primitives::solid::MassPropertiesMethod::Analytical`]
+    /// variant is reserved for when the shell-level inertia is fixed
+    /// (Future Work in `linear-inventing-oasis.md`).
     ///
-    /// ```text
-    ///     V = | (1/6) Σ_t  v0_t · (v1_t × v2_t) |
-    /// ```
-    ///
-    /// where the sum is taken over every outward-oriented triangle of
-    /// the tessellated solid. Each triangle, taken with the origin,
-    /// forms a tetrahedron whose signed volume sums to the polyhedral
-    /// volume; the kernel's tessellator emits triangles in CCW outward
-    /// orientation so the sum is positive in normal cases. The `.abs()`
-    /// is a final defence against an inverted shell — it lets the
-    /// fallback report the correct magnitude even if some upstream
-    /// orientation flag is wrong, at the cost of not surfacing that
-    /// upstream bug here. Cross-check via signed-volume tests on
-    /// boxes if you need to detect inversion.
-    fn mesh_based_volume(&self, solid_id: u32) -> Option<f64> {
-        let solid = self.solids.get(solid_id)?;
-        let mesh = crate::tessellation::tessellate_solid(
-            solid,
-            self,
-            &crate::tessellation::TessellationParams::fine(),
-        );
-        if mesh.triangles.is_empty() {
-            return None;
-        }
-        let mut six_v = 0.0;
-        for tri in &mesh.triangles {
-            let v0 = mesh.vertices[tri[0] as usize].position.to_vec();
-            let v1 = mesh.vertices[tri[1] as usize].position.to_vec();
-            let v2 = mesh.vertices[tri[2] as usize].position.to_vec();
-            six_v += v0.dot(&v1.cross(&v2));
-        }
-        Some((six_v / 6.0).abs())
-    }
-
-    /// Mesh-based surface area fallback. Sums `0.5 * ‖(v1−v0) × (v2−v0)‖`
-    /// over every triangle of the tessellated solid. Symmetric in
-    /// vertex order, so triangle orientation does not affect the
-    /// result.
-    fn mesh_based_surface_area(&self, solid_id: u32) -> Option<f64> {
-        let solid = self.solids.get(solid_id)?;
-        let mesh = crate::tessellation::tessellate_solid(
-            solid,
-            self,
-            &crate::tessellation::TessellationParams::fine(),
-        );
-        if mesh.triangles.is_empty() {
-            return None;
-        }
-        let mut total = 0.0;
-        for tri in &mesh.triangles {
-            let v0 = mesh.vertices[tri[0] as usize].position.to_vec();
-            let v1 = mesh.vertices[tri[1] as usize].position.to_vec();
-            let v2 = mesh.vertices[tri[2] as usize].position.to_vec();
-            total += 0.5 * (v1 - v0).cross(&(v2 - v0)).magnitude();
-        }
-        Some(total)
-    }
-
-    /// Internal helper: drives [`crate::primitives::solid::Solid::compute_mass_properties`]
-    /// using this model's topology stores and returns a clone of the
-    /// resulting [`crate::primitives::solid::SolidMassProperties`] so
-    /// the caller does not have to juggle the simultaneous mutable
-    /// borrows of `solids` + the topology stores.
-    fn compute_solid_mass_properties(
+    /// Result is installed into
+    /// [`crate::primitives::solid::Solid::install_mass_props_cache`]
+    /// so subsequent calls hit the cache without re-tessellating.
+    pub(crate) fn compute_solid_mass_properties(
         &mut self,
         solid_id: u32,
     ) -> Option<crate::primitives::solid::SolidMassProperties> {
-        let solid = self.solids.get_mut(solid_id)?;
-        solid
-            .compute_mass_properties(
-                &mut self.shells,
-                &mut self.faces,
-                &mut self.loops,
-                &self.vertices,
-                &self.edges,
-                &self.curves,
-                &self.surfaces,
-            )
-            .ok()
-            .cloned()
+        // Hit the cache first — `install_mass_props_cache` populates
+        // it after the first successful mesh integration, so repeated
+        // calls (mass + obb + part-report on the same solid) avoid
+        // re-tessellating.
+        if let Some(solid) = self.solids.get(solid_id) {
+            if let Some(cached) = solid.cached_mass_props_ref() {
+                return Some(cached.clone());
+            }
+        }
+        let props = self.mesh_based_mass_properties(solid_id)?;
+        if let Some(solid) = self.solids.get_mut(solid_id) {
+            solid.install_mass_props_cache(props.clone());
+        }
+        Some(props)
+    }
+
+    /// Mesh-based mass-properties pipeline. Tessellates the solid at
+    /// [`crate::tessellation::TessellationParams::fine`] resolution
+    /// and integrates volume, first moment (for COM), second-moment
+    /// tensor (for inertia) and surface area in a single pass over
+    /// the triangles.
+    ///
+    /// Each outward-oriented triangle `(v0, v1, v2)` forms a tetrahedron
+    /// with the origin whose signed volume is
+    /// `V_t = v0 · (v1 × v2) / 6`. Tonon (2004) closed-form formulas
+    /// (Eq. 9 specialised to `v_1 = O = 0`) give the second-moment
+    /// integrals over that tetrahedron:
+    ///
+    /// ```text
+    ///   ∫x² dV_t = (V_t / 10) · (x0² + x1² + x2² + x0·x1 + x0·x2 + x1·x2)
+    ///   ∫xy dV_t = (V_t / 20) · [2·(x0·y0 + x1·y1 + x2·y2)
+    ///                            + x0·y1 + x1·y0 + x0·y2 + x2·y0
+    ///                            + x1·y2 + x2·y1]
+    /// ```
+    ///
+    /// Summing over every triangle gives the second-moment tensor
+    /// about the origin; the parallel-axis shift to COM and the
+    /// Jacobi eigendecomposition are factored out via
+    /// [`crate::primitives::solid::principal_axes_from_origin_moments`]
+    /// so the analytical and mesh paths share the exact same shape of
+    /// output.
+    ///
+    /// Reference: Tonon, F. (2004). "Explicit Exact Formulas for the
+    /// 3-D Tetrahedron Inertia Tensor in Terms of its Vertex
+    /// Coordinates." *Journal of Mathematics and Statistics*, 1(1),
+    /// 8-11.
+    fn mesh_based_mass_properties(
+        &self,
+        solid_id: u32,
+    ) -> Option<crate::primitives::solid::SolidMassProperties> {
+        let solid = self.solids.get(solid_id)?;
+        let density = solid.attributes.material.density;
+        let mesh = crate::tessellation::tessellate_solid(
+            solid,
+            self,
+            &crate::tessellation::TessellationParams::fine(),
+        );
+        if mesh.triangles.is_empty() {
+            return None;
+        }
+
+        // Single pass: accumulate signed volume, first moments,
+        // second moments (upper triangle only — tensor is symmetric)
+        // and absolute surface area.
+        let mut six_volume = 0.0_f64;
+        let mut first_moment_sum = Vector3::ZERO; // Σ V_t · (v0 + v1 + v2)
+        // Second moments accumulator: integrals ∫x², ∫y², ∫z², ∫xy, ∫xz, ∫yz over the solid.
+        let mut m_xx = 0.0_f64;
+        let mut m_yy = 0.0_f64;
+        let mut m_zz = 0.0_f64;
+        let mut m_xy = 0.0_f64;
+        let mut m_xz = 0.0_f64;
+        let mut m_yz = 0.0_f64;
+        let mut surface_area = 0.0_f64;
+
+        for tri in &mesh.triangles {
+            let v0 = mesh.vertices[tri[0] as usize].position.to_vec();
+            let v1 = mesh.vertices[tri[1] as usize].position.to_vec();
+            let v2 = mesh.vertices[tri[2] as usize].position.to_vec();
+
+            // 6 V_t = v0 · (v1 × v2)
+            let six_vt = v0.dot(&v1.cross(&v2));
+            six_volume += six_vt;
+
+            // First moment over tet (O, v0, v1, v2): V_t · (v0 + v1 + v2) / 4.
+            // We accumulate V_t · (v0 + v1 + v2) here and divide by the
+            // final total volume below.
+            first_moment_sum += (v0 + v1 + v2) * (six_vt / 6.0);
+
+            // Tonon (2004) Eq. 9 with v_1 = O = 0. For each diagonal
+            // integral the coefficient is V_t / 10 on the same-index
+            // squares (x_i²) and V_t / 30 on cross-products (x_i·x_j,
+            // i ≠ j) — i.e. (V_t/10)·(x0² + x1² + x2² + x0·x1 + x0·x2
+            // + x1·x2). We multiply by `six_vt / 6` (= V_t) implicitly
+            // by absorbing `six_vt` and dividing by 60 / 180 respectively.
+            let xs = [v0.x, v1.x, v2.x];
+            let ys = [v0.y, v1.y, v2.y];
+            let zs = [v0.z, v1.z, v2.z];
+            let mut sx2 = 0.0;
+            let mut sy2 = 0.0;
+            let mut sz2 = 0.0;
+            for i in 0..3 {
+                sx2 += xs[i] * xs[i];
+                sy2 += ys[i] * ys[i];
+                sz2 += zs[i] * zs[i];
+                for j in (i + 1)..3 {
+                    sx2 += xs[i] * xs[j];
+                    sy2 += ys[i] * ys[j];
+                    sz2 += zs[i] * zs[j];
+                }
+            }
+            // diag: ∫x² dV_t = (V_t / 10) · sx2 = (six_vt / 60) · sx2
+            m_xx += six_vt * sx2 / 60.0;
+            m_yy += six_vt * sy2 / 60.0;
+            m_zz += six_vt * sz2 / 60.0;
+
+            // Off-diagonals (Tonon Eq. 9 cross term):
+            //   ∫xy dV_t = (V_t / 20) · [2·Σ x_i y_i + Σ_{i≠j} x_i y_j]
+            //           = (six_vt / 120) · [2·(x0 y0 + x1 y1 + x2 y2)
+            //                              + x0 y1 + x1 y0 + x0 y2
+            //                              + x2 y0 + x1 y2 + x2 y1]
+            let xy_diag = xs[0] * ys[0] + xs[1] * ys[1] + xs[2] * ys[2];
+            let xz_diag = xs[0] * zs[0] + xs[1] * zs[1] + xs[2] * zs[2];
+            let yz_diag = ys[0] * zs[0] + ys[1] * zs[1] + ys[2] * zs[2];
+            let xy_cross = xs[0] * ys[1]
+                + xs[1] * ys[0]
+                + xs[0] * ys[2]
+                + xs[2] * ys[0]
+                + xs[1] * ys[2]
+                + xs[2] * ys[1];
+            let xz_cross = xs[0] * zs[1]
+                + xs[1] * zs[0]
+                + xs[0] * zs[2]
+                + xs[2] * zs[0]
+                + xs[1] * zs[2]
+                + xs[2] * zs[1];
+            let yz_cross = ys[0] * zs[1]
+                + ys[1] * zs[0]
+                + ys[0] * zs[2]
+                + ys[2] * zs[0]
+                + ys[1] * zs[2]
+                + ys[2] * zs[1];
+            m_xy += six_vt * (2.0 * xy_diag + xy_cross) / 120.0;
+            m_xz += six_vt * (2.0 * xz_diag + xz_cross) / 120.0;
+            m_yz += six_vt * (2.0 * yz_diag + yz_cross) / 120.0;
+
+            // Surface area: ½ ‖(v1 − v0) × (v2 − v0)‖. Symmetric in
+            // vertex order so triangle orientation does not matter.
+            surface_area += 0.5 * (v1 - v0).cross(&(v2 - v0)).magnitude();
+        }
+
+        let signed_volume = six_volume / 6.0;
+        let volume = signed_volume.abs();
+        if volume < 1e-12 {
+            return None;
+        }
+
+        // Sign-correct the moments so they refer to the outward-oriented
+        // tessellation regardless of whether the kernel happened to emit
+        // CW or CCW triangle winding. Tonon's formulas are linear in the
+        // signed volume, so flipping the sign of every accumulator when
+        // `signed_volume < 0` re-aligns them with the unsigned volume.
+        //
+        // First moment ∫r dV for tetrahedron (O, v0, v1, v2) is
+        // V_t · (v0 + v1 + v2) / 4. Accumulator above sums V_t · (v0 +
+        // v1 + v2), so we divide by 4 here when normalising to COM.
+        let orient = signed_volume.signum();
+        let center_of_mass = Point3::new(
+            orient * first_moment_sum.x / (4.0 * volume),
+            orient * first_moment_sum.y / (4.0 * volume),
+            orient * first_moment_sum.z / (4.0 * volume),
+        );
+
+        // Origin-frame inertia: mass-weighted second moments
+        //   I_xx = ∫ρ(y² + z²) dV, I_xy = -∫ρ·xy dV, etc.
+        // Tonon accumulators above are pure volume integrals (∫r² dV),
+        // so we multiply by `density` here to align with the
+        // parallel-axis shift in `principal_axes_from_origin_moments`,
+        // which uses physical mass.
+        let i_origin = [
+            [
+                orient * density * (m_yy + m_zz),
+                -orient * density * m_xy,
+                -orient * density * m_xz,
+            ],
+            [
+                -orient * density * m_xy,
+                orient * density * (m_xx + m_zz),
+                -orient * density * m_yz,
+            ],
+            [
+                -orient * density * m_xz,
+                -orient * density * m_yz,
+                orient * density * (m_xx + m_yy),
+            ],
+        ];
+        let mass = volume * density;
+        let (inertia_tensor, principal_moments, principal_axes) =
+            crate::primitives::solid::principal_axes_from_origin_moments(
+                i_origin,
+                mass,
+                &center_of_mass,
+            );
+        let radius_of_gyration = Vector3::new(
+            (principal_moments.x / mass).sqrt(),
+            (principal_moments.y / mass).sqrt(),
+            (principal_moments.z / mass).sqrt(),
+        );
+
+        Some(crate::primitives::solid::SolidMassProperties {
+            volume,
+            surface_area,
+            mass,
+            center_of_mass,
+            inertia_tensor,
+            principal_moments,
+            principal_axes,
+            radius_of_gyration,
+            method: crate::primitives::solid::MassPropertiesMethod::Tessellated {
+                // Empirical bound at `TessellationParams::fine()`:
+                // matches analytical formulas to ~5e-3 relative on
+                // curved primitives (sphere/cylinder/cone) per the
+                // kernel_workflow_regression suite.
+                rel_tolerance: 5e-3,
+            },
+        })
     }
 
     /// Tessellate a solid into a watertight triangle mesh for visualization

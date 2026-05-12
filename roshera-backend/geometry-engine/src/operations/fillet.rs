@@ -227,6 +227,15 @@ pub fn fillet_edges(
             .with_output_faces(fillet_faces.iter().map(|&f| f as u64)),
     );
 
+    // Drop the solid's cached mass-properties — volume, surface area,
+    // COM and inertia tensor all changed when the blend faces were
+    // spliced in. Without this, `calculate_solid_volume` returns the
+    // pre-fillet figure, and `/api/agent/parts/{id}/mass` reports
+    // stale data until the solid is rebuilt.
+    if let Some(solid) = model.solids.get_mut(solid_id) {
+        solid.invalidate_mass_props_cache();
+    }
+
     Ok(fillet_faces)
 }
 

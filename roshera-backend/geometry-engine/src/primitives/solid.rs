@@ -25,6 +25,7 @@ use crate::primitives::{
     vertex::VertexStore,
 };
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -132,6 +133,37 @@ impl Default for SolidAttributes {
     }
 }
 
+/// Provenance of a [`SolidMassProperties`] report.
+///
+/// Mirrors Parasolid's `PK_TOPOL_eval_mass_props` "method" indicator so
+/// agents and downstream tooling can tell whether the numbers came
+/// from a closed-form analytical integral over the B-Rep faces (exact
+/// to floating-point noise for planar-faced solids) or from numerical
+/// integration over the tessellated surface (mesh-density-bounded
+/// tolerance, used as a fallback when analytical loop traversal
+/// aborts on degenerate seam loops — the situation produced by every
+/// curved primitive: sphere, cylinder, cone, torus).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MassPropertiesMethod {
+    /// Computed from analytical face-by-face divergence-theorem
+    /// traversal of the B-Rep. Exact to floating-point noise for
+    /// planar-faced solids (box, prism, polyhedron).
+    Analytical,
+    /// Computed from numerical integration over the tessellated
+    /// solid using Tonon (2004) per-tetrahedron formulas. Used when
+    /// analytical traversal would fail on degenerate seam loops
+    /// (curved primitives). `rel_tolerance` is the empirical bound
+    /// vs analytical formulas at the tessellation resolution that
+    /// was used.
+    Tessellated {
+        /// Empirical relative-error bound at the tessellation
+        /// resolution used to integrate (≈ 5e-3 at `TessellationParams::fine()`
+        /// per the calibration in `tests/kernel_workflow_regression.rs`).
+        rel_tolerance: f64,
+    },
+}
+
 /// Mass properties for solid
 #[derive(Debug, Clone)]
 pub struct SolidMassProperties {
@@ -153,6 +185,10 @@ pub struct SolidMassProperties {
     pub principal_axes: [Vector3; 3],
     /// Radius of gyration
     pub radius_of_gyration: Vector3,
+    /// How this report was computed — analytical face traversal or
+    /// numerical mesh integration. Surfaced on the wire so agents
+    /// can decide whether to trust the tail digits.
+    pub method: MassPropertiesMethod,
 }
 
 /// Solid statistics
@@ -587,6 +623,7 @@ impl Solid {
                 principal_moments,
                 principal_axes,
                 radius_of_gyration,
+                method: MassPropertiesMethod::Analytical,
             });
         }
 
@@ -594,6 +631,37 @@ impl Solid {
             .cached_mass_props
             .as_ref()
             .expect("cached_mass_props populated above when None"))
+    }
+
+    /// Install a pre-computed [`SolidMassProperties`] into the cache.
+    ///
+    /// Used exclusively by [`crate::primitives::topology_builder::BRepModel::compute_solid_mass_properties`]
+    /// when the analytical path fails and the mesh-based fallback
+    /// produces a [`MassPropertiesMethod::Tessellated`] report. Cache
+    /// invalidation continues to flow through [`Self::invalidate_cache`]
+    /// — no separate path is needed.
+    pub(crate) fn install_mass_props_cache(&mut self, props: SolidMassProperties) {
+        self.cached_mass_props = Some(props);
+    }
+
+    /// Read-only access to the cached mass-properties report, if any.
+    ///
+    /// Used by [`crate::primitives::topology_builder::BRepModel::compute_solid_mass_properties`]
+    /// to short-circuit the mesh fallback when a prior call has already
+    /// populated the cache.
+    pub(crate) fn cached_mass_props_ref(&self) -> Option<&SolidMassProperties> {
+        self.cached_mass_props.as_ref()
+    }
+
+    /// Drop the cached mass-properties report.
+    ///
+    /// Called by topology-mutating operations (fillet, chamfer, boolean,
+    /// shell, …) whose shell-level changes invalidate the cached volume,
+    /// surface area, COM, and inertia tensor. The next
+    /// [`crate::primitives::topology_builder::BRepModel::compute_solid_mass_properties`]
+    /// call re-runs the mesh integration from scratch.
+    pub(crate) fn invalidate_mass_props_cache(&mut self) {
+        self.cached_mass_props = None;
     }
 
     /// Transform solid
@@ -952,6 +1020,38 @@ fn compute_principal_inertia(inertia: &[[f64; 3]; 3]) -> (Vector3, [Vector3; 3])
     ];
 
     (principal_moments, principal_axes)
+}
+
+/// Given the **origin-frame** inertia tensor (`I_xx = ∫(y² + z²) dV`,
+/// `I_xy = -∫xy dV`, etc.), shift it to the centre-of-mass frame via
+/// the parallel-axis theorem and return the eigendecomposition.
+///
+/// Exposed at module scope so the mesh-based mass-properties pipeline
+/// in [`crate::primitives::topology_builder::BRepModel::compute_solid_mass_properties`]
+/// can reuse the same parallel-axis-shift + Jacobi solver the
+/// analytical path uses, guaranteeing the inertia tensor returned to
+/// agents is consistent across the two methods.
+///
+/// Returns `(inertia_tensor_at_com, principal_moments, principal_axes)`
+/// — same triple of shapes the analytical pipeline computes.
+pub(crate) fn principal_axes_from_origin_moments(
+    i_origin: [[f64; 3]; 3],
+    mass: f64,
+    com: &Point3,
+) -> ([[f64; 3]; 3], Vector3, [Vector3; 3]) {
+    // Parallel-axis shift: I_C = I_O − m · [(c·c) I₃ − c ⊗ c]
+    // (Goldstein, *Classical Mechanics*, §5.3).
+    let c = [com.x, com.y, com.z];
+    let cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+    let mut i_com = i_origin;
+    for i in 0..3 {
+        for j in 0..3 {
+            let kron = if i == j { 1.0 } else { 0.0 };
+            i_com[i][j] -= mass * (cc * kron - c[i] * c[j]);
+        }
+    }
+    let (principal_moments, principal_axes) = compute_principal_inertia(&i_com);
+    (i_com, principal_moments, principal_axes)
 }
 
 /// Solid storage with feature indexing

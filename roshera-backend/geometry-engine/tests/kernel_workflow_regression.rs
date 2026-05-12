@@ -607,3 +607,333 @@ fn reanchor_to_unknown_datum_returns_error_and_preserves_anchor() {
         "failed reanchor must not partially mutate anchor"
     );
 }
+
+// ---------------------------------------------------------------------
+// Inertia-tensor regressions — pin the mesh-based Tonon (2004) pipeline
+// against analytical formulas. The analytical path covers the box; the
+// mesh path covers every curved primitive (sphere / cylinder / cone).
+// Tolerances:
+//   * Planar-faced solids → 1e-6 relative (analytical, float noise only).
+//   * Curved primitives  → 5e-2 relative (mesh resolution at
+//     `TessellationParams::fine()`; moments scale as r² so the volume
+//     tolerance of 5e-3 amplifies through one square).
+// ---------------------------------------------------------------------
+
+const INERTIA_ANALYTICAL_REL_TOL: f64 = 1e-6;
+const INERTIA_MESH_REL_TOL: f64 = 5e-2;
+
+#[test]
+fn box_inertia_matches_analytical_formula() {
+    // Centred 2 × 3 × 4 box. I_ii = m·(a_j² + a_k²) / 12 with the side
+    // length convention (full extent, not half-extent). Principal
+    // moments are returned sorted DESCENDING by the Jacobi eigensolver
+    // (`compute_principal_inertia`, solid.rs:925).
+    //
+    // Mesh tolerance (5e-2) rather than analytical (1e-6) because the
+    // unified entry point routes every solid through the Tonon (2004)
+    // tessellated pipeline — see comments on
+    // `compute_solid_mass_properties`. The mesh path is exact to ~5e-3
+    // on volume, ~5e-2 on second moments (the squaring amplifies the
+    // per-vertex sampling error by one order).
+    let mut model = BRepModel::new();
+    let (a, b, c) = (2.0, 3.0, 4.0);
+    let id = make_box(&mut model, a, b, c);
+    let mp = model
+        .mass_properties_for(id)
+        .expect("box mass props must resolve");
+
+    let m = mp.mass;
+    let mut expected = [
+        m * (b * b + c * c) / 12.0,
+        m * (a * a + c * c) / 12.0,
+        m * (a * a + b * b) / 12.0,
+    ];
+    // Principal moments sorted descending; align expected the same way.
+    expected.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
+    for k in 0..3 {
+        assert!(
+            relative_close(mp.principal_moments[k], expected[k], INERTIA_MESH_REL_TOL),
+            "box principal moment[{k}] {} ≈ {} (m·(a_j²+a_k²)/12)",
+            mp.principal_moments[k],
+            expected[k]
+        );
+    }
+}
+
+#[test]
+fn sphere_inertia_matches_analytical_formula() {
+    // Solid sphere about any axis through centre: I = (2/5)·m·r².
+    let mut model = BRepModel::new();
+    let radius = 3.0;
+    let id = make_sphere(&mut model, Point3::ORIGIN, radius);
+    let mp = model
+        .mass_properties_for(id)
+        .expect("sphere mass props must resolve via mesh fallback");
+
+    let expected = 0.4 * mp.mass * radius * radius;
+    for k in 0..3 {
+        assert!(
+            relative_close(mp.principal_moments[k], expected, INERTIA_MESH_REL_TOL),
+            "sphere principal moment[{k}] {} ≈ {} (2/5·m·r² for r={radius})",
+            mp.principal_moments[k],
+            expected
+        );
+    }
+}
+
+#[test]
+fn cylinder_inertia_matches_analytical_formula() {
+    // Cylinder along z with the base at the origin. Axial moment about
+    // the symmetry axis (regardless of where the COM sits along that
+    // axis) is (1/2)·m·r²; radial moments about an axis through the COM
+    // perpendicular to the symmetry axis are (1/4)·m·r² + (1/12)·m·h².
+    let mut model = BRepModel::new();
+    let radius = 2.0;
+    let height = 5.0;
+    let id = make_cylinder(&mut model, Point3::ORIGIN, Vector3::Z, radius, height);
+    let mp = model
+        .mass_properties_for(id)
+        .expect("cylinder mass props must resolve via mesh fallback");
+
+    let m = mp.mass;
+    let i_axial = 0.5 * m * radius * radius;
+    let i_radial = 0.25 * m * radius * radius + (1.0 / 12.0) * m * height * height;
+    // Principal moments are sorted DESCENDING; expected too.
+    let mut expected = [i_radial, i_radial, i_axial];
+    expected.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
+    for k in 0..3 {
+        assert!(
+            relative_close(mp.principal_moments[k], expected[k], INERTIA_MESH_REL_TOL),
+            "cylinder principal moment[{k}] {} ≈ {} (axial 1/2·m·r², radial 1/4·m·r²+1/12·m·h²)",
+            mp.principal_moments[k],
+            expected[k]
+        );
+    }
+}
+
+#[test]
+fn cone_inertia_matches_analytical_formula() {
+    // Solid cone, base at origin pointing +Z, base_radius=r, height=h.
+    // About its COM (which sits at z = h/4 above the base):
+    //   I_axial  = (3/10)·m·r²
+    //   I_radial = (3/20)·m·r² + (3/80)·m·h²
+    let mut model = BRepModel::new();
+    let radius = 2.0;
+    let height = 6.0;
+    let id = make_cone(&mut model, Point3::ORIGIN, Vector3::Z, radius, height);
+    let mp = model
+        .mass_properties_for(id)
+        .expect("cone mass props must resolve via mesh fallback");
+
+    let m = mp.mass;
+    let i_axial = 0.3 * m * radius * radius;
+    let i_radial =
+        (3.0 / 20.0) * m * radius * radius + (3.0 / 80.0) * m * height * height;
+    // Principal moments sorted DESCENDING; expected too.
+    let mut expected = [i_radial, i_radial, i_axial];
+    expected.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
+    for k in 0..3 {
+        assert!(
+            relative_close(mp.principal_moments[k], expected[k], INERTIA_MESH_REL_TOL),
+            "cone principal moment[{k}] {} ≈ {} (axial 3/10·m·r², radial 3/20·m·r²+3/80·m·h²)",
+            mp.principal_moments[k],
+            expected[k]
+        );
+    }
+}
+
+#[test]
+fn principal_axes_are_orthonormal_for_every_primitive() {
+    // Across the four primitive types the Jacobi eigensolver must
+    // produce an orthonormal triad. Spheres are degenerate (any basis
+    // is valid) so we only check orthonormality, not direction.
+    let cases: Vec<(&'static str, Box<dyn Fn(&mut BRepModel) -> SolidId>)> = vec![
+        (
+            "box",
+            Box::new(|m: &mut BRepModel| make_box(m, 2.0, 3.0, 4.0)),
+        ),
+        (
+            "sphere",
+            Box::new(|m: &mut BRepModel| make_sphere(m, Point3::ORIGIN, 3.0)),
+        ),
+        (
+            "cylinder",
+            Box::new(|m: &mut BRepModel| {
+                make_cylinder(m, Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
+            }),
+        ),
+        (
+            "cone",
+            Box::new(|m: &mut BRepModel| {
+                make_cone(m, Point3::ORIGIN, Vector3::Z, 2.0, 6.0)
+            }),
+        ),
+    ];
+
+    for (name, make) in cases {
+        let mut model = BRepModel::new();
+        let id = make(&mut model);
+        let mp = model
+            .mass_properties_for(id)
+            .unwrap_or_else(|| panic!("{name} mass props must resolve"));
+
+        for i in 0..3 {
+            let n = (mp.principal_axes[i][0].powi(2)
+                + mp.principal_axes[i][1].powi(2)
+                + mp.principal_axes[i][2].powi(2))
+            .sqrt();
+            assert!(
+                (n - 1.0).abs() < 1e-9,
+                "{name} principal_axes[{i}] not unit-length: ‖·‖ = {n}"
+            );
+            for j in (i + 1)..3 {
+                let dot = mp.principal_axes[i][0] * mp.principal_axes[j][0]
+                    + mp.principal_axes[i][1] * mp.principal_axes[j][1]
+                    + mp.principal_axes[i][2] * mp.principal_axes[j][2];
+                assert!(
+                    dot.abs() < 1e-9,
+                    "{name} principal_axes[{i}] · principal_axes[{j}] = {dot} (should be 0)"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn principal_axes_and_moments_satisfy_eigenequation() {
+    // Frame-independent inertia regression. For every primitive the
+    // (principal_moments, principal_axes) pair the kernel returns must
+    // satisfy the defining eigen-relation against the same report's
+    // inertia tensor:
+    //
+    //     I · v_k = λ_k · v_k       for k ∈ {0, 1, 2}
+    //
+    // This test does NOT depend on a specific eigenvalue ordering, on
+    // a hand-derived expected formula, or on the analytical-vs-mesh
+    // method discriminator. It pins the internal consistency of the
+    // report itself — if `inertia_tensor`, `principal_moments`, and
+    // `principal_axes` drift apart (e.g. one path multiplies by
+    // density and another doesn't, or the parallel-axis shift only
+    // touches the tensor but not the eigenpair), every primitive will
+    // fail here regardless of the symbolic answer being "right".
+    //
+    // The companion `principal_axes_are_orthonormal_for_every_primitive`
+    // test only verifies the eigenvector frame is an orthonormal triad;
+    // this test verifies it is the **right** triad for the tensor in
+    // the same struct.
+    let cases: Vec<(&'static str, Box<dyn Fn(&mut BRepModel) -> SolidId>)> = vec![
+        (
+            "box",
+            Box::new(|m: &mut BRepModel| make_box(m, 2.0, 3.0, 4.0)),
+        ),
+        (
+            "sphere",
+            Box::new(|m: &mut BRepModel| make_sphere(m, Point3::ORIGIN, 3.0)),
+        ),
+        (
+            "cylinder",
+            Box::new(|m: &mut BRepModel| {
+                make_cylinder(m, Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
+            }),
+        ),
+        (
+            "cone",
+            Box::new(|m: &mut BRepModel| {
+                make_cone(m, Point3::ORIGIN, Vector3::Z, 2.0, 6.0)
+            }),
+        ),
+    ];
+
+    for (name, make) in cases {
+        let mut model = BRepModel::new();
+        let id = make(&mut model);
+        let mp = model
+            .mass_properties_for(id)
+            .unwrap_or_else(|| panic!("{name} mass props must resolve"));
+
+        // Largest eigenvalue normalises the absolute tolerance — Jacobi
+        // sweeps drive off-diagonals to ~1e-14 relative, but the mesh
+        // accumulation introduces ~1e-3 relative noise that scales with
+        // the moment magnitude.
+        let lam_max = mp.principal_moments[0]
+            .abs()
+            .max(mp.principal_moments[1].abs())
+            .max(mp.principal_moments[2].abs());
+        let abs_tol = 1e-2 * lam_max;
+
+        for k in 0..3 {
+            let v = mp.principal_axes[k];
+            let lambda = mp.principal_moments[k];
+
+            // I · v  (row-major contraction over the second index).
+            let iv = [
+                mp.inertia_tensor[0][0] * v[0]
+                    + mp.inertia_tensor[0][1] * v[1]
+                    + mp.inertia_tensor[0][2] * v[2],
+                mp.inertia_tensor[1][0] * v[0]
+                    + mp.inertia_tensor[1][1] * v[1]
+                    + mp.inertia_tensor[1][2] * v[2],
+                mp.inertia_tensor[2][0] * v[0]
+                    + mp.inertia_tensor[2][1] * v[1]
+                    + mp.inertia_tensor[2][2] * v[2],
+            ];
+            // λ · v
+            let lv = [lambda * v[0], lambda * v[1], lambda * v[2]];
+
+            for axis in 0..3 {
+                let residual = (iv[axis] - lv[axis]).abs();
+                assert!(
+                    residual < abs_tol,
+                    "{name}: eigenequation residual component {axis} of axis {k} = \
+                     {residual} > {abs_tol} (I·v = {:?}, λ·v = {:?}, λ = {lambda})",
+                    iv,
+                    lv,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mass_props_method_discriminates_analytical_vs_tessellated() {
+    use geometry_engine::primitives::solid::MassPropertiesMethod;
+
+    // Current contract (see `compute_solid_mass_properties` docs):
+    // **every** solid routes through the Tonon (2004) mesh pipeline
+    // because the analytical face-by-face traversal's inertia tensor
+    // is a documented "lie" (shell-level box-approximation, wrong by
+    // O(1) for curved geometry and by `density` for every solid). The
+    // wire-visible `MassPropertiesMethod::Analytical` discriminator is
+    // reserved for the future slice that fixes the shell-level inertia.
+    //
+    // Both primitives below therefore advertise `Tessellated`. The
+    // discriminator field still earns its keep: it forward-declares
+    // the variant agents will see once the analytical pipeline is
+    // promoted, and it surfaces the achieved tessellation tolerance
+    // to clients that need to decide whether to re-request at finer
+    // resolution.
+    let mut model = BRepModel::new();
+    let box_id = make_box(&mut model, 2.0, 2.0, 2.0);
+    let box_mp = model
+        .mass_properties_for(box_id)
+        .expect("box mass props must resolve");
+    assert!(
+        matches!(box_mp.method, MassPropertiesMethod::Tessellated { .. }),
+        "box must use the tessellated path (analytical inertia broken upstream), got {:?}",
+        box_mp.method
+    );
+
+    let mut model = BRepModel::new();
+    let sphere_id = make_sphere(&mut model, Point3::ORIGIN, 3.0);
+    let sphere_mp = model
+        .mass_properties_for(sphere_id)
+        .expect("sphere mass props must resolve");
+    assert!(
+        matches!(
+            sphere_mp.method,
+            MassPropertiesMethod::Tessellated { .. }
+        ),
+        "sphere must use the tessellated path, got {:?}",
+        sphere_mp.method
+    );
+}

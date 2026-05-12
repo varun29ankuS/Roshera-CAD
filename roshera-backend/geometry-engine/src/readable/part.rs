@@ -20,7 +20,7 @@
 //! production-sized models and an LRU cache would be premature).
 
 use crate::primitives::datum::{DatumId, DatumKind, LocationDescriptor};
-use crate::primitives::solid::SolidId;
+use crate::primitives::solid::{MassPropertiesMethod, SolidId};
 use serde::{Deserialize, Serialize};
 
 /// Topology fingerprint — counts of the canonical entity types a solid
@@ -142,6 +142,15 @@ pub struct MassPropertiesReport {
     pub principal_axes: [[f64; 3]; 3],
     /// Radius of gyration about each principal axis (`sqrt(I/m)`).
     pub radius_of_gyration: [f64; 3],
+    /// Indicator of how this report was computed —
+    /// [`MassPropertiesMethod::Analytical`] (closed-form face traversal,
+    /// exact to floating-point noise) or
+    /// [`MassPropertiesMethod::Tessellated`] (numerical integration over
+    /// the tessellated surface, used for curved primitives whose
+    /// analytical seam loops would degenerate). The tessellated variant
+    /// carries an empirical relative-tolerance bound the agent can use
+    /// to decide whether to trust the tail digits.
+    pub method: MassPropertiesMethod,
 }
 
 /// Oriented bounding box returned by `BRepModel::oriented_bbox_for`.

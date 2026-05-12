@@ -347,6 +347,13 @@ pub fn extrude_face(
         validate_extruded_solid(model, unified_solid_id)?;
     }
 
+    // The unified-extrusion path replaces `outer_shell` on the parent solid
+    // in-place (see create_unified_extrusion / create_complex_unified_extrusion).
+    // Any volume/area/inertia previously memoised on the Solid is stale.
+    if let Some(solid) = model.solids.get_mut(unified_solid_id) {
+        solid.invalidate_mass_props_cache();
+    }
+
     // Record for attached recorders. `direction` above was moved into
     // `create_*_unified_extrusion`, so re-read from `options` (the option
     // struct is still borrowed and un-normalized — sufficient for a record).
