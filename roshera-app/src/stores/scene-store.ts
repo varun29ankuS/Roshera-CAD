@@ -431,6 +431,19 @@ export interface SketchState {
 // strictly request/response — so a peer-side edit will not surface
 // until the local view explicitly refreshes. Slice N-3 / D-3 will
 // revisit this once the editor has live-collaboration value.
+/**
+ * Drawing tool inside the constrained sketcher. Mirrors the legacy
+ * click-to-place `SketchTool` but speaks the csketch vocabulary
+ * (`point` / `line` / `circle` map to `POST /point` / `/line` /
+ * `/circle` respectively).
+ *
+ * `null` is the idle / "no draw tool active" state — the overlay
+ * falls through to the legacy capture-plane click handler when
+ * idle. Set via `setCSketchTool`; cleared on `closeCSketch` /
+ * `deleteCSketch` (active).
+ */
+export type CSketchTool = 'point' | 'line' | 'circle'
+
 export interface CSketchState {
   /**
    * Every known csketch keyed by server id, populated by
@@ -467,6 +480,16 @@ export interface CSketchState {
    * suitable for refresh on every constraint add / remove.
    */
   lastDofReport: DofReport | null
+  /**
+   * Active draw tool for the csketch editor, or `null` when no
+   * tool is selected (the legacy capture-plane handler then
+   * processes clicks normally). Set by the SketchPanel tool row
+   * (D-2-b). The overlay reads this on every pointer down: when
+   * non-null, clicks are routed through the csketch REST surface
+   * (`addPoint` / `addLine` / `addCircle`) instead of the legacy
+   * sketch handler.
+   */
+  activeTool: CSketchTool | null
 }
 
 // ─── Scene store ─────────────────────────────────────────────────────
@@ -812,6 +835,16 @@ interface SceneState {
    * constraint add / remove for a reactive "DOF: 3" badge.
    */
   analyseCSketchDof: (id: string) => Promise<DofReport>
+  /**
+   * Set or clear the active csketch draw tool (D-2-b). Pass `null`
+   * to return the editor to read-only / drag-only mode. Toggling
+   * the same tool twice is a no-op at the caller's discretion —
+   * the panel uses a click-to-toggle pattern.
+   *
+   * No round-trip; pure local state. Cleared automatically when
+   * the active csketch closes / is deleted.
+   */
+  setCSketchTool: (tool: CSketchTool | null) => void
 
   setSceneRef: (scene: THREE.Scene | null) => void
   setCameraRef: (camera: THREE.Camera | null) => void
@@ -885,6 +918,7 @@ export const useSceneStore = create<SceneState>()(
       activeConstraints: [],
       lastReport: null,
       lastDofReport: null,
+      activeTool: null,
     },
     sceneRef: null,
     cameraRef: null,
@@ -1681,6 +1715,9 @@ export const useSceneStore = create<SceneState>()(
             activeConstraints: constraints,
             lastReport: null,
             lastDofReport: null,
+            // Opening a fresh csketch always lands in read-only /
+            // drag-only mode; the user picks a tool from the panel.
+            activeTool: null,
           },
         }
       })
@@ -1694,6 +1731,7 @@ export const useSceneStore = create<SceneState>()(
           activeConstraints: [],
           lastReport: null,
           lastDofReport: null,
+          activeTool: null,
         },
       }))
     },
@@ -1712,6 +1750,7 @@ export const useSceneStore = create<SceneState>()(
             activeConstraints: wasActive ? [] : state.csketch.activeConstraints,
             lastReport: wasActive ? null : state.csketch.lastReport,
             lastDofReport: wasActive ? null : state.csketch.lastDofReport,
+            activeTool: wasActive ? null : state.csketch.activeTool,
           },
         }
       })
@@ -1872,6 +1911,12 @@ export const useSceneStore = create<SceneState>()(
         }
       })
       return report
+    },
+
+    setCSketchTool: (tool) => {
+      set((state) => ({
+        csketch: { ...state.csketch, activeTool: tool },
+      }))
     },
 
     setSceneRef: (scene) => set({ sceneRef: scene }),
