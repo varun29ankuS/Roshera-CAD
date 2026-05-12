@@ -576,6 +576,13 @@ export function SketchOverlay() {
           csketch and an active sketch plane to project onto. */}
       <CSketchDimensions plane={sketch.plane} />
 
+      {/* Geometric-constraint badges (D-3b). Small one-glyph
+          bordered chips anchored to the constraint's entity
+          centroid. Badges turn rose for `conflicts` and amber for
+          `redundant` so the H-slice diagnosis surfaces visually
+          without an extra panel. */}
+      <CSketchGeometricBadges plane={sketch.plane} />
+
       <SketchPreview showMeasure={showMeasure} />
 
       {/* Inference line drawn through the anchor whenever the cursor
@@ -1046,6 +1053,247 @@ function circleRightmost(
   if (refs.length === 0) return null
   const c = entityCircle(refs[0], circles)
   return c ? [c.cx + c.radius, c.cy] : null
+}
+
+// ─── Constrained-sketch geometric badges (D-3b) ──────────────────────
+
+/**
+ * Status of a geometric constraint as far as the viewport overlay
+ * cares. Drives badge tint:
+ *
+ *   - `ok`        → neutral border, foreground glyph (the common case)
+ *   - `redundant` → amber border + glyph; from `DofReport.redundant`
+ *                   (linearly dependent row with zero residual)
+ *   - `conflict`  → rose border + glyph; from `DofReport.conflicts`
+ *                   (linearly dependent row with non-zero residual)
+ */
+type GeometricBadgeStatus = 'ok' | 'redundant' | 'conflict'
+
+interface GeometricBadge {
+  /** Stable React key; equals the constraint id. */
+  constraintId: string
+  /** Single-glyph (or short string) for the badge body. */
+  glyph: string
+  /** Human-readable name shown as the badge's `title` (browser tooltip). */
+  title: string
+  status: GeometricBadgeStatus
+  /** Plane-local (u, v) position of the badge anchor. */
+  uv: [number, number]
+}
+
+/**
+ * Map a `GeometricConstraint` variant to its display glyph + tooltip.
+ * Returns `null` for variants we don't render — those would clutter
+ * the viewport (e.g. `EqualArea` is a multi-loop property that has no
+ * natural single-point anchor).
+ *
+ * Glyph choices:
+ *   - One-character where a recognisable Unicode exists (∥ ⊥ ≡ ◎ ∠)
+ *   - Two-character ASCII where Unicode is ambiguous (Eq, Tg, Co)
+ *   - Avoid emoji — the badges live on a 16-px line and emoji break
+ *     vertical centering in tabular CSS layouts.
+ */
+function geometricGlyph(
+  g: import('@/lib/csketch-api').GeometricConstraint,
+): { glyph: string; title: string } | null {
+  if (typeof g === 'string') {
+    switch (g) {
+      case 'Horizontal': return { glyph: 'H', title: 'Horizontal' }
+      case 'Vertical': return { glyph: 'V', title: 'Vertical' }
+      case 'Perpendicular': return { glyph: '\u22A5', title: 'Perpendicular' }
+      case 'Parallel': return { glyph: '\u2225', title: 'Parallel' }
+      case 'Coincident': return { glyph: '\u2261', title: 'Coincident' }
+      case 'Tangent': return { glyph: 'Tg', title: 'Tangent' }
+      case 'Concentric': return { glyph: '\u25CE', title: 'Concentric' }
+      case 'Equal': return { glyph: '=', title: 'Equal' }
+      case 'Collinear': return { glyph: 'Co', title: 'Collinear' }
+      case 'Midpoint': return { glyph: 'M', title: 'Midpoint' }
+      case 'Symmetric': return { glyph: 'Sy', title: 'Symmetric' }
+      case 'PointOnCurve': return { glyph: '\u2022', title: 'Point on Curve' }
+      case 'SmoothTangent': return { glyph: 'G2', title: 'Smooth Tangent (G2)' }
+      case 'CurvatureContinuity': return { glyph: 'G3', title: 'Curvature Continuity (G3)' }
+      case 'ContactConstraint': return { glyph: 'Ct', title: 'Contact' }
+      // Variants below have no canonical viewport anchor — skip.
+      case 'Offset':
+      case 'MultiTangent':
+      case 'EqualArea':
+      case 'EqualPerimeter':
+      case 'Centroid':
+      case 'CurvatureExtremum':
+        return null
+    }
+  }
+  if ('IntersectionAngle' in g) {
+    const deg = ((g.IntersectionAngle * 180) / Math.PI).toFixed(0)
+    return { glyph: '\u2220', title: `Intersection Angle ${deg}\u00B0` }
+  }
+  return null
+}
+
+/**
+ * Compute the (u, v) anchor for a constraint's badge: the centroid
+ * of its entity representatives. Single-entity constraints anchor at
+ * the entity itself; multi-entity constraints anchor at the average
+ * so a `Parallel(line1, line2)` badge sits between the two lines.
+ *
+ * Returns `null` if no entity referenced by the constraint resolves
+ * — the summary may lag a constraint mutation by one render frame.
+ */
+function constraintAnchor(
+  refs: EntityRef[],
+  points: Map<string, CSketchPointSummary>,
+  lines: Map<string, CSketchLineSummary>,
+  circles: Map<string, CSketchCircleSummary>,
+): [number, number] | null {
+  const uvs: [number, number][] = []
+  for (const e of refs) {
+    if ('Point' in e) {
+      const p = points.get(e.Point)
+      if (p) uvs.push([p.x, p.y])
+    } else if ('Line' in e) {
+      const l = lines.get(e.Line)
+      if (l) uvs.push(lineRepresentative(l))
+    } else if ('Circle' in e) {
+      const c = circles.get(e.Circle)
+      if (c) uvs.push([c.cx, c.cy])
+    }
+    // Other entity kinds (Arc, Rectangle, Ellipse, Spline, Polyline)
+    // are not yet in the summary surface — once they land, extend
+    // this switch.
+  }
+  if (uvs.length === 0) return null
+  const ux = uvs.reduce((s, u) => s + u[0], 0) / uvs.length
+  const uy = uvs.reduce((s, u) => s + u[1], 0) / uvs.length
+  return [ux, uy]
+}
+
+/**
+ * Pure derivation: produce one badge per geometric constraint that
+ * has a canonical anchor. Badges share the `conflict`/`redundant`
+ * classification computed by slice H's `/dof` diagnose pass, so a
+ * constraint that participates in a redundant/inconsistent set is
+ * tinted to draw the user's eye.
+ */
+function buildCSketchGeometricBadges(
+  summary: CSketchSummary,
+  constraints: Constraint[],
+  conflictIds: Set<string>,
+  redundantIds: Set<string>,
+): GeometricBadge[] {
+  const pointsById = new Map<string, CSketchPointSummary>()
+  for (const p of summary.points) pointsById.set(p.id, p)
+  const linesById = new Map<string, CSketchLineSummary>()
+  for (const l of summary.lines) linesById.set(l.id, l)
+  const circlesById = new Map<string, CSketchCircleSummary>()
+  for (const c of summary.circles) circlesById.set(c.id, c)
+
+  const out: GeometricBadge[] = []
+  for (const c of constraints) {
+    if (!('Geometric' in c.constraint_type)) continue
+    const meta = geometricGlyph(c.constraint_type.Geometric)
+    if (!meta) continue
+    const anchor = constraintAnchor(c.entities, pointsById, linesById, circlesById)
+    if (!anchor) continue
+    const status: GeometricBadgeStatus = conflictIds.has(c.id)
+      ? 'conflict'
+      : redundantIds.has(c.id)
+        ? 'redundant'
+        : 'ok'
+    out.push({
+      constraintId: c.id,
+      glyph: meta.glyph,
+      title: meta.title,
+      status,
+      uv: anchor,
+    })
+  }
+  return out
+}
+
+/**
+ * Render a small bordered glyph next to every geometric constraint
+ * on the active csketch. Slice D-3b — pairs with the dimension
+ * labels (N-3) so the user sees the full constraint state, not just
+ * the dimensional half.
+ *
+ * Multiple badges that share the same anchor (e.g. `Horizontal` and
+ * `Equal` on the same line endpoint) stack into a single flex row
+ * inside one `<Html>`, so they never overlap pixel-for-pixel.
+ *
+ * Read-only in this slice; right-click-to-delete and click-to-select
+ * land in D-3d once the selection state is wired.
+ */
+function CSketchGeometricBadges({ plane }: { plane: SketchPlane }) {
+  const activeId = useSceneStore((s) => s.csketch.activeId)
+  const summary = useSceneStore((s) =>
+    s.csketch.activeId ? s.csketch.summaries.get(s.csketch.activeId) ?? null : null,
+  )
+  const constraints = useSceneStore((s) => s.csketch.activeConstraints)
+  const dofReport = useSceneStore((s) => s.csketch.lastDofReport)
+
+  const groups = useMemo(() => {
+    if (!activeId || !summary) return []
+    const conflictIds = new Set(dofReport?.conflicts ?? [])
+    const redundantIds = new Set(dofReport?.redundant ?? [])
+    const badges = buildCSketchGeometricBadges(
+      summary,
+      constraints,
+      conflictIds,
+      redundantIds,
+    )
+    // Group badges that land at (almost) the same (u, v) so they
+    // stack visually instead of overlapping. 1e-4 in sketch units
+    // is well below the visual threshold yet captures all "same
+    // entity" cases (everything anchored to the same point/line).
+    const byKey = new Map<string, GeometricBadge[]>()
+    for (const b of badges) {
+      const key = `${b.uv[0].toFixed(4)}|${b.uv[1].toFixed(4)}`
+      const existing = byKey.get(key)
+      if (existing) existing.push(b)
+      else byKey.set(key, [b])
+    }
+    return Array.from(byKey.entries()).map(([key, list]) => ({
+      key,
+      uv: list[0].uv,
+      badges: list,
+    }))
+  }, [activeId, summary, constraints, dofReport])
+
+  if (groups.length === 0 || !activeId) return null
+
+  return (
+    <group name="csketch-geometric-badges">
+      {groups.map((g) => (
+        <Html
+          key={g.key}
+          position={uvToWorld(g.uv, plane)}
+          center
+          pointerEvents="none"
+          zIndexRange={[100, 0]}
+        >
+          <div className="flex items-center gap-0.5 select-none">
+            {g.badges.map((b) => {
+              const tone =
+                b.status === 'conflict'
+                  ? 'border-rose-400/60 text-rose-300 bg-rose-950/40'
+                  : b.status === 'redundant'
+                    ? 'border-amber-400/50 text-amber-300 bg-amber-950/40'
+                    : 'border-border/60 text-foreground bg-background/80'
+              return (
+                <div
+                  key={b.constraintId}
+                  title={b.title}
+                  className={`px-1 min-w-[16px] h-4 inline-flex items-center justify-center text-[9px] font-mono font-semibold uppercase tracking-tight border ${tone} backdrop-blur-sm`}
+                >
+                  {b.glyph}
+                </div>
+              )
+            })}
+          </div>
+        </Html>
+      ))}
+    </group>
+  )
 }
 
 // ─── Preview + dimensions ────────────────────────────────────────────
