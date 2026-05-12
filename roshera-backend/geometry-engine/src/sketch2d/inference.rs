@@ -143,7 +143,7 @@ pub struct ProposedConstraint {
 /// [`Sketch::best_snap`] for endpoint coincidence detection.
 ///
 /// `equal_radius_tol` gates the EqualRadius rule on draft circles.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct InferenceTolerance {
     /// Angular tolerance in radians for direction-based rules.
     pub angle_tol: f64,
