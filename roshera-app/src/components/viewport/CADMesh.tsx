@@ -238,15 +238,25 @@ export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
       if (sketchActive) return
       if (selectionMode === 'object') return
       e.stopPropagation()
-      const faceIndex = e.faceIndex ?? 0
+      const triangleIndex = e.faceIndex ?? 0
       const subType = selectionMode as 'face' | 'edge' | 'vertex'
+      // Face hover must resolve the picked triangle to its kernel
+      // FaceId so `SubElementHighlight` can fan out across every
+      // triangle sharing that face id. Storing the raw triangle
+      // index here is what made face hover render a single triangle
+      // (the fan-out loop compares `faceIds[t] === sel.index`, and
+      // a triangle index will never match a FaceId).
+      // Edge / vertex still get the raw triangle index; the backend
+      // resolves those from the picked point on click.
+      const elementIndex =
+        subType === 'face' ? resolveFaceId(triangleIndex) : triangleIndex
       setHoveredSubElement({
         objectId: object.id,
         type: subType,
-        index: faceIndex,
+        index: elementIndex,
       })
     },
-    [sketchActive, selectionMode, object.id, setHoveredSubElement],
+    [sketchActive, selectionMode, object.id, setHoveredSubElement, resolveFaceId],
   )
 
   const handlePointerOut = useCallback(() => {
