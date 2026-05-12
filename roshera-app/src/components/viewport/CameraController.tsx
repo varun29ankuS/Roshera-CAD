@@ -52,7 +52,6 @@ export function CameraController() {
   const pendingFrameObjectId = useSceneStore((s) => s.pendingFrameObjectId)
   const setPendingFrameObject = useSceneStore((s) => s.setPendingFrameObject)
   const setCameraRef = useSceneStore((s) => s.setCameraRef)
-  const sketchActive = useSceneStore((s) => s.sketch.active)
   const projection = useSceneStore((s) => s.cameraProjection)
   // Suppresses orbit-rotation while a viewport gizmo (e.g. face-pull
   // arrow) owns the pointer. OrbitControls listens at the canvas DOM
@@ -279,22 +278,24 @@ export function CameraController() {
         zoomSpeed={1.2}
         minDistance={1}
         maxDistance={500}
-        // Sketch mode owns left-click for point placement; rotate must
-        // not fire on the same gesture. Pan + zoom stay enabled via
-        // middle button + scroll so the user can still navigate while
-        // drawing on a plane.
-        enableRotate={!sketchActive && !gizmoDragging}
+        // Sketch mode shares the left button with OrbitControls:
+        // click-without-drag places a sketch point (SketchOverlay
+        // implements a movement threshold on pointerup), drag-beyond-
+        // threshold orbits the camera. The Fusion/Onshape pattern —
+        // and the only way to give the user an orbit affordance while
+        // sketching without burning a separate modifier key.
+        // Gizmo drags still fully suppress orbit (the arrow owns the
+        // gesture end-to-end).
+        enableRotate={!gizmoDragging}
         enablePan
         screenSpacePanning
         mouseButtons={{
-          // Sketch mode owns left-click; OrbitControls treats `undefined`
-          // as "no binding" so the gesture passes through cleanly. Same
-          // pass-through applies while a gizmo is mid-drag — the
-          // gesture must not also rotate the camera.
-          LEFT:
-            sketchActive || gizmoDragging
-              ? (undefined as unknown as THREE.MOUSE)
-              : THREE.MOUSE.ROTATE,
+          // While a gizmo is mid-drag the left button must pass through
+          // cleanly (OrbitControls treats `undefined` as "no binding")
+          // — otherwise the same gesture would also rotate the camera.
+          LEFT: gizmoDragging
+            ? (undefined as unknown as THREE.MOUSE)
+            : THREE.MOUSE.ROTATE,
           MIDDLE: THREE.MOUSE.PAN,
           // RIGHT intentionally unbound — reserved for the viewport
           // context menu (CADMesh.onContextMenu). Pan is still
