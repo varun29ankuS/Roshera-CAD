@@ -68,6 +68,10 @@ ml = []
 name = "geometry_bench"
 harness = false
 
+[[bench]]
+name = "tessellation_bench"
+harness = false
+
 [[bin]]
 name = "bench_runner"
 path = "src/bin/bench_runner.rs"
