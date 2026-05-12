@@ -912,9 +912,11 @@ mod tests {
     #[test]
     fn proper_crossing_triangle_and_square() {
         // Triangle straddling a square: the triangle's apex is outside,
-        // its base crosses through the square.
+        // its base crosses through the square. Both polygons must be
+        // CCW-wound (the algorithm's input contract) — the triangle's
+        // vertices are ordered to give a positive signed area.
         let square = vec![p(0.0, 0.0), p(4.0, 0.0), p(4.0, 4.0), p(0.0, 4.0)];
-        let triangle = vec![p(-1.0, 2.0), p(5.0, 2.0), p(2.0, -2.0)];
+        let triangle = vec![p(-1.0, 2.0), p(2.0, -2.0), p(5.0, 2.0)];
         let result = intersect_polygons(&square, &triangle, &tol()).expect("clip ok");
         assert_eq!(result.regions.len(), 1);
         // Visual area: pentagon bounded by (0,0)-(4,0)-(4,2)-(0,2)
