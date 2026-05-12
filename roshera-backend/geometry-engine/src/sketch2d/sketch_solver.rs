@@ -388,6 +388,34 @@ pub struct DofReport {
     /// Entities that cannot contribute DOFs in slice B-2 — same
     /// list semantics as [`SketchSolveReport::entities_skipped`].
     pub entities_skipped: Vec<SkippedEntity>,
+    /// Constraints whose Jacobian rows are linearly dependent on
+    /// earlier rows **and** whose post-solve residual is within
+    /// tolerance. Safe-to-remove duplicates: the system still has a
+    /// solution, but this constraint contributes no new information.
+    ///
+    /// Populated when the structural verdict is not
+    /// `FullyConstrained` (i.e. one of `OverConstrained` /
+    /// `UnderConstrained`). For `FullyConstrained` sketches the
+    /// numerical analysis is skipped because the structural count
+    /// already proves there is no redundancy.
+    ///
+    /// Order is deterministic for any given constraint ordering: the
+    /// list reflects the first time each redundant constraint was
+    /// encountered while scanning rows of the Jacobian.
+    #[serde(default)]
+    pub redundant: Vec<ConstraintId>,
+    /// Constraints whose Jacobian rows are linearly dependent on
+    /// earlier rows **and** whose post-solve residual exceeds
+    /// tolerance. These are part of an inconsistent subset — the
+    /// sketch cannot satisfy them simultaneously with the
+    /// independent constraints that came before.
+    ///
+    /// Same population rules as `redundant`. The classification is
+    /// order-dependent: a true global minimum-cardinality unsat
+    /// subset (MUS) requires QuickXplain-style search, deferred to a
+    /// follow-up slice.
+    #[serde(default)]
+    pub conflicts: Vec<ConstraintId>,
 }
 
 impl DofReport {
@@ -572,6 +600,25 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         },
     };
 
+    // Numerical diagnostic pass: when the structural count says the
+    // sketch is anything other than `FullyConstrained`, classify each
+    // constraint as essential / redundant / conflicting using the
+    // Jacobian's rank profile. The pass is skipped for fully
+    // constrained sketches because by construction `constraint_dofs
+    // _removed == total_free_dofs` precludes both redundancy and
+    // conflict.
+    //
+    // The diagnostic builds an isolated `ConstraintSolver` populated
+    // from the sketch's *current* entity state (which may or may not
+    // be a converged solution). The solver's own DashMap is the only
+    // mutable surface; the sketch is never written back. This keeps
+    // `analyze_dofs` side-effect-free, matching its documented
+    // contract.
+    let (redundant, conflicts) = match status {
+        DofStatus::FullyConstrained => (Vec::new(), Vec::new()),
+        _ => diagnose_constraints(sketch, &skipped_set),
+    };
+
     DofReport {
         total_free_dofs,
         constraint_dofs_removed,
@@ -580,7 +627,47 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         constraints_analysed,
         constraints_skipped,
         entities_skipped,
+        redundant,
+        conflicts,
     }
+}
+
+/// Build a non-mutating `ConstraintSolver` snapshot of the sketch
+/// and run its rank-revealing diagnosis. Only constraints whose
+/// entire entity set is supported by the bridge are fed to the
+/// solver — the rest contribute neither rows nor verdict so the
+/// classification stays consistent with the DOF accounting above.
+///
+/// Returns `(redundant, conflicts)` constraint id lists per
+/// `ConstraintDiagnosis::redundant` / `::conflicts` semantics.
+fn diagnose_constraints(
+    sketch: &Sketch,
+    skipped_set: &std::collections::HashSet<EntityRef>,
+) -> (Vec<ConstraintId>, Vec<ConstraintId>) {
+    let mut solver = ConstraintSolver::new();
+    populate_solver(sketch, &solver);
+
+    let mut diagnosable: Vec<super::constraints::Constraint> = Vec::new();
+    for c in sketch.all_constraints().iter() {
+        if c.entities.iter().any(|e| skipped_set.contains(e)) {
+            continue;
+        }
+        diagnosable.push(c.clone());
+    }
+    if diagnosable.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // `sketch.all_constraints()` iterates a `DashMap` and is therefore
+    // unordered. The diagnosis is order-dependent (the first row in
+    // a linearly-dependent set is the "essential" one; the rest are
+    // flagged). Sort by id so the verdict is deterministic across
+    // calls — the UI can otherwise see the same sketch produce
+    // different redundancy lists on consecutive `/dof` requests.
+    diagnosable.sort_by_key(|c| c.id.0);
+    solver.set_constraints(diagnosable);
+
+    let diagnosis = solver.diagnose();
+    (diagnosis.redundant, diagnosis.conflicts)
 }
 
 // ── Internal: shared solve path + drag-constraint synthesis ────────
@@ -1691,6 +1778,140 @@ mod tests {
         assert!(report.has_skipped_constraints());
         assert!(report.is_under_constrained());
         assert_eq!(report.remaining_dofs(), Some(2));
+    }
+
+    // ── H: constraint diagnosis (redundancy + conflicts) ───────────
+
+    #[test]
+    fn analyze_dofs_fully_constrained_has_no_redundancy_or_conflicts() {
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(3.0, 4.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(4.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        let report = analyze_dofs(&sketch);
+        assert!(report.is_fully_constrained());
+        // Fully-constrained sketches skip the numerical pass.
+        assert!(report.redundant.is_empty());
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn analyze_dofs_flags_redundant_duplicate_x_constraint() {
+        // 1 free point + 3 XCoordinate(3.0): structurally
+        // over-constrained (3 DOFs removed vs 2 free). Two of the
+        // three X-constraints are linearly dependent on the first
+        // (in sorted-by-id order) AND their residuals are zero →
+        // both are redundant; the third is essential.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(3.0, 0.0));
+        let c1 = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        );
+        let c2 = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        );
+        let c3 = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        );
+        let ids = [c1.id, c2.id, c3.id];
+        sketch.add_constraint(c1);
+        sketch.add_constraint(c2);
+        sketch.add_constraint(c3);
+
+        let report = analyze_dofs(&sketch);
+        assert!(report.is_over_constrained());
+        assert!(report.conflicts.is_empty(), "got {:?}", report.conflicts);
+        // Exactly two of the three are redundant; the third (the one
+        // with the smallest uuid by sort order) is the essential
+        // representative — but we don't pin which from the outside.
+        assert_eq!(report.redundant.len(), 2);
+        for rid in &report.redundant {
+            assert!(ids.contains(rid), "redundant id {rid:?} not in sketch");
+        }
+    }
+
+    #[test]
+    fn analyze_dofs_flags_conflicting_inconsistent_x_constraints() {
+        // 1 free point at (3,0) + 3× XCoordinate(3.0/7.0/9.0).
+        // Same Jacobian row for all three, different RHS — two of
+        // them are linearly dependent on the essential one and their
+        // residuals cannot all be zero. The two non-essential rows
+        // must be classified as conflicts (not redundant).
+        //
+        // Diagnose runs only when the structural verdict is non-fully-
+        // constrained, so we need ≥3 constraints on 2 DOFs to trigger
+        // the over-constrained path.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(3.0, 0.0));
+        let c1 = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        );
+        let c2 = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(7.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        );
+        let c3 = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(9.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        );
+        let ids = [c1.id, c2.id, c3.id];
+        sketch.add_constraint(c1);
+        sketch.add_constraint(c2);
+        sketch.add_constraint(c3);
+
+        let report = analyze_dofs(&sketch);
+        assert!(report.is_over_constrained());
+        // Two of the three are dependent rows with non-zero residuals
+        // → conflicts. The third (smallest uuid by sort order) is
+        // essential. We don't pin which from the outside.
+        assert_eq!(
+            report.conflicts.len(),
+            2,
+            "expected 2 conflicts, got {:?}",
+            report.conflicts
+        );
+        for cid in &report.conflicts {
+            assert!(ids.contains(cid), "conflict id {cid:?} not in sketch");
+        }
+        assert!(report.redundant.is_empty(), "got {:?}", report.redundant);
+    }
+
+    #[test]
+    fn analyze_dofs_under_constrained_sketch_has_no_conflicts() {
+        // 2 free points + 1 distance: structurally
+        // under-constrained (4 free DOFs - 1 removed = 3 free).
+        // The lone distance row is independent → no redundancy,
+        // no conflict.
+        let sketch = fresh_sketch();
+        let p1 = sketch.add_point(Point2d::new(0.0, 0.0));
+        let p2 = sketch.add_point(Point2d::new(1.0, 0.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(1.0),
+            vec![EntityRef::Point(p1), EntityRef::Point(p2)],
+            ConstraintPriority::Required,
+        ));
+        let report = analyze_dofs(&sketch);
+        assert!(report.is_under_constrained());
+        assert!(report.redundant.is_empty());
+        assert!(report.conflicts.is_empty());
     }
 
     // ── B-2 hardening: dragging a fixed point is rejected ──────────
