@@ -15,6 +15,7 @@
 #![allow(clippy::panic)]
 
 use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::operations::{extrude_face, ExtrudeOptions, OperationError};
 use geometry_engine::primitives::{
     curve::Line,
@@ -195,6 +196,57 @@ fn extrudes_face_without_holes_unchanged_behavior() {
 // ---------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Slice C — coplanar disjoint extrusions must Union successfully
+// ---------------------------------------------------------------------
+
+#[test]
+fn coincident_planes_disjoint_extrusions_union_succeeds() {
+    // Two disjoint rectangles on the same XY sketch plane. Pre-Slice C
+    // their extrusions shared bottom and top sketch planes, so the
+    // boolean pipeline's `plane_plane_intersection` short-circuited
+    // with `OperationError::CoplanarFaces` and killed the Union. After
+    // Slice C, the face-overlap check sees the AABBs are disjoint and
+    // lets the intersection pass return an empty curve set — Union
+    // proceeds normally.
+    let mut model = BRepModel::new();
+
+    let outer_a = add_outer_rect_loop(&mut model, 0.0, 0.0, 2.0, 2.0);
+    let face_a = build_xy_face(&mut model, outer_a, &[]);
+
+    let outer_b = add_outer_rect_loop(&mut model, 10.0, 10.0, 12.0, 12.0);
+    let face_b = build_xy_face(&mut model, outer_b, &[]);
+
+    let extrude_opts = ExtrudeOptions {
+        distance: 5.0,
+        common: geometry_engine::operations::CommonOptions {
+            validate_result: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let solid_a = extrude_face(&mut model, face_a, extrude_opts.clone())
+        .expect("extrude rect A succeeds");
+    let solid_b =
+        extrude_face(&mut model, face_b, extrude_opts).expect("extrude rect B succeeds");
+
+    let result = boolean_operation(
+        &mut model,
+        solid_a,
+        solid_b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    );
+
+    assert!(
+        result.is_ok(),
+        "Union of two disjoint coplanar extrusions must succeed after Slice C, \
+         got error: {:?}",
+        result.err(),
+    );
+}
 
 #[test]
 fn rejects_inner_loop_outside_outer() {
