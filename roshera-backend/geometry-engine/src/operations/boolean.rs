@@ -92,12 +92,31 @@ impl Default for BooleanOptions {
     }
 }
 
-/// Intersection between two faces
+/// Intersection between two faces.
+///
+/// For the standard proper-crossing case (two faces meeting along a
+/// curve), all cutting curves live in [`Self::curves`] — they
+/// geometrically lie on BOTH faces' surfaces, so they go into both
+/// face's cut lists in [`split_faces_along_curves`].
+///
+/// For the coplanar-overlap case (Slice E imprint-merge), the cuts
+/// are per-face: B's boundary segments inside A only cut face A, and
+/// A's boundary segments inside B only cut face B. These live in
+/// [`Self::coplanar_curves_a`] and [`Self::coplanar_curves_b`]
+/// respectively. The standard `curves` field stays empty in this case.
 #[derive(Debug)]
 struct FaceIntersection {
     face_a_id: FaceId,
     face_b_id: FaceId,
     curves: Vec<IntersectionCurve>,
+    /// Cuts applied to `face_a` only (segments of `face_b`'s boundary
+    /// lying inside `face_a`, in the coplanar-overlap case). Empty in
+    /// the standard proper-crossing case.
+    coplanar_curves_a: Vec<IntersectionCurve>,
+    /// Cuts applied to `face_b` only (segments of `face_a`'s boundary
+    /// lying inside `face_b`, in the coplanar-overlap case). Empty in
+    /// the standard proper-crossing case.
+    coplanar_curves_b: Vec<IntersectionCurve>,
 }
 
 /// Intersection curve between two faces. Only `curve_id` is consumed by
@@ -403,14 +422,31 @@ fn intersect_faces(
             // without knowing whether the bounded FACES on those planes
             // overlap. Two faces on the same plane with disjoint outer
             // loops have no shared boundary curve — the correct answer
-            // is "no intersection", not an error. Test the bounded
-            // overlap and route accordingly. Truly overlapping coplanar
-            // faces remain a `CoplanarFaces` error pending Slice E's
-            // imprint-then-merge implementation.
-            if coplanar_faces_overlap(model, face_a, face_b, &options.common.tolerance)? {
-                return Err(OperationError::CoplanarFaces(msg));
+            // is "no intersection", not an error.
+            //
+            // Slice E imprint-merge: when the bounded faces DO overlap,
+            // route to `imprint_merge_coplanar_overlap` to produce the
+            // per-face cuts that split each face into "inside the other"
+            // and "outside" sub-faces. `classify_split_faces` already
+            // tags the resulting coplanar overlap sub-faces as
+            // `OnBoundary`, and `select_faces_for_operation` already
+            // resolves the per-op semantics (Union → keep one, Intersect
+            // → keep one, Difference → drop both).
+            if !coplanar_faces_overlap(model, face_a, face_b, &options.common.tolerance)? {
+                return Ok(None);
             }
-            return Ok(None);
+            return imprint_merge_coplanar_overlap(model, face_a, face_b, &options.common.tolerance)
+                .map_err(|e| match e {
+                    // Surface a clear "still unimplemented" error when
+                    // the polygon-clip subroutine hits a degeneracy
+                    // (shared vertex, vertex on edge, collinear overlap)
+                    // — these need the Hormann-Agathos perturbation
+                    // extension, deferred to a follow-up sub-slice.
+                    OperationError::InvalidGeometry(detail) => OperationError::CoplanarFaces(
+                        format!("{msg}; imprint-merge degeneracy: {detail}"),
+                    ),
+                    other => other,
+                });
         }
         Err(e) => return Err(e),
     };
@@ -460,6 +496,8 @@ fn intersect_faces(
         face_a_id: face_a,
         face_b_id: face_b,
         curves: intersection_curves,
+        coplanar_curves_a: Vec::new(),
+        coplanar_curves_b: Vec::new(),
     }))
 }
 
@@ -2208,17 +2246,34 @@ fn split_faces_along_curves(
     let mut face_curves: HashMap<FaceId, (SolidId, Vec<CurveId>)> = HashMap::new();
 
     // Collect curves for each face, tagged with the solid the face came from.
+    //
+    // Two sources of cuts per intersection record:
+    //   * `curves` — meet curves shared by both faces (proper-crossing
+    //     case). Routed to both face_a and face_b's cut lists.
+    //   * `coplanar_curves_a` / `coplanar_curves_b` — per-face cuts
+    //     produced by Slice E's imprint-merge for coplanar overlapping
+    //     faces. Each side's cuts are segments of the OPPOSITE face's
+    //     boundary lying inside this face, and apply ONLY to this face.
     for intersection in intersections {
-        face_curves
+        let a_entry = face_curves
             .entry(intersection.face_a_id)
-            .or_insert_with(|| (solid_a, Vec::new()))
+            .or_insert_with(|| (solid_a, Vec::new()));
+        a_entry
             .1
             .extend(intersection.curves.iter().map(|c| c.curve_id));
-        face_curves
+        a_entry
+            .1
+            .extend(intersection.coplanar_curves_a.iter().map(|c| c.curve_id));
+
+        let b_entry = face_curves
             .entry(intersection.face_b_id)
-            .or_insert_with(|| (solid_b, Vec::new()))
+            .or_insert_with(|| (solid_b, Vec::new()));
+        b_entry
             .1
             .extend(intersection.curves.iter().map(|c| c.curve_id));
+        b_entry
+            .1
+            .extend(intersection.coplanar_curves_b.iter().map(|c| c.curve_id));
     }
 
     // Split each face, carrying its origin solid through to the SplitFace.
@@ -3666,6 +3721,156 @@ fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
         j = i;
     }
     inside
+}
+
+/// Slice E imprint-merge: build a `FaceIntersection` for two coplanar
+/// faces whose outer loops overlap in a proper-crossing configuration.
+///
+/// The standard `surface_surface_intersection` path returns
+/// `CoplanarFaces` for any two faces on the same plane; that is the
+/// correct answer at the SURFACE level (the two planes meet everywhere,
+/// not along a curve) but useless at the FACE level — the boolean op
+/// still needs to split each face along the OTHER face's interior
+/// boundary segments.
+///
+/// This routine produces those cuts:
+///   * sub-segments of `face_b`'s outer loop lying inside `face_a` go
+///     into `coplanar_curves_a` (cuts for `face_a` only);
+///   * sub-segments of `face_a`'s outer loop lying inside `face_b` go
+///     into `coplanar_curves_b` (cuts for `face_b` only).
+///
+/// Downstream the existing pipeline handles the rest:
+///   * `split_faces_along_curves` routes each side's per-face cuts to
+///     the matching face's cut list (see lines 2257–2277);
+///   * `classify_split_faces` tags the resulting overlap sub-face as
+///     `OnBoundary` via the existing coincident-boundary detector;
+///   * `select_faces_for_operation` resolves Union (keep one copy),
+///     Intersect (keep one copy), Difference (drop both) for
+///     `OnBoundary` faces.
+///
+/// The plane frame is taken from `face_a`. The
+/// `surface_surface_intersection` short-circuit already proved both
+/// planes coincident, so either face's frame is a valid 2D projection
+/// for the partition.
+///
+/// Returns `Ok(Some(_))` on a proper-crossing partition with at least
+/// one cut per side, `Ok(None)` when the polygon-clip partition is
+/// empty (touching boundary, no proper crossings — nothing to imprint).
+/// Surfaces `OperationError::InvalidGeometry` from the polygon-clip
+/// degeneracy detector (shared vertex, vertex-on-edge, collinear
+/// overlap); the caller in `intersect_faces` wraps these as
+/// `CoplanarFaces` to signal a future-extension limit rather than a
+/// kernel bug.
+fn imprint_merge_coplanar_overlap(
+    model: &mut BRepModel,
+    face_a: FaceId,
+    face_b: FaceId,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<FaceIntersection>> {
+    use super::polygon_clip::{self, Point2d};
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::Plane;
+
+    // 1. Resolve `face_a`'s plane frame (origin + u_dir + v_dir). The
+    //    immutable borrow is dropped before any `model.curves.add` call.
+    let (origin, u_dir, v_dir) = {
+        let face_data = model
+            .faces
+            .get(face_a)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "face_a".to_string(),
+                expected: "valid face ID".to_string(),
+                received: format!("{:?}", face_a),
+            })?;
+        let surface = model.surfaces.get(face_data.surface_id).ok_or_else(|| {
+            OperationError::InvalidInput {
+                parameter: "surface_a_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{:?}", face_data.surface_id),
+            }
+        })?;
+        if surface.surface_type() != SurfaceType::Plane {
+            // The coplanar branch only fires for Plane×Plane; arriving
+            // here means broken kernel state, not user input.
+            return Err(OperationError::InternalError(format!(
+                "imprint_merge_coplanar_overlap: face {face_a:?} is not planar (type {:?})",
+                surface.surface_type()
+            )));
+        }
+        let plane =
+            surface
+                .as_any()
+                .downcast_ref::<Plane>()
+                .ok_or_else(|| {
+                    OperationError::InternalError(format!(
+                        "imprint_merge_coplanar_overlap: face {face_a:?} marked Plane but downcast failed",
+                    ))
+                })?;
+        (plane.origin, plane.u_dir, plane.v_dir)
+    };
+
+    // 2. Project both faces' outer loops into the (u, v) frame.
+    let project = |p: Point3| -> (f64, f64) {
+        let d = p - origin;
+        (d.dot(&u_dir), d.dot(&v_dir))
+    };
+    let poly_a_raw = face_outer_polyline_2d(model, face_a, &project)?;
+    let poly_b_raw = face_outer_polyline_2d(model, face_b, &project)?;
+    if poly_a_raw.len() < 3 || poly_b_raw.len() < 3 {
+        // Degenerate face — partition cannot proceed. Surface as
+        // InvalidGeometry; the caller rewraps as CoplanarFaces.
+        return Err(OperationError::InvalidGeometry(format!(
+            "coplanar imprint-merge requires ≥3-vertex polylines (face_a={}, face_b={})",
+            poly_a_raw.len(),
+            poly_b_raw.len(),
+        )));
+    }
+
+    // 3. Convert to polygon_clip's Point2d and partition each polygon's
+    //    boundary by the other's interior.
+    let poly_a: Vec<Point2d> = poly_a_raw
+        .iter()
+        .map(|&(x, y)| Point2d::new(x, y))
+        .collect();
+    let poly_b: Vec<Point2d> = poly_b_raw
+        .iter()
+        .map(|&(x, y)| Point2d::new(x, y))
+        .collect();
+    let partition = polygon_clip::partition_boundaries(&poly_a, &poly_b, tolerance)?;
+
+    // 4. Lift each 2D segment back to a 3D Line on the shared plane,
+    //    register it as a model curve, and tag it for the face it cuts.
+    //    Per-face routing: B's boundary inside A cuts FACE A (= cuts_a);
+    //    A's boundary inside B cuts FACE B (= cuts_b).
+    let lift = |p: Point2d| -> Point3 { origin + u_dir * p.x + v_dir * p.y };
+
+    let mut coplanar_curves_a: Vec<IntersectionCurve> = Vec::new();
+    for (s, e) in &partition.b_inside_a {
+        let line = Line::new(lift(*s), lift(*e));
+        let curve_id = model.curves.add(Box::new(line));
+        coplanar_curves_a.push(IntersectionCurve { curve_id });
+    }
+    let mut coplanar_curves_b: Vec<IntersectionCurve> = Vec::new();
+    for (s, e) in &partition.a_inside_b {
+        let line = Line::new(lift(*s), lift(*e));
+        let curve_id = model.curves.add(Box::new(line));
+        coplanar_curves_b.push(IntersectionCurve { curve_id });
+    }
+
+    if coplanar_curves_a.is_empty() && coplanar_curves_b.is_empty() {
+        // Polygons touched but did not properly cross (e.g. corner
+        // contact). Nothing to imprint — report "no intersection"
+        // rather than a phantom `FaceIntersection` with empty cuts.
+        return Ok(None);
+    }
+
+    Ok(Some(FaceIntersection {
+        face_a_id: face_a,
+        face_b_id: face_b,
+        curves: Vec::new(),
+        coplanar_curves_a,
+        coplanar_curves_b,
+    }))
 }
 
 /// Trim a plane-plane `SurfaceIntersectionCurve` to the overlap of both
@@ -6552,22 +6757,45 @@ mod tests {
     }
 
     #[test]
-    fn intersect_faces_coplanar_overlapping_still_errors() {
-        // The truly-degenerate case: two coplanar faces whose outer
-        // loops overlap. Slice C does NOT fix this — it must keep
-        // returning CoplanarFaces until Slice E's imprint-then-merge
-        // lands.
+    fn intersect_faces_coplanar_overlapping_returns_imprint_cuts() {
+        // Slice E: two coplanar faces whose outer loops properly cross
+        // now produce per-face imprint cuts instead of an error. The
+        // cuts populate `coplanar_curves_a` / `coplanar_curves_b` (the
+        // shared `curves` list stays empty), and the existing
+        // classify+select pipeline resolves Union/Intersect/Difference
+        // on the resulting `OnBoundary` sub-faces.
+        //
+        // Geometry: A = [0,5]², B = [3,8]², overlap = [3,5]². Each
+        // polygon contributes exactly two boundary sub-segments inside
+        // the other (the two L-shaped halves around the overlap
+        // corner), so we expect 2 cuts per side.
         let mut model = BRepModel::new();
         let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 5.0, 5.0);
         let face_b = add_xy_square_face(&mut model, 3.0, 3.0, 8.0, 8.0);
         let options = BooleanOptions::default();
         let result = intersect_faces(&mut model, face_a, face_b, &options);
-        match result {
-            Err(OperationError::CoplanarFaces(_)) => {}
-            other => panic!(
-                "expected CoplanarFaces error on overlapping coplanar faces, got {other:?}"
-            ),
-        }
+        let intersection = match result {
+            Ok(Some(fi)) => fi,
+            Ok(None) => panic!("imprint-merge produced no cuts for overlapping squares"),
+            Err(e) => panic!("imprint-merge surfaced error: {e:?}"),
+        };
+        assert!(
+            intersection.curves.is_empty(),
+            "coplanar imprint-merge keeps the shared `curves` list empty; got {} entries",
+            intersection.curves.len()
+        );
+        assert_eq!(
+            intersection.coplanar_curves_a.len(),
+            2,
+            "expected 2 cuts on face_a (B's L-shaped boundary inside A); got {}",
+            intersection.coplanar_curves_a.len()
+        );
+        assert_eq!(
+            intersection.coplanar_curves_b.len(),
+            2,
+            "expected 2 cuts on face_b (A's L-shaped boundary inside B); got {}",
+            intersection.coplanar_curves_b.len()
+        );
     }
 
     // =====================================================================
