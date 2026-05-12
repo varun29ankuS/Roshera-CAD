@@ -1356,7 +1356,19 @@ mod tests {
         let report = sketch
             .solve_constraints_with_options(SolveOptions::default())
             .expect("solve");
-        assert!(report.converged());
+        // A single Distance(fixed, free) leaves a rotational DOF
+        // around the fixed anchor — the solver's "honest DOF" path
+        // surfaces this as `UnderConstrained` even though the
+        // distance residual is zero. Either Converged (no DOFs
+        // left) or UnderConstrained (distance satisfied, geometry
+        // still free to rotate) is a successful outcome for this
+        // pin test; what matters is that the distance equals the
+        // target after the solve.
+        assert!(
+            report.is_fully_constrained() || report.is_under_constrained(),
+            "solve should land on the constraint manifold (status: {:?})",
+            report.status
+        );
 
         let resolved = sketch.get_point(&b).expect("b present");
         let d = (resolved.x.powi(2) + resolved.y.powi(2)).sqrt();
