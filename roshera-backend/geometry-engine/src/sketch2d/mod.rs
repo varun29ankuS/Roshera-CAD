@@ -54,6 +54,9 @@ pub mod sketch_plane;
 // Snap engine: cursor → entity feature proximity (D-1-a).
 pub mod snap;
 
+// Constraint inference: draft entity → proposed constraints (D-1-b).
+pub mod inference;
+
 // Utilities
 pub mod sketch_topology;
 pub mod sketch_validation;
@@ -82,6 +85,9 @@ pub use sketch_solver::{
 pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};
+pub use inference::{
+    infer_constraints, DraftEntity, DraftSlot, InferenceTolerance, ProposedConstraint,
+};
 
 // Error types for 2D operations
 use thiserror::Error;
