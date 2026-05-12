@@ -156,6 +156,13 @@ pub fn chamfer_edges(
             .with_output_faces(chamfer_faces.iter().map(|&f| f as u64)),
     );
 
+    // Drop the solid's cached mass-properties — the splice changed
+    // volume, surface area, COM and inertia. Without this the next
+    // mass / surface-area query returns the pre-chamfer figure.
+    if let Some(solid) = model.solids.get_mut(solid_id) {
+        solid.invalidate_mass_props_cache();
+    }
+
     Ok(chamfer_faces)
 }
 

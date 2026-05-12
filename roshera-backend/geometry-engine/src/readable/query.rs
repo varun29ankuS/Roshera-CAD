@@ -348,17 +348,24 @@ impl BRepModel {
     /// center of mass, inertia tensor, principal axes, radius of
     /// gyration). Cached after first computation.
     ///
-    /// Takes `&mut self` because [`crate::primitives::solid::Solid::compute_mass_properties`]
-    /// mutates per-entity caches on the solid, shell, face, and loop
-    /// stores. The api-server should briefly upgrade to a write lock
-    /// for the first call; subsequent calls hit the cache.
+    /// Routes through [`crate::primitives::topology_builder::BRepModel::compute_solid_mass_properties`]
+    /// — the unified entry point — so curved primitives (sphere,
+    /// cylinder, cone, torus) whose analytical seam loops would
+    /// degenerate transparently fall back to a Tonon (2004) mesh-based
+    /// integration instead of producing `None` (which used to surface
+    /// as 404s on the agent-facing REST endpoint). The returned
+    /// `method` field discriminates the two pipelines.
     ///
-    /// Returns `None` when the solid id is unknown, the outer shell
-    /// cannot be resolved, or the divergence-theorem volume integral
-    /// fails for degenerate geometry. Mass = `volume × material.density`
-    /// — the `Material` defaults to Steel (7850 kg/m³) for solids
-    /// without an explicit assignment, so `mass` is always a real
-    /// number on the returned report.
+    /// Takes `&mut self` because the unified entry point mutates
+    /// per-entity caches on the solid, shell, face, and loop stores
+    /// on first call. Subsequent calls hit the cache.
+    ///
+    /// Returns `None` only when the solid id is unknown or the
+    /// tessellation pass produces zero triangles (an irrecoverably
+    /// degenerate solid). Mass = `volume × material.density` —
+    /// `Material` defaults to Steel (7850 kg/m³) for solids without
+    /// an explicit assignment, so `mass` is always a real number on
+    /// the returned report.
     pub fn mass_properties_for(&mut self, solid_id: SolidId) -> Option<MassPropertiesReport> {
         // Capture the material before borrowing the solid mutably so
         // we don't tangle borrows on the inertia computation.
@@ -370,32 +377,12 @@ impl BRepModel {
             )
         };
 
-        // `compute_mass_properties` needs &mut access to the solid plus
-        // &mut/& access to the topology stores. We therefore go via
-        // `solids.get_mut` for the solid handle and pass the model's
-        // store fields explicitly.
-        let solid = self.solids.get_mut(solid_id)?;
-        let props = solid
-            .compute_mass_properties(
-                &mut self.shells,
-                &mut self.faces,
-                &mut self.loops,
-                &self.vertices,
-                &self.edges,
-                &self.curves,
-                &self.surfaces,
-            )
-            .ok()?
-            .clone();
+        let props = self.compute_solid_mass_properties(solid_id)?;
 
         // Surface area now lives on `SolidMassProperties` itself — read
-        // from the same cached struct as volume / COM / inertia so the
-        // numbers are guaranteed to come from the same kernel state
-        // and never drift relative to each other. Previously this
-        // called `calculate_solid_surface_area` separately, traversing
-        // the topology a second time and (in principle) able to
-        // disagree with the divergence-theorem face traversal that
-        // produced the rest of the report.
+        // from the same struct as volume / COM / inertia so the
+        // numbers are guaranteed to come from the same integration
+        // pass and never drift relative to each other.
         let surface_area = props.surface_area;
 
         // Principal moments come back as a Vector3; principal axes as
@@ -446,6 +433,7 @@ impl BRepModel {
                 props.radius_of_gyration.y,
                 props.radius_of_gyration.z,
             ],
+            method: props.method,
         })
     }
 
