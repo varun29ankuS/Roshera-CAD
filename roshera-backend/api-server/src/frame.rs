@@ -66,6 +66,7 @@ use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use serde::Deserialize;
+use shared_types::DisplayQuality;
 use std::io::Cursor;
 
 /// Hard upper bound on output dimensions. 2048×2048 RGBA is ~16 MB —
@@ -90,6 +91,13 @@ const LIGHT_DIR_RAW: [f64; 3] = [-0.4, -0.6, -0.7];
 /// Query parameters accepted by `GET /api/frame`. Each field is
 /// individually optional; missing fields fall back to the auto-fit
 /// camera + 512×512 defaults documented at the module level.
+///
+/// `quality` accepts `low | medium | high` (case-insensitive). The
+/// `Custom` variant of `DisplayQuality` is not reachable from a query
+/// string — its three numeric fields would need explicit query
+/// parameters and there's no compelling reason to expose them on the
+/// `frame` endpoint when the named presets cover the agent-screenshot
+/// use case.
 #[derive(Debug, Default, Deserialize)]
 pub struct FrameQuery {
     pub width: Option<u32>,
@@ -102,6 +110,7 @@ pub struct FrameQuery {
     pub target_y: Option<f64>,
     pub target_z: Option<f64>,
     pub fov_deg: Option<f64>,
+    pub quality: Option<String>,
 }
 
 /// Camera resolved from the query (or auto-fit when nothing is
@@ -213,11 +222,14 @@ pub async fn get_frame(
         .into());
     }
 
+    let quality = parse_quality(q.quality.as_deref())?;
+    let tess_params: TessellationParams = quality.into();
+
     let model = state.model.read().await;
-    let bounds = compute_bounds(&model);
+    let bounds = compute_bounds(&model, &tess_params);
     let camera = resolve_camera(&q, &bounds, width, height, fov_deg);
     let aspect = width as f64 / height as f64;
-    let png = render_png(&model, &camera, aspect, width, height);
+    let png = render_png(&model, &camera, aspect, width, height, &tess_params);
     drop(model);
 
     let png =
@@ -241,14 +253,32 @@ fn clamp_dim(d: u32) -> Result<u32, ApiError> {
     Ok(d)
 }
 
+/// Parse `?quality=low|medium|high` (case-insensitive) into a
+/// `DisplayQuality`. `None` and an empty string both fall back to
+/// the default (Medium). Anything else is a 400.
+fn parse_quality(raw: Option<&str>) -> Result<DisplayQuality, ApiError> {
+    let s = match raw {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(DisplayQuality::default()),
+    };
+    match s.to_ascii_lowercase().as_str() {
+        "low" => Ok(DisplayQuality::Low),
+        "medium" | "med" => Ok(DisplayQuality::Medium),
+        "high" => Ok(DisplayQuality::High),
+        other => Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("quality must be one of low|medium|high; got {other:?}"),
+        )),
+    }
+}
+
 /// Walk every solid in the model, tessellating each, and accumulate a
 /// world-space bounding box. The model lock must be held by the
 /// caller.
-fn compute_bounds(model: &BRepModel) -> SceneBounds {
+fn compute_bounds(model: &BRepModel, params: &TessellationParams) -> SceneBounds {
     let mut bounds = SceneBounds::empty();
-    let params = TessellationParams::default();
     for (_, solid) in model.solids.iter() {
-        let mesh = tessellate_solid(solid, model, &params);
+        let mesh = tessellate_solid(solid, model, params);
         for v in &mesh.vertices {
             bounds.extend(v.position);
         }
@@ -473,6 +503,7 @@ fn render_png(
     _aspect: f64,
     w: u32,
     h: u32,
+    params: &TessellationParams,
 ) -> Result<Vec<u8>, String> {
     let basis = camera_basis(cam);
     let pixel_count = (w as usize) * (h as usize);
@@ -485,10 +516,9 @@ fn render_png(
     }
     let mut zb = vec![1.0f32; pixel_count];
 
-    let params = TessellationParams::default();
     for (sid, solid) in model.solids.iter() {
         let base_rgb = solid_color(sid);
-        let mesh = tessellate_solid(solid, model, &params);
+        let mesh = tessellate_solid(solid, model, params);
         for tri in &mesh.triangles {
             let i0 = tri[0] as usize;
             let i1 = tri[1] as usize;
@@ -612,6 +642,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_quality_accepts_named_presets_case_insensitively() {
+        assert_eq!(parse_quality(Some("low")).unwrap(), DisplayQuality::Low);
+        assert_eq!(parse_quality(Some("LOW")).unwrap(), DisplayQuality::Low);
+        assert_eq!(parse_quality(Some("Low")).unwrap(), DisplayQuality::Low);
+        assert_eq!(
+            parse_quality(Some("medium")).unwrap(),
+            DisplayQuality::Medium
+        );
+        assert_eq!(parse_quality(Some("med")).unwrap(), DisplayQuality::Medium);
+        assert_eq!(parse_quality(Some("HIGH")).unwrap(), DisplayQuality::High);
+    }
+
+    #[test]
+    fn parse_quality_falls_back_to_default_when_missing() {
+        assert_eq!(parse_quality(None).unwrap(), DisplayQuality::default());
+        assert_eq!(parse_quality(Some("")).unwrap(), DisplayQuality::default());
+    }
+
+    #[test]
+    fn parse_quality_rejects_unknown_values() {
+        assert!(parse_quality(Some("ultra")).is_err());
+        assert!(parse_quality(Some("0")).is_err());
+    }
+
+    #[test]
     fn project_round_trips_origin_to_screen_center() {
         let cam = Camera {
             eye: Point3::new(10.0, 0.0, 0.0),
@@ -662,7 +717,8 @@ mod tests {
             znear: 0.1,
             zfar: 100.0,
         };
-        let png = render_png(&model, &cam, 1.0, 32, 32).unwrap();
+        let params = TessellationParams::default();
+        let png = render_png(&model, &cam, 1.0, 32, 32, &params).unwrap();
         // PNG signature
         assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
     }

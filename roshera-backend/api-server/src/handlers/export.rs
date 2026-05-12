@@ -63,7 +63,11 @@ pub async fn export_mesh(
     // `shared_types::Mesh`. We can't use `Mesh::merge_multiple` here —
     // the kernel produces `tessellation::TriangleMesh`, not
     // `shared_types::Mesh` — so the offset+append loop is inline.
-    let tess_params = TessellationParams::default();
+    //
+    // `request.quality` (default Medium) chooses the tessellation
+    // preset. Low → fast preview, High → publication-grade meshes,
+    // Custom carries explicit chord/angle/edge knobs.
+    let tess_params: TessellationParams = request.quality.into();
     let mut merged_vertices: Vec<f32> = Vec::new();
     let mut merged_normals: Vec<f32> = Vec::new();
     let mut merged_indices: Vec<u32> = Vec::new();
