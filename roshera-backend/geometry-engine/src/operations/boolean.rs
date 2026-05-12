@@ -371,35 +371,53 @@ fn intersect_faces(
             received: format!("{:?}", face_b),
         })?;
 
-    // Get surfaces
-    let surface_a =
-        model
+    let surface_a_id = face_a_data.surface_id;
+    let surface_b_id = face_b_data.surface_id;
+
+    // Scope the surface borrows so they release before the coplanar
+    // overlap path takes a fresh `&BRepModel` borrow.
+    let intersection_attempt = {
+        let surface_a = model
             .surfaces
-            .get(face_a_data.surface_id)
+            .get(surface_a_id)
             .ok_or_else(|| OperationError::InvalidInput {
                 parameter: "surface_a_id".to_string(),
                 expected: "valid surface ID".to_string(),
-                received: format!("{:?}", face_a_data.surface_id),
+                received: format!("{:?}", surface_a_id),
             })?;
-    let surface_b =
-        model
+        let surface_b = model
             .surfaces
-            .get(face_b_data.surface_id)
+            .get(surface_b_id)
             .ok_or_else(|| OperationError::InvalidInput {
                 parameter: "surface_b_id".to_string(),
                 expected: "valid surface ID".to_string(),
-                received: format!("{:?}", face_b_data.surface_id),
+                received: format!("{:?}", surface_b_id),
             })?;
+        surface_surface_intersection(surface_a, surface_b, &options.common.tolerance)
+    };
 
-    // Compute surface-surface intersection curves
-    let curves = surface_surface_intersection(surface_a, surface_b, &options.common.tolerance)?;
+    let curves = match intersection_attempt {
+        Ok(curves) => curves,
+        Err(OperationError::CoplanarFaces(msg)) => {
+            // Slice C: the surface-level test reports coincident planes
+            // without knowing whether the bounded FACES on those planes
+            // overlap. Two faces on the same plane with disjoint outer
+            // loops have no shared boundary curve — the correct answer
+            // is "no intersection", not an error. Test the bounded
+            // overlap and route accordingly. Truly overlapping coplanar
+            // faces remain a `CoplanarFaces` error pending Slice E's
+            // imprint-then-merge implementation.
+            if coplanar_faces_overlap(model, face_a, face_b, &options.common.tolerance)? {
+                return Err(OperationError::CoplanarFaces(msg));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
 
     if curves.is_empty() {
         return Ok(None);
     }
-
-    // Drop the immutable surface borrows before we mutate `model` below.
-    let _ = (surface_a, surface_b);
 
     // Clip each cutting curve to the overlap of both faces' trim regions.
     // For plane-plane pairs, `surface_surface_intersection` produces a
@@ -3384,6 +3402,251 @@ fn clip_circle_to_spherical_face(
     }
 }
 
+/// Test whether two faces lying on coincident planes have overlapping
+/// outer-loop polygons. Called by `intersect_faces` on the
+/// `CoplanarFaces` branch to distinguish "disjoint same-plane faces"
+/// (no shared boundary ⇒ no intersection curve ⇒ boolean proceeds
+/// cleanly) from "genuinely overlapping coplanar faces" (truly
+/// degenerate ⇒ pre-Slice-E this is still `CoplanarFaces`).
+///
+/// Both face surfaces are assumed to be `SurfaceType::Plane` and to lie
+/// on coincident planes — that is the caller's contract from
+/// `plane_plane_intersection`'s `tolerance.parallel_threshold()` +
+/// `tolerance.distance()` short-circuit. Non-planar coincident surfaces
+/// or downcast failures conservatively report `Ok(true)` so the caller
+/// preserves the `CoplanarFaces` error (no silent incorrect results).
+///
+/// The overlap test runs in `face_a`'s plane frame:
+///   1. **AABB rejection** — disjoint bounding boxes ⇒ no overlap.
+///   2. **Edge-edge intersection** — any segment of polygon A crosses
+///      any segment of polygon B ⇒ overlap.
+///   3. **Containment** — vertex 0 of A in B, or vertex 0 of B in A
+///      ⇒ one polygon fully contains the other ⇒ overlap.
+fn coplanar_faces_overlap(
+    model: &BRepModel,
+    face_a: FaceId,
+    face_b: FaceId,
+    tolerance: &Tolerance,
+) -> OperationResult<bool> {
+    use crate::primitives::surface::Plane;
+
+    let face_a_data = model
+        .faces
+        .get(face_a)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_a".to_string(),
+            expected: "valid face ID".to_string(),
+            received: format!("{:?}", face_a),
+        })?;
+
+    let surface_a = model
+        .surfaces
+        .get(face_a_data.surface_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "surface_a_id".to_string(),
+            expected: "valid surface ID".to_string(),
+            received: format!("{:?}", face_a_data.surface_id),
+        })?;
+
+    if surface_a.surface_type() != SurfaceType::Plane {
+        // The plane-plane short-circuit only fires on Plane×Plane, so
+        // we should never land here. Be defensive: preserve the
+        // CoplanarFaces error rather than silently returning Ok(None).
+        return Ok(true);
+    }
+    let plane = match surface_a.as_any().downcast_ref::<Plane>() {
+        Some(p) => p,
+        // Surface marked Plane but downcast failed — broken kernel
+        // state. Preserve the error rather than corrupt the result.
+        None => return Ok(true),
+    };
+
+    let origin = plane.origin;
+    let u_dir = plane.u_dir;
+    let v_dir = plane.v_dir;
+    let project = |p: Point3| -> (f64, f64) {
+        let d = p - origin;
+        (d.dot(&u_dir), d.dot(&v_dir))
+    };
+
+    let poly_a = face_outer_polyline_2d(model, face_a, &project)?;
+    let poly_b = face_outer_polyline_2d(model, face_b, &project)?;
+    if poly_a.len() < 3 || poly_b.len() < 3 {
+        // Degenerate polygons — cannot prove disjoint. Preserve the
+        // CoplanarFaces error to avoid silently corrupting the boolean.
+        return Ok(true);
+    }
+
+    Ok(polygons_overlap_2d(&poly_a, &poly_b, tolerance))
+}
+
+/// Sample the outer loop of a planar face into a 2D polygon under the
+/// supplied projection. Line edges contribute one polygon vertex (the
+/// start point, in loop-walk order); non-line edges (arcs, circles, …)
+/// contribute 16 evenly-spaced samples on `[0, 1]` excluding the
+/// terminal point — that terminal is picked up as the next edge's
+/// start, so adjacent edges chain without duplicating vertices.
+///
+/// Edge orientation in the loop (`orientations[i]`) is respected: when
+/// `false`, samples walk t = 1 → 0 instead of 0 → 1, so the resulting
+/// 2D polygon traces the loop topology, not the underlying curve
+/// parametrization.
+fn face_outer_polyline_2d(
+    model: &BRepModel,
+    face_id: FaceId,
+    project: &impl Fn(Point3) -> (f64, f64),
+) -> OperationResult<Vec<(f64, f64)>> {
+    use crate::primitives::curve::Line;
+
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "face_id".to_string(),
+            expected: "valid face ID".to_string(),
+            received: format!("{:?}", face_id),
+        })?;
+    let outer_loop = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidInput {
+            parameter: "outer_loop_id".to_string(),
+            expected: "valid loop ID".to_string(),
+            received: format!("{:?}", face.outer_loop),
+        })?;
+
+    const SAMPLES_PER_CURVED_EDGE: usize = 16;
+
+    let mut poly: Vec<(f64, f64)> = Vec::new();
+    for (i, &eid) in outer_loop.edges.iter().enumerate() {
+        let fwd = outer_loop.orientations.get(i).copied().unwrap_or(true);
+        let edge = model
+            .edges
+            .get(eid)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "edge_id".to_string(),
+                expected: "valid edge ID".to_string(),
+                received: format!("{:?}", eid),
+            })?;
+        let curve = model
+            .curves
+            .get(edge.curve_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "curve_id".to_string(),
+                expected: "valid curve ID".to_string(),
+                received: format!("{:?}", edge.curve_id),
+            })?;
+
+        let n_samples: usize = if curve.as_any().downcast_ref::<Line>().is_some() {
+            1
+        } else {
+            SAMPLES_PER_CURVED_EDGE
+        };
+
+        for k in 0..n_samples {
+            let t_raw = k as f64 / n_samples as f64;
+            let t = if fwd { t_raw } else { 1.0 - t_raw };
+            let p = curve.point_at(t)?;
+            poly.push(project(p));
+        }
+    }
+
+    Ok(poly)
+}
+
+/// Polygon-polygon overlap predicate for 2D simple polygons.
+/// `tolerance.distance()` is used as AABB slack so faces whose AABBs
+/// merely graze (e.g. two extrusions abutting along one edge) reject
+/// cleanly as disjoint.
+fn polygons_overlap_2d(
+    a: &[(f64, f64)],
+    b: &[(f64, f64)],
+    tolerance: &Tolerance,
+) -> bool {
+    // AABB rejection.
+    let (a_min_x, a_max_x, a_min_y, a_max_y) = polygon_aabb_2d(a);
+    let (b_min_x, b_max_x, b_min_y, b_max_y) = polygon_aabb_2d(b);
+    let slack = tolerance.distance();
+    if a_max_x < b_min_x - slack
+        || b_max_x < a_min_x - slack
+        || a_max_y < b_min_y - slack
+        || b_max_y < a_min_y - slack
+    {
+        return false;
+    }
+
+    // Edge-edge intersection. The strict-inequality cross-product test
+    // classifies edge-sharing as "not crossing", which is the right
+    // call for the CAD use case: two extrusions abutting along one
+    // edge share boundary, not interior, and should not block a Union.
+    let n_a = a.len();
+    let n_b = b.len();
+    for i in 0..n_a {
+        let p1 = a[i];
+        let p2 = a[(i + 1) % n_a];
+        for j in 0..n_b {
+            let p3 = b[j];
+            let p4 = b[(j + 1) % n_b];
+            if segments_properly_intersect_2d(p1, p2, p3, p4) {
+                return true;
+            }
+        }
+    }
+
+    // Containment: if no boundary crossings, the polygons are either
+    // fully disjoint, or one is fully inside the other.
+    if point_in_polygon_2d(a[0].0, a[0].1, b) {
+        return true;
+    }
+    if point_in_polygon_2d(b[0].0, b[0].1, a) {
+        return true;
+    }
+
+    false
+}
+
+fn polygon_aabb_2d(poly: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(x, y) in poly {
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
+/// Proper 2D segment intersection (interiors cross). Collinear or
+/// endpoint-touching segments report `false` — by design, see the
+/// caller's comment on edge-sharing.
+fn segments_properly_intersect_2d(
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    p4: (f64, f64),
+) -> bool {
+    let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let d1 = cross(p3, p4, p1);
+    let d2 = cross(p3, p4, p2);
+    let d3 = cross(p1, p2, p3);
+    let d4 = cross(p1, p2, p4);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
 /// 2D ray-casting point-in-polygon. The polygon is closed implicitly by
 /// connecting the last vertex back to the first.
 fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
@@ -6127,6 +6390,183 @@ mod tests {
                 "parallel distinct planes must produce no curves"
             ),
             Err(e) => panic!("parallel distinct planes should not error, got {e:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Slice C — face-overlap check on coincident planes
+    // ---------------------------------------------------------------
+
+    fn square_polygon_2d(cx: f64, cy: f64, half: f64) -> Vec<(f64, f64)> {
+        vec![
+            (cx - half, cy - half),
+            (cx + half, cy - half),
+            (cx + half, cy + half),
+            (cx - half, cy + half),
+        ]
+    }
+
+    /// Build a square planar face in the XY plane with corners
+    /// (x0,y0)-(x1,y1), CCW. Returns the face id.
+    fn add_xy_square_face(
+        model: &mut BRepModel,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    ) -> FaceId {
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::EdgeOrientation;
+        use crate::primitives::face::FaceOrientation;
+        use crate::primitives::r#loop::{Loop as TopoLoop, LoopType};
+
+        let plane = Plane::from_point_normal(Point3::ORIGIN, Vector3::Z).expect("xy plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+
+        let v0 = model.vertices.add(x0, y0, 0.0);
+        let v1 = model.vertices.add(x1, y0, 0.0);
+        let v2 = model.vertices.add(x1, y1, 0.0);
+        let v3 = model.vertices.add(x0, y1, 0.0);
+        let mk_edge = |model: &mut BRepModel, va, vb, p_start: Point3, p_end: Point3| -> EdgeId {
+            let line = Line::new(p_start, p_end);
+            let curve_id = model.curves.add(Box::new(line));
+            let edge = Edge::new(
+                0,
+                va,
+                vb,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            model.edges.add(edge)
+        };
+        let e0 = mk_edge(model, v0, v1, Point3::new(x0, y0, 0.0), Point3::new(x1, y0, 0.0));
+        let e1 = mk_edge(model, v1, v2, Point3::new(x1, y0, 0.0), Point3::new(x1, y1, 0.0));
+        let e2 = mk_edge(model, v2, v3, Point3::new(x1, y1, 0.0), Point3::new(x0, y1, 0.0));
+        let e3 = mk_edge(model, v3, v0, Point3::new(x0, y1, 0.0), Point3::new(x0, y0, 0.0));
+
+        let mut l = TopoLoop::new(0, LoopType::Outer);
+        l.add_edge(e0, true);
+        l.add_edge(e1, true);
+        l.add_edge(e2, true);
+        l.add_edge(e3, true);
+        let loop_id = model.loops.add(l);
+
+        let face = crate::primitives::face::Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        model.faces.add(face)
+    }
+
+    #[test]
+    fn polygons_overlap_2d_rejects_aabb_disjoint_squares() {
+        let tol = Tolerance::default();
+        let a = square_polygon_2d(0.0, 0.0, 1.0); // [-1,1]²
+        let b = square_polygon_2d(10.0, 0.0, 1.0); // [9,11]×[-1,1]
+        assert!(
+            !polygons_overlap_2d(&a, &b, &tol),
+            "AABB-disjoint squares must report no overlap"
+        );
+    }
+
+    #[test]
+    fn polygons_overlap_2d_detects_partial_overlap() {
+        let tol = Tolerance::default();
+        let a = square_polygon_2d(0.0, 0.0, 1.0); // [-1,1]²
+        let b = square_polygon_2d(0.5, 0.5, 1.0); // [-0.5,1.5]²
+        assert!(
+            polygons_overlap_2d(&a, &b, &tol),
+            "partially overlapping squares must report overlap"
+        );
+    }
+
+    #[test]
+    fn polygons_overlap_2d_detects_containment() {
+        let tol = Tolerance::default();
+        let outer = square_polygon_2d(0.0, 0.0, 10.0);
+        let inner = square_polygon_2d(0.0, 0.0, 1.0);
+        assert!(
+            polygons_overlap_2d(&outer, &inner, &tol),
+            "fully-contained polygon must report overlap"
+        );
+        // Symmetric.
+        assert!(
+            polygons_overlap_2d(&inner, &outer, &tol),
+            "containment-overlap test must be symmetric"
+        );
+    }
+
+    #[test]
+    fn polygons_overlap_2d_edge_sharing_counts_as_disjoint() {
+        // Two squares that share exactly one edge along x=1. Strict-interior
+        // overlap test treats this as disjoint — the right call for
+        // glue-along-edge boolean Union.
+        let tol = Tolerance::default();
+        let a = square_polygon_2d(0.0, 0.0, 1.0); // [-1,1]²
+        let b = square_polygon_2d(2.0, 0.0, 1.0); // [1,3]²
+        assert!(
+            !polygons_overlap_2d(&a, &b, &tol),
+            "edge-sharing squares must NOT report overlap (boundary, not interior)"
+        );
+    }
+
+    #[test]
+    fn coplanar_faces_overlap_rejects_aabb_disjoint_faces() {
+        let mut model = BRepModel::new();
+        let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 2.0, 2.0);
+        let face_b = add_xy_square_face(&mut model, 10.0, 10.0, 12.0, 12.0);
+        let tol = Tolerance::default();
+        let overlap = coplanar_faces_overlap(&model, face_a, face_b, &tol)
+            .expect("coplanar overlap test ok");
+        assert!(!overlap, "disjoint coplanar faces must report no overlap");
+    }
+
+    #[test]
+    fn coplanar_faces_overlap_detects_overlapping_faces() {
+        let mut model = BRepModel::new();
+        let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 5.0, 5.0);
+        let face_b = add_xy_square_face(&mut model, 3.0, 3.0, 8.0, 8.0);
+        let tol = Tolerance::default();
+        let overlap = coplanar_faces_overlap(&model, face_a, face_b, &tol)
+            .expect("coplanar overlap test ok");
+        assert!(overlap, "overlapping coplanar faces must report overlap");
+    }
+
+    #[test]
+    fn intersect_faces_coplanar_disjoint_returns_none_not_error() {
+        // End-to-end: `intersect_faces` on two disjoint coplanar faces
+        // must return `Ok(None)` (no shared boundary curve), not a
+        // CoplanarFaces error. This is the contract Slice B's Union
+        // fold relies on for multi-region sketches.
+        let mut model = BRepModel::new();
+        let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 2.0, 2.0);
+        let face_b = add_xy_square_face(&mut model, 10.0, 10.0, 12.0, 12.0);
+        let options = BooleanOptions::default();
+        let result = intersect_faces(&mut model, face_a, face_b, &options);
+        match result {
+            Ok(None) => {}
+            Ok(Some(fi)) => panic!(
+                "expected Ok(None) on coplanar disjoint; got Ok(Some(_)) with {} curves",
+                fi.curves.len()
+            ),
+            Err(e) => panic!("expected Ok(None) on coplanar disjoint; got error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn intersect_faces_coplanar_overlapping_still_errors() {
+        // The truly-degenerate case: two coplanar faces whose outer
+        // loops overlap. Slice C does NOT fix this — it must keep
+        // returning CoplanarFaces until Slice E's imprint-then-merge
+        // lands.
+        let mut model = BRepModel::new();
+        let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 5.0, 5.0);
+        let face_b = add_xy_square_face(&mut model, 3.0, 3.0, 8.0, 8.0);
+        let options = BooleanOptions::default();
+        let result = intersect_faces(&mut model, face_a, face_b, &options);
+        match result {
+            Err(OperationError::CoplanarFaces(_)) => {}
+            other => panic!(
+                "expected CoplanarFaces error on overlapping coplanar faces, got {other:?}"
+            ),
         }
     }
 
