@@ -56,6 +56,7 @@ use super::constraint_solver::{
     ConstraintSolver, EntityState, EntityUpdate, SolverResult, SolverStatus,
 };
 use super::constraints::{ConstraintId, EntityRef};
+use super::ellipse2d::{Ellipse2d, ParametricEllipse2d};
 use super::line2d::{LineGeometry, ParametricLine2d};
 use super::point2d::ParametricPoint2d;
 use super::rectangle2d::{ParametricRectangle2d, Rectangle2d};
@@ -232,8 +233,8 @@ pub struct SketchSolveReport {
     pub constraints_solved: usize,
     /// Entity references the bridge could not address through the
     /// public `EntityState` constructors and therefore excluded from
-    /// the solve. As of slice C-2 the remaining unsupported kinds are
-    /// ellipses, splines, and polylines (slices C-3 through C-5).
+    /// the solve. As of slice C-3 the remaining unsupported kinds
+    /// are splines and polylines (slices C-4 and C-5).
     /// Reporting the [`EntityRef`] (not just a count) lets the UI
     /// highlight exactly which entities went unsolved.
     pub entities_skipped: Vec<SkippedEntity>,
@@ -313,7 +314,7 @@ impl SketchSolveReport {
 
     /// Count of entities the bridge could not register with the
     /// solver because their kind has no public `EntityState`
-    /// constructor yet (rectangle / ellipse / spline / polyline).
+    /// constructor yet (spline / polyline).
     /// Equivalent to `entities_skipped.len()`.
     pub fn skipped_count(&self) -> usize {
         self.entities_skipped.len()
@@ -364,8 +365,10 @@ pub struct DofReport {
     /// Lines contribute 4 (px, py, dx, dy).
     /// Circles contribute 3 (cx, cy, r).
     /// Arcs contribute 5 (cx, cy, r, start_angle, end_angle).
+    /// Rectangles contribute 5 (cx, cy, width, height, rotation).
+    /// Ellipses contribute 5 (cx, cy, semi_major, semi_minor, rotation).
     /// Entities listed in `entities_skipped` contribute 0 — slices
-    /// C-2 through C-5 lift this for the remaining kinds.
+    /// C-4 and C-5 lift this for splines and polylines.
     pub total_free_dofs: usize,
     /// Sum of `degrees_of_freedom_removed()` across constraints
     /// whose entire entity set is supported by the current bridge
@@ -577,6 +580,20 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // per-DOF fix flag today; the four corners are derived from
     // (center, width, height, rotation) on every read.
     for _entry in sketch.rectangles().iter() {
+        entities_analysed += 1;
+        total_free_dofs += 5;
+    }
+    // Ellipses: 5 DOFs (cx, cy, semi_major, semi_minor, rotation).
+    // Matches the solver-side `EntityState::ellipse` parameter
+    // layout introduced in slice C-3. Counted as 5 regardless of
+    // orientation — `ParametricEllipse2d::degrees_of_freedom`
+    // returns 4 for axis-aligned ellipses, but the solver always
+    // carries 5 free parameters and a user who wants axis-alignment
+    // adds an explicit Horizontal constraint on the major axis. The
+    // alternative — branching on a near-zero rotation — would
+    // produce a flicker in the DOF badge as the rotation drifts
+    // across the tolerance boundary during solving.
+    for _entry in sketch.ellipses().iter() {
         entities_analysed += 1;
         total_free_dofs += 5;
     }
@@ -885,23 +902,49 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         registered += 1;
     }
 
+    for entry in sketch.ellipses().iter() {
+        let id = *entry.key();
+        let ellipse: &ParametricEllipse2d = entry.value();
+        // Ellipses have no per-DOF fix flags on the parametric
+        // wrapper (only `is_construction`), matching every other
+        // supported kind. All five DOFs (center.x, center.y,
+        // semi_major, semi_minor, rotation) start free; explicit
+        // dimensional or positional constraints can pin them
+        // downstream. The `semi_major >= semi_minor` convention is
+        // enforced only on write-back through `Ellipse2d::new`, not
+        // inside the solver — keeping the two axes independent
+        // floats during iteration keeps the Jacobian well-conditioned.
+        solver.add_entity(
+            EntityRef::Ellipse(id),
+            EntityState::ellipse(
+                ellipse.ellipse.center,
+                ellipse.ellipse.semi_major,
+                ellipse.ellipse.semi_minor,
+                ellipse.ellipse.rotation,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        registered += 1;
+    }
+
     registered
 }
 
 /// Collect `EntityRef`s for entities whose kinds are unsupported by
-/// the current bridge (ellipses / splines / polylines).
-/// Arcs are supported as of slice C-1; rectangles as of slice C-2 —
-/// neither appears here. The returned vector is in DashMap iteration
-/// order; callers that need a stable order should sort after collection.
+/// the current bridge (splines / polylines).
+/// Arcs are supported as of slice C-1; rectangles as of slice C-2;
+/// ellipses as of slice C-3 — none of them appears here. The
+/// returned vector is in DashMap iteration order; callers that need
+/// a stable order should sort after collection.
 ///
 /// Returning the IDs (not just a count) lets the UI highlight
 /// specifically which entities will remain unsolved until later
 /// slices add `EntityState` constructors for their kinds.
 fn collect_unsupported(sketch: &Sketch) -> Vec<EntityRef> {
     let mut skipped: Vec<EntityRef> = Vec::new();
-    for entry in sketch.ellipses().iter() {
-        skipped.push(EntityRef::Ellipse(*entry.key()));
-    }
     for entry in sketch.splines().iter() {
         skipped.push(EntityRef::Spline(*entry.key()));
     }
@@ -997,6 +1040,32 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
                         Rectangle2d::new_rotated(*center, *width, *height, *rotation)
                     {
                         entry.value_mut().rectangle = updated;
+                    }
+                }
+            }
+            (
+                EntityRef::Ellipse(id),
+                EntityUpdate::Ellipse(center, semi_major, semi_minor, rotation),
+            ) => {
+                if let Some(mut entry) = sketch.ellipses().get_mut(id) {
+                    // Use `Ellipse2d::new` rather than mutating the
+                    // struct in place so the
+                    // semi_major > tolerance / semi_minor > tolerance
+                    // invariants live in one place. If the solver
+                    // pushes either axis through zero (which would
+                    // happen on a wildly under-constrained sketch),
+                    // the constructor returns Err and we leave the
+                    // prior geometry intact — same "preserve
+                    // identity, never poison the store" convention
+                    // used for rectangle write-back. The
+                    // `semi_major >= semi_minor` normalisation (and
+                    // the 90° rotation adjust when the swap fires)
+                    // is also handled by the constructor, so the
+                    // store never carries an un-normalised ellipse.
+                    if let Ok(updated) =
+                        Ellipse2d::new(*center, *semi_major, *semi_minor, *rotation)
+                    {
+                        entry.value_mut().ellipse = updated;
                     }
                 }
             }
@@ -1175,18 +1244,28 @@ mod tests {
         sketch
             .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(2.0, 1.0))
             .expect("rect");
-        let ellipse_id = sketch
+        sketch
             .add_ellipse(Point2d::new(3.0, 3.0), 2.0, 1.0, 0.0)
             .expect("ellipse");
+        let polyline_id = sketch
+            .add_polyline(
+                vec![
+                    Point2d::new(0.0, 0.0),
+                    Point2d::new(1.0, 0.0),
+                    Point2d::new(1.0, 1.0),
+                ],
+                false,
+            )
+            .expect("polyline");
 
         let report = solve(&sketch).expect("solve");
-        // 1 point + 1 circle + 1 rectangle = 3 supported; ellipse
-        // skipped (slice C-3 will land it).
-        assert_eq!(report.entities_solved, 3);
+        // 1 point + 1 circle + 1 rectangle + 1 ellipse = 4 supported;
+        // polyline skipped (slice C-5 will land it).
+        assert_eq!(report.entities_solved, 4);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(
             report.entities_skipped,
-            vec![EntityRef::Ellipse(ellipse_id)]
+            vec![EntityRef::Polyline(polyline_id)]
         );
     }
 
@@ -1350,19 +1429,30 @@ mod tests {
     #[test]
     fn mixed_kinds_with_arc_register_arc_as_supported() {
         // Sanity check for the supported-kinds list update: a
-        // sketch carrying one point + one arc + one ellipse should
-        // count 2 supported and 1 skipped.
+        // sketch carrying one point + one arc + one polyline should
+        // count 2 supported and 1 skipped (polyline still skipped
+        // until slice C-5).
         let sketch = fresh_sketch();
         sketch.add_point(Point2d::new(0.0, 0.0));
         sketch
             .add_arc_center_angles(Point2d::new(0.0, 0.0), 1.0, 0.0, 1.0)
             .expect("arc");
-        let ellipse_id = sketch
-            .add_ellipse(Point2d::new(2.0, 0.0), 1.0, 0.5, 0.0)
-            .expect("ellipse");
+        let polyline_id = sketch
+            .add_polyline(
+                vec![
+                    Point2d::new(2.0, 0.0),
+                    Point2d::new(3.0, 0.0),
+                    Point2d::new(3.0, 1.0),
+                ],
+                false,
+            )
+            .expect("polyline");
         let report = solve(&sketch).expect("solve");
         assert_eq!(report.entities_solved, 2);
-        assert_eq!(report.entities_skipped, vec![EntityRef::Ellipse(ellipse_id)]);
+        assert_eq!(
+            report.entities_skipped,
+            vec![EntityRef::Polyline(polyline_id)]
+        );
     }
 
     // ── C-2: rectangle bridge ──────────────────────────────────────
@@ -1531,6 +1621,137 @@ mod tests {
             "heights diverged: {} vs {}",
             ra.height,
             rb.height,
+        );
+    }
+
+    // ── C-3: ellipse bridge ───────────────────────────────────────
+
+    #[test]
+    fn ellipse_geometry_round_trips_unchanged_with_no_constraints() {
+        // Slice C-3: ellipses are first-class solver entities. With
+        // no constraints the bridge must register the ellipse, run
+        // the solver (which converges trivially), and write back the
+        // identical parameters — preserving id, centre, semi_major,
+        // semi_minor, and rotation. The write-back goes through
+        // `Ellipse2d::new`, which re-applies the `semi_major >=
+        // semi_minor` invariant; we author the inputs in that order
+        // so the round-trip is exact.
+        let sketch = fresh_sketch();
+        let id = sketch
+            .add_ellipse(
+                Point2d::new(2.0, -1.0),
+                3.0,
+                1.5,
+                std::f64::consts::PI / 6.0,
+            )
+            .expect("ellipse");
+
+        let report = solve(&sketch).expect("solve");
+        assert!(
+            !report
+                .entities_skipped
+                .iter()
+                .any(|e| matches!(e, EntityRef::Ellipse(_))),
+            "ellipse must not appear in entities_skipped: {:?}",
+            report.entities_skipped,
+        );
+        assert_eq!(report.entities_solved, 1);
+
+        let entry = sketch.ellipses().get(&id).expect("ellipse survives");
+        let e = &entry.value().ellipse;
+        assert!((e.center.x - 2.0).abs() < 1e-10);
+        assert!((e.center.y - (-1.0)).abs() < 1e-10);
+        assert!((e.semi_major - 3.0).abs() < 1e-10);
+        assert!((e.semi_minor - 1.5).abs() < 1e-10);
+        assert!((e.rotation - std::f64::consts::PI / 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ellipse_contributes_five_dofs_to_analysis() {
+        // EntityState::ellipse parameter layout:
+        // [center.x, center.y, semi_major, semi_minor, rotation] →
+        // 5 DOFs. The bridge always reports 5 even for an axis-aligned
+        // ellipse (where ParametricEllipse2d::degrees_of_freedom would
+        // say 4) to avoid the DOF-badge flickering as the solver
+        // nudges rotation across the tolerance threshold.
+        let sketch = fresh_sketch();
+        sketch
+            .add_ellipse(Point2d::new(0.0, 0.0), 2.0, 1.0, 0.0)
+            .expect("ellipse");
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 5);
+        assert_eq!(report.entities_analysed, 1);
+        assert!(report.entities_skipped.is_empty());
+    }
+
+    #[test]
+    fn ellipse_center_pinned_by_x_and_y_coordinate_dimensions() {
+        // Drive the ellipse's centre to (3, -2) using a pair of
+        // dimensional constraints. EntityState::ellipse places centre
+        // at params[0..2] so the solver's generic
+        // `get_point_position` path applies without dispatch changes.
+        let sketch = fresh_sketch();
+        let id = sketch
+            .add_ellipse(Point2d::new(0.0, 0.0), 2.0, 1.0, 0.0)
+            .expect("ellipse");
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Ellipse(id)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(-2.0),
+            vec![EntityRef::Ellipse(id)],
+            ConstraintPriority::Required,
+        ));
+
+        let report = solve(&sketch).expect("solve");
+        assert!(report.converged(), "status was {:?}", report.status);
+
+        let entry = sketch.ellipses().get(&id).expect("ellipse");
+        let e = &entry.value().ellipse;
+        assert!((e.center.x - 3.0).abs() < 1e-8);
+        assert!((e.center.y - (-2.0)).abs() < 1e-8);
+    }
+
+    #[test]
+    fn equal_constraint_collapses_ellipse_axes() {
+        // Equal(Ellipse, Ellipse) is a 2-residual constraint
+        // (semi_major AND semi_minor must match — rotation is
+        // independent). Assert the converged solution agrees on
+        // (semi_major, semi_minor) without prescribing the absolute
+        // value.
+        let sketch = fresh_sketch();
+        let a = sketch
+            .add_ellipse(Point2d::new(0.0, 0.0), 3.0, 2.0, 0.0)
+            .expect("a");
+        let b = sketch
+            .add_ellipse(Point2d::new(10.0, 10.0), 5.0, 1.0, 0.0)
+            .expect("b");
+        sketch.add_constraint(Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![EntityRef::Ellipse(a), EntityRef::Ellipse(b)],
+            ConstraintPriority::Required,
+        ));
+
+        let report = solve(&sketch).expect("solve");
+        assert!(report.converged(), "status was {:?}", report.status);
+
+        let ea = sketch.ellipses().get(&a).expect("a");
+        let eb = sketch.ellipses().get(&b).expect("b");
+        let ea = &ea.value().ellipse;
+        let eb = &eb.value().ellipse;
+        assert!(
+            (ea.semi_major - eb.semi_major).abs() < 1e-8,
+            "semi_majors diverged: {} vs {}",
+            ea.semi_major,
+            eb.semi_major,
+        );
+        assert!(
+            (ea.semi_minor - eb.semi_minor).abs() < 1e-8,
+            "semi_minors diverged: {} vs {}",
+            ea.semi_minor,
+            eb.semi_minor,
         );
     }
 
@@ -1966,18 +2187,25 @@ mod tests {
     #[test]
     fn analyze_dofs_skips_unsupported_kinds_into_report() {
         let sketch = fresh_sketch();
-        let ellipse_id = sketch
-            .add_ellipse(Point2d::new(0.0, 0.0), 2.0, 1.0, 0.0)
-            .expect("ellipse");
+        let polyline_id = sketch
+            .add_polyline(
+                vec![
+                    Point2d::new(0.0, 0.0),
+                    Point2d::new(1.0, 0.0),
+                    Point2d::new(1.0, 1.0),
+                ],
+                false,
+            )
+            .expect("polyline");
         let report = analyze_dofs(&sketch);
-        // Ellipse contributes 0 DOFs until slice C-3 lands and is
+        // Polyline contributes 0 DOFs until slice C-5 lands and is
         // surfaced via entities_skipped so the UI can highlight the
-        // gap. (Rectangles became supported in slice C-2 and so no
-        // longer land here.)
+        // gap. (Rectangles became supported in slice C-2 and
+        // ellipses in slice C-3, so neither lands here anymore.)
         assert_eq!(report.total_free_dofs, 0);
         assert_eq!(
             report.entities_skipped,
-            vec![EntityRef::Ellipse(ellipse_id)]
+            vec![EntityRef::Polyline(polyline_id)]
         );
         // Empty constraint list → no skipped constraints.
         assert_eq!(report.constraints_skipped, 0);
@@ -1986,20 +2214,27 @@ mod tests {
 
     #[test]
     fn analyze_dofs_excludes_constraints_touching_unsupported_entities() {
-        // 1 point (2 free DOFs) + 1 ellipse (skipped until C-3) +
-        // Coincident(Point, EllipseCenter via EntityRef::Ellipse).
+        // 1 point (2 free DOFs) + 1 polyline (skipped until C-5) +
+        // Coincident(Point, PolylineRef via EntityRef::Polyline).
         // Without filtering, we'd count 2 DOFs removed and report
         // FullyConstrained — a lie, because the constraint can't
         // be evaluated. With filtering: 2 free, 0 removed →
         // UnderConstrained, plus constraints_skipped = 1.
         let sketch = fresh_sketch();
         let p = sketch.add_point(Point2d::new(0.0, 0.0));
-        let ellipse = sketch
-            .add_ellipse(Point2d::new(1.0, 1.0), 2.0, 1.0, 0.0)
-            .expect("ellipse");
+        let polyline = sketch
+            .add_polyline(
+                vec![
+                    Point2d::new(1.0, 1.0),
+                    Point2d::new(2.0, 1.0),
+                    Point2d::new(2.0, 2.0),
+                ],
+                false,
+            )
+            .expect("polyline");
         sketch.add_constraint(Constraint::new_geometric(
             GeometricConstraint::Coincident,
-            vec![EntityRef::Point(p), EntityRef::Ellipse(ellipse)],
+            vec![EntityRef::Point(p), EntityRef::Polyline(polyline)],
             ConstraintPriority::High,
         ));
 
@@ -2007,7 +2242,7 @@ mod tests {
         assert_eq!(report.total_free_dofs, 2);
         assert_eq!(
             report.constraint_dofs_removed, 0,
-            "constraint must be skipped because ellipse is unsupported"
+            "constraint must be skipped because polyline is unsupported"
         );
         assert_eq!(report.constraints_analysed, 0);
         assert_eq!(report.constraints_skipped, 1);

@@ -663,23 +663,25 @@ impl ConstraintSolver {
 
     /// Get circle center from entity state.
     ///
-    /// Also returns the center of a `Rectangle` entity since rectangles
-    /// store `[center.x, center.y, ...]` in the same leading two
-    /// parameter slots. This lets `Concentric` constraints work
-    /// between any pair of {Circle, Arc, Rectangle} without
-    /// dispatching on entity-kind combinations.
+    /// Also returns the centres of `Rectangle` and `Ellipse` entities
+    /// since both store `[center.x, center.y, ...]` in the same
+    /// leading two parameter slots. This lets `Concentric`
+    /// constraints work between any pair of
+    /// {Circle, Arc, Rectangle, Ellipse} without dispatching on
+    /// entity-kind combinations.
     fn get_circle_center(&self, entity: &EntityRef) -> Option<Point2d> {
         match entity {
-            EntityRef::Circle(_) | EntityRef::Arc(_) | EntityRef::Rectangle(_) => {
-                self.entity_state.get(entity).and_then(|state| {
-                    if state.parameters.len() >= 2 {
-                        // Parameters: center.x, center.y, ...
-                        Some(Point2d::new(state.parameters[0], state.parameters[1]))
-                    } else {
-                        None
-                    }
-                })
-            }
+            EntityRef::Circle(_)
+            | EntityRef::Arc(_)
+            | EntityRef::Rectangle(_)
+            | EntityRef::Ellipse(_) => self.entity_state.get(entity).and_then(|state| {
+                if state.parameters.len() >= 2 {
+                    // Parameters: center.x, center.y, ...
+                    Some(Point2d::new(state.parameters[0], state.parameters[1]))
+                } else {
+                    None
+                }
+            }),
             _ => None,
         }
     }
@@ -694,6 +696,25 @@ impl ConstraintSolver {
             EntityRef::Rectangle(_) => self.entity_state.get(entity).and_then(|state| {
                 if state.parameters.len() >= 4 {
                     // Parameters: center.x, center.y, width, height, rotation
+                    Some((state.parameters[2], state.parameters[3]))
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        }
+    }
+
+    /// Get ellipse `(semi_major, semi_minor)` from entity state.
+    ///
+    /// Returns `None` for non-ellipse entities. Used by the `Equal`
+    /// constraint evaluator to compare both axis lengths when
+    /// equating two ellipses; rotation is independent and excluded.
+    fn get_ellipse_axes(&self, entity: &EntityRef) -> Option<(f64, f64)> {
+        match entity {
+            EntityRef::Ellipse(_) => self.entity_state.get(entity).and_then(|state| {
+                if state.parameters.len() >= 4 {
+                    // Parameters: center.x, center.y, semi_major, semi_minor, rotation
                     Some((state.parameters[2], state.parameters[3]))
                 } else {
                     None
@@ -904,7 +925,9 @@ impl ConstraintSolver {
     /// driven only by their constraint variant. A small number depend
     /// on the entity kinds in `constraint.entities`:
     /// - `Equal` between two rectangles produces 2 residuals (width
-    ///   diff + height diff); every other `Equal` pair produces 1.
+    ///   diff + height diff); `Equal` between two ellipses produces
+    ///   2 residuals (semi_major diff + semi_minor diff); every other
+    ///   `Equal` pair produces 1.
     fn constraint_error_count(&self, constraint: &Constraint) -> usize {
         match &constraint.constraint_type {
             ConstraintType::Geometric(gc) => match gc {
@@ -915,8 +938,10 @@ impl ConstraintSolver {
                 GeometricConstraint::Vertical => 1,
                 GeometricConstraint::Equal => {
                     if constraint.entities.len() == 2
-                        && matches!(constraint.entities[0], EntityRef::Rectangle(_))
-                        && matches!(constraint.entities[1], EntityRef::Rectangle(_))
+                        && ((matches!(constraint.entities[0], EntityRef::Rectangle(_))
+                            && matches!(constraint.entities[1], EntityRef::Rectangle(_)))
+                            || (matches!(constraint.entities[0], EntityRef::Ellipse(_))
+                                && matches!(constraint.entities[1], EntityRef::Ellipse(_))))
                     {
                         2
                     } else {
@@ -1222,6 +1247,23 @@ impl ConstraintSolver {
                     self.get_rectangle_dimensions(entity2),
                 ) {
                     vec![w1 - w2, h1 - h2]
+                } else {
+                    vec![0.0, 0.0]
+                }
+            }
+            (EntityRef::Ellipse(_), EntityRef::Ellipse(_)) => {
+                // Equal axes: both semi_major AND semi_minor must
+                // match. Rotation is independent, matching the
+                // rectangle convention — two ellipses are "equal"
+                // when they have the same shape, regardless of how
+                // they are oriented on the sketch plane. The 2-residual
+                // shape is reported by `constraint_error_count` so the
+                // Jacobian allocates the right row budget.
+                if let (Some((a1, b1)), Some((a2, b2))) = (
+                    self.get_ellipse_axes(entity1),
+                    self.get_ellipse_axes(entity2),
+                ) {
+                    vec![a1 - a2, b1 - b2]
                 } else {
                     vec![0.0, 0.0]
                 }
@@ -1618,6 +1660,55 @@ impl EntityState {
             ],
         }
     }
+
+    /// Create state for an ellipse.
+    ///
+    /// Parameter layout is `[center.x, center.y, semi_major, semi_minor,
+    /// rotation]` — matches `EntityUpdate::Ellipse(center, semi_major,
+    /// semi_minor, rotation)` and the emission path in
+    /// `get_entity_updates`. The leading two slots are the centre, so
+    /// `get_point_position` already returns the ellipse centre and
+    /// `Coincident`, `Distance`, `XCoordinate`, and `YCoordinate`
+    /// constraints work for ellipses without any further dispatch.
+    /// `get_circle_center` also matches `EntityRef::Ellipse`, which
+    /// makes `Concentric` work between any pair of {Circle, Arc,
+    /// Rectangle, Ellipse}.
+    ///
+    /// Four fix flags:
+    /// - `center_fixed` pins both x and y of the centre together.
+    /// - `semi_major_fixed` / `semi_minor_fixed` pin the scalar axis
+    ///   lengths independently — an ellipse with `semi_major` fixed
+    ///   can still flex in `semi_minor`, which is what the snap
+    ///   engine wants when an Equal constraint propagates only one
+    ///   dimension.
+    /// - `rotation_fixed` pins the rotation angle.
+    ///
+    /// The `semi_major >= semi_minor` convention enforced by
+    /// `Ellipse2d::new` is applied only on write-back (see
+    /// `apply_solver_result`); inside the solver `semi_major` and
+    /// `semi_minor` are independent free parameters, which keeps the
+    /// Jacobian well-conditioned.
+    pub fn ellipse(
+        center: Point2d,
+        semi_major: f64,
+        semi_minor: f64,
+        rotation: f64,
+        center_fixed: bool,
+        semi_major_fixed: bool,
+        semi_minor_fixed: bool,
+        rotation_fixed: bool,
+    ) -> Self {
+        Self {
+            parameters: vec![center.x, center.y, semi_major, semi_minor, rotation],
+            fixed_mask: vec![
+                center_fixed,
+                center_fixed,
+                semi_major_fixed,
+                semi_minor_fixed,
+                rotation_fixed,
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1637,15 +1728,15 @@ mod tests {
     //!
     //! Tests use only the public surface of [`ConstraintSolver`] and
     //! [`EntityState`]; entity kinds whose state cannot be authored
-    //! through the public API today (Arc, Rectangle, Ellipse, Spline,
-    //! Polyline) are exercised indirectly via constraints they share
-    //! with the supported kinds (Line, Circle).
+    //! through the public API today (Spline, Polyline) are exercised
+    //! indirectly via constraints they share with the supported kinds
+    //! (Point, Line, Circle, Arc, Rectangle, Ellipse).
     #![allow(clippy::float_cmp)]
     #![allow(clippy::expect_used)]
 
     use super::*;
     use crate::sketch2d::constraints::{ConstraintPriority, ConstraintType};
-    use crate::sketch2d::{Circle2dId, Line2dId, Point2dId, Rectangle2dId};
+    use crate::sketch2d::{Circle2dId, Ellipse2dId, Line2dId, Point2dId, Rectangle2dId};
 
     // ────────────────────────────── helpers ───────────────────────────
 
@@ -1667,6 +1758,10 @@ mod tests {
 
     fn rect_ref() -> EntityRef {
         EntityRef::Rectangle(Rectangle2dId::new())
+    }
+
+    fn ellipse_ref() -> EntityRef {
+        EntityRef::Ellipse(Ellipse2dId::new())
     }
 
     fn coincident(p1: EntityRef, p2: EntityRef) -> Constraint {
@@ -3186,6 +3281,223 @@ mod tests {
             ConstraintPriority::High,
         );
         assert_eq!(s.constraint_error_count(&c), 1);
+    }
+
+    // ── C-3: Ellipse entity ───────────────────────────────────────
+
+    #[test]
+    fn entity_state_ellipse_layout() {
+        // Parameter order is [center.x, center.y, semi_major,
+        // semi_minor, rotation] so that params[0..2] aligns with the
+        // generic `get_point_position` dispatch (which reads slot 0/1
+        // from any entity it understands).
+        let st = EntityState::ellipse(
+            Point2d::new(1.0, 2.0),
+            5.0,
+            3.0,
+            std::f64::consts::FRAC_PI_6,
+            false,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(
+            st.parameters,
+            vec![1.0, 2.0, 5.0, 3.0, std::f64::consts::FRAC_PI_6]
+        );
+        // `center_fixed = false` flows into BOTH x and y slots.
+        assert_eq!(
+            st.fixed_mask,
+            vec![false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn entity_state_ellipse_fixed_center_pins_both_axes() {
+        let st = EntityState::ellipse(
+            Point2d::new(0.0, 0.0),
+            2.0,
+            1.0,
+            0.0,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(st.fixed_mask, vec![true, true, false, false, false]);
+    }
+
+    #[test]
+    fn equal_ellipses_error_is_axes_diff() {
+        // Equal(Ellipse, Ellipse) is a 2-residual constraint:
+        // r0 = a1 - a2, r1 = b1 - b2. Rotation is independent — two
+        // ellipses of identical shape but different orientation are
+        // still "equal", matching the rectangle convention.
+        let mut s = ConstraintSolver::new();
+        let e1 = ellipse_ref();
+        let e2 = ellipse_ref();
+        s.add_entity(
+            e1,
+            EntityState::ellipse(
+                Point2d::ORIGIN, 5.0, 3.0, 0.0, false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            e2,
+            EntityState::ellipse(
+                Point2d::ORIGIN, 2.0, 7.0, 0.0, false, false, false, false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Equal,
+            &[e1, e2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], 3.0, 1e-12));
+        assert!(approx_eq(errs[1], -4.0, 1e-12));
+    }
+
+    #[test]
+    fn coincident_ellipses_error_is_center_diff() {
+        // get_point_position must read ellipse params[0..2] as
+        // (center.x, center.y) so Coincident over two ellipses
+        // measures center-to-center displacement.
+        let mut s = ConstraintSolver::new();
+        let e1 = ellipse_ref();
+        let e2 = ellipse_ref();
+        s.add_entity(
+            e1,
+            EntityState::ellipse(
+                Point2d::new(1.0, 2.0), 2.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            e2,
+            EntityState::ellipse(
+                Point2d::new(4.0, -1.0), 2.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Coincident,
+            &[e1, e2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], -3.0, 1e-12));
+        assert!(approx_eq(errs[1], 3.0, 1e-12));
+    }
+
+    #[test]
+    fn concentric_ellipses_error_is_center_diff() {
+        // get_circle_center treats Ellipse alongside Circle/Arc/
+        // Rectangle so Concentric works between any pair.
+        let mut s = ConstraintSolver::new();
+        let e1 = ellipse_ref();
+        let e2 = ellipse_ref();
+        s.add_entity(
+            e1,
+            EntityState::ellipse(
+                Point2d::new(2.0, 5.0), 2.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            e2,
+            EntityState::ellipse(
+                Point2d::new(2.0, 5.0), 4.0, 3.0, 1.0,
+                false, false, false, false,
+            ),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Concentric,
+            &[e1, e2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], 0.0, 1e-12));
+        assert!(approx_eq(errs[1], 0.0, 1e-12));
+    }
+
+    #[test]
+    fn concentric_ellipse_with_circle_uses_centers() {
+        // Mixed-kind Concentric: the centre dispatch unifies
+        // Circle/Arc/Rectangle/Ellipse on params[0..2].
+        let mut s = ConstraintSolver::new();
+        let ell = ellipse_ref();
+        let circ = circle_ref();
+        s.add_entity(
+            ell,
+            EntityState::ellipse(
+                Point2d::new(1.0, 1.0), 2.0, 1.0, 0.0,
+                false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            circ,
+            EntityState::circle(Point2d::new(4.0, 5.0), 1.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::Concentric,
+            &[ell, circ],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(approx_eq(errs[0], -3.0, 1e-12));
+        assert!(approx_eq(errs[1], -4.0, 1e-12));
+    }
+
+    #[test]
+    fn get_entity_updates_returns_ellipse_variant_for_ellipse_ref() {
+        let s = ConstraintSolver::new();
+        let e = ellipse_ref();
+        s.add_entity(
+            e,
+            EntityState::ellipse(
+                Point2d::new(1.5, 2.5), 4.5, 3.5,
+                std::f64::consts::FRAC_PI_3,
+                false, false, false, false,
+            ),
+        );
+        let updates = s.get_entity_updates();
+        match updates.get(&e).expect("present") {
+            EntityUpdate::Ellipse(center, a, b, rot) => {
+                assert_eq!(center.x, 1.5);
+                assert_eq!(center.y, 2.5);
+                assert_eq!(*a, 4.5);
+                assert_eq!(*b, 3.5);
+                assert!(approx_eq(*rot, std::f64::consts::FRAC_PI_3, 1e-12));
+            }
+            other => panic!("expected Ellipse variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn constraint_error_count_equal_two_ellipses_is_two() {
+        // The dimension of the residual for Equal depends on the
+        // entity kinds it ranges over. For two ellipses the residual
+        // is (Δa, Δb) → 2 rows; the Jacobian must size itself
+        // accordingly or the solver will silently drop or overcount
+        // rows.
+        let mut s = ConstraintSolver::new();
+        let e1 = ellipse_ref();
+        let e2 = ellipse_ref();
+        s.add_entity(
+            e1,
+            EntityState::ellipse(
+                Point2d::ORIGIN, 2.0, 1.0, 0.0, false, false, false, false,
+            ),
+        );
+        s.add_entity(
+            e2,
+            EntityState::ellipse(
+                Point2d::ORIGIN, 3.0, 2.0, 0.0, false, false, false, false,
+            ),
+        );
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![e1, e2],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&c), 2);
     }
 
     #[test]
