@@ -19,9 +19,10 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::constraints::{ConstraintPriority, EntityRef};
+use super::spline2d::BSpline2d;
 use super::{
     Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
-    Vector2d,
+    Tolerance2d, Vector2d,
 };
 use crate::math::tolerance::STRICT_TOLERANCE;
 use dashmap::DashMap;
@@ -141,19 +142,44 @@ pub struct ConstraintSolver {
     dependency_graph: HashMap<ConstraintId, HashSet<EntityRef>>,
 }
 
+/// Structural metadata for a spline entity that cannot vary during
+/// Newton–Raphson.
+///
+/// Knots and degree are pinned across solves: changing them is a
+/// structural edit (knot refinement, degree elevation) rather than a
+/// constraint solve, and the solver has no continuous gradient with
+/// respect to them. The control points themselves live inside
+/// [`EntityState::parameters`] — for a B-spline this is the flat
+/// `[cp0.x, cp0.y, cp1.x, cp1.y, …]` layout (2n entries for n control
+/// points). Reconstruct a [`BSpline2d`] from a parameter vector +
+/// metadata pair via [`ConstraintSolver::get_bspline2d`].
+#[derive(Debug, Clone)]
+pub struct SplineMetadata {
+    /// Polynomial degree of the spline (order = degree + 1).
+    pub degree: usize,
+    /// Knot vector (length = control_point_count + degree + 1).
+    pub knots: Vec<f64>,
+}
+
 /// Solver state for a single sketch entity.
 ///
 /// Stores the entity's parameter vector together with a per-parameter
 /// fixed-mask used by the Newton–Raphson solver. Construct one via
-/// [`EntityState::point`], [`EntityState::line`], or
-/// [`EntityState::circle`] and register it with
-/// [`ConstraintSolver::add_entity`].
+/// [`EntityState::point`], [`EntityState::line`], [`EntityState::circle`],
+/// [`EntityState::arc`], [`EntityState::rectangle`],
+/// [`EntityState::ellipse`], or [`EntityState::spline_bspline`] and
+/// register it with [`ConstraintSolver::add_entity`].
 #[derive(Debug, Clone)]
 pub struct EntityState {
     /// Current parameters (position, angles, etc.)
     parameters: Vec<f64>,
     /// Fixed parameters (indices that cannot change)
     fixed_mask: Vec<bool>,
+    /// Structural metadata when this state describes a spline; `None`
+    /// for every other entity kind. Carried inside `EntityState` so
+    /// the solver can reconstruct a [`BSpline2d`] from the parameter
+    /// vector without reaching back into the sketch.
+    spline: Option<SplineMetadata>,
 }
 
 impl ConstraintSolver {
@@ -1340,8 +1366,72 @@ impl ConstraintSolver {
                     vec![0.0]
                 }
             }
+            EntityRef::Spline(_) => {
+                // Project p onto the spline and return the *signed*
+                // perpendicular distance: (p − foot) × tangent / |tangent|.
+                // The sign comes from the cross-product direction so the
+                // residual is monotonic through zero, which is what the
+                // Newton-Raphson loop needs to converge (an unsigned
+                // distance has a non-differentiable cusp at the
+                // solution).
+                let (p, bspline) = match (point, self.get_bspline2d(curve_entity)) {
+                    (Some(p), Some(bs)) => (p, bs),
+                    _ => return vec![0.0],
+                };
+                let tolerance = Tolerance2d::default();
+                let (foot, u) = match bspline.closest_point(&p, &tolerance) {
+                    Ok(pair) => pair,
+                    Err(_) => return vec![0.0],
+                };
+                let foot_to_p = Vector2d::from_points(&foot, &p);
+                let tangent = match bspline.tangent(u) {
+                    Ok(t) => t,
+                    Err(_) => return vec![foot_to_p.magnitude()],
+                };
+                let tan_len = tangent.magnitude();
+                if tan_len < STRICT_TOLERANCE.distance() {
+                    // Degenerate tangent (e.g. evaluated at a coincident
+                    // knot) — fall back to unsigned distance. Direction
+                    // is undefined here, so signedness adds no
+                    // information.
+                    return vec![foot_to_p.magnitude()];
+                }
+                vec![foot_to_p.cross(&tangent) / tan_len]
+            }
             _ => vec![0.0],
         }
+    }
+
+    /// Reconstruct a [`BSpline2d`] from the entity state when `entity`
+    /// is a B-spline; `None` for every other kind (including NURBS, until
+    /// a native rational `closest_point` ships — see
+    /// [`EntityState::spline_bspline`] for the rationale).
+    ///
+    /// Reads control points as consecutive `(x, y)` pairs from
+    /// `state.parameters` and pairs them with the structural
+    /// `(degree, knots)` carried in `state.spline`. Any inconsistency
+    /// (odd parameter length, wrong knot count, validation failure on
+    /// `BSpline2d::new`) returns `None`, leaving the caller to fall
+    /// back to a zero residual rather than panic.
+    fn get_bspline2d(&self, entity: &EntityRef) -> Option<BSpline2d> {
+        if !matches!(entity, EntityRef::Spline(_)) {
+            return None;
+        }
+        let state = self.entity_state.get(entity)?;
+        let meta = state.spline.as_ref()?;
+        if state.parameters.len() % 2 != 0 {
+            return None;
+        }
+        let cp_count = state.parameters.len() / 2;
+        let mut control_points = Vec::with_capacity(cp_count);
+        for i in 0..cp_count {
+            let base = i * 2;
+            control_points.push(Point2d::new(
+                state.parameters[base],
+                state.parameters[base + 1],
+            ));
+        }
+        BSpline2d::new(meta.degree, control_points, meta.knots.clone()).ok()
     }
 
     /// Evaluate midpoint constraint
@@ -1563,6 +1653,7 @@ impl EntityState {
         Self {
             parameters: vec![pos.x, pos.y],
             fixed_mask: vec![fixed, fixed],
+            spline: None,
         }
     }
 
@@ -1571,6 +1662,7 @@ impl EntityState {
         Self {
             parameters: vec![point.x, point.y, direction.x, direction.y],
             fixed_mask: vec![point_fixed, point_fixed, dir_fixed, dir_fixed],
+            spline: None,
         }
     }
 
@@ -1579,6 +1671,7 @@ impl EntityState {
         Self {
             parameters: vec![center.x, center.y, radius],
             fixed_mask: vec![center_fixed, center_fixed, radius_fixed],
+            spline: None,
         }
     }
 
@@ -1618,6 +1711,7 @@ impl EntityState {
                 angles_fixed,
                 angles_fixed,
             ],
+            spline: None,
         }
     }
 
@@ -1658,6 +1752,7 @@ impl EntityState {
                 height_fixed,
                 rotation_fixed,
             ],
+            spline: None,
         }
     }
 
@@ -1707,6 +1802,55 @@ impl EntityState {
                 semi_minor_fixed,
                 rotation_fixed,
             ],
+            spline: None,
+        }
+    }
+
+    /// Create state for a non-rational B-Spline curve.
+    ///
+    /// Parameter layout is `[cp0.x, cp0.y, cp1.x, cp1.y, …, cpn.x,
+    /// cpn.y]` — 2n entries for n control points. The 2D solver treats
+    /// each `(x, y)` pair as two independent free parameters, so an
+    /// unconstrained B-spline with n control points contributes 2n
+    /// DOFs — exactly matching [`ParametricSpline2d::degrees_of_freedom`].
+    ///
+    /// Knots and degree are pinned across solves (see
+    /// [`SplineMetadata`]). The kernel needs them to reconstruct a
+    /// [`BSpline2d`] when evaluating `PointOnCurve` residuals; varying
+    /// them would be a structural edit (refine / elevate) outside the
+    /// constraint-solver contract.
+    ///
+    /// `fixed_control_points` pins every control point's x and y
+    /// together. Per-control-point pinning is a no-op for every
+    /// currently-defined constraint (PointOnCurve / Coincident-to-first
+    /// don't need it) so the simpler API ships first; refine if a user
+    /// surface needs per-CP locking later.
+    ///
+    /// **NURBS:** rational NURBS curves are deferred to a follow-up
+    /// slice. The naive route (project through [`NurbsCurve2d::to_bspline`])
+    /// loses the rational-denominator term and changes the curve's
+    /// geometry, so it would drive the solver toward the wrong point.
+    /// A native rational `closest_point` on `NurbsCurve2d` lands first,
+    /// then a sibling `spline_nurbs` constructor wires it into the
+    /// solver.
+    pub fn spline_bspline(
+        degree: usize,
+        control_points: Vec<Point2d>,
+        knots: Vec<f64>,
+        fixed_control_points: bool,
+    ) -> Self {
+        let mut parameters = Vec::with_capacity(control_points.len() * 2);
+        let mut fixed_mask = Vec::with_capacity(control_points.len() * 2);
+        for cp in &control_points {
+            parameters.push(cp.x);
+            parameters.push(cp.y);
+            fixed_mask.push(fixed_control_points);
+            fixed_mask.push(fixed_control_points);
+        }
+        Self {
+            parameters,
+            fixed_mask,
+            spline: Some(SplineMetadata { degree, knots }),
         }
     }
 }
@@ -1727,15 +1871,18 @@ mod tests {
     //! - Robustness / degenerate inputs (Category I)
     //!
     //! Tests use only the public surface of [`ConstraintSolver`] and
-    //! [`EntityState`]; entity kinds whose state cannot be authored
-    //! through the public API today (Spline, Polyline) are exercised
-    //! indirectly via constraints they share with the supported kinds
-    //! (Point, Line, Circle, Arc, Rectangle, Ellipse).
+    //! [`EntityState`]; the Polyline entity kind whose state cannot
+    //! yet be authored through the public API is exercised indirectly
+    //! via constraints it shares with the supported kinds
+    //! (Point, Line, Circle, Arc, Rectangle, Ellipse, Spline).
+    //! B-Spline support landed in slice C-4-a; NURBS authoring (and a
+    //! rational `closest_point`) is queued for a follow-up slice.
     #![allow(clippy::float_cmp)]
     #![allow(clippy::expect_used)]
 
     use super::*;
     use crate::sketch2d::constraints::{ConstraintPriority, ConstraintType};
+    use crate::sketch2d::spline2d::Spline2dId;
     use crate::sketch2d::{Circle2dId, Ellipse2dId, Line2dId, Point2dId, Rectangle2dId};
 
     // ────────────────────────────── helpers ───────────────────────────
@@ -1762,6 +1909,28 @@ mod tests {
 
     fn ellipse_ref() -> EntityRef {
         EntityRef::Ellipse(Ellipse2dId::new())
+    }
+
+    fn spline_ref() -> EntityRef {
+        EntityRef::Spline(Spline2dId::new())
+    }
+
+    /// Build the clamped-uniform B-spline state used by the
+    /// `point_on_bspline_*` tests: degree-2, four control points at
+    /// (0,0), (1,2), (2,0), (3,2), open-uniform knot vector
+    /// `[0, 0, 0, 0.5, 1, 1, 1]`. The curve interpolates the first
+    /// and last control points (clamped endpoints) and bulges between
+    /// them, which gives a non-degenerate tangent at every interior
+    /// parameter.
+    fn sample_bspline_state() -> EntityState {
+        let control_points = vec![
+            Point2d::new(0.0, 0.0),
+            Point2d::new(1.0, 2.0),
+            Point2d::new(2.0, 0.0),
+            Point2d::new(3.0, 2.0),
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0];
+        EntityState::spline_bspline(2, control_points, knots, false)
     }
 
     fn coincident(p1: EntityRef, p2: EntityRef) -> Constraint {
@@ -2221,6 +2390,136 @@ mod tests {
             &[p, c],
         );
         assert!(approx_eq(errs[0], 2.0, 1e-12));
+    }
+
+    // PointOnCurve · B-Spline (slice C-4-a). The residual is the
+    // signed perpendicular distance from the point to the spline's
+    // closest-point foot, computed via `BSpline2d::closest_point` +
+    // tangent dispatch. NURBS support is deferred to a sibling
+    // slice that lands a native rational `closest_point` on
+    // `NurbsCurve2d`.
+
+    #[test]
+    fn point_on_bspline_zero_error_when_on_curve() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        // Clamped endpoint: the spline interpolates control_points[0]
+        // = (0, 0), so a point exactly there sits on the curve.
+        s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(sp, sample_bspline_state());
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, sp],
+        );
+        // closest_point's Newton refinement converges to a tight
+        // residual; the foot snaps to (0, 0) and the perpendicular
+        // distance is at numerical noise.
+        assert!(errs[0].abs() < 1e-8);
+    }
+
+    #[test]
+    fn point_on_bspline_nonzero_error_when_off_curve() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        // (1.5, -3.0) sits well below the curve (which lies at y ≥ 0
+        // across the entire parameter range). The signed residual
+        // should be large in magnitude — the exact sign depends on
+        // the tangent's CCW orientation at the foot, so assert only
+        // on magnitude.
+        s.add_entity(p, EntityState::point(Point2d::new(1.5, -3.0), false));
+        s.add_entity(sp, sample_bspline_state());
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, sp],
+        );
+        assert!(
+            errs[0].abs() > 1.0,
+            "expected large off-curve residual, got {}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn point_on_bspline_emits_single_residual() {
+        // PointOnCurve has a single-residual contract regardless of
+        // curve kind — `constraint_error_count` returns 1 for every
+        // non-Equal geometric constraint, so the spline arm must
+        // not break that invariant.
+        let s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(1.5, -3.0), false));
+        s.add_entity(sp, sample_bspline_state());
+        let c = Constraint::new_geometric(
+            GeometricConstraint::PointOnCurve,
+            vec![p, sp],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&c), 1);
+    }
+
+    #[test]
+    fn spline_bspline_dof_equals_two_per_control_point() {
+        // Four control points × 2 free coords = 8 DOFs when nothing
+        // is pinned. Matches `ParametricSpline2d::degrees_of_freedom`
+        // for the non-rational case.
+        let s = ConstraintSolver::new();
+        let sp = spline_ref();
+        s.add_entity(sp, sample_bspline_state());
+        assert_eq!(s.count_degrees_of_freedom(), 8);
+    }
+
+    #[test]
+    fn spline_bspline_fixed_flag_pins_all_control_points() {
+        // Passing `fixed_control_points = true` to `spline_bspline`
+        // pins every (x, y) pair, removing all DOFs the solver could
+        // move. Matches the rectangle / ellipse "fix everything"
+        // convention.
+        let s = ConstraintSolver::new();
+        let sp = spline_ref();
+        let control_points = vec![
+            Point2d::new(0.0, 0.0),
+            Point2d::new(1.0, 0.0),
+            Point2d::new(2.0, 0.0),
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        s.add_entity(sp, EntityState::spline_bspline(2, control_points, knots, true));
+        assert_eq!(s.count_degrees_of_freedom(), 0);
+    }
+
+    #[test]
+    fn spline_get_entity_updates_returns_parameters() {
+        // The Spline arm in `get_entity_updates` already emits
+        // `EntityUpdate::Parameters(state.parameters.clone())`
+        // (pre-dates C-4-a). Pin that contract: the byte-for-byte
+        // parameter layout must equal the constructor's pack order
+        // so downstream consumers (sketch_solver) can unpack
+        // control points by stride-2 indexing.
+        let s = ConstraintSolver::new();
+        let sp = spline_ref();
+        let control_points = vec![
+            Point2d::new(1.5, -2.5),
+            Point2d::new(3.5, 4.5),
+            Point2d::new(7.0, 0.25),
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        s.add_entity(sp, EntityState::spline_bspline(2, control_points, knots, false));
+        let updates = s.get_entity_updates();
+        let update = updates.get(&sp).expect("spline update missing");
+        match update {
+            EntityUpdate::Parameters(params) => {
+                assert_eq!(params.len(), 6);
+                assert!(approx_eq(params[0], 1.5, 1e-12));
+                assert!(approx_eq(params[1], -2.5, 1e-12));
+                assert!(approx_eq(params[2], 3.5, 1e-12));
+                assert!(approx_eq(params[3], 4.5, 1e-12));
+                assert!(approx_eq(params[4], 7.0, 1e-12));
+                assert!(approx_eq(params[5], 0.25, 1e-12));
+            }
+            other => panic!("expected Parameters update, got {:?}", other),
+        }
     }
 
     #[test]
