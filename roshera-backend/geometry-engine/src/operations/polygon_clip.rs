@@ -112,6 +112,136 @@ impl PolygonClipResult {
     }
 }
 
+/// Per-face boundary partition from [`partition_boundaries`].
+///
+/// Each segment is an open polyline of length two — start and end —
+/// representing one sub-segment of an input polygon's boundary that
+/// lies strictly inside the opposing polygon. The segments are the
+/// cutting curves the boolean pipeline needs to split each coplanar
+/// face into "inside the opposing face" and "outside" sub-faces.
+#[derive(Debug, Clone, Default)]
+pub struct BoundaryPartition {
+    /// Sub-segments of `polygon_a`'s edges that lie strictly inside
+    /// `polygon_b`. Each `(Point2d, Point2d)` is an open line segment
+    /// in input-edge winding order.
+    pub a_inside_b: Vec<(Point2d, Point2d)>,
+    /// Sub-segments of `polygon_b`'s edges that lie strictly inside
+    /// `polygon_a`. Same encoding as `a_inside_b`.
+    pub b_inside_a: Vec<(Point2d, Point2d)>,
+}
+
+/// Partition each polygon's boundary by the other polygon's interior.
+///
+/// For two simple polygons that overlap in a proper-crossing
+/// configuration, this returns:
+/// - the sub-segments of A's edges lying strictly inside B
+///   (`a_inside_b`) — these are the cuts that split face B into
+///   "interior to A" and "exterior to A" parts;
+/// - the sub-segments of B's edges lying strictly inside A
+///   (`b_inside_a`) — these split face A.
+///
+/// For two-square overlap (A = unit square at origin, B = unit square
+/// at (0.5, 0.5)): `a_inside_b` is the L-shape `(1, 0.5) → (1, 1) →
+/// (0.5, 1)` (segments of A's right and top edges inside B); the
+/// symmetric L from B's left and bottom edges populates `b_inside_a`.
+///
+/// # Errors
+///
+/// Same contract as [`intersect_polygons`]: degenerate configurations
+/// (shared vertex, vertex-on-edge, collinear overlap) return
+/// [`OperationError::InvalidGeometry`]; under-three vertices returns
+/// [`OperationError::InvalidInput`].
+pub fn partition_boundaries(
+    polygon_a: &[Point2d],
+    polygon_b: &[Point2d],
+    tolerance: &Tolerance,
+) -> OperationResult<BoundaryPartition> {
+    if polygon_a.len() < 3 {
+        return Err(OperationError::InvalidInput {
+            parameter: "polygon_a".to_string(),
+            expected: "at least 3 vertices".to_string(),
+            received: format!("{} vertices", polygon_a.len()),
+        });
+    }
+    if polygon_b.len() < 3 {
+        return Err(OperationError::InvalidInput {
+            parameter: "polygon_b".to_string(),
+            expected: "at least 3 vertices".to_string(),
+            received: format!("{} vertices", polygon_b.len()),
+        });
+    }
+    let eps = tolerance.distance().max(f64::EPSILON);
+    let eps_sq = eps * eps;
+    let crossings = find_all_crossings(polygon_a, polygon_b, eps, eps_sq)?;
+
+    let a_inside_b = partition_edges(polygon_a, polygon_b, &crossings, true, eps);
+    let b_inside_a = partition_edges(polygon_b, polygon_a, &crossings, false, eps);
+    Ok(BoundaryPartition {
+        a_inside_b,
+        b_inside_a,
+    })
+}
+
+/// Walk `subject`'s edges, splitting each at every crossing, and emit
+/// the sub-segments whose midpoint is inside `tester`.
+///
+/// `crossings_describe_a` selects which side of each crossing record
+/// belongs to `subject`: when `true`, `subject` is `polygon_a` and the
+/// crossing's `edge_a` / `alpha_a` apply; when `false`, `subject` is
+/// `polygon_b` and `edge_b` / `alpha_b` apply.
+fn partition_edges(
+    subject: &[Point2d],
+    tester: &[Point2d],
+    crossings: &[Crossing],
+    crossings_describe_a: bool,
+    eps: f64,
+) -> Vec<(Point2d, Point2d)> {
+    let n = subject.len();
+    let mut per_edge: Vec<Vec<(f64, Point2d)>> = vec![Vec::new(); n];
+    for c in crossings {
+        let (edge, alpha) = if crossings_describe_a {
+            (c.edge_a, c.alpha_a)
+        } else {
+            (c.edge_b, c.alpha_b)
+        };
+        per_edge[edge].push((alpha, c.point));
+    }
+
+    let mut output = Vec::new();
+    for i in 0..n {
+        let p0 = subject[i];
+        let p1 = subject[(i + 1) % n];
+
+        let mut hits = per_edge[i].clone();
+        hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Build the alpha-ordered list of points along this edge.
+        let mut pts: Vec<Point2d> = Vec::with_capacity(hits.len() + 2);
+        pts.push(p0);
+        for (_, p) in &hits {
+            pts.push(*p);
+        }
+        pts.push(p1);
+
+        for w in pts.windows(2) {
+            let s = w[0];
+            let e = w[1];
+            // Skip degenerate sub-segments (an edge ending at a crossing
+            // whose alpha is effectively 0 or 1 — should not happen given
+            // the in-open-interval guard in segment_segment_intersection,
+            // but defensive).
+            if s.distance_sq(e) <= eps * eps {
+                continue;
+            }
+            let mid = Point2d::new(0.5 * (s.x + e.x), 0.5 * (s.y + e.y));
+            if point_in_polygon(mid, tester, eps) {
+                output.push((s, e));
+            }
+        }
+    }
+    output
+}
+
 /// Compute the geometric intersection `A ∩ B` of two simple polygons.
 ///
 /// Both inputs are interpreted as closed CCW-oriented polygons with an
@@ -828,6 +958,74 @@ mod tests {
         let b = vec![p(2.0, 0.0), p(3.0, -1.0), p(1.0, -1.0)];
         let result = intersect_polygons(&a, &b, &tol());
         assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    #[test]
+    fn partition_two_overlapping_squares_yields_two_l_shaped_cuts() {
+        // A = unit square at origin, B = unit square at (0.5, 0.5).
+        // A's edges inside B: (1, 0.5)→(1, 1) and (1, 1)→(0.5, 1).
+        // B's edges inside A: (0.5, 0.5)→(1, 0.5) and (0.5, 1)→(0.5, 0.5).
+        let a = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
+        let b = vec![p(0.5, 0.5), p(1.5, 0.5), p(1.5, 1.5), p(0.5, 1.5)];
+        let part = partition_boundaries(&a, &b, &tol()).expect("partition ok");
+        assert_eq!(
+            part.a_inside_b.len(),
+            2,
+            "expected 2 A-edge sub-segments inside B, got {}",
+            part.a_inside_b.len()
+        );
+        assert_eq!(
+            part.b_inside_a.len(),
+            2,
+            "expected 2 B-edge sub-segments inside A, got {}",
+            part.b_inside_a.len()
+        );
+        // Verify the A-edges-inside-B sub-segments chain at (1, 1).
+        let endpoints: Vec<Point2d> = part
+            .a_inside_b
+            .iter()
+            .flat_map(|(s, e)| vec![*s, *e])
+            .collect();
+        assert!(
+            endpoints
+                .iter()
+                .any(|p| (p.x - 1.0).abs() < 1e-9 && (p.y - 1.0).abs() < 1e-9),
+            "expected vertex (1, 1) in a_inside_b endpoint set, got {endpoints:?}"
+        );
+    }
+
+    #[test]
+    fn partition_disjoint_polygons_yields_empty() {
+        let a = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
+        let b = vec![p(5.0, 5.0), p(6.0, 5.0), p(6.0, 6.0), p(5.0, 6.0)];
+        let part = partition_boundaries(&a, &b, &tol()).expect("partition ok");
+        assert!(part.a_inside_b.is_empty());
+        assert!(part.b_inside_a.is_empty());
+    }
+
+    #[test]
+    fn partition_segments_have_midpoints_inside_other_polygon() {
+        // Property test: every output sub-segment's midpoint must lie
+        // inside the opposing polygon.
+        let a = vec![p(0.0, 0.0), p(4.0, 0.0), p(4.0, 4.0), p(0.0, 4.0)];
+        let b = vec![p(2.0, 2.0), p(6.0, 2.0), p(6.0, 6.0), p(2.0, 6.0)];
+        let part = partition_boundaries(&a, &b, &tol()).expect("partition ok");
+
+        let eps = 1e-6;
+        for (s, e) in &part.a_inside_b {
+            let mid = Point2d::new(0.5 * (s.x + e.x), 0.5 * (s.y + e.y));
+            assert!(
+                point_in_polygon(mid, &b, eps),
+                "a_inside_b segment ({s:?}, {e:?}) midpoint {mid:?} not inside B"
+            );
+        }
+        for (s, e) in &part.b_inside_a {
+            let mid = Point2d::new(0.5 * (s.x + e.x), 0.5 * (s.y + e.y));
+            assert!(
+                point_in_polygon(mid, &a, eps),
+                "b_inside_a segment ({s:?}, {e:?}) midpoint {mid:?} not inside A"
+            );
+        }
     }
 
     #[test]
