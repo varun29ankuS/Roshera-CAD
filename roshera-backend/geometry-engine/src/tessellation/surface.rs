@@ -370,18 +370,33 @@ fn sample_loop_3d_polygon(
     }
 }
 
-/// Compute the chord-tolerance-driven sample count for a curve segment.
+/// Compute the curvature-adaptive sample count for a curve segment.
 ///
-/// Estimates arc length via a 16-point polyline probe, then returns
-/// `ceil(arc_length / max_edge_length)` clamped to
-/// `[min_segments, max_segments]`. The sample count is identical to
-/// what the cylindrical / spherical / conical / toroidal tessellators
-/// derive from the same chord tolerance applied to their parametric
-/// span — so boundary samples land at the same curve parameters as
-/// the curved-surface grid samples, and `weld_mesh_watertight_range`
-/// collapses the shared edge cleanly. This is the invariant that lets
-/// a primitive cylinder render watertight: cap and lateral face
-/// agree on every closed-circle boundary point.
+/// Probes the curve with 16 uniform parametric samples and estimates
+/// two scalars from the resulting polyline:
+///
+/// * `total_length`  — sum of chord magnitudes (lower-bound on arc length).
+/// * `total_angle`   — sum of consecutive segment turn angles
+///   (lower-bound on total tangent rotation).
+///
+/// The sample count is then the strictest of three constraints, the
+/// same triple-guard used by `arc_steps_for_quality` for primitive
+/// surface grids:
+///
+/// 1. **max_edge_length** — `n_len = ceil(total_length / max_edge_length)`.
+/// 2. **max_angle_deviation** — `n_angle = ceil(total_angle / max_angle_deviation)`.
+/// 3. **chord_tolerance (sagitta)** — from the effective mean radius
+///    `r ≈ total_length / total_angle`, the per-segment subtended angle
+///    that keeps sagitta below the tolerance is
+///    `θ_seg = 2·acos(1 − chord_tolerance / r)`, giving
+///    `n_sag = ceil(total_angle / θ_seg)`.
+///
+/// This keeps face-boundary samples in lockstep with the cylindrical /
+/// spherical / conical / toroidal tessellators (which derive their
+/// step counts from the same triple-guard over the parametric span),
+/// so cap and lateral faces agree on every closed-circle boundary
+/// point. Watertightness then survives `weld_mesh_watertight_range`
+/// without relying on the welder's spatial tolerance as a safety net.
 fn compute_curve_sample_count(
     curve: &dyn crate::primitives::curve::Curve,
     t_start: f64,
@@ -389,22 +404,83 @@ fn compute_curve_sample_count(
     params: &TessellationParams,
 ) -> usize {
     const PROBE: usize = 16;
-    let mut total_length = 0.0_f64;
-    let mut prev = curve.point_at(t_start).ok();
+
+    // 16-point parametric probe → polyline.
+    let mut pts: Vec<Option<Point3>> = Vec::with_capacity(PROBE + 1);
+    pts.push(curve.point_at(t_start).ok());
     for i in 1..=PROBE {
         let t = t_start + (i as f64) * (t_end - t_start) / (PROBE as f64);
-        let cur = curve.point_at(t).ok();
-        if let (Some(a), Some(b)) = (prev.as_ref(), cur.as_ref()) {
+        pts.push(curve.point_at(t).ok());
+    }
+
+    // Total chord length (lower-bound on arc length).
+    let mut total_length = 0.0_f64;
+    for i in 1..pts.len() {
+        if let (Some(a), Some(b)) = (pts[i - 1].as_ref(), pts[i].as_ref()) {
             total_length += (*b - *a).magnitude();
         }
-        prev = cur;
     }
-    let n = if params.max_edge_length > 0.0 {
+
+    // Total turning angle (lower-bound on tangent rotation). The probe
+    // misses up to one segment of curvature per endpoint, but for any
+    // reasonably refined curve this underestimate is small and we
+    // always clamp by min_segments afterwards.
+    let mut total_angle = 0.0_f64;
+    for i in 1..pts.len() - 1 {
+        if let (Some(a), Some(b), Some(c)) =
+            (pts[i - 1].as_ref(), pts[i].as_ref(), pts[i + 1].as_ref())
+        {
+            let v1 = *b - *a;
+            let v2 = *c - *b;
+            let m1 = v1.magnitude();
+            let m2 = v2.magnitude();
+            if m1 > 1e-12 && m2 > 1e-12 {
+                let cos_t = (v1.dot(&v2) / (m1 * m2)).clamp(-1.0, 1.0);
+                total_angle += cos_t.acos();
+            }
+        }
+    }
+
+    // 1. Arc-length constraint.
+    let n_len = if params.max_edge_length > 0.0 && total_length > 0.0 {
         (total_length / params.max_edge_length).ceil() as usize
     } else {
         params.min_segments
     };
-    n.max(params.min_segments.max(3)).min(params.max_segments)
+
+    // 2. Angle-deviation constraint.
+    let n_angle = if params.max_angle_deviation > 0.0 && total_angle > 0.0 {
+        (total_angle / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+
+    // 3. Chord-height (sagitta) constraint. Effective radius is
+    //    r = total_length / total_angle (matches a circular arc
+    //    exactly, conservative for non-uniform curvature). For
+    //    sagitta < r, the per-segment angle is well-defined.
+    let n_sag = if params.chord_tolerance > 0.0 && total_angle > 1e-9 && total_length > 0.0 {
+        let radius = total_length / total_angle;
+        if params.chord_tolerance < radius {
+            let cos_half = 1.0 - params.chord_tolerance / radius;
+            let theta_seg = 2.0 * cos_half.acos();
+            if theta_seg > 0.0 {
+                (total_angle / theta_seg).ceil() as usize
+            } else {
+                params.min_segments
+            }
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
+
+    n_len
+        .max(n_angle)
+        .max(n_sag)
+        .max(params.min_segments.max(3))
+        .min(params.max_segments)
 }
 
 /// Triangulate a planar face's outer + (optional) inner loops in the

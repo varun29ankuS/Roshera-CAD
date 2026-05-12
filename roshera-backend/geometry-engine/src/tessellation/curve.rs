@@ -55,7 +55,26 @@ fn tessellate_arc(
     params: &TessellationParams,
 ) -> Vec<Point3> {
     let arc_length = curve.arc_length(tolerance::STRICT_TOLERANCE);
-    let num_segments = calculate_arc_segments(arc_length, params);
+    // Recover the arc's geometric radius from three sample points
+    // (start, mid, end). For a circular `Arc` this is exact; for any
+    // other curve marketed as "Arc" we still get the circumradius of
+    // the three-point sample, which is the right scale for the
+    // sagitta calculation. Avoids a downcast through &dyn Curve.
+    let t_mid = (t_start + t_end) * 0.5;
+    let radius = match (
+        curve.point_at(t_start),
+        curve.point_at(t_mid),
+        curve.point_at(t_end),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => circumradius_from_three_points(a, b, c),
+        _ => 0.0,
+    };
+    let swept_angle = if radius > 1e-12 {
+        arc_length / radius
+    } else {
+        0.0
+    };
+    let num_segments = calculate_arc_segments(arc_length, swept_angle, radius, params);
 
     let mut points = Vec::with_capacity(num_segments + 1);
 
@@ -67,6 +86,24 @@ fn tessellate_arc(
     }
 
     points
+}
+
+/// Circumradius of the triangle ABC, i.e. the radius of the unique
+/// circle through three non-collinear points. Returns `0.0` for
+/// degenerate (collinear / coincident) inputs.
+fn circumradius_from_three_points(a: Point3, b: Point3, c: Point3) -> f64 {
+    let ab = b - a;
+    let bc = c - b;
+    let ca = a - c;
+    let len_ab = ab.magnitude();
+    let len_bc = bc.magnitude();
+    let len_ca = ca.magnitude();
+    // Triangle area via half the magnitude of (b-a) × (c-a).
+    let area = (b - a).cross(&(c - a)).magnitude() * 0.5;
+    if area < 1e-18 {
+        return 0.0;
+    }
+    (len_ab * len_bc * len_ca) / (4.0 * area)
 }
 
 /// Tessellate a NURBS curve adaptively
@@ -112,13 +149,49 @@ fn tessellate_generic_curve(
     points
 }
 
-/// Calculate number of segments for an arc
-fn calculate_arc_segments(arc_length: f64, params: &TessellationParams) -> usize {
-    let segments_by_length = (arc_length / params.max_edge_length).ceil() as usize;
-    let segments_by_angle = (std::f64::consts::PI / params.max_angle_deviation).ceil() as usize;
+/// Calculate number of segments for an arc using the triple-guard
+/// (chord_tolerance/sagitta + max_edge_length + max_angle_deviation)
+/// pattern used by `arc_steps_for_quality` for primitive surface
+/// grids. Honoring all three keeps wireframe arc samples in sync with
+/// the cylindrical / spherical / toroidal cap boundaries — same
+/// curvature, same segment count.
+fn calculate_arc_segments(
+    arc_length: f64,
+    span_angle: f64,
+    radius: f64,
+    params: &TessellationParams,
+) -> usize {
+    let segments_by_length = if params.max_edge_length > 0.0 && arc_length > 0.0 {
+        (arc_length / params.max_edge_length).ceil() as usize
+    } else {
+        params.min_segments
+    };
+
+    let segments_by_angle = if params.max_angle_deviation > 0.0 && span_angle > 0.0 {
+        (span_angle / params.max_angle_deviation).ceil() as usize
+    } else {
+        params.min_segments
+    };
+
+    let segments_by_sagitta = if params.chord_tolerance > 0.0
+        && radius > 0.0
+        && params.chord_tolerance < radius
+        && span_angle > 0.0
+    {
+        let cos_half = 1.0 - params.chord_tolerance / radius;
+        let theta_seg = 2.0 * cos_half.acos();
+        if theta_seg > 0.0 {
+            (span_angle / theta_seg).ceil() as usize
+        } else {
+            params.min_segments
+        }
+    } else {
+        params.min_segments
+    };
 
     segments_by_length
         .max(segments_by_angle)
+        .max(segments_by_sagitta)
         .clamp(params.min_segments, params.max_segments)
 }
 
@@ -150,7 +223,22 @@ fn calculate_adaptive_step(curve: &dyn Curve, t: f64, params: &TessellationParam
     }
 }
 
-/// Recursive adaptive tessellation
+/// Recursive curvature-adaptive tessellation. Subdivides a curve
+/// segment whenever *any* of the three quality guards fires:
+///
+/// * **chord_tolerance** — midpoint sagitta (perpendicular distance
+///   from `p_mid` to the chord `p_start → p_end`) exceeds the
+///   tolerance. This is the classical adaptive-tessellation test.
+/// * **max_edge_length** — the chord itself is longer than the
+///   per-segment length budget. Forces refinement on long, nearly
+///   straight stretches (e.g. a long low-curvature NURBS span that a
+///   pure sagitta test would accept with a single segment).
+/// * **max_angle_deviation** — the turn angle from `p_start → p_mid`
+///   to `p_mid → p_end` exceeds the per-segment angle budget. Catches
+///   sharp local curvature spikes that a global sagitta test on the
+///   whole span might miss.
+///
+/// Recursion stops at `MAX_DEPTH = 10` (≤ 1024 segments per call).
 fn adaptive_tessellate(
     curve: &dyn Curve,
     t_start: f64,
@@ -204,9 +292,24 @@ fn adaptive_tessellate(
     let closest_on_chord = p_start + chord_dir * projection;
     let deviation = p_mid.distance(&closest_on_chord);
 
-    // Decide whether to subdivide
-    if deviation > params.chord_tolerance && depth < MAX_DEPTH {
-        // Recursively tessellate both halves
+    // Turn angle between half-chords (p_start→p_mid) and (p_mid→p_end).
+    let v1 = p_mid - p_start;
+    let v2 = p_end - p_mid;
+    let m1 = v1.magnitude();
+    let m2 = v2.magnitude();
+    let turn_angle = if m1 > 1e-12 && m2 > 1e-12 {
+        let cos_t = (v1.dot(&v2) / (m1 * m2)).clamp(-1.0, 1.0);
+        cos_t.acos()
+    } else {
+        0.0
+    };
+
+    // Subdivide if *any* guard fires, subject to recursion depth.
+    let too_curved = params.chord_tolerance > 0.0 && deviation > params.chord_tolerance;
+    let too_long = params.max_edge_length > 0.0 && chord_length > params.max_edge_length;
+    let too_angled = params.max_angle_deviation > 0.0 && turn_angle > params.max_angle_deviation;
+
+    if (too_curved || too_long || too_angled) && depth < MAX_DEPTH {
         adaptive_tessellate(curve, t_start, t_mid, params, points, depth + 1);
         adaptive_tessellate(curve, t_mid, t_end, params, points, depth + 1);
     } else {
@@ -275,5 +378,79 @@ mod tests {
         for i in 0..points.len() {
             assert!((points[i].x - i as f64).abs() < 1e-10);
         }
+    }
+
+    /// Tighter chord_tolerance must produce more samples on a curved
+    /// arc — the sagitta guard in `calculate_arc_segments`.
+    #[test]
+    fn arc_sampling_density_grows_with_chord_tolerance() {
+        let arc = Arc::new(Point3::ZERO, Vector3::Z, 1.0, 0.0, consts::HALF_PI).unwrap();
+
+        let coarse = TessellationParams {
+            chord_tolerance: 0.1,
+            ..TessellationParams::default()
+        };
+        let fine = TessellationParams {
+            chord_tolerance: 0.001,
+            ..TessellationParams::default()
+        };
+
+        let n_coarse = tessellate_curve(&arc, &coarse).len();
+        let n_fine = tessellate_curve(&arc, &fine).len();
+
+        assert!(
+            n_fine > n_coarse,
+            "expected fine ({n_fine}) > coarse ({n_coarse}) for tighter chord_tolerance"
+        );
+    }
+
+    /// A large-radius arc swept by the same parameter range must get
+    /// at least as many samples as a unit-radius one at the same
+    /// chord_tolerance — absolute sagitta scales with radius for a
+    /// fixed segment count, so larger arcs need finer subdivision.
+    #[test]
+    fn arc_sampling_density_scales_with_radius() {
+        let small = Arc::new(Point3::ZERO, Vector3::Z, 1.0, 0.0, consts::HALF_PI).unwrap();
+        let large = Arc::new(Point3::ZERO, Vector3::Z, 100.0, 0.0, consts::HALF_PI).unwrap();
+
+        let params = TessellationParams {
+            chord_tolerance: 0.01,
+            // remove length cap so radius drives the count, not chord_length
+            max_edge_length: f64::INFINITY,
+            ..TessellationParams::default()
+        };
+
+        let n_small = tessellate_curve(&small, &params).len();
+        let n_large = tessellate_curve(&large, &params).len();
+
+        assert!(
+            n_large >= n_small,
+            "expected radius-100 arc ({n_large}) ≥ radius-1 arc ({n_small}) at same chord_tolerance"
+        );
+    }
+
+    /// `max_edge_length` must force refinement on a large arc even
+    /// when curvature alone would be coarse — guards against long
+    /// chord segments across nearly-straight stretches.
+    #[test]
+    fn arc_sampling_respects_max_edge_length() {
+        let arc = Arc::new(Point3::ZERO, Vector3::Z, 100.0, 0.0, consts::HALF_PI).unwrap();
+
+        let params = TessellationParams {
+            chord_tolerance: 10.0,         // very loose curvature
+            max_angle_deviation: 1.0,      // very loose angle
+            max_edge_length: 1.0,          // tight length
+            min_segments: 3,
+            max_segments: 10_000,
+        };
+
+        let points = tessellate_curve(&arc, &params);
+        // Quarter-arc of radius 100 has length ~157; with 1.0 budget,
+        // need >= 157 segments → 158 points.
+        assert!(
+            points.len() >= 100,
+            "expected long arc to be refined by max_edge_length; got {} points",
+            points.len()
+        );
     }
 }
