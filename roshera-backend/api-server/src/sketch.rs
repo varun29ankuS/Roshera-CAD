@@ -718,7 +718,7 @@ fn materialise_circle(points: &[[f64; 2]], segments: u32) -> Result<Vec<[f64; 2]
 //      one pass and the user is much better served by extruding the
 //      outer body, then drawing a second sketch on its top face.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Region {
     pub outer_shape_idx: usize,
     pub hole_shape_idxs: Vec<usize>,
@@ -890,6 +890,110 @@ fn ensure_ccw(polygon: &mut [[f64; 2]]) {
     }
     if signed_area < 0.0 {
         polygon.reverse();
+    }
+}
+
+// ─── Region computation (server-authoritative) ───────────────────────
+//
+// `detect_regions` is the pure classifier. The two helpers below are
+// the public glue: one for the session-bound case (we materialise the
+// session's shapes and then classify), and one for the stateless case
+// (the caller hands us already-materialised polygons). Both are
+// callable from the REST handlers and from the WS broadcast path, so
+// the classification the frontend sees on hover is exactly the
+// classification the extrude pipeline will see at finalise time.
+
+/// Wire-shape response for both `GET /api/sketch/{id}/regions` and
+/// `POST /api/sketch/regions/preview`. `regions` is empty either when
+/// no shape has materialised yet (in-progress sketch with too few
+/// points) or when `region_error` carries a detection failure such as
+/// nested-island-in-a-hole.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionsResponse {
+    pub regions: Vec<Region>,
+    pub region_error: Option<String>,
+}
+
+/// Request body for the stateless preview endpoint. Callers pass a
+/// flat list of closed 2D polygons; we run `detect_regions` and
+/// return the same `RegionsResponse` shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewRegionsBody {
+    pub polygons: Vec<Vec<[f64; 2]>>,
+}
+
+/// Materialise every shape on the session and classify the resulting
+/// polygons. Shapes that fail to materialise (in-progress polylines,
+/// degenerate rectangles, etc.) are silently skipped — they're not
+/// yet ready to participate in topology classification. The returned
+/// regions reference *original* shape indices on the session, so the
+/// caller does not have to remap.
+pub fn compute_regions_for_session(session: &SketchSession) -> RegionsResponse {
+    // (original_idx, polygon) for every shape that successfully
+    // materialises. Skipping degenerate shapes lets the user keep
+    // drawing without flickering "region detection failed" errors
+    // mid-stroke.
+    let materialised: Vec<(usize, Vec<[f64; 2]>)> = session
+        .shapes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, shape)| {
+            materialise_shape(shape, session.circle_segments)
+                .ok()
+                .map(|polygon| (idx, polygon))
+        })
+        .collect();
+
+    if materialised.is_empty() {
+        return RegionsResponse {
+            regions: Vec::new(),
+            region_error: None,
+        };
+    }
+
+    let polygon_refs: Vec<&Vec<[f64; 2]>> = materialised.iter().map(|(_, p)| p).collect();
+    match detect_regions(&polygon_refs) {
+        Ok(regions) => RegionsResponse {
+            regions: regions
+                .into_iter()
+                .map(|r| Region {
+                    outer_shape_idx: materialised[r.outer_shape_idx].0,
+                    hole_shape_idxs: r
+                        .hole_shape_idxs
+                        .into_iter()
+                        .map(|i| materialised[i].0)
+                        .collect(),
+                    area: r.area,
+                })
+                .collect(),
+            region_error: None,
+        },
+        Err(e) => RegionsResponse {
+            regions: Vec::new(),
+            region_error: Some(e.to_string()),
+        },
+    }
+}
+
+/// Stateless variant for the preview endpoint. Indices in the
+/// returned regions refer directly into the input `polygons` slice.
+pub fn compute_regions_for_polygons(polygons: &[Vec<[f64; 2]>]) -> RegionsResponse {
+    if polygons.is_empty() {
+        return RegionsResponse {
+            regions: Vec::new(),
+            region_error: None,
+        };
+    }
+    let refs: Vec<&Vec<[f64; 2]>> = polygons.iter().collect();
+    match detect_regions(&refs) {
+        Ok(regions) => RegionsResponse {
+            regions,
+            region_error: None,
+        },
+        Err(e) => RegionsResponse {
+            regions: Vec::new(),
+            region_error: Some(e.to_string()),
+        },
     }
 }
 
@@ -1111,6 +1215,37 @@ pub async fn get_sketch(
         .get(&id)
         .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
     Ok(Json(session))
+}
+
+/// `GET /api/sketch/{id}/regions` — read-only region classification
+/// for an in-progress sketch session. Returns the same data the
+/// extrude pipeline will see at finalise time, so a hover preview
+/// can paint outer/hole topology server-authoritatively. Materialise
+/// errors on a per-shape basis are swallowed (the user is still
+/// drawing); detection-level errors (nested-island-in-hole) come
+/// back as `region_error`.
+pub async fn get_sketch_regions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RegionsResponse>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    Ok(Json(compute_regions_for_session(&session)))
+}
+
+/// `POST /api/sketch/regions/preview` — stateless region detection
+/// on a caller-supplied polygon list. No session is involved; useful
+/// for clients (or other backend services) that have already
+/// materialised polygons and just want the classification. Returns
+/// `RegionsResponse` with the same shape as the session-bound
+/// endpoint.
+pub async fn preview_regions(
+    Json(body): Json<PreviewRegionsBody>,
+) -> Result<Json<RegionsResponse>, ApiError> {
+    Ok(Json(compute_regions_for_polygons(&body.polygons)))
 }
 
 /// `DELETE /api/sketch/{id}` — abandon a session.
@@ -2280,15 +2415,42 @@ pub async fn plane_from_face(
 /// Push a `SketchCreated` frame onto the geometry broadcaster. Every
 /// connected viewer mirrors the new session into its local store so a
 /// second client opening the panel sees the in-progress sketch.
+///
+/// A `SketchRegionsUpdated` frame rides along so any client that
+/// cares about the outer/hole topology preview gets the
+/// authoritative classification in the same WS tick — no extra
+/// round-trip needed.
 fn broadcast_sketch_created(session: &SketchSession) {
     publish_sketch_frame("SketchCreated", serde_json::to_value(session).ok());
+    publish_sketch_regions_frame(session);
 }
 
 /// Push a `SketchUpdated` frame. Used after every mutation
 /// (add/pop/set point, plane swap, tool swap, segments swap) so peers
-/// stay in lock-step with the authoring client.
+/// stay in lock-step with the authoring client. Region classification
+/// is co-broadcast so the preview overlay stays in sync with shape
+/// edits without polling.
 fn broadcast_sketch_updated(session: &SketchSession) {
     publish_sketch_frame("SketchUpdated", serde_json::to_value(session).ok());
+    publish_sketch_regions_frame(session);
+}
+
+/// Push a `SketchRegionsUpdated` frame carrying the outer/hole
+/// topology for the session's current shapes. Materialises every
+/// shape server-side and runs `detect_regions` — the FE never needs
+/// to duplicate the classification logic. Decoupled from
+/// `SketchUpdated` so existing clients that don't understand
+/// regions silently ignore the frame.
+fn publish_sketch_regions_frame(session: &SketchSession) {
+    let regions = compute_regions_for_session(session);
+    publish_sketch_frame(
+        "SketchRegionsUpdated",
+        Some(serde_json::json!({
+            "sketch_id":    session.id.to_string(),
+            "regions":      regions.regions,
+            "region_error": regions.region_error,
+        })),
+    );
 }
 
 /// Push a `SketchDeleted` frame so peers can drop the session.
@@ -2692,6 +2854,215 @@ mod tests {
         let sq = square(0.0, 0.0, 1.0);
         assert!(point_in_polygon([0.0, 0.0], &sq));
         assert!(!point_in_polygon([5.0, 5.0], &sq));
+    }
+
+    // ---------------------------------------------------------------
+    // Slice D — server-authoritative region preview API.
+    //
+    // The two helpers (`compute_regions_for_session` and
+    // `compute_regions_for_polygons`) are the load-bearing pieces
+    // that back both REST handlers and the WS broadcast frame, so
+    // they get exhaustive coverage here. Handler-level tests are
+    // omitted because api-server is a binary crate (no `[lib]`):
+    // the handlers are five-line `Json` wrappers over the helpers,
+    // and the route registration is verified by the existing
+    // server-boot smoke tests.
+    // ---------------------------------------------------------------
+
+    fn rect_shape(x0: f64, y0: f64, x1: f64, y1: f64) -> SketchShape {
+        let mut s = SketchShape::new(SketchTool::Rectangle);
+        s.points = vec![[x0, y0], [x1, y1]];
+        s
+    }
+
+    fn polyline_shape(points: Vec<[f64; 2]>) -> SketchShape {
+        let mut s = SketchShape::new(SketchTool::Polyline);
+        s.points = points;
+        s
+    }
+
+    fn session_with_shapes(shapes: Vec<SketchShape>) -> SketchSession {
+        let mut session = SketchSession::new(SketchPlane::XY, SketchTool::Polyline);
+        session.shapes = shapes;
+        session
+    }
+
+    #[test]
+    fn regions_single_rectangle_one_outer_no_holes() {
+        let session = session_with_shapes(vec![rect_shape(0.0, 0.0, 10.0, 10.0)]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.region_error.is_none(), "no classification error");
+        assert_eq!(resp.regions.len(), 1);
+        assert_eq!(resp.regions[0].outer_shape_idx, 0);
+        assert!(resp.regions[0].hole_shape_idxs.is_empty());
+    }
+
+    #[test]
+    fn regions_rectangle_with_inner_rectangle_one_hole() {
+        let session = session_with_shapes(vec![
+            rect_shape(0.0, 0.0, 10.0, 10.0),
+            rect_shape(3.0, 3.0, 7.0, 7.0),
+        ]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.region_error.is_none());
+        assert_eq!(resp.regions.len(), 1);
+        assert_eq!(resp.regions[0].outer_shape_idx, 0);
+        assert_eq!(resp.regions[0].hole_shape_idxs, vec![1]);
+    }
+
+    #[test]
+    fn regions_two_disjoint_rectangles_two_outers() {
+        let session = session_with_shapes(vec![
+            rect_shape(0.0, 0.0, 2.0, 2.0),
+            rect_shape(10.0, 10.0, 12.0, 12.0),
+        ]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.region_error.is_none());
+        assert_eq!(resp.regions.len(), 2);
+        for region in &resp.regions {
+            assert!(region.hole_shape_idxs.is_empty(), "disjoint outers have no holes");
+        }
+    }
+
+    #[test]
+    fn regions_nested_island_in_hole_returns_error() {
+        // Outer (10×10) > hole (6×6) > island (2×2) → depth-2 nesting,
+        // which the kernel pipeline cannot represent in one extrude.
+        // `detect_regions` rejects with `NestingTooDeep`; we surface
+        // that message via `region_error`.
+        let session = session_with_shapes(vec![
+            rect_shape(0.0, 0.0, 10.0, 10.0),
+            rect_shape(2.0, 2.0, 8.0, 8.0),
+            rect_shape(4.0, 4.0, 6.0, 6.0),
+        ]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.regions.is_empty(), "regions cleared on error");
+        let err = resp.region_error.expect("error message present");
+        assert!(
+            err.contains("nested"),
+            "error mentions nesting depth, got `{err}`",
+        );
+    }
+
+    #[test]
+    fn regions_in_progress_shape_silently_skipped() {
+        // A polyline with only two points cannot materialise into a
+        // closed polygon, so it must not poison the classifier — the
+        // valid rectangle still produces one outer region and no
+        // error surface to the user mid-stroke.
+        let session = session_with_shapes(vec![
+            rect_shape(0.0, 0.0, 10.0, 10.0),
+            polyline_shape(vec![[1.0, 1.0], [2.0, 2.0]]),
+        ]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.region_error.is_none());
+        assert_eq!(resp.regions.len(), 1);
+        assert_eq!(resp.regions[0].outer_shape_idx, 0);
+    }
+
+    #[test]
+    fn regions_only_in_progress_shapes_returns_empty_no_error() {
+        // The session is too early-state to classify — both shapes
+        // are still being drawn. We return empty regions with no
+        // error so the preview overlay simply renders nothing.
+        let session = session_with_shapes(vec![
+            polyline_shape(vec![[0.0, 0.0]]),
+            polyline_shape(vec![[1.0, 1.0], [2.0, 2.0]]),
+        ]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.regions.is_empty());
+        assert!(resp.region_error.is_none());
+    }
+
+    #[test]
+    fn regions_remap_uses_original_shape_indices() {
+        // The classifier-internal indices step over skipped shapes,
+        // so the helper must remap back to the session's shape
+        // positions. Place a degenerate polyline between two valid
+        // outers and assert the surviving outer indices are 0 and 2
+        // (the session indices), not 0 and 1 (the materialised
+        // indices).
+        let session = session_with_shapes(vec![
+            rect_shape(0.0, 0.0, 2.0, 2.0),
+            polyline_shape(vec![[5.0, 5.0]]), // skipped
+            rect_shape(10.0, 10.0, 12.0, 12.0),
+        ]);
+        let resp = compute_regions_for_session(&session);
+        assert!(resp.region_error.is_none());
+        let mut outer_idxs: Vec<usize> = resp.regions.iter().map(|r| r.outer_shape_idx).collect();
+        outer_idxs.sort_unstable();
+        assert_eq!(outer_idxs, vec![0, 2]);
+    }
+
+    #[test]
+    fn regions_stateless_polygon_list_classifies_directly() {
+        // POST /api/sketch/regions/preview path — no session, just
+        // polygons. Verifies the stateless helper preserves indices
+        // 1:1 with the input slice.
+        let polygons: Vec<Vec<[f64; 2]>> = vec![
+            square(0.0, 0.0, 5.0),  // outer at index 0
+            square(0.0, 0.0, 1.0),  // hole at index 1
+            square(20.0, 0.0, 2.0), // disjoint outer at index 2
+        ];
+        let resp = compute_regions_for_polygons(&polygons);
+        assert!(resp.region_error.is_none());
+        assert_eq!(resp.regions.len(), 2);
+        let with_hole = resp
+            .regions
+            .iter()
+            .find(|r| r.outer_shape_idx == 0)
+            .expect("region for the large outer");
+        assert_eq!(with_hole.hole_shape_idxs, vec![1]);
+        let lone = resp
+            .regions
+            .iter()
+            .find(|r| r.outer_shape_idx == 2)
+            .expect("region for the disjoint outer");
+        assert!(lone.hole_shape_idxs.is_empty());
+    }
+
+    #[test]
+    fn regions_stateless_empty_input_returns_empty_no_error() {
+        let resp = compute_regions_for_polygons(&[]);
+        assert!(resp.regions.is_empty());
+        assert!(resp.region_error.is_none());
+    }
+
+    #[test]
+    fn regions_stateless_too_short_polygon_returns_error() {
+        let polygons: Vec<Vec<[f64; 2]>> = vec![vec![[0.0, 0.0], [1.0, 0.0]]];
+        let resp = compute_regions_for_polygons(&polygons);
+        assert!(resp.regions.is_empty());
+        let err = resp.region_error.expect("error present");
+        assert!(err.contains("fewer than 3"), "got `{err}`");
+    }
+
+    #[test]
+    fn regions_response_round_trips_through_serde() {
+        // Locks the wire format. The FE depends on these field names
+        // (`regions`, `region_error`, `outer_shape_idx`,
+        // `hole_shape_idxs`, `area`) and on the null vs absent
+        // semantics for `region_error`. If this test breaks, the WS
+        // and REST consumers see a different shape — bump the API
+        // version intentionally instead of editing the assertion.
+        let resp = RegionsResponse {
+            regions: vec![Region {
+                outer_shape_idx: 0,
+                hole_shape_idxs: vec![1, 2],
+                area: 42.0,
+            }],
+            region_error: None,
+        };
+        let v = serde_json::to_value(&resp).expect("serialise");
+        assert_eq!(v["regions"][0]["outer_shape_idx"], 0);
+        assert_eq!(v["regions"][0]["hole_shape_idxs"], serde_json::json!([1, 2]));
+        assert_eq!(v["regions"][0]["area"], 42.0);
+        assert!(v["region_error"].is_null());
+
+        let back: RegionsResponse = serde_json::from_value(v).expect("deserialise");
+        assert_eq!(back.regions.len(), 1);
+        assert_eq!(back.regions[0].hole_shape_idxs, vec![1, 2]);
+        assert!(back.region_error.is_none());
     }
 
     #[test]
