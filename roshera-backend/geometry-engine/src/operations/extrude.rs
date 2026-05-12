@@ -180,11 +180,17 @@ fn create_side_face_shared(
 /// edges in the same order/orientation as the base loop. No fresh
 /// vertices, no fresh edges — the top face's outer boundary is exactly
 /// the upper edge of the side faces.
+///
+/// `inner_specs` carries one `(inner_base_loop, inner_topology)` pair per
+/// inner loop on the base face. Each pair produces a matching inner loop
+/// on the top cap so the bottom and top caps have identical hole
+/// topology. Pass an empty slice when the base face has no inner loops.
 fn create_top_face_shared(
     model: &mut BRepModel,
     base_face: &Face,
     base_loop: &Loop,
     topology: &ExtrusionLoopTopology,
+    inner_specs: &[(Loop, ExtrusionLoopTopology)],
     direction: Vector3,
     distance: f64,
 ) -> OperationResult<FaceId> {
@@ -206,7 +212,26 @@ fn create_top_face_shared(
     for (i, &top_edge_id) in topology.top_edges.iter().enumerate() {
         top_loop.add_edge(top_edge_id, base_loop.orientations[i]);
     }
-    let loop_id = model.loops.add(top_loop);
+    let outer_loop_id = model.loops.add(top_loop);
+
+    // One inner loop on the top cap per hole on the base face. The hole's
+    // top edges sit in the same order/orientation as the corresponding
+    // bottom edges (shared via the inner topology), so the cap's hole
+    // boundary matches the upper edge of the inner-loop side faces.
+    let mut inner_loop_ids: Vec<crate::primitives::r#loop::LoopId> =
+        Vec::with_capacity(inner_specs.len());
+    for (inner_base_loop, inner_topology) in inner_specs {
+        if inner_base_loop.edges.len() != inner_topology.top_edges.len() {
+            return Err(OperationError::InvalidGeometry(
+                "Top edge count does not match inner loop".to_string(),
+            ));
+        }
+        let mut inner_top_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Inner);
+        for (i, &top_edge_id) in inner_topology.top_edges.iter().enumerate() {
+            inner_top_loop.add_edge(top_edge_id, inner_base_loop.orientations[i]);
+        }
+        inner_loop_ids.push(model.loops.add(inner_top_loop));
+    }
 
     // Top cap normal points opposite to the base face — its outward
     // direction is along `direction`, while the base face's outward
@@ -215,7 +240,11 @@ fn create_top_face_shared(
         FaceOrientation::Forward => FaceOrientation::Backward,
         FaceOrientation::Backward => FaceOrientation::Forward,
     };
-    let face = Face::new(0, new_surface_id, loop_id, new_orientation);
+    let mut face =
+        Face::with_capacity(0, new_surface_id, outer_loop_id, new_orientation, inner_loop_ids.len());
+    for loop_id in inner_loop_ids {
+        face.add_inner_loop(loop_id);
+    }
     Ok(model.faces.add(face))
 }
 
@@ -405,58 +434,56 @@ fn create_unified_extrusion(
     let cloned_faces = deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
     unified_faces.extend(cloned_faces);
 
-    // 2. Build the shared extrusion topology once — top vertices,
-    //    vertical edges, and top edges are all created here so the
-    //    side faces and top cap reference the same `VertexId` /
-    //    `EdgeId`s and the resulting shell is watertight.
-    let base_loop = model
+    // 2. Build the shared extrusion topology once per loop — top
+    //    vertices, vertical edges, and top edges are all created here so
+    //    the side faces and top cap reference the same `VertexId` /
+    //    `EdgeId`s and the resulting shell is watertight. The same
+    //    treatment applies to each inner loop (hole) on the base face;
+    //    see `create_fresh_extrusion` for the doc on inner-loop winding.
+    validate_inner_loops_inside_outer(model, base_face)?;
+
+    let outer_base_loop = model
         .loops
         .get(base_face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
-    let topology = build_extrusion_loop_topology(model, &base_loop, direction, distance)?;
+    let outer_topology =
+        build_extrusion_loop_topology(model, &outer_base_loop, direction, distance)?;
 
-    // Snapshot bottom edge endpoints so we can index into the topology
-    // without re-fetching during side-face construction.
-    let bottom_endpoints: Vec<(VertexId, VertexId)> = base_loop
-        .edges
-        .iter()
-        .map(|&edge_id| {
-            model
-                .edges
-                .get(edge_id)
-                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
-                .map(|e| (e.start_vertex, e.end_vertex))
-        })
-        .collect::<OperationResult<Vec<_>>>()?;
+    build_loop_side_faces(
+        model,
+        &outer_base_loop,
+        &outer_topology,
+        &mut unified_faces,
+    )?;
 
-    for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
-        let bottom_forward = base_loop.orientations[i];
-        let (raw_start, raw_end) = bottom_endpoints[i];
-        // When the bottom edge is walked in reverse, its "start" along
-        // the loop is the raw end vertex.
-        let (loop_start, loop_end) = if bottom_forward {
-            (raw_start, raw_end)
-        } else {
-            (raw_end, raw_start)
-        };
-        let side_face = create_side_face_shared(
-            model,
-            bottom_edge_id,
-            bottom_forward,
-            loop_start,
-            loop_end,
-            topology.top_edges[i],
-            &topology,
-        )?;
-        unified_faces.push(side_face);
+    let inner_loop_ids = base_face.inner_loops.clone();
+    let mut inner_specs: Vec<(Loop, ExtrusionLoopTopology)> =
+        Vec::with_capacity(inner_loop_ids.len());
+    for inner_loop_id in inner_loop_ids {
+        let inner_loop = model
+            .loops
+            .get(inner_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Inner loop not found".to_string()))?
+            .clone();
+        let inner_topology =
+            build_extrusion_loop_topology(model, &inner_loop, direction, distance)?;
+        build_loop_side_faces(model, &inner_loop, &inner_topology, &mut unified_faces)?;
+        inner_specs.push((inner_loop, inner_topology));
     }
 
     // 3. Top cap built from the shared top edges — no fresh vertices.
     if cap_ends {
-        let top_face =
-            create_top_face_shared(model, base_face, &base_loop, &topology, direction, distance)?;
+        let top_face = create_top_face_shared(
+            model,
+            base_face,
+            &outer_base_loop,
+            &outer_topology,
+            &inner_specs,
+            direction,
+            distance,
+        )?;
         unified_faces.push(top_face);
     }
 
@@ -471,8 +498,9 @@ fn create_unified_extrusion(
     debug!(
         shell_id = unified_shell_id,
         face_count = unified_faces.len(),
-        top_vertices = topology.top_vertex.len(),
-        vertical_edges = topology.vertical_edge.len(),
+        top_vertices = outer_topology.top_vertex.len(),
+        vertical_edges = outer_topology.vertical_edge.len(),
+        inner_loops = inner_specs.len(),
         "Created watertight unified shell"
     );
     for (i, &face_id) in unified_faces.iter().enumerate() {
@@ -516,8 +544,17 @@ fn create_unified_extrusion(
 /// Used when `extrude_face` is called on a face that was just synthesized
 /// from a sketch profile and is not yet attached to any solid. The base face
 /// becomes the bottom cap of the new solid; one ruled side face is generated
-/// per edge of the base loop; an optional translated copy of the base face
+/// per edge of the outer loop; an optional translated copy of the base face
 /// caps the top.
+///
+/// **Multi-loop support:** when `base_face.inner_loops` is non-empty, each
+/// inner loop (hole) is treated the same way as the outer loop — one ruled
+/// side face per inner-loop edge, and the top cap is built with matching
+/// inner loops. The inner-loop winding (CW when the outer is CCW per the
+/// B-Rep invariant) naturally orients the side faces' outward normals into
+/// the hole, so material lies between the outer-loop side walls and the
+/// inner-loop side walls. See `validate_inner_loops_inside_outer` for the
+/// containment guard.
 fn create_fresh_extrusion(
     model: &mut BRepModel,
     base_face: &Face,
@@ -526,61 +563,70 @@ fn create_fresh_extrusion(
     distance: f64,
     cap_ends: bool,
 ) -> OperationResult<SolidId> {
+    // Reject malformed input up front: every inner loop must lie inside
+    // the outer loop, otherwise the extruded shell would be degenerate
+    // (e.g. side faces crossing each other in 3D).
+    validate_inner_loops_inside_outer(model, base_face)?;
+
     let mut unified_faces: Vec<FaceId> = Vec::new();
 
     // Bottom cap = the original base face, reversed so its outward normal
-    // points away from the extrusion direction.
+    // points away from the extrusion direction. The base face already
+    // references its inner loops by value, so the bottom cap is multi-loop
+    // automatically without any extra work here.
     if cap_ends {
         unified_faces.push(base_face_id);
     }
 
-    // Side faces — one per edge of the base loop. All vertical seams
-    // share `VertexId`/`EdgeId`s through the shared topology, so the
-    // resulting shell is watertight.
-    let base_loop = model
+    // Outer side faces — one per edge of the outer loop. All vertical
+    // seams share `VertexId`/`EdgeId`s through the shared topology, so the
+    // resulting shell is watertight along the outer boundary.
+    let outer_base_loop = model
         .loops
         .get(base_face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
-    let topology = build_extrusion_loop_topology(model, &base_loop, direction, distance)?;
+    let outer_topology =
+        build_extrusion_loop_topology(model, &outer_base_loop, direction, distance)?;
 
-    let bottom_endpoints: Vec<(VertexId, VertexId)> = base_loop
-        .edges
-        .iter()
-        .map(|&edge_id| {
-            model
-                .edges
-                .get(edge_id)
-                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
-                .map(|e| (e.start_vertex, e.end_vertex))
-        })
-        .collect::<OperationResult<Vec<_>>>()?;
+    build_loop_side_faces(
+        model,
+        &outer_base_loop,
+        &outer_topology,
+        &mut unified_faces,
+    )?;
 
-    for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
-        let bottom_forward = base_loop.orientations[i];
-        let (raw_start, raw_end) = bottom_endpoints[i];
-        let (loop_start, loop_end) = if bottom_forward {
-            (raw_start, raw_end)
-        } else {
-            (raw_end, raw_start)
-        };
-        let side_face = create_side_face_shared(
-            model,
-            bottom_edge_id,
-            bottom_forward,
-            loop_start,
-            loop_end,
-            topology.top_edges[i],
-            &topology,
-        )?;
-        unified_faces.push(side_face);
+    // Inner-loop side faces — one per edge of each inner loop. The same
+    // helper builds them; the inner loop's own CW winding (relative to
+    // the outer's CCW) flips the side-face normal so it points into the
+    // hole, which is what we want for the wall facing vacuum.
+    let inner_loop_ids = base_face.inner_loops.clone();
+    let mut inner_specs: Vec<(Loop, ExtrusionLoopTopology)> =
+        Vec::with_capacity(inner_loop_ids.len());
+    for inner_loop_id in inner_loop_ids {
+        let inner_loop = model
+            .loops
+            .get(inner_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Inner loop not found".to_string()))?
+            .clone();
+        let inner_topology =
+            build_extrusion_loop_topology(model, &inner_loop, direction, distance)?;
+        build_loop_side_faces(model, &inner_loop, &inner_topology, &mut unified_faces)?;
+        inner_specs.push((inner_loop, inner_topology));
     }
 
-    // Top cap built from the shared top edges.
+    // Top cap built from the shared top edges — both outer and inner.
     if cap_ends {
-        let top_face =
-            create_top_face_shared(model, base_face, &base_loop, &topology, direction, distance)?;
+        let top_face = create_top_face_shared(
+            model,
+            base_face,
+            &outer_base_loop,
+            &outer_topology,
+            &inner_specs,
+            direction,
+            distance,
+        )?;
         unified_faces.push(top_face);
     }
 
@@ -598,10 +644,143 @@ fn create_fresh_extrusion(
         solid_id,
         shell_id,
         face_count = unified_faces.len(),
+        inner_loops = inner_specs.len(),
         "Created fresh extruded solid"
     );
 
     Ok(solid_id)
+}
+
+/// Build one side face per edge of `base_loop`, pushing each new `FaceId`
+/// onto `out_faces`. Shared between outer and inner loop extrusion paths.
+fn build_loop_side_faces(
+    model: &mut BRepModel,
+    base_loop: &Loop,
+    topology: &ExtrusionLoopTopology,
+    out_faces: &mut Vec<FaceId>,
+) -> OperationResult<()> {
+    let bottom_endpoints: Vec<(VertexId, VertexId)> = base_loop
+        .edges
+        .iter()
+        .map(|&edge_id| {
+            model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
+                .map(|e| (e.start_vertex, e.end_vertex))
+        })
+        .collect::<OperationResult<Vec<_>>>()?;
+
+    if base_loop.edges.len() != topology.top_edges.len() {
+        return Err(OperationError::InvalidGeometry(
+            "Top edge count does not match base loop".to_string(),
+        ));
+    }
+    if base_loop.edges.len() != base_loop.orientations.len() {
+        return Err(OperationError::InvalidGeometry(
+            "Loop orientations length mismatch".to_string(),
+        ));
+    }
+
+    for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
+        let bottom_forward = base_loop.orientations[i];
+        let (raw_start, raw_end) = bottom_endpoints[i];
+        let (loop_start, loop_end) = if bottom_forward {
+            (raw_start, raw_end)
+        } else {
+            (raw_end, raw_start)
+        };
+        let side_face = create_side_face_shared(
+            model,
+            bottom_edge_id,
+            bottom_forward,
+            loop_start,
+            loop_end,
+            topology.top_edges[i],
+            topology,
+        )?;
+        out_faces.push(side_face);
+    }
+
+    Ok(())
+}
+
+/// Validate that every inner loop of `base_face` lies inside the outer
+/// loop. Uses each inner loop's vertex centroid as the sample point and
+/// `Loop::contains_point` (winding-number) on the outer loop, projected
+/// in the dominant-axis plane of the face's surface normal.
+///
+/// **Limitation:** the centroid may fall outside a highly concave inner
+/// loop. For the production case (rectangles, circles approximated as
+/// regular polygons, simple polygons emitted by `detect_regions`), all
+/// loops are star-shaped relative to their centroid and the test is
+/// reliable. Pathological non-star-shaped inner loops can produce false
+/// rejections — refine the sampling strategy if that case ever arises.
+fn validate_inner_loops_inside_outer(
+    model: &BRepModel,
+    base_face: &Face,
+) -> OperationResult<()> {
+    if base_face.inner_loops.is_empty() {
+        return Ok(());
+    }
+
+    let outer_loop = model.loops.get(base_face.outer_loop).ok_or_else(|| {
+        OperationError::InvalidGeometry("Outer loop not found during inner-loop validation".to_string())
+    })?;
+
+    let surface = model.surfaces.get(base_face.surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry("Surface not found during inner-loop validation".to_string())
+    })?;
+    let (u_bounds, v_bounds) = surface.parameter_bounds();
+    let u_mid = 0.5 * (u_bounds.0 + u_bounds.1);
+    let v_mid = 0.5 * (v_bounds.0 + v_bounds.1);
+    let surface_normal = surface
+        .normal_at(u_mid, v_mid)
+        .map_err(|e| OperationError::NumericalError(format!("Surface normal failed: {:?}", e)))?;
+
+    for &inner_loop_id in &base_face.inner_loops {
+        let inner_loop = model
+            .loops
+            .get(inner_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Inner loop not found".to_string()))?;
+
+        let inner_vertex_ids = inner_loop
+            .vertices_cached(&model.edges)
+            .map_err(|e| OperationError::NumericalError(format!("Inner loop vertex query failed: {:?}", e)))?;
+        if inner_vertex_ids.is_empty() {
+            return Err(OperationError::InvalidGeometry(
+                "Inner loop has no vertices".to_string(),
+            ));
+        }
+
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        let mut cz = 0.0;
+        for vid in &inner_vertex_ids {
+            let v = model.vertices.get(*vid).ok_or_else(|| {
+                OperationError::InvalidGeometry("Inner-loop vertex not found".to_string())
+            })?;
+            cx += v.position[0];
+            cy += v.position[1];
+            cz += v.position[2];
+        }
+        let n = inner_vertex_ids.len() as f64;
+        let centroid = Point3::new(cx / n, cy / n, cz / n);
+
+        let inside = outer_loop
+            .contains_point(&centroid, &surface_normal, &model.vertices, &model.edges)
+            .map_err(|e| {
+                OperationError::NumericalError(format!("Inner-loop containment test failed: {:?}", e))
+            })?;
+        if !inside {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Inner loop {} centroid is not inside the outer loop",
+                inner_loop_id
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Create a unified extrusion with draft angle, twist, and/or end scale.
