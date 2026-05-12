@@ -591,6 +591,67 @@ impl NurbsCurve2d {
             internal_curve: None,
         }
     }
+
+    /// First derivative (tangent vector) at parameter `u`.
+    ///
+    /// Goes through the 3D `NurbsCurve::evaluate_derivatives` so the
+    /// derivative respects the rational quotient rule — projecting
+    /// weights away first (via `to_bspline`) gives a different,
+    /// non-rational curve and the wrong tangent.
+    pub fn tangent(&self, u: f64) -> Sketch2dResult<Vector2d> {
+        let points_3d: Vec<Point3> = self
+            .control_points
+            .iter()
+            .map(|p| Point3::new(p.x, p.y, 0.0))
+            .collect();
+        let curve_3d = NurbsCurve::new(
+            points_3d,
+            self.weights.clone(),
+            self.knots.clone(),
+            self.degree,
+        )
+        .map_err(|e| Sketch2dError::NumericalError {
+            description: format!("Failed to create 3D NURBS: {:?}", e),
+        })?;
+        let nurbs_point = curve_3d.evaluate_derivatives(u, 1);
+        let d1 = nurbs_point
+            .derivative1
+            .ok_or_else(|| Sketch2dError::NumericalError {
+                description: "NURBS first derivative unavailable".to_string(),
+            })?;
+        Ok(Vector2d::new(d1.x, d1.y))
+    }
+
+    /// Closest-point projection: returns `(foot, u)` minimising the
+    /// 2D distance from `point` to the curve.
+    ///
+    /// Delegates to the 3D `NurbsCurve::closest_point` (rational Newton
+    /// on `f(u) = (C(u) − P) · C'(u)`) after lifting `point` and the
+    /// control polygon into the z = 0 plane. The 3D routine already
+    /// respects weights, so no quotient handling is needed here.
+    pub fn closest_point(
+        &self,
+        point: &Point2d,
+        tolerance: &Tolerance2d,
+    ) -> Sketch2dResult<(Point2d, f64)> {
+        let points_3d: Vec<Point3> = self
+            .control_points
+            .iter()
+            .map(|p| Point3::new(p.x, p.y, 0.0))
+            .collect();
+        let curve_3d = NurbsCurve::new(
+            points_3d,
+            self.weights.clone(),
+            self.knots.clone(),
+            self.degree,
+        )
+        .map_err(|e| Sketch2dError::NumericalError {
+            description: format!("Failed to create 3D NURBS: {:?}", e),
+        })?;
+        let p3 = Point3::new(point.x, point.y, 0.0);
+        let (u, foot3) = curve_3d.closest_point(&p3, tolerance.distance);
+        Ok((Point2d::new(foot3.x, foot3.y), u))
+    }
 }
 
 /// A parametric spline entity with constraint tracking

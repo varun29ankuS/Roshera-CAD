@@ -19,7 +19,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::constraints::{ConstraintPriority, EntityRef};
-use super::spline2d::BSpline2d;
+use super::spline2d::{BSpline2d, NurbsCurve2d};
 use super::{
     Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
     Tolerance2d, Vector2d,
@@ -145,20 +145,32 @@ pub struct ConstraintSolver {
 /// Structural metadata for a spline entity that cannot vary during
 /// Newton–Raphson.
 ///
-/// Knots and degree are pinned across solves: changing them is a
-/// structural edit (knot refinement, degree elevation) rather than a
-/// constraint solve, and the solver has no continuous gradient with
-/// respect to them. The control points themselves live inside
-/// [`EntityState::parameters`] — for a B-spline this is the flat
+/// Knots, degree, and (when present) per-control-point weights are
+/// pinned across solves: changing any of them is a structural edit
+/// (knot refinement, degree elevation, rationality change) rather
+/// than a constraint solve, and the solver has no continuous
+/// gradient with respect to them. The control points themselves
+/// live inside [`EntityState::parameters`] as a flat
 /// `[cp0.x, cp0.y, cp1.x, cp1.y, …]` layout (2n entries for n control
-/// points). Reconstruct a [`BSpline2d`] from a parameter vector +
-/// metadata pair via [`ConstraintSolver::get_bspline2d`].
+/// points) regardless of whether the spline is rational.
+///
+/// Reconstruct the curve from a parameter vector + metadata pair via
+/// [`ConstraintSolver::get_bspline2d`] (when `weights == None`) or
+/// [`ConstraintSolver::get_nurbs_curve2d`] (when `weights == Some`).
 #[derive(Debug, Clone)]
 pub struct SplineMetadata {
     /// Polynomial degree of the spline (order = degree + 1).
     pub degree: usize,
     /// Knot vector (length = control_point_count + degree + 1).
     pub knots: Vec<f64>,
+    /// Per-control-point weights. `None` = non-rational B-Spline;
+    /// `Some(ws)` (with `ws.len() == control_point_count`) = NURBS.
+    /// Weights are pinned because they alter the curve's rational
+    /// denominator — varying them is a structural edit, not a
+    /// constraint solve. If a user surface ever needs free-weight
+    /// solving, the 3n parameter layout from the spline2d module doc
+    /// is the natural extension and lands as a follow-up slice.
+    pub weights: Option<Vec<f64>>,
 }
 
 /// Solver state for a single sketch entity.
@@ -167,8 +179,9 @@ pub struct SplineMetadata {
 /// fixed-mask used by the Newton–Raphson solver. Construct one via
 /// [`EntityState::point`], [`EntityState::line`], [`EntityState::circle`],
 /// [`EntityState::arc`], [`EntityState::rectangle`],
-/// [`EntityState::ellipse`], or [`EntityState::spline_bspline`] and
-/// register it with [`ConstraintSolver::add_entity`].
+/// [`EntityState::ellipse`], [`EntityState::spline_bspline`], or
+/// [`EntityState::spline_nurbs`] and register it with
+/// [`ConstraintSolver::add_entity`].
 #[derive(Debug, Clone)]
 pub struct EntityState {
     /// Current parameters (position, angles, etc.)
@@ -180,6 +193,26 @@ pub struct EntityState {
     /// the solver can reconstruct a [`BSpline2d`] from the parameter
     /// vector without reaching back into the sketch.
     spline: Option<SplineMetadata>,
+}
+
+/// Decode the flat `[x0, y0, x1, y1, …]` spline-control-point pack
+/// from an `EntityState::parameters` slice. Returns `None` if the
+/// length is not even (the slice is malformed and the caller should
+/// degrade to a zero residual rather than panic). Shared by
+/// `get_bspline2d` and `get_nurbs_curve2d` because both share the
+/// same 2n parameter layout — weights live in metadata, not in the
+/// solved parameter vector.
+fn control_points_from_parameters(parameters: &[f64]) -> Option<Vec<Point2d>> {
+    if parameters.len() % 2 != 0 {
+        return None;
+    }
+    let cp_count = parameters.len() / 2;
+    let mut control_points = Vec::with_capacity(cp_count);
+    for i in 0..cp_count {
+        let base = i * 2;
+        control_points.push(Point2d::new(parameters[base], parameters[base + 1]));
+    }
+    Some(control_points)
 }
 
 impl ConstraintSolver {
@@ -1374,17 +1407,41 @@ impl ConstraintSolver {
                 // Newton-Raphson loop needs to converge (an unsigned
                 // distance has a non-differentiable cusp at the
                 // solution).
-                let (p, bspline) = match (point, self.get_bspline2d(curve_entity)) {
-                    (Some(p), Some(bs)) => (p, bs),
-                    _ => return vec![0.0],
+                //
+                // Dispatch on weights metadata: NURBS uses native
+                // rational closest_point + tangent; B-Spline uses
+                // the non-rational path. Projecting NURBS weights
+                // away (via `to_bspline`) would change the curve and
+                // drive the foot to the wrong place — see
+                // `spline2d::NurbsCurve2d::to_bspline` doc.
+                let p = match point {
+                    Some(p) => p,
+                    None => return vec![0.0],
                 };
                 let tolerance = Tolerance2d::default();
-                let (foot, u) = match bspline.closest_point(&p, &tolerance) {
-                    Ok(pair) => pair,
-                    Err(_) => return vec![0.0],
+                let (foot, tangent_res) = if self.is_spline_rational(curve_entity) {
+                    let nurbs = match self.get_nurbs_curve2d(curve_entity) {
+                        Some(c) => c,
+                        None => return vec![0.0],
+                    };
+                    let (foot, u) = match nurbs.closest_point(&p, &tolerance) {
+                        Ok(pair) => pair,
+                        Err(_) => return vec![0.0],
+                    };
+                    (foot, nurbs.tangent(u))
+                } else {
+                    let bspline = match self.get_bspline2d(curve_entity) {
+                        Some(c) => c,
+                        None => return vec![0.0],
+                    };
+                    let (foot, u) = match bspline.closest_point(&p, &tolerance) {
+                        Ok(pair) => pair,
+                        Err(_) => return vec![0.0],
+                    };
+                    (foot, bspline.tangent(u))
                 };
                 let foot_to_p = Vector2d::from_points(&foot, &p);
-                let tangent = match bspline.tangent(u) {
+                let tangent = match tangent_res {
                     Ok(t) => t,
                     Err(_) => return vec![foot_to_p.magnitude()],
                 };
@@ -1403,9 +1460,8 @@ impl ConstraintSolver {
     }
 
     /// Reconstruct a [`BSpline2d`] from the entity state when `entity`
-    /// is a B-spline; `None` for every other kind (including NURBS, until
-    /// a native rational `closest_point` ships — see
-    /// [`EntityState::spline_bspline`] for the rationale).
+    /// is a non-rational B-spline; `None` for NURBS (use
+    /// [`ConstraintSolver::get_nurbs_curve2d`]) and every other kind.
     ///
     /// Reads control points as consecutive `(x, y)` pairs from
     /// `state.parameters` and pairs them with the structural
@@ -1419,19 +1475,57 @@ impl ConstraintSolver {
         }
         let state = self.entity_state.get(entity)?;
         let meta = state.spline.as_ref()?;
-        if state.parameters.len() % 2 != 0 {
+        if meta.weights.is_some() {
             return None;
         }
-        let cp_count = state.parameters.len() / 2;
-        let mut control_points = Vec::with_capacity(cp_count);
-        for i in 0..cp_count {
-            let base = i * 2;
-            control_points.push(Point2d::new(
-                state.parameters[base],
-                state.parameters[base + 1],
-            ));
-        }
+        let control_points = control_points_from_parameters(&state.parameters)?;
         BSpline2d::new(meta.degree, control_points, meta.knots.clone()).ok()
+    }
+
+    /// Reconstruct a [`NurbsCurve2d`] from the entity state when
+    /// `entity` is a rational NURBS curve; `None` for B-splines (use
+    /// [`ConstraintSolver::get_bspline2d`]) and every other kind.
+    ///
+    /// Same control-point unpacking as [`Self::get_bspline2d`]; in
+    /// addition the weights vector length must match the
+    /// control-point count, otherwise `None` is returned (degrades
+    /// the residual to zero rather than panicking).
+    fn get_nurbs_curve2d(&self, entity: &EntityRef) -> Option<NurbsCurve2d> {
+        if !matches!(entity, EntityRef::Spline(_)) {
+            return None;
+        }
+        let state = self.entity_state.get(entity)?;
+        let meta = state.spline.as_ref()?;
+        let weights = meta.weights.as_ref()?;
+        let control_points = control_points_from_parameters(&state.parameters)?;
+        if weights.len() != control_points.len() {
+            return None;
+        }
+        NurbsCurve2d::new(
+            meta.degree,
+            control_points,
+            weights.clone(),
+            meta.knots.clone(),
+        )
+        .ok()
+    }
+
+    /// `true` iff `entity` is a spline carrying NURBS weights.
+    /// Drives the dispatch in
+    /// [`Self::evaluate_point_on_curve`]; returns `false` for
+    /// B-splines and every non-spline kind.
+    fn is_spline_rational(&self, entity: &EntityRef) -> bool {
+        if !matches!(entity, EntityRef::Spline(_)) {
+            return false;
+        }
+        let Some(state) = self.entity_state.get(entity) else {
+            return false;
+        };
+        state
+            .spline
+            .as_ref()
+            .and_then(|m| m.weights.as_ref())
+            .is_some()
     }
 
     /// Evaluate midpoint constraint
@@ -1850,7 +1944,52 @@ impl EntityState {
         Self {
             parameters,
             fixed_mask,
-            spline: Some(SplineMetadata { degree, knots }),
+            spline: Some(SplineMetadata {
+                degree,
+                knots,
+                weights: None,
+            }),
+        }
+    }
+
+    /// Create state for a rational NURBS curve.
+    ///
+    /// Parameter layout matches [`EntityState::spline_bspline`]: a
+    /// flat `[cp0.x, cp0.y, cp1.x, cp1.y, …]` pack of 2n entries for
+    /// n control points. Weights live in [`SplineMetadata::weights`]
+    /// and are pinned (see that field's doc). The solver therefore
+    /// reports 2n DOFs for an unconstrained NURBS curve — the same
+    /// as a B-Spline of equal control-point count. Per-weight free
+    /// solving is a follow-up slice (would need a 3n pack +
+    /// non-negativity guard on each Newton step).
+    ///
+    /// `weights.len()` MUST equal `control_points.len()`. Mismatch is
+    /// rejected at curve-reconstruction time in
+    /// [`ConstraintSolver::get_nurbs_curve2d`] (returns `None`,
+    /// degrading the residual to zero rather than panicking).
+    pub fn spline_nurbs(
+        degree: usize,
+        control_points: Vec<Point2d>,
+        weights: Vec<f64>,
+        knots: Vec<f64>,
+        fixed_control_points: bool,
+    ) -> Self {
+        let mut parameters = Vec::with_capacity(control_points.len() * 2);
+        let mut fixed_mask = Vec::with_capacity(control_points.len() * 2);
+        for cp in &control_points {
+            parameters.push(cp.x);
+            parameters.push(cp.y);
+            fixed_mask.push(fixed_control_points);
+            fixed_mask.push(fixed_control_points);
+        }
+        Self {
+            parameters,
+            fixed_mask,
+            spline: Some(SplineMetadata {
+                degree,
+                knots,
+                weights: Some(weights),
+            }),
         }
     }
 }
@@ -1875,8 +2014,9 @@ mod tests {
     //! yet be authored through the public API is exercised indirectly
     //! via constraints it shares with the supported kinds
     //! (Point, Line, Circle, Arc, Rectangle, Ellipse, Spline).
-    //! B-Spline support landed in slice C-4-a; NURBS authoring (and a
-    //! rational `closest_point`) is queued for a follow-up slice.
+    //! B-Spline support landed in slice C-4-a-1; rational NURBS support
+    //! (native rational `closest_point` + `tangent` on `NurbsCurve2d`)
+    //! landed in slice C-4-a-2.
     #![allow(clippy::float_cmp)]
     #![allow(clippy::expect_used)]
 
@@ -2520,6 +2660,168 @@ mod tests {
             }
             other => panic!("expected Parameters update, got {:?}", other),
         }
+    }
+
+    // PointOnCurve · NURBS (slice C-4-a-2). The dispatch lives in
+    // `evaluate_point_on_curve`'s Spline arm: `is_spline_rational`
+    // routes through `get_nurbs_curve2d` + `NurbsCurve2d::{closest_point,
+    // tangent}` (native rational, not the lossy `to_bspline` route).
+    // Tests use a quadratic NURBS quarter-arc — the rational weighting
+    // is essential to keep the arc on the exact circle, which is what
+    // distinguishes the rational path from the B-Spline path that
+    // would project weights away.
+
+    /// Build a quadratic NURBS quarter-arc state on the unit circle,
+    /// centered at the origin, sweeping from `(1, 0)` to `(0, 1)`.
+    /// Control points + weights are the standard one-segment NURBS arc
+    /// construction (Piegl–Tiller §7.5): three control points with
+    /// the corner point lifted to `(1, 1)` and middle weight `cos(45°)
+    /// = √2/2`. The B-Spline projection of this curve (control points
+    /// scaled by weights) is a parabola through `(1,0)`–`(√2/2, √2/2)`
+    /// –`(0,1)`, which is NOT on the unit circle — the test fixture
+    /// thereby separates the two code paths.
+    fn sample_nurbs_quarter_arc_state() -> EntityState {
+        let control_points = vec![
+            Point2d::new(1.0, 0.0),
+            Point2d::new(1.0, 1.0),
+            Point2d::new(0.0, 1.0),
+        ];
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let weights = vec![1.0, w, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        EntityState::spline_nurbs(2, control_points, weights, knots, false)
+    }
+
+    #[test]
+    fn point_on_nurbs_zero_error_when_on_curve() {
+        // The midpoint of the quarter arc sits at (√2/2, √2/2) on the
+        // unit circle. A B-Spline using the same control points would
+        // pass through (0.5, 0.5) at u = 0.5 (Bézier midpoint of an
+        // (1,0)/(1,1)/(0,1) polygon), so getting near-zero residual at
+        // (√2/2, √2/2) proves the rational dispatch fired.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        let half_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+        s.add_entity(
+            p,
+            EntityState::point(Point2d::new(half_sqrt2, half_sqrt2), false),
+        );
+        s.add_entity(sp, sample_nurbs_quarter_arc_state());
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, sp],
+        );
+        // closest_point's Newton refinement converges to a tight
+        // residual on the arc.
+        assert!(
+            errs[0].abs() < 1e-6,
+            "NURBS residual should be ~0 on the arc, got {}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn point_on_nurbs_nonzero_error_when_off_curve() {
+        // (5, 5) is far outside the unit quarter arc — should produce
+        // a large signed residual regardless of sign.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(5.0, 5.0), false));
+        s.add_entity(sp, sample_nurbs_quarter_arc_state());
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[p, sp],
+        );
+        assert!(
+            errs[0].abs() > 1.0,
+            "expected large off-curve NURBS residual, got {}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn nurbs_dispatch_distinct_from_bspline() {
+        // Same control points, but one carries NURBS weights and the
+        // other does not. At the midpoint (√2/2, √2/2) — on the
+        // rational arc, not on the B-Spline parabola — the residuals
+        // must differ in magnitude. This pins the dispatch: a regression
+        // that routes NURBS through `to_bspline()` would make both
+        // residuals match.
+        let control_points = vec![
+            Point2d::new(1.0, 0.0),
+            Point2d::new(1.0, 1.0),
+            Point2d::new(0.0, 1.0),
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let half_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+        let probe = Point2d::new(half_sqrt2, half_sqrt2);
+
+        let mut s_bspline = ConstraintSolver::new();
+        let pb = point_ref();
+        let spb = spline_ref();
+        s_bspline.add_entity(pb, EntityState::point(probe, false));
+        s_bspline.add_entity(
+            spb,
+            EntityState::spline_bspline(2, control_points.clone(), knots.clone(), false),
+        );
+        let bs_err = s_bspline.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[pb, spb],
+        )[0];
+
+        let mut s_nurbs = ConstraintSolver::new();
+        let pn = point_ref();
+        let spn = spline_ref();
+        s_nurbs.add_entity(pn, EntityState::point(probe, false));
+        s_nurbs.add_entity(spn, sample_nurbs_quarter_arc_state());
+        let nb_err = s_nurbs.evaluate_geometric_constraint(
+            &GeometricConstraint::PointOnCurve,
+            &[pn, spn],
+        )[0];
+
+        // NURBS arc passes through the probe → ~0; B-Spline parabola
+        // does not → ≥ 0.1. Magnitudes must differ enough that the
+        // dispatch is unambiguous.
+        assert!(
+            (bs_err.abs() - nb_err.abs()).abs() > 0.05,
+            "rational vs non-rational residual collapsed: bs={}, nb={}",
+            bs_err,
+            nb_err,
+        );
+    }
+
+    #[test]
+    fn spline_nurbs_dof_equals_two_per_control_point() {
+        // Weights are pinned in metadata — DOF count matches the
+        // B-Spline of equal control-point count. Three CPs × 2 free
+        // coords = 6 DOFs.
+        let s = ConstraintSolver::new();
+        let sp = spline_ref();
+        s.add_entity(sp, sample_nurbs_quarter_arc_state());
+        assert_eq!(s.count_degrees_of_freedom(), 6);
+    }
+
+    #[test]
+    fn spline_nurbs_fixed_flag_pins_all_control_points() {
+        // Symmetric with the B-Spline case — `fixed_control_points =
+        // true` zeroes every solver DOF; weights are already pinned
+        // unconditionally.
+        let s = ConstraintSolver::new();
+        let sp = spline_ref();
+        let control_points = vec![
+            Point2d::new(1.0, 0.0),
+            Point2d::new(1.0, 1.0),
+            Point2d::new(0.0, 1.0),
+        ];
+        let weights = vec![1.0, std::f64::consts::FRAC_1_SQRT_2, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        s.add_entity(
+            sp,
+            EntityState::spline_nurbs(2, control_points, weights, knots, true),
+        );
+        assert_eq!(s.count_degrees_of_freedom(), 0);
     }
 
     #[test]
