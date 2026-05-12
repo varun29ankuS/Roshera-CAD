@@ -58,6 +58,49 @@ pub struct SolverResult {
     pub solve_time_ms: f64,
 }
 
+/// Classification of every constraint in the solver after a numerical
+/// diagnostic pass.
+///
+/// The Jacobian rows are processed in `constraints` order; each
+/// constraint contributes one or more rows (see
+/// `constraint_error_count`). A row is **independent** if its
+/// component orthogonal to the span of previously processed rows
+/// has norm above `STRICT_TOLERANCE`; otherwise it is **dependent**.
+///
+/// - A constraint is `redundant` when none of its rows are
+///   independent **and** its post-solve residual is below the
+///   solver's tolerance. The constraint duplicates information
+///   already pinned by earlier constraints and can be safely
+///   removed without changing the solution.
+/// - A constraint is `conflicting` when none of its rows are
+///   independent **and** its post-solve residual exceeds the
+///   solver's tolerance. The constraint asks for something the
+///   earlier (numerically prior) constraints make impossible — the
+///   sketch is over-constrained at this row.
+///
+/// The classification is order-dependent: swapping the input
+/// constraint order can shift which constraint of a redundant pair
+/// is labelled redundant. The UI treats this as "this constraint
+/// is part of a redundant/conflicting set"; pinpointing the global
+/// minimum-cardinality MUS requires QuickXplain-style search
+/// (deferred).
+#[derive(Debug, Clone, Default)]
+pub struct ConstraintDiagnosis {
+    /// Constraints whose rows are linearly dependent on earlier rows
+    /// and whose residual is within tolerance — safe to remove.
+    pub redundant: Vec<ConstraintId>,
+    /// Constraints whose rows are linearly dependent on earlier rows
+    /// but whose residual exceeds tolerance — part of an
+    /// inconsistent (over-constrained) subset.
+    pub conflicts: Vec<ConstraintId>,
+    /// Numerical rank of the Jacobian. `redundant.len() +
+    /// conflicts.len() = num_rows - rank` (modulo duplicate rows
+    /// from the same constraint).
+    pub jacobian_rank: usize,
+    /// Total number of residual rows analysed.
+    pub jacobian_rows: usize,
+}
+
 /// Entity position/parameter update
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -687,6 +730,146 @@ impl ConstraintSolver {
     fn perturb_parameter(&self, entity: &EntityRef, param_index: usize, value: f64) {
         if let Some(mut state) = self.entity_state.get_mut(entity) {
             state.parameters[param_index] = value;
+        }
+    }
+
+    /// Build the per-row constraint-id map.
+    ///
+    /// Entry `i` of the returned vector is the id of the constraint
+    /// whose residual occupies row `i` of the Jacobian / error vector.
+    /// Each constraint contributes `constraint_error_count(c)`
+    /// consecutive entries. Used by [`ConstraintSolver::diagnose`] to
+    /// translate row-level rank analysis back into constraint-level
+    /// redundancy / conflict verdicts.
+    pub fn jacobian_row_owners(&self) -> Vec<ConstraintId> {
+        let mut owners = Vec::new();
+        for c in &self.constraints {
+            let n = self.constraint_error_count(c);
+            for _ in 0..n {
+                owners.push(c.id);
+            }
+        }
+        owners
+    }
+
+    /// Classify the current constraint set into independent,
+    /// redundant, and conflicting constraints.
+    ///
+    /// Procedure:
+    /// 1. Build the Jacobian `J` (numerical, central difference) and
+    ///    the row-owner map.
+    /// 2. Run row-wise modified Gram-Schmidt with a rank-revealing
+    ///    tolerance: a row whose component orthogonal to the span of
+    ///    previously-accepted rows has norm < `STRICT_TOLERANCE *
+    ///    max(||row||, 1.0)` is classified as **linearly dependent**.
+    /// 3. Group the dependence verdict by constraint: a constraint is
+    ///    "dependent" iff *every* row it owns was dependent.
+    /// 4. Split dependent constraints by post-solve residual:
+    ///    - residual ≤ `self.tolerance` → `redundant`
+    ///    - residual >  `self.tolerance` → `conflicts`
+    ///
+    /// Does **not** mutate solver parameters; calls
+    /// `compute_constraint_errors` after the Gram-Schmidt pass so the
+    /// residual classification reflects the *current* parameter
+    /// state. Callers that want the residuals to reflect a converged
+    /// solution should run `solve()` before `diagnose()`.
+    pub fn diagnose(&self) -> ConstraintDiagnosis {
+        let jacobian = self.compute_jacobian();
+        let row_owners = self.jacobian_row_owners();
+        let residuals = self.compute_constraint_errors();
+        let jacobian_rows = jacobian.len();
+        if jacobian_rows == 0 || row_owners.is_empty() {
+            return ConstraintDiagnosis {
+                redundant: Vec::new(),
+                conflicts: Vec::new(),
+                jacobian_rank: 0,
+                jacobian_rows,
+            };
+        }
+
+        // Modified Gram-Schmidt rank analysis. `basis` holds the
+        // accepted (orthonormal) row vectors; `row_independent[i]`
+        // tracks whether row `i` contributed to the basis.
+        let n_cols = jacobian[0].len();
+        let mut basis: Vec<Vec<f64>> = Vec::new();
+        let mut row_independent = vec![false; jacobian_rows];
+
+        for (i, row) in jacobian.iter().enumerate() {
+            if row.len() != n_cols {
+                // Defensive: jagged rows shouldn't happen because
+                // `compute_jacobian` allocates a uniform matrix, but
+                // we degrade gracefully rather than panic.
+                continue;
+            }
+            // Project out the span of the existing basis.
+            let mut residual = row.clone();
+            for b in &basis {
+                let dot: f64 = residual
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(r, v)| r * v)
+                    .sum();
+                for (rk, vk) in residual.iter_mut().zip(b.iter()) {
+                    *rk -= dot * vk;
+                }
+            }
+            let norm: f64 = residual.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let row_norm: f64 = row.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let scale = row_norm.max(1.0);
+            if norm > STRICT_TOLERANCE.distance() * scale {
+                // Independent — normalise and add to the basis.
+                for rk in residual.iter_mut() {
+                    *rk /= norm;
+                }
+                basis.push(residual);
+                row_independent[i] = true;
+            }
+        }
+
+        let jacobian_rank = basis.len();
+
+        // Group by owning constraint id, preserving first-seen order
+        // so the returned vectors are deterministic for any given
+        // constraint ordering.
+        let mut order: Vec<ConstraintId> = Vec::new();
+        let mut all_dependent: HashMap<ConstraintId, bool> = HashMap::new();
+        let mut residual_sq: HashMap<ConstraintId, f64> = HashMap::new();
+        for (i, &owner) in row_owners.iter().enumerate() {
+            if !all_dependent.contains_key(&owner) {
+                order.push(owner);
+                all_dependent.insert(owner, true);
+                residual_sq.insert(owner, 0.0);
+            }
+            if row_independent[i] {
+                if let Some(v) = all_dependent.get_mut(&owner) {
+                    *v = false;
+                }
+            }
+            if let Some(r) = residuals.get(i) {
+                if let Some(acc) = residual_sq.get_mut(&owner) {
+                    *acc += r * r;
+                }
+            }
+        }
+
+        let mut redundant = Vec::new();
+        let mut conflicts = Vec::new();
+        for cid in order {
+            if all_dependent.get(&cid).copied().unwrap_or(false) {
+                let mag = residual_sq.get(&cid).copied().unwrap_or(0.0).sqrt();
+                if mag <= self.tolerance {
+                    redundant.push(cid);
+                } else {
+                    conflicts.push(cid);
+                }
+            }
+        }
+
+        ConstraintDiagnosis {
+            redundant,
+            conflicts,
+            jacobian_rank,
+            jacobian_rows,
         }
     }
 
@@ -2102,6 +2285,143 @@ mod tests {
         let dist = distance(point_ref(), point_ref(), 1.0);
         assert_eq!(s.constraint_error_count(&coinc), 2);
         assert_eq!(s.constraint_error_count(&dist), 1);
+    }
+
+    // ───────────────── E.5 Diagnose: redundancy & conflicts ───────────
+
+    #[test]
+    fn jacobian_row_owners_maps_each_row_to_its_constraint() {
+        // Coincident contributes 2 rows; Distance contributes 1. The
+        // first two entries of the owner map should equal the first
+        // constraint's id; the third entry should equal the second's.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), false));
+        let c1 = coincident(a, b);
+        let c2 = distance(a, b, 1.0);
+        let id1 = c1.id;
+        let id2 = c2.id;
+        s.set_constraints(vec![c1, c2]);
+        let owners = s.jacobian_row_owners();
+        assert_eq!(owners.len(), 3);
+        assert_eq!(owners[0], id1);
+        assert_eq!(owners[1], id1);
+        assert_eq!(owners[2], id2);
+    }
+
+    #[test]
+    fn diagnose_empty_solver_returns_default() {
+        let s = ConstraintSolver::new();
+        let d = s.diagnose();
+        assert!(d.redundant.is_empty());
+        assert!(d.conflicts.is_empty());
+        assert_eq!(d.jacobian_rank, 0);
+        assert_eq!(d.jacobian_rows, 0);
+    }
+
+    #[test]
+    fn diagnose_marks_no_constraint_redundant_when_all_independent() {
+        // Free point + XCoordinate + YCoordinate: 2 rows, full rank 2,
+        // no constraint is dependent.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let cx = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        let cy = Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(4.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        s.set_constraints(vec![cx, cy]);
+        let d = s.diagnose();
+        assert!(d.redundant.is_empty(), "expected no redundant: {:?}", d);
+        assert!(d.conflicts.is_empty(), "expected no conflicts: {:?}", d);
+        assert_eq!(d.jacobian_rank, 2);
+        assert_eq!(d.jacobian_rows, 2);
+    }
+
+    #[test]
+    fn diagnose_classifies_duplicate_x_constraint_as_redundant() {
+        // Two XCoordinate(3.0) on the same point: identical Jacobian
+        // rows AND identical RHS, residual zero → redundant.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let cx_first = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        let cx_dup = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        let dup_id = cx_dup.id;
+        s.set_constraints(vec![cx_first, cx_dup]);
+        let d = s.diagnose();
+        assert_eq!(d.redundant, vec![dup_id]);
+        assert!(d.conflicts.is_empty());
+        assert_eq!(d.jacobian_rank, 1);
+        assert_eq!(d.jacobian_rows, 2);
+    }
+
+    #[test]
+    fn diagnose_classifies_contradictory_x_constraint_as_conflict() {
+        // Two XCoordinate constraints with different targets:
+        // identical Jacobian rows but inconsistent RHS. The point's
+        // current position satisfies the first but not the second
+        // (or vice-versa) → second row dependent + non-zero residual
+        // → conflict.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let cx_first = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        let cx_conflict = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(7.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        let conflict_id = cx_conflict.id;
+        s.set_constraints(vec![cx_first, cx_conflict]);
+        let d = s.diagnose();
+        assert!(d.redundant.is_empty(), "got redundant: {:?}", d.redundant);
+        assert_eq!(d.conflicts, vec![conflict_id]);
+        assert_eq!(d.jacobian_rank, 1);
+    }
+
+    #[test]
+    fn diagnose_preserves_essential_constraint_when_rank_full() {
+        // 1 free point + Distance from a fixed origin + XCoordinate:
+        // 2 rows on a 2-DOF system. Both independent at the current
+        // configuration (Distance row has both x and y partials;
+        // XCoordinate row has only x). No constraint is dependent.
+        let mut s = ConstraintSolver::new();
+        let origin = point_ref();
+        let p = point_ref();
+        s.add_entity(origin, EntityState::point(Point2d::ORIGIN, true));
+        s.add_entity(p, EntityState::point(Point2d::new(3.0, 4.0), false));
+        let cd = distance(origin, p, 5.0);
+        let cx = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![p],
+            ConstraintPriority::Required,
+        );
+        s.set_constraints(vec![cd, cx]);
+        let d = s.diagnose();
+        assert!(d.redundant.is_empty());
+        assert!(d.conflicts.is_empty());
+        assert_eq!(d.jacobian_rank, 2);
     }
 
     // ─────────────────── F. Gaussian elimination ──────────────────────
