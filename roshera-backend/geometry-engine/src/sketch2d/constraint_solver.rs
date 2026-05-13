@@ -19,6 +19,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::constraints::{ConstraintPriority, EntityRef};
+use super::polyline2d::Polyline2d;
 use super::spline2d::{BSpline2d, NurbsCurve2d};
 use super::{
     Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
@@ -173,15 +174,33 @@ pub struct SplineMetadata {
     pub weights: Option<Vec<f64>>,
 }
 
+/// Structural metadata for a polyline entity that cannot vary during
+/// Newton–Raphson.
+///
+/// The `is_closed` flag pins the polyline's topology — flipping it
+/// is a structural edit (adding or removing the wrap-around segment),
+/// not a constraint solve. Vertex coordinates themselves live inside
+/// [`EntityState::parameters`] as a flat `[v0.x, v0.y, v1.x, v1.y, …]`
+/// layout (2n entries for n vertices).
+///
+/// Reconstruct the polyline from a parameter vector + metadata pair
+/// via [`ConstraintSolver::get_polyline2d`].
+#[derive(Debug, Clone)]
+pub struct PolylineMetadata {
+    /// Whether the polyline wraps the last vertex back to the first.
+    /// Pinned across solves — a closed polyline stays closed.
+    pub is_closed: bool,
+}
+
 /// Solver state for a single sketch entity.
 ///
 /// Stores the entity's parameter vector together with a per-parameter
 /// fixed-mask used by the Newton–Raphson solver. Construct one via
 /// [`EntityState::point`], [`EntityState::line`], [`EntityState::circle`],
 /// [`EntityState::arc`], [`EntityState::rectangle`],
-/// [`EntityState::ellipse`], [`EntityState::spline_bspline`], or
-/// [`EntityState::spline_nurbs`] and register it with
-/// [`ConstraintSolver::add_entity`].
+/// [`EntityState::ellipse`], [`EntityState::spline_bspline`],
+/// [`EntityState::spline_nurbs`], or [`EntityState::polyline`] and
+/// register it with [`ConstraintSolver::add_entity`].
 #[derive(Debug, Clone)]
 pub struct EntityState {
     /// Current parameters (position, angles, etc.)
@@ -193,6 +212,14 @@ pub struct EntityState {
     /// the solver can reconstruct a [`BSpline2d`] from the parameter
     /// vector without reaching back into the sketch.
     spline: Option<SplineMetadata>,
+    /// Structural metadata when this state describes a polyline; `None`
+    /// for every other entity kind. Carried inside `EntityState` so
+    /// the solver can reconstruct a [`Polyline2d`] from the parameter
+    /// vector without reaching back into the sketch. Mutually
+    /// exclusive with [`Self::spline`] in practice (each constructor
+    /// sets at most one), but the struct does not enforce that — the
+    /// invariant is held by the constructor surface.
+    polyline: Option<PolylineMetadata>,
 }
 
 /// Decode the flat `[x0, y0, x1, y1, …]` spline-control-point pack
@@ -1455,6 +1482,42 @@ impl ConstraintSolver {
                 }
                 vec![foot_to_p.cross(&tangent) / tan_len]
             }
+            EntityRef::Polyline(_) => {
+                // Project p onto the polyline and return the signed
+                // perpendicular distance against the closest segment's
+                // tangent: `(p − foot) × seg_dir / |seg_dir|`. Sign
+                // comes from the cross-product direction so the
+                // residual is monotonic through zero, matching the
+                // spline path (an unsigned distance has a
+                // non-differentiable cusp at the solution which
+                // breaks Newton-Raphson convergence). At the
+                // vertex-bend ridge (two segments equidistant) the
+                // function is continuous but not smooth — same
+                // limitation as a polyline geometrically has.
+                let p = match point {
+                    Some(p) => p,
+                    None => return vec![0.0],
+                };
+                let polyline = match self.get_polyline2d(curve_entity) {
+                    Some(pl) => pl,
+                    None => return vec![0.0],
+                };
+                let (foot, seg_idx, _t) = polyline.closest_point(&p);
+                let segment = match polyline.segment(seg_idx) {
+                    Some(s) => s,
+                    None => return vec![Vector2d::from_points(&foot, &p).magnitude()],
+                };
+                let seg_dir = Vector2d::from_points(&segment.start, &segment.end);
+                let seg_len = seg_dir.magnitude();
+                let foot_to_p = Vector2d::from_points(&foot, &p);
+                if seg_len < STRICT_TOLERANCE.distance() {
+                    // Degenerate segment (shouldn't happen — Polyline2d
+                    // rejects coincident consecutive vertices on
+                    // construction) — fall back to unsigned distance.
+                    return vec![foot_to_p.magnitude()];
+                }
+                vec![foot_to_p.cross(&seg_dir) / seg_len]
+            }
             _ => vec![0.0],
         }
     }
@@ -1508,6 +1571,29 @@ impl ConstraintSolver {
             meta.knots.clone(),
         )
         .ok()
+    }
+
+    /// Reconstruct a [`Polyline2d`] from the entity state when
+    /// `entity` is a polyline; `None` for every other kind.
+    ///
+    /// Reads vertices as consecutive `(x, y)` pairs from
+    /// `state.parameters` and pairs them with the `is_closed` flag
+    /// carried in `state.polyline`. Any inconsistency (odd parameter
+    /// length, validation failure on `Polyline2d::new`, e.g.
+    /// coincident consecutive vertices that the solver drifted into)
+    /// returns `None`, leaving the caller to fall back to a zero
+    /// residual rather than panic.
+    fn get_polyline2d(&self, entity: &EntityRef) -> Option<Polyline2d> {
+        if !matches!(entity, EntityRef::Polyline(_)) {
+            return None;
+        }
+        let state = self.entity_state.get(entity)?;
+        let meta = state.polyline.as_ref()?;
+        let vertices = control_points_from_parameters(&state.parameters)?;
+        if vertices.len() < 2 {
+            return None;
+        }
+        Polyline2d::new(vertices, meta.is_closed).ok()
     }
 
     /// `true` iff `entity` is a spline carrying NURBS weights.
@@ -1748,6 +1834,7 @@ impl EntityState {
             parameters: vec![pos.x, pos.y],
             fixed_mask: vec![fixed, fixed],
             spline: None,
+            polyline: None,
         }
     }
 
@@ -1757,6 +1844,7 @@ impl EntityState {
             parameters: vec![point.x, point.y, direction.x, direction.y],
             fixed_mask: vec![point_fixed, point_fixed, dir_fixed, dir_fixed],
             spline: None,
+            polyline: None,
         }
     }
 
@@ -1766,6 +1854,7 @@ impl EntityState {
             parameters: vec![center.x, center.y, radius],
             fixed_mask: vec![center_fixed, center_fixed, radius_fixed],
             spline: None,
+            polyline: None,
         }
     }
 
@@ -1806,6 +1895,7 @@ impl EntityState {
                 angles_fixed,
             ],
             spline: None,
+            polyline: None,
         }
     }
 
@@ -1847,6 +1937,7 @@ impl EntityState {
                 rotation_fixed,
             ],
             spline: None,
+            polyline: None,
         }
     }
 
@@ -1897,6 +1988,7 @@ impl EntityState {
                 rotation_fixed,
             ],
             spline: None,
+            polyline: None,
         }
     }
 
@@ -1949,6 +2041,7 @@ impl EntityState {
                 knots,
                 weights: None,
             }),
+            polyline: None,
         }
     }
 
@@ -1990,6 +2083,44 @@ impl EntityState {
                 knots,
                 weights: Some(weights),
             }),
+            polyline: None,
+        }
+    }
+
+    /// Create state for a polyline (piecewise-linear curve).
+    ///
+    /// Parameter layout is `[v0.x, v0.y, v1.x, v1.y, …, vn.x, vn.y]` —
+    /// 2n entries for n vertices. The 2D solver treats each `(x, y)`
+    /// pair as two independent free parameters, so an unconstrained
+    /// polyline with n vertices contributes 2n DOFs — exactly matching
+    /// [`ParametricPolyline2d::degrees_of_freedom`].
+    ///
+    /// The `is_closed` flag is pinned across solves (see
+    /// [`PolylineMetadata`]). The kernel needs it to reconstruct a
+    /// [`Polyline2d`] when evaluating `PointOnCurve` residuals;
+    /// changing it (open ↔ closed) is a structural edit (adding or
+    /// removing the wrap-around segment) outside the constraint-solver
+    /// contract.
+    ///
+    /// `fixed_vertices` pins every vertex's x and y together.
+    /// Per-vertex pinning is a no-op for every currently-defined
+    /// constraint (PointOnCurve does not need it) so the simpler API
+    /// ships first; refine if a user surface needs per-vertex locking
+    /// later.
+    pub fn polyline(vertices: Vec<Point2d>, is_closed: bool, fixed_vertices: bool) -> Self {
+        let mut parameters = Vec::with_capacity(vertices.len() * 2);
+        let mut fixed_mask = Vec::with_capacity(vertices.len() * 2);
+        for v in &vertices {
+            parameters.push(v.x);
+            parameters.push(v.y);
+            fixed_mask.push(fixed_vertices);
+            fixed_mask.push(fixed_vertices);
+        }
+        Self {
+            parameters,
+            fixed_mask,
+            spline: None,
+            polyline: Some(PolylineMetadata { is_closed }),
         }
     }
 }
