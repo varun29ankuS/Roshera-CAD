@@ -1209,7 +1209,7 @@ pub struct FaceStore {
     pub stats: FaceStoreStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FaceStoreStats {
     pub total_created: u64,
     pub total_deleted: u64,
@@ -1229,6 +1229,27 @@ impl FaceStore {
             loop_to_faces: DashMap::new(),
             next_id: 0,
             stats: FaceStoreStats::default(),
+        }
+    }
+
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// Two DashMap indexes are rebuilt entry-by-entry; `Face` derives
+    /// `Clone`.
+    pub(crate) fn deep_copy(&self) -> Self {
+        let surface_to_faces = DashMap::with_capacity(self.surface_to_faces.len());
+        for kv in self.surface_to_faces.iter() {
+            surface_to_faces.insert(*kv.key(), kv.value().clone());
+        }
+        let loop_to_faces = DashMap::with_capacity(self.loop_to_faces.len());
+        for kv in self.loop_to_faces.iter() {
+            loop_to_faces.insert(*kv.key(), kv.value().clone());
+        }
+        Self {
+            faces: self.faces.clone(),
+            surface_to_faces,
+            loop_to_faces,
+            next_id: self.next_id,
+            stats: self.stats.clone(),
         }
     }
 

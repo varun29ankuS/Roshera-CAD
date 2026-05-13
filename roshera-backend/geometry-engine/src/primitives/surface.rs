@@ -3991,7 +3991,7 @@ pub struct SurfaceStore {
     pub stats: SurfaceStoreStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SurfaceStoreStats {
     pub total_created: u64,
     pub evaluation_count: u64,
@@ -4005,6 +4005,18 @@ impl SurfaceStore {
             surfaces: Vec::new(),
             next_id: 0,
             stats: SurfaceStoreStats::default(),
+        }
+    }
+
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// Trait-object surfaces are cloned through `Surface::clone_box`;
+    /// the resulting `Vec` owns its own heap allocations independent
+    /// of the original.
+    pub(crate) fn deep_copy(&self) -> Self {
+        Self {
+            surfaces: self.surfaces.iter().map(|s| s.clone_box()).collect(),
+            next_id: self.next_id,
+            stats: self.stats.clone(),
         }
     }
 

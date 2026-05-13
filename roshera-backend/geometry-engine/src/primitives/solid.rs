@@ -352,6 +352,37 @@ impl Solid {
         solid
     }
 
+    /// Deep copy of this solid for the F2-δ ModelSnapshot primitive.
+    ///
+    /// The derived `Clone` impl is unsafe for snapshotting: `features`
+    /// and `history` are `Arc<RwLock<…>>` and a derived clone hands
+    /// back the same underlying allocation, so a later mutation
+    /// through `add_feature` / history push would leak into the
+    /// snapshot. This method snapshots the inner contents under a
+    /// read guard and rewraps each in a fresh `Arc<RwLock<…>>`.
+    /// `collision_tree` is logically read-only after construction
+    /// (`Solid::compute_collision_tree` always replaces, never mutates
+    /// the inner), so `Arc::clone` is safe; we keep that as a
+    /// reference-bump.
+    pub(crate) fn deep_copy(&self) -> Self {
+        let features_snapshot = self.features.read().clone();
+        let history_snapshot = self.history.read().clone();
+        Self {
+            id: self.id,
+            outer_shell: self.outer_shell,
+            inner_shells: self.inner_shells.clone(),
+            name: self.name.clone(),
+            features: Arc::new(RwLock::new(features_snapshot)),
+            attributes: self.attributes.clone(),
+            anchor: self.anchor.clone(),
+            cached_mass_props: self.cached_mass_props.clone(),
+            cached_stats: self.cached_stats.clone(),
+            parent_assembly: self.parent_assembly,
+            history: Arc::new(RwLock::new(history_snapshot)),
+            collision_tree: self.collision_tree.clone(),
+        }
+    }
+
     /// Add inner shell (void)
     pub fn add_inner_shell(&mut self, shell_id: ShellId) {
         self.inner_shells.push(shell_id);
@@ -1071,7 +1102,7 @@ pub struct SolidStore {
     pub stats: SolidStoreStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SolidStoreStats {
     pub total_created: u64,
     pub boolean_operations: u64,
@@ -1091,6 +1122,20 @@ impl SolidStore {
             shell_to_solids: HashMap::new(),
             next_id: 0,
             stats: SolidStoreStats::default(),
+        }
+    }
+
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// Defers to `Solid::deep_copy` so that each solid's
+    /// `Arc<RwLock<…>>` features and history are unshared — see
+    /// the note on `Solid::deep_copy`.
+    pub(crate) fn deep_copy(&self) -> Self {
+        Self {
+            solids: self.solids.iter().map(Solid::deep_copy).collect(),
+            name_map: self.name_map.clone(),
+            shell_to_solids: self.shell_to_solids.clone(),
+            next_id: self.next_id,
+            stats: self.stats.clone(),
         }
     }
 

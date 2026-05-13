@@ -612,7 +612,7 @@ pub struct EdgeStore {
     pub stats: EdgeStoreStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EdgeStoreStats {
     pub total_created: u64,
     pub total_deleted: u64,
@@ -635,6 +635,32 @@ impl EdgeStore {
             edge_cache: DashMap::new(),
             next_id: AtomicU32::new(0),
             stats: EdgeStoreStats::default(),
+        }
+    }
+
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// Three DashMap indexes are rebuilt entry-by-entry; `Edge` derives
+    /// `Clone`, so the backing `Vec` clones cleanly.
+    pub(crate) fn deep_copy(&self) -> Self {
+        let vertex_to_edges = DashMap::with_capacity(self.vertex_to_edges.len());
+        for kv in self.vertex_to_edges.iter() {
+            vertex_to_edges.insert(*kv.key(), kv.value().clone());
+        }
+        let curve_to_edges = DashMap::with_capacity(self.curve_to_edges.len());
+        for kv in self.curve_to_edges.iter() {
+            curve_to_edges.insert(*kv.key(), kv.value().clone());
+        }
+        let edge_cache = DashMap::with_capacity(self.edge_cache.len());
+        for kv in self.edge_cache.iter() {
+            edge_cache.insert(*kv.key(), *kv.value());
+        }
+        Self {
+            edges: self.edges.clone(),
+            vertex_to_edges,
+            curve_to_edges,
+            edge_cache,
+            next_id: AtomicU32::new(self.next_id.load(Ordering::Acquire)),
+            stats: self.stats.clone(),
         }
     }
 

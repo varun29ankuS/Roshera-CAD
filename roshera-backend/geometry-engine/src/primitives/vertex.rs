@@ -244,6 +244,41 @@ impl VertexStore {
         }
     }
 
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    ///
+    /// All SoA buffers are cloned by value. The two DashMaps are
+    /// rebuilt entry-by-entry so the new store owns its concurrent
+    /// state independent of the original. `next_id` is read with
+    /// `Acquire` ordering and reseeded into a fresh atomic — the
+    /// snapshot must observe at least every id that has been handed
+    /// out at the call site, and `Acquire` pairs with the `Release`
+    /// stores used in `add_or_find`.
+    pub(crate) fn deep_copy(&self) -> Self {
+        let spatial_hash = DashMap::with_capacity(self.spatial_hash.len());
+        for kv in self.spatial_hash.iter() {
+            spatial_hash.insert(*kv.key(), kv.value().clone());
+        }
+        let attributes = DashMap::with_capacity(self.attributes.len());
+        for kv in self.attributes.iter() {
+            attributes.insert(*kv.key(), kv.value().clone());
+        }
+        Self {
+            x_coords: self.x_coords.clone(),
+            y_coords: self.y_coords.clone(),
+            z_coords: self.z_coords.clone(),
+            u_params: self.u_params.clone(),
+            v_params: self.v_params.clone(),
+            flags: self.flags.clone(),
+            tolerances: self.tolerances.clone(),
+            spatial_hash,
+            attributes,
+            next_id: AtomicU32::new(self.next_id.load(Ordering::Acquire)),
+            grid_size: self.grid_size,
+            enable_deduplication: self.enable_deduplication,
+            stats: self.stats.clone(),
+        }
+    }
+
     /// Add or find existing vertex (with deduplication) - OPTIMIZED VERSION
     ///
     /// The coincidence ball is the *union* of the caller-supplied tolerance
