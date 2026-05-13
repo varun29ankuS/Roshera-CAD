@@ -134,6 +134,57 @@ impl std::fmt::Debug for SpineRail {
     }
 }
 
+/// Sub-interval of the edge parameter range `[0, 1]` over which the
+/// spine should be solved. Defaults to [`ParamTrim::FULL`] — the
+/// entire edge. F3-δ.3 introduces it so [`solve_spine_for_chain`]
+/// can retract a spine's endpoints by the corner setbacks stored in
+/// [`crate::operations::blend_graph::BlendEdge::start_setback`] /
+/// `end_setback`.
+///
+/// Internal/transient: callers outside [`solve_spine_for_chain`]
+/// generally want [`ParamTrim::FULL`]. Stored on [`SpineOptions`]
+/// rather than threaded as a separate argument so the solver dispatch
+/// signatures stay stable across F3-α/β/γ.
+#[derive(Debug, Clone, Copy)]
+pub struct ParamTrim {
+    /// Lower bound on the trimmed parameter range.
+    pub t_start: f64,
+    /// Upper bound on the trimmed parameter range.
+    pub t_end: f64,
+}
+
+impl ParamTrim {
+    /// Untrimmed full edge — `[0, 1]`. The pre-F3-δ.3 implicit default.
+    pub const FULL: ParamTrim = ParamTrim {
+        t_start: 0.0,
+        t_end: 1.0,
+    };
+
+    /// Map a normalised sample fraction `frac ∈ [0, 1]` into the
+    /// trimmed edge parameter range. With `FULL` this is the identity.
+    #[inline]
+    pub fn map(&self, frac: f64) -> f64 {
+        self.t_start + (self.t_end - self.t_start) * frac
+    }
+
+    /// `true` iff this trim covers the whole edge — used to gate
+    /// closed-edge (full revolution) treatment in the arc-based
+    /// analytic solvers. A non-FULL trim implies a corner setback at
+    /// at least one endpoint, in which case the edge can no longer be
+    /// treated as topologically closed even if [`Edge::is_loop`]
+    /// returns true.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.t_start == 0.0 && self.t_end == 1.0
+    }
+}
+
+impl Default for ParamTrim {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
 /// Options threaded through every solver arm.
 #[derive(Debug, Clone)]
 pub struct SpineOptions {
@@ -147,10 +198,22 @@ pub struct SpineOptions {
     /// hit even if the curvature-adaptive refinement would request
     /// more.
     pub max_samples: usize,
-    /// When `true`, consult [`BlendGraph`] for per-corner setback
-    /// distances and trim the spine parameter range accordingly. F3-α
-    /// does not yet implement setback consumption — the flag is
-    /// stored and honoured starting in F3-δ.
+    /// Trimmed edge parameter sub-range. Defaults to
+    /// [`ParamTrim::FULL`]. [`solve_spine_for_chain`] computes a
+    /// retracted sub-range from the chain's
+    /// [`crate::operations::blend_graph::BlendEdge`] setbacks when
+    /// `honor_setbacks` is `true`. All inner solver sample loops
+    /// iterate over `trim.map(frac)` rather than the literal
+    /// `frac` so analytic and marching arms honour the retraction
+    /// uniformly.
+    pub edge_param_trim: ParamTrim,
+    /// When `true`, [`solve_spine_for_chain`] consults the chain's
+    /// [`crate::operations::blend_graph::BlendEdge::start_setback`]
+    /// and `end_setback` fields and trims the spine parameter range
+    /// accordingly. F3-δ.3 lands the wiring; entry points that don't
+    /// build a [`BlendGraph`] (today this is the path through
+    /// [`solve_spine_for_edge`]) leave the trim at
+    /// [`ParamTrim::FULL`] regardless of this flag.
     pub honor_setbacks: bool,
     /// When `true`, surface pairs that no analytic arm recognises
     /// route to the F3-γ marching solver instead of returning
@@ -176,6 +239,7 @@ impl Default for SpineOptions {
             max_samples: 2048,
             honor_setbacks: true,
             enable_marching: true,
+            edge_param_trim: ParamTrim::FULL,
         }
     }
 }
@@ -230,7 +294,74 @@ pub fn solve_spine_for_chain(
     if faces.len() != 2 {
         return Ok(None);
     }
-    solve_spine_for_edge(model, edge_id, faces[0], faces[1], radius, options)
+
+    // F3-δ.3: compute the setback-derived parameter trim. With
+    // `honor_setbacks` off, or with both setbacks unset/zero, this
+    // returns `ParamTrim::FULL` and the solvers iterate the entire
+    // edge — preserving pre-F3-δ.3 behaviour. With non-zero
+    // setbacks we retract the spine endpoints by converting each
+    // setback arc-length to a normalised edge parameter via the
+    // edge's total length.
+    let trim = if options.honor_setbacks {
+        let edge_ref = model.edges.get(edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("Edge {} not found", edge_id))
+        })?;
+        compute_setback_trim(edge_ref, blend_edge, &model.curves, options.tolerance)?
+    } else {
+        ParamTrim::FULL
+    };
+
+    let mut effective_options = options.clone();
+    effective_options.edge_param_trim = trim;
+    solve_spine_for_edge(model, edge_id, faces[0], faces[1], radius, &effective_options)
+}
+
+/// Convert a chain edge's [`BlendEdge`] setbacks (arc-length
+/// distances stamped at the start and end vertices by the F2-γ
+/// setback solver) into a [`ParamTrim`] on the edge's normalised
+/// parameter range `[0, 1]`.
+///
+/// Assumes the edge curve is arc-length-proportional in its native
+/// parameterisation — exact for [`Line`] and [`Arc`] (the only
+/// curves that back today's analytic-arm-eligible edges), and a
+/// close approximation for [`NurbsCurve`] when the curve is fitted
+/// to uniform sampling. F4 will refine to inverse arc-length lookup
+/// when variable-radius blends require sub-parameter precision.
+///
+/// Returns `Err` if the setback sum reaches or exceeds the edge
+/// length — in that case the corner geometry cannot accommodate a
+/// constant-radius blend at the requested setback and the caller
+/// must either fall back to a smaller radius or to a variable-
+/// radius schedule that vanishes at the corner.
+fn compute_setback_trim(
+    edge: &Edge,
+    blend_edge: &crate::operations::blend_graph::BlendEdge,
+    curves: &crate::primitives::curve::CurveStore,
+    tolerance: Tolerance,
+) -> OperationResult<ParamTrim> {
+    let start_setback = blend_edge.start_setback.unwrap_or(0.0).max(0.0);
+    let end_setback = blend_edge.end_setback.unwrap_or(0.0).max(0.0);
+    if start_setback <= 0.0 && end_setback <= 0.0 {
+        return Ok(ParamTrim::FULL);
+    }
+    let length = edge.compute_arc_length(curves, tolerance).map_err(|e| {
+        OperationError::NumericalError(format!("Edge length compute failed: {:?}", e))
+    })?;
+    if !(length > 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "Edge has non-positive arc length; cannot apply setback".into(),
+        ));
+    }
+    if start_setback + end_setback >= length {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Setbacks ({} + {}) consume entire edge length {}",
+            start_setback, end_setback, length
+        )));
+    }
+    Ok(ParamTrim {
+        t_start: start_setback / length,
+        t_end: 1.0 - end_setback / length,
+    })
 }
 
 /// Resolve a spine for one blend edge given its two supporting
@@ -575,7 +706,12 @@ fn solve_plane_plane(
     let mut prev_center: Option<Point3> = None;
     let mut cumulative_arc = 0.0;
     for i in 0..n_samples {
-        let t = i as f64 / (n_samples as f64 - 1.0);
+        // F3-δ.3: trim-aware parameterisation. `frac` walks `[0, 1]`
+        // uniformly; `t` is the corresponding edge parameter under
+        // the active [`ParamTrim`]. With `ParamTrim::FULL` this
+        // collapses to the legacy uniform-t sampling.
+        let frac = i as f64 / (n_samples as f64 - 1.0);
+        let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
         let center = edge_point + bisector * (offset_sign * offset_distance);
         let contact_a = center + normal_a * (contact_sign * radius);
@@ -852,7 +988,9 @@ fn solve_plane_cyl_perpendicular(
 
     let mut edge_angles: Vec<f64> = Vec::with_capacity(n_samples);
     for i in 0..n_samples {
-        let t = i as f64 / (n_samples as f64 - 1.0);
+        // F3-δ.3: trim-aware parameterisation; see solve_plane_plane.
+        let frac = i as f64 / (n_samples as f64 - 1.0);
+        let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
         let p_off = edge_point - cylinder.origin;
         let axial_t = p_off.dot(&cylinder.axis);
@@ -900,8 +1038,14 @@ fn solve_plane_cyl_perpendicular(
     // Closed edges (full rim of cylinder) sweep ±2π — the direction
     // is taken from the angle delta accumulated over samples so
     // that the arc parameterisation tracks the edge curve.
+    //
+    // F3-δ.3: a non-FULL [`ParamTrim`] means a corner setback at one
+    // (or both) endpoints — the edge can no longer be treated as
+    // topologically closed even if [`Edge::is_loop`] is true, since
+    // the spine is intentionally retracted from at least one end.
+    let closed_for_arc = edge.is_loop() && options.edge_param_trim.is_full();
     let (start_angle, sweep_angle) =
-        resolve_arc_parameters(&edge_angles, edge.is_loop());
+        resolve_arc_parameters(&edge_angles, closed_for_arc);
 
     // Spine arc: centred on the cylinder axis at z_spine, normal
     // aligned with cylinder.axis, radius r_spine. We pass cyl.axis
@@ -1038,7 +1182,9 @@ fn solve_plane_cyl_parallel_tangent(
     // perfect line numerically and downstream consumers expect a
     // uniform sample array.
     for i in 0..n_samples {
-        let t = i as f64 / (n_samples as f64 - 1.0);
+        // F3-δ.3: trim-aware parameterisation; see solve_plane_plane.
+        let frac = i as f64 / (n_samples as f64 - 1.0);
+        let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
         let p_off = edge_point - cylinder.origin;
         let axial_t = p_off.dot(&cylinder.axis);
@@ -1228,7 +1374,9 @@ fn solve_plane_sphere(
     let mut edge_angles: Vec<f64> = Vec::with_capacity(n_samples);
 
     for i in 0..n_samples {
-        let t = i as f64 / (n_samples as f64 - 1.0);
+        // F3-δ.3: trim-aware parameterisation; see solve_plane_plane.
+        let frac = i as f64 / (n_samples as f64 - 1.0);
+        let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
 
         // Project edge point onto offset plane and measure its
@@ -1274,8 +1422,11 @@ fn solve_plane_sphere(
         });
     }
 
+    // F3-δ.3: setback-retracted edges are no longer "closed" for
+    // arc-parameter reconstruction; see solve_plane_cyl_perpendicular.
+    let closed_for_arc = edge.is_loop() && options.edge_param_trim.is_full();
     let (start_angle, sweep_angle) =
-        resolve_arc_parameters(&edge_angles, edge.is_loop());
+        resolve_arc_parameters(&edge_angles, closed_for_arc);
 
     let spine_arc = Arc::new(
         spine_centre,
@@ -1637,7 +1788,9 @@ fn solve_marching(
     let mut worst_iters: usize = 0;
 
     for i in 0..n_samples {
-        let t = i as f64 / (n_samples as f64 - 1.0);
+        // F3-δ.3: trim-aware parameterisation; see solve_plane_plane.
+        let frac = i as f64 / (n_samples as f64 - 1.0);
+        let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
 
         // Bisector seed at this edge parameter — same heuristic as
@@ -2442,6 +2595,193 @@ mod tests {
             result.is_none(),
             "multi-edge chain should return None in F3-α"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // F3-δ.3: setback wiring tests
+    // ---------------------------------------------------------------
+
+    /// Construct a single-edge BlendGraph entry with the given
+    /// setbacks. The radius is constant; chain id is irrelevant for
+    /// the trim math.
+    fn single_edge_graph(
+        edge_id: EdgeId,
+        radius: f64,
+        start_setback: Option<f64>,
+        end_setback: Option<f64>,
+    ) -> BlendGraph {
+        let mut graph = BlendGraph::default();
+        graph.edges.insert(
+            edge_id,
+            BlendEdge {
+                id: edge_id,
+                radius: BlendRadius::Constant(radius),
+                chain_id: 0,
+                dihedral_angle: None,
+                convexity: 1,
+                manifold_kind: ManifoldKind::Manifold,
+                start_setback,
+                end_setback,
+            },
+        );
+        graph
+    }
+
+    #[test]
+    fn param_trim_full_is_identity_under_map() {
+        let t = ParamTrim::FULL;
+        assert!(t.is_full());
+        assert_eq!(t.map(0.0), 0.0);
+        assert_eq!(t.map(0.5), 0.5);
+        assert_eq!(t.map(1.0), 1.0);
+    }
+
+    #[test]
+    fn param_trim_non_full_maps_linearly() {
+        let t = ParamTrim {
+            t_start: 0.1,
+            t_end: 0.9,
+        };
+        assert!(!t.is_full());
+        assert!((t.map(0.0) - 0.1).abs() < 1e-15);
+        assert!((t.map(0.5) - 0.5).abs() < 1e-15);
+        assert!((t.map(1.0) - 0.9).abs() < 1e-15);
+    }
+
+    #[test]
+    fn solve_spine_for_chain_setbacks_retract_endpoints() {
+        // Box edge of length 2.0 along Z. Setbacks of 0.4 at each
+        // end retract the spine to the parameter window [0.2, 0.8].
+        // The spine endpoints must land at z = 0.4 and z = 1.6
+        // (assuming the edge runs from z=0 to z=2 — make_box's
+        // vertical edges are length = height = 2.0).
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, _, _) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+
+        let edge = model.edges.get(edge_id).expect("edge").clone();
+        let length = edge
+            .compute_arc_length(&model.curves, Tolerance::default())
+            .expect("length");
+        let setback = length * 0.2; // 20% retraction at each end.
+
+        let graph = single_edge_graph(edge_id, 0.25, Some(setback), Some(setback));
+        let opts = SpineOptions::default();
+        let rail = solve_spine_for_chain(&model, &[edge_id], &graph, &opts)
+            .expect("solve")
+            .expect("analytic");
+
+        // First and last sample edge_parameters must match the trim
+        // window, not [0, 1].
+        let first = rail.samples.first().expect("samples non-empty");
+        let last = rail.samples.last().expect("samples non-empty");
+        assert!(
+            (first.edge_parameter - 0.2).abs() < 1e-9,
+            "first sample edge_parameter = {} (expected 0.2)",
+            first.edge_parameter
+        );
+        assert!(
+            (last.edge_parameter - 0.8).abs() < 1e-9,
+            "last sample edge_parameter = {} (expected 0.8)",
+            last.edge_parameter
+        );
+
+        // Spine arc length must shrink proportionally — for a
+        // straight box edge the spine is also a straight line, so
+        // the trimmed spine length is 0.6 × (original spine length).
+        let spine_len = last.arc_length;
+        // The spine parallels the edge for plane/plane; trimmed
+        // spine length = (t_end - t_start) × edge length = 0.6 × L.
+        let expected_spine_len = 0.6 * length;
+        assert!(
+            (spine_len - expected_spine_len).abs() < 1e-6,
+            "trimmed spine arc length = {} (expected {})",
+            spine_len,
+            expected_spine_len
+        );
+    }
+
+    #[test]
+    fn solve_spine_for_chain_no_setback_matches_full_edge() {
+        // Sanity: setbacks=(None, None) → ParamTrim::FULL → first
+        // sample at t=0, last sample at t=1, same as the legacy
+        // path. This locks in the pre-F3-δ.3 default behaviour for
+        // any chain whose BlendGraph hasn't run F2-γ setback
+        // computation.
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, _, _) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+
+        let graph = single_edge_graph(edge_id, 0.25, None, None);
+        let opts = SpineOptions::default();
+        let rail = solve_spine_for_chain(&model, &[edge_id], &graph, &opts)
+            .expect("solve")
+            .expect("analytic");
+
+        let first = rail.samples.first().expect("samples").edge_parameter;
+        let last = rail.samples.last().expect("samples").edge_parameter;
+        assert!(first.abs() < 1e-12, "first edge_parameter = {}", first);
+        assert!(
+            (last - 1.0).abs() < 1e-12,
+            "last edge_parameter = {}",
+            last
+        );
+    }
+
+    #[test]
+    fn solve_spine_for_chain_setback_disabled_ignores_blend_edge() {
+        // honor_setbacks=false → setbacks on the BlendEdge are
+        // ignored; spine spans the full edge. This is the escape
+        // hatch for callers that want raw geometry without the
+        // F2-γ retraction (preview paths, debug rails).
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, _, _) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+
+        let edge = model.edges.get(edge_id).expect("edge").clone();
+        let length = edge
+            .compute_arc_length(&model.curves, Tolerance::default())
+            .expect("length");
+
+        let graph = single_edge_graph(edge_id, 0.25, Some(0.3 * length), Some(0.3 * length));
+        let opts = SpineOptions {
+            honor_setbacks: false,
+            ..SpineOptions::default()
+        };
+        let rail = solve_spine_for_chain(&model, &[edge_id], &graph, &opts)
+            .expect("solve")
+            .expect("analytic");
+
+        let first = rail.samples.first().expect("samples").edge_parameter;
+        let last = rail.samples.last().expect("samples").edge_parameter;
+        assert!(first.abs() < 1e-12);
+        assert!((last - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn solve_spine_for_chain_setbacks_consuming_edge_errors() {
+        // Setbacks whose sum reaches the edge length leave no spine
+        // to compute — the corner geometry can't host a blend at
+        // the requested setback. compute_setback_trim must return
+        // InvalidGeometry rather than silently producing a
+        // zero-length or inverted trim.
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, _, _) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+
+        let edge = model.edges.get(edge_id).expect("edge").clone();
+        let length = edge
+            .compute_arc_length(&model.curves, Tolerance::default())
+            .expect("length");
+
+        let graph = single_edge_graph(edge_id, 0.25, Some(0.6 * length), Some(0.5 * length));
+        let opts = SpineOptions::default();
+        let result = solve_spine_for_chain(&model, &[edge_id], &graph, &opts);
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
     }
 
     #[test]
