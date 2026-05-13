@@ -1699,19 +1699,35 @@ fn intersect_plane_plane(
 /// General surface-surface intersection — delegates to the canonical math
 /// layer ([`crate::math::surface_intersection::intersect_surfaces`]) and
 /// wraps each traced polyline as a `Box<dyn Curve>` for the `IntersectionResult`.
+///
+/// The working tolerance handed to the math layer is the per-face
+/// tolerance propagation: each face contributes its own surface-fit
+/// slack, and the operation's nominal `tolerance` acts as a snapping
+/// floor. This is the F1-α / F1-δ contract — without this, an edge
+/// produced between two loose faces would be measured against a
+/// tight tolerance and the corrector would chase noise that isn't
+/// actually present at the face level.
 fn intersect_general_surfaces(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
-    _face1: &Face,
-    _face2: &Face,
+    face1: &Face,
+    face2: &Face,
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     use crate::math::surface_intersection::{
         intersect_surfaces as math_intersect, intersection_curve_to_nurbs,
     };
     use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
+    use crate::primitives::tolerance_propagation::intersection_tolerance;
 
-    let raw = math_intersect(surface1, surface2, &tolerance).map_err(|e| {
+    let working_distance = intersection_tolerance(
+        face1.tolerance,
+        face2.tolerance,
+        tolerance.distance(),
+    );
+    let working_tolerance = Tolerance::new(working_distance, tolerance.angle());
+
+    let raw = math_intersect(surface1, surface2, &working_tolerance).map_err(|e| {
         OperationError::NumericalError(format!("surface-surface intersection failed: {:?}", e))
     })?;
 
