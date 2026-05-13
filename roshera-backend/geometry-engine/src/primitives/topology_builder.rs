@@ -270,6 +270,14 @@ pub struct BRepModel {
     /// (api-server, AI batch driver, …). Not serialized; recorder identity
     /// is an orchestration concern, not a model invariant.
     pub recorder: Option<std::sync::Arc<dyn crate::operations::recorder::OperationRecorder>>,
+    /// Working tolerance for this model.
+    ///
+    /// Used as the default when seeding entity stores, and as the floor
+    /// for any operation that doesn't override via `CommonOptions`. Per-
+    /// entity tolerances (`Vertex.tolerance`, `Edge.tolerance`) are
+    /// always honoured via the `max(stored, caller)` rule — this is the
+    /// caller tolerance when no explicit op tolerance is supplied.
+    pub tolerance: Tolerance,
 }
 
 impl BRepModel {
@@ -280,6 +288,19 @@ impl BRepModel {
 
     /// Create B-Rep model with capacity estimation based on expected complexity
     pub fn with_estimated_capacity(complexity: EstimatedComplexity) -> Self {
+        Self::with_estimated_capacity_and_tolerance(complexity, Tolerance::default())
+    }
+
+    /// Create B-Rep model with explicit working tolerance.
+    ///
+    /// Use this when the application has a non-default tolerance regime
+    /// (e.g. boolean ops at 1e-8, manufacturing at 1e-4). The vertex
+    /// store is seeded with the supplied tolerance — its grid-hash and
+    /// dedup defaults derive from this value.
+    pub fn with_estimated_capacity_and_tolerance(
+        complexity: EstimatedComplexity,
+        tolerance: Tolerance,
+    ) -> Self {
         let (vertex_capacity, edge_capacity, face_capacity, shell_capacity, solid_capacity) =
             complexity.estimate_topology_requirements();
 
@@ -290,7 +311,10 @@ impl BRepModel {
         datums.seed_defaults();
 
         Self {
-            vertices: VertexStore::with_capacity_and_tolerance(vertex_capacity, 1e-12),
+            vertices: VertexStore::with_capacity_and_tolerance(
+                vertex_capacity,
+                tolerance.distance(),
+            ),
             curves: CurveStore::new(),
             edges: EdgeStore::with_capacity(edge_capacity),
             loops: LoopStore::with_capacity(face_capacity), // Loops ≈ faces for typical models
@@ -303,7 +327,26 @@ impl BRepModel {
             datum_graph: crate::primitives::datum::DatumGraph::new(),
             location_cache: crate::primitives::datum::LocationDescriptorCache::new(),
             recorder: None,
+            tolerance,
         }
+    }
+
+    /// Current working tolerance.
+    #[inline]
+    pub fn tolerance(&self) -> Tolerance {
+        self.tolerance
+    }
+
+    /// Override the model's working tolerance.
+    ///
+    /// This does *not* rebuild the per-entity stores, so the grid-hash
+    /// and dedup-enabled flags on the existing `VertexStore` stay at
+    /// whatever they were seeded with. Callers that need a different
+    /// store configuration should create the model with
+    /// `with_estimated_capacity_and_tolerance`.
+    #[inline]
+    pub fn set_tolerance(&mut self, tolerance: Tolerance) {
+        self.tolerance = tolerance;
     }
 
     /// Attach a recorder that will receive one event per successful
@@ -3839,6 +3882,30 @@ mod cascade_tests {
         for vid in v {
             assert!(model.vertices.get(vid).is_some());
         }
+    }
+
+    // ---- F1-β: model working tolerance ------------------------------------
+
+    #[test]
+    fn brep_model_default_tolerance_is_normal() {
+        let model = BRepModel::new();
+        assert!((model.tolerance().distance() - 1e-6).abs() < 1e-18);
+    }
+
+    #[test]
+    fn brep_model_with_explicit_tolerance_seeds_vertex_store() {
+        let model = BRepModel::with_estimated_capacity_and_tolerance(
+            EstimatedComplexity::Medium,
+            crate::math::tolerance::BOOLEAN_TOLERANCE,
+        );
+        assert!((model.tolerance().distance() - 1e-8).abs() < 1e-20);
+    }
+
+    #[test]
+    fn brep_model_set_tolerance_overrides_field() {
+        let mut model = BRepModel::new();
+        model.set_tolerance(crate::math::tolerance::MANUFACTURING_TOLERANCE);
+        assert!((model.tolerance().distance() - 1e-4).abs() < 1e-18);
     }
 }
 
