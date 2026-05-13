@@ -906,7 +906,9 @@ impl VolumeIntegrals {
     /// center-of-mass frame via the parallel-axis theorem (Goldstein,
     /// *Classical Mechanics*, §5.3):
     ///
-    ///     I_C = I_O − m · [(c·c) I₃ − c ⊗ c]
+    /// ```text
+    /// I_C = I_O − m · [(c·c) I₃ − c ⊗ c]
+    /// ```
     ///
     /// where `I_O` is `self.second_moments` (computed about the origin
     /// during volume-integral accumulation), `c` is the center of mass,

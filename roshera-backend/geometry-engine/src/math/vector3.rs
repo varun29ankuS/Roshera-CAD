@@ -8,11 +8,12 @@
 //!
 //! # Examples
 //! ```
-//! use geometry-engine::math::{Vector3, Point3};
+//! use geometry_engine::math::{Vector3, Point3};
 //!
 //! let v1 = Vector3::new(1.0, 0.0, 0.0);
 //! let v2 = Vector3::new(0.0, 1.0, 0.0);
 //! let cross = v1.cross(&v2); // [0, 0, 1]
+//! let _ = (cross, Point3::new(0.0, 0.0, 0.0));
 //! ```
 
 use super::{consts, ApproxEq, Interpolate, MathError, MathResult, Matrix4, Tolerance, Transform};

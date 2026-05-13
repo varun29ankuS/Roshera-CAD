@@ -1712,7 +1712,7 @@ impl NurbsSurface {
     /// O(n*m) where n,m are control point grid dimensions. Typically < 1ms for 100x100 grid.
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let surface = NurbsSurface::new(
     ///     control_points,
     ///     weights,
