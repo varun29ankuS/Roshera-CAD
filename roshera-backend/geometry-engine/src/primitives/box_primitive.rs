@@ -9,6 +9,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::operations::orientation::orient_face_for_outward;
 use crate::primitives::{
     curve::Line,
     edge::{Edge, EdgeOrientation},
@@ -430,8 +431,11 @@ impl Primitive for BoxPrimitive {
             vertices.push(vertex_id);
         }
 
-        // Create surfaces
+        // Create surfaces and remember each face's geometric outward
+        // normal (post-transform) so we can pass it to
+        // `orient_face_for_outward` when stamping the Face below.
         let mut surfaces = Vec::with_capacity(6);
+        let mut outward_normals = Vec::with_capacity(6);
         for &((cx, cy, cz), (nx, ny, nz)) in &BoxTopology::FACE_DATA {
             let mut center = Point3::new(cx * hw, cy * hh, cz * hd);
             let mut normal = Vector3::new(nx, ny, nz);
@@ -456,6 +460,7 @@ impl Primitive for BoxPrimitive {
                 }
             })?;
             surfaces.push(model.surfaces.add(Box::new(plane)));
+            outward_normals.push(normal);
         }
 
         // Create edges
@@ -507,13 +512,29 @@ impl Primitive for BoxPrimitive {
             }
             let loop_id = model.loops.add(face_loop);
 
-            // Create face
-            let face = crate::primitives::face::Face::new(
-                0,
-                surfaces[face_idx],
-                loop_id,
-                crate::primitives::face::FaceOrientation::Forward,
-            );
+            // Stamp the FaceOrientation so the face's oriented outward
+            // normal (`surface.normal_at × orientation.sign()`) aligns
+            // with the explicit ±axis target stored in `outward_normals`.
+            // For a freshly-constructed `Plane::from_point_normal(center,
+            // normal)` the intrinsic normal already matches `normal`, so
+            // this resolves to `Forward` — but the helper is invoked so
+            // the invariant survives future refactors of `Plane`'s
+            // parameterisation. Slice 3 of the comprehensive
+            // face-orientation fix.
+            let plane_ref = model.surfaces.get(surfaces[face_idx]).ok_or_else(|| {
+                PrimitiveError::TopologyError {
+                    message: "Box face plane surface missing from store".to_string(),
+                    euler_characteristic: None,
+                }
+            })?;
+            let orientation =
+                orient_face_for_outward(plane_ref, outward_normals[face_idx]).map_err(|e| {
+                    PrimitiveError::TopologyError {
+                        message: format!("Failed to orient box face: {e:?}"),
+                        euler_characteristic: None,
+                    }
+                })?;
+            let face = crate::primitives::face::Face::new(0, surfaces[face_idx], loop_id, orientation);
             faces.push(model.faces.add(face));
         }
 

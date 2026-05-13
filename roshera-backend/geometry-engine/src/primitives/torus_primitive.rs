@@ -9,6 +9,7 @@
 
 use crate::{
     math::{consts, Point3, Vector3},
+    operations::orientation::orient_face_for_outward,
     primitives::{
         curve::{Arc, Circle, ParameterRange},
         edge::{Edge, EdgeOrientation},
@@ -17,10 +18,58 @@ use crate::{
         r#loop::{Loop, LoopType},
         shell::{Shell, ShellType},
         solid::{Solid, SolidId},
-        surface::Torus,
+        surface::{SurfaceId, Torus},
         topology_builder::BRepModel,
     },
 };
+
+/// Pick the `FaceOrientation` for the torus surface so its oriented
+/// outward normal points radially outward from the tube axis at the
+/// parametric midpoint. For a closed torus this is the radial-outward
+/// direction in the minor-circle plane (mid-point minus the major
+/// circle's mid-point). Slice 3 of the comprehensive face-orientation
+/// fix.
+fn orient_torus_outward(
+    model: &BRepModel,
+    torus_surface_id: SurfaceId,
+    center: Point3,
+    axis: Vector3,
+    major_radius: f64,
+) -> Result<FaceOrientation, PrimitiveError> {
+    let surface = model.surfaces.get(torus_surface_id).ok_or_else(|| {
+        PrimitiveError::GeometryError {
+            operation: "Torus surface lookup".to_string(),
+            details: "torus surface missing from store".to_string(),
+        }
+    })?;
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let u_mid = 0.5 * (u_min + u_max);
+    let v_mid = 0.5 * (v_min + v_max);
+    let mid_point =
+        surface
+            .point_at(u_mid, v_mid)
+            .map_err(|e| PrimitiveError::GeometryError {
+                operation: "Torus mid-point evaluation".to_string(),
+                details: format!("{e:?}"),
+            })?;
+    // Compute the corresponding point on the major circle (centre of
+    // the tube at angle u_mid). The outward target is from that point
+    // to the surface mid-point.
+    let from_center = mid_point - center;
+    let axial_component = from_center.dot(&axis);
+    let radial_in_plane = from_center - axis * axial_component;
+    let major_dir = radial_in_plane
+        .normalize()
+        .unwrap_or_else(|_| axis.perpendicular());
+    let major_circle_point = center + major_dir * major_radius;
+    let radial_target = mid_point - major_circle_point;
+    orient_face_for_outward(surface, radial_target).map_err(|e| {
+        PrimitiveError::GeometryError {
+            operation: "Torus face orientation".to_string(),
+            details: format!("{e:?}"),
+        }
+    })
+}
 use serde::{Deserialize, Serialize};
 
 type PrimitiveResult<T> = Result<T, PrimitiveError>;
@@ -227,7 +276,14 @@ impl TorusPrimitive {
             outer_loop.add_edge(edge2_id, true);
             let outer_loop_id = model.loops.add(outer_loop);
 
-            let face = Face::new(0, torus_surface_id, outer_loop_id, FaceOrientation::Forward);
+            let torus_orientation = orient_torus_outward(
+                model,
+                torus_surface_id,
+                params.center,
+                params.axis,
+                params.major_radius,
+            )?;
+            let face = Face::new(0, torus_surface_id, outer_loop_id, torus_orientation);
             model.faces.add(face)
         } else {
             // Partial torus - create boundary edges
@@ -318,12 +374,14 @@ impl TorusPrimitive {
                 boundary_loop.add_edge(*edge_id, orientations[i]);
             }
             let boundary_loop_id = model.loops.add(boundary_loop);
-            let face = Face::new(
-                0,
+            let torus_orientation = orient_torus_outward(
+                model,
                 torus_surface_id,
-                boundary_loop_id,
-                FaceOrientation::Forward,
-            );
+                params.center,
+                params.axis,
+                params.major_radius,
+            )?;
+            let face = Face::new(0, torus_surface_id, boundary_loop_id, torus_orientation);
             model.faces.add(face)
         };
 

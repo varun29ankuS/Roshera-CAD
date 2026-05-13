@@ -10,10 +10,10 @@
 #![allow(clippy::indexing_slicing)]
 
 use crate::math::{Matrix4, Point3, Tolerance, Vector3};
+use crate::operations::orientation::orient_face_for_outward;
 use crate::primitives::{
     curve::{Circle, Line, ParameterRange},
     edge::{Edge, EdgeOrientation},
-    face::FaceOrientation,
     primitive_traits::{
         EntityRef, IssueSeverity, ManifoldStatus, ParameterDefinition, ParameterSchema,
         ParameterType, Primitive, PrimitiveError, ValidationIssue, ValidationMetrics,
@@ -262,29 +262,75 @@ impl Primitive for CylinderPrimitive {
         let lateral_loop_id = model.loops.add(lateral_loop);
 
         // ---- faces. ----
+        // Stamp each FaceOrientation so the face's oriented outward
+        // normal (`surface.normal_at × orientation.sign()`) matches the
+        // explicit geometric outward target. For the freshly-constructed
+        // surfaces above this resolves to `Forward`, but the helper is
+        // invoked so the invariant survives any future change to the
+        // surface parameterisation. Slice 3 of the comprehensive
+        // face-orientation fix.
+        let bottom_surface_ref = model.surfaces.get(bottom_surface_id).ok_or_else(|| {
+            topology_err("bottom_surface_lookup", "missing in store".to_string())
+        })?;
+        let bottom_orientation =
+            orient_face_for_outward(bottom_surface_ref, -z_axis).map_err(|e| {
+                topology_err("bottom_face_orientation", format!("{e:?}"))
+            })?;
         let mut bottom_face = crate::primitives::face::Face::new(
             0,
             bottom_surface_id,
             bottom_loop_id,
-            FaceOrientation::Forward,
+            bottom_orientation,
         );
         bottom_face.outer_loop = bottom_loop_id;
         let bottom_face_id = model.faces.add(bottom_face);
 
+        let top_surface_ref = model.surfaces.get(top_surface_id).ok_or_else(|| {
+            topology_err("top_surface_lookup", "missing in store".to_string())
+        })?;
+        let top_orientation =
+            orient_face_for_outward(top_surface_ref, z_axis).map_err(|e| {
+                topology_err("top_face_orientation", format!("{e:?}"))
+            })?;
         let mut top_face = crate::primitives::face::Face::new(
             0,
             top_surface_id,
             top_loop_id,
-            FaceOrientation::Forward,
+            top_orientation,
         );
         top_face.outer_loop = top_loop_id;
         let top_face_id = model.faces.add(top_face);
 
+        // Lateral cylinder: outward = radial from axis to surface point
+        // at the parametric midpoint. We sample the surface point at
+        // mid-(u, v) and project onto the radial plane through the
+        // mid-height axis foot, giving a target that is independent of
+        // the cylinder surface's intrinsic normal sign convention.
+        let lateral_surface_ref = model.surfaces.get(lateral_surface_id).ok_or_else(|| {
+            topology_err("lateral_surface_lookup", "missing in store".to_string())
+        })?;
+        let ((u_min, u_max), (v_min, v_max)) = lateral_surface_ref.parameter_bounds();
+        let u_mid = 0.5 * (u_min + u_max);
+        let v_mid = 0.5 * (v_min + v_max);
+        let mid_point = lateral_surface_ref
+            .point_at(u_mid, v_mid)
+            .map_err(|e| topology_err("lateral_mid_point", format!("{e:?}")))?;
+        let from_base = Vector3::new(
+            mid_point.x - params.base_center.x,
+            mid_point.y - params.base_center.y,
+            mid_point.z - params.base_center.z,
+        );
+        let axial_component = from_base.dot(&z_axis);
+        let radial_target = from_base - z_axis * axial_component;
+        let lateral_orientation =
+            orient_face_for_outward(lateral_surface_ref, radial_target).map_err(|e| {
+                topology_err("lateral_face_orientation", format!("{e:?}"))
+            })?;
         let mut lateral_face = crate::primitives::face::Face::new(
             0,
             lateral_surface_id,
             lateral_loop_id,
-            FaceOrientation::Forward,
+            lateral_orientation,
         );
         lateral_face.outer_loop = lateral_loop_id;
         let lateral_face_id = model.faces.add(lateral_face);
