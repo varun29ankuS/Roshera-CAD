@@ -13,7 +13,7 @@
 #![allow(clippy::indexing_slicing)]
 //!
 //! # Example
-//! ```
+//! ```ignore
 //! let mut assembly = Assembly::new("Engine Assembly");
 //! let piston = assembly.add_part(piston_model, "Piston");
 //! let cylinder = assembly.add_part(cylinder_model, "Cylinder");

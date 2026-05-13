@@ -191,7 +191,11 @@ fn make_box(model: &mut BRepModel, w: f64, h: f64, d: f64) -> SolidId {
 /// axis (within `1e-7`). For an extrusion along Z that's exactly
 /// the set of vertical side-face edges.
 fn edges_along_axis(model: &BRepModel, axis: Vector3) -> Vec<EdgeId> {
-    let mut result = Vec::new();
+    // DashMap iteration order is non-deterministic across runs and across
+    // independently-built models. To make tests that index into the
+    // returned vector (e.g. `[0]`) reproducible, collect into a stable
+    // ordering keyed on the physical midpoint of each edge.
+    let mut result: Vec<(EdgeId, [f64; 3])> = Vec::new();
     let axis_n = axis.normalize().expect("axis must be non-zero");
     for (id, edge) in model.edges.iter() {
         let s = match model.vertices.get(edge.start_vertex) {
@@ -209,10 +213,30 @@ fn edges_along_axis(model: &BRepModel, axis: Vector3) -> Vec<EdgeId> {
         }
         let dn = d / len;
         if (dn.dot(&axis_n).abs() - 1.0).abs() < 1e-7 {
-            result.push(id);
+            let mid = [
+                0.5 * (s[0] + e[0]),
+                0.5 * (s[1] + e[1]),
+                0.5 * (s[2] + e[2]),
+            ];
+            result.push((id, mid));
         }
     }
-    result
+    result.sort_by(|a, b| {
+        a.1[0]
+            .partial_cmp(&b.1[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.1[1]
+                    .partial_cmp(&b.1[1])
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                a.1[2]
+                    .partial_cmp(&b.1[2])
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    result.into_iter().map(|(id, _)| id).collect()
 }
 
 /// True iff the solid's outer shell passes topology validation:
