@@ -240,18 +240,40 @@ pub struct SketchSolveReport {
 }
 
 impl SketchSolveReport {
-    /// Convenience: did the solver converge to within tolerance?
+    /// Convenience: did the solver find a configuration that
+    /// satisfies every constraint to within tolerance?
+    ///
+    /// True for `SolverStatus::Converged`. Also true for
+    /// `SolverStatus::UnderConstrained` when `violations.is_empty()`:
+    /// the constraint solver runs Tikhonov-regularised Newton even
+    /// on under-constrained systems (see
+    /// [`ConstraintSolver::solve`] doc), so a degenerate Jacobian
+    /// still yields a minimum-norm step that can drive every
+    /// residual under `self.tolerance` — at which point
+    /// `get_violations` returns the empty list. This is the
+    /// "Solved" state in Onshape / SolidWorks / Fusion parlance
+    /// (distinct from "Fully Defined", which additionally requires
+    /// zero remaining DOFs — see [`Self::is_fully_constrained`]).
     pub fn converged(&self) -> bool {
-        matches!(self.status, SolverStatus::Converged { .. })
+        match self.status {
+            SolverStatus::Converged { .. } => true,
+            SolverStatus::UnderConstrained { .. } => self.violations.is_empty(),
+            SolverStatus::OverConstrained { .. }
+            | SolverStatus::NotConverged { .. }
+            | SolverStatus::Unstable => false,
+        }
     }
 
     /// Convenience: is the sketch fully constrained (converged with
     /// no remaining degrees of freedom)?
     ///
     /// In Onshape / SolidWorks / Fusion parlance this is the "fully
-    /// defined" state that turns the sketch border green.
+    /// defined" state that turns the sketch border green. Strictly
+    /// stronger than [`Self::converged`]: an under-constrained
+    /// sketch can be "Solved" (all residuals satisfied) without
+    /// being "Fully Defined" (free DOFs remain).
     pub fn is_fully_constrained(&self) -> bool {
-        self.converged()
+        matches!(self.status, SolverStatus::Converged { .. })
     }
 
     /// Convenience: did the solver report an under-constrained system?
@@ -599,6 +621,20 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         entities_analysed += 1;
         total_free_dofs += 5;
     }
+    // Splines (B-Spline and NURBS): 2 DOFs per control point.
+    // Mirrors the solver-side `EntityState::spline_{bspline,nurbs}`
+    // parameter pack registered by `populate_solver` — knots and
+    // (for NURBS) weights are pinned in `SplineMetadata` and never
+    // become free DOFs of Newton-Raphson. The 2n count therefore
+    // exactly matches what the solver will iterate.
+    for entry in sketch.splines().iter() {
+        entities_analysed += 1;
+        let cp_count = match &entry.value().spline {
+            Spline2d::BSpline(bs) => bs.control_points.len(),
+            Spline2d::Nurbs(nurbs) => nurbs.control_points.len(),
+        };
+        total_free_dofs += 2 * cp_count;
+    }
 
     let entities_skipped = collect_unsupported(sketch);
     // HashSet for O(1) membership checks while iterating constraints.
@@ -697,6 +733,26 @@ fn diagnose_constraints(
     diagnosable.sort_by_key(|c| c.id.0);
     solver.set_constraints(diagnosable);
 
+    // Run Newton-Raphson before `diagnose()` so the residual readings
+    // reflect the post-solve state, not the entities' freshly-loaded
+    // initial positions. Without this, a constraint that happens to
+    // be satisfied by the initial guess (residual = 0) is classified
+    // as *redundant* even when it is part of an inconsistent set —
+    // e.g. three `XCoordinate` constraints with values {3, 7, 9} on
+    // a point initially at x=3. The order of constraint processing
+    // (deterministic, by `id` sort above) then picks which row is
+    // the "essential" representative; running `solve()` first pushes
+    // the point to the regularised least-squares minimum so every
+    // dependent row carries a non-zero residual and the conflict
+    // classifier produces the same count regardless of which uuid
+    // sorts first. Matches the `diagnose()` contract:
+    // "callers that need a residual-accurate solution should run
+    // solve() before diagnose()".
+    //
+    // The solver mutates only its internal `entity_state`; the
+    // sketch is never written back, so `analyze_dofs` stays
+    // side-effect-free.
+    let _ = solver.solve();
     let diagnosis = solver.diagnose();
     (diagnosis.redundant, diagnosis.conflicts)
 }
@@ -1215,7 +1271,8 @@ mod tests {
 
     use super::*;
     use crate::sketch2d::constraints::{
-        Constraint, ConstraintPriority, DimensionalConstraint, GeometricConstraint,
+        Constraint, ConstraintId, ConstraintPriority, DimensionalConstraint,
+        GeometricConstraint,
     };
     use crate::sketch2d::line2d::{Line2d, LineSegment2d};
     use crate::sketch2d::sketch::{Sketch, SketchAnchor};
@@ -1947,15 +2004,38 @@ mod tests {
 
     #[test]
     fn report_under_constrained_exposes_dof() {
-        let r = report_with_status(SolverStatus::UnderConstrained {
+        // Inject one violation so `converged()` correctly returns
+        // false — an under-constrained sketch with a still-unsatisfied
+        // residual is genuinely not solved. The empty-violations
+        // case (= solver did satisfy every residual) is exercised
+        // by `report_under_constrained_with_no_violations_is_solved`.
+        let mut r = report_with_status(SolverStatus::UnderConstrained {
             degrees_of_freedom: 3,
         });
+        r.violations.push((ConstraintId(uuid::Uuid::new_v4()), 1.0));
         assert!(!r.converged());
         assert!(r.is_under_constrained());
+        assert!(!r.is_fully_constrained());
         assert_eq!(r.degrees_of_freedom(), Some(3));
         assert_eq!(r.iterations(), None);
         assert_eq!(r.final_error(), None);
         assert_eq!(r.conflicting_constraints(), None);
+    }
+
+    #[test]
+    fn report_under_constrained_with_no_violations_is_solved() {
+        // Tikhonov-regularised Newton can drive an under-constrained
+        // system's residuals under tolerance — at which point
+        // `converged()` reports true ("Solved" in Onshape parlance)
+        // even though `is_fully_constrained()` stays false
+        // (free DOFs remain).
+        let r = report_with_status(SolverStatus::UnderConstrained {
+            degrees_of_freedom: 3,
+        });
+        assert!(r.converged());
+        assert!(r.is_under_constrained());
+        assert!(!r.is_fully_constrained());
+        assert_eq!(r.degrees_of_freedom(), Some(3));
     }
 
     #[test]
