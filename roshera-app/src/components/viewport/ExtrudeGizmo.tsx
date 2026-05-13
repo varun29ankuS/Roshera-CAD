@@ -29,7 +29,15 @@ import { useSceneStore, type CADObject } from '@/stores/scene-store'
  *   to get a delta. This gives stable axis-aligned drag regardless of
  *   camera roll, and degrades gracefully (handler returns) when the
  *   axis is nearly parallel to the view direction.
+ *
+ * Increment behaviour:
+ *   Drag distance snaps to `EXTRUDE_STEP` (0.1 model units). This is the
+ *   on-screen UX increment; the REST payload carries the snapped value
+ *   verbatim. Sub-step jitter is removed at the drag layer so the readout,
+ *   the arrow shaft length, and the eventual committed extrusion all agree.
  */
+const EXTRUDE_STEP = 0.1
+
 export function ExtrudeGizmo() {
   const subElementSelections = useSceneStore((s) => s.subElementSelections)
   const selectionMode = useSceneStore((s) => s.selectionMode)
@@ -199,9 +207,13 @@ export function ExtrudeGizmo() {
       if (!raycaster.ray.intersectPlane(plane, intersection)) return
       fromOrigin.subVectors(intersection, drag.origin)
       const dot = fromOrigin.dot(drag.axis)
-      const next = dot - drag.refDot
-      drag.currentDistance = next
-      setDistance(next)
+      const raw = dot - drag.refDot
+      // Snap to the UX step so readout, arrow length, and the eventual
+      // committed extrusion all agree. Ties round-to-even (Math.round
+      // default) which is acceptable at this granularity.
+      const snapped = Math.round(raw / EXTRUDE_STEP) * EXTRUDE_STEP
+      drag.currentDistance = snapped
+      setDistance(snapped)
     }
 
     const onUp = () => {
@@ -441,7 +453,7 @@ export function ExtrudeGizmo() {
             <span className="text-muted-foreground mr-2">PULL</span>
             <span className="text-foreground tabular-nums">
               {distance >= 0 ? '+' : ''}
-              {distance.toFixed(3)}
+              {distance.toFixed(1)}
             </span>
           </div>
         </Html>
