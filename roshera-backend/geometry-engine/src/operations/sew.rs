@@ -197,6 +197,7 @@ fn find_matching_vertices(
             .get(vertex_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
         let pos1 = Point3::from(vertex.position);
+        let tol1 = vertex.tolerance;
 
         for &other_id in &all_vertices {
             if processed.contains(&other_id) {
@@ -209,7 +210,11 @@ fn find_matching_vertices(
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
             let pos2 = Point3::from(other.position);
 
-            if pos1.distance(&pos2) <= tolerance {
+            // Effective coincidence ball is the loosest of the two
+            // per-vertex tolerances and the sew floor.
+            let effective_tol = tol1.max(other.tolerance).max(tolerance);
+
+            if pos1.distance(&pos2) <= effective_tol {
                 group.push(other_id);
                 processed.insert(other_id);
             }
@@ -223,7 +228,12 @@ fn find_matching_vertices(
     Ok(vertex_groups)
 }
 
-/// Check if two edges match within tolerance
+/// Check if two edges match within tolerance.
+///
+/// The effective gap tolerance is the maximum of the two per-edge
+/// tolerances and the operation's `sew_tolerance` floor (Parasolid's
+/// union-of-spheres convention: a sample gap is "coincident" iff it is
+/// no larger than the loosest of the participating tolerances).
 fn edges_match(
     model: &BRepModel,
     edge1_id: EdgeId,
@@ -239,6 +249,8 @@ fn edges_match(
         .get(edge2_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
+    let effective_tol = edge1.tolerance.max(edge2.tolerance).max(tolerance);
+
     // Check if edges share same geometry (opposite orientation)
     // Sample points along edges and compare
     let num_samples = 5;
@@ -251,8 +263,8 @@ fn edges_match(
         let p2_forward = edge2.evaluate(t, &model.curves)?;
         let p2_reverse = edge2.evaluate(1.0 - t, &model.curves)?;
 
-        let matches_forward = p1.distance(&p2_forward) <= tolerance;
-        let matches_reverse = p1.distance(&p2_reverse) <= tolerance;
+        let matches_forward = p1.distance(&p2_forward) <= effective_tol;
+        let matches_reverse = p1.distance(&p2_reverse) <= effective_tol;
 
         if !matches_forward && !matches_reverse {
             return Ok(false);
