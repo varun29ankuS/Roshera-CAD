@@ -13,6 +13,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::blend_graph::{self, BlendGraph, BlendRadius};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
@@ -195,6 +196,24 @@ pub fn fillet_edges(
         // Propagate edge selection if requested
         let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
+        // F3-δ.4: build the F2-β blend graph for the full selection.
+        // The graph carries per-edge convexity / dihedral / manifold-
+        // kind (F2-α cached classification), plus the per-corner
+        // setbacks computed by F2-γ. The constant-radius spine path
+        // consults it to retract spine endpoints at shared corners.
+        // For today's selections (no shared corners — still rejected
+        // by `validate_no_shared_corners` until F5 lands corner
+        // patches) every BlendEdge has setbacks = None, so the trim
+        // collapses to ParamTrim::FULL and behaviour is identical
+        // to the pre-F3-δ.4 path. The wiring is the foundation that
+        // F4/F5 corner-blending will activate.
+        let blend_selection: Vec<(EdgeId, BlendRadius)> = selected_edges
+            .iter()
+            .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type)))
+            .collect();
+        let mut blend_graph = blend_graph::build(model, &blend_selection)?;
+        blend_graph::compute_setbacks(model, &mut blend_graph)?;
+
         // Group edges into fillet chains
         let edge_chains = group_edges_into_chains(model, &selected_edges)?;
 
@@ -203,7 +222,7 @@ pub fn fillet_edges(
         let mut surgeries = Vec::new();
         for chain in edge_chains {
             let (chain_faces, chain_surgeries) =
-                create_fillet_chain(model, solid_id, chain, &options)?;
+                create_fillet_chain(model, solid_id, chain, &options, &blend_graph)?;
             fillet_faces.extend(chain_faces);
             surgeries.extend(chain_surgeries);
         }
@@ -292,11 +311,35 @@ pub fn fillet_vertices(
 /// 3-sided degenerate path returns no surgery). The surgery list is
 /// passed downstream to `update_adjacent_faces` for topology
 /// re-stitching.
+/// Translate a [`FilletType`] into the [`BlendRadius`] shape that
+/// [`blend_graph::build`] expects. F3-δ.4 wires the BlendGraph into
+/// the constant-radius spine path; non-constant types are passed
+/// through with their best-effort BlendRadius mapping so the graph
+/// classification (convexity / dihedral / manifold-kind) still
+/// covers every selected edge, even though the variable / function /
+/// chord paths don't yet consult the graph for setback retraction.
+fn fillet_type_to_blend_radius(fillet_type: &FilletType) -> BlendRadius {
+    match fillet_type {
+        FilletType::Constant(r) => BlendRadius::Constant(*r),
+        FilletType::Variable(r1, r2) => BlendRadius::Linear {
+            start: *r1,
+            end: *r2,
+        },
+        // The Function and Chord paths don't expose a closed-form
+        // sampling here; report Constant(1.0) as a placeholder so
+        // the edge is still classified into the graph. F4 will
+        // refine these when variable-radius fillets land.
+        FilletType::Function(_) => BlendRadius::Constant(1.0),
+        FilletType::Chord(c) => BlendRadius::Constant(*c),
+    }
+}
+
 fn create_fillet_chain(
     model: &mut BRepModel,
     solid_id: SolidId,
     edges: Vec<EdgeId>,
     options: &FilletOptions,
+    blend_graph: &BlendGraph,
 ) -> OperationResult<(Vec<FaceId>, Vec<BlendEdgeSurgery>)> {
     let mut fillet_faces = Vec::new();
     let mut surgeries = Vec::new();
@@ -307,17 +350,28 @@ fn create_fillet_chain(
 
         // Create fillet surface between the faces
         let (fillet_face, surgery) = match &options.fillet_type {
-            FilletType::Constant(radius) => {
-                create_constant_radius_fillet(model, edge_id, face1_id, face2_id, *radius)?
-            }
-            FilletType::Variable(r1, r2) => {
-                create_variable_radius_fillet(model, edge_id, face1_id, face2_id, *r1, *r2)?
-            }
+            FilletType::Constant(radius) => create_constant_radius_fillet(
+                model,
+                edge_id,
+                face1_id,
+                face2_id,
+                *radius,
+                blend_graph,
+            )?,
+            FilletType::Variable(r1, r2) => create_variable_radius_fillet(
+                model,
+                edge_id,
+                face1_id,
+                face2_id,
+                *r1,
+                *r2,
+                blend_graph,
+            )?,
             FilletType::Function(f) => {
-                create_function_radius_fillet(model, edge_id, face1_id, face2_id, f)?
+                create_function_radius_fillet(model, edge_id, face1_id, face2_id, f, blend_graph)?
             }
             FilletType::Chord(chord) => {
-                create_chord_fillet(model, edge_id, face1_id, face2_id, *chord)?
+                create_chord_fillet(model, edge_id, face1_id, face2_id, *chord, blend_graph)?
             }
         };
 
@@ -345,6 +399,7 @@ fn create_constant_radius_fillet(
     face1_id: FaceId,
     face2_id: FaceId,
     radius: f64,
+    blend_graph: &BlendGraph,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get edge and face data
     let edge = model
@@ -364,21 +419,22 @@ fn create_constant_radius_fillet(
         return create_closed_edge_fillet(model, edge_id, face1_id, face2_id, radius, radius);
     }
 
-    // F3-α: try the new analytic spine solver first. For plane/plane
-    // face pairs (the only arm wired in this slice) it returns
-    // `Some(SpineRail)` with an exact straight-line spine and exact
-    // straight-line rails — numerically identical to the legacy
-    // bisector path within 1e-8 by construction. Every other surface
-    // pair returns `None` and we fall through to the legacy bisector
-    // below, which keeps non-plane behaviour untouched until F3-β/γ
-    // wires in cylinder, sphere, and the marching solver.
+    // F3-δ.4: route through `solve_spine_for_chain` so the spine
+    // path consumes the F2-γ setbacks stored on `blend_graph`.
+    // For single-edge selections without shared corners the
+    // BlendEdge carries `start_setback = end_setback = None` and
+    // the trim collapses to `ParamTrim::FULL` — byte-equivalent to
+    // the pre-F3-δ.4 path. When the corner-patch work (F4/F5)
+    // lands and `validate_no_shared_corners` is replaced by the
+    // setback-aware dispatch, the same code path produces
+    // retracted spines without any further plumbing change. Pairs
+    // that no analytic arm handles return `None` and we fall back
+    // to the legacy bisector below.
     let spine_options = super::spine_solver::SpineOptions::default();
-    let rolling_ball_data = match super::spine_solver::solve_spine_for_edge(
+    let rolling_ball_data = match super::spine_solver::solve_spine_for_chain(
         model,
-        edge_id,
-        face1_id,
-        face2_id,
-        radius,
+        &[edge_id],
+        blend_graph,
         &spine_options,
     )? {
         Some(spine_rail) => rolling_ball_data_from_spine_rail(&spine_rail),
@@ -434,6 +490,7 @@ fn create_variable_radius_fillet(
     face2_id: FaceId,
     start_radius: f64,
     end_radius: f64,
+    _blend_graph: &BlendGraph,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get edge and face data
     let edge = model
@@ -1160,6 +1217,7 @@ fn create_function_radius_fillet(
     face1_id: FaceId,
     face2_id: FaceId,
     radius_fn: &Box<dyn Fn(f64) -> f64>,
+    blend_graph: &BlendGraph,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Validate the function over the full edge parameter at the same
     // density used by the rolling-ball construction — we don't want
@@ -1187,7 +1245,14 @@ fn create_function_radius_fillet(
         .map(|r| (r - r_mean).abs())
         .fold(0.0_f64, f64::max);
     if r_mean > 0.0 && r_max_dev / r_mean < 0.01 {
-        return create_constant_radius_fillet(model, edge_id, face1_id, face2_id, r_mean);
+        return create_constant_radius_fillet(
+            model,
+            edge_id,
+            face1_id,
+            face2_id,
+            r_mean,
+            blend_graph,
+        );
     }
 
     // Variable path: build rolling-ball data using the function-derived
@@ -1364,6 +1429,7 @@ fn create_chord_fillet(
     face1_id: FaceId,
     face2_id: FaceId,
     chord_length: f64,
+    blend_graph: &BlendGraph,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Compute radius from chord length and face angle
     let angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
@@ -1375,7 +1441,7 @@ fn create_chord_fillet(
     }
     let radius = chord_length / (2.0 * half_sin);
 
-    create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius)
+    create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius, blend_graph)
 }
 
 /// Describes one filleted edge-blend surface adjacent to a vertex.
