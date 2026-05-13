@@ -9,6 +9,7 @@
 //! pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Vector3, Tolerance};
@@ -91,6 +92,24 @@ pub enum BoundaryHandling {
 
 /// Create blend between two faces
 pub fn blend_faces(
+    model: &mut BRepModel,
+    face1_id: FaceId,
+    face2_id: FaceId,
+    blend_curves: Option<(Vec<Point3>, Vec<Point3>)>,
+    options: BlendOptions,
+) -> OperationResult<Vec<FaceId>> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::BlendFaces { face_a: face1_id, face_b: face2_id },
+        )?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        blend_faces_body(model, face1_id, face2_id, blend_curves, options)
+    })
+}
+
+fn blend_faces_body(
     model: &mut BRepModel,
     face1_id: FaceId,
     face2_id: FaceId,

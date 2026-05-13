@@ -8,6 +8,7 @@
 //! constants. Matches the pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
@@ -46,6 +47,20 @@ pub struct TransformResult {
 
 /// Apply transformation to a solid
 pub fn transform_solid(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    transform: Matrix4,
+    options: TransformOptions,
+) -> OperationResult<TransformResult> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        transform_solid_body(model, solid_id, transform, options)
+    })
+}
+
+fn transform_solid_body(
     model: &mut BRepModel,
     solid_id: SolidId,
     transform: Matrix4,
@@ -110,6 +125,20 @@ pub fn transform_faces(
     transform: Matrix4,
     options: TransformOptions,
 ) -> OperationResult<TransformResult> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        transform_faces_body(model, face_ids, transform, options)
+    })
+}
+
+fn transform_faces_body(
+    model: &mut BRepModel,
+    face_ids: Vec<FaceId>,
+    transform: Matrix4,
+    options: TransformOptions,
+) -> OperationResult<TransformResult> {
     validate_transform_inputs(model, &transform)?;
 
     let input_face_ids: Vec<u32> = face_ids.clone();
@@ -149,6 +178,20 @@ pub fn transform_faces(
 
 /// Apply transformation to edges
 pub fn transform_edges(
+    model: &mut BRepModel,
+    edge_ids: Vec<EdgeId>,
+    transform: Matrix4,
+    options: TransformOptions,
+) -> OperationResult<TransformResult> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        transform_edges_body(model, edge_ids, transform, options)
+    })
+}
+
+fn transform_edges_body(
     model: &mut BRepModel,
     edge_ids: Vec<EdgeId>,
     transform: Matrix4,
@@ -254,16 +297,24 @@ pub fn mirror(
     plane_normal: Vector3,
     options: TransformOptions,
 ) -> OperationResult<TransformResult> {
-    // Build mirror matrix
-    let transform = Matrix4::mirror(plane_origin, plane_normal)?;
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        // Build mirror matrix
+        let transform = Matrix4::mirror(plane_origin, plane_normal)?;
 
-    // Dispatch based on entity type
-    let result = transform_solid(model, entity_ids[0], transform, options)?;
+        // Dispatch based on entity type. The inner `transform_solid`
+        // takes its own snapshot; we accept the nested-snapshot cost
+        // for transactional correctness across the combined
+        // mirror+orient-fix path.
+        let result = transform_solid(model, entity_ids[0], transform, options)?;
 
-    // Mirroring reverses orientation, need to fix
-    fix_mirrored_orientations(model, result.transformed_ids[0])?;
+        // Mirroring reverses orientation, need to fix
+        fix_mirrored_orientations(model, result.transformed_ids[0])?;
 
-    Ok(result)
+        Ok(result)
+    })
 }
 
 /// Transform vertices in place.

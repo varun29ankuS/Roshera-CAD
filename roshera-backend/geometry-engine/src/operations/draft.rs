@@ -9,6 +9,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::surface_plane_intersection::{
     intersect_surface_plane, SurfacePlaneIntersectionConfig,
@@ -132,6 +133,23 @@ pub enum DraftIntersectionHandling {
 
 /// Apply draft to faces
 pub fn apply_draft(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    faces: Vec<FaceId>,
+    options: DraftOptions,
+) -> OperationResult<Vec<FaceId>> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::Draft { face_ids: &faces },
+        )?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        apply_draft_body(model, solid_id, faces, options)
+    })
+}
+
+fn apply_draft_body(
     model: &mut BRepModel,
     solid_id: SolidId,
     faces: Vec<FaceId>,

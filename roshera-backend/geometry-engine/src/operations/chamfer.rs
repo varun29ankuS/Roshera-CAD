@@ -7,8 +7,9 @@
 //! enumeration. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::edge_blend_topology::{splice_blend_edge, validate_no_shared_corners, BlendEdgeSurgery};
+use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::fillet::edge_orientation_in_face;
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
@@ -93,78 +94,91 @@ pub fn chamfer_edges(
     edges: Vec<EdgeId>,
     options: ChamferOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    // Validate inputs
-    validate_chamfer_inputs(model, solid_id, &edges, &options)?;
+    // F2-δ pre-flight: cheap input validation + setback-aware
+    // corner compatibility (replaces the historical
+    // `validate_no_shared_corners` blanket reject). Atomic — the
+    // model is untouched if pre-flight fails.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::ChamferEdges {
+                solid_id,
+                edges: &edges,
+            },
+        )?;
+    }
 
-    // Reject multi-edge calls that meet at a corner — corner sphere
-    // blends are not yet implemented (Task #82 slice 2). This must
-    // run before any topology mutation so the rejection is atomic.
-    validate_no_shared_corners(model, &edges)?;
+    // F2-δ transactional wrapper: any Err out of the body restores
+    // the pre-call snapshot so the caller sees an unchanged model.
+    lifecycle::with_rollback(model, move |model| {
+        // Validate inputs
+        validate_chamfer_inputs(model, solid_id, &edges, &options)?;
 
-    // Capture input edges before the Vec is consumed by propagation.
-    let input_edges_for_record: Vec<u32> = edges.clone();
+        // Capture input edges before the Vec is consumed by propagation.
+        let input_edges_for_record: Vec<u32> = edges.clone();
 
-    // Propagate edge selection if requested
-    let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
+        // Propagate edge selection if requested
+        let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
-    // Create chamfer faces for each edge. Closed-edge (rim) chamfers
-    // perform their topology surgery inline and return `None`; open
-    // edges return `Some(surgery)` for the 4-face splice below.
-    let mut chamfer_faces = Vec::new();
-    let mut surgeries: Vec<BlendEdgeSurgery> = Vec::new();
-    for &edge_id in &selected_edges {
-        let (face_id, surgery) = create_edge_chamfer(model, solid_id, edge_id, &options)?;
-        chamfer_faces.push(face_id);
-        if let Some(s) = surgery {
-            surgeries.push(s);
+        // Create chamfer faces for each edge. Closed-edge (rim) chamfers
+        // perform their topology surgery inline and return `None`; open
+        // edges return `Some(surgery)` for the 4-face splice below.
+        let mut chamfer_faces = Vec::new();
+        let mut surgeries: Vec<BlendEdgeSurgery> = Vec::new();
+        for &edge_id in &selected_edges {
+            let (face_id, surgery) = create_edge_chamfer(model, solid_id, edge_id, &options)?;
+            chamfer_faces.push(face_id);
+            if let Some(s) = surgery {
+                surgeries.push(s);
+            }
         }
-    }
 
-    // Re-stitch surrounding topology and add chamfer faces to outer shell.
-    update_adjacent_faces_for_chamfer(model, solid_id, &chamfer_faces, &surgeries)?;
+        // Re-stitch surrounding topology and add chamfer faces to outer shell.
+        update_adjacent_faces_for_chamfer(model, solid_id, &chamfer_faces, &surgeries)?;
 
-    // Handle vertex conditions where multiple chamfers meet
-    if selected_edges.len() > 1 {
-        handle_chamfer_vertices(model, solid_id, &selected_edges, &chamfer_faces)?;
-    }
+        // Handle vertex conditions where multiple chamfers meet
+        if selected_edges.len() > 1 {
+            handle_chamfer_vertices(model, solid_id, &selected_edges, &chamfer_faces)?;
+        }
 
-    // Validate result if requested
-    if options.common.validate_result {
-        validate_chamfered_solid(model, solid_id)?;
-    }
+        // Validate result if requested
+        if options.common.validate_result {
+            validate_chamfered_solid(model, solid_id)?;
+        }
 
-    // Record the operation for timeline / event-sourcing consumers.
-    // `outputs` leads with `solid_id` so that downstream modify ops
-    // (fillet-after-chamfer, shell-after-chamfer, …) resolve their
-    // parent edge to this event rather than skipping past it to the
-    // primitive that originally produced `solid_id`. The chamfer face
-    // ids follow so the lineage graph still records *what* topology
-    // the op produced.
-    model.record_operation(
-        crate::operations::recorder::RecordedOperation::new("chamfer_edges")
-            .with_parameters(serde_json::json!({
-                "solid_id": solid_id,
-                "chamfer_type": format!("{:?}", options.chamfer_type),
-                "distance1": options.distance1,
-                "distance2": options.distance2,
-                "symmetric": options.symmetric,
-                "propagation": format!("{:?}", options.propagation),
-                "preserve_edges": options.preserve_edges,
-            }))
-            .with_input_solids([solid_id as u64])
-            .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
-            .with_output_solids([solid_id as u64])
-            .with_output_faces(chamfer_faces.iter().map(|&f| f as u64)),
-    );
+        // Record the operation for timeline / event-sourcing consumers.
+        // `outputs` leads with `solid_id` so that downstream modify ops
+        // (fillet-after-chamfer, shell-after-chamfer, …) resolve their
+        // parent edge to this event rather than skipping past it to the
+        // primitive that originally produced `solid_id`. The chamfer face
+        // ids follow so the lineage graph still records *what* topology
+        // the op produced.
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new("chamfer_edges")
+                .with_parameters(serde_json::json!({
+                    "solid_id": solid_id,
+                    "chamfer_type": format!("{:?}", options.chamfer_type),
+                    "distance1": options.distance1,
+                    "distance2": options.distance2,
+                    "symmetric": options.symmetric,
+                    "propagation": format!("{:?}", options.propagation),
+                    "preserve_edges": options.preserve_edges,
+                }))
+                .with_input_solids([solid_id as u64])
+                .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
+                .with_output_solids([solid_id as u64])
+                .with_output_faces(chamfer_faces.iter().map(|&f| f as u64)),
+        );
 
-    // Drop the solid's cached mass-properties — the splice changed
-    // volume, surface area, COM and inertia. Without this the next
-    // mass / surface-area query returns the pre-chamfer figure.
-    if let Some(solid) = model.solids.get_mut(solid_id) {
-        solid.invalidate_mass_props_cache();
-    }
+        // Drop the solid's cached mass-properties — the splice changed
+        // volume, surface area, COM and inertia. Without this the next
+        // mass / surface-area query returns the pre-chamfer figure.
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.invalidate_mass_props_cache();
+        }
 
-    Ok(chamfer_faces)
+        Ok(chamfer_faces)
+    })
 }
 
 /// Create chamfer for a single edge.

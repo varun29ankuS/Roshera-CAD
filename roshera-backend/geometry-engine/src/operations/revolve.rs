@@ -3,6 +3,7 @@
 //! Creates solids of revolution by rotating profiles around an axis.
 //! Supports partial revolutions, multiple profiles, and helical paths.
 
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
@@ -67,63 +68,70 @@ pub fn revolve_face(
     face_id: FaceId,
     options: RevolveOptions,
 ) -> OperationResult<SolidId> {
-    // Validate inputs
-    validate_revolve_inputs(model, face_id, &options)?;
-
-    // Normalize axis direction
-    let axis_dir = options.axis_direction.normalize()?;
-
-    // Get the face to revolve
-    let face = model
-        .faces
-        .get(face_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
-        .clone();
-
-    // Check if face intersects the axis (would create self-intersection)
-    if face_intersects_axis(model, &face, options.axis_origin, axis_dir)? {
-        return Err(OperationError::SelfIntersection);
+    // F2-δ pre-flight.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::RevolveFace { face_id })?;
     }
 
-    // Create revolved solid
-    let solid_id = if options.pitch.abs() < 1e-10 {
-        // Pure revolution
-        create_revolution(model, &face, face_id, &options)?
-    } else {
-        // Helical sweep
-        create_helical_sweep(model, &face, face_id, &options)?
-    };
+    lifecycle::with_rollback(model, move |model| {
+        // Validate inputs
+        validate_revolve_inputs(model, face_id, &options)?;
 
-    // Validate result if requested
-    if options.common.validate_result {
-        validate_revolved_solid(model, solid_id)?;
-    }
+        // Normalize axis direction
+        let axis_dir = options.axis_direction.normalize()?;
 
-    // Record for attached recorders.
-    model.record_operation(
-        crate::operations::recorder::RecordedOperation::new("revolve_face")
-            .with_parameters(serde_json::json!({
-                "face_id": face_id,
-                "axis_origin": [
-                    options.axis_origin.x,
-                    options.axis_origin.y,
-                    options.axis_origin.z,
-                ],
-                "axis_direction": [
-                    options.axis_direction.x,
-                    options.axis_direction.y,
-                    options.axis_direction.z,
-                ],
-                "angle": options.angle,
-                "pitch": options.pitch,
-                "segments": options.segments,
-                "cap_ends": options.cap_ends,
-            }))
-            .with_input_faces([face_id as u64])
-            .with_output_solids([solid_id as u64]),
-    );
+        // Get the face to revolve
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
+            .clone();
 
-    Ok(solid_id)
+        // Check if face intersects the axis (would create self-intersection)
+        if face_intersects_axis(model, &face, options.axis_origin, axis_dir)? {
+            return Err(OperationError::SelfIntersection);
+        }
+
+        // Create revolved solid
+        let solid_id = if options.pitch.abs() < 1e-10 {
+            // Pure revolution
+            create_revolution(model, &face, face_id, &options)?
+        } else {
+            // Helical sweep
+            create_helical_sweep(model, &face, face_id, &options)?
+        };
+
+        // Validate result if requested
+        if options.common.validate_result {
+            validate_revolved_solid(model, solid_id)?;
+        }
+
+        // Record for attached recorders.
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new("revolve_face")
+                .with_parameters(serde_json::json!({
+                    "face_id": face_id,
+                    "axis_origin": [
+                        options.axis_origin.x,
+                        options.axis_origin.y,
+                        options.axis_origin.z,
+                    ],
+                    "axis_direction": [
+                        options.axis_direction.x,
+                        options.axis_direction.y,
+                        options.axis_direction.z,
+                    ],
+                    "angle": options.angle,
+                    "pitch": options.pitch,
+                    "segments": options.segments,
+                    "cap_ends": options.cap_ends,
+                }))
+                .with_input_faces([face_id as u64])
+                .with_output_solids([solid_id as u64]),
+        );
+
+        Ok(solid_id)
+    })
 }
 
 /// Revolve a wire/profile to create a solid
@@ -132,11 +140,18 @@ pub fn revolve_profile(
     profile_edges: Vec<EdgeId>,
     options: RevolveOptions,
 ) -> OperationResult<SolidId> {
-    // First create a face from the profile
-    let face_id = create_face_from_profile(model, profile_edges)?;
-
-    // Then revolve the face
-    revolve_face(model, face_id, options)
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::RevolveProfile {
+                profile_edges: &profile_edges,
+            },
+        )?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        let face_id = create_face_from_profile(model, profile_edges)?;
+        revolve_face(model, face_id, options)
+    })
 }
 
 /// Create a pure revolution (no helical component)
@@ -1333,7 +1348,8 @@ mod tests {
             ..Default::default()
         };
         let result = revolve_face(&mut model, 9999, opts);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+        // F2-δ: pre-flight resolves entity IDs and returns InvalidInput.
+        assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
     #[test]

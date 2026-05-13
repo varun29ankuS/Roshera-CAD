@@ -49,6 +49,14 @@ pub mod edge_classification;
 // F2-γ (setback computation) plus F3/F5 (spine + corner patches).
 pub mod blend_graph;
 
+// F2-δ validation lifecycle: pre-flight `validate_can_apply` +
+// transactional `with_rollback` wrapper. Together with the
+// F2-δ.1 `ModelSnapshot` primitive these promote every kernel op
+// entry point to a "commit a valid model or leave it untouched"
+// contract. Folds in F2-γ.1 (setback-aware corner compatibility)
+// via the same pre-flight dispatch.
+pub mod lifecycle;
+
 // Internal helpers for boolean face splitting (DCEL-based planar arrangement).
 // Not part of the public API — used by `boolean::split_face_by_curves` only.
 pub(crate) mod face_arrangement;
@@ -204,6 +212,12 @@ pub struct CommonOptions {
     /// Tolerance for the operation
     pub tolerance: Tolerance,
 
+    /// F2-δ pre-flight: when true, [`lifecycle::validate_can_apply`]
+    /// runs before the op body. Defaults to `true`. Callers running
+    /// in a hot path that has already validated its inputs (push-pull
+    /// preview, batched fillet retries) may opt out.
+    pub validate_before: bool,
+
     /// Whether to validate result
     pub validate_result: bool,
 
@@ -219,6 +233,7 @@ impl Default for CommonOptions {
         use crate::math::tolerance::NORMAL_TOLERANCE;
         Self {
             tolerance: NORMAL_TOLERANCE,
+            validate_before: true,
             validate_result: true,
             merge_entities: true,
             track_history: true,
