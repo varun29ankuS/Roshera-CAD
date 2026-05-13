@@ -26,8 +26,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::math::vector3::Vector3;
 use crate::operations::edge_classification::classify_and_cache;
-use crate::operations::OperationResult;
+use crate::operations::{OperationError, OperationResult};
 use crate::primitives::edge::{EdgeId, ManifoldKind};
 use crate::primitives::topology_builder::BRepModel;
 use crate::primitives::vertex::VertexId;
@@ -467,6 +468,197 @@ pub fn classify_vertex_kind(model: &BRepModel, incident: &[EdgeId]) -> BlendVert
     BlendVertexKind::Smooth
 }
 
+/// Tangent vectors that are within `PARALLEL_RAD` of being colinear
+/// (parallel or anti-parallel) at a corner produce a rank-deficient
+/// setback frame — we cannot decide a unique offset direction and
+/// caller must intervene (split the chain, perturb the seed radii,
+/// or refuse the operation). Matches the angle band used by the F2-α
+/// classifier when deciding "essentially straight" edges.
+const PARALLEL_RAD: f64 = 1e-6;
+
+/// Compute per-edge setbacks at every corner vertex of the graph.
+///
+/// **Formula.** For each blend edge `i` incident to a corner vertex
+/// `v` with degree ≥ 2:
+///
+/// ```text
+/// setback_i = r_i · cos(θ_min(i) / 2)
+/// ```
+///
+/// where `r_i` is the conservative (minimum) radius along edge `i`'s
+/// schedule and `θ_min(i)` is the smallest angle between edge `i`'s
+/// outgoing tangent at `v` and the outgoing tangent of any other
+/// blend edge at `v`. Outgoing tangents point *away* from `v` along
+/// each edge.
+///
+/// **Geometric meaning.** A rolling-ball blend of radius `r` on a
+/// pair of edges meeting at an angle `θ` produces spine endpoints
+/// at distance `r·cot(θ/2)` from the corner along each edge. To make
+/// room for a corner patch that connects the spines smoothly, each
+/// spine endpoint is *retracted* by an amount that depends on the
+/// neighbour with the tightest angle (which dominates the corner
+/// geometry). The closed-form `r·cos(θ/2)` is the P0 distance used
+/// by Hoffmann §12.4 and matches vendor practice for symmetric
+/// corners.
+///
+/// **Worked example.** A unit-cube corner with three orthogonal
+/// edges and uniform radius `r`: every pairwise angle is π/2, so
+/// `θ_min = π/2` per edge → `setback = r·cos(π/4) = r/√2`. The
+/// matching expectation is pinned by [`tests`].
+///
+/// **Side effects.** Stamps `start_setback` (if `v == start_vertex`)
+/// or `end_setback` (otherwise) on each [`BlendEdge`] in `graph`.
+/// Vertices classified as [`BlendVertexKind::Smooth`] or
+/// [`BlendVertexKind::Cliff`] are skipped; an isolated degree-1
+/// blend vertex is similarly skipped because it has no neighbour to
+/// derive `θ_min` from.
+///
+/// **Errors.** Returns [`OperationError::InvalidGeometry`] when a
+/// referenced edge has disappeared from `model`, when a vertex
+/// listed as an endpoint is not actually incident, or when two
+/// outgoing tangents are within [`PARALLEL_RAD`] of parallel or
+/// anti-parallel (the rank-deficient case). Caller-visible
+/// behaviour: setbacks are either fully populated or not populated
+/// at all — there is no partial-success state.
+pub fn compute_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> OperationResult<()> {
+    // Snapshot the corner work-list. We avoid borrowing `graph`
+    // immutably while we mutate `graph.edges` below.
+    let work: Vec<(VertexId, Vec<EdgeId>)> = graph
+        .vertices
+        .iter()
+        .filter_map(|(vid, v)| {
+            if vertex_needs_setback(v.kind) && v.incident_blend_edges.len() >= 2 {
+                Some((*vid, v.incident_blend_edges.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (vertex_id, blend_edges) in work {
+        // Compute outgoing tangents at this vertex for every incident
+        // blend edge. `edge.tangent_at(0.0)` already factors in the
+        // edge's orientation sign (see edge.rs:333), so at the start
+        // vertex it points "forward into" the edge — which is the
+        // outgoing direction we want. At the end vertex, the same
+        // forward tangent points back toward the vertex, so we
+        // negate it.
+        let mut outgoing: Vec<Vector3> = Vec::with_capacity(blend_edges.len());
+        for &eid in &blend_edges {
+            let edge = model.edges.get(eid).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "BlendGraph references edge {} that is no longer in the model",
+                    eid
+                ))
+            })?;
+            let t_forward = edge.tangent_at(0.0_f64, &model.curves).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "tangent_at(0) failed for edge {}: {:?}",
+                    eid, e
+                ))
+            })?;
+            let dir = if edge.start_vertex == vertex_id {
+                t_forward
+            } else if edge.end_vertex == vertex_id {
+                // Negate the forward tangent to get the outgoing
+                // direction at the end vertex.
+                let t_end = edge.tangent_at(1.0_f64, &model.curves).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "tangent_at(1) failed for edge {}: {:?}",
+                        eid, e
+                    ))
+                })?;
+                Vector3::new(-t_end.x, -t_end.y, -t_end.z)
+            } else {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "vertex {} is not an endpoint of edge {}",
+                    vertex_id, eid
+                )));
+            };
+            outgoing.push(dir);
+        }
+
+        // For each edge i, find θ_min(i) over all j ≠ i and stamp
+        // the setback. Track whether any pair is rank-deficient so
+        // we can surface a specific error rather than a default.
+        for (i, &eid) in blend_edges.iter().enumerate() {
+            let mut theta_min = f64::INFINITY;
+            for j in 0..blend_edges.len() {
+                if i == j {
+                    continue;
+                }
+                let theta = outgoing[i].angle(&outgoing[j]).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "angle between outgoing tangents at vertex {} failed: {:?}",
+                        vertex_id, e
+                    ))
+                })?;
+                if theta < theta_min {
+                    theta_min = theta;
+                }
+            }
+
+            if !theta_min.is_finite() {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "vertex {} has no neighbour pair to derive setback from",
+                    vertex_id
+                )));
+            }
+            if theta_min < PARALLEL_RAD {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "vertex {} corner is rank-deficient: outgoing tangents nearly parallel (θ_min = {:.3e} rad)",
+                    vertex_id, theta_min
+                )));
+            }
+            if (std::f64::consts::PI - theta_min) < PARALLEL_RAD {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "vertex {} corner is rank-deficient: outgoing tangents nearly anti-parallel (θ_min = {:.3e} rad)",
+                    vertex_id, theta_min
+                )));
+            }
+
+            // Conservative radius = minimum value over the schedule.
+            // For Constant this is the radius itself; for Linear /
+            // Variable we take the smallest sample so the setback
+            // never overreaches the available arc.
+            let r = graph
+                .edges
+                .get(&eid)
+                .map(|be| be.radius.min_value())
+                .unwrap_or(0.0_f64);
+            let setback = r * (theta_min * 0.5_f64).cos();
+
+            // Decide which endpoint to stamp by re-reading the edge.
+            let (is_start, is_end) = match model.edges.get(eid) {
+                Some(e) => (e.start_vertex == vertex_id, e.end_vertex == vertex_id),
+                None => (false, false),
+            };
+            if let Some(be) = graph.edges.get_mut(&eid) {
+                if is_start {
+                    be.start_setback = Some(setback);
+                } else if is_end {
+                    be.end_setback = Some(setback);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// True if a vertex of the given kind should receive a setback
+/// computation. Pulled out for testability.
+#[inline]
+fn vertex_needs_setback(kind: BlendVertexKind) -> bool {
+    match kind {
+        BlendVertexKind::ConvexCorner { degree } | BlendVertexKind::ConcaveCorner { degree } => {
+            degree >= 2
+        }
+        BlendVertexKind::Mixed => true,
+        BlendVertexKind::Smooth | BlendVertexKind::Cliff => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +875,195 @@ mod tests {
         // fictitious id should report Cliff, not panic.
         let kind = classify_vertex_kind(&model, &[42_u32]);
         assert_eq!(kind, BlendVertexKind::Cliff);
+    }
+
+    /// Symmetric cube corner: three orthogonal blend edges with the
+    /// same radius `r`. Every pairwise outgoing-tangent angle is
+    /// π/2, so the formula gives `setback = r · cos(π/4) = r/√2`
+    /// for every edge end at the shared corner. Matches the
+    /// expectation pinned in the F2-γ plan (Hoffmann §12.4).
+    #[test]
+    fn unit_cube_symmetric_corner_setback_is_r_over_sqrt2() {
+        let mut model = build_unit_box();
+        let (shared_vertex, edges) = edges_sharing_vertex(&model, 3);
+        let r = 0.1_f64;
+        let selection: Vec<_> = edges
+            .iter()
+            .map(|&e| (e, BlendRadius::Constant(r)))
+            .collect();
+        let mut graph =
+            build(&mut model, &selection).expect("build three-edge corner selection");
+
+        compute_setbacks(&model, &mut graph).expect("compute_setbacks must succeed");
+
+        let expected = r / 2.0_f64.sqrt();
+        for &eid in &edges {
+            let be = graph.edge(eid).expect("BlendEdge present");
+            let edge = model.edges.get(eid).expect("edge present");
+            let setback_at_corner = if edge.start_vertex == shared_vertex {
+                be.start_setback
+            } else {
+                be.end_setback
+            };
+            let v = setback_at_corner.expect("setback at corner must be populated");
+            assert!(
+                (v - expected).abs() < 1e-9,
+                "setback at orthogonal corner: expected {} (= r/√2), got {}",
+                expected,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn setback_skips_degree_one_endpoints() {
+        let mut model = build_unit_box();
+        let (shared_vertex, edges) = edges_sharing_vertex(&model, 3);
+        let selection: Vec<_> = edges
+            .iter()
+            .map(|&e| (e, BlendRadius::Constant(0.1)))
+            .collect();
+        let mut graph = build(&mut model, &selection).expect("build three-edge selection");
+        compute_setbacks(&model, &mut graph).expect("compute_setbacks");
+
+        // The far endpoint of each of the three blend edges is a
+        // ConvexCorner{degree:1} because no other selected blend edge
+        // touches it. compute_setbacks must skip those — the
+        // corresponding end (the non-shared endpoint) has no setback.
+        for &eid in &edges {
+            let be = graph.edge(eid).expect("BlendEdge present");
+            let edge = model.edges.get(eid).expect("edge present");
+            let setback_at_far = if edge.start_vertex == shared_vertex {
+                be.end_setback
+            } else {
+                be.start_setback
+            };
+            assert!(
+                setback_at_far.is_none(),
+                "degree-1 endpoint must not receive a setback (got {:?})",
+                setback_at_far
+            );
+        }
+    }
+
+    #[test]
+    fn setback_no_op_on_empty_graph() {
+        let model = BRepModel::new();
+        let mut graph = BlendGraph::default();
+        compute_setbacks(&model, &mut graph).expect("empty graph is a no-op");
+        assert!(graph.is_empty());
+    }
+
+    #[test]
+    fn setback_no_op_on_single_edge_selection() {
+        let mut model = build_unit_box();
+        let edge_id: EdgeId = model.edges.iter().next().map(|(id, _)| id).expect("≥ 1 edge");
+        let selection = vec![(edge_id, BlendRadius::Constant(0.1))];
+        let mut graph = build(&mut model, &selection).expect("build single-edge selection");
+        compute_setbacks(&model, &mut graph).expect("single edge: no corner ⇒ no-op");
+
+        let be = graph.edge(edge_id).expect("BlendEdge present");
+        assert!(
+            be.start_setback.is_none() && be.end_setback.is_none(),
+            "single-edge selection: both endpoints are degree-1, so no setbacks"
+        );
+    }
+
+    /// Pair of blend edges meeting at a single right-angle corner
+    /// of the cube. The shared vertex is degree-2; the far endpoints
+    /// are degree-1. Setback at the shared corner is `r·cos(π/4)`;
+    /// the far endpoints stay `None`.
+    #[test]
+    fn two_edge_right_angle_corner_setback() {
+        let mut model = build_unit_box();
+        let (shared_vertex, edges) = edges_sharing_vertex(&model, 2);
+        let r = 0.25_f64;
+        let selection: Vec<_> = edges
+            .iter()
+            .map(|&e| (e, BlendRadius::Constant(r)))
+            .collect();
+        let mut graph = build(&mut model, &selection).expect("build two-edge selection");
+        compute_setbacks(&model, &mut graph).expect("two-edge corner setback");
+
+        let expected = r / 2.0_f64.sqrt();
+        for &eid in &edges {
+            let be = graph.edge(eid).expect("BlendEdge present");
+            let edge = model.edges.get(eid).expect("edge present");
+            let (at_corner, at_far) = if edge.start_vertex == shared_vertex {
+                (be.start_setback, be.end_setback)
+            } else {
+                (be.end_setback, be.start_setback)
+            };
+            let v = at_corner.expect("setback at shared corner");
+            assert!(
+                (v - expected).abs() < 1e-9,
+                "two-edge right-angle setback: expected {}, got {}",
+                expected,
+                v
+            );
+            assert!(at_far.is_none(), "far endpoint must stay None");
+        }
+    }
+
+    /// Per-edge radii differ: each edge's setback uses its own `r`
+    /// (conservative `min_value`) — even when θ_min is shared, the
+    /// stamped values differ.
+    #[test]
+    fn setback_uses_per_edge_radius() {
+        let mut model = build_unit_box();
+        let (shared_vertex, edges) = edges_sharing_vertex(&model, 2);
+        let r0 = 0.10_f64;
+        let r1 = 0.30_f64;
+        let selection = vec![
+            (edges[0], BlendRadius::Constant(r0)),
+            (edges[1], BlendRadius::Constant(r1)),
+        ];
+        let mut graph = build(&mut model, &selection).expect("build per-radius selection");
+        compute_setbacks(&model, &mut graph).expect("compute_setbacks");
+
+        let cos_pi_over_4 = (std::f64::consts::FRAC_PI_4).cos();
+        for (eid, r_expected) in [(edges[0], r0), (edges[1], r1)] {
+            let be = graph.edge(eid).expect("BlendEdge present");
+            let edge = model.edges.get(eid).expect("edge present");
+            let at_corner = if edge.start_vertex == shared_vertex {
+                be.start_setback
+            } else {
+                be.end_setback
+            };
+            let v = at_corner.expect("setback");
+            let expected = r_expected * cos_pi_over_4;
+            assert!(
+                (v - expected).abs() < 1e-9,
+                "per-edge setback: expected {} (= r·cos(π/4)), got {}",
+                expected,
+                v
+            );
+        }
+    }
+
+    /// `vertex_needs_setback` decides which vertex kinds participate
+    /// in setback computation. Pinning the policy makes it explicit
+    /// for downstream readers.
+    #[test]
+    fn vertex_needs_setback_classification() {
+        assert!(!vertex_needs_setback(BlendVertexKind::Smooth));
+        assert!(!vertex_needs_setback(BlendVertexKind::Cliff));
+        assert!(!vertex_needs_setback(
+            BlendVertexKind::ConvexCorner { degree: 1 }
+        ));
+        assert!(!vertex_needs_setback(
+            BlendVertexKind::ConcaveCorner { degree: 1 }
+        ));
+        assert!(vertex_needs_setback(
+            BlendVertexKind::ConvexCorner { degree: 2 }
+        ));
+        assert!(vertex_needs_setback(
+            BlendVertexKind::ConvexCorner { degree: 3 }
+        ));
+        assert!(vertex_needs_setback(
+            BlendVertexKind::ConcaveCorner { degree: 2 }
+        ));
+        assert!(vertex_needs_setback(BlendVertexKind::Mixed));
     }
 
     #[test]
