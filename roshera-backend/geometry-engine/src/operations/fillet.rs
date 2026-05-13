@@ -364,9 +364,26 @@ fn create_constant_radius_fillet(
         return create_closed_edge_fillet(model, edge_id, face1_id, face2_id, radius, radius);
     }
 
-    // Compute rolling ball positions along edge
-    let rolling_ball_data =
-        compute_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, radius)?;
+    // F3-α: try the new analytic spine solver first. For plane/plane
+    // face pairs (the only arm wired in this slice) it returns
+    // `Some(SpineRail)` with an exact straight-line spine and exact
+    // straight-line rails — numerically identical to the legacy
+    // bisector path within 1e-8 by construction. Every other surface
+    // pair returns `None` and we fall through to the legacy bisector
+    // below, which keeps non-plane behaviour untouched until F3-β/γ
+    // wires in cylinder, sphere, and the marching solver.
+    let spine_options = super::spine_solver::SpineOptions::default();
+    let rolling_ball_data = match super::spine_solver::solve_spine_for_edge(
+        model,
+        edge_id,
+        face1_id,
+        face2_id,
+        radius,
+        &spine_options,
+    )? {
+        Some(spine_rail) => rolling_ball_data_from_spine_rail(&spine_rail),
+        None => compute_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, radius)?,
+    };
 
     // Create fillet surface (cylindrical or toroidal patch)
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
@@ -1944,6 +1961,37 @@ struct RollingBallData {
     parameters: Vec<f64>,
     /// Radius at each position
     radii: Vec<f64>,
+}
+
+/// Convert a F3-α [`SpineRail`](super::spine_solver::SpineRail) into the
+/// legacy [`RollingBallData`] shape so the existing downstream pipeline
+/// (`create_rolling_ball_surface`, `compute_fillet_trim_curves`, cap
+/// construction) consumes analytic-arm output without modification.
+///
+/// This is the parallel-deployment bridge: F3-α produces a richer
+/// `SpineRail` (with explicit `solver_kind` + spine/rail curves), but
+/// the downstream code still reads sample arrays. F3-δ will replace
+/// the downstream readers with `SpineRail` consumers directly and
+/// delete this converter.
+fn rolling_ball_data_from_spine_rail(
+    spine_rail: &super::spine_solver::SpineRail,
+) -> RollingBallData {
+    let n = spine_rail.samples.len();
+    let mut data = RollingBallData {
+        centers: Vec::with_capacity(n),
+        contacts1: Vec::with_capacity(n),
+        contacts2: Vec::with_capacity(n),
+        parameters: Vec::with_capacity(n),
+        radii: Vec::with_capacity(n),
+    };
+    for s in &spine_rail.samples {
+        data.parameters.push(s.edge_parameter);
+        data.radii.push(s.radius);
+        data.centers.push(s.center);
+        data.contacts1.push(s.contact_a);
+        data.contacts2.push(s.contact_b);
+    }
+    data
 }
 
 /// Compute rolling ball positions for fillet

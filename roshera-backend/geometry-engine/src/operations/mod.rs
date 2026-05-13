@@ -82,6 +82,15 @@ pub(crate) mod orientation;
 // Recording abstraction (dependency-inversion for timeline / audit log)
 pub mod recorder;
 
+// F3-α spine and rail computation: explicit dispatch on the
+// (face_a, face_b, edge, radius_schedule) tuple. Plane/plane closed
+// form lands here; cylinder/sphere arms follow in F3-β, marching
+// solver in F3-γ. Replaces the always-sampled bisector hack in
+// `fillet::compute_rolling_ball_positions` incrementally — F3-α is
+// parallel-deployment-safe (non-plane/plane requests fall through
+// to the legacy path).
+pub mod spine_solver;
+
 // AI integration
 pub mod ai_operations_registry;
 
