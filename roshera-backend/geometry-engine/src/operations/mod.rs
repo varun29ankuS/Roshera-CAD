@@ -35,6 +35,13 @@ pub mod intersect;
 pub mod project;
 pub mod sew;
 
+// F2-α edge-classification cache: stamps {manifold_kind, dihedral,
+// convexity, smoothness} onto EdgeAttributes at construction time so
+// downstream consumers (blend graph, sewing, healing) can branch on
+// edge topology without re-walking the shell. Public so api-server
+// and timeline-engine can drive the cache lifecycle.
+pub mod edge_classification;
+
 // Internal helpers for boolean face splitting (DCEL-based planar arrangement).
 // Not part of the public API — used by `boolean::split_face_by_curves` only.
 pub(crate) mod face_arrangement;
