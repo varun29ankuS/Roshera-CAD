@@ -1,13 +1,34 @@
 # Roshera CAD — Internal Performance Metrics
 
-Last measured: July 27, 2025
+Last measured: May 13, 2026
 
 These numbers are **internal regression targets** obtained on our own bench
-machine with `cargo bench`. They are **not** claims against any third-party
-CAD kernel. If you want to compare, run the benches on the same hardware
-against your own baseline.
+machine. Math/quaternion/B-spline figures come from `cargo bench`; the
+tessellation table is from `cargo run --release -p geometry-engine
+--example tess_quick` (50-iteration averaged wall-clock, warm cache). They
+are **not** claims against any third-party CAD kernel. If you want to
+compare, run the benches on the same hardware against your own baseline.
 
 ## Measured (internal)
+
+### Tessellation per primitive (release, warm cache, May 13 2026)
+
+50-iter average; reports per-call wall-clock plus mesh size at each REST
+quality preset. `cargo run --release -p geometry-engine --example tess_quick`.
+
+| Shape              | Coarse                | Default               | Fine                  |
+|--------------------|-----------------------|-----------------------|-----------------------|
+| Box 10×10×10       | 11.7 µs (12 tri)      | 10.5 µs (12 tri)      | 10.0 µs (12 tri)      |
+| Sphere r=5         | 641 µs (760 tri)      | 15.6 ms (19 800 tri)  | 49.2 ms (79 600 tri)  |
+| Cylinder r=2,h=5   | 219 µs (436 tri)      | 10.0 ms (10 196 tri)  | 38.9 ms (80 396 tri)  |
+| Cone r=2,h=5       | 192 µs (398 tri)      | 14.8 ms (9 998 tri)   | 53.6 ms (79 998 tri)  |
+| Torus R=5,r=1      | 314 µs (400 tri)      | 8.3 ms (10 000 tri)   | 27.3 ms (40 000 tri)  |
+
+Per-triangle cost at default quality (the path the REST/WS surface uses
+unless the client requests otherwise): ~0.8–1.5 µs/triangle across curved
+primitives. Box is curvature-flat and stays at ~10 µs regardless of
+preset. Internal regression budget of 250 ms / 1M triangles is met by a
+factor of ~3×.
 
 ### Vector3
 | Operation       | Measured (ns) | Rate (ops/sec)  |
