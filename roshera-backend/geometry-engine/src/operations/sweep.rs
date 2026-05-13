@@ -9,6 +9,7 @@
 //! kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::frame::parallel_transport_frames;
 use crate::math::{MathError, Matrix4, Point3, Tolerance, Vector3};
@@ -165,15 +166,23 @@ pub fn sweep_profile(
     // Capture profile edges before they're consumed, for recording.
     let profile_edges_for_record: Vec<u32> = profile.clone();
 
-    // Create face from profile if needed
-    let profile_face = create_profile_face(model, profile)?;
-
-    // Get path curve
+    // Get path curve up-front so we can compute the path tangent at
+    // t = 0 and pass `-tangent` as the start-cap outward target. The
+    // sweep's start cap must point *opposite* the sweep direction
+    // (away from the body of the swept solid), and the end cap —
+    // synthesised later by `create_reversed_face` — must point along
+    // `+tangent_at_end`; flipping a correctly-oriented start cap is
+    // exactly what `create_reversed_face` does, so getting the start
+    // cap right propagates to the end cap by construction.
     let path_edge = model
         .edges
         .get(path)
         .ok_or_else(|| OperationError::InvalidGeometry("Path edge not found".to_string()))?
         .clone();
+    let start_outward_target = sweep_start_cap_outward(model, &path_edge)?;
+
+    // Create face from profile
+    let profile_face = create_profile_face(model, profile, start_outward_target)?;
 
     // Create swept solid based on sweep type
     let solid_id = match options.sweep_type {
@@ -737,7 +746,16 @@ fn get_section_vertex_ring(
     Ok(ring)
 }
 
-/// Create lateral faces between sections
+/// Create lateral faces between sections.
+///
+/// Each quad's outward target is the radial direction from the
+/// sweep-axis midpoint (mean of the two section centroids) to the
+/// quad's own centroid. This places the oriented normal away from
+/// the swept solid's interior, satisfying the kernel-wide outward-
+/// normal invariant maintained by `orient_face_for_outward`. Sections
+/// that collapse to a point (zero-radius profile, degenerate sweep)
+/// fall back to the quad's geometric normal so the orientation pick
+/// remains deterministic.
 fn create_lateral_faces(
     model: &mut BRepModel,
     section1: &SweepSection,
@@ -752,26 +770,99 @@ fn create_lateral_faces(
     let mut faces = Vec::new();
     let n = section1.vertices.len();
 
+    // Compute the section centroids and the midline between them. The
+    // per-quad radial direction is anchored to this midline so every
+    // lateral face's outward target points away from the swept solid.
+    let centroid1 = section_centroid(model, section1)?;
+    let centroid2 = section_centroid(model, section2)?;
+    let axis_mid = (centroid1 + centroid2) * 0.5;
+
     for i in 0..n {
         let v1 = section1.vertices[i];
         let v2 = section1.vertices[(i + 1) % n];
         let v3 = section2.vertices[(i + 1) % n];
         let v4 = section2.vertices[i];
 
-        let face = create_quad_face(model, v1, v2, v3, v4)?;
+        let p1 = Vector3::from(
+            model
+                .vertices
+                .get(v1)
+                .ok_or_else(|| OperationError::InvalidGeometry("v1 not found".to_string()))?
+                .position,
+        );
+        let p2 = Vector3::from(
+            model
+                .vertices
+                .get(v2)
+                .ok_or_else(|| OperationError::InvalidGeometry("v2 not found".to_string()))?
+                .position,
+        );
+        let p3 = Vector3::from(
+            model
+                .vertices
+                .get(v3)
+                .ok_or_else(|| OperationError::InvalidGeometry("v3 not found".to_string()))?
+                .position,
+        );
+        let p4 = Vector3::from(
+            model
+                .vertices
+                .get(v4)
+                .ok_or_else(|| OperationError::InvalidGeometry("v4 not found".to_string()))?
+                .position,
+        );
+        let quad_centroid = (p1 + p2 + p3 + p4) * 0.25;
+        let radial = quad_centroid - axis_mid;
+        // Geometric fallback normal — the bilinear-patch's mid-uv normal.
+        let fallback = (p2 - p1).cross(&(p4 - p1));
+        let outward_target = if radial.magnitude_squared() > 1e-20 {
+            radial
+        } else if fallback.magnitude_squared() > 1e-20 {
+            fallback
+        } else {
+            Vector3::Z
+        };
+
+        let face = create_quad_face(model, v1, v2, v3, v4, outward_target)?;
         faces.push(face);
     }
 
     Ok(faces)
 }
 
-/// Create a quadrilateral face
+/// Mean position of all vertices in a sweep section.
+fn section_centroid(model: &BRepModel, section: &SweepSection) -> OperationResult<Vector3> {
+    if section.vertices.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "Sweep section has no vertices".to_string(),
+        ));
+    }
+    let mut sum = Vector3::ZERO;
+    for &vid in &section.vertices {
+        let v = model
+            .vertices
+            .get(vid)
+            .ok_or_else(|| OperationError::InvalidGeometry("Section vertex not found".to_string()))?;
+        sum = sum + Vector3::from(v.position);
+    }
+    Ok(sum * (1.0 / section.vertices.len() as f64))
+}
+
+/// Create a quadrilateral face whose oriented outward normal aligns
+/// with `outward_target`.
+///
+/// The caller is responsible for computing a meaningful outward
+/// direction (typically the radial vector from the sweep midline to
+/// the quad centroid). The orientation pick uses
+/// `orient_face_for_outward` against the bilinear-patch's parametric-
+/// midpoint normal.
 fn create_quad_face(
     model: &mut BRepModel,
     v1: VertexId,
     v2: VertexId,
     v3: VertexId,
     v4: VertexId,
+    outward_target: Vector3,
 ) -> OperationResult<FaceId> {
     // Create edges
     let e1 = create_or_find_edge(model, v1, v2)?;
@@ -792,6 +883,7 @@ fn create_quad_face(
 
     // Create surface (bilinear patch)
     let surface = create_bilinear_surface(model, v1, v2, v3, v4)?;
+    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
     let surface_id = model.surfaces.add(surface);
 
     // Create face
@@ -799,7 +891,7 @@ fn create_quad_face(
         0, // ID will be assigned by store
         surface_id,
         loop_id,
-        FaceOrientation::Forward,
+        orientation,
     );
 
     Ok(model.faces.add(face))
@@ -890,13 +982,49 @@ fn create_bilinear_surface(
     Ok(Box::new(RuledSurface::new(bottom, top)))
 }
 
+/// Compute the outward-target direction for the start cap of a sweep.
+///
+/// Geometrically, the start cap is the back face of the swept solid —
+/// its oriented normal must point *away* from the sweep direction.
+/// We sample the path's unit tangent at t = 0 and return its negation.
+/// A degenerate path (zero-length tangent) is rejected because the
+/// sweep cannot proceed.
+fn sweep_start_cap_outward(
+    model: &BRepModel,
+    path_edge: &Edge,
+) -> OperationResult<Vector3> {
+    let curve = model
+        .curves
+        .get(path_edge.curve_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Path curve not found".to_string()))?;
+    let curve_t = path_edge.edge_to_curve_parameter(0.0);
+    let derivs = curve.evaluate_derivatives(curve_t, 1)?;
+    let tangent = derivs
+        .get(1)
+        .ok_or_else(|| OperationError::InvalidGeometry("Path tangent unavailable".to_string()))?;
+    if tangent.magnitude_squared() < 1e-20 {
+        return Err(OperationError::InvalidGeometry(
+            "Path tangent at start is degenerate".to_string(),
+        ));
+    }
+    Ok(-(tangent.normalize()?))
+}
+
 /// Create profile face from edges.
 ///
 /// Constructs a planar surface fitted to the profile's actual vertex
 /// positions rather than defaulting to the XY plane — sweeping a circle
 /// in the YZ plane (e.g. profile normal = +X) would otherwise collapse to
 /// a degenerate strip when projected onto Z = 0.
-fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationResult<FaceId> {
+///
+/// `outward_target` is the geometric direction the face's oriented
+/// outward normal must align with. For a sweep start cap this is
+/// `-path_tangent_at_start`.
+fn create_profile_face(
+    model: &mut BRepModel,
+    edges: Vec<EdgeId>,
+    outward_target: Vector3,
+) -> OperationResult<FaceId> {
     use crate::primitives::surface::Plane;
 
     // Collect sample points from each edge in loop order. For straight-edge
@@ -990,6 +1118,7 @@ fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationRe
     let loop_id = model.loops.add(profile_loop);
 
     let surface: Box<dyn Surface> = Box::new(plane);
+    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
     let surface_id = model.surfaces.add(surface);
 
     // Create face
@@ -997,7 +1126,7 @@ fn create_profile_face(model: &mut BRepModel, edges: Vec<EdgeId>) -> OperationRe
         0, // ID will be assigned by store
         surface_id,
         loop_id,
-        FaceOrientation::Forward,
+        orientation,
     );
 
     Ok(model.faces.add(face))
@@ -1310,7 +1439,8 @@ mod tests {
         let v2 = model.vertices.add(1.0, 0.0, 0.0);
         let v3 = model.vertices.add(1.0, 1.0, 0.0);
         let v4 = model.vertices.add(0.0, 1.0, 0.0);
-        let face_id = create_quad_face(&mut model, v1, v2, v3, v4).expect("face");
+        let face_id =
+            create_quad_face(&mut model, v1, v2, v3, v4, Vector3::Z).expect("face");
         let face = model.faces.get(face_id).expect("face in store");
         let outer = model.loops.get(face.outer_loop).expect("loop");
         assert_eq!(outer.edges.len(), 4);
@@ -1363,7 +1493,8 @@ mod tests {
         let v2 = model.vertices.add(1.0, 0.0, 0.0);
         let v3 = model.vertices.add(1.0, 1.0, 0.0);
         let v4 = model.vertices.add(0.0, 1.0, 0.0);
-        let face_id = create_quad_face(&mut model, v1, v2, v3, v4).expect("face");
+        let face_id =
+            create_quad_face(&mut model, v1, v2, v3, v4, Vector3::Z).expect("face");
         let original_orientation = model.faces.get(face_id).expect("face").orientation;
         let reversed_id = create_reversed_face(&mut model, face_id).expect("reversed");
         let reversed_orientation = model.faces.get(reversed_id).expect("reversed face").orientation;
@@ -1385,7 +1516,7 @@ mod tests {
     fn create_profile_face_from_rectangle_succeeds() {
         let mut model = BRepModel::new();
         let edges = make_unit_square(&mut model);
-        let face_id = create_profile_face(&mut model, edges).expect("face");
+        let face_id = create_profile_face(&mut model, edges, Vector3::Z).expect("face");
         assert!(model.faces.get(face_id).is_some());
     }
 
@@ -1396,7 +1527,7 @@ mod tests {
         let v0 = model.vertices.add(0.0, 0.0, 0.0);
         let v1 = model.vertices.add(1.0, 0.0, 0.0);
         let e0 = add_line_edge(&mut model, v0, v1);
-        let result = create_profile_face(&mut model, vec![e0, e0]);
+        let result = create_profile_face(&mut model, vec![e0, e0], Vector3::Z);
         // Two edges = 2 distinct start positions only; below the 3-point threshold.
         assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
     }
@@ -1412,14 +1543,14 @@ mod tests {
         let e0 = add_line_edge(&mut model, v0, v1);
         let e1 = add_line_edge(&mut model, v1, v2);
         let e2 = add_line_edge(&mut model, v2, v3);
-        let result = create_profile_face(&mut model, vec![e0, e1, e2]);
+        let result = create_profile_face(&mut model, vec![e0, e1, e2], Vector3::Z);
         assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
     }
 
     #[test]
     fn create_profile_face_rejects_unknown_edge() {
         let mut model = BRepModel::new();
-        let result = create_profile_face(&mut model, vec![9999]);
+        let result = create_profile_face(&mut model, vec![9999], Vector3::Z);
         assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
     }
 

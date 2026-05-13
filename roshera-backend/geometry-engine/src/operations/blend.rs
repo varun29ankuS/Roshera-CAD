@@ -9,11 +9,12 @@
 //! pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Point3, Tolerance};
+use crate::math::{Point3, Vector3, Tolerance};
 use crate::primitives::{
     edge::{Edge, EdgeId},
-    face::{Face, FaceId, FaceOrientation},
+    face::{Face, FaceId},
     r#loop::Loop,
     surface::Surface,
     topology_builder::BRepModel,
@@ -164,7 +165,7 @@ fn create_g1_blend(
     let surface_id = model.surfaces.add(blend_surface);
 
     // Create blend face
-    let blend_face = create_blend_face(model, surface_id, curve1, curve2)?;
+    let blend_face = create_blend_face(model, surface_id, face1, face2, curve1, curve2)?;
 
     Ok(vec![blend_face])
 }
@@ -196,7 +197,7 @@ fn create_g2_blend(
     }
     let blend_surface = create_hermite_blend_surface(model, face1, face2, curve1, curve2, 3)?;
     let surface_id = model.surfaces.add(blend_surface);
-    let blend_face = create_blend_face(model, surface_id, curve1, curve2)?;
+    let blend_face = create_blend_face(model, surface_id, face1, face2, curve1, curve2)?;
     Ok(vec![blend_face])
 }
 
@@ -225,7 +226,7 @@ fn create_g3_blend(
     }
     let blend_surface = create_hermite_blend_surface(model, face1, face2, curve1, curve2, 5)?;
     let surface_id = model.surfaces.add(blend_surface);
-    let blend_face = create_blend_face(model, surface_id, curve1, curve2)?;
+    let blend_face = create_blend_face(model, surface_id, face1, face2, curve1, curve2)?;
     Ok(vec![blend_face])
 }
 
@@ -289,7 +290,7 @@ fn create_conic_blend(
     // Build a loft surface where each cross-section is a weighted conic blend
     let blend_surface = create_conic_blend_surface(curve1, curve2, rho)?;
     let surface_id = model.surfaces.add(blend_surface);
-    let blend_face = create_blend_face(model, surface_id, curve1, curve2)?;
+    let blend_face = create_blend_face(model, surface_id, face1, face2, curve1, curve2)?;
     Ok(vec![blend_face])
 }
 
@@ -482,11 +483,18 @@ fn create_ruled_blend_surface(
     Ok(Box::new(ruled))
 }
 
-/// Create blend face with proper boundaries
+/// Create blend face with proper boundaries.
+///
+/// The outward orientation is the bisector of the two adjacent face
+/// normals at their parametric midpoints — the blend bridges face1 and
+/// face2, so its outward direction is geometrically (n1 + n2) / 2.
+/// Slice 2 of the comprehensive face-orientation fix.
 #[allow(clippy::expect_used)] // curve1/curve2 non-empty: validated at blend_faces entry point
 fn create_blend_face(
     model: &mut BRepModel,
     surface_id: u32,
+    face1: &Face,
+    face2: &Face,
     curve1: &[Point3],
     curve2: &[Point3],
 ) -> OperationResult<FaceId> {
@@ -515,16 +523,48 @@ fn create_blend_face(
     blend_loop.add_edge(edge4, true);
     let loop_id = model.loops.add(blend_loop);
 
+    // Compute outward target: bisector of the two adjacent face normals
+    // sampled at their parametric midpoints. The blend face bridges
+    // face1 and face2; its outward direction is the average of the
+    // two underlying outward normals.
+    let n1 = face_outward_normal_mid(model, face1)?;
+    let n2 = face_outward_normal_mid(model, face2)?;
+    let outward_target = n1 + n2;
+    let blend_surface_ref = model
+        .surfaces
+        .get(surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Blend surface not found".into()))?;
+    let orientation = orient_face_for_outward(blend_surface_ref, outward_target)?;
+
     // Create face
     let face = Face::new(
         0, // Will be assigned by store
         surface_id,
         loop_id,
-        FaceOrientation::Forward,
+        orientation,
     );
     let face_id = model.faces.add(face);
 
     Ok(face_id)
+}
+
+/// Sample the outward-facing normal of `face` at its parametric midpoint.
+///
+/// Combines the surface's intrinsic normal with the face's stored
+/// orientation sign — so the returned vector is guaranteed to be the
+/// outward-pointing normal (out of the solid material) for already-
+/// correctly-oriented faces. Used by `create_blend_face` to derive an
+/// outward target for the new blend surface.
+fn face_outward_normal_mid(model: &BRepModel, face: &Face) -> OperationResult<Vector3> {
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face surface not found".into()))?;
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let u_mid = 0.5 * (u_min + u_max);
+    let v_mid = 0.5 * (v_min + v_max);
+    let n = surface.normal_at(u_mid, v_mid)?;
+    Ok(n * face.orientation.sign())
 }
 
 /// Create an edge whose underlying curve is a NURBS fit through `points`.

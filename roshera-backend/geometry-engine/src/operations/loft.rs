@@ -9,6 +9,7 @@
 //! sample density. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Vector3};
 use crate::primitives::{
@@ -148,14 +149,21 @@ fn create_linear_loft(
     options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     let mut shell_faces = Vec::new();
+    let num_profiles = profiles.len();
 
-    // Add bottom cap if creating solid
+    // Add bottom cap if creating solid. The cap's oriented outward normal
+    // must point AWAY from the loft body, which is the direction from
+    // profile[1]'s centroid to profile[0]'s centroid (i.e., backwards
+    // along the loft progression direction at the first profile).
     if options.create_solid && !options.closed {
-        shell_faces.push(profiles[0]);
+        let c0 = face_centroid(model, profiles[0])?;
+        let c1 = face_centroid(model, profiles[1])?;
+        let outward_target = c0 - c1;
+        let bottom_cap = create_cap_face_outward_oriented(model, &profiles[0], outward_target)?;
+        shell_faces.push(bottom_cap);
     }
 
     // Create lateral faces between adjacent profiles
-    let num_profiles = profiles.len();
     let profile_pairs: Vec<(usize, usize)> = if options.closed {
         (0..num_profiles)
             .map(|i| (i, (i + 1) % num_profiles))
@@ -170,16 +178,21 @@ fn create_linear_loft(
         shell_faces.extend(lateral_faces);
     }
 
-    // Add top cap if creating solid
+    // Add top cap if creating solid. Its oriented outward normal must
+    // point AWAY from the loft body, i.e., from profile[N-2]'s centroid
+    // toward profile[N-1]'s centroid (forward along the loft direction
+    // at the last profile).
     if options.create_solid && !options.closed {
         // `profiles.last()` is guaranteed Some: loft construction
-        // requires ≥2 profiles (validated at entry), and the enclosing
-        // loop has already iterated over them.
-        let last_profile = profiles
+        // requires ≥2 profiles (validated at entry).
+        let last_profile = *profiles
             .last()
             .expect("loft: profiles validated non-empty at entry (≥2 required)");
-        let top_face = create_reversed_face(model, last_profile)?;
-        shell_faces.push(top_face);
+        let c_last = face_centroid(model, last_profile)?;
+        let c_prev = face_centroid(model, profiles[num_profiles - 2])?;
+        let outward_target = c_last - c_prev;
+        let top_cap = create_cap_face_outward_oriented(model, &last_profile, outward_target)?;
+        shell_faces.push(top_cap);
     }
 
     // Create shell and solid
@@ -342,14 +355,26 @@ fn create_cubic_loft(
     // Build lateral faces between consecutive rings using ruled surfaces
     let mut shell_faces: Vec<FaceId> = Vec::new();
 
+    // Add bottom cap if creating solid. Outward target points from the
+    // second-ring centroid back toward the first profile — i.e., away
+    // from the loft body at its entry end.
     if options.create_solid && !options.closed {
-        shell_faces.push(profiles[0]);
+        let c0 = face_centroid(model, profiles[0])?;
+        let c1 = ring_centroid(model, &rings[1])?;
+        let outward_target = c0 - c1;
+        let bottom_cap = create_cap_face_outward_oriented(model, &profiles[0], outward_target)?;
+        shell_faces.push(bottom_cap);
     }
 
     for ri in 0..total_rings - 1 {
         let r0 = &rings[ri];
         let r1 = &rings[ri + 1];
         let n = r0.len();
+        // Per-ring-pair midline anchor for radial-outward computation.
+        let centroid_r0 = ring_centroid(model, r0)?;
+        let centroid_r1 = ring_centroid(model, r1)?;
+        let axis_mid = (centroid_r0 + centroid_r1) * 0.5;
+
         for vi in 0..n {
             let v00 = r0[vi];
             let v10 = r0[(vi + 1) % n];
@@ -377,6 +402,11 @@ fn create_cubic_loft(
                 .map(|v| v.position)
                 .unwrap_or([0.0; 3]);
 
+            let p00 = Vector3::new(pos00[0], pos00[1], pos00[2]);
+            let p10 = Vector3::new(pos10[0], pos10[1], pos10[2]);
+            let p01 = Vector3::new(pos01[0], pos01[1], pos01[2]);
+            let p11 = Vector3::new(pos11[0], pos11[1], pos11[2]);
+
             let c1 = Box::new(Line::new(
                 Point3::new(pos00[0], pos00[1], pos00[2]),
                 Point3::new(pos10[0], pos10[1], pos10[2]),
@@ -386,7 +416,23 @@ fn create_cubic_loft(
                 Point3::new(pos11[0], pos11[1], pos11[2]),
             ));
             let surface = RuledSurface::new(c1, c2);
-            let surface_id = model.surfaces.add(Box::new(surface));
+
+            // Outward target: radial from the loft midline at this quad.
+            let quad_centroid = (p00 + p10 + p01 + p11) * 0.25;
+            let radial = quad_centroid - axis_mid;
+            let outward_target = if radial.magnitude_squared() > 1e-20 {
+                radial
+            } else {
+                let fallback = (p10 - p00).cross(&(p01 - p00));
+                if fallback.magnitude_squared() > 1e-20 {
+                    fallback
+                } else {
+                    Vector3::Z
+                }
+            };
+            let surface_box: Box<dyn Surface> = Box::new(surface);
+            let orientation = orient_face_for_outward(surface_box.as_ref(), outward_target)?;
+            let surface_id = model.surfaces.add(surface_box);
 
             let e0 = create_or_find_edge(model, v00, v10)?;
             let e1 = create_or_find_edge(model, v10, v11)?;
@@ -401,17 +447,23 @@ fn create_cubic_loft(
             face_loop.add_edge(e3, true);
             let loop_id = model.loops.add(face_loop);
 
-            let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+            let face = Face::new(0, surface_id, loop_id, orientation);
             shell_faces.push(model.faces.add(face));
         }
     }
 
+    // Add top cap if creating solid. Outward target points from the
+    // penultimate ring's centroid toward the last profile's centroid —
+    // away from the loft body at its exit end.
     if options.create_solid && !options.closed {
-        let last_profile = profiles
+        let last_profile = *profiles
             .last()
             .expect("loft: profiles validated non-empty at entry (≥2 required)");
-        let top_face = create_reversed_face(model, last_profile)?;
-        shell_faces.push(top_face);
+        let c_last = face_centroid(model, last_profile)?;
+        let c_prev = ring_centroid(model, &rings[total_rings - 2])?;
+        let outward_target = c_last - c_prev;
+        let top_cap = create_cap_face_outward_oriented(model, &last_profile, outward_target)?;
+        shell_faces.push(top_cap);
     }
 
     let shell_type = if options.create_solid {
@@ -668,7 +720,11 @@ fn create_guided_loft(
     let mut shell_faces: Vec<FaceId> = Vec::new();
 
     if options.create_solid && !options.closed {
-        shell_faces.push(profiles[0]);
+        let c0 = face_centroid(model, profiles[0])?;
+        let c1 = face_centroid(model, profiles[1])?;
+        let outward_target = c0 - c1;
+        let bottom_cap = create_cap_face_outward_oriented(model, &profiles[0], outward_target)?;
+        shell_faces.push(bottom_cap);
     }
 
     let profile_pairs: Vec<(usize, usize)> = if options.closed {
@@ -689,11 +745,14 @@ fn create_guided_loft(
     }
 
     if options.create_solid && !options.closed {
-        let last_profile = profiles
+        let last_profile = *profiles
             .last()
             .expect("loft: profiles validated non-empty at entry (≥2 required)");
-        let top_face = create_reversed_face(model, last_profile)?;
-        shell_faces.push(top_face);
+        let c_last = face_centroid(model, last_profile)?;
+        let c_prev = face_centroid(model, profiles[num_profiles - 2])?;
+        let outward_target = c_last - c_prev;
+        let top_cap = create_cap_face_outward_oriented(model, &last_profile, outward_target)?;
+        shell_faces.push(top_cap);
     }
 
     let shell_type = if options.create_solid {
@@ -711,7 +770,14 @@ fn create_guided_loft(
     Ok(model.solids.add(solid))
 }
 
-/// Create ruled surfaces between two profiles
+/// Create ruled surfaces between two profiles.
+///
+/// Each lateral quad face's outward target is computed as the radial
+/// direction from the loft midline (mean of the two profile centroids)
+/// to the quad's own centroid. If the radial component is degenerate
+/// (the quad straddles the midline, < 1e-20 magnitude) we fall back to
+/// the diagonal cross-product of the quad as a sensible local outward
+/// approximation, and finally to `Vector3::Z` only if both are zero.
 fn create_ruled_surfaces_between_profiles(
     model: &mut BRepModel,
     vertices1: &[VertexId],
@@ -724,6 +790,12 @@ fn create_ruled_surfaces_between_profiles(
     let mut faces = Vec::new();
     let n = vertices1.len();
 
+    // Compute each ring's centroid; their midpoint is the loft midline
+    // anchor used for radial-outward computation per quad.
+    let centroid1 = ring_centroid(model, vertices1)?;
+    let centroid2 = ring_centroid(model, vertices2)?;
+    let axis_mid = (centroid1 + centroid2) * 0.5;
+
     // Create a face between each pair of corresponding edges
     for i in 0..n {
         let v1_start = vertices1[i];
@@ -731,20 +803,72 @@ fn create_ruled_surfaces_between_profiles(
         let v2_start = vertices2[i];
         let v2_end = vertices2[(i + 1) % n];
 
-        let face_id = create_ruled_face(model, v1_start, v1_end, v2_start, v2_end)?;
+        let p1 = vertex_position(model, v1_start)?;
+        let p2 = vertex_position(model, v1_end)?;
+        let p3 = vertex_position(model, v2_start)?;
+        let p4 = vertex_position(model, v2_end)?;
+        let quad_centroid = (p1 + p2 + p3 + p4) * 0.25;
+        let radial = quad_centroid - axis_mid;
+        let outward_target = if radial.magnitude_squared() > 1e-20 {
+            radial
+        } else {
+            let fallback = (p2 - p1).cross(&(p3 - p1));
+            if fallback.magnitude_squared() > 1e-20 {
+                fallback
+            } else {
+                Vector3::Z
+            }
+        };
+
+        let face_id =
+            create_ruled_face(model, v1_start, v1_end, v2_start, v2_end, outward_target)?;
         faces.push(face_id);
     }
 
     Ok(faces)
 }
 
-/// Create a ruled face between four vertices
+/// Compute the centroid of a vertex ring as the mean of vertex positions.
+fn ring_centroid(model: &BRepModel, vertices: &[VertexId]) -> OperationResult<Vector3> {
+    if vertices.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "Cannot compute ring centroid from empty vertex list".to_string(),
+        ));
+    }
+    let mut sum = Vector3::ZERO;
+    for &vid in vertices {
+        sum = sum + vertex_position(model, vid)?;
+    }
+    Ok(sum * (1.0 / vertices.len() as f64))
+}
+
+/// Helper: look up a vertex's position as a `Vector3`.
+fn vertex_position(model: &BRepModel, vid: VertexId) -> OperationResult<Vector3> {
+    let v = model
+        .vertices
+        .get(vid)
+        .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
+    Ok(Vector3::from(v.position))
+}
+
+/// Create a ruled face between four vertices.
+///
+/// `outward_target` is the geometric direction in which the face's oriented
+/// outward normal must point (away from the solid material). The function
+/// constructs the bilinear NURBS surface, samples its intrinsic normal at
+/// the parametric midpoint, and picks `FaceOrientation::Forward` or
+/// `Backward` so that `surface.normal_at × orientation.sign()` aligns
+/// with `outward_target`. This is required because the bilinear
+/// surface's intrinsic normal direction depends on the corner-vertex
+/// ordering (u × v), which is itself derived from the loft profile
+/// correspondence and is not constrained to point outward.
 fn create_ruled_face(
     model: &mut BRepModel,
     v1_start: VertexId,
     v1_end: VertexId,
     v2_start: VertexId,
     v2_end: VertexId,
+    outward_target: Vector3,
 ) -> OperationResult<FaceId> {
     // Create edges
     let edge1 = create_or_find_edge(model, v1_start, v1_end)?;
@@ -765,6 +889,7 @@ fn create_ruled_face(
 
     // Create ruled surface
     let surface = create_bilinear_surface(model, v1_start, v1_end, v2_start, v2_end)?;
+    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
     let surface_id = model.surfaces.add(surface);
 
     // Create face
@@ -772,7 +897,7 @@ fn create_ruled_face(
         0, // ID will be assigned by store
         surface_id,
         loop_id,
-        FaceOrientation::Forward,
+        orientation,
     );
     let face_id = model.faces.add(face);
 
@@ -1127,7 +1252,14 @@ fn compute_planar_surface(
     Ok(Box::new(plane))
 }
 
-/// Create a reversed copy of a face
+/// Create a reversed copy of a face.
+///
+/// Used by tests and as a fallback when explicit outward-orientation
+/// data is unavailable. Production cap-construction paths use
+/// [`create_cap_face_outward_oriented`] instead, which picks the
+/// `FaceOrientation` deterministically from the surface's intrinsic
+/// normal and a caller-supplied outward target — making the result
+/// independent of the input face's pre-existing orientation flag.
 fn create_reversed_face(model: &mut BRepModel, face_id: &FaceId) -> OperationResult<FaceId> {
     let face = model
         .faces
@@ -1143,6 +1275,52 @@ fn create_reversed_face(model: &mut BRepModel, face_id: &FaceId) -> OperationRes
     };
 
     Ok(model.faces.add(reversed_face))
+}
+
+/// Clone a profile face into a new face whose orientation is picked so
+/// that the oriented outward normal aligns with `outward_target`.
+///
+/// The profile face was created by `create_planar_face_from_edges` with
+/// a (default) `FaceOrientation::Forward` stamp that does not encode
+/// outward direction — the planar surface's intrinsic normal comes from
+/// Newell's-method winding and depends on the profile vertex ordering.
+/// This helper samples the surface normal at its parametric midpoint
+/// and returns a fresh face whose orientation makes
+/// `surface.normal_at × orientation.sign()` align with the caller's
+/// geometric outward target.
+fn create_cap_face_outward_oriented(
+    model: &mut BRepModel,
+    profile_face_id: &FaceId,
+    outward_target: Vector3,
+) -> OperationResult<FaceId> {
+    let face = model
+        .faces
+        .get(*profile_face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Profile face not found".to_string()))?
+        .clone();
+    let surface = model
+        .surfaces
+        .get(face.surface_id)
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry("Profile surface not found".to_string())
+        })?;
+    let orientation = orient_face_for_outward(surface, outward_target)?;
+    let mut cap_face = face;
+    cap_face.id = 0; // ID will be assigned by store
+    cap_face.orientation = orientation;
+    Ok(model.faces.add(cap_face))
+}
+
+/// Compute the centroid of a face by averaging its outer loop's vertex
+/// positions. Used to derive cap outward directions from inter-profile
+/// geometry (bottom cap outward = profile[0]_centroid − profile[1]_centroid).
+fn face_centroid(model: &BRepModel, face_id: FaceId) -> OperationResult<Vector3> {
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+    let vertices = get_ordered_vertices_from_face(model, face)?;
+    ring_centroid(model, &vertices)
 }
 
 /// Establish vertex correspondence between profiles
@@ -1584,7 +1762,8 @@ mod tests {
         let v1e = model.vertices.add(1.0, 0.0, 0.0);
         let v2s = model.vertices.add(0.0, 0.0, 1.0);
         let v2e = model.vertices.add(1.0, 0.0, 1.0);
-        let face_id = create_ruled_face(&mut model, v1s, v1e, v2s, v2e).expect("face");
+        let face_id =
+            create_ruled_face(&mut model, v1s, v1e, v2s, v2e, Vector3::Z).expect("face");
         let face = model.faces.get(face_id).expect("face");
         let outer = model.loops.get(face.outer_loop).expect("loop");
         assert_eq!(outer.edges.len(), 4);
@@ -1627,7 +1806,8 @@ mod tests {
         let v10 = model.vertices.add(1.0, 0.0, 0.0);
         let v01 = model.vertices.add(0.0, 1.0, 0.0);
         let v11 = model.vertices.add(1.0, 1.0, 0.0);
-        let face_id = create_ruled_face(&mut model, v00, v10, v01, v11).expect("face");
+        let face_id =
+            create_ruled_face(&mut model, v00, v10, v01, v11, Vector3::Z).expect("face");
         let original = model.faces.get(face_id).expect("face").orientation;
         let reversed_id = create_reversed_face(&mut model, &face_id).expect("reversed");
         let reversed = model.faces.get(reversed_id).expect("reversed").orientation;

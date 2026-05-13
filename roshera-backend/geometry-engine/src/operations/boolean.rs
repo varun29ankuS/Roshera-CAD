@@ -5735,13 +5735,20 @@ fn build_shells_from_faces(
 
             let loop_id = model.loops.add(face_loop);
 
+            // Inherit the parent face's orientation: the split is on the
+            // same surface, in the same parametric region, so the outward
+            // direction of the parent is the outward direction of every
+            // split piece. Falls back to Forward if the parent was already
+            // removed from the store. Slice 2 of the comprehensive
+            // face-orientation fix.
+            let inherited_orientation = model
+                .faces
+                .get(split_face.original_face)
+                .map(|f| f.orientation)
+                .unwrap_or(crate::primitives::face::FaceOrientation::Forward);
+
             // Create face with surface and loop
-            let face = Face::new(
-                0,
-                split_face.surface,
-                loop_id,
-                crate::primitives::face::FaceOrientation::Forward,
-            );
+            let face = Face::new(0, split_face.surface, loop_id, inherited_orientation);
             let face_id = model.faces.add(face);
 
             shell.add_face(face_id);
