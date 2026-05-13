@@ -145,14 +145,16 @@ fn empty_sketch_solve_is_a_no_op_with_valid_report() {
 }
 
 #[test]
-fn unsupported_kinds_are_surfaced_as_entity_refs() {
-    // Rectangles, ellipses, and splines are all supported by the
-    // solver now (C-2, C-3, C-4); only polylines remain unsupported
-    // (C-5 pending). The bridge must still surface a stable
-    // `entities_skipped` contract for any kind it cannot register.
+fn every_kind_is_supported_after_c5() {
+    // As of slice C-5 every sketch-entity kind (Point, Line, Circle,
+    // Arc, Rectangle, Ellipse, Spline, Polyline) has a solver
+    // registration arm, so `entities_skipped` is empty regardless of
+    // mixture. The `entities_skipped` contract itself is preserved
+    // so a future new kind can be surfaced through the same channel
+    // without re-introducing the plumbing.
     let sketch = fresh();
     let _p = sketch.add_point(Point2d::new(0.0, 0.0));
-    let poly_id = sketch
+    let _poly_id = sketch
         .add_polyline(
             vec![
                 Point2d::new(0.0, 0.0),
@@ -164,11 +166,10 @@ fn unsupported_kinds_are_surfaced_as_entity_refs() {
         .expect("polyline");
 
     let report = sketch.solve_constraints().expect("solve");
-    assert_eq!(report.entities_solved, 1);
-    assert_eq!(report.skipped_count(), 1);
-    // The polyline's id is surfaced verbatim so UI layers can
-    // highlight specifically which entity went unsolved.
-    assert_eq!(report.entities_skipped, vec![EntityRef::Polyline(poly_id)]);
+    // 1 point + 1 polyline = 2 supported, 0 skipped.
+    assert_eq!(report.entities_solved, 2);
+    assert_eq!(report.skipped_count(), 0);
+    assert!(report.entities_skipped.is_empty());
 }
 
 #[test]
@@ -498,17 +499,12 @@ fn drag_preserves_entity_id_after_call() {
 }
 
 #[test]
-fn analyze_dofs_flags_constraints_skipped_when_unsupported_kinds_touched() {
-    // The DOF verdict must remain honest when the sketch contains
-    // entity kinds slice B-2 cannot analyse. Counting their
-    // constraints while excluding their free DOFs would produce
-    // a phantom over-constraint; the bridge instead surfaces a
-    // `constraints_skipped > 0` flag so the UI can warn.
-    //
-    // Rectangles/ellipses/splines are all analysed now (C-2/C-3/C-4);
-    // polylines (C-5) are the remaining unsupported kind, so the
-    // test exercises the skip path through a constraint that
-    // references a polyline.
+fn analyze_dofs_counts_polyline_constraints_after_c5() {
+    // After slice C-5, polylines are first-class solver entities;
+    // constraints touching them no longer go through the skip path.
+    // A 3-vertex polyline contributes 2 × 3 = 6 free DOFs; adding
+    // a Coincident(Point, Polyline) constraint removes 2 DOFs (xy
+    // coincidence). 2 (point) + 6 (polyline) - 2 (coincident) = 6.
     let sketch = fresh();
     let p = sketch.add_point(Point2d::new(0.0, 0.0));
     let poly = sketch
@@ -528,11 +524,13 @@ fn analyze_dofs_flags_constraints_skipped_when_unsupported_kinds_touched() {
     ));
 
     let dof = sketch.analyze_dofs();
-    assert!(dof.has_skipped_constraints());
-    assert_eq!(dof.constraints_skipped, 1);
-    assert_eq!(dof.constraints_analysed, 0);
-    // Verdict reflects the supported subset only: 2 free DOFs on
-    // the point, 0 removed (constraint filtered out).
+    assert!(!dof.has_skipped_constraints());
+    assert_eq!(dof.constraints_skipped, 0);
+    assert_eq!(dof.constraints_analysed, 1);
+    // 2 (point) + 6 (polyline) = 8 free DOFs.
+    assert_eq!(dof.total_free_dofs, 8);
+    // Coincident removes 2 DOFs (X and Y).
+    assert_eq!(dof.constraint_dofs_removed, 2);
     assert!(dof.is_under_constrained());
-    assert_eq!(dof.remaining_dofs(), Some(2));
+    assert_eq!(dof.remaining_dofs(), Some(6));
 }

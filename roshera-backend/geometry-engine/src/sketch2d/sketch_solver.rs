@@ -57,6 +57,7 @@ use super::constraints::{ConstraintId, EntityRef};
 use super::ellipse2d::{Ellipse2d, ParametricEllipse2d};
 use super::line2d::{LineGeometry, ParametricLine2d};
 use super::point2d::ParametricPoint2d;
+use super::polyline2d::Polyline2d;
 use super::rectangle2d::{ParametricRectangle2d, Rectangle2d};
 use super::sketch::Sketch;
 use super::spline2d::{BSpline2d, NurbsCurve2d, ParametricSpline2d, Spline2d};
@@ -635,6 +636,16 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         };
         total_free_dofs += 2 * cp_count;
     }
+    // Polylines: 2 DOFs per vertex.
+    // Mirrors the solver-side `EntityState::polyline` parameter pack
+    // registered by `populate_solver` — `is_closed` is pinned in
+    // `PolylineMetadata` and never becomes a free DOF of
+    // Newton-Raphson. The 2n count exactly matches
+    // `ParametricPolyline2d::degrees_of_freedom`.
+    for entry in sketch.polylines().iter() {
+        entities_analysed += 1;
+        total_free_dofs += 2 * entry.value().polyline.vertices.len();
+    }
 
     let entities_skipped = collect_unsupported(sketch);
     // HashSet for O(1) membership checks while iterating constraints.
@@ -1018,26 +1029,46 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         registered += 1;
     }
 
+    for entry in sketch.polylines().iter() {
+        let id = *entry.key();
+        let polyline = entry.value();
+        // Polyline registration (slice C-5). The solver's parameter
+        // pack is 2n entries for n vertices; `is_closed` is pinned in
+        // `PolylineMetadata` because flipping it is a structural edit
+        // (adds or removes the wrap-around segment). Per-vertex fix
+        // flags are not yet exposed; every vertex starts free and can
+        // be pinned by explicit Coincident-to-fixed-point constraints
+        // downstream.
+        let state = EntityState::polyline(
+            polyline.polyline.vertices.clone(),
+            polyline.polyline.is_closed,
+            false,
+        );
+        solver.add_entity(EntityRef::Polyline(id), state);
+        registered += 1;
+    }
+
     registered
 }
 
 /// Collect `EntityRef`s for entities whose kinds are unsupported by
-/// the current bridge — polylines (slice C-5).
-/// Arcs are supported as of slice C-1; rectangles as of slice C-2;
-/// ellipses as of slice C-3; splines (both B-Spline and rational
-/// NURBS) as of slice C-4 — none of those appears here. The
-/// returned vector is in DashMap iteration order; callers that need
-/// a stable order should sort after collection.
+/// the current bridge.
 ///
-/// Returning the IDs (not just a count) lets the UI highlight
-/// specifically which entities will remain unsolved until later
-/// slices add `EntityState` constructors for their kinds.
-fn collect_unsupported(sketch: &Sketch) -> Vec<EntityRef> {
-    let mut skipped: Vec<EntityRef> = Vec::new();
-    for entry in sketch.polylines().iter() {
-        skipped.push(EntityRef::Polyline(*entry.key()));
-    }
-    skipped
+/// As of slice C-5 every sketch-entity kind (Point, Line, Circle, Arc,
+/// Rectangle, Ellipse, Spline, Polyline) has an `EntityState`
+/// constructor and a registration arm in
+/// [`populate_solver`] — this function therefore returns an empty
+/// vector. The infrastructure (collection + propagation through
+/// `entities_skipped` and `constraints_skipped`) is kept so a future
+/// new kind can be added without re-introducing the plumbing: a
+/// single `for entry in sketch.<new_kind>s().iter()` push into
+/// `skipped` is all that's needed.
+///
+/// The `_sketch` parameter is intentionally unused right now; renaming
+/// the argument (rather than removing it) keeps the signature stable
+/// for the future-new-kind path so callers don't need to change.
+fn collect_unsupported(_sketch: &Sketch) -> Vec<EntityRef> {
+    Vec::new()
 }
 
 /// Translate a `LineGeometry` variant into the (point, direction)
@@ -1182,6 +1213,42 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
                     };
                     if let Some(s) = updated {
                         entry.value_mut().spline = s;
+                    }
+                }
+            }
+            (EntityRef::Polyline(id), EntityUpdate::Parameters(params)) => {
+                if let Some(mut entry) = sketch.polylines().get_mut(id) {
+                    // Solver returns a flat `[x0, y0, x1, y1, …]`
+                    // pack — same layout the registration loop
+                    // packed vertices into. `is_closed` is pinned in
+                    // `PolylineMetadata` on the solver side, so it is
+                    // preserved here by reading it from the prior
+                    // geometry rather than the update payload.
+                    //
+                    // A parameter-count mismatch (e.g. the solver
+                    // returning fewer/more floats than the current
+                    // vertex count) or a `Polyline2d::new` validation
+                    // failure (coincident consecutive vertices that
+                    // the solver drifted into) leaves the prior
+                    // geometry intact — same "preserve identity,
+                    // never poison the store" convention used for
+                    // rectangle / ellipse / spline write-back.
+                    if params.len() % 2 != 0 {
+                        continue;
+                    }
+                    let expected = params.len() / 2;
+                    let current_len = entry.value().polyline.vertices.len();
+                    if expected != current_len {
+                        continue;
+                    }
+                    let mut new_vertices = Vec::with_capacity(expected);
+                    for i in 0..expected {
+                        let base = i * 2;
+                        new_vertices.push(Point2d::new(params[base], params[base + 1]));
+                    }
+                    let is_closed = entry.value().polyline.is_closed;
+                    if let Ok(updated) = Polyline2d::new(new_vertices, is_closed) {
+                        entry.value_mut().polyline = updated;
                     }
                 }
             }
@@ -1378,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_kinds_register_supported_only() {
+    fn mixed_kinds_register_all_supported() {
         let sketch = fresh_sketch();
         sketch.add_point(Point2d::new(0.0, 0.0));
         sketch
@@ -1390,7 +1457,7 @@ mod tests {
         sketch
             .add_ellipse(Point2d::new(3.0, 3.0), 2.0, 1.0, 0.0)
             .expect("ellipse");
-        let polyline_id = sketch
+        let _polyline_id = sketch
             .add_polyline(
                 vec![
                     Point2d::new(0.0, 0.0),
@@ -1402,14 +1469,11 @@ mod tests {
             .expect("polyline");
 
         let report = solve(&sketch).expect("solve");
-        // 1 point + 1 circle + 1 rectangle + 1 ellipse = 4 supported;
-        // polyline skipped (slice C-5 will land it).
-        assert_eq!(report.entities_solved, 4);
-        assert_eq!(report.skipped_count(), 1);
-        assert_eq!(
-            report.entities_skipped,
-            vec![EntityRef::Polyline(polyline_id)]
-        );
+        // 1 point + 1 circle + 1 rectangle + 1 ellipse + 1 polyline =
+        // 5 supported; nothing skipped after slice C-5.
+        assert_eq!(report.entities_solved, 5);
+        assert_eq!(report.skipped_count(), 0);
+        assert!(report.entities_skipped.is_empty());
     }
 
     // ── Write-back correctness ─────────────────────────────────────
@@ -1571,16 +1635,15 @@ mod tests {
 
     #[test]
     fn mixed_kinds_with_arc_register_arc_as_supported() {
-        // Sanity check for the supported-kinds list update: a
-        // sketch carrying one point + one arc + one polyline should
-        // count 2 supported and 1 skipped (polyline still skipped
-        // until slice C-5).
+        // Sanity check: every entity kind now lands as supported
+        // (slice C-5 finished the matrix). One point + one arc + one
+        // polyline = 3 supported, 0 skipped.
         let sketch = fresh_sketch();
         sketch.add_point(Point2d::new(0.0, 0.0));
         sketch
             .add_arc_center_angles(Point2d::new(0.0, 0.0), 1.0, 0.0, 1.0)
             .expect("arc");
-        let polyline_id = sketch
+        let _polyline_id = sketch
             .add_polyline(
                 vec![
                     Point2d::new(2.0, 0.0),
@@ -1591,11 +1654,8 @@ mod tests {
             )
             .expect("polyline");
         let report = solve(&sketch).expect("solve");
-        assert_eq!(report.entities_solved, 2);
-        assert_eq!(
-            report.entities_skipped,
-            vec![EntityRef::Polyline(polyline_id)]
-        );
+        assert_eq!(report.entities_solved, 3);
+        assert!(report.entities_skipped.is_empty());
     }
 
     // ── C-2: rectangle bridge ──────────────────────────────────────
@@ -2351,9 +2411,12 @@ mod tests {
     }
 
     #[test]
-    fn analyze_dofs_skips_unsupported_kinds_into_report() {
+    fn analyze_dofs_counts_polylines_as_supported() {
+        // Slice C-5: polylines contribute 2 DOFs per vertex and are
+        // surfaced as analysed (not skipped). A 3-vertex polyline
+        // therefore contributes 6 free DOFs.
         let sketch = fresh_sketch();
-        let polyline_id = sketch
+        sketch
             .add_polyline(
                 vec![
                     Point2d::new(0.0, 0.0),
@@ -2364,57 +2427,11 @@ mod tests {
             )
             .expect("polyline");
         let report = analyze_dofs(&sketch);
-        // Polyline contributes 0 DOFs until slice C-5 lands and is
-        // surfaced via entities_skipped so the UI can highlight the
-        // gap. (Rectangles became supported in slice C-2 and
-        // ellipses in slice C-3, so neither lands here anymore.)
-        assert_eq!(report.total_free_dofs, 0);
-        assert_eq!(
-            report.entities_skipped,
-            vec![EntityRef::Polyline(polyline_id)]
-        );
-        // Empty constraint list → no skipped constraints.
+        assert_eq!(report.total_free_dofs, 6);
+        assert_eq!(report.entities_analysed, 1);
+        assert!(report.entities_skipped.is_empty());
         assert_eq!(report.constraints_skipped, 0);
         assert!(!report.has_skipped_constraints());
-    }
-
-    #[test]
-    fn analyze_dofs_excludes_constraints_touching_unsupported_entities() {
-        // 1 point (2 free DOFs) + 1 polyline (skipped until C-5) +
-        // Coincident(Point, PolylineRef via EntityRef::Polyline).
-        // Without filtering, we'd count 2 DOFs removed and report
-        // FullyConstrained — a lie, because the constraint can't
-        // be evaluated. With filtering: 2 free, 0 removed →
-        // UnderConstrained, plus constraints_skipped = 1.
-        let sketch = fresh_sketch();
-        let p = sketch.add_point(Point2d::new(0.0, 0.0));
-        let polyline = sketch
-            .add_polyline(
-                vec![
-                    Point2d::new(1.0, 1.0),
-                    Point2d::new(2.0, 1.0),
-                    Point2d::new(2.0, 2.0),
-                ],
-                false,
-            )
-            .expect("polyline");
-        sketch.add_constraint(Constraint::new_geometric(
-            GeometricConstraint::Coincident,
-            vec![EntityRef::Point(p), EntityRef::Polyline(polyline)],
-            ConstraintPriority::High,
-        ));
-
-        let report = analyze_dofs(&sketch);
-        assert_eq!(report.total_free_dofs, 2);
-        assert_eq!(
-            report.constraint_dofs_removed, 0,
-            "constraint must be skipped because polyline is unsupported"
-        );
-        assert_eq!(report.constraints_analysed, 0);
-        assert_eq!(report.constraints_skipped, 1);
-        assert!(report.has_skipped_constraints());
-        assert!(report.is_under_constrained());
-        assert_eq!(report.remaining_dofs(), Some(2));
     }
 
     // ── H: constraint diagnosis (redundancy + conflicts) ───────────
