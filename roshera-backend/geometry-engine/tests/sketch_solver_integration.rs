@@ -146,18 +146,29 @@ fn empty_sketch_solve_is_a_no_op_with_valid_report() {
 
 #[test]
 fn unsupported_kinds_are_surfaced_as_entity_refs() {
+    // Rectangles, ellipses, and splines are all supported by the
+    // solver now (C-2, C-3, C-4); only polylines remain unsupported
+    // (C-5 pending). The bridge must still surface a stable
+    // `entities_skipped` contract for any kind it cannot register.
     let sketch = fresh();
     let _p = sketch.add_point(Point2d::new(0.0, 0.0));
-    let rect_id = sketch
-        .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
-        .expect("rect");
+    let poly_id = sketch
+        .add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(1.0, 0.0),
+                Point2d::new(1.0, 1.0),
+            ],
+            false,
+        )
+        .expect("polyline");
 
     let report = sketch.solve_constraints().expect("solve");
     assert_eq!(report.entities_solved, 1);
     assert_eq!(report.skipped_count(), 1);
-    // The rectangle's id is surfaced verbatim so UI layers can
+    // The polyline's id is surfaced verbatim so UI layers can
     // highlight specifically which entity went unsolved.
-    assert_eq!(report.entities_skipped, vec![EntityRef::Rectangle(rect_id)]);
+    assert_eq!(report.entities_skipped, vec![EntityRef::Polyline(poly_id)]);
 }
 
 #[test]
@@ -493,14 +504,26 @@ fn analyze_dofs_flags_constraints_skipped_when_unsupported_kinds_touched() {
     // constraints while excluding their free DOFs would produce
     // a phantom over-constraint; the bridge instead surfaces a
     // `constraints_skipped > 0` flag so the UI can warn.
+    //
+    // Rectangles/ellipses/splines are all analysed now (C-2/C-3/C-4);
+    // polylines (C-5) are the remaining unsupported kind, so the
+    // test exercises the skip path through a constraint that
+    // references a polyline.
     let sketch = fresh();
     let p = sketch.add_point(Point2d::new(0.0, 0.0));
-    let rect = sketch
-        .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
-        .expect("rect");
+    let poly = sketch
+        .add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(1.0, 0.0),
+                Point2d::new(1.0, 1.0),
+            ],
+            false,
+        )
+        .expect("polyline");
     sketch.add_constraint(Constraint::new_geometric(
         GeometricConstraint::Coincident,
-        vec![EntityRef::Point(p), EntityRef::Rectangle(rect)],
+        vec![EntityRef::Point(p), EntityRef::Polyline(poly)],
         ConstraintPriority::High,
     ));
 
