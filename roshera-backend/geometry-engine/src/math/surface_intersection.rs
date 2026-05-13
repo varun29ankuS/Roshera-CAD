@@ -556,6 +556,15 @@ fn trace_intersection_curve(
 }
 
 /// Single-direction predictor–corrector tracing.
+///
+/// When the corrector declares divergence (see
+/// [`correct_to_intersection`]) the trace halves the prediction step
+/// and retries, down to `MIN_STEP_FACTOR` of the nominal step. If the
+/// corrector still cannot lock on, the trace terminates cleanly —
+/// returning the partial curve. This replaces the previous behaviour
+/// of absorbing the best-so-far corrector output into the curve, which
+/// could spin the predictor for the full 1000-step budget along
+/// tangent or near-tangent contact lines.
 #[allow(clippy::too_many_arguments)]
 fn trace_direction(
     surface1: &dyn Surface,
@@ -566,13 +575,22 @@ fn trace_direction(
     tolerance: &Tolerance,
     closed_out: &mut bool,
 ) -> MathResult<()> {
-    let max_steps = 1000usize;
-    let step_size = 0.01_f64;
+    const MAX_STEPS: usize = 1000;
+    const NOMINAL_STEP: f64 = 0.01;
+    /// Floor on subdivision: when the prediction step has been halved
+    /// to this fraction of nominal and the corrector still diverges,
+    /// give up cleanly. Six halvings ≈ 1/64 of nominal = 1.5e-4 in
+    /// world units, well below any meaningful chord-tolerance.
+    const MIN_STEP_FACTOR: f64 = 1.0 / 64.0;
 
-    for _ in 0..max_steps {
+    let mut step_factor = 1.0_f64;
+    let mut total_steps = 0usize;
+
+    while total_steps < MAX_STEPS {
+        let step_size = NOMINAL_STEP * step_factor;
         let predicted_pos = current.position + current.tangent * (step_size * direction);
 
-        let corrected = correct_to_intersection(
+        let corrected_opt = correct_to_intersection(
             surface1,
             surface2,
             &predicted_pos,
@@ -580,6 +598,24 @@ fn trace_direction(
             current.uv2,
             tolerance,
         )?;
+
+        let corrected = match corrected_opt {
+            Some(c) => c,
+            None => {
+                // Divergence at this step. Halve the prediction
+                // distance and retry from the same anchor — a smaller
+                // chord is easier for the corrector when the surfaces
+                // are nearly tangent or the seed pair is on the wrong
+                // side of an inflection. If we've already halved
+                // below the floor, declare the trace done; the
+                // partial curve up to `current` is still valid.
+                step_factor *= 0.5;
+                if step_factor < MIN_STEP_FACTOR {
+                    break;
+                }
+                continue;
+            }
+        };
 
         if is_out_of_bounds(surface1, corrected.uv1) || is_out_of_bounds(surface2, corrected.uv2) {
             break;
@@ -601,14 +637,33 @@ fn trace_direction(
         curve.tangents.push(corrected.tangent);
 
         current = corrected;
+        total_steps += 1;
+        // Successful step — relax the step factor back toward nominal
+        // so the trace doesn't crawl through the rest of the curve at
+        // 1/64 chord just because one earlier seed needed help.
+        step_factor = (step_factor * 2.0).min(1.0);
     }
 
     Ok(())
 }
 
 /// Alternating-projection corrector: project onto surface 1, then onto
-/// surface 2, until the 3-D gap drops below distance tolerance or 10
-/// iterations are exhausted.
+/// surface 2, until the 3-D gap drops below distance tolerance or the
+/// iteration budget is exhausted.
+///
+/// Returns:
+/// - `Ok(Some(point))` when the corrector converged (gap below
+///   `tolerance.distance()`).
+/// - `Ok(None)` when the corrector *diverged* — the inter-surface gap
+///   failed to monotonically decrease for `DIVERGENCE_PATIENCE`
+///   consecutive iterations, signalling that the seed pair did not
+///   admit refinement. The caller is expected to react (subdivide the
+///   prediction step, reseed, or terminate the trace cleanly) rather
+///   than treat the best-so-far as a valid intersection point — a
+///   stale corrector output dragged through the predictor produces
+///   the runaway "1000 steps of noise" failure mode this slice closes.
+/// - `Err(_)` for evaluation / closest-point errors that the caller
+///   cannot recover from.
 fn correct_to_intersection(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
@@ -616,25 +671,55 @@ fn correct_to_intersection(
     uv1_init: (f64, f64),
     uv2_init: (f64, f64),
     tolerance: &Tolerance,
-) -> MathResult<IntersectionPoint> {
+) -> MathResult<Option<IntersectionPoint>> {
+    /// Patience for the monotonic-decrease check. Numerical noise can
+    /// produce a single non-decreasing iteration even on a healthy
+    /// corrector path; three in a row is a clean "the seed pair is in
+    /// the wrong basin" signal.
+    const DIVERGENCE_PATIENCE: usize = 3;
+    /// Hard iteration cap. The corrector is alternating projection
+    /// (linearly convergent in the worst case); 32 iterations is a
+    /// generous upper bound for any pair of well-conditioned smooth
+    /// surfaces. Hitting the cap without converging is treated as
+    /// divergence — the caller subdivides and retries.
+    const MAX_ITERATIONS: usize = 32;
+
     let mut uv1 = uv1_init;
     let mut uv2 = uv2_init;
+    let mut prev_gap_sq = f64::INFINITY;
+    let mut non_decreasing_streak: usize = 0;
+    let tol_sq = tolerance.distance_squared();
 
-    for _ in 0..10 {
+    for _ in 0..MAX_ITERATIONS {
         let p1 = surface1.evaluate_full(uv1.0, uv1.1)?.position;
         let p2 = surface2.evaluate_full(uv2.0, uv2.1)?.position;
 
         let f = p1 - p2;
-        if f.magnitude_squared() < tolerance.distance_squared() {
+        let gap_sq = f.magnitude_squared();
+        if gap_sq < tol_sq {
             let position = (p1 + p2) * 0.5;
             let tangent = compute_intersection_tangent(surface1, surface2, uv1, uv2)?;
-            return Ok(IntersectionPoint {
+            return Ok(Some(IntersectionPoint {
                 position,
                 uv1,
                 uv2,
                 tangent,
-            });
+            }));
         }
+
+        // Monotone-decrease check. A small slack factor (0.999) keeps
+        // numerical jitter at the lower end of the convergence trail
+        // from spuriously triggering divergence on a corrector that
+        // is in fact converging — but only just.
+        if gap_sq >= prev_gap_sq * 0.999 {
+            non_decreasing_streak += 1;
+            if non_decreasing_streak >= DIVERGENCE_PATIENCE {
+                return Ok(None);
+            }
+        } else {
+            non_decreasing_streak = 0;
+        }
+        prev_gap_sq = gap_sq;
 
         let closest1 = find_closest_point_on_surface(surface1, &p2, tolerance)?;
         uv1 = closest1.uv;
@@ -644,17 +729,10 @@ fn correct_to_intersection(
         uv2 = closest2.uv;
     }
 
-    let p1 = surface1.evaluate_full(uv1.0, uv1.1)?.position;
-    let p2 = surface2.evaluate_full(uv2.0, uv2.1)?.position;
-    let position = (p1 + p2) * 0.5;
-    let tangent = compute_intersection_tangent(surface1, surface2, uv1, uv2)?;
-
-    Ok(IntersectionPoint {
-        position,
-        uv1,
-        uv2,
-        tangent,
-    })
+    // Budget exhausted without converging. Treat as divergence so the
+    // caller can subdivide rather than absorb the best-so-far gap into
+    // the traced curve.
+    Ok(None)
 }
 
 /// `true` when `uv` lies strictly outside the surface's parameter bounds.
@@ -858,6 +936,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sphere_sphere_externally_tangent_terminates_cleanly() {
+        // Two unit spheres whose surfaces just touch at the origin's
+        // +X direction: centres at -1 and +1 along X, radius 1 each.
+        // The intersection set is a single point (measure-zero in the
+        // 1-D curve sense). Pre-F1-δ, the corrector would absorb the
+        // best-so-far ~zero-gap output into the trace and either spin
+        // for 1000 steps producing noise or generate a long degenerate
+        // curve. Post-F1-δ, divergence detection terminates the trace
+        // cleanly; the result is either no curve or a tiny stub at
+        // the contact point, never a 1000-point noise polyline.
+        let s1 = Sphere::new(Point3::new(-1.0, 0.0, 0.0), 1.0).expect("s1");
+        let s2 = Sphere::new(Point3::new(1.0, 0.0, 0.0), 1.0).expect("s2");
+        let t = tol();
+        let curves = intersect_surfaces(&s1, &s2, &t).expect("ssi");
+        // Whatever the marcher produced must not be a runaway long
+        // polyline — the failure mode this slice closes is producing
+        // hundreds of points that aren't actually on the intersection.
+        // A handful of points clustered near the contact is acceptable;
+        // hundreds is not.
+        for c in &curves {
+            assert!(
+                c.points.len() < 50,
+                "tangent contact must not produce {} trace points",
+                c.points.len()
+            );
+            // Every produced point must lie close to the shared
+            // tangent point (the origin) since that is the only
+            // geometric intersection. Allow generous slack since
+            // tangent-corrector convergence is intrinsically noisy.
+            for p in &c.points {
+                let dist = (*p - Point3::ORIGIN).magnitude();
+                assert!(
+                    dist < 0.1,
+                    "tangent-contact trace point {:?} too far from origin (dist {})",
+                    p,
+                    dist
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corrector_diverges_on_non_intersection_seed() {
+        // The corrector is internal; exercise it through a scenario
+        // where the marching seeder might in principle hand back a
+        // bad pair. Two coaxial cylinders of different radii (no
+        // intersection) — the seed pre-filter rules out grid samples
+        // far from the other surface, and the corrector divergence
+        // path closes any residual seed that slipped through. The
+        // intersect_surfaces contract: empty result, not a runaway
+        // trace.
+        let inner = Cylinder::new(Point3::new(0.0, 0.0, -2.0), Vector3::Z, 0.5).expect("inner");
+        let outer = Cylinder::new(Point3::new(0.0, 0.0, -2.0), Vector3::Z, 1.5).expect("outer");
+        let t = tol();
+        let curves = intersect_surfaces(&inner, &outer, &t).expect("ssi");
+        assert!(
+            curves.is_empty(),
+            "coaxial cylinders of distinct radii must yield no intersection, got {} curves",
+            curves.len()
+        );
     }
 
     #[test]
