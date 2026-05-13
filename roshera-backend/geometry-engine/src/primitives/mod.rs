@@ -9,6 +9,7 @@ pub mod r#loop;
 pub mod shell;
 pub mod solid;
 pub mod surface;
+pub mod tolerance_propagation;
 pub mod topology;
 pub mod topology_builder;
 pub mod validation;

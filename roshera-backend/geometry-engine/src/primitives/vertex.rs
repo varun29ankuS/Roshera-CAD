@@ -245,12 +245,18 @@ impl VertexStore {
     }
 
     /// Add or find existing vertex (with deduplication) - OPTIMIZED VERSION
+    ///
+    /// The coincidence ball is the *union* of the caller-supplied tolerance
+    /// sphere and each candidate's stored tolerance sphere (Parasolid
+    /// convention): two points with tolerances `t1, t2` are coincident iff
+    /// `dist(p1, p2) ≤ max(t1, t2)`. This means snapping a tight new
+    /// vertex onto an existing loose one does not require relaxing the
+    /// loose vertex's tolerance, and matches the behaviour of
+    /// `tolerance_propagation::merge_tolerance`.
     #[inline(always)]
     pub fn add_or_find(&mut self, x: f64, y: f64, z: f64, tolerance: f64) -> VertexId {
         // Fast linear search through vertices for deduplication
         // This is much faster than DashMap for small numbers of vertices (like primitive creation)
-        let tolerance_sq = tolerance * tolerance;
-
         for i in 0..self.x_coords.len() {
             // Skip deleted vertices
             if self.flags[i] & VertexFlags::DELETED != 0 {
@@ -262,6 +268,10 @@ impl VertexStore {
             let dz = self.z_coords[i] - z;
             let dist_sq = dx * dx + dy * dy + dz * dz;
 
+            let stored = self.tolerances.get(i).copied().unwrap_or(1e-6);
+            let merged = stored.max(tolerance);
+            let tolerance_sq = merged * merged;
+
             if dist_sq <= tolerance_sq {
                 self.stats.duplicates_found += 1;
                 self.stats.cache_hits += 1;
@@ -269,18 +279,20 @@ impl VertexStore {
             }
         }
 
-        // No match found, create new vertex
+        // No match found, create new vertex stamped with caller's tolerance
         self.stats.cache_misses += 1;
-        self.add_unchecked(x, y, z)
+        self.add_unchecked_with_tolerance(x, y, z, tolerance)
     }
 
     /// Add vertex with full deduplication (use sparingly - expensive)
+    ///
+    /// Coincidence ball is `max(caller, stored)` per vertex (see
+    /// `add_or_find` for the rationale).
     pub fn add_or_find_with_dedup(&mut self, x: f64, y: f64, z: f64, tolerance: f64) -> VertexId {
         if !self.enable_deduplication || tolerance < 1e-10 {
-            return self.add_unchecked(x, y, z);
+            return self.add_unchecked_with_tolerance(x, y, z, tolerance);
         }
 
-        let tolerance_sq = tolerance * tolerance;
         let key = SpatialHashKey::from_position(x, y, z, self.grid_size);
 
         // Check for duplicates
@@ -291,6 +303,10 @@ impl VertexStore {
                 let dy = self.y_coords[idx] - y;
                 let dz = self.z_coords[idx] - z;
 
+                let stored = self.tolerances.get(idx).copied().unwrap_or(1e-6);
+                let merged = stored.max(tolerance);
+                let tolerance_sq = merged * merged;
+
                 if dx * dx + dy * dy + dz * dz <= tolerance_sq {
                     self.stats.duplicates_found += 1;
                     self.stats.cache_hits += 1;
@@ -299,9 +315,9 @@ impl VertexStore {
             }
         }
 
-        // Create new vertex
+        // Create new vertex stamped with caller's tolerance
         self.stats.cache_misses += 1;
-        let id = self.add_unchecked(x, y, z);
+        let id = self.add_unchecked_with_tolerance(x, y, z, tolerance);
 
         // Update spatial hash
         if let Some(mut entry) = self.spatial_hash.get_mut(&key) {
@@ -314,12 +330,14 @@ impl VertexStore {
     }
 
     /// PERFORMANCE: Batch add multiple vertices with optimized deduplication
+    ///
+    /// Coincidence ball is `max(caller, stored)` per vertex (see
+    /// `add_or_find` for the rationale).
     pub fn add_or_find_batch(
         &mut self,
         positions: &[(f64, f64, f64)],
         tolerance: f64,
     ) -> Vec<VertexId> {
-        let tolerance_sq = tolerance * tolerance;
         let mut result = Vec::with_capacity(positions.len());
 
         for &(x, y, z) in positions {
@@ -332,6 +350,10 @@ impl VertexStore {
                     let dx = self.x_coords[idx] - x;
                     let dy = self.y_coords[idx] - y;
                     let dz = self.z_coords[idx] - z;
+
+                    let stored = self.tolerances.get(idx).copied().unwrap_or(1e-6);
+                    let merged = stored.max(tolerance);
+                    let tolerance_sq = merged * merged;
 
                     if dx * dx + dy * dy + dz * dz <= tolerance_sq {
                         found = Some(id);
@@ -346,7 +368,7 @@ impl VertexStore {
                 Some(id) => id,
                 None => {
                     self.stats.cache_misses += 1;
-                    let id = self.add_unchecked(x, y, z);
+                    let id = self.add_unchecked_with_tolerance(x, y, z, tolerance);
                     self.spatial_hash
                         .entry(key)
                         .or_insert_with(|| Vec::with_capacity(4))
@@ -361,9 +383,27 @@ impl VertexStore {
         result
     }
 
-    /// Add vertex without deduplication check
+    /// Add vertex without deduplication check (uses default 1e-6 tolerance)
     #[inline(always)]
     pub fn add_unchecked(&mut self, x: f64, y: f64, z: f64) -> VertexId {
+        self.add_unchecked_with_tolerance(x, y, z, 1e-6)
+    }
+
+    /// Add vertex without deduplication check, stamping the supplied
+    /// tolerance on the new entity.
+    ///
+    /// Use this from operation sites that know the working tolerance of
+    /// the op producing the vertex — downstream coincidence queries
+    /// (e.g. sewing, intersection) will respect that stamped value via
+    /// the `max(caller, stored)` rule in `add_or_find`.
+    #[inline(always)]
+    pub fn add_unchecked_with_tolerance(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        tolerance: f64,
+    ) -> VertexId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.x_coords.push(x);
         self.y_coords.push(y);
@@ -371,7 +411,7 @@ impl VertexStore {
         self.u_params.push(f64::NAN);
         self.v_params.push(f64::NAN);
         self.flags.push(0);
-        self.tolerances.push(1e-6); // Default CAD tolerance
+        self.tolerances.push(tolerance);
         self.stats.total_created += 1;
         id
     }
@@ -459,6 +499,12 @@ impl VertexStore {
                     self.u_params[write_idx] = self.u_params[read_idx];
                     self.v_params[write_idx] = self.v_params[read_idx];
                     self.flags[write_idx] = self.flags[read_idx];
+                    let src_tol = self.tolerances.get(read_idx).copied();
+                    if let (Some(src), Some(slot)) =
+                        (src_tol, self.tolerances.get_mut(write_idx))
+                    {
+                        *slot = src;
+                    }
                 }
                 remap.insert(read_idx as VertexId, write_idx as VertexId);
                 write_idx += 1;
@@ -472,6 +518,7 @@ impl VertexStore {
         self.u_params.truncate(write_idx);
         self.v_params.truncate(write_idx);
         self.flags.truncate(write_idx);
+        self.tolerances.truncate(write_idx);
 
         // Rebuild spatial hash
         self.rebuild_spatial_hash();
@@ -642,6 +689,7 @@ impl VertexStore {
         self.u_params.reserve(additional);
         self.v_params.reserve(additional);
         self.flags.reserve(additional);
+        self.tolerances.reserve(additional);
     }
 }
 
@@ -1070,5 +1118,88 @@ mod tests {
         s.reserve(128);
         assert_eq!(s.len(), 0);
         assert!(s.is_empty());
+    }
+
+    // ---- Per-vertex tolerance (F1-α) ---------------------------------------
+
+    #[test]
+    fn add_unchecked_with_tolerance_stamps_supplied_value() {
+        let mut s = VertexStore::with_capacity_no_dedup(2);
+        let id = s.add_unchecked_with_tolerance(0.0, 0.0, 0.0, 5e-4);
+        let tol = s.get_tolerance(id).expect("vertex must exist");
+        assert!((tol - 5e-4).abs() < 1e-15);
+    }
+
+    #[test]
+    fn add_or_find_stamps_caller_tolerance_on_new_vertex() {
+        let mut s = VertexStore::with_capacity_and_tolerance(2, 1e-6);
+        let id = s.add_or_find(1.0, 2.0, 3.0, 5e-8);
+        let tol = s.get_tolerance(id).expect("vertex must exist");
+        assert!((tol - 5e-8).abs() < 1e-18);
+    }
+
+    #[test]
+    fn add_or_find_uses_max_of_stored_and_caller_for_coincidence() {
+        // A loose vertex with stored tolerance 1e-3 is queried with a
+        // tight caller tolerance 1e-9; per Parasolid's union-of-spheres
+        // convention, the merged radius is 1e-3 so a point 1e-4 away
+        // must snap to the existing vertex.
+        let mut s = VertexStore::with_capacity_and_tolerance(2, 1e-3);
+        let loose_id = s.add_unchecked_with_tolerance(0.0, 0.0, 0.0, 1e-3);
+        let snap_id = s.add_or_find(1e-4, 0.0, 0.0, 1e-9);
+        assert_eq!(loose_id, snap_id, "tight query must snap onto loose vertex");
+    }
+
+    #[test]
+    fn add_or_find_creates_new_vertex_when_outside_merged_ball() {
+        // Stored 1e-9 + caller 1e-9 → coincidence radius 1e-9; a point
+        // 1e-6 away must not snap.
+        let mut s = VertexStore::with_capacity_and_tolerance(2, 1e-9);
+        let a = s.add_unchecked_with_tolerance(0.0, 0.0, 0.0, 1e-9);
+        let b = s.add_or_find(1e-6, 0.0, 0.0, 1e-9);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn add_or_find_with_dedup_respects_per_vertex_tolerance() {
+        let mut s = VertexStore::with_capacity_and_tolerance(8, 1e-3);
+        let loose_id = s.add_unchecked_with_tolerance(0.0, 0.0, 0.0, 1e-3);
+        // Re-insert spatial-hash key so the dedup path can find it.
+        let key = SpatialHashKey::from_position(0.0, 0.0, 0.0, s.grid_size);
+        s.spatial_hash.insert(key, vec![loose_id]);
+        let snap_id = s.add_or_find_with_dedup(1e-4, 0.0, 0.0, 1e-9);
+        assert_eq!(loose_id, snap_id);
+    }
+
+    #[test]
+    fn add_or_find_batch_stamps_caller_tolerance() {
+        let mut s = VertexStore::with_capacity_and_tolerance(4, 1e-6);
+        let positions = [(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)];
+        let ids = s.add_or_find_batch(&positions, 5e-7);
+        for id in ids {
+            let tol = s.get_tolerance(id).expect("vertex must exist");
+            assert!((tol - 5e-7).abs() < 1e-18);
+        }
+    }
+
+    #[test]
+    fn compact_preserves_tolerances() {
+        let mut s = VertexStore::with_capacity_no_dedup(4);
+        let _a = s.add_unchecked_with_tolerance(0.0, 0.0, 0.0, 1e-9);
+        let b = s.add_unchecked_with_tolerance(1.0, 0.0, 0.0, 1e-3);
+        let _c = s.add_unchecked_with_tolerance(2.0, 0.0, 0.0, 1e-6);
+        // Remove the middle vertex; compact must keep the tolerances on
+        // the surviving vertices intact and not leak the stale slot.
+        assert!(s.remove(b));
+        let _remap = s.compact();
+        let surviving: Vec<f64> = s
+            .iter()
+            .map(|(id, _)| s.get_tolerance(id).unwrap_or(0.0))
+            .collect();
+        assert_eq!(surviving.len(), 2);
+        assert!(surviving.iter().any(|&t| (t - 1e-9).abs() < 1e-18));
+        assert!(surviving.iter().any(|&t| (t - 1e-6).abs() < 1e-18));
+        // tolerances Vec is also truncated, not just the coordinate arrays.
+        assert_eq!(s.tolerances.len(), 2);
     }
 }
