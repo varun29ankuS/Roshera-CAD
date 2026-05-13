@@ -108,7 +108,7 @@ pub fn imprint_curves_on_face(
     // ------------------------------------------------------------------
     // 1. Resolve the face's surface and validate curves lie on it.
     // ------------------------------------------------------------------
-    let surface_id = {
+    let (surface_id, parent_orientation) = {
         let face = model
             .faces
             .get(face_id)
@@ -117,7 +117,7 @@ pub fn imprint_curves_on_face(
                 expected: "valid face ID".to_string(),
                 received: format!("{face_id:?}"),
             })?;
-        face.surface_id
+        (face.surface_id, face.orientation)
     };
 
     let tolerance = options.common.tolerance;
@@ -204,7 +204,12 @@ pub fn imprint_curves_on_face(
         }
         let loop_id = model.loops.add(face_loop);
 
-        let new_face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        // Inherit the parent face's orientation: each sub-face shares
+        // the parent's surface and parametric region, so the parent's
+        // outward direction is the correct outward direction for every
+        // imprinted sub-face. Slice 2 of the comprehensive
+        // face-orientation fix.
+        let new_face = Face::new(0, surface_id, loop_id, parent_orientation);
         let new_face_id = model.faces.add(new_face);
         sub_faces.push(new_face_id);
     }

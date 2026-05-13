@@ -49,6 +49,14 @@ pub(crate) mod polygon_clip;
 // face so the resulting B-Rep is watertight.
 pub(crate) mod edge_blend_topology;
 
+// Shared face-orientation helpers. Every face-construction site that
+// builds a lateral / side-wall / blend surface must call
+// `orient_face_for_outward` to pick the `FaceOrientation` flag that
+// makes `surface.normal_at × orientation.sign()` point away from the
+// solid material. See `orientation.rs` doc comment for the full
+// rationale. Slice 1 of the comprehensive face-orientation fix.
+pub(crate) mod orientation;
+
 // Recording abstraction (dependency-inversion for timeline / audit log)
 pub mod recorder;
 

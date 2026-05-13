@@ -14,12 +14,13 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::edge_blend_topology::{splice_blend_edge, validate_no_shared_corners, BlendEdgeSurgery};
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Curve, Line, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
-    face::{Face, FaceId, FaceOrientation},
+    face::{Face, FaceId},
     fillet_surfaces::{CylindricalFillet, ToroidalFillet, VariableRadiusFillet},
     solid::SolidId,
     surface::{Cylinder, Surface},
@@ -623,7 +624,7 @@ fn cylinder_rim_fillet(
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     use crate::primitives::curve::Arc;
     use crate::primitives::edge::EdgeOrientation;
-    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::face::Face;
     use crate::primitives::r#loop::{Loop, LoopType};
     use crate::primitives::surface::{Cylinder, Torus};
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -981,6 +982,14 @@ fn cylinder_rim_fillet(
     // Anchor u=0 to the same ref_dir as the cylinder so the torus seam
     // aligns with the new lateral seam edge.
     torus.ref_dir = ref_dir;
+    // Outward target at the torus's parametric midpoint (u=π, v=π/4):
+    // the surface normal there is in the direction
+    // -ref_dir·cos(π/4) + (axis·sign)·sin(π/4) ≡ (axis·sign − ref_dir)/√2.
+    // This is the geometric "diagonal" between the lateral-outward and
+    // cap-outward directions at the corner — the fillet blend face must
+    // have its oriented outward normal align with this diagonal.
+    let blend_outward_target = torus_axis - ref_dir;
+    let blend_orientation = orient_face_for_outward(&torus, blend_outward_target)?;
     let torus_surface_id = model.surfaces.add(Box::new(torus));
 
     // Loop sequence (parameter-space CCW for outward-pointing torus):
@@ -995,12 +1004,7 @@ fn cylinder_rim_fillet(
     blend_loop.add_edge(torus_seam_edge_id, false);
     let blend_loop_id = model.loops.add(blend_loop);
 
-    let mut blend_face = Face::new(
-        0,
-        torus_surface_id,
-        blend_loop_id,
-        FaceOrientation::Forward,
-    );
+    let mut blend_face = Face::new(0, torus_surface_id, blend_loop_id, blend_orientation);
     blend_face.outer_loop = blend_loop_id;
     let blend_face_id = model.faces.add(blend_face);
 
@@ -2775,7 +2779,61 @@ fn create_trimmed_fillet_face(
         (lid, Some(surgery))
     };
 
-    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    // Pick the fillet face's orientation so its oriented outward normal
+    // points away from the rolling-ball trajectory. The rolling-ball
+    // center at the surface's parametric midpoint is approximately the
+    // midpoint of the two cap centers (which are the rolling-ball
+    // positions at the V0 and V1 ends). The surface midpoint sample
+    // gives us the geometric point on the blend face there; their
+    // difference is the geometric outward target.
+    let surface_ref = model
+        .surfaces
+        .get(surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Fillet surface not found".to_string()))?;
+    let ((u_min, u_max), (v_min, v_max)) = surface_ref.parameter_bounds();
+    let u_mid = 0.5 * (u_min + u_max);
+    let v_mid = 0.5 * (v_min + v_max);
+    let surface_mid_pt = surface_ref.point_at(u_mid, v_mid).map_err(|e| {
+        OperationError::NumericalError(format!(
+            "Fillet surface midpoint evaluation failed: {:?}",
+            e
+        ))
+    })?;
+    let rolling_ball_mid = Point3::new(
+        0.5 * (cap_v0_center.x + cap_v1_center.x),
+        0.5 * (cap_v0_center.y + cap_v1_center.y),
+        0.5 * (cap_v0_center.z + cap_v1_center.z),
+    );
+    let outward_target = surface_mid_pt - rolling_ball_mid;
+    // If the surface midpoint coincides with the rolling-ball midpoint
+    // (radius collapses to 0, degenerate three-sided limit), fall back
+    // to the bisector of the two face1 / face2 normals at the edge
+    // midpoint — that direction points away from the dihedral.
+    let outward_target = if outward_target.magnitude_squared() > 1e-20 {
+        outward_target
+    } else {
+        let edge_mid = Point3::new(
+            0.5 * (start_pos[0] + end_pos[0]),
+            0.5 * (start_pos[1] + end_pos[1]),
+            0.5 * (start_pos[2] + end_pos[2]),
+        );
+        let n1 = get_face_oriented_normal(model, face1_id, &edge_mid)
+            .unwrap_or(Vector3::Z);
+        let n2 = get_face_oriented_normal(model, face2_id, &edge_mid)
+            .unwrap_or(Vector3::Z);
+        let bisector = n1 + n2;
+        if bisector.magnitude_squared() > 1e-20 {
+            bisector
+        } else {
+            Vector3::Z
+        }
+    };
+    let surface_ref = model
+        .surfaces
+        .get(surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Fillet surface not found".to_string()))?;
+    let orientation = orient_face_for_outward(surface_ref, outward_target)?;
+    let face = Face::new(0, surface_id, loop_id, orientation);
     Ok((model.faces.add(face), surgery))
 }
 

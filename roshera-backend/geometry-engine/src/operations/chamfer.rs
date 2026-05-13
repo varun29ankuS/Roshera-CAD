@@ -9,6 +9,7 @@
 
 use super::edge_blend_topology::{splice_blend_edge, validate_no_shared_corners, BlendEdgeSurgery};
 use super::fillet::edge_orientation_in_face;
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -877,6 +878,17 @@ fn create_closed_edge_chamfer(
         cone_v_lat,
     )
     .map_err(|e| OperationError::NumericalError(format!("Cone blend: {e}")))?;
+    // Cone's intrinsic normal at its parametric midpoint (u=π,
+    // v=midpoint) points in the direction (cos π · ref_dir + sin π ·
+    // ortho)·cos(half_angle) + cone_axis·sin(half_angle), which is
+    // approximately the corner-outward diagonal `cone_axis − ref_dir`.
+    // Since `cone_axis = axis * (-sign)` and the chamfer surface
+    // bridges the cap-pulled-back circle to the lateral-shortened
+    // circle, the geometric outward direction at the blend midpoint
+    // is `axis·sign − ref_dir` — the same diagonal that the fillet
+    // torus uses (away from the cylinder material at u=π).
+    let chamfer_outward_target = axis * sign - ref_dir;
+    let blend_orientation = orient_face_for_outward(&cone, chamfer_outward_target)?;
     // Anchor u=0 to the cylinder's ref_dir so the cone's seam aligns
     // with the new lateral seam edge.
     cone.ref_dir = ref_dir;
@@ -899,12 +911,7 @@ fn create_closed_edge_chamfer(
     blend_loop.add_edge(cone_seam_edge_id, false);
     let blend_loop_id = model.loops.add(blend_loop);
 
-    let mut blend_face = Face::new(
-        0,
-        cone_surface_id,
-        blend_loop_id,
-        FaceOrientation::Forward,
-    );
+    let mut blend_face = Face::new(0, cone_surface_id, blend_loop_id, blend_orientation);
     blend_face.outer_loop = blend_loop_id;
     let blend_face_id = model.faces.add(blend_face);
 
@@ -1173,7 +1180,19 @@ fn create_chamfer_face(
     chamfer_loop.add_edge(cap_v0_edge, true);
     let loop_id = model.loops.add(chamfer_loop);
 
-    // Create face
+    // Orientation: FaceOrientation::Forward is preserved here pending
+    // the Slice-4 consumer-side cleanup. The chamfer flat-bisector
+    // ruled surface's intrinsic u × v normal is constructed in
+    // `create_ruled_chamfer_surface` such that downstream consumers
+    // (mass-properties divergence integral, fillet's
+    // get_face_oriented_normal, shell solid_angle) compensate via
+    // `face.orientation.sign()` workarounds, and the historical
+    // Forward stamping happens to produce geometrically consistent
+    // results for convex AND concave reflex edges (see
+    // `fillet_chamfer_dihedral_matrix::fillet_and_chamfer_agree_on_concave_l_shape_reflex_edge`).
+    // Switching to an orient_face_for_outward(n1+n2) check would flip
+    // the orientation on reflex edges and break that regression pin
+    // before the consumer-side workarounds are removed in Slice 4.
     let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
     let face_id = model.faces.add(face);
 

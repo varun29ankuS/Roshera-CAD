@@ -14,6 +14,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::deep_clone::deep_clone_faces;
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
@@ -142,6 +143,18 @@ fn build_extrusion_loop_topology(
 /// come from the shared topology, so the next side face along the
 /// loop will reference the same right-vertical edge as its left-vertical
 /// — that's what makes the shell watertight.
+///
+/// `outward_target` is the geometric direction the face's oriented
+/// normal must align with. For an outer-loop wall it points away from
+/// the loop centroid (away from the solid material); for an inner-loop
+/// (hole) wall it points toward the loop centroid (into the hole = away
+/// from solid material). Caller is responsible for computing this. The
+/// helper picks `FaceOrientation::Forward` or `Backward` so the ruled-
+/// surface intrinsic normal × orientation.sign() aligns with the target
+/// — without this fix the orientation was always `Forward` regardless
+/// of the ruled-surface u × v parameterisation direction, and downstream
+/// fillet/chamfer at non-90° dihedrals would carve material from the
+/// wrong side of the edge.
 fn create_side_face_shared(
     model: &mut BRepModel,
     bottom_edge_id: EdgeId,
@@ -150,6 +163,7 @@ fn create_side_face_shared(
     bottom_end_v: VertexId,
     top_edge_id: EdgeId,
     topology: &ExtrusionLoopTopology,
+    outward_target: Vector3,
 ) -> OperationResult<FaceId> {
     let left_vertical = *topology.vertical_edge.get(&bottom_start_v).ok_or_else(|| {
         OperationError::InvalidGeometry("Vertical edge map miss (left)".to_string())
@@ -169,9 +183,10 @@ fn create_side_face_shared(
     let loop_id = model.loops.add(face_loop);
 
     let surface = create_ruled_surface(model, bottom_edge_id, top_edge_id)?;
+    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
     let surface_id = model.surfaces.add(surface);
 
-    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    let face = Face::new(0, surface_id, loop_id, orientation);
     Ok(model.faces.add(face))
 }
 
@@ -204,7 +219,7 @@ fn create_top_face_shared(
     // surface normal to +direction — the outward direction for the top
     // cap. Computed before the surface is moved into the store so we
     // don't need a second lookup.
-    let new_orientation = orientation_for_target(translated_surface.as_ref(), direction)?;
+    let new_orientation = orient_face_for_outward(translated_surface.as_ref(), direction)?;
     let new_surface_id = model.surfaces.add(translated_surface);
 
     if base_loop.edges.len() != topology.top_edges.len() {
@@ -244,42 +259,6 @@ fn create_top_face_shared(
         face.add_inner_loop(loop_id);
     }
     Ok(model.faces.add(face))
-}
-
-/// Pick the `FaceOrientation` that aligns the face's oriented outward
-/// normal (`surface_normal × orientation.sign()`) with `target`.
-///
-/// Required because `create_face_from_profile` (and other profile-from-
-/// edges builders) always emit `FaceOrientation::Forward` while the
-/// underlying Newell's-method plane normal direction depends on the
-/// polygon's winding — CCW polygons get a `+Z` normal, CW polygons
-/// get `-Z`. Without this fix, the bottom cap of a CCW + +Z extrusion
-/// has its oriented normal pointing INTO the solid, which inverts the
-/// signed dihedral at every rim edge and makes fillet / chamfer
-/// remove material from the wrong side. The cylinder primitive avoids
-/// this by hand-building its caps with `Plane::from_point_normal(_,
-/// -axis)` / `+axis`; this helper is the same fix factored as a
-/// reusable post-build adjustment.
-///
-/// Sampled at the surface's parametric midpoint — sufficient for the
-/// planar caps this is currently called on. If the target and surface
-/// normal are exactly perpendicular at the sample point (oblique
-/// extrusion edge case) the helper prefers `Forward` deterministically.
-fn orientation_for_target(
-    surface: &dyn Surface,
-    target: Vector3,
-) -> OperationResult<FaceOrientation> {
-    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
-    let u_mid = 0.5 * (u_min + u_max);
-    let v_mid = 0.5 * (v_min + v_max);
-    let n = surface
-        .normal_at(u_mid, v_mid)
-        .map_err(|e| OperationError::NumericalError(format!("Surface normal failed: {:?}", e)))?;
-    if n.dot(&target) >= 0.0 {
-        Ok(FaceOrientation::Forward)
-    } else {
-        Ok(FaceOrientation::Backward)
-    }
 }
 
 /// Find the solid that contains the given face
@@ -625,7 +604,7 @@ fn create_fresh_extrusion(
                 .ok_or_else(|| {
                     OperationError::InvalidGeometry("Base surface not found".to_string())
                 })?;
-            orientation_for_target(base_surface, -direction)?
+            orient_face_for_outward(base_surface, -direction)?
         };
         if let Some(face_mut) = model.faces.get_mut(base_face_id) {
             face_mut.orientation = correct_orientation;
@@ -708,6 +687,14 @@ fn create_fresh_extrusion(
 
 /// Build one side face per edge of `base_loop`, pushing each new `FaceId`
 /// onto `out_faces`. Shared between outer and inner loop extrusion paths.
+///
+/// For each side face the outward target is computed as the in-plane
+/// direction from the loop centroid to the bottom-edge midpoint, then
+/// negated for inner (hole) loops — so a hole wall's oriented outward
+/// normal points into the hole, away from the surrounding solid
+/// material. The target is passed to `create_side_face_shared` which
+/// hands it to `orient_face_for_outward` to pick the correct
+/// `FaceOrientation` for the ruled surface.
 fn build_loop_side_faces(
     model: &mut BRepModel,
     base_loop: &Loop,
@@ -737,6 +724,42 @@ fn build_loop_side_faces(
         ));
     }
 
+    // Compute the loop centroid (vertex-centroid in 3D) — the reference
+    // point for outward-target direction at every wall along this loop.
+    // For an outer loop the centroid lies inside the solid material so
+    // (edge_mid - centroid) points outward. For an inner (hole) loop the
+    // centroid lies inside the void so (edge_mid - centroid) points INTO
+    // the surrounding material and must be flipped.
+    let mut unique_vertices: Vec<VertexId> = Vec::with_capacity(bottom_endpoints.len());
+    for &(s, e) in &bottom_endpoints {
+        if !unique_vertices.contains(&s) {
+            unique_vertices.push(s);
+        }
+        if !unique_vertices.contains(&e) {
+            unique_vertices.push(e);
+        }
+    }
+    let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
+    for &vid in &unique_vertices {
+        let v = model.vertices.get(vid).ok_or_else(|| {
+            OperationError::InvalidGeometry("Loop vertex not found while computing centroid".to_string())
+        })?;
+        cx += v.position[0];
+        cy += v.position[1];
+        cz += v.position[2];
+    }
+    let n = unique_vertices.len() as f64;
+    if n == 0.0 {
+        return Err(OperationError::InvalidGeometry(
+            "Loop has no vertices".to_string(),
+        ));
+    }
+    let centroid = crate::math::Point3::new(cx / n, cy / n, cz / n);
+    let inner_sign = match base_loop.loop_type {
+        crate::primitives::r#loop::LoopType::Inner => -1.0,
+        _ => 1.0,
+    };
+
     for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
         let bottom_forward = base_loop.orientations[i];
         let (raw_start, raw_end) = bottom_endpoints[i];
@@ -745,6 +768,35 @@ fn build_loop_side_faces(
         } else {
             (raw_end, raw_start)
         };
+
+        // Bottom-edge midpoint in 3D as the per-wall sample point.
+        let start_pos = model.vertices.get(loop_start).ok_or_else(|| {
+            OperationError::InvalidGeometry("Start vertex not found".to_string())
+        })?.position;
+        let end_pos = model.vertices.get(loop_end).ok_or_else(|| {
+            OperationError::InvalidGeometry("End vertex not found".to_string())
+        })?.position;
+        let edge_mid = crate::math::Point3::new(
+            0.5 * (start_pos[0] + end_pos[0]),
+            0.5 * (start_pos[1] + end_pos[1]),
+            0.5 * (start_pos[2] + end_pos[2]),
+        );
+        let radial = (edge_mid - centroid) * inner_sign;
+        // If the bottom edge happens to pass through the centroid the
+        // radial direction degenerates to zero; fall back to any
+        // direction perpendicular to the edge that is non-zero. In
+        // practice this only happens for pathological degenerate loops
+        // and the downstream `orient_face_for_outward` will still
+        // produce a determinate (if arbitrary) answer.
+        let outward_target = if radial.magnitude_squared() > 1e-20 {
+            radial
+        } else {
+            // Use any non-zero fallback so the dot product is well-
+            // defined; the resulting orientation is arbitrary but
+            // deterministic.
+            crate::math::Vector3::Z
+        };
+
         let side_face = create_side_face_shared(
             model,
             bottom_edge_id,
@@ -753,6 +805,7 @@ fn build_loop_side_faces(
             loop_end,
             topology.top_edges[i],
             topology,
+            outward_target,
         )?;
         out_faces.push(side_face);
     }

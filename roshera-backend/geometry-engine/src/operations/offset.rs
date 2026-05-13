@@ -807,9 +807,10 @@ fn create_wall_face(
 ) -> OperationResult<FaceId> {
     use crate::primitives::curve::Line;
     use crate::primitives::edge::EdgeOrientation;
-    use crate::primitives::face::FaceOrientation;
     use crate::primitives::r#loop::LoopType;
     use crate::primitives::surface::Plane;
+
+    use super::orientation::orient_face_for_outward;
 
     let outer_edge = model
         .edges
@@ -953,8 +954,18 @@ fn create_wall_face(
     wall_loop.add_edge(e_left, true);
     let loop_id = model.loops.add(wall_loop);
 
+    // The wall lies in the plane of the removed face, so its outward
+    // direction (out of the resulting hollow solid) is the removed
+    // face's outward normal itself. Slice 2 of the comprehensive
+    // face-orientation fix.
+    let wall_surface_ref = model
+        .surfaces
+        .get(surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Wall surface not found".into()))?;
+    let orientation = orient_face_for_outward(wall_surface_ref, removed_face_outward_normal)?;
+
     // Create face
-    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    let face = Face::new(0, surface_id, loop_id, orientation);
     let face_id = model.faces.add(face);
 
     Ok(face_id)

@@ -3,12 +3,13 @@
 //! Creates solids of revolution by rotating profiles around an axis.
 //! Supports partial revolutions, multiple profiles, and helical paths.
 
+use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     curve::ParameterRange,
     edge::{Edge, EdgeId, EdgeOrientation},
-    face::{Face, FaceId, FaceOrientation},
+    face::{Face, FaceId},
     r#loop::Loop,
     shell::{Shell, ShellType},
     solid::{Solid, SolidId},
@@ -284,7 +285,6 @@ fn create_helical_sweep(
 
             use crate::primitives::curve::Line;
             use crate::primitives::edge::EdgeOrientation;
-            use crate::primitives::face::FaceOrientation;
             use crate::primitives::r#loop::LoopType;
             use crate::primitives::surface::Plane;
 
@@ -337,9 +337,27 @@ fn create_helical_sweep(
                 Vector3::Z
             };
             let surf = Plane::from_point_normal(p1, normal)?;
-            let surf_id = model.surfaces.add(Box::new(surf));
 
-            let face = Face::new(0, surf_id, loop_id, FaceOrientation::Forward);
+            // Outward target: radially outward from the revolution axis
+            // at the quad centroid. Project the centroid onto the axis
+            // line; the perpendicular component is the radial outward
+            // direction. Fall back to `normal` if the quad straddles the
+            // axis (radius below tolerance) so the orientation pick
+            // degrades gracefully.
+            let centroid = (p1 + p2 + p3 + p4) * 0.25;
+            let to_centroid = centroid - options.axis_origin;
+            let axial = to_centroid.dot(&options.axis_direction) * options.axis_direction;
+            let radial = to_centroid - axial;
+            let outward_target = if radial.magnitude_squared() > 1e-20 {
+                radial
+            } else {
+                normal
+            };
+            let surf_box: Box<dyn Surface> = Box::new(surf);
+            let orientation = orient_face_for_outward(surf_box.as_ref(), outward_target)?;
+            let surf_id = model.surfaces.add(surf_box);
+
+            let face = Face::new(0, surf_id, loop_id, orientation);
             shell_faces.push(model.faces.add(face));
         }
     }
@@ -477,6 +495,34 @@ fn create_revolution_segment_face(
 
     // Create surface of revolution
     let surface = create_revolution_surface(model, edge.curve_id, axis_origin, axis_direction)?;
+
+    // Outward target: radially outward from the axis at the midpoint
+    // of the segment. Take the profile-edge midpoint, rotate it by the
+    // mid-angle of the segment, project onto the axis, and the
+    // perpendicular component is the radial outward direction. This
+    // matches the geometric outward of any surface of revolution whose
+    // profile sits on one side of the axis (the standard case; profiles
+    // that cross the axis are rejected earlier by
+    // `face_intersects_axis`). If the midpoint sits on the axis
+    // (degenerate, only happens for an apex-touching profile that wasn't
+    // caught above), default to `+axis_direction` so the orientation
+    // pick is at least deterministic.
+    let start_pos = Vector3::from(start_vertex.position);
+    let end_pos = Vector3::from(end_vertex.position);
+    let profile_mid = (start_pos + end_pos) * 0.5;
+    let mid_angle = 0.5 * (start_angle + end_angle);
+    let rotation_mid = Matrix4::from_axis_angle(&axis_direction, mid_angle)?;
+    let mid_rel = profile_mid - axis_origin;
+    let mid_world = rotation_mid.transform_point(&mid_rel) + axis_origin;
+    let to_mid = mid_world - axis_origin;
+    let axial = to_mid.dot(&axis_direction) * axis_direction;
+    let radial = to_mid - axial;
+    let outward_target = if radial.magnitude_squared() > 1e-20 {
+        radial
+    } else {
+        axis_direction
+    };
+    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
     let surface_id = model.surfaces.add(surface);
 
     // Create face
@@ -484,7 +530,7 @@ fn create_revolution_segment_face(
         0, // ID will be assigned by store
         surface_id,
         loop_id,
-        FaceOrientation::Forward,
+        orientation,
     );
     let face_id = model.faces.add(face);
 
