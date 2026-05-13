@@ -35,8 +35,27 @@ import { useSceneStore, type CADObject } from '@/stores/scene-store'
  *   on-screen UX increment; the REST payload carries the snapped value
  *   verbatim. Sub-step jitter is removed at the drag layer so the readout,
  *   the arrow shaft length, and the eventual committed extrusion all agree.
+ *
+ * Live ghost preview:
+ *   During drag, pointermoves schedule a debounced
+ *   `POST /api/geometry/face/extrude/preview` call (50 ms trailing
+ *   debounce). The backend runs the kernel face-pull against a
+ *   ModelSnapshot, tessellates with realtime params, restores, and
+ *   returns the mesh — leaving the model untouched. The response is
+ *   rendered as a translucent ghost overlay so the user sees the
+ *   final shape before committing. Stale responses are discarded via
+ *   a per-drag sequence counter + AbortController; the ghost is torn
+ *   down when the drag ends regardless of how it terminates (commit,
+ *   sub-tolerance no-op, selection change, etc).
  */
 const EXTRUDE_STEP = 0.1
+const PREVIEW_DEBOUNCE_MS = 50
+
+type PreviewMesh = {
+  vertices: number[]
+  indices: number[]
+  normals: number[]
+}
 
 export function ExtrudeGizmo() {
   const subElementSelections = useSceneStore((s) => s.subElementSelections)
@@ -150,6 +169,35 @@ export function ExtrudeGizmo() {
     currentDistance: number
   } | null>(null)
 
+  // Live ghost-mesh state. `previewMesh` drives the React render; the
+  // refs sequence in-flight requests so a slow response from a stale
+  // distance never overwrites a fresh one. Sequence guard: every
+  // dispatched preview call captures the seq value at issue time; on
+  // resolve, the response is dropped unless seq still matches.
+  const [previewMesh, setPreviewMesh] = useState<PreviewMesh | null>(null)
+  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const previewAbortRef = useRef<AbortController | null>(null)
+  const previewSeqRef = useRef(0)
+  const previewLastDistanceRef = useRef<number | null>(null)
+
+  // Tear down any pending preview work. Safe to call from anywhere —
+  // clears the debounce timer, aborts the in-flight fetch (which
+  // surfaces as an AbortError handled below), invalidates the
+  // sequence counter, and drops the ghost mesh from the scene.
+  const cancelPreview = () => {
+    if (previewTimerRef.current !== null) {
+      clearTimeout(previewTimerRef.current)
+      previewTimerRef.current = null
+    }
+    if (previewAbortRef.current !== null) {
+      previewAbortRef.current.abort()
+      previewAbortRef.current = null
+    }
+    previewSeqRef.current += 1
+    previewLastDistanceRef.current = null
+    setPreviewMesh(null)
+  }
+
   // Reset live distance whenever the selection target changes — the
   // gizmo always starts at zero relative offset for the currently-
   // selected face. CRITICAL: also release `gizmoDragging` here. If the
@@ -165,6 +213,10 @@ export function ExtrudeGizmo() {
     dragRef.current = null
     setActive(false)
     setGizmoDragging(false)
+    cancelPreview()
+    // cancelPreview is stable across renders (refs only), and we
+    // deliberately want this to run on every selection change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel?.objectId, sel?.index, setGizmoDragging])
 
   // Window-level pointer listeners while dragging. Three-fiber's event
@@ -214,6 +266,131 @@ export function ExtrudeGizmo() {
       const snapped = Math.round(raw / EXTRUDE_STEP) * EXTRUDE_STEP
       drag.currentDistance = snapped
       setDistance(snapped)
+      schedulePreview(drag.objectId, drag.faceId, snapped, drag.axis)
+    }
+
+    // Trailing-edge debounced preview dispatcher. Rapid moves coalesce
+    // into a single backend call per `PREVIEW_DEBOUNCE_MS` window;
+    // the most recent distance always wins. Sub-tolerance distances
+    // collapse to "no preview" so a brief drift back to ~0 clears
+    // the ghost rather than showing a degenerate zero-thickness body.
+    const schedulePreview = (
+      objectId: string,
+      faceId: number,
+      snapped: number,
+      axis: THREE.Vector3,
+    ) => {
+      if (!Number.isFinite(snapped) || Math.abs(snapped) < 1e-6) {
+        // Tear down any ghost from a previous step and abort any
+        // in-flight request — we want the ghost to disappear cleanly
+        // when the user drags back through zero.
+        if (previewTimerRef.current !== null) {
+          clearTimeout(previewTimerRef.current)
+          previewTimerRef.current = null
+        }
+        if (previewAbortRef.current !== null) {
+          previewAbortRef.current.abort()
+          previewAbortRef.current = null
+        }
+        previewSeqRef.current += 1
+        previewLastDistanceRef.current = null
+        setPreviewMesh(null)
+        return
+      }
+      // Coalesce identical-distance moves — the snap step means the
+      // user can move the pointer several pixels without crossing a
+      // step boundary; re-issuing the same call wastes a roundtrip.
+      if (previewLastDistanceRef.current === snapped) return
+      if (previewTimerRef.current !== null) {
+        clearTimeout(previewTimerRef.current)
+      }
+      previewTimerRef.current = setTimeout(() => {
+        previewTimerRef.current = null
+        void dispatchPreview(objectId, faceId, snapped, axis)
+      }, PREVIEW_DEBOUNCE_MS)
+    }
+
+    const dispatchPreview = async (
+      objectId: string,
+      faceId: number,
+      snapped: number,
+      axis: THREE.Vector3,
+    ) => {
+      // Abort the prior in-flight preview, if any. The kernel still
+      // ran on the server (we can't recall it), but the response
+      // body is never parsed and never overwrites our ghost.
+      if (previewAbortRef.current !== null) {
+        previewAbortRef.current.abort()
+      }
+      const controller = new AbortController()
+      previewAbortRef.current = controller
+      const seq = ++previewSeqRef.current
+      previewLastDistanceRef.current = snapped
+      try {
+        const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+        const resp = await fetch(
+          `${API_BASE}/geometry/face/extrude/preview`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              object_uuid: objectId,
+              face_id: faceId,
+              distance: snapped,
+              direction: [axis.x, axis.y, axis.z],
+            }),
+            signal: controller.signal,
+          },
+        )
+        // Sequence guard: a slower response from an earlier dispatch
+        // must not clobber a newer ghost. Abort already pushes us
+        // into the catch branch in modern browsers, but the guard
+        // also covers the case where the request resolved with a
+        // body before abort took effect.
+        if (seq !== previewSeqRef.current) return
+        if (!resp.ok) {
+          // Non-2xx responses are silently swallowed for preview —
+          // we don't want a noisy console for every drag tick that
+          // produced a degenerate intermediate state. The commit
+          // path still surfaces real errors.
+          return
+        }
+        const data = (await resp.json()) as {
+          mesh?: {
+            vertices?: number[]
+            indices?: number[]
+            normals?: number[]
+          }
+        }
+        if (seq !== previewSeqRef.current) return
+        const mesh = data.mesh
+        if (
+          !mesh ||
+          !Array.isArray(mesh.vertices) ||
+          !Array.isArray(mesh.indices) ||
+          !Array.isArray(mesh.normals) ||
+          mesh.indices.length === 0
+        ) {
+          return
+        }
+        setPreviewMesh({
+          vertices: mesh.vertices,
+          indices: mesh.indices,
+          normals: mesh.normals,
+        })
+      } catch (err) {
+        // AbortError is the expected path when a newer dispatch
+        // supersedes us; ignore. Anything else is a network error
+        // we also ignore for preview — the ghost simply doesn't
+        // update, and the commit path will surface real failures.
+        if ((err as { name?: string })?.name !== 'AbortError') {
+          // Swallow; preview is best-effort.
+        }
+      } finally {
+        if (previewAbortRef.current === controller) {
+          previewAbortRef.current = null
+        }
+      }
     }
 
     const onUp = () => {
@@ -223,6 +400,13 @@ export function ExtrudeGizmo() {
       setPickedDirection(null)
       // Release orbit-rotate suppression — this gesture is over.
       setGizmoDragging(false)
+      // Drop the ghost the moment the user releases. Either the
+      // commit succeeds and the real mesh arrives via WS broadcast
+      // (no overlap window — kernel meshing is fast at realtime
+      // params), or the commit is a sub-tolerance no-op and the
+      // original mesh is correct. Either way, the ghost has done
+      // its job.
+      cancelPreview()
       if (!drag) {
         setDistance(0)
         return
@@ -295,7 +479,14 @@ export function ExtrudeGizmo() {
     return () => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      // The drag was torn down externally (selection change,
+      // unmount). Cancel any pending preview so a late response
+      // doesn't paint a ghost over a now-irrelevant face.
+      cancelPreview()
     }
+    // cancelPreview is stable (refs only). The other deps are the
+    // values the inner closures actually read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, camera, gl, setGizmoDragging])
 
   // Quaternion that aligns the cone/cylinder default +Y axis to the
@@ -308,6 +499,36 @@ export function ExtrudeGizmo() {
     }
     return q
   }, [transform])
+
+  // Build a BufferGeometry from the latest preview response. Rebuilt
+  // only when the mesh data identity changes — React state replaces
+  // `previewMesh` wholesale on every successful response, so this
+  // hashes to "once per preview tick". The geometry's previous
+  // `.dispose()` is called inside the same memo to free the WebGL
+  // buffers before the next one allocates.
+  const previewGeometry = useMemo(() => {
+    if (!previewMesh) return null
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(previewMesh.vertices, 3),
+    )
+    geometry.setAttribute(
+      'normal',
+      new THREE.Float32BufferAttribute(previewMesh.normals, 3),
+    )
+    geometry.setIndex(previewMesh.indices)
+    return geometry
+  }, [previewMesh])
+
+  // Dispose the previous geometry when this hook re-runs or the
+  // gizmo unmounts. `previewGeometry` holds onto GPU buffers; React
+  // garbage-collecting the JS object doesn't free them.
+  useEffect(() => {
+    return () => {
+      if (previewGeometry) previewGeometry.dispose()
+    }
+  }, [previewGeometry])
 
   if (!sel || !transform) return null
 
@@ -400,8 +621,30 @@ export function ExtrudeGizmo() {
       : posShaft + HEAD_LENGTH + 0.15
 
   return (
-    <group position={transform.origin} quaternion={orientation}>
-      {/* +axis arrow */}
+    <>
+      {/* Translucent ghost mesh of what the commit would produce.
+          Kernel returns world-space vertices (matches the commit
+          response's `position: [0,0,0]`), so the mesh mounts at
+          the root — outside the gizmo's positioned/oriented group.
+          `depthWrite={false}` keeps the original solid visible
+          through the ghost; `side: DoubleSide` makes the ghost
+          read sensibly when the preview face normals temporarily
+          flip during an extrude-through-self regime. */}
+      {previewGeometry && (
+        <mesh geometry={previewGeometry} renderOrder={1}>
+          <meshStandardMaterial
+            color="#ffaa00"
+            transparent
+            opacity={0.35}
+            depthWrite={false}
+            side={THREE.DoubleSide}
+            metalness={0.0}
+            roughness={0.8}
+          />
+        </mesh>
+      )}
+      <group position={transform.origin} quaternion={orientation}>
+        {/* +axis arrow */}
       {showPos && (
         <Arrow
           color={tintColor(hoveredPos, pickedDirection === 1)}
@@ -458,7 +701,8 @@ export function ExtrudeGizmo() {
           </div>
         </Html>
       )}
-    </group>
+      </group>
+    </>
   )
 }
 
