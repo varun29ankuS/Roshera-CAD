@@ -1627,8 +1627,12 @@ impl NurbsCurve {
     /// Parameter at which the cumulative arc length from `u_min` equals
     /// `target_length`. Clamps to the parameter domain at both ends.
     ///
-    /// Uses bounded Newton iteration on `f(u) = L(u) - target_length`
-    /// where `f'(u) = |C'(u)|`.
+    /// Solves `f(u) = L(u) - target_length = 0` with
+    /// `f'(u) = |C'(u)|`. Uses Newton-Raphson with a bisection fallback
+    /// (`crate::math::bisection`): bisection always converges because
+    /// `f` is monotonically non-decreasing on `[u_min, u_max]`, so
+    /// degenerate-speed regions can no longer leave the result stuck on
+    /// the seed.
     pub fn parameter_at_length(&self, target_length: f64, tolerance_distance: f64) -> f64 {
         let (u_min, u_max) = self.parameter_bounds();
         let total = self.arc_length(tolerance_distance);
@@ -1638,28 +1642,26 @@ impl NurbsCurve {
         if target_length >= total {
             return u_max;
         }
-        let mut u = u_min + (u_max - u_min) * (target_length / total);
-        for _ in 0..20 {
-            let current = self.arc_length_between(u_min, u, tolerance_distance);
-            let err = current - target_length;
-            if err.abs() < tolerance_distance {
-                break;
-            }
-            let speed = self.speed(u);
-            if speed < consts::EPSILON {
-                break;
-            }
-            u -= err / speed;
-            u = u.clamp(u_min, u_max);
-        }
-        u
+        let seed = u_min + (u_max - u_min) * (target_length / total);
+        crate::math::bisection::newton_with_bisection_fallback(
+            |u| self.arc_length_between(u_min, u, tolerance_distance) - target_length,
+            |u| self.speed(u),
+            seed,
+            u_min,
+            u_max,
+            tolerance_distance,
+            20,
+        )
     }
 
     /// Closest point on the curve to a given point.
     ///
     /// Returns `(parameter, point_on_curve)`. Combines a coarse 20-sample
-    /// search for an initial guess with bounded Newton-Raphson refinement
-    /// of `f(u) = (C(u) - P) · C'(u) = 0`.
+    /// search for an initial guess with Newton-Raphson refinement of
+    /// `f(u) = (C(u) - P) · C'(u) = 0`, falling back to bisection
+    /// (`crate::math::bisection`) when the Newton derivative vanishes —
+    /// inflection-point cases that previously stalled and returned the
+    /// seed now converge.
     pub fn closest_point(&self, point: &Point3, tolerance_distance: f64) -> (f64, Point3) {
         let (u_min, u_max) = self.parameter_bounds();
         const N_SAMPLES: usize = 20;
@@ -1676,25 +1678,28 @@ impl NurbsCurve {
             }
         }
 
-        let mut u = best_u;
-        for _ in 0..20 {
+        // f(u) = (C(u) - P) · C'(u)
+        // f'(u) = |C'(u)|² + (C(u) - P) · C''(u)
+        let f = |u: f64| {
+            let ders = self.evaluate_derivatives(u, 1);
+            let c1 = ders.derivative1.unwrap_or(Vector3::ZERO);
+            (ders.point - *point).dot(&c1)
+        };
+        let df = |u: f64| {
             let ders = self.evaluate_derivatives(u, 2);
-            let c = ders.point;
             let c1 = ders.derivative1.unwrap_or(Vector3::ZERO);
             let c2 = ders.derivative2.unwrap_or(Vector3::ZERO);
-            let to_p = c - *point;
-            let f = to_p.dot(&c1);
-            if f.abs() < tolerance_distance {
-                break;
-            }
-            // f'(u) = |C'(u)|² + (C(u) - P) · C''(u)
-            let df = c1.magnitude_squared() + to_p.dot(&c2);
-            if df.abs() < consts::EPSILON {
-                break;
-            }
-            let du = f / df;
-            u = (u - du).clamp(u_min, u_max);
-        }
+            c1.magnitude_squared() + (ders.point - *point).dot(&c2)
+        };
+        let u = crate::math::bisection::newton_with_bisection_fallback(
+            f,
+            df,
+            best_u,
+            u_min,
+            u_max,
+            tolerance_distance,
+            20,
+        );
         let closest = self.evaluate(u).point;
         (u, closest)
     }
