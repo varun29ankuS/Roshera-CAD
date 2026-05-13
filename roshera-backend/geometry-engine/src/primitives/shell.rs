@@ -983,7 +983,7 @@ pub struct ShellStore {
     pub stats: ShellStoreStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ShellStoreStats {
     pub total_created: u64,
     pub total_deleted: u64,
@@ -1003,6 +1003,21 @@ impl ShellStore {
             closed_shells: HashSet::new(),
             next_id: 0,
             stats: ShellStoreStats::default(),
+        }
+    }
+
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// All sub-stores derive `Clone`. The `Shell::cached_mass_props`
+    /// inside each cloned shell is preserved verbatim — restoring a
+    /// snapshot brings back the cached value, matching the
+    /// "operation never happened" invariant.
+    pub(crate) fn deep_copy(&self) -> Self {
+        Self {
+            shells: self.shells.clone(),
+            face_to_shells: self.face_to_shells.clone(),
+            closed_shells: self.closed_shells.clone(),
+            next_id: self.next_id,
+            stats: self.stats.clone(),
         }
     }
 

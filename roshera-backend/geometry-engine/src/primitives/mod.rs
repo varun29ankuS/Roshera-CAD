@@ -7,6 +7,7 @@ pub mod face;
 pub mod fillet_surfaces;
 pub mod r#loop;
 pub mod shell;
+pub mod snapshot;
 pub mod solid;
 pub mod surface;
 pub mod tolerance_propagation;

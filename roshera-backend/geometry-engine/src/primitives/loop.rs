@@ -725,7 +725,7 @@ pub struct LoopStore {
     pub stats: LoopStoreStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LoopStoreStats {
     pub total_created: u64,
     pub total_deleted: u64,
@@ -745,6 +745,18 @@ impl LoopStore {
             root_loops: Vec::new(),
             next_id: 0,
             stats: LoopStoreStats::default(),
+        }
+    }
+
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// All sub-stores derive `Clone`; nothing here is concurrent state.
+    pub(crate) fn deep_copy(&self) -> Self {
+        Self {
+            loops: self.loops.clone(),
+            edge_to_loops: self.edge_to_loops.clone(),
+            root_loops: self.root_loops.clone(),
+            next_id: self.next_id,
+            stats: self.stats.clone(),
         }
     }
 

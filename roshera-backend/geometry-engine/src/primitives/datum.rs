@@ -515,6 +515,21 @@ impl DatumStore {
         }
     }
 
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// Each `Datum` derives `Clone`. `next_id` is read under the
+    /// existing mutex and reseeded into a fresh mutex so the
+    /// snapshot owns its own allocation counter.
+    pub(crate) fn deep_copy(&self) -> Self {
+        let datums = DashMap::with_capacity(self.datums.len());
+        for kv in self.datums.iter() {
+            datums.insert(*kv.key(), kv.value().clone());
+        }
+        Self {
+            datums,
+            next_id: Mutex::new(*self.next_id.lock()),
+        }
+    }
+
     /// Seed the canonical default datums: world Origin, three reference
     /// planes (XY / XZ / YZ), and three reference axes (X / Y / Z).
     ///
@@ -893,6 +908,25 @@ impl DatumGraph {
         Self::default()
     }
 
+    /// Deep copy of this graph for the F2-δ ModelSnapshot primitive.
+    /// Each of the five DashMap indexes is rebuilt entry-by-entry.
+    pub(crate) fn deep_copy(&self) -> Self {
+        fn copy_u32_map(src: &DashMap<u32, Vec<u32>>) -> DashMap<u32, Vec<u32>> {
+            let dst = DashMap::with_capacity(src.len());
+            for kv in src.iter() {
+                dst.insert(*kv.key(), kv.value().clone());
+            }
+            dst
+        }
+        Self {
+            datum_to_datums: copy_u32_map(&self.datum_to_datums),
+            datum_to_solids: copy_u32_map(&self.datum_to_solids),
+            vertex_to_datums: copy_u32_map(&self.vertex_to_datums),
+            edge_to_datums: copy_u32_map(&self.edge_to_datums),
+            face_to_datums: copy_u32_map(&self.face_to_datums),
+        }
+    }
+
     /// Register that `datum_id`'s evaluation depends on every entity
     /// referenced by `source`. Idempotent per (upstream, downstream)
     /// pair: re-registering the same edge does nothing.
@@ -1053,6 +1087,17 @@ impl LocationDescriptorCache {
     /// Empty cache. `BRepModel::new()` constructs a fresh cache.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Deep copy of this cache for the F2-δ ModelSnapshot primitive.
+    /// `LocationDescriptor` derives `Clone`; entries are rebuilt one
+    /// by one so the snapshot owns its own DashMap.
+    pub(crate) fn deep_copy(&self) -> Self {
+        let entries = DashMap::with_capacity(self.entries.len());
+        for kv in self.entries.iter() {
+            entries.insert(*kv.key(), kv.value().clone());
+        }
+        Self { entries }
     }
 
     /// Cached descriptor for `solid_id`, or `None` on miss.

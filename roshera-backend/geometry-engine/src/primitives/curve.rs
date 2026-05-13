@@ -3324,6 +3324,17 @@ impl CurveStore {
         }
     }
 
+    /// Deep copy of this store for the F2-δ ModelSnapshot primitive.
+    /// Trait-object curves are cloned through `Curve::clone_box`; the
+    /// resulting `Vec` owns its own heap allocations independent of
+    /// the original.
+    pub(crate) fn deep_copy(&self) -> Self {
+        Self {
+            curves: self.curves.iter().map(|c| c.clone_box()).collect(),
+            next_id: self.next_id,
+        }
+    }
+
     /// Add a curve
     pub fn add(&mut self, curve: Box<dyn Curve>) -> CurveId {
         let id = self.next_id;
