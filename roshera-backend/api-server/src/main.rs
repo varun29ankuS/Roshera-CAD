@@ -2723,6 +2723,207 @@ async fn extrude_face_endpoint(
     })))
 }
 
+/// POST /api/geometry/face/extrude/preview — live-drag preview for the
+/// push-pull gizmo. Same inputs as `/api/geometry/face/extrude`; runs
+/// the extrude against a snapshot of the model, tessellates the result
+/// with realtime-quality params, then restores. Side-effect-free: the
+/// model is unchanged on success or failure, no UUID mapping is
+/// rewritten, no WebSocket frame is broadcast, no recorder event is
+/// emitted.
+///
+/// Intended for 50 ms-debounced drag ticks. The frontend (PP-2)
+/// renders the returned mesh as a translucent ghost overlay; the user
+/// commits via the regular extrude endpoint when they release the
+/// gizmo.
+///
+/// Response shape mirrors the commit endpoint's `object.mesh` block so
+/// the frontend can feed the same buffer-builder for both:
+/// ```json
+/// { "mesh": { "vertices": [...], "indices": [...],
+///             "normals": [...], "face_ids": [...] },
+///   "stats": { "vertex_count": …, "triangle_count": …,
+///              "tessellation_ms": … } }
+/// ```
+async fn preview_face_extrude(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::extrude::{extrude_face, ExtrudeOptions};
+    use geometry_engine::primitives::snapshot::ModelSnapshot;
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let object_uuid_str = payload
+        .get("object_uuid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object_uuid"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("object_uuid is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+    let face_id = payload
+        .get("face_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ApiError::missing_field("face_id"))? as u32;
+    let distance = payload
+        .get("distance")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("distance"))?;
+    if !distance.is_finite() || distance.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("distance must be non-zero and finite (got {distance})"),
+        ));
+    }
+
+    let host_solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for {object_uuid}"),
+        )
+    })?;
+
+    // Pre-flight face ownership + direction resolution under a read
+    // lock — same shape as the commit endpoint, so a drag tick that
+    // would commit-fail doesn't even enter the write phase here.
+    let direction = {
+        let model = state.model.read().await;
+        let solid = model
+            .solids
+            .get(host_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(host_solid_id))?;
+        let mut owns_face = false;
+        let outer = std::iter::once(&solid.outer_shell);
+        for &shell_id in outer.chain(solid.inner_shells.iter()) {
+            if let Some(shell) = model.shells.get(shell_id) {
+                if shell.faces.contains(&face_id) {
+                    owns_face = true;
+                    break;
+                }
+            }
+        }
+        if !owns_face {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "face_id {face_id} does not belong to solid {host_solid_id} \
+                     (uuid {object_uuid})"
+                ),
+            ));
+        }
+        match payload.get("direction") {
+            Some(d) => {
+                let arr = d.as_array().ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        "direction must be an array of 3 numbers".to_string(),
+                    )
+                })?;
+                if arr.len() != 3 {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("direction needs 3 numbers, got {}", arr.len()),
+                    ));
+                }
+                Vector3::new(
+                    arr[0].as_f64().unwrap_or(0.0),
+                    arr[1].as_f64().unwrap_or(0.0),
+                    arr[2].as_f64().unwrap_or(0.0),
+                )
+            }
+            None => {
+                let face = model.faces.get(face_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("face {face_id} not found"),
+                    )
+                })?;
+                face.normal_at(0.5, 0.5, &model.surfaces).map_err(|e| {
+                    ApiError::new(
+                        ErrorCode::Internal,
+                        format!("failed to evaluate normal on face {face_id}: {e}"),
+                    )
+                })?
+            }
+        }
+    };
+
+    // The transactional core. Detach the recorder so the kernel's
+    // success-path event emission for `extrude_face` never reaches
+    // the timeline — this op is a what-if, not history. Take a deep
+    // snapshot, run the op, tessellate on success, then restore. The
+    // snapshot path is on both the success and failure exits; the
+    // model is provably identical when this scope ends.
+    let outcome: Result<
+        (
+            geometry_engine::tessellation::TriangleMesh,
+            u64,
+            geometry_engine::primitives::solid::SolidId,
+        ),
+        ApiError,
+    > = {
+        let mut model = state.model.write().await;
+        let saved_recorder = model.attach_recorder(None);
+        let snap = ModelSnapshot::take(&model);
+
+        let options = ExtrudeOptions {
+            direction,
+            distance,
+            ..ExtrudeOptions::default()
+        };
+        let op_result = extrude_face(&mut model, face_id, options);
+
+        let outcome = match op_result {
+            Ok(preview_solid_id) => {
+                let solid = match model.solids.get(preview_solid_id) {
+                    Some(s) => s,
+                    None => {
+                        snap.restore(&mut model);
+                        model.attach_recorder(saved_recorder);
+                        return Err(ApiError::solid_not_found(preview_solid_id));
+                    }
+                };
+                let tess_start = Instant::now();
+                let mesh = tessellate_solid(solid, &model, &TessellationParams::realtime());
+                let elapsed = tess_start.elapsed().as_millis() as u64;
+                Ok((mesh, elapsed, preview_solid_id))
+            }
+            Err(e) => Err(ApiError::kernel_error(e)),
+        };
+
+        snap.restore(&mut model);
+        model.attach_recorder(saved_recorder);
+        outcome
+    };
+
+    let (tri_mesh, tessellation_ms, preview_solid_id) = outcome?;
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            preview_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "mesh": {
+            "vertices": vertices,
+            "indices":  indices,
+            "normals":  normals,
+            "face_ids": face_ids,
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 // Auth handlers (login, logout, refresh_token) live in handlers::auth and are
 // brought into scope via `use handlers::*;`. The export endpoint dispatches to
 // handlers::export::export_mesh.
@@ -4979,6 +5180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/boolean", post(boolean_operation))
         .route("/api/geometry/extrude", post(create_extrude))
         .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
+        .route(
+            "/api/geometry/face/extrude/preview",
+            post(preview_face_extrude),
+        )
         .route("/api/geometry/shell", post(shell_solid))
         .route("/api/geometry/mirror", post(mirror_solid))
         .route("/api/geometry/fillet", post(fillet_edges_endpoint))
