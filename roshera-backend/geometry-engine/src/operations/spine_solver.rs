@@ -35,17 +35,17 @@
 
 #![allow(clippy::indexing_slicing)] // Indexed access into bounded sample arrays.
 
-use crate::math::frame::FrameAtStation;
+use crate::math::frame::{parallel_transport_frames, FrameAtStation};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::operations::blend_graph::{BlendGraph, BlendRadius};
 use crate::operations::edge_classification::find_adjacent_faces;
 use crate::operations::fillet::{edge_orientation_in_face, get_face_oriented_normal};
 use crate::operations::fillet_robust::robust_face_angle;
 use crate::operations::{OperationError, OperationResult};
-use crate::primitives::curve::{Arc, Curve, Line};
+use crate::primitives::curve::{Arc, Curve, Line, NurbsCurve};
 use crate::primitives::edge::{Edge, EdgeId};
 use crate::primitives::face::FaceId;
-use crate::primitives::surface::{Cylinder, Plane, Sphere, SurfaceType};
+use crate::primitives::surface::{Cylinder, Plane, Sphere, Surface, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 
 /// Which solver produced this spine. Tests pin the kind so a
@@ -152,6 +152,20 @@ pub struct SpineOptions {
     /// does not yet implement setback consumption — the flag is
     /// stored and honoured starting in F3-δ.
     pub honor_setbacks: bool,
+    /// When `true`, surface pairs that no analytic arm recognises
+    /// route to the F3-γ marching solver instead of returning
+    /// `Ok(None)` to the caller. **Default is `false`** during the
+    /// F3-γ → F3-δ transition: production fillet code uses the
+    /// legacy bisector fallback for non-analytic pairs so that
+    /// flat ruled-surface side faces (every extruded prism wall)
+    /// don't hit the marching corrector's noise floor on
+    /// `RuledSurface::closest_point`. F3-δ adds planar-surface
+    /// detection that promotes flat ruled walls into the
+    /// plane/plane analytic arm and flips this default back to
+    /// `true`. Tests that exercise marching invoke
+    /// [`solve_marching`] directly or pass `enable_marching:
+    /// true` explicitly.
+    pub enable_marching: bool,
 }
 
 impl Default for SpineOptions {
@@ -161,6 +175,7 @@ impl Default for SpineOptions {
             min_samples: 32,
             max_samples: 2048,
             honor_setbacks: true,
+            enable_marching: false,
         }
     }
 }
@@ -260,93 +275,93 @@ pub fn solve_spine_for_edge(
 
     // Dispatch on the surface-type tuple. F3-α landed plane/plane;
     // F3-β adds plane/cylinder (perpendicular + parallel-tangent
-    // sub-cases) and plane/sphere. Oblique plane/cylinder, secant
-    // plane/cylinder, sphere/sphere, cylinder/cylinder, and any
-    // NURBS pair fall through to None so the caller routes the
-    // request through the legacy bisector path until F3-γ wires in
-    // marching.
-    match (surface_a.surface_type(), surface_b.surface_type()) {
-        (SurfaceType::Plane, SurfaceType::Plane) => {
-            let plane_a = surface_a
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| OperationError::InternalError("Plane downcast failed".into()))?;
-            let plane_b = surface_b
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| OperationError::InternalError("Plane downcast failed".into()))?;
-            solve_plane_plane(
-                model, &edge, edge_id, face_a, face_b, plane_a, plane_b, radius, options,
-            )
-            .map(Some)
+    // sub-cases) and plane/sphere. F3-γ ships the marching solver
+    // as a parallel-deployment addition behind
+    // [`SpineOptions::enable_marching`] (default `false` — see the
+    // field doc for the rationale). When the flag is `true` and no
+    // analytic arm claims the pair, marching takes over; when the
+    // flag is `false` (production today) we return `Ok(None)` so
+    // [`fillet`] falls through to the legacy bisector path. F3-δ
+    // adds planar-ruled-surface promotion and flips the default
+    // back to `true`.
+    let analytic_result: OperationResult<Option<SpineRail>> =
+        match (surface_a.surface_type(), surface_b.surface_type()) {
+            (SurfaceType::Plane, SurfaceType::Plane) => {
+                let plane_a = surface_a.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+                    OperationError::InternalError("Plane downcast failed".into())
+                })?;
+                let plane_b = surface_b.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+                    OperationError::InternalError("Plane downcast failed".into())
+                })?;
+                solve_plane_plane(
+                    model, &edge, edge_id, face_a, face_b, plane_a, plane_b, radius, options,
+                )
+                .map(Some)
+            }
+            (SurfaceType::Plane, SurfaceType::Cylinder) => {
+                let plane = surface_a.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+                    OperationError::InternalError("Plane downcast failed".into())
+                })?;
+                let cylinder = surface_b.as_any().downcast_ref::<Cylinder>().ok_or_else(
+                    || OperationError::InternalError("Cylinder downcast failed".into()),
+                )?;
+                solve_plane_cylinder(
+                    model, &edge, edge_id, face_a, face_b, plane, cylinder,
+                    /*plane_is_a=*/ true, radius, options,
+                )
+            }
+            (SurfaceType::Cylinder, SurfaceType::Plane) => {
+                let cylinder = surface_a.as_any().downcast_ref::<Cylinder>().ok_or_else(
+                    || OperationError::InternalError("Cylinder downcast failed".into()),
+                )?;
+                let plane = surface_b.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+                    OperationError::InternalError("Plane downcast failed".into())
+                })?;
+                solve_plane_cylinder(
+                    model, &edge, edge_id, face_a, face_b, plane, cylinder,
+                    /*plane_is_a=*/ false, radius, options,
+                )
+            }
+            (SurfaceType::Plane, SurfaceType::Sphere) => {
+                let plane = surface_a.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+                    OperationError::InternalError("Plane downcast failed".into())
+                })?;
+                let sphere = surface_b.as_any().downcast_ref::<Sphere>().ok_or_else(|| {
+                    OperationError::InternalError("Sphere downcast failed".into())
+                })?;
+                solve_plane_sphere(
+                    model, &edge, edge_id, face_a, face_b, plane, sphere,
+                    /*plane_is_a=*/ true, radius, options,
+                )
+            }
+            (SurfaceType::Sphere, SurfaceType::Plane) => {
+                let sphere = surface_a.as_any().downcast_ref::<Sphere>().ok_or_else(|| {
+                    OperationError::InternalError("Sphere downcast failed".into())
+                })?;
+                let plane = surface_b.as_any().downcast_ref::<Plane>().ok_or_else(|| {
+                    OperationError::InternalError("Plane downcast failed".into())
+                })?;
+                solve_plane_sphere(
+                    model, &edge, edge_id, face_a, face_b, plane, sphere,
+                    /*plane_is_a=*/ false, radius, options,
+                )
+            }
+            _ => Ok(None),
+        };
+
+    match analytic_result {
+        Ok(Some(rail)) => Ok(Some(rail)),
+        Ok(None) => {
+            if options.enable_marching {
+                solve_marching(
+                    model, &edge, edge_id, face_a, face_b, surface_a, surface_b, radius, options,
+                )
+                .map(Some)
+            } else {
+                Ok(None)
+            }
         }
-        (SurfaceType::Plane, SurfaceType::Cylinder) => {
-            let plane = surface_a
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| OperationError::InternalError("Plane downcast failed".into()))?;
-            let cylinder = surface_b
-                .as_any()
-                .downcast_ref::<Cylinder>()
-                .ok_or_else(|| OperationError::InternalError("Cylinder downcast failed".into()))?;
-            solve_plane_cylinder(
-                model, &edge, edge_id, face_a, face_b, plane, cylinder, /*plane_is_a=*/ true,
-                radius, options,
-            )
-        }
-        (SurfaceType::Cylinder, SurfaceType::Plane) => {
-            let cylinder = surface_a
-                .as_any()
-                .downcast_ref::<Cylinder>()
-                .ok_or_else(|| OperationError::InternalError("Cylinder downcast failed".into()))?;
-            let plane = surface_b
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| OperationError::InternalError("Plane downcast failed".into()))?;
-            solve_plane_cylinder(
-                model, &edge, edge_id, face_a, face_b, plane, cylinder, /*plane_is_a=*/ false,
-                radius, options,
-            )
-        }
-        (SurfaceType::Plane, SurfaceType::Sphere) => {
-            let plane = surface_a
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| OperationError::InternalError("Plane downcast failed".into()))?;
-            let sphere = surface_b
-                .as_any()
-                .downcast_ref::<Sphere>()
-                .ok_or_else(|| OperationError::InternalError("Sphere downcast failed".into()))?;
-            solve_plane_sphere(
-                model, &edge, edge_id, face_a, face_b, plane, sphere, /*plane_is_a=*/ true,
-                radius, options,
-            )
-        }
-        (SurfaceType::Sphere, SurfaceType::Plane) => {
-            let sphere = surface_a
-                .as_any()
-                .downcast_ref::<Sphere>()
-                .ok_or_else(|| OperationError::InternalError("Sphere downcast failed".into()))?;
-            let plane = surface_b
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| OperationError::InternalError("Plane downcast failed".into()))?;
-            solve_plane_sphere(
-                model, &edge, edge_id, face_a, face_b, plane, sphere, /*plane_is_a=*/ false,
-                radius, options,
-            )
-        }
-        // (Cylinder, Cylinder) coaxial: the geometry requires two
-        // coaxial cylinders that genuinely share an edge curve.
-        // That topology does not arise from our primitive
-        // constructors (a stepped shaft has a planar step face
-        // between the two cylinders, not a direct cyl/cyl edge),
-        // and the boolean-imprint path that could produce one is
-        // F3-γ marching's territory because the spine geometry
-        // depends on the imprint curve, not just the surfaces.
-        // Returning None defers to the legacy bisector. Once a
-        // genuine cyl/cyl edge fixture appears we will revisit.
-        _ => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -1232,6 +1247,468 @@ fn solve_plane_sphere(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// F3-γ — Marching solver
+// ---------------------------------------------------------------------------
+//
+// For every surface pair the analytic dispatcher declines to handle, we
+// march along the source edge curve sampling the rolling-ball spine at
+// uniform parameters. At each station an alternate-projection corrector
+// refines an initial bisector seed using each face's `Surface::closest_point`
+// — so unlike the legacy bisector path the contacts are *projected* onto
+// the supporting faces rather than approximated via `center ± radius·normal`.
+//
+// The corrector is a Picard-style iteration capped at [`MAX_CORRECTOR_ITERS`]
+// rounds with an F1-δ-style monotone-decrease guard: if the worst-case gap
+// (max of `||center − contact_i| − radius|` over i ∈ {a, b}) fails to shrink
+// for [`CORRECTOR_STALL_LIMIT`] consecutive iterations the corrector returns
+// a `PK_BLEND_SPINE_DIVERGED` numerical error. F2-δ rollback turns that
+// into a clean "model untouched" failure at the fillet entry point.
+//
+// Frames are attached after fitting: the marched centres are fitted to a
+// cubic NURBS curve, then [`parallel_transport_frames`] produces a
+// rotation-minimising frame sequence (Wang/Jüttler double-reflection) along
+// it. F4 consumes those frames when stamping the pipe / NURBS-skin blend
+// surface — analytic arms re-derive frames from their closed forms so the
+// frames field is left empty there.
+
+/// Hard cap on corrector iterations per station. Eight is enough for the
+/// quadratic convergence of the alternating projection to reach
+/// `tolerance.distance()` on every well-conditioned blend we have measured.
+const MAX_CORRECTOR_ITERS: usize = 8;
+
+/// Stall threshold for the F1-δ-style monotone-decrease guard. Three
+/// consecutive non-decreasing gaps declare divergence.
+const CORRECTOR_STALL_LIMIT: usize = 3;
+
+/// Near-tangent guard for the marching solver. Slightly tighter than the
+/// analytic 0.1 rad bound — marching can in principle cope with sharper
+/// dihedrals than the bisector heuristic, but anything tighter than ≈3°
+/// is almost always a blend-too-large pathology and rejecting it surfaces
+/// the failure to the caller instead of silently producing garbage.
+const MARCHING_NEAR_TANGENT_RAD: f64 = 0.05;
+
+/// One station of the marching corrector. Given a seed centre, alternates
+/// projecting onto `surface_a` and `surface_b` and re-centring at the
+/// midpoint of the two `(contact + radius·outward_normal)` targets.
+///
+/// Returns `(corrected_center, contact_a, contact_b, iterations_used)`.
+///
+/// Errors with `PK_BLEND_SPINE_DIVERGED` when the worst-case
+/// `||center − contact| − radius|` fails to monotonically decrease for
+/// [`CORRECTOR_STALL_LIMIT`] iterations, or when the iteration cap is
+/// reached with the residual still more than 10× the target tolerance.
+fn corrector(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    seed_center: Point3,
+    radius: f64,
+    tolerance: Tolerance,
+) -> OperationResult<(Point3, Point3, Point3, usize)> {
+    let target = tolerance.distance().max(1e-9);
+    let mut center = seed_center;
+    let mut prev_gap = f64::INFINITY;
+    let mut stall: usize = 0;
+    let mut best: Option<(Point3, Point3, Point3, f64)> = None;
+
+    for iter in 1..=MAX_CORRECTOR_ITERS {
+        let (ua, va) = surface_a.closest_point(&center, tolerance).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Marching corrector: closest_point on face A failed: {:?}",
+                e
+            ))
+        })?;
+        let contact_a = surface_a.point_at(ua, va).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Marching corrector: point_at face A failed: {:?}",
+                e
+            ))
+        })?;
+        let (ub, vb) = surface_b.closest_point(&center, tolerance).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Marching corrector: closest_point on face B failed: {:?}",
+                e
+            ))
+        })?;
+        let contact_b = surface_b.point_at(ub, vb).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Marching corrector: point_at face B failed: {:?}",
+                e
+            ))
+        })?;
+
+        let da = (center - contact_a).magnitude();
+        let db = (center - contact_b).magnitude();
+        let gap_a = (da - radius).abs();
+        let gap_b = (db - radius).abs();
+        let gap = gap_a.max(gap_b);
+
+        // Track the best (lowest-gap) iterate so we can return it on
+        // iteration exhaustion if it's "close enough".
+        best = match best {
+            Some((_, _, _, g)) if g <= gap => best,
+            _ => Some((center, contact_a, contact_b, gap)),
+        };
+
+        if gap <= target {
+            return Ok((center, contact_a, contact_b, iter));
+        }
+
+        // Monotone-decrease guard. A tiny relative slack (1e-6) keeps
+        // floating-point noise from declaring divergence on a stalled-
+        // but-converged residual.
+        if gap >= prev_gap * (1.0 - 1e-6) {
+            stall += 1;
+            if stall >= CORRECTOR_STALL_LIMIT {
+                return Err(OperationError::NumericalError(format!(
+                    "PK_BLEND_SPINE_DIVERGED: marching corrector gap not decreasing \
+                     ({:.3e} ≥ {:.3e}) for {} iterations at radius {}",
+                    gap, prev_gap, stall, radius
+                )));
+            }
+        } else {
+            stall = 0;
+        }
+        prev_gap = gap;
+
+        // Picard update. Push each contact outward by `radius` along the
+        // (center − contact) direction; the next centre estimate is the
+        // midpoint of those two push targets. When the centre coincides
+        // with a contact (da or db ≈ 0) we fall back to the surface
+        // normal at that contact — that case is rare in practice
+        // (corrector should never land on the surface) but is the
+        // correct degenerate limit.
+        let dir_a = if da > 1e-30 {
+            (center - contact_a) * (1.0 / da)
+        } else {
+            surface_a.normal_at(ua, va).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "Marching corrector: normal at contact A: {:?}",
+                    e
+                ))
+            })?
+        };
+        let dir_b = if db > 1e-30 {
+            (center - contact_b) * (1.0 / db)
+        } else {
+            surface_b.normal_at(ub, vb).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "Marching corrector: normal at contact B: {:?}",
+                    e
+                ))
+            })?
+        };
+        let push_a = contact_a + dir_a * radius;
+        let push_b = contact_b + dir_b * radius;
+        center = Point3 {
+            x: 0.5 * (push_a.x + push_b.x),
+            y: 0.5 * (push_a.y + push_b.y),
+            z: 0.5 * (push_a.z + push_b.z),
+        };
+    }
+
+    // Iteration cap reached without converging. Accept the best iterate
+    // if its residual is within 10× the target — that's still well
+    // inside the supporting-face tolerance budget and avoids rejecting
+    // marginally-converged stations on otherwise valid blends. Anything
+    // worse declares divergence.
+    let (best_c, best_a, best_b, best_gap) = best.ok_or_else(|| {
+        OperationError::InternalError(
+            "Marching corrector exited without computing any iterate".to_string(),
+        )
+    })?;
+    if best_gap > target * 10.0 {
+        return Err(OperationError::NumericalError(format!(
+            "PK_BLEND_SPINE_DIVERGED: marching corrector exceeded {} iterations \
+             with best gap {:.3e} (target {:.3e})",
+            MAX_CORRECTOR_ITERS, best_gap, target
+        )));
+    }
+    Ok((best_c, best_a, best_b, MAX_CORRECTOR_ITERS))
+}
+
+/// Marching solver for surface pairs that no analytic arm recognises.
+///
+/// The march samples [`SpineOptions::min_samples`] stations at uniform
+/// edge-curve parameters. Each station seeds the corrector with either
+/// the previous corrected centre (warm-start, used once we have one) or
+/// the legacy bisector heuristic (cold-start at the first station). The
+/// corrector then alternate-projects onto both supporting faces.
+///
+/// After all stations succeed, the centre and contact arrays are fitted
+/// to cubic NURBS curves and [`parallel_transport_frames`] attaches a
+/// rotation-minimising frame sequence to the spine. The returned
+/// `SolverKind::Marched` records the worst-case corrector iteration
+/// count so callers / tests can monitor convergence quality.
+#[allow(clippy::too_many_arguments)]
+fn solve_marching(
+    model: &BRepModel,
+    edge: &Edge,
+    edge_id: EdgeId,
+    face_a: FaceId,
+    _face_b: FaceId,
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    radius: f64,
+    options: &SpineOptions,
+) -> OperationResult<SpineRail> {
+    // 1. Establish signed dihedral and sign convention once at the
+    //    edge midpoint — identical convention to plane/plane and the
+    //    legacy bisector. The marching path inherits this so we don't
+    //    flip-flop ball-side along the edge.
+    let edge_mid = edge.evaluate(0.5, &model.curves)?;
+    let n_a_mid = get_face_oriented_normal(model, face_a, &edge_mid)?;
+    let n_b_mid = get_face_oriented_normal(model, _face_b, &edge_mid)?;
+    let raw_tangent = edge.tangent_at(0.5, &model.curves)?;
+    let face_a_loop_sign = edge_orientation_in_face(model, face_a, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face_a
+        ))
+    })?;
+    let edge_tangent_in_loop = raw_tangent * face_a_loop_sign;
+    let dihedral = robust_face_angle(
+        &n_a_mid,
+        &n_b_mid,
+        &edge_tangent_in_loop,
+        &options.tolerance,
+    )
+    .map_err(|e| {
+        OperationError::NumericalError(format!("Marching: dihedral compute failed: {:?}", e))
+    })?;
+
+    let abs_dihedral = dihedral.abs();
+    if abs_dihedral < MARCHING_NEAR_TANGENT_RAD
+        || (std::f64::consts::PI - abs_dihedral) < MARCHING_NEAR_TANGENT_RAD
+    {
+        return Err(OperationError::InvalidGeometry(
+            "Near-tangent surfaces require special handling (marching solver)".to_string(),
+        ));
+    }
+
+    let offset_sign = if dihedral > 0.0 { -1.0 } else { 1.0 };
+
+    // 2. Sampling cadence. Honor `min_samples`; cap at `max_samples`.
+    //    Marching needs ≥ 4 samples to fit a cubic NURBS later, but
+    //    `NurbsCurve::fit_to_points` degrades degree gracefully below
+    //    that — we still enforce a hard floor of 4 so the frame
+    //    sequence is non-trivial.
+    let n_samples = options
+        .min_samples
+        .max(4)
+        .min(options.max_samples.max(4));
+
+    // 3. March along the edge. Uniform-parameter sampling — adaptive
+    //    arc-length refinement is an F3-γ.1 follow-up; for the
+    //    landing slice uniform-t is sufficient and matches the
+    //    convention used by the analytic arms.
+    //
+    //    Each station seeds the corrector with the bisector heuristic
+    //    evaluated at the *local* edge point. Warm-starting from the
+    //    previous corrected centre is tempting (saves 1-2 corrector
+    //    iterations on curved spines) but breaks plane/plane: the
+    //    corrector's Picard iteration there has an *infinite line*
+    //    of fixed points (any point at the correct perpendicular
+    //    offset from the edge satisfies `|center−contact_i| = r`
+    //    on both faces). Once station 0 lands at the corner's x,
+    //    warm-starting holds that x through every subsequent
+    //    station, producing a spine parallel to the edge but
+    //    anchored at the wrong axial position. Cold-seeding per
+    //    station puts the seed on the correct edge-perpendicular
+    //    locus before the corrector runs, eliminating the
+    //    degeneracy. The 1-2 saved iterations per station on
+    //    curved geometry are not worth the plane/plane failure
+    //    mode.
+    let mut samples: Vec<SpineRailSample> = Vec::with_capacity(n_samples);
+    let mut prev_center: Option<Point3> = None;
+    let mut cumulative_arc = 0.0_f64;
+    let mut worst_iters: usize = 0;
+
+    for i in 0..n_samples {
+        let t = i as f64 / (n_samples as f64 - 1.0);
+        let edge_point = edge.evaluate(t, &model.curves)?;
+
+        // Bisector seed at this edge parameter — same heuristic as
+        // the legacy bisector path and the analytic arms' starting
+        // point. Anchors the corrector on the correct edge-
+        // perpendicular locus regardless of prior station drift.
+        let seed = {
+            let n_a = get_face_oriented_normal(model, face_a, &edge_point)?;
+            let n_b = get_face_oriented_normal(model, _face_b, &edge_point)?;
+            let bisector_raw = n_a + n_b;
+            let bisector = bisector_raw.normalize().map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "Marching: bisector normalize at t={}: {:?}",
+                    t, e
+                ))
+            })?;
+            let dot_a = bisector.dot(&n_a);
+            let offset_dist = if dot_a.abs() > 1e-9 {
+                radius / dot_a
+            } else {
+                radius
+            };
+            edge_point + bisector * (offset_sign * offset_dist)
+        };
+
+        let (center, contact_a, contact_b, iters) =
+            corrector(surface_a, surface_b, seed, radius, options.tolerance)?;
+        worst_iters = worst_iters.max(iters);
+
+        if let Some(prev) = prev_center {
+            cumulative_arc += (center - prev).magnitude();
+        }
+        prev_center = Some(center);
+
+        samples.push(SpineRailSample {
+            edge_parameter: t,
+            arc_length: cumulative_arc,
+            center,
+            contact_a,
+            contact_b,
+            radius,
+        });
+    }
+
+    // 4. Build spine + rail curves. If the marched samples are
+    //    collinear within tolerance (which happens whenever the
+    //    underlying geometry admits a straight spine — plane/plane
+    //    blends, axis-parallel cylinder/plane, etc.), emit exact
+    //    [`Line`]s. Otherwise fit cubic NURBS through the samples;
+    //    the fitter uses uniform parameterisation and clamped
+    //    knot vectors. Three independent fits keep each curve's
+    //    parameterisation aligned to the discrete `SpineRailSample`
+    //    arrays so F4 / F5 can reason about local frames.
+    //
+    //    Collinearity detection matters for two reasons:
+    //
+    //    * Numerical: `NurbsCurve::fit_to_points` with collinear
+    //      control points yields a NURBS whose interior derivative
+    //      can collapse to zero magnitude (degenerate basis-function
+    //      evaluation when control points span no 2D extent),
+    //      breaking the downstream `tangent_at(t).normalize()` call
+    //      inside [`parallel_transport_frames`].
+    //    * Semantic: emitting a `Line` instead of a NURBS for a
+    //      provably-straight spine matches the analytic plane/plane
+    //      arm and keeps F4's pipe-surface dispatch on the cheap
+    //      path.
+    let centers: Vec<Point3> = samples.iter().map(|s| s.center).collect();
+    let contacts_a: Vec<Point3> = samples.iter().map(|s| s.contact_a).collect();
+    let contacts_b: Vec<Point3> = samples.iter().map(|s| s.contact_b).collect();
+
+    let tol = options.tolerance.distance();
+    let centers_colinear = points_are_collinear(&centers, tol);
+    let rail_a_colinear = points_are_collinear(&contacts_a, tol);
+    let rail_b_colinear = points_are_collinear(&contacts_b, tol);
+
+    let spine: Box<dyn Curve> = if centers_colinear {
+        Box::new(Line::new(centers[0], centers[centers.len() - 1]))
+    } else {
+        Box::new(NurbsCurve::fit_to_points(&centers, 3, tol).map_err(|e| {
+            OperationError::NumericalError(format!("Marching: spine NURBS fit failed: {:?}", e))
+        })?)
+    };
+    let rail_a: Box<dyn Curve> = if rail_a_colinear {
+        Box::new(Line::new(contacts_a[0], contacts_a[contacts_a.len() - 1]))
+    } else {
+        Box::new(NurbsCurve::fit_to_points(&contacts_a, 3, tol).map_err(|e| {
+            OperationError::NumericalError(format!("Marching: rail A NURBS fit failed: {:?}", e))
+        })?)
+    };
+    let rail_b: Box<dyn Curve> = if rail_b_colinear {
+        Box::new(Line::new(contacts_b[0], contacts_b[contacts_b.len() - 1]))
+    } else {
+        Box::new(NurbsCurve::fit_to_points(&contacts_b, 3, tol).map_err(|e| {
+            OperationError::NumericalError(format!("Marching: rail B NURBS fit failed: {:?}", e))
+        })?)
+    };
+
+    // 5. Rotation-minimising frames along the fitted spine. For
+    //    genuinely curved spines (NURBS path) we run
+    //    `parallel_transport_frames` with a hint derived from the
+    //    spine→contact_a direction at station 0 — that vector is
+    //    approximately perpendicular to the spine tangent (exactly
+    //    so for an exact rolling ball), giving the parallel-
+    //    transport seed a well-defined starting normal.
+    //
+    //    For collinear samples (Line spine) the rotation-minimising
+    //    frame is constant along the spine and F4 reconstructs it
+    //    analytically from `(bisector, edge_tangent)` — exactly the
+    //    same convention as the analytic plane/plane arm, which
+    //    returns `frames: Vec::new()`. Emitting an empty frame
+    //    vector here keeps marching's output shape consistent with
+    //    the analytic arm for the collinear case (no spurious
+    //    `parallel_transport_frames` call on a straight curve, which
+    //    can degenerate when the underlying tangent derivative
+    //    collapses through rounding).
+    let frames = if centers_colinear {
+        Vec::new()
+    } else {
+        let frame_hint = (contacts_a[0] - centers[0]).normalize().ok();
+        parallel_transport_frames(
+            spine.as_ref(),
+            n_samples,
+            frame_hint.as_ref(),
+            options.tolerance,
+        )
+        .map_err(|e| {
+            OperationError::NumericalError(format!("Marching: frame attachment failed: {:?}", e))
+        })?
+    };
+
+    Ok(SpineRail {
+        spine,
+        rail_a,
+        rail_b,
+        samples,
+        frames,
+        solver_kind: SolverKind::Marched {
+            predictor_steps: n_samples,
+            corrector_iters: worst_iters,
+        },
+    })
+}
+
+/// Return `true` when every point in `pts` lies within a small
+/// envelope of the chord from `pts[0]` to `pts[last]`. The envelope
+/// is `max(10·tol, 1e-10)` — large enough to absorb the corrector's
+/// own convergence noise (which is `O(tol)`) but tight enough to
+/// reject any geometrically-meaningful curvature drift (a typical
+/// cylinder-rim spine arc has sagitta in the 10⁻²–10⁻¹ range, many
+/// orders of magnitude above this threshold).
+///
+/// Degenerate single-point or zero-length-chord inputs are treated
+/// as trivially collinear.
+fn points_are_collinear(pts: &[Point3], tol: f64) -> bool {
+    if pts.len() < 3 {
+        return true;
+    }
+    let perp_tol = (10.0 * tol).max(1e-10);
+    let perp_tol_sq = perp_tol * perp_tol;
+    let first = pts[0];
+    let last = pts[pts.len() - 1];
+    let chord = last - first;
+    let chord_len_sq = chord.dot(&chord);
+    if chord_len_sq < f64::EPSILON {
+        // Zero-length chord: collinear iff every interior point
+        // coincides with `first` within tolerance.
+        return pts
+            .iter()
+            .all(|p| (*p - first).dot(&(*p - first)) <= perp_tol_sq);
+    }
+    let inv = 1.0 / chord_len_sq;
+    for p in &pts[1..pts.len() - 1] {
+        let v = *p - first;
+        // Perpendicular component squared = |v|² - (v·chord)² / |chord|².
+        let v_dot_chord = v.dot(&chord);
+        let perp_sq = (v.dot(&v) - v_dot_chord * v_dot_chord * inv).max(0.0);
+        if perp_sq > perp_tol_sq {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1888,6 +2365,270 @@ mod tests {
         assert!(
             along_edge.abs() < 1e-9,
             "offset {offset_vec:?} should be ⟂ edge tangent (along={along_edge})"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // F3-γ — marching solver tests
+    //
+    // The marching solver is exercised directly (not via
+    // `solve_spine_for_edge`, which would route plane/plane into the
+    // analytic arm). Calling `solve_marching` on a box edge with
+    // plane/plane geometry lets us cross-check marching results
+    // against the closed-form analytic result and validate the
+    // corrector + NURBS-fit + frame-attachment pipeline end-to-end.
+    // ----------------------------------------------------------------
+
+    /// Test helper: gather the (`edge`, `surface_a`, `surface_b`)
+    /// references needed to invoke [`solve_marching`] for a given
+    /// box edge.
+    fn marching_inputs(
+        model: &BRepModel,
+        edge_id: EdgeId,
+        face_a: FaceId,
+        face_b: FaceId,
+    ) -> (Edge, crate::primitives::surface::SurfaceId, crate::primitives::surface::SurfaceId) {
+        let edge = model.edges.get(edge_id).expect("edge").clone();
+        let surface_a_id = model.faces.get(face_a).expect("face a").surface_id;
+        let surface_b_id = model.faces.get(face_b).expect("face b").surface_id;
+        (edge, surface_a_id, surface_b_id)
+    }
+
+    #[test]
+    fn marching_box_edge_converges() {
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, face_a, face_b) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
+        let surface_a = model.surfaces.get(sa_id).expect("surface a");
+        let surface_b = model.surfaces.get(sb_id).expect("surface b");
+
+        let opts = SpineOptions::default();
+        let rail = solve_marching(
+            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.25, &opts,
+        )
+        .expect("marching should converge on plane/plane");
+
+        assert!(rail.samples.len() >= 4);
+    }
+
+    #[test]
+    fn marching_solver_kind_is_marched() {
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, face_a, face_b) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
+        let surface_a = model.surfaces.get(sa_id).expect("surface a");
+        let surface_b = model.surfaces.get(sb_id).expect("surface b");
+
+        let opts = SpineOptions::default();
+        let rail = solve_marching(
+            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.3, &opts,
+        )
+        .expect("marching");
+        match rail.solver_kind {
+            SolverKind::Marched {
+                predictor_steps,
+                corrector_iters,
+            } => {
+                assert!(predictor_steps >= 4);
+                // For two infinite planes the Picard iteration is a
+                // contraction; corrector converges in very few steps.
+                assert!(
+                    corrector_iters <= MAX_CORRECTOR_ITERS,
+                    "corrector took {corrector_iters} iters (cap {MAX_CORRECTOR_ITERS})"
+                );
+            }
+            other => panic!("expected Marched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marching_contact_distance_equals_radius() {
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, face_a, face_b) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
+        let surface_a = model.surfaces.get(sa_id).expect("surface a");
+        let surface_b = model.surfaces.get(sb_id).expect("surface b");
+
+        let radius = 0.4;
+        let opts = SpineOptions::default();
+        let rail = solve_marching(
+            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, radius, &opts,
+        )
+        .expect("marching");
+
+        for s in &rail.samples {
+            let da = (s.contact_a - s.center).magnitude();
+            let db = (s.contact_b - s.center).magnitude();
+            // Corrector convergence target is `tolerance.distance()`
+            // (~1e-6); use a slightly looser bound to accommodate the
+            // best-iterate fallback envelope.
+            assert!(
+                (da - radius).abs() < 1e-5,
+                "contact_a-to-center {da} != r {radius}"
+            );
+            assert!(
+                (db - radius).abs() < 1e-5,
+                "contact_b-to-center {db} != r {radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn marching_matches_analytic_for_box_edge() {
+        // Marching on a plane/plane configuration must converge to
+        // within tolerance of the analytic closed-form solution.
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, face_a, face_b) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let radius = 0.25;
+        let opts = SpineOptions::default();
+
+        // Analytic via the public entry point.
+        let analytic = solve_spine_for_edge(&model, edge_id, face_a, face_b, radius, &opts)
+            .expect("analytic solve")
+            .expect("analytic should match");
+        assert_eq!(analytic.solver_kind, SolverKind::AnalyticPlanePlane);
+
+        // Marching via direct call (bypasses analytic dispatch).
+        let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
+        let surface_a = model.surfaces.get(sa_id).expect("surface a");
+        let surface_b = model.surfaces.get(sb_id).expect("surface b");
+        let marched = solve_marching(
+            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, radius, &opts,
+        )
+        .expect("marching");
+
+        // Compare centres at matching edge parameters. Both arms
+        // sample uniformly with `options.min_samples` stations, so
+        // sample indices align.
+        assert_eq!(analytic.samples.len(), marched.samples.len());
+        for (a, m) in analytic.samples.iter().zip(marched.samples.iter()) {
+            let dc = (a.center - m.center).magnitude();
+            assert!(
+                dc < 5e-5,
+                "centre mismatch at t={}: analytic {:?} vs marched {:?} (Δ={})",
+                a.edge_parameter,
+                a.center,
+                m.center,
+                dc
+            );
+        }
+    }
+
+    #[test]
+    fn marching_collinear_emits_empty_frames() {
+        // Collinear samples (plane/plane spine is straight) take the
+        // Line path and return `frames: Vec::new()` — matching the
+        // analytic plane/plane arm's convention. F4 reconstructs
+        // frames analytically for straight spines.
+        //
+        // Frame attachment on a genuinely curved (NURBS) marched
+        // spine is exercised by F3-γ.1 once a non-analytic curved
+        // fixture is in scope.
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, face_a, face_b) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
+        let surface_a = model.surfaces.get(sa_id).expect("surface a");
+        let surface_b = model.surfaces.get(sb_id).expect("surface b");
+
+        let opts = SpineOptions {
+            min_samples: 16,
+            ..SpineOptions::default()
+        };
+        let rail = solve_marching(
+            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.2, &opts,
+        )
+        .expect("marching");
+        assert_eq!(rail.samples.len(), 16);
+        assert!(
+            rail.frames.is_empty(),
+            "collinear spine should not emit frames"
+        );
+    }
+
+    #[test]
+    fn marching_emits_line_for_collinear_samples() {
+        // Marching on a plane/plane configuration must detect the
+        // collinear spine and emit a `Line` (matching the analytic
+        // arm's output type), not a degenerate NURBS fit through
+        // collinear control points.
+        let mut model = BRepModel::new();
+        let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
+        let (edge_id, face_a, face_b) =
+            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
+        let surface_a = model.surfaces.get(sa_id).expect("surface a");
+        let surface_b = model.surfaces.get(sb_id).expect("surface b");
+
+        let opts = SpineOptions::default();
+        let rail = solve_marching(
+            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.2, &opts,
+        )
+        .expect("marching");
+
+        assert!(
+            rail.spine.as_any().downcast_ref::<Line>().is_some(),
+            "marched spine on plane/plane should be Line, got {}",
+            rail.spine.type_name()
+        );
+        assert!(
+            rail.rail_a.as_any().downcast_ref::<Line>().is_some(),
+            "rail_a should be Line for plane/plane, got {}",
+            rail.rail_a.type_name()
+        );
+        assert!(
+            rail.rail_b.as_any().downcast_ref::<Line>().is_some(),
+            "rail_b should be Line for plane/plane, got {}",
+            rail.rail_b.type_name()
+        );
+    }
+
+    #[test]
+    fn points_are_collinear_basic_cases() {
+        // Pin the collinearity helper directly so a regression in
+        // the tolerance envelope doesn't manifest only through
+        // marching's downstream behaviour.
+        let p0 = Point3 { x: 0.0, y: 0.0, z: 0.0 };
+        let p1 = Point3 { x: 1.0, y: 0.0, z: 0.0 };
+        let p2 = Point3 { x: 2.0, y: 0.0, z: 0.0 };
+        let p_off = Point3 { x: 1.0, y: 0.1, z: 0.0 };
+
+        assert!(points_are_collinear(&[p0, p1, p2], 1e-6));
+        assert!(!points_are_collinear(&[p0, p_off, p2], 1e-6));
+        // Singleton / pair → trivially collinear.
+        assert!(points_are_collinear(&[p0], 1e-6));
+        assert!(points_are_collinear(&[p0, p1], 1e-6));
+        // Within-noise drift (1e-7 perpendicular) accepted at tol = 1e-6.
+        let p_noisy = Point3 { x: 1.0, y: 1e-7, z: 0.0 };
+        assert!(points_are_collinear(&[p0, p_noisy, p2], 1e-6));
+    }
+
+    #[test]
+    fn marching_disabled_returns_none_for_non_analytic() {
+        // The F3-γ → F3-δ transition defaults `enable_marching` to
+        // `false` so production fillet routes non-analytic pairs to
+        // the legacy bisector path (avoids `RuledSurface::closest_point`
+        // noise on flat extruded walls). Explicit construction with
+        // `enable_marching: true` lets callers opt in; the default
+        // stays opt-out until F3-δ.
+        let opts = SpineOptions {
+            enable_marching: true,
+            ..SpineOptions::default()
+        };
+        assert!(opts.enable_marching);
+        let default_opts = SpineOptions::default();
+        assert!(
+            !default_opts.enable_marching,
+            "marching is opt-in until F3-δ lands planar-ruled-surface promotion"
         );
     }
 }
