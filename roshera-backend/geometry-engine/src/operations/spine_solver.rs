@@ -45,7 +45,7 @@ use crate::operations::{OperationError, OperationResult};
 use crate::primitives::curve::{Arc, Curve, Line, NurbsCurve};
 use crate::primitives::edge::{Edge, EdgeId};
 use crate::primitives::face::FaceId;
-use crate::primitives::surface::{Cylinder, Plane, Sphere, Surface, SurfaceType};
+use crate::primitives::surface::{Cylinder, Plane, RuledSurface, Sphere, Surface, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 
 /// Which solver produced this spine. Tests pin the kind so a
@@ -273,25 +273,44 @@ pub fn solve_spine_for_edge(
         OperationError::InvalidGeometry(format!("Surface for face {} not found", face_b))
     })?;
 
-    // Dispatch on the surface-type tuple. F3-α landed plane/plane;
-    // F3-β adds plane/cylinder (perpendicular + parallel-tangent
-    // sub-cases) and plane/sphere. F3-γ ships the marching solver
-    // as a parallel-deployment addition behind
+    // Dispatch on the (effective) surface-type tuple. F3-α landed
+    // plane/plane; F3-β adds plane/cylinder (perpendicular +
+    // parallel-tangent sub-cases) and plane/sphere. F3-γ ships the
+    // marching solver as a parallel-deployment addition behind
     // [`SpineOptions::enable_marching`] (default `false` — see the
     // field doc for the rationale). When the flag is `true` and no
     // analytic arm claims the pair, marching takes over; when the
     // flag is `false` (production today) we return `Ok(None)` so
-    // [`fillet`] falls through to the legacy bisector path. F3-δ
-    // adds planar-ruled-surface promotion and flips the default
-    // back to `true`.
+    // [`fillet`] falls through to the legacy bisector path.
+    //
+    // F3-δ.1 introduces planar-ruled-surface *promotion*: extrusion
+    // produces [`RuledSurface`] side walls (not [`Plane`] faces) but
+    // their geometry is exactly a plane whenever both rails are
+    // [`Line`](crate::primitives::curve::Line)s with coplanar
+    // corners — which is the universal case for prism walls. Without
+    // promotion these faces fall through to the wildcard arm and
+    // the marching solver's corrector can't beat
+    // [`RuledSurface::closest_point`]'s 30×10 grid noise floor
+    // (~1e-4 vs target 1e-6). With promotion they route through the
+    // plane/plane (or plane/cylinder, plane/sphere) analytic arms
+    // exactly as if extrude had emitted [`Plane`] faces directly.
+    let effective_plane_a = effective_plane(surface_a, &options.tolerance);
+    let effective_plane_b = effective_plane(surface_b, &options.tolerance);
+    let effective_type_a = effective_plane_a
+        .as_ref()
+        .map_or_else(|| surface_a.surface_type(), |_| SurfaceType::Plane);
+    let effective_type_b = effective_plane_b
+        .as_ref()
+        .map_or_else(|| surface_b.surface_type(), |_| SurfaceType::Plane);
+
     let analytic_result: OperationResult<Option<SpineRail>> =
-        match (surface_a.surface_type(), surface_b.surface_type()) {
+        match (effective_type_a, effective_type_b) {
             (SurfaceType::Plane, SurfaceType::Plane) => {
-                let plane_a = surface_a.as_any().downcast_ref::<Plane>().ok_or_else(|| {
-                    OperationError::InternalError("Plane downcast failed".into())
+                let plane_a = effective_plane_a.as_ref().ok_or_else(|| {
+                    OperationError::InternalError("Effective plane A missing".into())
                 })?;
-                let plane_b = surface_b.as_any().downcast_ref::<Plane>().ok_or_else(|| {
-                    OperationError::InternalError("Plane downcast failed".into())
+                let plane_b = effective_plane_b.as_ref().ok_or_else(|| {
+                    OperationError::InternalError("Effective plane B missing".into())
                 })?;
                 solve_plane_plane(
                     model, &edge, edge_id, face_a, face_b, plane_a, plane_b, radius, options,
@@ -299,8 +318,8 @@ pub fn solve_spine_for_edge(
                 .map(Some)
             }
             (SurfaceType::Plane, SurfaceType::Cylinder) => {
-                let plane = surface_a.as_any().downcast_ref::<Plane>().ok_or_else(|| {
-                    OperationError::InternalError("Plane downcast failed".into())
+                let plane = effective_plane_a.as_ref().ok_or_else(|| {
+                    OperationError::InternalError("Effective plane A missing".into())
                 })?;
                 let cylinder = surface_b.as_any().downcast_ref::<Cylinder>().ok_or_else(
                     || OperationError::InternalError("Cylinder downcast failed".into()),
@@ -314,8 +333,8 @@ pub fn solve_spine_for_edge(
                 let cylinder = surface_a.as_any().downcast_ref::<Cylinder>().ok_or_else(
                     || OperationError::InternalError("Cylinder downcast failed".into()),
                 )?;
-                let plane = surface_b.as_any().downcast_ref::<Plane>().ok_or_else(|| {
-                    OperationError::InternalError("Plane downcast failed".into())
+                let plane = effective_plane_b.as_ref().ok_or_else(|| {
+                    OperationError::InternalError("Effective plane B missing".into())
                 })?;
                 solve_plane_cylinder(
                     model, &edge, edge_id, face_a, face_b, plane, cylinder,
@@ -323,8 +342,8 @@ pub fn solve_spine_for_edge(
                 )
             }
             (SurfaceType::Plane, SurfaceType::Sphere) => {
-                let plane = surface_a.as_any().downcast_ref::<Plane>().ok_or_else(|| {
-                    OperationError::InternalError("Plane downcast failed".into())
+                let plane = effective_plane_a.as_ref().ok_or_else(|| {
+                    OperationError::InternalError("Effective plane A missing".into())
                 })?;
                 let sphere = surface_b.as_any().downcast_ref::<Sphere>().ok_or_else(|| {
                     OperationError::InternalError("Sphere downcast failed".into())
@@ -338,8 +357,8 @@ pub fn solve_spine_for_edge(
                 let sphere = surface_a.as_any().downcast_ref::<Sphere>().ok_or_else(|| {
                     OperationError::InternalError("Sphere downcast failed".into())
                 })?;
-                let plane = surface_b.as_any().downcast_ref::<Plane>().ok_or_else(|| {
-                    OperationError::InternalError("Plane downcast failed".into())
+                let plane = effective_plane_b.as_ref().ok_or_else(|| {
+                    OperationError::InternalError("Effective plane B missing".into())
                 })?;
                 solve_plane_sphere(
                     model, &edge, edge_id, face_a, face_b, plane, sphere,
@@ -363,6 +382,98 @@ pub fn solve_spine_for_edge(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Resolve a face's *effective* [`Plane`] for dispatch purposes.
+///
+/// Returns `Some(_)` when:
+/// * `surface` is a [`Plane`] — the stored plane is cloned out.
+/// * `surface` is a [`RuledSurface`] whose two rails are
+///   [`Line`](crate::primitives::curve::Line)s and whose four corner
+///   points are coplanar — a synthesised [`Plane`] through those
+///   corners is returned (see [`try_promote_ruled_to_plane`]).
+///
+/// Returns `None` for every other surface type (and for ruled
+/// surfaces with curved rails, with collinear corners, or with
+/// non-coplanar corners). Callers fall through to the wildcard
+/// dispatch arm, which routes to marching (if
+/// [`SpineOptions::enable_marching`]) or returns `Ok(None)` so the
+/// legacy bisector path picks the case up.
+fn effective_plane(surface: &dyn Surface, tolerance: &Tolerance) -> Option<Plane> {
+    if let Some(p) = surface.as_any().downcast_ref::<Plane>() {
+        return Some(p.clone());
+    }
+    if let Some(r) = surface.as_any().downcast_ref::<RuledSurface>() {
+        return try_promote_ruled_to_plane(r, tolerance);
+    }
+    None
+}
+
+/// Detect when a [`RuledSurface`] is geometrically a plane and, if
+/// so, synthesise the corresponding [`Plane`].
+///
+/// Promotion is conservative — both rails must be
+/// [`Line`](crate::primitives::curve::Line)s and the four corner
+/// points must be coplanar to within `tolerance.distance()` (scaled
+/// by the local diagonal length to absorb large-coordinate models).
+/// This is exactly the case extrusion produces: each prism wall has
+/// `curve1` = a base-sketch edge and `curve2` = the same edge
+/// translated by the extrude vector, so the four corners form a
+/// parallelogram and are trivially coplanar.
+///
+/// Curved-rail ruled surfaces (e.g. the lateral surface of a
+/// cylinder built as a ruled surface between two coaxial arcs) are
+/// *not* promoted — sampling two coaxial arcs would produce coplanar
+/// rail endpoints but the interior of the ruled surface bows away
+/// from the chord plane, and only the marching solver handles them
+/// correctly.
+fn try_promote_ruled_to_plane(ruled: &RuledSurface, tolerance: &Tolerance) -> Option<Plane> {
+    let line1 = ruled.curve1.as_any().downcast_ref::<Line>()?;
+    let line2 = ruled.curve2.as_any().downcast_ref::<Line>()?;
+
+    let p1 = line1.start;
+    let p2 = line1.end;
+    let p3 = line2.start;
+    let p4 = line2.end;
+
+    let diag = ((p1 - p3).magnitude())
+        .max((p1 - p4).magnitude())
+        .max((p2 - p3).magnitude())
+        .max((p2 - p4).magnitude())
+        .max(1.0);
+    let abs_tol = tolerance.distance() * diag;
+
+    // Try plane through (p1, p2, p3); if degenerate (collinear), try
+    // (p1, p2, p4). If both triangles are degenerate the four points
+    // are collinear — a degenerate "ruled surface" we refuse to
+    // promote (it's a 1D object, not a plane).
+    let v12 = p2 - p1;
+    let v13 = p3 - p1;
+    let cross_123 = v12.cross(&v13);
+    let mag_123 = cross_123.magnitude();
+    if mag_123 > 1e-12 {
+        let normal = cross_123 / mag_123;
+        let dev = (p4 - p1).dot(&normal).abs();
+        if dev <= abs_tol {
+            return Plane::from_three_points(p1, p2, p3).ok();
+        }
+        return None;
+    }
+
+    let v14 = p4 - p1;
+    let cross_124 = v12.cross(&v14);
+    let mag_124 = cross_124.magnitude();
+    if mag_124 > 1e-12 {
+        let normal = cross_124 / mag_124;
+        let dev = (p3 - p1).dot(&normal).abs();
+        if dev <= abs_tol {
+            return Plane::from_three_points(p1, p2, p4).ok();
+        }
+        return None;
+    }
+
+    // All four corners collinear — degenerate ruled surface.
+    None
 }
 
 /// Closed-form spine + rail solve for two planar faces.
@@ -2629,6 +2740,226 @@ mod tests {
         assert!(
             !default_opts.enable_marching,
             "marching is opt-in until F3-δ lands planar-ruled-surface promotion"
+        );
+    }
+
+    // ----- F3-δ.1: planar-ruled-surface promotion -----
+
+    /// Build a [`RuledSurface`] with two [`Line`] rails between
+    /// `(p1, p2)` and `(p3, p4)`.
+    fn ruled_from_corners(p1: Point3, p2: Point3, p3: Point3, p4: Point3) -> RuledSurface {
+        RuledSurface::new(Box::new(Line::new(p1, p2)), Box::new(Line::new(p3, p4)))
+    }
+
+    #[test]
+    fn promote_ruled_parallelogram_succeeds() {
+        // Two parallel Line rails translated by a constant offset
+        // (extrude case). The four corners form a parallelogram and
+        // are trivially coplanar — promotion should yield a Plane
+        // whose normal is perpendicular to both the edge tangent and
+        // the extrude direction.
+        let p1 = Point3::new(0.0, 0.0, 0.0);
+        let p2 = Point3::new(2.0, 0.0, 0.0); // edge tangent +X
+        let extrude = Vector3::new(0.0, 0.0, 1.0); // extrude direction +Z
+        let p3 = p1 + extrude;
+        let p4 = p2 + extrude;
+        let ruled = ruled_from_corners(p1, p2, p3, p4);
+        let tol = Tolerance::from_distance(1e-6);
+        let plane = try_promote_ruled_to_plane(&ruled, &tol).expect("planar rails should promote");
+        // Plane normal must be perpendicular to both edge_tangent (X)
+        // and extrude (Z) — i.e. ±Y.
+        let dot_x = plane.normal.dot(&Vector3::X).abs();
+        let dot_z = plane.normal.dot(&Vector3::Z).abs();
+        assert!(dot_x < 1e-9, "plane normal must be ⊥ edge tangent: dot_x={dot_x}");
+        assert!(dot_z < 1e-9, "plane normal must be ⊥ extrude dir: dot_z={dot_z}");
+        // Corners lie on the plane (zero signed distance).
+        for p in [p1, p2, p3, p4] {
+            let signed = (p - plane.origin).dot(&plane.normal).abs();
+            assert!(signed < 1e-9, "corner {p:?} off plane by {signed}");
+        }
+    }
+
+    #[test]
+    fn promote_ruled_non_coplanar_rejected() {
+        // Skew rails — p4 lifted out of the (p1, p2, p3) plane.
+        let p1 = Point3::new(0.0, 0.0, 0.0);
+        let p2 = Point3::new(1.0, 0.0, 0.0);
+        let p3 = Point3::new(0.0, 1.0, 0.0);
+        let p4 = Point3::new(1.0, 1.0, 0.5); // out of plane z=0
+        let ruled = ruled_from_corners(p1, p2, p3, p4);
+        let tol = Tolerance::from_distance(1e-6);
+        assert!(
+            try_promote_ruled_to_plane(&ruled, &tol).is_none(),
+            "non-coplanar rails must not promote"
+        );
+    }
+
+    #[test]
+    fn promote_ruled_curved_rail_rejected() {
+        // RuledSurface with one Arc rail (not a Line). Promotion is
+        // strictly Line-only — even when the arc lies in a plane its
+        // ruling interior bows off the chord plane, so the marching
+        // solver must own this case.
+        let p1 = Point3::new(0.0, 0.0, 0.0);
+        let p2 = Point3::new(1.0, 0.0, 0.0);
+        let line1 = Box::new(Line::new(p1, p2));
+        let arc =
+            Arc::new(Point3::new(0.5, 0.5, 0.0), Vector3::Z, 0.5, 0.0, std::f64::consts::PI)
+                .expect("arc construction");
+        let ruled = RuledSurface::new(line1, Box::new(arc));
+        let tol = Tolerance::from_distance(1e-6);
+        assert!(
+            try_promote_ruled_to_plane(&ruled, &tol).is_none(),
+            "curved-rail ruled surface must not promote"
+        );
+    }
+
+    #[test]
+    fn promote_ruled_collinear_corners_rejected() {
+        // All four corners on a single line — degenerate.
+        let p1 = Point3::new(0.0, 0.0, 0.0);
+        let p2 = Point3::new(1.0, 0.0, 0.0);
+        let p3 = Point3::new(2.0, 0.0, 0.0);
+        let p4 = Point3::new(3.0, 0.0, 0.0);
+        let ruled = ruled_from_corners(p1, p2, p3, p4);
+        let tol = Tolerance::from_distance(1e-6);
+        assert!(
+            try_promote_ruled_to_plane(&ruled, &tol).is_none(),
+            "fully collinear corners are not a plane"
+        );
+    }
+
+    #[test]
+    fn promote_ruled_triangle_case_succeeds() {
+        // p1, p2, p3 collinear but p4 off the line — the (p1, p2, p3)
+        // triangle is degenerate so the helper must fall back to
+        // (p1, p2, p4) and check p3 against that plane.
+        let p1 = Point3::new(0.0, 0.0, 0.0);
+        let p2 = Point3::new(1.0, 0.0, 0.0);
+        let p3 = Point3::new(2.0, 0.0, 0.0); // collinear with p1, p2
+        let p4 = Point3::new(0.0, 1.0, 0.0); // off the line
+        let ruled = ruled_from_corners(p1, p2, p3, p4);
+        let tol = Tolerance::from_distance(1e-6);
+        let plane = try_promote_ruled_to_plane(&ruled, &tol)
+            .expect("fallback triangle (p1,p2,p4) should promote");
+        // p3 is on the plane through (p1,p2,p4) (z=0 plane).
+        let signed = (p3 - plane.origin).dot(&plane.normal).abs();
+        assert!(signed < 1e-9, "p3 off plane: {signed}");
+    }
+
+    #[test]
+    fn effective_plane_returns_actual_plane_unchanged() {
+        // A real Plane round-trips through effective_plane().
+        let origin = Point3::new(1.0, 2.0, 3.0);
+        let normal = Vector3::new(0.0, 0.0, 1.0);
+        let u_dir = Vector3::X;
+        let plane = Plane::new(origin, normal, u_dir).expect("plane construction");
+        let tol = Tolerance::from_distance(1e-6);
+        let eff = effective_plane(&plane, &tol).expect("real plane returns Some");
+        assert!((eff.normal - plane.normal).magnitude() < 1e-12);
+        assert!((eff.origin - plane.origin).magnitude() < 1e-12);
+    }
+
+    #[test]
+    fn effective_plane_promotes_ruled_extrude_wall() {
+        // Sanity check at the dispatch-layer helper: a planar
+        // RuledSurface that mimics an extrude side wall must
+        // produce Some(plane).
+        let p1 = Point3::new(0.0, 0.0, 0.0);
+        let p2 = Point3::new(2.0, 0.0, 0.0);
+        let p3 = Point3::new(0.0, 0.0, 1.0);
+        let p4 = Point3::new(2.0, 0.0, 1.0);
+        let ruled = ruled_from_corners(p1, p2, p3, p4);
+        let tol = Tolerance::from_distance(1e-6);
+        assert!(
+            effective_plane(&ruled, &tol).is_some(),
+            "planar extrude-wall ruled surface must promote"
+        );
+    }
+
+    #[test]
+    fn effective_plane_returns_none_for_cylinder() {
+        // Non-plane, non-ruled surfaces fall through to None.
+        let cyl =
+            Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cylinder construction");
+        let tol = Tolerance::from_distance(1e-6);
+        assert!(effective_plane(&cyl, &tol).is_none());
+    }
+
+    #[test]
+    fn extrude_prism_side_walls_route_through_analytic_plane_plane() {
+        // Integration check at the spine-solver layer: extruding a
+        // triangular profile creates a prism whose three vertical
+        // side faces are [`RuledSurface`]s. With F3-δ.1 promotion
+        // the dispatch routes a vertical-edge fillet (between two
+        // RuledSurface side walls) through the plane/plane analytic
+        // arm. Without promotion it would fall through to the
+        // wildcard arm and either march (and fail on noise) or
+        // return Ok(None).
+        use crate::operations::extrude::{extrude_profile, ExtrudeOptions};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let mut model = BRepModel::new();
+        let pts: [(f64, f64); 3] = [(0.0, 0.0), (2.0, 0.0), (1.0, 1.5)];
+        let mut vertex_ids = Vec::with_capacity(pts.len());
+        for &(x, y) in &pts {
+            vertex_ids.push(model.vertices.add(x, y, 0.0));
+        }
+        let mut edge_ids = Vec::with_capacity(pts.len());
+        for i in 0..pts.len() {
+            let a = vertex_ids[i];
+            let b = vertex_ids[(i + 1) % pts.len()];
+            let pa = model.vertices.get(a).expect("vertex a exists").position;
+            let pb = model.vertices.get(b).expect("vertex b exists").position;
+            let line = Line::new(
+                Point3::new(pa[0], pa[1], pa[2]),
+                Point3::new(pb[0], pb[1], pb[2]),
+            );
+            let curve_id = model.curves.add(Box::new(line));
+            let edge = Edge::new_auto_range(0, a, b, curve_id, EdgeOrientation::Forward);
+            edge_ids.push(model.edges.add(edge));
+        }
+        let extrude_opts = ExtrudeOptions {
+            direction: Vector3::Z,
+            distance: 1.0,
+            cap_ends: true,
+            ..Default::default()
+        };
+        let _ = extrude_profile(&mut model, edge_ids, extrude_opts)
+            .expect("triangular prism extrusion");
+
+        // Find an edge whose two adjacent faces are both Ruled — a
+        // vertical seam of the prism.
+        let mut ruled_pair: Option<(EdgeId, FaceId, FaceId)> = None;
+        for (edge_id, _) in model.edges.iter() {
+            let faces = find_adjacent_faces(&model, edge_id);
+            if faces.len() != 2 {
+                continue;
+            }
+            let both_ruled = faces.iter().all(|&fid| {
+                model
+                    .faces
+                    .get(fid)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| s.surface_type() == SurfaceType::Ruled)
+                    .unwrap_or(false)
+            });
+            if both_ruled {
+                ruled_pair = Some((edge_id, faces[0], faces[1]));
+                break;
+            }
+        }
+        let (edge_id, face_a, face_b) =
+            ruled_pair.expect("prism must have a ruled/ruled vertical edge");
+
+        let opts = SpineOptions::default();
+        let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.1, &opts)
+            .expect("solve")
+            .expect("planar ruled walls must promote to plane/plane analytic");
+        assert_eq!(
+            rail.solver_kind,
+            SolverKind::AnalyticPlanePlane,
+            "F3-δ.1: extruded ruled walls must promote to plane/plane analytic"
         );
     }
 }
