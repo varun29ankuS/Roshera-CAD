@@ -154,17 +154,17 @@ pub struct SpineOptions {
     pub honor_setbacks: bool,
     /// When `true`, surface pairs that no analytic arm recognises
     /// route to the F3-γ marching solver instead of returning
-    /// `Ok(None)` to the caller. **Default is `false`** during the
-    /// F3-γ → F3-δ transition: production fillet code uses the
-    /// legacy bisector fallback for non-analytic pairs so that
-    /// flat ruled-surface side faces (every extruded prism wall)
-    /// don't hit the marching corrector's noise floor on
-    /// `RuledSurface::closest_point`. F3-δ adds planar-surface
-    /// detection that promotes flat ruled walls into the
-    /// plane/plane analytic arm and flips this default back to
-    /// `true`. Tests that exercise marching invoke
-    /// [`solve_marching`] directly or pass `enable_marching:
-    /// true` explicitly.
+    /// `Ok(None)` to the caller. **Default is `true`** as of F3-δ.2:
+    /// F3-δ.1 added planar-ruled-surface promotion so flat extruded
+    /// side walls (the dominant source of marching-corrector noise
+    /// against `RuledSurface::closest_point`) route through the
+    /// plane/plane analytic arm before marching is even considered.
+    /// Genuinely non-planar pairs that survive promotion are exactly
+    /// the cases marching exists for, and we want them on the
+    /// hardened solver — not the legacy bisector. Callers in hot
+    /// paths that have a reason to stay on the analytic-only
+    /// envelope (regression fixtures, parallel-deployment toggles)
+    /// can still pass `enable_marching: false` explicitly.
     pub enable_marching: bool,
 }
 
@@ -175,7 +175,7 @@ impl Default for SpineOptions {
             min_samples: 32,
             max_samples: 2048,
             honor_setbacks: true,
-            enable_marching: false,
+            enable_marching: true,
         }
     }
 }
@@ -275,13 +275,14 @@ pub fn solve_spine_for_edge(
 
     // Dispatch on the (effective) surface-type tuple. F3-α landed
     // plane/plane; F3-β adds plane/cylinder (perpendicular +
-    // parallel-tangent sub-cases) and plane/sphere. F3-γ ships the
-    // marching solver as a parallel-deployment addition behind
-    // [`SpineOptions::enable_marching`] (default `false` — see the
-    // field doc for the rationale). When the flag is `true` and no
-    // analytic arm claims the pair, marching takes over; when the
-    // flag is `false` (production today) we return `Ok(None)` so
-    // [`fillet`] falls through to the legacy bisector path.
+    // parallel-tangent sub-cases) and plane/sphere. F3-γ shipped
+    // the marching solver; F3-δ.2 promotes it to the default
+    // fallback for non-analytic pairs (see
+    // [`SpineOptions::enable_marching`] for the per-call opt-out).
+    // When `enable_marching` is `true` and no analytic arm claims
+    // the pair, marching takes over; when explicitly disabled we
+    // return `Ok(None)` so [`fillet`] falls through to the legacy
+    // bisector path.
     //
     // F3-δ.1 introduces planar-ruled-surface *promotion*: extrusion
     // produces [`RuledSurface`] side walls (not [`Plane`] faces) but
@@ -2724,23 +2725,26 @@ mod tests {
     }
 
     #[test]
-    fn marching_disabled_returns_none_for_non_analytic() {
-        // The F3-γ → F3-δ transition defaults `enable_marching` to
-        // `false` so production fillet routes non-analytic pairs to
-        // the legacy bisector path (avoids `RuledSurface::closest_point`
-        // noise on flat extruded walls). Explicit construction with
-        // `enable_marching: true` lets callers opt in; the default
-        // stays opt-out until F3-δ.
-        let opts = SpineOptions {
-            enable_marching: true,
-            ..SpineOptions::default()
-        };
-        assert!(opts.enable_marching);
+    fn marching_enabled_by_default_after_promotion() {
+        // F3-δ.2: planar-ruled-surface promotion (F3-δ.1) routes
+        // flat extruded walls through the plane/plane analytic arm,
+        // so the marching corrector no longer fights
+        // `RuledSurface::closest_point`'s grid noise floor on the
+        // common case. `enable_marching` now defaults to `true` —
+        // genuinely non-planar pairs (NURBS/NURBS, cone/torus, etc.)
+        // get the hardened marching solver instead of the legacy
+        // bisector. Callers that want the analytic-only envelope
+        // can still opt out explicitly.
         let default_opts = SpineOptions::default();
         assert!(
-            !default_opts.enable_marching,
-            "marching is opt-in until F3-δ lands planar-ruled-surface promotion"
+            default_opts.enable_marching,
+            "marching is the default fallback after F3-δ.1 promotion"
         );
+        let opts = SpineOptions {
+            enable_marching: false,
+            ..SpineOptions::default()
+        };
+        assert!(!opts.enable_marching, "explicit opt-out still honoured");
     }
 
     // ----- F3-δ.1: planar-ruled-surface promotion -----
