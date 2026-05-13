@@ -2126,7 +2126,7 @@ fn compute_rolling_ball_positions(
 /// whose orientation happens to be `Forward` and concave-flipped
 /// fillets for the other half. The user-visible symptom was "one edge
 /// fillets convex, the next is concave" on a freshly extruded box.
-fn get_face_oriented_normal(
+pub(crate) fn get_face_oriented_normal(
     model: &BRepModel,
     face_id: FaceId,
     point: &Point3,

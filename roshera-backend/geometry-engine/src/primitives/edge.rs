@@ -75,6 +75,31 @@ pub enum Continuity {
     Unknown,
 }
 
+/// Manifold classification of an edge based on its face-usage count.
+///
+/// Cached on [`EdgeAttributes`] by F2-α's edge classifier so downstream
+/// code (sewing, blending, healing) can branch on edge manifoldness
+/// without re-walking the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifoldKind {
+    /// Classification has not been computed yet (or has been invalidated
+    /// after an adjacent face mutation).
+    Unknown,
+    /// Edge is used by exactly two faces — the standard closed-shell case.
+    Manifold,
+    /// Edge is used by exactly one face — a free edge / shell boundary.
+    Boundary,
+    /// Edge is used by three or more faces — non-manifold T-junction.
+    NonManifold,
+}
+
+impl Default for ManifoldKind {
+    #[inline(always)]
+    fn default() -> Self {
+        ManifoldKind::Unknown
+    }
+}
+
 /// Edge attributes for advanced operations
 #[derive(Debug, Clone)]
 pub struct EdgeAttributes {
@@ -90,6 +115,38 @@ pub struct EdgeAttributes {
     pub weight: f32,
     /// User-defined attributes
     pub user_data: Option<Vec<u8>>,
+    /// Cached signed dihedral angle at the edge midpoint (radians).
+    /// `None` ⇒ unclassified or non-manifold (no well-defined two-face
+    /// dihedral). Sign convention matches `compute_face_angle`:
+    /// positive ⇒ convex, negative ⇒ concave. Populated by F2-α's
+    /// [`crate::operations::edge_classification::classify_and_cache`].
+    pub dihedral_angle: Option<f64>,
+    /// Cached manifold classification. See [`ManifoldKind`].
+    pub manifold_kind: ManifoldKind,
+}
+
+impl EdgeAttributes {
+    /// Drop every classification-derived attribute back to its
+    /// unclassified default. Called when an adjacent face is replaced
+    /// or mutated, since cached convexity / dihedral / manifold-kind
+    /// values are no longer trustworthy. Continuity, weight and user
+    /// data are preserved — they belong to the edge itself, not to
+    /// its current face neighbourhood.
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.convexity = 0;
+        self.sharpness = 0.0;
+        self.dihedral_angle = None;
+        self.manifold_kind = ManifoldKind::Unknown;
+    }
+
+    /// `true` once F2-α has stamped this edge with a manifold kind
+    /// other than `Unknown`. Cheap idempotency check for
+    /// `classify_and_cache`.
+    #[inline(always)]
+    pub fn is_classified(&self) -> bool {
+        !matches!(self.manifold_kind, ManifoldKind::Unknown)
+    }
 }
 
 impl Default for EdgeAttributes {
@@ -102,6 +159,8 @@ impl Default for EdgeAttributes {
             sharpness: 0.0,
             weight: 1.0,
             user_data: None,
+            dihedral_angle: None,
+            manifold_kind: ManifoldKind::Unknown,
         }
     }
 }
@@ -114,6 +173,8 @@ const DEFAULT_EDGE_ATTRIBUTES: EdgeAttributes = EdgeAttributes {
     sharpness: 0.0,
     weight: 1.0,
     user_data: None,
+    dihedral_angle: None,
+    manifold_kind: ManifoldKind::Unknown,
 };
 
 /// Edge representation
