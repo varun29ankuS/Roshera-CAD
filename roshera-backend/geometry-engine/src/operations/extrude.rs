@@ -14,6 +14,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::deep_clone::deep_clone_faces;
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
@@ -335,86 +336,93 @@ pub fn extrude_face(
     face_id: FaceId,
     options: ExtrudeOptions,
 ) -> OperationResult<SolidId> {
-    // Validate inputs
-    validate_extrude_inputs(model, face_id, &options)?;
+    // F2-δ pre-flight.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::ExtrudeFace { face_id })?;
+    }
 
-    // Find the parent solid that contains this face. If none exists (e.g. the
-    // face was just synthesized from a sketch profile), route to the fresh-
-    // solid path which includes the base face as the bottom cap rather than
-    // replacing it inside an existing shell.
-    let parent_solid_id = find_parent_solid(model, face_id);
+    lifecycle::with_rollback(model, move |model| {
+        // Validate inputs
+        validate_extrude_inputs(model, face_id, &options)?;
 
-    // Normalize direction
-    let direction = options.direction.normalize().map_err(|e| {
-        OperationError::NumericalError(format!("Direction normalization failed: {:?}", e))
-    })?;
+        // Find the parent solid that contains this face. If none exists (e.g. the
+        // face was just synthesized from a sketch profile), route to the fresh-
+        // solid path which includes the base face as the bottom cap rather than
+        // replacing it inside an existing shell.
+        let parent_solid_id = find_parent_solid(model, face_id);
 
-    // Get the face to extrude
-    let face = model
-        .faces
-        .get(face_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
-        .clone();
+        // Normalize direction
+        let direction = options.direction.normalize().map_err(|e| {
+            OperationError::NumericalError(format!("Direction normalization failed: {:?}", e))
+        })?;
 
-    // Route to complex extrusion when draft, twist, or taper are active
-    let has_complex_options = options.draft_angle.abs() > 1e-10
-        || options.twist_angle.abs() > 1e-10
-        || (options.end_scale - 1.0).abs() > 1e-10;
+        // Get the face to extrude
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
+            .clone();
 
-    let unified_solid_id = match (parent_solid_id, has_complex_options) {
-        (Some(parent), true) => {
-            create_complex_unified_extrusion(model, parent, &face, face_id, &options)?
+        // Route to complex extrusion when draft, twist, or taper are active
+        let has_complex_options = options.draft_angle.abs() > 1e-10
+            || options.twist_angle.abs() > 1e-10
+            || (options.end_scale - 1.0).abs() > 1e-10;
+
+        let unified_solid_id = match (parent_solid_id, has_complex_options) {
+            (Some(parent), true) => {
+                create_complex_unified_extrusion(model, parent, &face, face_id, &options)?
+            }
+            (Some(parent), false) => create_unified_extrusion(
+                model,
+                parent,
+                &face,
+                face_id,
+                direction,
+                options.distance,
+                options.cap_ends,
+            )?,
+            (None, _) => create_fresh_extrusion(
+                model,
+                &face,
+                face_id,
+                direction,
+                options.distance,
+                options.cap_ends,
+            )?,
+        };
+
+        // Validate result if requested
+        if options.common.validate_result {
+            validate_extruded_solid(model, unified_solid_id)?;
         }
-        (Some(parent), false) => create_unified_extrusion(
-            model,
-            parent,
-            &face,
-            face_id,
-            direction,
-            options.distance,
-            options.cap_ends,
-        )?,
-        (None, _) => create_fresh_extrusion(
-            model,
-            &face,
-            face_id,
-            direction,
-            options.distance,
-            options.cap_ends,
-        )?,
-    };
 
-    // Validate result if requested
-    if options.common.validate_result {
-        validate_extruded_solid(model, unified_solid_id)?;
-    }
+        // The unified-extrusion path replaces `outer_shell` on the parent solid
+        // in-place (see create_unified_extrusion / create_complex_unified_extrusion).
+        // Any volume/area/inertia previously memoised on the Solid is stale.
+        if let Some(solid) = model.solids.get_mut(unified_solid_id) {
+            solid.invalidate_mass_props_cache();
+        }
 
-    // The unified-extrusion path replaces `outer_shell` on the parent solid
-    // in-place (see create_unified_extrusion / create_complex_unified_extrusion).
-    // Any volume/area/inertia previously memoised on the Solid is stale.
-    if let Some(solid) = model.solids.get_mut(unified_solid_id) {
-        solid.invalidate_mass_props_cache();
-    }
+        // Record for attached recorders. `direction` above was moved into
+        // `create_*_unified_extrusion`, so re-read from `options` (the option
+        // struct is still borrowed and un-normalized — sufficient for a record).
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new("extrude_face")
+                .with_parameters(serde_json::json!({
+                    "face_id": face_id,
+                    "distance": options.distance,
+                    "direction": [options.direction.x, options.direction.y, options.direction.z],
+                    "cap_ends": options.cap_ends,
+                    "draft_angle": options.draft_angle,
+                    "twist_angle": options.twist_angle,
+                    "end_scale": options.end_scale,
+                }))
+                .with_input_faces([face_id as u64])
+                .with_output_solids([unified_solid_id as u64]),
+        );
 
-    // Record for attached recorders. `direction` above was moved into
-    // `create_*_unified_extrusion`, so re-read from `options` (the option
-    // struct is still borrowed and un-normalized — sufficient for a record).
-    model.record_operation(
-        crate::operations::recorder::RecordedOperation::new("extrude_face")
-            .with_parameters(serde_json::json!({
-                "face_id": face_id,
-                "distance": options.distance,
-                "direction": [options.direction.x, options.direction.y, options.direction.z],
-                "cap_ends": options.cap_ends,
-                "draft_angle": options.draft_angle,
-                "twist_angle": options.twist_angle,
-                "end_scale": options.end_scale,
-            }))
-            .with_input_faces([face_id as u64])
-            .with_output_solids([unified_solid_id as u64]),
-    );
-
-    Ok(unified_solid_id)
+        Ok(unified_solid_id)
+    })
 }
 
 /// Create a unified extrusion that combines the original solid with the extruded volume
@@ -1058,11 +1066,25 @@ pub fn extrude_profile(
     profile_edges: Vec<EdgeId>,
     options: ExtrudeOptions,
 ) -> OperationResult<SolidId> {
-    // First create a face from the profile
-    let face_id = create_face_from_profile(model, profile_edges)?;
+    // F2-δ pre-flight on the profile edges. The inner `extrude_face`
+    // call adds its own pre-flight on the synthesized face.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::ExtrudeProfile {
+                profile_edges: &profile_edges,
+            },
+        )?;
+    }
 
-    // Then extrude the face
-    extrude_face(model, face_id, options)
+    // F2-δ rollback wrapper. `create_face_from_profile` mutates the
+    // edge/loop/face stores before `extrude_face` is called; without
+    // an outer snapshot, a failed profile-to-face step would leave
+    // orphaned topology even though the user-observable op failed.
+    lifecycle::with_rollback(model, move |model| {
+        let face_id = create_face_from_profile(model, profile_edges)?;
+        extrude_face(model, face_id, options)
+    })
 }
 
 /// Create a straight line edge between two vertices
@@ -1959,10 +1981,12 @@ mod tests {
         let opts = ExtrudeOptions::default();
         let result = extrude_face(&mut model, 99_999, opts);
         match result {
-            Err(OperationError::InvalidGeometry(msg)) => {
-                assert!(msg.contains("Face not found"), "msg = {msg}");
+            // F2-δ: pre-flight reports missing entity IDs as
+            // InvalidInput with the actual missing-id value in `received`.
+            Err(OperationError::InvalidInput { received, .. }) => {
+                assert!(received.contains("99999"), "received = {received}");
             }
-            other => panic!("expected InvalidGeometry, got {other:?}"),
+            other => panic!("expected InvalidInput, got {other:?}"),
         }
     }
 

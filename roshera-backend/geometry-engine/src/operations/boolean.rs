@@ -39,6 +39,7 @@
 //! enumeration. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -235,40 +236,56 @@ pub fn boolean_operation(
         operation, solid_a, solid_b,
     );
 
-    // Step 1: Compute face-face intersections
-    let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
+    // F2-δ pre-flight.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::Boolean { solid_a, solid_b },
+        )?;
+    }
 
-    // Step 2: Split faces along intersection curves
-    let split_faces = split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
+    // F2-δ rollback wrapper — boolean is the canonical example of an
+    // op that can leave a half-split shell behind on a coplanar-face
+    // degeneracy. The snapshot ensures the input solids are intact
+    // on failure.
+    lifecycle::with_rollback(model, move |model| {
+        // Step 1: Compute face-face intersections
+        let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
 
-    // Step 3: Classify split faces (inside/outside/on boundary)
-    let classified_faces = classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
+        // Step 2: Split faces along intersection curves
+        let split_faces =
+            split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
 
-    // Step 4: Select faces based on boolean operation
-    let selected_faces = select_faces_for_operation(&classified_faces, operation, solid_a, solid_b);
+        // Step 3: Classify split faces (inside/outside/on boundary)
+        let classified_faces =
+            classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
 
-    // Step 5: Reconstruct topology from selected faces
-    let result_solid = reconstruct_topology(model, selected_faces, &options)?;
+        // Step 4: Select faces based on boolean operation
+        let selected_faces =
+            select_faces_for_operation(&classified_faces, operation, solid_a, solid_b);
 
-    // Record the successful operation for attached recorders (timeline, audit, …).
-    // Recording never propagates failure — see BRepModel::record_operation.
-    let op_kind = match operation {
-        BooleanOp::Union => "boolean_union",
-        BooleanOp::Intersection => "boolean_intersection",
-        BooleanOp::Difference => "boolean_difference",
-    };
-    model.record_operation(
-        crate::operations::recorder::RecordedOperation::new(op_kind)
-            .with_parameters(serde_json::json!({
-                "solid_a": solid_a,
-                "solid_b": solid_b,
-                "operation": format!("{:?}", operation),
-            }))
-            .with_input_solids([solid_a as u64, solid_b as u64])
-            .with_output_solids([result_solid as u64]),
-    );
+        // Step 5: Reconstruct topology from selected faces
+        let result_solid = reconstruct_topology(model, selected_faces, &options)?;
 
-    Ok(result_solid)
+        // Record the successful operation for attached recorders.
+        let op_kind = match operation {
+            BooleanOp::Union => "boolean_union",
+            BooleanOp::Intersection => "boolean_intersection",
+            BooleanOp::Difference => "boolean_difference",
+        };
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new(op_kind)
+                .with_parameters(serde_json::json!({
+                    "solid_a": solid_a,
+                    "solid_b": solid_b,
+                    "operation": format!("{:?}", operation),
+                }))
+                .with_input_solids([solid_a as u64, solid_b as u64])
+                .with_output_solids([result_solid as u64]),
+        );
+
+        Ok(result_solid)
+    })
 }
 
 /// Compute all face-face intersections between two solids

@@ -3,6 +3,7 @@
 //! Provides operations to delete geometry entities with proper topology management,
 //! cascade deletion, and orphan cleanup.
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::primitives::{
     edge::EdgeId, face::FaceId, r#loop::LoopId, shell::ShellId, solid::SolidId,
@@ -149,6 +150,19 @@ pub fn delete_entities(
     target: DeleteTarget,
     options: DeleteOptions,
 ) -> OperationResult<DeleteResult> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        delete_entities_body(model, target, options)
+    })
+}
+
+fn delete_entities_body(
+    model: &mut BRepModel,
+    target: DeleteTarget,
+    options: DeleteOptions,
+) -> OperationResult<DeleteResult> {
     // Collect entities to delete
     let mut to_delete = collect_entities_to_delete(model, &target)?;
 
@@ -216,6 +230,17 @@ pub fn delete_solid(
     solid_id: SolidId,
     cascade: bool,
 ) -> OperationResult<Vec<(EntityType, u32)>> {
+    lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    lifecycle::with_rollback(model, move |model| {
+        delete_solid_body(model, solid_id, cascade)
+    })
+}
+
+fn delete_solid_body(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    cascade: bool,
+) -> OperationResult<Vec<(EntityType, u32)>> {
     let mut deleted = Vec::new();
 
     // Get the solid and clone necessary data
@@ -250,8 +275,13 @@ pub fn delete_solid(
 }
 
 /// Delete a single face
-#[allow(clippy::expect_used)] // face_id validated non-None at fn entry; not removed since
 pub fn delete_face(model: &mut BRepModel, face_id: FaceId, heal: bool) -> OperationResult<()> {
+    lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    lifecycle::with_rollback(model, move |model| delete_face_body(model, face_id, heal))
+}
+
+#[allow(clippy::expect_used)] // face_id validated non-None at fn entry; not removed since
+fn delete_face_body(model: &mut BRepModel, face_id: FaceId, heal: bool) -> OperationResult<()> {
     // Validate face exists
     if model.faces.get(face_id).is_none() {
         return Err(OperationError::InvalidInput {
@@ -305,6 +335,19 @@ pub fn delete_face(model: &mut BRepModel, face_id: FaceId, heal: bool) -> Operat
 
 /// Delete an edge
 pub fn delete_edge(
+    model: &mut BRepModel,
+    edge_id: EdgeId,
+    options: DeleteOptions,
+) -> OperationResult<DeleteResult> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        delete_edge_body(model, edge_id, options)
+    })
+}
+
+fn delete_edge_body(
     model: &mut BRepModel,
     edge_id: EdgeId,
     options: DeleteOptions,

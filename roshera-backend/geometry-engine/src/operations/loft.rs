@@ -9,6 +9,7 @@
 //! sample density. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Vector3};
@@ -84,6 +85,26 @@ pub enum LoftType {
 /// Loft between multiple profile curves to create a solid or surface
 #[allow(clippy::expect_used)] // profiles non-empty (≥2): validate_loft_inputs at fn entry
 pub fn loft_profiles(
+    model: &mut BRepModel,
+    profiles: Vec<Vec<EdgeId>>,
+    options: LoftOptions,
+) -> OperationResult<SolidId> {
+    // F2-δ pre-flight.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::LoftProfiles {
+                profiles: &profiles,
+            },
+        )?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        loft_profiles_body(model, profiles, options)
+    })
+}
+
+#[allow(clippy::expect_used)] // profiles non-empty (≥2): validate_loft_inputs at fn entry
+fn loft_profiles_body(
     model: &mut BRepModel,
     profiles: Vec<Vec<EdgeId>>,
     options: LoftOptions,
@@ -1925,7 +1946,10 @@ mod tests {
             ..Default::default()
         };
         let result = loft_profiles(&mut model, vec![p1], opts);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+        // F2-δ: pre-flight now classifies "fewer than 2 profiles" as
+        // InvalidInput rather than InvalidGeometry (it's a caller-side
+        // bad input, not a topology condition).
+        assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
     #[test]
@@ -1940,7 +1964,9 @@ mod tests {
             ..Default::default()
         };
         let result = loft_profiles(&mut model, vec![p1, vec![9999]], opts);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+        // F2-δ: pre-flight resolves entity IDs and returns
+        // InvalidInput when a referenced edge is missing.
+        assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
     #[test]

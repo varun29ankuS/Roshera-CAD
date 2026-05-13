@@ -13,7 +13,8 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::edge_blend_topology::{splice_blend_edge, validate_no_shared_corners, BlendEdgeSurgery};
+use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
@@ -132,112 +133,125 @@ pub fn fillet_edges(
     edges: Vec<EdgeId>,
     options: FilletOptions,
 ) -> OperationResult<Vec<FaceId>> {
-    // Validate inputs
-    validate_fillet_inputs(model, solid_id, &edges, &options)?;
+    // F2-δ pre-flight: cheap input validation + setback-aware
+    // corner compatibility (replaces the historical
+    // `validate_no_shared_corners` blanket reject). Atomic — the
+    // model is untouched if pre-flight fails.
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::FilletEdges {
+                solid_id,
+                edges: &edges,
+            },
+        )?;
+    }
 
-    // Capture input edges before `edges` is consumed by the propagation
-    // step below — needed for the recorder payload.
-    let input_edges_for_record: Vec<u32> = edges.clone();
+    // F2-δ transactional wrapper: any Err out of the body restores
+    // the pre-call snapshot so the caller sees an unchanged model.
+    lifecycle::with_rollback(model, move |model| {
+        // Validate inputs
+        validate_fillet_inputs(model, solid_id, &edges, &options)?;
 
-    // Additional robust validation. For variable-radius fillets we
-    // must check both endpoint radii — the linear interpolant means
-    // either end can independently violate the half-edge-length bound,
-    // and rejecting only `r1` (as the original loop did) lets a
-    // pathological `r2` slip through to surgery time where it would
-    // surface a less actionable error.
-    for &edge_id in &edges {
-        let radii_to_check: Vec<f64> = match &options.fillet_type {
-            FilletType::Constant(r) => vec![*r],
-            FilletType::Variable(r1, r2) => vec![*r1, *r2],
-            // Function radii are validated per-sample inside the
-            // surgery loop; the placeholder of 1.0 only exercises the
-            // structural bounds here (edge length non-zero, edge
-            // exists).
-            FilletType::Function(_) => vec![1.0],
-            FilletType::Chord(c) => vec![*c],
-        };
-        for radius in radii_to_check {
-            validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)?;
+        // Capture input edges before `edges` is consumed by the
+        // propagation step below — needed for the recorder payload.
+        let input_edges_for_record: Vec<u32> = edges.clone();
+
+        // Additional robust validation. For variable-radius fillets we
+        // must check both endpoint radii — the linear interpolant means
+        // either end can independently violate the half-edge-length bound,
+        // and rejecting only `r1` (as the original loop did) lets a
+        // pathological `r2` slip through to surgery time where it would
+        // surface a less actionable error.
+        for &edge_id in &edges {
+            let radii_to_check: Vec<f64> = match &options.fillet_type {
+                FilletType::Constant(r) => vec![*r],
+                FilletType::Variable(r1, r2) => vec![*r1, *r2],
+                // Function radii are validated per-sample inside the
+                // surgery loop; the placeholder of 1.0 only exercises the
+                // structural bounds here (edge length non-zero, edge
+                // exists).
+                FilletType::Function(_) => vec![1.0],
+                FilletType::Chord(c) => vec![*c],
+            };
+            for radius in radii_to_check {
+                validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)?;
+            }
         }
-    }
 
-    // Reject multi-edge calls that meet at a corner — corner sphere
-    // blends are not yet implemented (Task #82 slice 2). This must
-    // run before any topology mutation so the rejection is atomic.
-    validate_no_shared_corners(model, &edges)?;
+        // Get radius value(s)
+        let radius = match &options.fillet_type {
+            FilletType::Constant(r) => *r,
+            FilletType::Variable(r1, _) => *r1, // Use start radius for validation
+            FilletType::Function(_) => 0.0,     // Will validate per point
+            FilletType::Chord(c) => *c,
+        };
 
-    // Get radius value(s)
-    let radius = match &options.fillet_type {
-        FilletType::Constant(r) => *r,
-        FilletType::Variable(r1, _) => *r1, // Use start radius for validation
-        FilletType::Function(_) => 0.0,     // Will validate per point
-        FilletType::Chord(c) => *c,
-    };
+        // Check radius validity
+        if radius <= 0.0 {
+            return Err(OperationError::InvalidRadius(radius));
+        }
 
-    // Check radius validity
-    if radius <= 0.0 {
-        return Err(OperationError::InvalidRadius(radius));
-    }
+        // Propagate edge selection if requested
+        let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
-    // Propagate edge selection if requested
-    let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
+        // Group edges into fillet chains
+        let edge_chains = group_edges_into_chains(model, &selected_edges)?;
 
-    // Group edges into fillet chains
-    let edge_chains = group_edges_into_chains(model, &selected_edges)?;
+        // Create fillet surfaces for each chain
+        let mut fillet_faces = Vec::new();
+        let mut surgeries = Vec::new();
+        for chain in edge_chains {
+            let (chain_faces, chain_surgeries) =
+                create_fillet_chain(model, solid_id, chain, &options)?;
+            fillet_faces.extend(chain_faces);
+            surgeries.extend(chain_surgeries);
+        }
 
-    // Create fillet surfaces for each chain
-    let mut fillet_faces = Vec::new();
-    let mut surgeries = Vec::new();
-    for chain in edge_chains {
-        let (chain_faces, chain_surgeries) =
-            create_fillet_chain(model, solid_id, chain, &options)?;
-        fillet_faces.extend(chain_faces);
-        surgeries.extend(chain_surgeries);
-    }
+        // Re-stitch the surrounding topology and add fillet faces to the
+        // outer shell so the resulting B-Rep is watertight.
+        update_adjacent_faces(model, solid_id, &fillet_faces, &surgeries)?;
 
-    // Re-stitch the surrounding topology and add fillet faces to the
-    // outer shell so the resulting B-Rep is watertight.
-    update_adjacent_faces(model, solid_id, &fillet_faces, &surgeries)?;
+        // Validate result if requested
+        if options.common.validate_result {
+            validate_filleted_solid(model, solid_id)?;
+        }
 
-    // Validate result if requested
-    if options.common.validate_result {
-        validate_filleted_solid(model, solid_id)?;
-    }
+        // Record for attached recorders. `inputs` lists the user-supplied
+        // edges (not the propagated superset — that's a derived detail).
+        // `outputs` leads with `solid_id` so the lineage graph treats this
+        // fillet as the new "producer" of the modified body — downstream
+        // ops (shell-after-fillet, chamfer-after-fillet, …) then parent to
+        // this event instead of jumping past it back to the primitive. The
+        // generated fillet faces follow so the recorded op still names the
+        // topology it introduced.
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new("fillet_edges")
+                .with_parameters(serde_json::json!({
+                    "solid_id": solid_id,
+                    "fillet_type": format!("{:?}", options.fillet_type),
+                    "radius": options.radius,
+                    "propagation": format!("{:?}", options.propagation),
+                    "preserve_edges": options.preserve_edges,
+                    "quality": format!("{:?}", options.quality),
+                }))
+                .with_input_solids([solid_id as u64])
+                .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
+                .with_output_solids([solid_id as u64])
+                .with_output_faces(fillet_faces.iter().map(|&f| f as u64)),
+        );
 
-    // Record for attached recorders. `inputs` lists the user-supplied
-    // edges (not the propagated superset — that's a derived detail).
-    // `outputs` leads with `solid_id` so the lineage graph treats this
-    // fillet as the new "producer" of the modified body — downstream
-    // ops (shell-after-fillet, chamfer-after-fillet, …) then parent to
-    // this event instead of jumping past it back to the primitive. The
-    // generated fillet faces follow so the recorded op still names the
-    // topology it introduced.
-    model.record_operation(
-        crate::operations::recorder::RecordedOperation::new("fillet_edges")
-            .with_parameters(serde_json::json!({
-                "solid_id": solid_id,
-                "fillet_type": format!("{:?}", options.fillet_type),
-                "radius": options.radius,
-                "propagation": format!("{:?}", options.propagation),
-                "preserve_edges": options.preserve_edges,
-                "quality": format!("{:?}", options.quality),
-            }))
-            .with_input_solids([solid_id as u64])
-            .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
-            .with_output_solids([solid_id as u64])
-            .with_output_faces(fillet_faces.iter().map(|&f| f as u64)),
-    );
+        // Drop the solid's cached mass-properties — volume, surface area,
+        // COM and inertia tensor all changed when the blend faces were
+        // spliced in. Without this, `calculate_solid_volume` returns the
+        // pre-fillet figure, and `/api/agent/parts/{id}/mass` reports
+        // stale data until the solid is rebuilt.
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.invalidate_mass_props_cache();
+        }
 
-    // Drop the solid's cached mass-properties — volume, surface area,
-    // COM and inertia tensor all changed when the blend faces were
-    // spliced in. Without this, `calculate_solid_volume` returns the
-    // pre-fillet figure, and `/api/agent/parts/{id}/mass` reports
-    // stale data until the solid is rebuilt.
-    if let Some(solid) = model.solids.get_mut(solid_id) {
-        solid.invalidate_mass_props_cache();
-    }
-
-    Ok(fillet_faces)
+        Ok(fillet_faces)
+    })
 }
 
 /// Apply fillet to vertices (create spherical patches)

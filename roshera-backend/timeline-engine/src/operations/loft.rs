@@ -133,6 +133,7 @@ impl OperationImpl for LoftOp {
             let loft_options = GeomLoftOptions {
                 common: geometry_engine::operations::CommonOptions {
                     tolerance: Tolerance::default(),
+                    validate_before: true,
                     validate_result: true,
                     merge_entities: true,
                     track_history: false,

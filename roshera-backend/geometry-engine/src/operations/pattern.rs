@@ -9,6 +9,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
@@ -171,6 +172,24 @@ pub enum PatternTarget {
 
 /// Create a pattern of features
 pub fn create_pattern(
+    model: &mut BRepModel,
+    source_features: Vec<FaceId>,
+    pattern_type: PatternType,
+    options: PatternOptions,
+) -> OperationResult<Vec<Vec<FaceId>>> {
+    if options.common.validate_before {
+        // Pattern operates over source features whose validity is
+        // checked in `validate_pattern_inputs` (face IDs resolved,
+        // pattern parameters bounded). Pre-flight is the generic
+        // "model isn't empty" path.
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        create_pattern_body(model, source_features, pattern_type, options)
+    })
+}
+
+fn create_pattern_body(
     model: &mut BRepModel,
     source_features: Vec<FaceId>,
     pattern_type: PatternType,

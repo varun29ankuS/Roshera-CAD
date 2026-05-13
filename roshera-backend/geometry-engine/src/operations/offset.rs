@@ -11,6 +11,7 @@
 //! bounded by sample / face count. Matches the pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -84,46 +85,66 @@ pub fn offset_face(
     face_id: FaceId,
     options: OffsetOptions,
 ) -> OperationResult<FaceId> {
-    // Validate inputs
-    validate_offset_face_inputs(model, face_id, &options)?;
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::OffsetFace { face_id })?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        // Validate inputs
+        validate_offset_face_inputs(model, face_id, &options)?;
 
-    // Get face data
-    let face = model
-        .faces
-        .get(face_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
-        .clone();
+        // Get face data
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?
+            .clone();
 
-    // Get offset distance
-    let distance = match &options.offset_type {
-        OffsetType::Distance(d) => *d,
-        OffsetType::PerFace(map) => *map.get(&face_id).unwrap_or(&0.0),
-    };
+        // Get offset distance
+        let distance = match &options.offset_type {
+            OffsetType::Distance(d) => *d,
+            OffsetType::PerFace(map) => *map.get(&face_id).unwrap_or(&0.0),
+        };
 
-    // Create offset surface
-    let offset_surface = create_offset_surface(model, &face, distance)?;
-    let surface_id = model.surfaces.add(offset_surface);
+        // Create offset surface
+        let offset_surface = create_offset_surface(model, &face, distance)?;
+        let surface_id = model.surfaces.add(offset_surface);
 
-    // Create offset edges. The standalone offset_face surface does not
-    // need the per-edge map — only the shell operation does — so
-    // discard it here.
-    let (offset_loop, _edge_map) = create_offset_loop(model, &face, distance, &options)?;
-    let loop_id = model.loops.add(offset_loop);
+        // Create offset edges. The standalone offset_face surface does not
+        // need the per-edge map — only the shell operation does — so
+        // discard it here.
+        let (offset_loop, _edge_map) = create_offset_loop(model, &face, distance, &options)?;
+        let loop_id = model.loops.add(offset_loop);
 
-    // Create new face
-    let offset_face = Face::new(
-        0, // ID will be assigned by store
-        surface_id,
-        loop_id,
-        face.orientation,
-    );
-    let face_id = model.faces.add(offset_face);
+        // Create new face
+        let offset_face = Face::new(
+            0, // ID will be assigned by store
+            surface_id,
+            loop_id,
+            face.orientation,
+        );
+        let new_face_id = model.faces.add(offset_face);
 
-    Ok(face_id)
+        Ok(new_face_id)
+    })
 }
 
 /// Create a shell (hollow) from a solid
 pub fn offset_solid(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    thickness: f64,
+    faces_to_remove: Vec<FaceId>,
+    options: OffsetOptions,
+) -> OperationResult<SolidId> {
+    if options.common.validate_before {
+        lifecycle::validate_can_apply(model, OpSpec::OffsetSolid { solid_id })?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        offset_solid_body(model, solid_id, thickness, faces_to_remove, options)
+    })
+}
+
+fn offset_solid_body(
     model: &mut BRepModel,
     solid_id: SolidId,
     thickness: f64,

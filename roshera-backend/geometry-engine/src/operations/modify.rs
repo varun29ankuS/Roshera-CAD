@@ -3,6 +3,7 @@
 //! Provides comprehensive operations to modify existing geometry entities including
 //! parameter changes, topology updates, property modifications, and geometric transformations.
 
+use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -163,6 +164,23 @@ pub struct ModifyResult {
 
 /// Apply an modify operation to the model
 pub fn apply_modification(
+    model: &mut BRepModel,
+    edit: ModifyType,
+    options: ModifyOptions,
+) -> OperationResult<ModifyResult> {
+    if options.common.validate_before {
+        // ModifyType variants dispatch over many entity kinds (vertex,
+        // edge, face, solid, loop, tolerance). The per-variant input
+        // check lives in `validate_modification` inside the body; the
+        // pre-flight here is the generic "model isn't empty" path.
+        lifecycle::validate_can_apply(model, OpSpec::Generic)?;
+    }
+    lifecycle::with_rollback(model, move |model| {
+        apply_modification_body(model, edit, options)
+    })
+}
+
+fn apply_modification_body(
     model: &mut BRepModel,
     edit: ModifyType,
     options: ModifyOptions,

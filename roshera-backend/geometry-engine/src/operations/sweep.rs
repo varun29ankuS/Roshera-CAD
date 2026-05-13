@@ -9,6 +9,7 @@
 //! kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::frame::parallel_transport_frames;
@@ -155,6 +156,29 @@ pub enum SweepQuality {
 
 /// Sweep a profile along a path
 pub fn sweep_profile(
+    model: &mut BRepModel,
+    profile: Vec<EdgeId>,
+    path: EdgeId,
+    options: SweepOptions,
+) -> OperationResult<SolidId> {
+    // F2-δ pre-flight: profile + path edges exist.
+    if options.common.validate_before {
+        let path_slice = [path];
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::SweepProfile {
+                profile_edges: &profile,
+                path_edges: &path_slice,
+            },
+        )?;
+    }
+
+    lifecycle::with_rollback(model, move |model| {
+        sweep_profile_body(model, profile, path, options)
+    })
+}
+
+fn sweep_profile_body(
     model: &mut BRepModel,
     profile: Vec<EdgeId>,
     path: EdgeId,
@@ -1572,7 +1596,8 @@ mod tests {
             ..Default::default()
         };
         let result = sweep_profile(&mut model, vec![9999], path, opts);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+        // F2-δ: pre-flight resolves entity IDs and returns InvalidInput.
+        assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
     #[test]
@@ -1587,7 +1612,8 @@ mod tests {
             ..Default::default()
         };
         let result = sweep_profile(&mut model, edges, 9999, opts);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+        // F2-δ: pre-flight resolves entity IDs and returns InvalidInput.
+        assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
     #[test]

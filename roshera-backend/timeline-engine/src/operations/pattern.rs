@@ -237,6 +237,7 @@ impl OperationImpl for PatternOp {
                                 let transform_options = TransformOptions {
                                     common: CommonOptions {
                                         tolerance: Tolerance::default(),
+                                        validate_before: true,
                                         validate_result: false,
                                         merge_entities: false,
                                         track_history: false,
@@ -312,6 +313,7 @@ impl OperationImpl for PatternOp {
                                 let transform_options = TransformOptions {
                                     common: CommonOptions {
                                         tolerance: Tolerance::default(),
+                                        validate_before: true,
                                         validate_result: false,
                                         merge_entities: false,
                                         track_history: false,
@@ -400,6 +402,7 @@ impl OperationImpl for PatternOp {
                                     let transform_options = TransformOptions {
                                         common: CommonOptions {
                                             tolerance: Tolerance::default(),
+                                            validate_before: true,
                                             validate_result: false,
                                             merge_entities: false,
                                             track_history: false,
