@@ -42,6 +42,13 @@ pub mod sew;
 // and timeline-engine can drive the cache lifecycle.
 pub mod edge_classification;
 
+// F2-β blend graph: read-only view of a fillet/chamfer edge
+// selection — vertex incidence, chain ids (union-find), and per-
+// vertex corner classification (Smooth / ConvexCorner / ConcaveCorner
+// / Mixed / Cliff). Consumes the F2-α classification cache and feeds
+// F2-γ (setback computation) plus F3/F5 (spine + corner patches).
+pub mod blend_graph;
+
 // Internal helpers for boolean face splitting (DCEL-based planar arrangement).
 // Not part of the public API — used by `boolean::split_face_by_curves` only.
 pub(crate) mod face_arrangement;
