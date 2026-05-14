@@ -466,9 +466,23 @@ fn compute_face_intersections(
                     format!("{}-{}", tb, ta)
                 }
             };
-            let entry = pair_curves_by_type.entry(pair_key).or_insert((0, 0));
+            let entry = pair_curves_by_type.entry(pair_key.clone()).or_insert((0, 0));
             entry.0 += 1; // pairs tested
-            if let Some(intersection) = intersect_faces(model, face_a, face_b, options)? {
+            let result = intersect_faces(model, face_a, face_b, options)?;
+            if pipeline_trace_enabled() {
+                match &result {
+                    Some(fi) => eprintln!(
+                        "  tested face_a={} face_b={} types={} → curves={} cop_a={} cop_b={}",
+                        face_a, face_b, pair_key, fi.curves.len(),
+                        fi.coplanar_curves_a.len(), fi.coplanar_curves_b.len(),
+                    ),
+                    None => eprintln!(
+                        "  tested face_a={} face_b={} types={} → None",
+                        face_a, face_b, pair_key,
+                    ),
+                }
+            }
+            if let Some(intersection) = result {
                 entry.1 += intersection.curves.len(); // curves produced
                 intersections.push(intersection);
             }
