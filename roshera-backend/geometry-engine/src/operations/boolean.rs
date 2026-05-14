@@ -4180,14 +4180,18 @@ pub(super) fn create_edge_from_curve(
         .vertices
         .add_or_find(end_point.x, end_point.y, end_point.z, 1e-6);
 
-    // Create edge
-    let edge = Edge::new(
+    // Create edge. F7-α: boolean intersection edges thread the
+    // kernel default tolerance explicitly so the F7-δ sew pass can
+    // compare gap measurements against the same value the edge was
+    // built with. Value matches the historical 1e-6 hardcode.
+    let edge = Edge::new_with_tolerance(
         0,
         start_vertex,
         end_vertex,
         curve_id,
         crate::primitives::edge::EdgeOrientation::Forward,
         crate::primitives::curve::ParameterRange::new(0.0, 1.0),
+        crate::math::Tolerance::default().distance(),
     );
 
     Ok(model.edges.add(edge))

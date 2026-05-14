@@ -224,16 +224,28 @@ pub enum EdgeIntersectionType {
 }
 
 impl Edge {
-    /// Create new edge with full parameters
-    /// Create new edge with MAXIMUM SPEED
+    /// Default per-edge tolerance for callers that do not specify one.
+    /// Matches `tolerance::NORMAL_TOLERANCE.distance()`. Kept as a literal
+    /// constant rather than a reference to `Tolerance::default()` so this
+    /// is usable from `const` contexts and the dependency direction stays
+    /// `edge.rs → math::tolerance` only at the call sites that need it.
+    pub const DEFAULT_TOLERANCE: f64 = 1e-6;
+
+    /// Create new edge with full parameters and an explicit per-edge
+    /// tolerance. Production rail-edge construction sites (fillet,
+    /// chamfer, boolean intersection edges) thread the tolerance from
+    /// the caller's `Tolerance` context so downstream operations
+    /// (sew gap detection, imprint coincidence, validation) compare
+    /// against the same value the edge was built with.
     #[inline(always)]
-    pub fn new(
+    pub fn new_with_tolerance(
         id: EdgeId,
         start_vertex: VertexId,
         end_vertex: VertexId,
         curve_id: CurveId,
         orientation: EdgeOrientation,
         param_range: ParameterRange,
+        tolerance: f64,
     ) -> Self {
         Self {
             id,
@@ -244,8 +256,55 @@ impl Edge {
             param_range,
             attributes: DEFAULT_EDGE_ATTRIBUTES,
             cached_length: f64::NAN,
-            tolerance: 1e-6, // Default CAD tolerance
+            tolerance,
         }
+    }
+
+    /// Create new edge with full parameters using `DEFAULT_TOLERANCE`.
+    /// Delegating shim over `new_with_tolerance`; preserved for the
+    /// large body of existing callers (primitives, transforms, tests)
+    /// that do not yet plumb a tolerance through.
+    #[inline(always)]
+    pub fn new(
+        id: EdgeId,
+        start_vertex: VertexId,
+        end_vertex: VertexId,
+        curve_id: CurveId,
+        orientation: EdgeOrientation,
+        param_range: ParameterRange,
+    ) -> Self {
+        Self::new_with_tolerance(
+            id,
+            start_vertex,
+            end_vertex,
+            curve_id,
+            orientation,
+            param_range,
+            Self::DEFAULT_TOLERANCE,
+        )
+    }
+
+    /// Create edge with automatic parameter range and an explicit
+    /// per-edge tolerance. Same contract as `new_with_tolerance` but
+    /// uses `ParameterRange::unit()`.
+    #[inline]
+    pub fn new_with_tolerance_auto_range(
+        id: EdgeId,
+        start_vertex: VertexId,
+        end_vertex: VertexId,
+        curve_id: CurveId,
+        orientation: EdgeOrientation,
+        tolerance: f64,
+    ) -> Self {
+        Self::new_with_tolerance(
+            id,
+            start_vertex,
+            end_vertex,
+            curve_id,
+            orientation,
+            ParameterRange::unit(),
+            tolerance,
+        )
     }
 
     /// Create edge with automatic parameter range
@@ -1065,6 +1124,66 @@ mod tests {
         let e = Edge::new_auto_range(0, 1, 2, 0, EdgeOrientation::Forward);
         assert_eq!(e.param_range.start, 0.0);
         assert_eq!(e.param_range.end, 1.0);
+    }
+
+    #[test]
+    fn edge_new_with_tolerance_preserves_tolerance() {
+        // F7-α: rail-edge construction sites use this to thread the
+        // caller's tolerance through. The value must survive untouched
+        // — sew gap detection (F7-δ) compares against this exact f64.
+        let e = Edge::new_with_tolerance(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+            5e-9,
+        );
+        assert_eq!(e.tolerance, 5e-9);
+    }
+
+    #[test]
+    fn edge_new_with_tolerance_auto_range_preserves_tolerance() {
+        let e = Edge::new_with_tolerance_auto_range(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            3e-7,
+        );
+        assert_eq!(e.tolerance, 3e-7);
+        assert_eq!(e.param_range.start, 0.0);
+        assert_eq!(e.param_range.end, 1.0);
+    }
+
+    #[test]
+    fn edge_new_is_delegating_shim_for_default_tolerance() {
+        // The "no semantic change" guarantee of F7-α: Edge::new still
+        // produces an edge with tolerance == DEFAULT_TOLERANCE (1e-6).
+        // Pinning this stops a future refactor of the shim from
+        // silently changing the value at the ~90 call sites that have
+        // not yet been migrated to new_with_tolerance.
+        let e_via_shim = Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
+        let e_explicit = Edge::new_with_tolerance(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+            Edge::DEFAULT_TOLERANCE,
+        );
+        assert_eq!(e_via_shim.tolerance, e_explicit.tolerance);
+        assert_eq!(e_via_shim.tolerance, 1e-6);
     }
 
     // ---- Predicates ---------------------------------------------------------

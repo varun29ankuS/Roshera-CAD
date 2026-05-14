@@ -777,37 +777,46 @@ fn create_closed_edge_chamfer(
     // ---------- step 6: build the new edges. ----------
     // ParameterRange::new(0.0, 1.0) matches `Arc`'s and `Line`'s unit
     // parameterisation — same convention as the fillet path.
-    let cap_trim_edge_id = model.edges.add(Edge::new(
+    // F7-α: rail/cap/seam edges thread the caller's tolerance so the
+    // F7-δ sew pass can compare gaps against the same value the edge
+    // was built with. `Tolerance::default().distance()` matches the
+    // historical 1e-6 hardcode — no semantic change vs. pre-F7-α.
+    let rail_tol = crate::math::Tolerance::default().distance();
+    let cap_trim_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         v_cap,
         v_cap,
         cap_trim_curve_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
-    let lat_trim_edge_id = model.edges.add(Edge::new(
+    let lat_trim_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         v_lat,
         v_lat,
         lat_trim_curve_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
-    let cone_seam_edge_id = model.edges.add(Edge::new(
+    let cone_seam_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         v_lat,
         v_cap,
         cone_seam_curve_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
-    let new_seam_edge_id = model.edges.add(Edge::new(
+    let new_seam_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         seam_edge.start_vertex,
         seam_edge.end_vertex,
         new_seam_line_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
 
     // ---------- step 7: replace the rim slot in the cap loop. ----------
@@ -1164,7 +1173,17 @@ fn create_chamfer_face(
     let v_t2_end = model.vertices.add(last2.x, last2.y, last2.z);
 
     // Trim edge on F1: start = v_t1_start, end = v_t1_end, Forward.
-    let trim1 = Edge::new_auto_range(0, v_t1_start, v_t1_end, offset_curve1, EdgeOrientation::Forward);
+    // F7-α: rail tolerance threaded explicitly; value matches
+    // `NORMAL_TOLERANCE.distance()` so no semantic change.
+    let rail_tol = crate::math::Tolerance::default().distance();
+    let trim1 = Edge::new_with_tolerance_auto_range(
+        0,
+        v_t1_start,
+        v_t1_end,
+        offset_curve1,
+        EdgeOrientation::Forward,
+        rail_tol,
+    );
     let trim1_edge = model.edges.add(trim1);
 
     // Cap edge at V1: v_t1_end → v_t2_end. The straight-line cap is a
@@ -1176,7 +1195,14 @@ fn create_chamfer_face(
     // traversal at this site is reversed (`add_edge(_, false)` below),
     // so the rectangular boundary still walks
     //   v_t1_start → v_t1_end → v_t2_end → v_t2_start → v_t1_start.
-    let trim2 = Edge::new_auto_range(0, v_t2_start, v_t2_end, offset_curve2, EdgeOrientation::Forward);
+    let trim2 = Edge::new_with_tolerance_auto_range(
+        0,
+        v_t2_start,
+        v_t2_end,
+        offset_curve2,
+        EdgeOrientation::Forward,
+        rail_tol,
+    );
     let trim2_edge = model.edges.add(trim2);
 
     // Cap edge at V0: v_t2_start → v_t1_start.
@@ -1288,12 +1314,16 @@ fn create_straight_edge(
     );
     let curve_id = model.curves.add(Box::new(line));
 
-    let edge = Edge::new_auto_range(
+    // F7-α: cap/connector edges thread the kernel default tolerance
+    // explicitly. Value matches the historical 1e-6 — no semantic
+    // change for any existing chamfer test.
+    let edge = Edge::new_with_tolerance_auto_range(
         0, // Will be assigned by store
         start,
         end,
         curve_id,
         EdgeOrientation::Forward,
+        crate::math::Tolerance::default().distance(),
     );
     let edge_id = model.edges.add(edge);
 
