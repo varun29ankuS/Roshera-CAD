@@ -55,6 +55,25 @@ use crate::primitives::{
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
+/// Pipeline-stage tracing, gated on the `ROSHERA_BOOL_TRACE`
+/// environment variable. When set (to any value), the boolean
+/// operation emits structured `eprintln!` lines after each pipeline
+/// stage so diagnostic tests can pinpoint the first stage at which
+/// expected fragments collapse. Used by Task #36 Slice 4 to diagnose
+/// the coplanar-bottom mass-drop in polyline_*_cut_box_* tests.
+fn pipeline_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROSHERA_BOOL_TRACE").is_ok())
+}
+
+/// Emit a pipeline-stage trace line. No-op when tracing is disabled.
+/// Format: `[bool] stage=<name> <key>=<value> …`.
+fn pipeline_trace(args: std::fmt::Arguments<'_>) {
+    if pipeline_trace_enabled() {
+        eprintln!("[bool] {}", args);
+    }
+}
+
 /// Type of Boolean operation
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BooleanOp {
@@ -272,16 +291,71 @@ pub fn boolean_operation(
     // degeneracy. The snapshot ensures the input solids are intact
     // on failure.
     lifecycle::with_rollback(model, move |model| {
+        pipeline_trace(format_args!(
+            "stage=entry op={:?} solid_a={} solid_b={}",
+            operation, solid_a, solid_b,
+        ));
+
         // Step 1: Compute face-face intersections
         let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
+        pipeline_trace(format_args!(
+            "stage=compute_face_intersections intersections={} curves_total={} coplanar_curves_a={} coplanar_curves_b={}",
+            intersections.len(),
+            intersections.iter().map(|i| i.curves.len()).sum::<usize>(),
+            intersections.iter().map(|i| i.coplanar_curves_a.len()).sum::<usize>(),
+            intersections.iter().map(|i| i.coplanar_curves_b.len()).sum::<usize>(),
+        ));
+        if pipeline_trace_enabled() {
+            for fi in &intersections {
+                eprintln!(
+                    "  pair face_a={} face_b={} curves={} cop_a={} cop_b={}",
+                    fi.face_a_id, fi.face_b_id, fi.curves.len(),
+                    fi.coplanar_curves_a.len(), fi.coplanar_curves_b.len(),
+                );
+            }
+        }
 
         // Step 2: Split faces along intersection curves
         let split_faces =
             split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
+        pipeline_trace(format_args!(
+            "stage=split_faces_along_curves fragments={}",
+            split_faces.len(),
+        ));
+        if pipeline_trace_enabled() {
+            let mut per_origin: HashMap<(FaceId, SolidId), usize> = HashMap::new();
+            for f in &split_faces {
+                *per_origin.entry((f.original_face, f.from_solid)).or_insert(0) += 1;
+            }
+            let mut keys: Vec<_> = per_origin.keys().copied().collect();
+            keys.sort();
+            for (origin, solid) in keys {
+                eprintln!(
+                    "  origin face={} solid={} fragments={}",
+                    origin, solid, per_origin[&(origin, solid)],
+                );
+            }
+        }
 
         // Step 3: Classify split faces (inside/outside/on boundary)
         let classified_faces =
             classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
+        pipeline_trace(format_args!(
+            "stage=classify_split_faces fragments={} inside={} outside={} on_boundary={}",
+            classified_faces.len(),
+            classified_faces.iter().filter(|f| matches!(f.classification, FaceClassification::Inside)).count(),
+            classified_faces.iter().filter(|f| matches!(f.classification, FaceClassification::Outside)).count(),
+            classified_faces.iter().filter(|f| matches!(f.classification, FaceClassification::OnBoundary)).count(),
+        ));
+        if pipeline_trace_enabled() {
+            for f in &classified_faces {
+                eprintln!(
+                    "  fragment origin={} solid={} edges={} class={:?} inner_loops={}",
+                    f.original_face, f.from_solid, f.boundary_edges.len(),
+                    f.classification, f.inner_loops.len(),
+                );
+            }
+        }
 
         // Step 3.5: Merge same-origin fragments into face-with-hole hints
         // (Task #36 Slice 2). Detects UV-containment between sibling
@@ -300,13 +374,38 @@ pub fn boolean_operation(
             solid_b,
             &options.common.tolerance,
         );
+        pipeline_trace(format_args!(
+            "stage=merge_same_origin_fragments fragments={} with_inner_loops={} inner_loop_total={}",
+            merged_faces.len(),
+            merged_faces.iter().filter(|f| !f.inner_loops.is_empty()).count(),
+            merged_faces.iter().map(|f| f.inner_loops.len()).sum::<usize>(),
+        ));
 
         // Step 4: Select faces based on boolean operation
         let selected_faces =
             select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
+        pipeline_trace(format_args!(
+            "stage=select_faces_for_operation fragments={} with_inner_loops={} inner_loop_total={}",
+            selected_faces.len(),
+            selected_faces.iter().filter(|f| !f.inner_loops.is_empty()).count(),
+            selected_faces.iter().map(|f| f.inner_loops.len()).sum::<usize>(),
+        ));
+        if pipeline_trace_enabled() {
+            for f in &selected_faces {
+                eprintln!(
+                    "  selected origin={} solid={} edges={} class={:?} inner_loops={}",
+                    f.original_face, f.from_solid, f.boundary_edges.len(),
+                    f.classification, f.inner_loops.len(),
+                );
+            }
+        }
 
         // Step 5: Reconstruct topology from selected faces
         let result_solid = reconstruct_topology(model, selected_faces, &options)?;
+        pipeline_trace(format_args!(
+            "stage=reconstruct_topology result_solid={}",
+            result_solid,
+        ));
 
         // Record the successful operation for attached recorders.
         let op_kind = match operation {
