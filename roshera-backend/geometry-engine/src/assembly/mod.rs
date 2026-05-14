@@ -480,6 +480,104 @@ impl Assembly {
         self.components.get(&id).map(|c| c.clone())
     }
 
+    /// Snapshot a mate constraint by ID.
+    pub fn get_mate(&self, id: MateId) -> Option<MateConstraint> {
+        self.mates.get(&id).map(|m| m.clone())
+    }
+
+    /// Register a named local-frame reference on a component. Returns
+    /// `ComponentNotFound` if the component is unknown. Triggers a
+    /// resolve afterwards so any pre-existing mate that referenced this
+    /// name (previously stuck on `mate.error = "not registered"`)
+    /// becomes solvable.
+    pub fn register_mate_reference(
+        &mut self,
+        component: ComponentId,
+        name: impl Into<String>,
+        reference: MateReference,
+    ) -> Result<(), AssemblyError> {
+        {
+            let mut comp = self
+                .components
+                .get_mut(&component)
+                .ok_or(AssemblyError::ComponentNotFound(component))?;
+            comp.mate_references.insert(name.into(), reference);
+        }
+        self.solve_constraints()
+    }
+
+    /// Toggle a mate's suppressed flag. Suppressed mates are skipped by
+    /// the solver but remain in storage so the caller can re-enable
+    /// them. Triggers a re-solve so transforms reflect the new active
+    /// constraint set.
+    pub fn set_mate_suppressed(
+        &mut self,
+        id: MateId,
+        suppressed: bool,
+    ) -> Result<(), AssemblyError> {
+        {
+            let mut m = self
+                .mates
+                .get_mut(&id)
+                .ok_or(AssemblyError::ReferenceNotFound(format!("{:?}", id)))?;
+            m.suppressed = suppressed;
+        }
+        self.solve_constraints()
+    }
+
+    /// Flip a mate's `flip` flag (the direction-inversion convention
+    /// applied by the solver for direction-based constraints).
+    pub fn set_mate_flip(&mut self, id: MateId, flip: bool) -> Result<(), AssemblyError> {
+        {
+            let mut m = self
+                .mates
+                .get_mut(&id)
+                .ok_or(AssemblyError::ReferenceNotFound(format!("{:?}", id)))?;
+            m.flip = flip;
+        }
+        self.solve_constraints()
+    }
+
+    /// Remove a mate constraint by ID. Returns `ReferenceNotFound` if
+    /// the mate is unknown. Also drops any persistent gear-neutral
+    /// transforms so a future Gear mate with the same ID would
+    /// re-capture its neutral pose.
+    pub fn remove_mate(&mut self, id: MateId) -> Result<(), AssemblyError> {
+        if self.mates.remove(&id).is_none() {
+            return Err(AssemblyError::ReferenceNotFound(format!("{:?}", id)));
+        }
+        // Gear neutrals are keyed by MateId; drop them too. Non-Gear
+        // mates simply have no entry, so this is a no-op for them.
+        self.gear_neutrals.remove(&id);
+        self.solve_constraints()
+    }
+
+    /// Remove a component by ID. Returns `ComponentNotFound` if the
+    /// component is unknown. Any mates referencing the removed
+    /// component are dropped (they would otherwise dangle).
+    pub fn remove_component(&mut self, id: ComponentId) -> Result<(), AssemblyError> {
+        if self.components.remove(&id).is_none() {
+            return Err(AssemblyError::ComponentNotFound(id));
+        }
+        self.tree.remove(&id);
+        if self.root_component == Some(id) {
+            self.root_component = None;
+        }
+        // Drop dangling mates whose either endpoint was the removed
+        // component, plus their gear-neutral entries.
+        let stale: Vec<MateId> = self
+            .mates
+            .iter()
+            .filter(|m| m.component1 == id || m.component2 == id)
+            .map(|m| m.id)
+            .collect();
+        for mate_id in stale {
+            self.mates.remove(&mate_id);
+            self.gear_neutrals.remove(&mate_id);
+        }
+        self.solve_constraints()
+    }
+
     /// Set component transform
     pub fn set_component_transform(
         &mut self,
@@ -3419,5 +3517,297 @@ mod tests {
         }
         let stored = a.mates.get(&id).expect("mate");
         assert!(stored.flip);
+    }
+
+    // ---------- Slice A.2 kernel additions: get_mate, register_mate_reference,
+    // set_mate_suppressed/_flip, remove_mate, remove_component ----------
+
+    #[test]
+    fn get_mate_returns_clone() {
+        let mut a = Assembly::new("get_mate");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let id = a
+            .add_mate(MateType::Coincident, c1, "r1", c2, "r2")
+            .expect("ok");
+        let m = a.get_mate(id).expect("present");
+        assert_eq!(m.id, id);
+        assert_eq!(m.mate_type, MateType::Coincident);
+    }
+
+    #[test]
+    fn get_mate_none_for_unknown_id() {
+        let a = Assembly::new("get_mate_none");
+        assert!(a.get_mate(MateId::new()).is_none());
+    }
+
+    #[test]
+    fn register_mate_reference_rejects_unknown_component() {
+        let mut a = Assembly::new("reg_ref_err");
+        let bogus = ComponentId::new();
+        let err = a
+            .register_mate_reference(
+                bogus,
+                "x",
+                MateReference::Point {
+                    position: Point3::new(0.0, 0.0, 0.0),
+                },
+            )
+            .expect_err("must error");
+        assert!(matches!(err, AssemblyError::ComponentNotFound(_)));
+    }
+
+    #[test]
+    fn register_mate_reference_unblocks_previously_stuck_mate() {
+        // A mate registered before its references were known is stored
+        // with `error = "not registered"`. Once the reference appears,
+        // the next solve must clear the error and mark the mate solved.
+        let mut a = Assembly::new("late_ref");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let mate_id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("accepted");
+        assert!(!a.get_mate(mate_id).unwrap().solved);
+
+        a.register_mate_reference(
+            c1,
+            "p1",
+            MateReference::Plane {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                normal: Vector3::new(0.0, 0.0, 1.0),
+            },
+        )
+        .expect("ok");
+        a.register_mate_reference(
+            c2,
+            "p2",
+            MateReference::Plane {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                normal: Vector3::new(0.0, 0.0, -1.0),
+            },
+        )
+        .expect("ok");
+
+        let m = a.get_mate(mate_id).expect("present");
+        assert!(m.solved, "after registering both refs, mate must solve");
+        assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn set_mate_suppressed_toggles_and_resolves() {
+        let mut a = Assembly::new("suppress_api");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        {
+            let mut c = a.components.get_mut(&c2).unwrap();
+            c.transform = Matrix4::from_translation(&Vector3::new(0.0, 0.0, 7.0));
+        }
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, -1.0),
+        );
+        let id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("ok");
+
+        // After add_mate the solver already drove c2 onto z=0. Re-seed
+        // off-plane and suppress — the next solve must leave c2 alone.
+        {
+            let mut c = a.components.get_mut(&c2).unwrap();
+            c.transform = Matrix4::from_translation(&Vector3::new(0.0, 0.0, 7.0));
+        }
+        a.set_mate_suppressed(id, true).expect("ok");
+        let z_after = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .translation_vector()
+            .z;
+        assert!(
+            (z_after - 7.0).abs() < 1e-6,
+            "suppressed mate must not pull c2 back to z=0"
+        );
+
+        // Un-suppress and re-solve — must pull back to z=0.
+        a.set_mate_suppressed(id, false).expect("ok");
+        let z_final = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .translation_vector()
+            .z;
+        assert!(z_final.abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_mate_suppressed_errors_on_unknown_id() {
+        let mut a = Assembly::new("suppress_err");
+        let err = a
+            .set_mate_suppressed(MateId::new(), true)
+            .expect_err("must error");
+        assert!(matches!(err, AssemblyError::ReferenceNotFound(_)));
+    }
+
+    #[test]
+    fn set_mate_flip_persists_and_resolves() {
+        let mut a = Assembly::new("flip_api");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        let id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("ok");
+        a.set_mate_flip(id, true).expect("ok");
+        assert!(a.get_mate(id).unwrap().flip);
+    }
+
+    #[test]
+    fn set_mate_flip_errors_on_unknown_id() {
+        let mut a = Assembly::new("flip_err");
+        let err = a
+            .set_mate_flip(MateId::new(), true)
+            .expect_err("must error");
+        assert!(matches!(err, AssemblyError::ReferenceNotFound(_)));
+    }
+
+    #[test]
+    fn remove_mate_drops_constraint_and_gear_neutral() {
+        let mut a = Assembly::new("remove_mate");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        let id = a
+            .add_mate(MateType::Gear { ratio: 2.0 }, c1, "a1", c2, "a2")
+            .expect("ok");
+        assert_eq!(a.gear_neutrals.len(), 1);
+
+        a.remove_mate(id).expect("ok");
+        assert!(a.get_mate(id).is_none());
+        assert!(a.gear_neutrals.is_empty(), "gear neutral must be evicted");
+    }
+
+    #[test]
+    fn remove_mate_errors_on_unknown_id() {
+        let mut a = Assembly::new("remove_mate_err");
+        let err = a.remove_mate(MateId::new()).expect_err("must error");
+        assert!(matches!(err, AssemblyError::ReferenceNotFound(_)));
+    }
+
+    #[test]
+    fn remove_mate_lets_solver_release_constraint() {
+        // Removed Coincident mate must stop forcing comp2 onto z=0.
+        let mut a = Assembly::new("remove_release");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, -1.0),
+        );
+        let id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("ok");
+        a.remove_mate(id).expect("ok");
+        // Off-plane move now stays put.
+        {
+            let mut c = a.components.get_mut(&c2).unwrap();
+            c.transform = Matrix4::from_translation(&Vector3::new(0.0, 0.0, 3.0));
+        }
+        a.solve_constraints().expect("ok");
+        let z = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .translation_vector()
+            .z;
+        assert!((z - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remove_component_drops_dangling_mates() {
+        let mut a = Assembly::new("remove_comp");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let c3 = a.add_part(Arc::new(BRepModel::new()), "p3");
+        let m12 = a
+            .add_mate(MateType::Coincident, c1, "r1", c2, "r2")
+            .expect("ok");
+        let m13 = a
+            .add_mate(MateType::Coincident, c1, "r1", c3, "r3")
+            .expect("ok");
+        let m23 = a
+            .add_mate(MateType::Coincident, c2, "r2", c3, "r3")
+            .expect("ok");
+
+        a.remove_component(c2).expect("ok");
+        assert!(a.get_component(c2).is_none());
+        // Mates touching c2 dropped, mate c1↔c3 retained.
+        assert!(a.get_mate(m12).is_none());
+        assert!(a.get_mate(m23).is_none());
+        assert!(a.get_mate(m13).is_some());
+    }
+
+    #[test]
+    fn remove_component_errors_on_unknown_id() {
+        let mut a = Assembly::new("remove_comp_err");
+        let err = a
+            .remove_component(ComponentId::new())
+            .expect_err("must error");
+        assert!(matches!(err, AssemblyError::ComponentNotFound(_)));
+    }
+
+    #[test]
+    fn remove_component_clears_root_when_root_removed() {
+        let mut a = Assembly::new("remove_root");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let _c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        a.remove_component(c1).expect("ok");
+        assert!(a.root_component.is_none());
     }
 }
