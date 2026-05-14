@@ -243,8 +243,87 @@ pub struct RenamePartRequest {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn not_found(id: Uuid) -> ApiError {
-    ApiError::new(ErrorCode::SolidNotFound, format!("part {} not found", id))
-        .with_hint("Create one via POST /api/parts first.")
+    ApiError::part_not_found(id)
+}
+
+// ── Active-part routing ─────────────────────────────────────────────
+
+/// Request header used by clients to scope a kernel call to one
+/// open part. Clients SHOULD send it on every call that touches
+/// geometry; absence falls back to `AppState.model` (the legacy
+/// single-document model) for backward compatibility with the
+/// pre-multi-tab handlers that have not yet been migrated.
+pub const PART_ID_HEADER: &str = "X-Roshera-Part-Id";
+
+/// Resolved BRepModel handle for the current request.
+///
+/// Construct this with the [`axum::extract::FromRequestParts`] impl
+/// — handlers that want part-aware routing add an `ActiveModel`
+/// parameter and the framework wires the lookup. The wrapped
+/// `Arc<RwLock<BRepModel>>` is whatever the caller asked for via
+/// the `X-Roshera-Part-Id` header, with a fallback to the legacy
+/// `AppState.model` when the header is absent so handlers that
+/// haven't been migrated yet keep working.
+#[derive(Clone)]
+pub struct ActiveModel(pub Arc<RwLock<BRepModel>>);
+
+/// Pure routing function — given the legacy fallback model, the
+/// part registry, and an optional header value, decide which model
+/// the caller should use.
+///
+/// Split out from the [`FromRequestParts`] impl so the routing
+/// rules can be unit-tested without spinning up a `Router` or
+/// constructing a full `AppState`. The extractor is a thin shim
+/// that parses the header and delegates here.
+pub fn resolve_active_model(
+    legacy: &Arc<RwLock<BRepModel>>,
+    parts: &PartManager,
+    header: Option<&str>,
+) -> Result<Arc<RwLock<BRepModel>>, ApiError> {
+    match header {
+        // No header → legacy single-document path. The frontend
+        // tab UI sends the header on every request; older clients
+        // (and the AI agent CLI today) don't, so we keep this
+        // path live until every handler is part-aware.
+        None => Ok(Arc::clone(legacy)),
+        Some(s) => {
+            let id = Uuid::parse_str(s).map_err(|_| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("invalid {PART_ID_HEADER} header: not a UUID"),
+                )
+                .with_hint(
+                    "Send the UUID returned from POST /api/parts in the \
+                     X-Roshera-Part-Id header, or omit the header to use \
+                     the default document.",
+                )
+            })?;
+            parts.get(&id).ok_or_else(|| not_found(id))
+        }
+    }
+}
+
+impl axum::extract::FromRequestParts<AppState> for ActiveModel {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // `HeaderValue::to_str` rejects non-ASCII bytes — surface
+        // that as InvalidParameter rather than letting a kernel
+        // call inherit a half-decoded id.
+        let header_value: Option<&str> = match parts.headers.get(PART_ID_HEADER) {
+            None => None,
+            Some(v) => Some(v.to_str().map_err(|_| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("invalid {PART_ID_HEADER} header: non-ASCII bytes"),
+                )
+            })?),
+        };
+        resolve_active_model(&state.model, &state.parts, header_value).map(ActiveModel)
+    }
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -583,5 +662,100 @@ mod tests {
         mgr.record_event(RecordedOperation::new("part.create"));
         // Reached here ⇒ no panic.
         assert_eq!(mgr.len(), 0);
+    }
+
+    // ── resolve_active_model ────────────────────────────────────
+
+    fn fresh_legacy() -> Arc<RwLock<BRepModel>> {
+        Arc::new(RwLock::new(BRepModel::new()))
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_legacy_when_header_absent() {
+        // No X-Roshera-Part-Id ⇒ caller is on the pre-multi-tab
+        // surface and must reach the legacy AppState.model.
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let resolved = resolve_active_model(&legacy, &mgr, None)
+            .expect("absent header must fall back to legacy model");
+        assert!(Arc::ptr_eq(&legacy, &resolved));
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_part_model_when_header_matches() {
+        // Header carries a real part id ⇒ caller gets THAT model,
+        // not the legacy one.
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let id = mgr.create("Routed").await;
+        let header = id.to_string();
+        let resolved = resolve_active_model(&legacy, &mgr, Some(&header))
+            .expect("known id must resolve");
+        let expected = mgr.get(&id).expect("part missing after create");
+        assert!(Arc::ptr_eq(&expected, &resolved));
+        // And it must NOT be the legacy model.
+        assert!(!Arc::ptr_eq(&legacy, &resolved));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_non_uuid_header() {
+        // Garbage in the header ⇒ InvalidParameter (400). The
+        // kernel must never see a half-decoded id.
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let err = resolve_active_model(&legacy, &mgr, Some("not-a-uuid"))
+            .expect_err("non-UUID must reject");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_unknown_part_id() {
+        // Well-formed UUID that isn't registered ⇒ PartNotFound
+        // (404). Frontend uses this to drop a stale tab.
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let phantom = Uuid::new_v4().to_string();
+        let err = resolve_active_model(&legacy, &mgr, Some(&phantom))
+            .expect_err("unknown id must reject");
+        assert_eq!(err.code, ErrorCode::PartNotFound);
+    }
+
+    #[tokio::test]
+    async fn resolve_after_delete_rejects_with_part_not_found() {
+        // The lookup must reflect deletes — a tab id that was just
+        // closed elsewhere should be reported as missing on the
+        // next request, not silently re-route to the legacy model.
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let id = mgr.create("Doomed").await;
+        let header = id.to_string();
+        mgr.delete(&id);
+        let err = resolve_active_model(&legacy, &mgr, Some(&header))
+            .expect_err("deleted id must reject");
+        assert_eq!(err.code, ErrorCode::PartNotFound);
+    }
+
+    #[tokio::test]
+    async fn resolve_with_two_parts_picks_the_requested_one() {
+        // Pin the dispatch: with two parts in the registry, asking
+        // for B must return B (and not A by index accident).
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let a = mgr.create("A").await;
+        let b = mgr.create("B").await;
+        let resolved_a = resolve_active_model(&legacy, &mgr, Some(&a.to_string()))
+            .expect("id a must resolve");
+        let resolved_b = resolve_active_model(&legacy, &mgr, Some(&b.to_string()))
+            .expect("id b must resolve");
+        assert!(Arc::ptr_eq(&mgr.get(&a).expect("a"), &resolved_a));
+        assert!(Arc::ptr_eq(&mgr.get(&b).expect("b"), &resolved_b));
+        assert!(!Arc::ptr_eq(&resolved_a, &resolved_b));
+    }
+
+    #[test]
+    fn part_id_header_constant_is_documented_string() {
+        // The constant is part of the public wire contract — pin
+        // it so a typo refactor can't silently break clients.
+        assert_eq!(PART_ID_HEADER, "X-Roshera-Part-Id");
     }
 }
