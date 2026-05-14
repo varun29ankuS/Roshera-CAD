@@ -5134,7 +5134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         permission_manager,
         cache_manager,
         timeline,
-        timeline_recorder,
+        timeline_recorder: timeline_recorder.clone(),
         branch_manager,
         hierarchy_manager,
         database,
@@ -5146,7 +5146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transactions: Arc::new(transactions::TransactionManager::new()),
         sketches: Arc::new(sketch::SketchManager::new()),
         csketches: Arc::new(csketch::CSketchManager::new()),
-        assemblies: Arc::new(assembly_mgr::AssemblyManager::new()),
+        // Share the same `TimelineRecorder` that's already attached
+        // to the BRepModel — assembly events land on the active
+        // branch via the same sync→async bridge, no duplicate
+        // recorder needed. See assembly_mgr::AssemblyManager docs.
+        assemblies: Arc::new(assembly_mgr::AssemblyManager::with_recorder(
+            timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+        )),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside

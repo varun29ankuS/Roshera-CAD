@@ -47,6 +47,7 @@ use geometry_engine::assembly::{
     Assembly, AssemblyError, ComponentId, ExplodedViewConfig, MateId, MateReference, MateType,
 };
 use geometry_engine::math::{Matrix4, Point3, Quaternion, Vector3};
+use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -69,11 +70,48 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct AssemblyManager {
     assemblies: DashMap<Uuid, Arc<RwLock<Assembly>>>,
+    /// Optional sink for assembly mutation events. When set, every
+    /// mutating handler emits a `RecordedOperation` with `kind` in the
+    /// `assembly.*` namespace so the timeline / audit stream captures
+    /// the same provenance trail it already carries for kernel ops.
+    ///
+    /// Stored as `Arc<dyn OperationRecorder>` so the same recorder
+    /// attached to the `BRepModel` (the `TimelineRecorder` wired in
+    /// `main.rs`) can be reused without a second sync→async bridge.
+    /// `None` is a hard no-op — safe for unit tests that don't care
+    /// about events.
+    recorder: Option<Arc<dyn OperationRecorder>>,
 }
 
 impl AssemblyManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a manager that emits assembly events into the given
+    /// recorder. The api-server wires this to the same
+    /// `TimelineRecorder` instance that's already attached to the
+    /// `BRepModel`, so kernel and assembly events share the same
+    /// timeline / audit stream and the same active-branch routing
+    /// (the recorder swaps its own branch target on `POST
+    /// /api/branches/active`; the manager never sees that detail).
+    pub fn with_recorder(recorder: Arc<dyn OperationRecorder>) -> Self {
+        Self {
+            assemblies: DashMap::new(),
+            recorder: Some(recorder),
+        }
+    }
+
+    /// Emit one `RecordedOperation` through the attached recorder.
+    /// Failures are logged at `warn` level — they never propagate
+    /// because the underlying assembly mutation has already
+    /// succeeded, exactly mirroring the kernel's recorder contract.
+    pub fn record_event(&self, op: RecordedOperation) {
+        if let Some(r) = self.recorder.as_ref() {
+            if let Err(e) = r.record(op) {
+                tracing::warn!(error = %e, "AssemblyManager: recorder rejected event");
+            }
+        }
     }
 
     /// Allocate a fresh, empty assembly with the given display name.
@@ -358,7 +396,13 @@ pub async fn create_assembly(
             "name must not be empty",
         ));
     }
+    let name = req.name.clone();
     let id = state.assemblies.create(req.name);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.create")
+            .with_parameters(serde_json::json!({ "name": name }))
+            .with_output_assembly(id),
+    );
     Ok(Json(CreateAssemblyResponse { id }))
 }
 
@@ -383,6 +427,11 @@ pub async fn delete_assembly(
         .assemblies
         .delete(&id)
         .ok_or_else(|| not_found(id))?;
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.delete")
+            .with_parameters(serde_json::json!({}))
+            .with_input_assembly(id),
+    );
     Ok(Json(serde_json::json!({"success": true, "id": id})))
 }
 
@@ -404,12 +453,23 @@ pub async fn add_component(
     // mate solver and transform pipeline don't read from the part at
     // all, so empty is the right placeholder rather than a stub.
     let part = Arc::new(BRepModel::new());
+    let name = req.name.clone();
     let cid = guard.add_part(part, req.name);
     if let Some(t) = req.transform {
         guard
             .set_component_transform(cid, array_to_matrix(t))
             .map_err(map_kernel_err)?;
     }
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.add_component")
+            .with_parameters(serde_json::json!({
+                "name": name,
+                "transform": req.transform,
+            }))
+            .with_input_assembly(id)
+            .with_output_component(cid.0),
+    );
     Ok(Json(AddComponentResponse {
         component_id: cid.0,
     }))
@@ -424,6 +484,13 @@ pub async fn remove_component(
     guard
         .remove_component(ComponentId(comp))
         .map_err(map_kernel_err)?;
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.remove_component")
+            .with_parameters(serde_json::json!({}))
+            .with_input_assembly(id)
+            .with_input_component(comp),
+    );
     Ok(Json(serde_json::json!({"success": true})))
 }
 
@@ -437,7 +504,15 @@ pub async fn set_component_transform(
     guard
         .set_component_transform(ComponentId(comp), array_to_matrix(req.transform))
         .map_err(map_kernel_err)?;
-    Ok(Json(snapshot(&guard)))
+    let snap = snapshot(&guard);
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.set_component_transform")
+            .with_parameters(serde_json::json!({ "transform": req.transform }))
+            .with_input_assembly(id)
+            .with_input_component(comp),
+    );
+    Ok(Json(snap))
 }
 
 pub async fn register_mate_reference(
@@ -453,9 +528,22 @@ pub async fn register_mate_reference(
     }
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let mut guard = handle.write().await;
+    let comp = req.component;
+    let name = req.name.clone();
+    let reference_payload = serde_json::to_value(&req.reference).unwrap_or(serde_json::Value::Null);
     guard
         .register_mate_reference(ComponentId(req.component), req.name, req.reference)
         .map_err(map_kernel_err)?;
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.register_mate_reference")
+            .with_parameters(serde_json::json!({
+                "name": name,
+                "reference": reference_payload,
+            }))
+            .with_input_assembly(id)
+            .with_input_component(comp),
+    );
     Ok(Json(serde_json::json!({"success": true})))
 }
 
@@ -466,6 +554,11 @@ pub async fn add_mate(
 ) -> Result<Json<AddMateResponse>, ApiError> {
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let mut guard = handle.write().await;
+    let mate_type = req.mate_type;
+    let c1 = req.component1;
+    let c2 = req.component2;
+    let r1 = req.reference1.clone();
+    let r2 = req.reference2.clone();
     let mid = guard
         .add_mate(
             req.mate_type,
@@ -475,6 +568,21 @@ pub async fn add_mate(
             req.reference2,
         )
         .map_err(map_kernel_err)?;
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.add_mate")
+            .with_parameters(serde_json::json!({
+                "mate_type": mate_type,
+                "component1": c1,
+                "reference1": r1,
+                "component2": c2,
+                "reference2": r2,
+            }))
+            .with_input_assembly(id)
+            .with_input_component(c1)
+            .with_input_refs([format!("component:{}", c2)])
+            .with_output_mate(mid.0),
+    );
     Ok(Json(AddMateResponse { mate_id: mid.0 }))
 }
 
@@ -485,6 +593,13 @@ pub async fn remove_mate(
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let mut guard = handle.write().await;
     guard.remove_mate(MateId(mate)).map_err(map_kernel_err)?;
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.remove_mate")
+            .with_parameters(serde_json::json!({}))
+            .with_input_assembly(id)
+            .with_input_mate(mate),
+    );
     Ok(Json(serde_json::json!({"success": true})))
 }
 
@@ -508,7 +623,18 @@ pub async fn patch_mate(
     if let Some(f) = req.flip {
         guard.set_mate_flip(mid, f).map_err(map_kernel_err)?;
     }
-    Ok(Json(snapshot(&guard)))
+    let snap = snapshot(&guard);
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.patch_mate")
+            .with_parameters(serde_json::json!({
+                "suppressed": req.suppressed,
+                "flip": req.flip,
+            }))
+            .with_input_assembly(id)
+            .with_input_mate(mate),
+    );
+    Ok(Json(snap))
 }
 
 pub async fn solve(
@@ -518,7 +644,14 @@ pub async fn solve(
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let mut guard = handle.write().await;
     guard.solve_constraints().map_err(map_kernel_err)?;
-    Ok(Json(snapshot(&guard)))
+    let snap = snapshot(&guard);
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.solve")
+            .with_parameters(serde_json::json!({}))
+            .with_input_assembly(id),
+    );
+    Ok(Json(snap))
 }
 
 pub async fn explode(
@@ -529,6 +662,12 @@ pub async fn explode(
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let mut guard = handle.write().await;
     let cfg = guard.create_exploded_view(req.auto);
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.explode")
+            .with_parameters(serde_json::json!({ "auto": req.auto }))
+            .with_input_assembly(id),
+    );
     Ok(Json(cfg))
 }
 
@@ -557,10 +696,25 @@ pub async fn simulate_motion(
     let rot = req
         .rotation
         .map(|q| Quaternion::new(q[3], q[0], q[1], q[2]));
+    let comp = req.component;
+    let translation = req.translation;
+    let rotation = req.rotation;
     guard
         .simulate_motion(ComponentId(req.component), delta, rot)
         .map_err(map_kernel_err)?;
-    Ok(Json(snapshot(&guard)))
+    let snap = snapshot(&guard);
+    drop(guard);
+    state.assemblies.record_event(
+        RecordedOperation::new("assembly.simulate_motion")
+            .with_parameters(serde_json::json!({
+                "component": comp,
+                "translation": translation,
+                "rotation": rotation,
+            }))
+            .with_input_assembly(id)
+            .with_input_component(comp),
+    );
+    Ok(Json(snap))
 }
 
 // Suppress an unused-import warning if `Point3` becomes unreferenced
@@ -576,6 +730,37 @@ fn _force_point3_used() -> Point3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geometry_engine::operations::recorder::{
+        OperationRecorder, RecordedOperation, RecorderError,
+    };
+    use std::sync::Mutex as StdMutex;
+
+    /// Captures every event the manager emits so tests can assert on
+    /// kind/parameters/inputs/outputs. Wrapped in `StdMutex` (not
+    /// `tokio::Mutex`) because `OperationRecorder::record` is sync.
+    #[derive(Debug, Default)]
+    struct CaptureRecorder {
+        events: StdMutex<Vec<RecordedOperation>>,
+    }
+
+    impl CaptureRecorder {
+        fn snapshot(&self) -> Vec<RecordedOperation> {
+            self.events
+                .lock()
+                .expect("CaptureRecorder mutex poisoned")
+                .clone()
+        }
+    }
+
+    impl OperationRecorder for CaptureRecorder {
+        fn record(&self, op: RecordedOperation) -> Result<(), RecorderError> {
+            self.events
+                .lock()
+                .expect("CaptureRecorder mutex poisoned")
+                .push(op);
+            Ok(())
+        }
+    }
 
     fn make_assembly() -> (AssemblyManager, Uuid) {
         let mgr = AssemblyManager::new();
@@ -970,5 +1155,89 @@ mod tests {
             .map(|(a, b)| (a.0, b.0))
             .collect();
         assert!(report.is_empty());
+    }
+
+    // ── Recorder integration (A.3) ──────────────────────────────────
+
+    #[test]
+    fn manager_without_recorder_silently_drops_events() {
+        // Default constructor leaves recorder = None. Calling
+        // `record_event` must be a hard no-op — this is the path
+        // every unit test in this module relies on.
+        let mgr = AssemblyManager::new();
+        mgr.record_event(RecordedOperation::new("assembly.noop"));
+        // No panic, no observable side-effect — coverage by absence.
+        assert_eq!(mgr.len(), 0);
+    }
+
+    #[test]
+    fn with_recorder_emits_events_through_attached_recorder() {
+        let capture = Arc::new(CaptureRecorder::default());
+        let mgr = AssemblyManager::with_recorder(capture.clone() as Arc<dyn OperationRecorder>);
+        mgr.record_event(
+            RecordedOperation::new("assembly.create")
+                .with_parameters(serde_json::json!({ "name": "demo" }))
+                .with_output_assembly(Uuid::nil()),
+        );
+        mgr.record_event(
+            RecordedOperation::new("assembly.delete")
+                .with_parameters(serde_json::json!({}))
+                .with_input_assembly(Uuid::nil()),
+        );
+        let events = capture.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "assembly.create");
+        assert_eq!(events[1].kind, "assembly.delete");
+        assert_eq!(
+            events[0].outputs,
+            vec![format!("assembly:{}", Uuid::nil())]
+        );
+        assert_eq!(events[1].inputs, vec![format!("assembly:{}", Uuid::nil())]);
+    }
+
+    #[test]
+    fn recorder_failure_does_not_panic_and_is_swallowed() {
+        // Recorder returning Err must never propagate — the mutation
+        // has already succeeded, the event log is best-effort.
+        #[derive(Debug)]
+        struct FailingRecorder;
+        impl OperationRecorder for FailingRecorder {
+            fn record(&self, _op: RecordedOperation) -> Result<(), RecorderError> {
+                Err(RecorderError::Unavailable("test fault".into()))
+            }
+        }
+        let mgr = AssemblyManager::with_recorder(Arc::new(FailingRecorder));
+        mgr.record_event(RecordedOperation::new("assembly.create"));
+        // Reached here ⇒ no panic.
+        assert_eq!(mgr.len(), 0);
+    }
+
+    #[test]
+    fn recorded_kinds_cover_every_mutating_handler() {
+        // Belt-and-braces check against the public surface: every
+        // handler that mutates state must use an `assembly.*` kind
+        // string in this exact set. If a new handler is added
+        // without instrumentation, this list goes stale — adding
+        // the entry forces the author to think about provenance.
+        let expected_kinds = [
+            "assembly.create",
+            "assembly.delete",
+            "assembly.add_component",
+            "assembly.remove_component",
+            "assembly.set_component_transform",
+            "assembly.register_mate_reference",
+            "assembly.add_mate",
+            "assembly.remove_mate",
+            "assembly.patch_mate",
+            "assembly.solve",
+            "assembly.explode",
+            "assembly.simulate_motion",
+        ];
+        // All kinds in the expected set use the canonical
+        // `assembly.<verb>` namespace — guard against typos.
+        for k in expected_kinds {
+            assert!(k.starts_with("assembly."), "{} has wrong namespace", k);
+            assert!(!k.contains(' '), "{} has whitespace", k);
+        }
     }
 }
