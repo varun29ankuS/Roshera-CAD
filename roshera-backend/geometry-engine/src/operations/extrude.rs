@@ -1245,7 +1245,17 @@ fn try_build_cylinder_from_circles(
     Cylinder::new_finite(origin, b_axis_n, b_radius, height).ok()
 }
 
-/// Create a face from a closed wire profile
+/// Create a face from a closed wire profile by re-deriving the host
+/// plane from edge samples (Newell best-fit).
+///
+/// Use this entry point only when the caller does not know the host
+/// plane up front. **Whenever the host plane is known a priori (sketch
+/// sessions, face-of-known-surface flows, datum-anchored profiles),
+/// prefer [`create_face_from_profile_with_plane`]** — it is more
+/// numerically robust because it never has to recover the plane from
+/// edge samples, which fails for degenerate / collinear / near-zero-
+/// area / heavily-skewed polygons (Newell's accumulated normal goes to
+/// `|n| < 1e-12`).
 pub fn create_face_from_profile(
     model: &mut BRepModel,
     profile_edges: Vec<EdgeId>,
@@ -1279,6 +1289,61 @@ pub fn create_face_from_profile(
     Ok(face_id)
 }
 
+/// Create a face from a closed wire profile using a **caller-supplied
+/// host plane**.
+///
+/// This is the preferred entry point whenever the host plane is known
+/// up front — sketch sessions carry a `SketchPlane`, face-of-known-
+/// surface flows carry the existing face's surface, datum-anchored
+/// profiles carry the datum frame. In all of those cases the plane
+/// must not be re-derived from edge samples: Newell best-fit can fail
+/// (degenerate / collinear / near-zero-area polygons → `|n| < 1e-12`)
+/// even when the host plane is perfectly well-defined by construction.
+///
+/// `plane_origin` and `plane_normal` are passed verbatim to
+/// `Plane::from_point_normal`. The normal need not be unit length;
+/// the constructor normalises it. The origin can be any point on the
+/// plane (it is used as the surface parameterisation origin and does
+/// not have to coincide with the polygon centroid).
+///
+/// Behaviour is otherwise identical to [`create_face_from_profile`]:
+/// the closed-profile invariant is validated, a single outer
+/// `Loop` is built from `profile_edges` in order, and a `Face` is
+/// stamped at `FaceOrientation::Forward` against the resulting plane.
+/// Inner loops are added separately by the caller via
+/// `Face::add_inner_loop` if needed.
+pub fn create_face_from_profile_with_plane(
+    model: &mut BRepModel,
+    profile_edges: Vec<EdgeId>,
+    plane_origin: Point3,
+    plane_normal: Vector3,
+) -> OperationResult<FaceId> {
+    validate_closed_profile(model, &profile_edges)?;
+
+    let mut profile_loop = Loop::new(
+        0,
+        crate::primitives::r#loop::LoopType::Outer,
+    );
+    for &edge_id in &profile_edges {
+        profile_loop.add_edge(edge_id, true);
+    }
+    let loop_id = model.loops.add(profile_loop);
+
+    use crate::primitives::surface::Plane;
+    let plane = Plane::from_point_normal(plane_origin, plane_normal).map_err(|e| {
+        OperationError::NumericalError(format!(
+            "Plane creation failed from caller-supplied origin/normal: {:?}",
+            e
+        ))
+    })?;
+    let surface_id = model.surfaces.add(Box::new(plane));
+
+    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    let face_id = model.faces.add(face);
+
+    Ok(face_id)
+}
+
 /// Create a planar surface from a set of edges
 fn create_planar_surface_from_edges(
     model: &mut BRepModel,
@@ -1304,9 +1369,23 @@ fn create_planar_surface_from_edges(
             .get(edge.curve_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
 
-        // Sample points along the edge
+        // Sample points along the edge, honouring its `param_range`.
+        //
+        // For per-edge `Line` curves (rectangle/circle tools) the range is
+        // the unit interval and this is a no-op. For the shared-`Polyline`
+        // pattern emitted by the api-server polyline tool — one Polyline
+        // curve registered once, N edges each referencing it via
+        // `param_range = [i/N, (i+1)/N]` — sampling unit-interval `t`
+        // produces the same three global polyline points for every edge,
+        // and Newell's accumulated normal collapses to zero (collinear
+        // duplicate sample set). Sliced sampling restores per-segment
+        // distinctness so the polygon is faithful and Newell's best-fit
+        // returns the correct plane normal.
+        let edge_range = edge.param_range;
+        let span = edge_range.end - edge_range.start;
         for i in 0..=2 {
-            let t = i as f64 / 2.0;
+            let local = i as f64 / 2.0;
+            let t = edge_range.start + local * span;
             let point = curve.point_at(t).map_err(|e| {
                 OperationError::NumericalError(format!("Curve evaluation failed: {:?}", e))
             })?;
@@ -1348,9 +1427,39 @@ fn create_planar_surface_from_edges(
     }
     let raw_normal = Vector3::new(nx, ny, nz);
     if raw_normal.magnitude() < 1e-12 {
-        return Err(OperationError::InvalidGeometry(
-            "Cannot fit plane: points are degenerate or collinear".to_string(),
-        ));
+        // Newell's accumulated normal collapses to zero whenever the
+        // sampled polygon is degenerate (all points collinear, points
+        // coincident under tolerance, or signed area below the cube
+        // of the noise floor). Surface diagnostic context so the
+        // caller can tell whether the input was actually flat-but-
+        // tiny, collinear, or carried a single rogue sample. If the
+        // caller already knows the host plane (sketch sessions, face-
+        // of-known-surface), it should be using
+        // `create_face_from_profile_with_plane` instead — Newell best-
+        // fit is only the right answer when the plane is unknown.
+        let bbox_min = points.iter().fold(
+            Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
+            |acc, p| Point3::new(acc.x.min(p.x), acc.y.min(p.y), acc.z.min(p.z)),
+        );
+        let bbox_max = points.iter().fold(
+            Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+            |acc, p| Point3::new(acc.x.max(p.x), acc.y.max(p.y), acc.z.max(p.z)),
+        );
+        let extent = bbox_max.distance(&bbox_min);
+        return Err(OperationError::InvalidGeometry(format!(
+            "Cannot fit plane via Newell best-fit: \
+             accumulated normal magnitude {:.3e} below 1e-12 threshold \
+             (samples: {}, bbox extent: {:.6e}, centroid: ({:.6}, {:.6}, {:.6})). \
+             Polygon is collinear, near-zero-area, or below numerical noise floor. \
+             If the host plane is known by construction, call \
+             `create_face_from_profile_with_plane` instead.",
+            raw_normal.magnitude(),
+            points.len(),
+            extent,
+            centroid.x,
+            centroid.y,
+            centroid.z,
+        )));
     }
     let origin = centroid;
     let normal = raw_normal.normalize().map_err(|e| {
@@ -1861,6 +1970,151 @@ mod tests {
         let mut model = BRepModel::new();
         let result = create_face_from_profile(&mut model, vec![]);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // create_face_from_profile_with_plane
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_face_with_supplied_plane_on_rectangle_succeeds() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 10.0, 5.0);
+        let face_id = create_face_from_profile_with_plane(
+            &mut model,
+            edges,
+            Point3::ORIGIN,
+            Vector3::Z,
+        )
+        .expect("face built with supplied plane");
+        let face = model.faces.get(face_id).expect("face stored");
+        let surface = model
+            .surfaces
+            .get(face.surface_id)
+            .expect("surface stored");
+        let plane = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Plane>()
+            .expect("planar surface");
+        // Normal must match the caller's normal direction (within sign
+        // since `from_point_normal` normalises but does not flip).
+        let dot = plane.normal.dot(&Vector3::Z);
+        assert!(
+            dot > 0.999,
+            "plane normal must align with supplied normal: dot={dot}"
+        );
+    }
+
+    #[test]
+    fn create_face_with_supplied_plane_succeeds_on_degenerate_polygon() {
+        // Build a polygon whose Newell best-fit would underflow:
+        // four points whose extent in y and z is below the noise floor
+        // (all approximately on the x-axis). The classic
+        // `create_face_from_profile` path returns
+        // `InvalidGeometry("Cannot fit plane …")`; the plane-aware
+        // path succeeds because the caller already knows the host
+        // plane is z=0.
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 1e-15, 0.0);
+        let v2 = model.vertices.add(2.0, 0.0, 0.0);
+        let v3 = model.vertices.add(1.0, -1e-15, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+            add_line_edge(&mut model, v2, v3),
+            add_line_edge(&mut model, v3, v0),
+        ];
+
+        // Sanity: Newell best-fit indeed rejects this polygon when
+        // the host plane is unknown. We don't call
+        // `create_face_from_profile` here because that would consume
+        // the edges; instead probe the helper directly.
+        let edge_ids: Vec<EdgeId> = edges.clone();
+        let newell_result = create_planar_surface_from_edges(&mut model, &edge_ids);
+        assert!(
+            newell_result.is_err(),
+            "Newell best-fit must reject this degenerate polygon \
+             (sanity for the with-plane fix)"
+        );
+
+        // With the host plane supplied, the same polygon yields a
+        // valid face.
+        let face_id = create_face_from_profile_with_plane(
+            &mut model,
+            edges,
+            Point3::ORIGIN,
+            Vector3::Z,
+        )
+        .expect("plane-aware path must accept degenerate polygons");
+        assert!(model.faces.get(face_id).is_some());
+    }
+
+    #[test]
+    fn create_face_with_supplied_plane_rejects_open_profile() {
+        let mut model = BRepModel::new();
+        let v0 = model.vertices.add(0.0, 0.0, 0.0);
+        let v1 = model.vertices.add(1.0, 0.0, 0.0);
+        let v2 = model.vertices.add(1.0, 1.0, 0.0);
+        let edges = vec![
+            add_line_edge(&mut model, v0, v1),
+            add_line_edge(&mut model, v1, v2),
+        ];
+        let result = create_face_from_profile_with_plane(
+            &mut model,
+            edges,
+            Point3::ORIGIN,
+            Vector3::Z,
+        );
+        assert!(
+            result.is_err(),
+            "open profile must still be rejected with plane supplied"
+        );
+    }
+
+    #[test]
+    fn create_face_with_supplied_plane_normalises_non_unit_normal() {
+        // The plane-aware entry must not require unit-length normal;
+        // `Plane::from_point_normal` normalises internally.
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 4.0, 3.0);
+        let face_id = create_face_from_profile_with_plane(
+            &mut model,
+            edges,
+            Point3::ORIGIN,
+            Vector3::new(0.0, 0.0, 7.5), // non-unit, still +Z
+        )
+        .expect("face built with non-unit normal");
+        let face = model.faces.get(face_id).expect("face stored");
+        let surface = model
+            .surfaces
+            .get(face.surface_id)
+            .expect("surface stored");
+        let plane = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Plane>()
+            .expect("planar surface");
+        let mag = plane.normal.magnitude();
+        assert!(
+            (mag - 1.0).abs() < 1e-9,
+            "stored plane normal must be unit length: |n|={mag}"
+        );
+    }
+
+    #[test]
+    fn create_face_with_supplied_plane_rejects_zero_normal() {
+        let mut model = BRepModel::new();
+        let edges = make_rectangle(&mut model, 4.0, 3.0);
+        let result = create_face_from_profile_with_plane(
+            &mut model,
+            edges,
+            Point3::ORIGIN,
+            Vector3::new(0.0, 0.0, 0.0),
+        );
+        assert!(
+            result.is_err(),
+            "zero-magnitude normal must surface a NumericalError"
+        );
     }
 
     // -------------------------------------------------------------------

@@ -152,15 +152,159 @@ pub fn tessellate_face(
             // (wasted triangles) depending on `max_edge_length`.
             let planar_tolerance =
                 Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
-            if surface.is_planar(planar_tolerance) {
+            let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
+            // Two-stage planarity classification:
+            //
+            // 1. **Surface-global** (`surface.is_planar`): tests the
+            //    FULL parameter bounds. Fast path that catches
+            //    genuinely-flat ruled surfaces (extruded straight
+            //    segments, prismatic sweeps with parallel rails).
+            //
+            // 2. **Face-restricted** (`is_face_uv_range_planar`):
+            //    samples normals over the face's actual UV window
+            //    `[u_min, u_max] × [v_min, v_max]` and accepts when
+            //    every normal agrees with the centre's within the
+            //    tolerance angle.
+            //
+            // The second stage exists because a single B-Rep face can
+            // cover a flat patch of an otherwise non-flat surface. The
+            // canonical case is the polyline-extruded side wall: the
+            // host `RuledSurface(Polyline, Polyline)` carries N kinks
+            // in its u-direction (one per polyline vertex), so
+            // `surface.is_planar` over u ∈ [0, 1] correctly returns
+            // false. But each side FACE is bounded to a single
+            // polyline segment (`u ∈ [i/N, (i+1)/N]`), within which
+            // the rails are colinear and the ruled patch is exactly
+            // planar. Routing that face through the curvature-adaptive
+            // quadtree (`tessellate_curved_adaptive`, MAX_DEPTH = 12)
+            // can cost up to 4^12 ≈ 16M recursive calls per face,
+            // which produces an apparent 15+ s "hang" on a polyline-
+            // extruded hex/L-shape. The face-restricted check pushes
+            // the side walls back onto `tessellate_planar_face`, which
+            // ear-clips a 4-vertex polygon in microseconds.
+            if surface.is_planar(planar_tolerance)
+                || is_face_loop_planar_in_3d(face, model, cache, planar_tolerance)
+            {
                 tessellate_planar_face(face, model, params, cache, mesh);
             } else {
-                let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
                 tessellate_curved_adaptive(
                     surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
                 );
             }
         }
+    }
+}
+
+/// 3D-loop planarity test: fit a plane to the face's boundary samples
+/// and accept when every sample lies within `tolerance.distance()` of
+/// it.
+///
+/// This bypasses surface parameter space entirely, which is critical
+/// for the canonical case this helper exists to catch — a polyline-
+/// extruded `RuledSurface(Polyline, Polyline)` whose host curve is C0
+/// at vertices between segments. Two failure modes in UV space:
+///
+/// 1. **Wraparound corner**: at the polyline's closing vertex
+///    (`u = 0 ≡ u = 1` in 3D), `closest_point` may project to either
+///    end of the parameter range nondeterministically. The face's
+///    `get_face_parameter_bounds` then reports a `u` range that spans
+///    almost the whole polyline (e.g. `[0, 0.97]`) instead of the
+///    single segment the face actually occupies (e.g. `[0.75, 1.0]`).
+///    Any UV-space planarity probe over the bogus range hits every
+///    polyline kink and rejects the face as non-planar.
+///
+/// 2. **C0 derivative discontinuity at kink**: `RuledSurface::evaluate
+///    _full` uses central-difference for du; at a polyline vertex the
+///    derivative averages the incoming and outgoing segment tangents,
+///    producing a hybrid `normal_at` that disagrees with both adjacent
+///    segments' true normals by up to 45°. UV probes sitting on the
+///    boundary trip on this.
+///
+/// The 3D-loop probe sidesteps both. It uses `cache.get_or_compute`
+/// (the same canonical edge sample cache that `tessellate_planar_face`
+/// consumes downstream), Newell's best-fit plane (the same primitive
+/// `create_planar_surface_from_edges` uses for actual face construction
+/// in `extrude.rs`), and a max-deviation check.
+///
+/// Cost is dominated by the cache fetches, which are already amortised
+/// across every face bounding each edge — at worst one curve evaluation
+/// per edge per tessellation pass, regardless of how many faces probe
+/// it.
+fn is_face_loop_planar_in_3d(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    tolerance: Tolerance,
+) -> bool {
+    // Sample the outer loop only. Inner loops (holes) cannot make a
+    // face non-planar — if the outer ring fits a plane, every hole
+    // sits inside it on the same plane by topological construction
+    // (a face has exactly one supporting surface).
+    let outer = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    let mut samples = Vec::new();
+    sample_loop_3d_polygon(outer, model, cache, &mut samples);
+    if samples.len() < 3 {
+        // Degenerate loop — let the curved path handle it (or fail
+        // downstream uniformly). Not our call to make here.
+        return false;
+    }
+
+    let n = match newell_normal(&samples) {
+        Some(v) => v,
+        None => return false,
+    };
+    let p0 = samples[0];
+    let d_plane = n.dot(&Vector3::new(p0.x, p0.y, p0.z));
+
+    let dist_tol = tolerance.distance();
+    for p in &samples {
+        let signed = n.dot(&Vector3::new(p.x, p.y, p.z)) - d_plane;
+        if signed.abs() > dist_tol {
+            return false;
+        }
+    }
+    true
+}
+
+/// Newell's best-fit-plane normal for a 3D polygon.
+///
+/// Sums signed-area projections onto the three coordinate planes
+/// (Sutherland-Hodgman-style decomposition; see Goldman, "Area of
+/// Planar Polygons and Volume of Polyhedra", Graphics Gems II 1991).
+/// The result is robust for non-convex polygons, oblique projections,
+/// and slightly non-planar samples — the dominant fitting plane
+/// "wins" because each face contributes signed area proportional to
+/// its projection onto that coordinate plane.
+///
+/// Returns `None` iff the polygon is degenerate (all samples
+/// collinear or coincident). This is the same fit
+/// `create_planar_surface_from_edges` uses in `operations/extrude.rs`,
+/// so the planar tessellator's projection normal agrees with the
+/// construction-time plane normal by construction.
+pub(crate) fn newell_normal(samples: &[Point3]) -> Option<Vector3> {
+    let n = samples.len();
+    if n < 3 {
+        return None;
+    }
+    let mut nx = 0.0_f64;
+    let mut ny = 0.0_f64;
+    let mut nz = 0.0_f64;
+    for i in 0..n {
+        let a = samples[i];
+        let b = samples[(i + 1) % n];
+        nx += (a.y - b.y) * (a.z + b.z);
+        ny += (a.z - b.z) * (a.x + b.x);
+        nz += (a.x - b.x) * (a.y + b.y);
+    }
+    let mag = (nx * nx + ny * ny + nz * nz).sqrt();
+    if mag < 1e-12 {
+        None
+    } else {
+        let inv = 1.0 / mag;
+        Some(Vector3::new(nx * inv, ny * inv, nz * inv))
     }
 }
 
@@ -172,32 +316,31 @@ fn tessellate_planar_face(
     cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
-    // Get surface and compute normal
+    // Get surface
     let surface = match model.surfaces.get(face.surface_id) {
         Some(s) => s,
         None => return,
     };
-
-    let (u_range, v_range) = surface.parameter_bounds();
-    let u_mid = (u_range.0 + u_range.1) / 2.0;
-    let v_mid = (v_range.0 + v_range.1) / 2.0;
-
-    let normal = face
-        .normal_at(u_mid, v_mid, &model.surfaces)
-        .unwrap_or(Vector3::Z);
 
     // Collect all vertices from outer loop and holes
     let mut all_vertices = Vec::new();
     let mut loop_boundaries = Vec::new();
 
     // Process outer loop
+    let outer_start;
+    let outer_end;
     if let Some(outer_loop) = model.loops.get(face.outer_loop) {
         let start_idx = all_vertices.len();
         sample_loop_3d_polygon(outer_loop, model, cache, &mut all_vertices);
         let end_idx = all_vertices.len();
+        outer_start = start_idx;
+        outer_end = end_idx;
         if end_idx > start_idx {
             loop_boundaries.push((start_idx, end_idx, true)); // true = outer loop
         }
+    } else {
+        outer_start = 0;
+        outer_end = 0;
     }
 
     // Process inner loops (holes)
@@ -215,6 +358,49 @@ fn tessellate_planar_face(
     if all_vertices.len() < 3 {
         return;
     }
+
+    // Compute the projection / outward normal.
+    //
+    // Strategy: prefer Newell's best-fit normal of the **outer loop's
+    // actual 3D samples** over the surface's analytical normal at a
+    // parameter midpoint. The surface-midpoint normal is wrong for
+    // any face whose UV bounds come back skewed from
+    // `get_face_parameter_bounds` — most notably the polyline-extruded
+    // side wall whose `RuledSurface(Polyline, Polyline)` covers a
+    // single segment but whose `closest_point` may project the
+    // wraparound vertex onto the opposite end of the parameter range,
+    // sending `u_mid` into a different segment of the polyline. The
+    // resulting `surface.normal_at(u_mid, v_mid)` is rotated by
+    // up-to-360°/N relative to the actual face, and the downstream
+    // ear-clip projection collapses the loop polygon to a degenerate
+    // sliver — emitting zero triangles. Newell's normal is a property
+    // of the loop's 3D vertices alone, independent of surface
+    // parameterisation, so it is correct by construction whenever the
+    // loop genuinely is planar (which the dispatch already verified
+    // for us via `is_face_loop_planar_in_3d`).
+    //
+    // B-Rep convention: the outer loop is CCW viewed from the
+    // surface's positive side. Newell's normal on a CCW polygon
+    // points "out of the page" — i.e. along the surface positive
+    // direction. The face's outward-pointing normal is then
+    // `surface_normal × face.orientation.sign()`, exactly the pattern
+    // `Face::normal_at` implements analytically. We apply the same
+    // sign multiplier here.
+    //
+    // Fallback: if Newell degenerates (zero-magnitude on a collinear
+    // sample sequence), reach for `face.normal_at` at the surface
+    // midpoint — at that point the loop is degenerate so any normal
+    // is acceptable; the ear-clipper will reject the polygon anyway.
+    let newell_n = newell_normal(&all_vertices[outer_start..outer_end]);
+    let normal = if let Some(n) = newell_n {
+        n * face.orientation.sign()
+    } else {
+        let (u_range, v_range) = surface.parameter_bounds();
+        let u_mid = (u_range.0 + u_range.1) / 2.0;
+        let v_mid = (v_range.0 + v_range.1) / 2.0;
+        face.normal_at(u_mid, v_mid, &model.surfaces)
+            .unwrap_or(Vector3::Z)
+    };
 
     // Triangulate. We unify the hole-free and holed cases on a single
     // bridged-ear-clipping algorithm:
