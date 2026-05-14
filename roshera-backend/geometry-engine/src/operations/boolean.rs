@@ -283,9 +283,27 @@ pub fn boolean_operation(
         let classified_faces =
             classify_split_faces(model, &split_faces, solid_a, solid_b, &options)?;
 
+        // Step 3.5: Merge same-origin fragments into face-with-hole hints
+        // (Task #36 Slice 2). Detects UV-containment between sibling
+        // SplitFaces emitted by `split_face_by_curves` for the same
+        // source face and, where the operation rule keeps the outer
+        // fragment but drops the inner, attaches the inner's reversed
+        // boundary as an `inner_loops` entry on the outer. Behaviour-
+        // preserving for cases where no nesting fires; Slice 3 wires
+        // selection + topology reconstruction to consume the new
+        // structure.
+        let merged_faces = merge_same_origin_fragments(
+            model,
+            classified_faces,
+            operation,
+            solid_a,
+            solid_b,
+            &options.common.tolerance,
+        );
+
         // Step 4: Select faces based on boolean operation
         let selected_faces =
-            select_faces_for_operation(&classified_faces, operation, solid_a, solid_b);
+            select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
 
         // Step 5: Reconstruct topology from selected faces
         let result_solid = reconstruct_topology(model, selected_faces, &options)?;
@@ -5082,6 +5100,278 @@ fn classify_split_faces(
     Ok(classified)
 }
 
+/// Merge sibling [`SplitFace`]s that share a source face into a
+/// face-with-hole topology hint (Task #36 Slice 2).
+///
+/// When [`split_face_by_curves`] cuts one source face into multiple
+/// disjoint DCEL cycles — e.g. a target box's top face cut by a
+/// hexagonal-prism cutter emits an outer rectangular fragment plus a
+/// separate hexagonal-disc fragment — the resulting [`SplitFace`]s are
+/// siblings with no structural link. Downstream
+/// [`build_shells_from_faces`] would then place the two fragments into
+/// disconnected shell components and reject the result as "<4 faces",
+/// or for closed-manifold solids emit two disjoint solids in place of
+/// one face-with-hole.
+///
+/// This pass restores the parent–child relationship:
+///
+///   1. Group [`SplitFace`]s by `(original_face, from_solid)`.
+///   2. Within each group of ≥2 fragments, project every fragment's
+///      boundary cycle to the shared surface's UV space and compute a
+///      representative interior UV point (centroid of the projected
+///      polygon).
+///   3. For each pair `(outer, inner)`, if `outer`'s UV polygon
+///      contains `inner`'s interior UV **and** the active boolean
+///      operation's selection rule would keep `outer` while dropping
+///      `inner`, attach `inner`'s reversed boundary to
+///      `outer.inner_loops` and mark `inner` for removal. Reversing
+///      flips both the edge order and each edge's `forward` bit so
+///      the hole walks against the outer's winding (the B-Rep
+///      convention).
+///   4. Drop the marked fragments; survivors carry the nesting
+///      through to selection and topology reconstruction.
+///
+/// **Slice 2 scope** (deliberate limitations):
+///
+/// * Direct (2-level) containment only. Deep hierarchies — an inner
+///   ring that itself contains another inner ring — take the first
+///   matching outer non-deterministically and may mis-route nesting.
+///   Not exercised by Task #36's hex-cut repro; the full containment
+///   DAG is a follow-up.
+/// * Operation-aware: nesting only happens when the active operation
+///   would select `outer` and drop `inner`. For `Intersection`, where
+///   the outer rectangular fragment is dropped and the inner hex disc
+///   is kept, no nesting fires — the two fragments stay as siblings
+///   and downstream topology reconstruction handles them via the
+///   pre-Slice-2 path.
+/// * Classification correctness is a prerequisite: if
+///   [`classify_face_relative_to_solid`] returns the wrong verdict
+///   for either fragment, this pass cannot recover (no merge fires).
+///   That bug is tracked separately in Task #36 follow-up work.
+///
+/// **Failure handling**: UV projection of a boundary cycle can fail
+/// when the projected polygon crosses a parametric seam (e.g. a
+/// closed cycle on a cylinder). Such fragments are left unmerged and
+/// the pass proceeds. The merge pass is purely a hint to downstream
+/// topology; a missing hint preserves the pre-Slice-2 behaviour for
+/// that fragment, so the failure mode is "no improvement", not
+/// "regression".
+fn merge_same_origin_fragments(
+    model: &BRepModel,
+    faces: Vec<SplitFace>,
+    operation: BooleanOp,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    tolerance: &Tolerance,
+) -> Vec<SplitFace> {
+    // 1. Group fragments by (original_face, from_solid).
+    let mut groups: HashMap<(FaceId, SolidId), Vec<usize>> = HashMap::new();
+    for (i, f) in faces.iter().enumerate() {
+        groups
+            .entry((f.original_face, f.from_solid))
+            .or_default()
+            .push(i);
+    }
+
+    let mut absorbed: HashSet<usize> = HashSet::new();
+    let mut nesting: HashMap<usize, Vec<Vec<(EdgeId, bool)>>> = HashMap::new();
+
+    for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+
+        // All fragments in a group share the source face's surface (the
+        // split pipeline never reassigns surface ids).
+        let surface_id = faces[indices[0]].surface;
+        let surface = match model.surfaces.get(surface_id) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // 2. Project each fragment's boundary cycle to UV. The merge
+        // test below is polygon-in-polygon (every inner vertex inside
+        // outer), so the projected polygon is the only artifact we
+        // need per fragment.
+        let mut polygons: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
+
+        for &idx in indices {
+            let edge_ids: Vec<EdgeId> = faces[idx]
+                .boundary_edges
+                .iter()
+                .map(|(e, _)| *e)
+                .collect();
+            let cycle3d = extract_cycle_vertices_3d(&edge_ids, model);
+            if cycle3d.len() < 3 {
+                continue;
+            }
+
+            let mut poly = Vec::with_capacity(cycle3d.len());
+            let mut all_projected = true;
+            for pt in &cycle3d {
+                match surface.closest_point(pt, *tolerance) {
+                    Ok((u, v)) => poly.push((u, v)),
+                    Err(_) => {
+                        all_projected = false;
+                        break;
+                    }
+                }
+            }
+            if !all_projected || poly.len() < 3 {
+                continue;
+            }
+            polygons.insert(idx, poly);
+        }
+
+        // 3. For every ordered pair (outer, inner) in this group, test
+        // containment + the operation's keep/drop rule. The first
+        // outer that contains an inner wins; subsequent containment
+        // tests against the absorbed inner are skipped.
+        //
+        // Containment is "strict polygon-in-polygon": every vertex of
+        // the inner's UV polygon must lie inside the outer's UV
+        // polygon. A single-point centroid test would fire spuriously
+        // for concentric polygons (e.g. a square inside a square
+        // sharing a centroid — both centroids satisfy "lies inside the
+        // other's polygon", giving an ambiguous direction). The
+        // strict test is directional and correctly rejects siblings
+        // whose UV bboxes overlap without one fully enclosing the
+        // other.
+        for &outer_idx in indices {
+            let outer_poly = match polygons.get(&outer_idx) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !keep_under_operation(operation, &faces[outer_idx], solid_a, solid_b) {
+                continue;
+            }
+
+            for &inner_idx in indices {
+                if outer_idx == inner_idx {
+                    continue;
+                }
+                if absorbed.contains(&inner_idx) {
+                    continue;
+                }
+                if keep_under_operation(operation, &faces[inner_idx], solid_a, solid_b) {
+                    // Both fragments survive selection — they're not a
+                    // hole / outer pair under this operation. Leave
+                    // them as separate faces.
+                    continue;
+                }
+                let inner_poly = match polygons.get(&inner_idx) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if !uv_polygon_strictly_contains(outer_poly, inner_poly) {
+                    continue;
+                }
+
+                // Reverse `inner.boundary_edges` for the hole loop: walk
+                // edges in opposite order and flip each forward bit so
+                // the hole winding is opposite the outer's, per the
+                // B-Rep `LoopType::Inner` convention.
+                let reversed: Vec<(EdgeId, bool)> = faces[inner_idx]
+                    .boundary_edges
+                    .iter()
+                    .rev()
+                    .map(|(e, fwd)| (*e, !*fwd))
+                    .collect();
+                nesting.entry(outer_idx).or_default().push(reversed);
+                absorbed.insert(inner_idx);
+            }
+        }
+    }
+
+    // 4. Drop absorbed fragments; attach nesting to survivors.
+    let mut result: Vec<SplitFace> = Vec::with_capacity(faces.len() - absorbed.len());
+    for (i, mut f) in faces.into_iter().enumerate() {
+        if absorbed.contains(&i) {
+            continue;
+        }
+        if let Some(loops) = nesting.remove(&i) {
+            f.inner_loops.extend(loops);
+        }
+        result.push(f);
+    }
+    result
+}
+
+/// Per-face keep rule under a boolean operation. Mirror of the rule
+/// embedded in [`select_faces_for_operation`] (`Union`/`Intersection`/
+/// `Difference` arms). Kept as a standalone helper so
+/// [`merge_same_origin_fragments`] can pre-decide whether a candidate
+/// outer/inner pair will land on opposite sides of selection. Must
+/// stay in lockstep with the source-of-truth at the `select` site.
+fn keep_under_operation(
+    operation: BooleanOp,
+    face: &SplitFace,
+    solid_a: SolidId,
+    solid_b: SolidId,
+) -> bool {
+    let from_a = face.from_solid == solid_a;
+    let from_b = face.from_solid == solid_b;
+    match operation {
+        BooleanOp::Union => match face.classification {
+            FaceClassification::Outside => true,
+            FaceClassification::OnBoundary => from_a,
+            FaceClassification::Inside => false,
+        },
+        BooleanOp::Intersection => match face.classification {
+            FaceClassification::Inside => true,
+            FaceClassification::OnBoundary => from_a,
+            FaceClassification::Outside => false,
+        },
+        BooleanOp::Difference => match face.classification {
+            FaceClassification::Outside => from_a,
+            FaceClassification::Inside => from_b,
+            FaceClassification::OnBoundary => false,
+        },
+    }
+}
+
+/// Strict polygon-in-polygon test for the merge pass: every vertex of
+/// `inner` must lie inside `outer`. Asymmetric and directional —
+/// rejects concentric pairs whose centroids both satisfy the looser
+/// point-in-polygon test but neither polygon strictly encloses the
+/// other (e.g. two equal-size squares sharing a centroid).
+///
+/// Returns `false` when either polygon has < 3 vertices (treats
+/// degenerate input as "no containment", matching
+/// [`uv_point_in_polygon`]'s degenerate-fall-through).
+fn uv_polygon_strictly_contains(outer: &[(f64, f64)], inner: &[(f64, f64)]) -> bool {
+    if outer.len() < 3 || inner.len() < 3 {
+        return false;
+    }
+    inner.iter().all(|p| uv_point_in_polygon(outer, *p))
+}
+
+/// 2D point-in-polygon test via horizontal ray-casting in the +u
+/// direction. Mirror of the inline test inside [`is_point_in_face`]
+/// (line ~5679); kept as a standalone helper because
+/// [`merge_same_origin_fragments`] operates on pre-projected
+/// `Vec<(f64, f64)>` polygons rather than face ids, and would
+/// otherwise re-project on every call.
+fn uv_point_in_polygon(polygon: &[(f64, f64)], (u, v): (f64, f64)) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut crossings = 0u32;
+    for i in 0..n {
+        let (u1, v1) = polygon[i];
+        let (u2, v2) = polygon[(i + 1) % n];
+        if (v1 <= v && v2 > v) || (v2 <= v && v1 > v) {
+            let t = (v - v1) / (v2 - v1);
+            let u_cross = u1 + t * (u2 - u1);
+            if u < u_cross {
+                crossings += 1;
+            }
+        }
+    }
+    crossings % 2 == 1
+}
+
 /// Classify a face relative to a solid using multi-ray majority vote.
 ///
 /// A single ray can give wrong results if it passes through an edge or vertex.
@@ -8159,5 +8449,1000 @@ mod tests {
             stamped,
             residual
         );
+    }
+
+    // =============================================
+    // merge_same_origin_fragments (Task #36 Slice 2)
+    // =============================================
+
+    /// Build a minimal `BRepModel` carrying a single XY plane surface,
+    /// the four corner vertices of an outer rectangle, the four corner
+    /// vertices of an inner axis-aligned square, the eight straight
+    /// edges that close each cycle, and return
+    /// `(surface_id, outer_edges, inner_edges)` ready to drop into a
+    /// `SplitFace` boundary.
+    ///
+    /// Geometry:
+    ///   * Outer: `(0,0)–(4,0)–(4,4)–(0,4)` (CCW in UV looking +Z).
+    ///   * Inner: `(1,1)–(3,1)–(3,3)–(1,3)` (CCW in UV; centroid at
+    ///     `(2,2)`, which lies strictly inside the outer rectangle).
+    ///
+    /// All vertices are at `z=0` so projection onto the XY plane is
+    /// the identity. Each edge carries a `Line` curve with start/end
+    /// matching the vertex pair.
+    fn make_rect_in_rect_fixture(
+        model: &mut BRepModel,
+    ) -> (
+        crate::primitives::surface::SurfaceId,
+        Vec<(EdgeId, bool)>,
+        Vec<(EdgeId, bool)>,
+    ) {
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::EdgeOrientation;
+        use crate::primitives::surface::Plane;
+
+        let plane = Plane::from_point_normal(Point3::ORIGIN, Vector3::Z).expect("xy plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+
+        let mk_v = |model: &mut BRepModel, x: f64, y: f64| model.vertices.add(x, y, 0.0);
+        let mk_edge = |model: &mut BRepModel, va, vb, ps: Point3, pe: Point3| -> EdgeId {
+            let curve_id = model.curves.add(Box::new(Line::new(ps, pe)));
+            let edge = crate::primitives::edge::Edge::new(
+                0,
+                va,
+                vb,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            model.edges.add(edge)
+        };
+
+        // Outer rectangle.
+        let ov0 = mk_v(model, 0.0, 0.0);
+        let ov1 = mk_v(model, 4.0, 0.0);
+        let ov2 = mk_v(model, 4.0, 4.0);
+        let ov3 = mk_v(model, 0.0, 4.0);
+        let oe0 = mk_edge(
+            model,
+            ov0,
+            ov1,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(4.0, 0.0, 0.0),
+        );
+        let oe1 = mk_edge(
+            model,
+            ov1,
+            ov2,
+            Point3::new(4.0, 0.0, 0.0),
+            Point3::new(4.0, 4.0, 0.0),
+        );
+        let oe2 = mk_edge(
+            model,
+            ov2,
+            ov3,
+            Point3::new(4.0, 4.0, 0.0),
+            Point3::new(0.0, 4.0, 0.0),
+        );
+        let oe3 = mk_edge(
+            model,
+            ov3,
+            ov0,
+            Point3::new(0.0, 4.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        );
+
+        // Inner square.
+        let iv0 = mk_v(model, 1.0, 1.0);
+        let iv1 = mk_v(model, 3.0, 1.0);
+        let iv2 = mk_v(model, 3.0, 3.0);
+        let iv3 = mk_v(model, 1.0, 3.0);
+        let ie0 = mk_edge(
+            model,
+            iv0,
+            iv1,
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(3.0, 1.0, 0.0),
+        );
+        let ie1 = mk_edge(
+            model,
+            iv1,
+            iv2,
+            Point3::new(3.0, 1.0, 0.0),
+            Point3::new(3.0, 3.0, 0.0),
+        );
+        let ie2 = mk_edge(
+            model,
+            iv2,
+            iv3,
+            Point3::new(3.0, 3.0, 0.0),
+            Point3::new(1.0, 3.0, 0.0),
+        );
+        let ie3 = mk_edge(
+            model,
+            iv3,
+            iv0,
+            Point3::new(1.0, 3.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        );
+
+        (
+            surface_id,
+            vec![(oe0, true), (oe1, true), (oe2, true), (oe3, true)],
+            vec![(ie0, true), (ie1, true), (ie2, true), (ie3, true)],
+        )
+    }
+
+    /// Hex-in-rect Difference case: the source face produced two
+    /// sibling fragments — an outer rect (Outside the cutter) and an
+    /// inner square (Inside the cutter) — and the merge pass attaches
+    /// the inner square's reversed boundary to the outer's
+    /// `inner_loops`, dropping the inner fragment from the survivor
+    /// list. After Slice 3 wires this nesting into the topology
+    /// builder, the result is a single Face with one outer loop and
+    /// one inner hole loop.
+    #[test]
+    fn merge_pass_nests_inner_in_outer_under_difference() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        let original_face: FaceId = 99;
+        let from_solid: SolidId = 0; // solid_a
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_edges.clone(),
+                classification: FaceClassification::Inside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            1,
+            "expected the inner fragment to be absorbed; survivors = {}",
+            merged.len(),
+        );
+        let outer = &merged[0];
+        assert_eq!(
+            outer.classification,
+            FaceClassification::Outside,
+            "the surviving fragment must be the outer one",
+        );
+        assert_eq!(
+            outer.inner_loops.len(),
+            1,
+            "expected one inner-loop hole; got {}",
+            outer.inner_loops.len(),
+        );
+        let hole = &outer.inner_loops[0];
+        assert_eq!(
+            hole.len(),
+            inner_edges.len(),
+            "hole loop edge count must equal the inner fragment's boundary edge count",
+        );
+        // Reversed walk: edges in opposite order with flipped `forward` bits.
+        for (h, src) in hole.iter().zip(inner_edges.iter().rev()) {
+            assert_eq!(h.0, src.0, "hole edge id must match source (reversed order)");
+            assert_eq!(h.1, !src.1, "hole edge forward bit must be flipped");
+        }
+    }
+
+    /// Same fixture under Intersection: the outer rectangle would be
+    /// dropped (Outside the cutter) and the inner square kept (Inside
+    /// the cutter). Nesting is the wrong answer here — the inner
+    /// fragment must stand alone as a standalone face after selection.
+    /// The merge pass therefore leaves both fragments un-merged.
+    #[test]
+    fn merge_pass_skips_nesting_under_intersection() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        let original_face: FaceId = 99;
+        let from_solid: SolidId = 0;
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_edges,
+                classification: FaceClassification::Inside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Intersection,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "Intersection should not merge: both fragments live on",
+        );
+        assert!(
+            merged.iter().all(|f| f.inner_loops.is_empty()),
+            "no fragment should carry an inner_loops hint",
+        );
+    }
+
+    /// Two fragments from the same source face whose boundaries are
+    /// geometrically disjoint (neither contains the other in UV) must
+    /// remain as separate siblings — the merge pass only nests when
+    /// the containment test fires.
+    #[test]
+    fn merge_pass_skips_disjoint_siblings() {
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::EdgeOrientation;
+        use crate::primitives::surface::Plane;
+
+        let mut model = BRepModel::new();
+        let plane = Plane::from_point_normal(Point3::ORIGIN, Vector3::Z).expect("xy plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+
+        let mk_v = |model: &mut BRepModel, x: f64, y: f64| model.vertices.add(x, y, 0.0);
+        let mk_edge = |model: &mut BRepModel, va, vb, ps: Point3, pe: Point3| -> EdgeId {
+            let curve_id = model.curves.add(Box::new(Line::new(ps, pe)));
+            let edge = crate::primitives::edge::Edge::new(
+                0,
+                va,
+                vb,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            model.edges.add(edge)
+        };
+
+        // Square A at (0..1, 0..1) — disjoint from square B at (5..6, 5..6).
+        let a0 = mk_v(&mut model, 0.0, 0.0);
+        let a1 = mk_v(&mut model, 1.0, 0.0);
+        let a2 = mk_v(&mut model, 1.0, 1.0);
+        let a3 = mk_v(&mut model, 0.0, 1.0);
+        let ae0 = mk_edge(
+            &mut model,
+            a0,
+            a1,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        );
+        let ae1 = mk_edge(
+            &mut model,
+            a1,
+            a2,
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        );
+        let ae2 = mk_edge(
+            &mut model,
+            a2,
+            a3,
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+        let ae3 = mk_edge(
+            &mut model,
+            a3,
+            a0,
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        );
+
+        let b0 = mk_v(&mut model, 5.0, 5.0);
+        let b1 = mk_v(&mut model, 6.0, 5.0);
+        let b2 = mk_v(&mut model, 6.0, 6.0);
+        let b3 = mk_v(&mut model, 5.0, 6.0);
+        let be0 = mk_edge(
+            &mut model,
+            b0,
+            b1,
+            Point3::new(5.0, 5.0, 0.0),
+            Point3::new(6.0, 5.0, 0.0),
+        );
+        let be1 = mk_edge(
+            &mut model,
+            b1,
+            b2,
+            Point3::new(6.0, 5.0, 0.0),
+            Point3::new(6.0, 6.0, 0.0),
+        );
+        let be2 = mk_edge(
+            &mut model,
+            b2,
+            b3,
+            Point3::new(6.0, 6.0, 0.0),
+            Point3::new(5.0, 6.0, 0.0),
+        );
+        let be3 = mk_edge(
+            &mut model,
+            b3,
+            b0,
+            Point3::new(5.0, 6.0, 0.0),
+            Point3::new(5.0, 5.0, 0.0),
+        );
+
+        let original_face: FaceId = 77;
+        let from_solid: SolidId = 0;
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: vec![(ae0, true), (ae1, true), (ae2, true), (ae3, true)],
+                classification: FaceClassification::Outside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: vec![(be0, true), (be1, true), (be2, true), (be3, true)],
+                classification: FaceClassification::Inside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "disjoint siblings must both survive: no UV containment, no merge",
+        );
+        assert!(
+            merged.iter().all(|f| f.inner_loops.is_empty()),
+            "no fragment should carry an inner_loops hint",
+        );
+    }
+
+    /// `uv_point_in_polygon`: basic positive / negative / boundary
+    /// behaviour on a unit-square polygon.
+    #[test]
+    fn uv_point_in_polygon_unit_square() {
+        let square: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        assert!(uv_point_in_polygon(&square, (0.5, 0.5)));
+        assert!(!uv_point_in_polygon(&square, (1.5, 0.5)));
+        assert!(!uv_point_in_polygon(&square, (-0.5, 0.5)));
+        // Degenerate input: <3 vertices is treated as "no containment".
+        assert!(!uv_point_in_polygon(&[(0.0, 0.0), (1.0, 1.0)], (0.5, 0.5)));
+    }
+
+    // =====================================================================
+    // Task #36 Slice 2 — extended hardening gauntlet for the merge pass
+    // and `uv_polygon_strictly_contains` helper.
+    //
+    // The four core tests above pin the happy path (Difference nest),
+    // operation gating (Intersection skip), disjoint-sibling skip, and
+    // basic point-in-polygon behaviour. The tests below stress the
+    // edge cases a Parasolid-style implementation has to survive:
+    // empty/single inputs, cross-solid grouping, cross-face grouping,
+    // pre-existing nesting, multi-hole nesting, equal-classification
+    // sibling pairs, and the helper's directional contract.
+    // =====================================================================
+
+    /// Build an axis-aligned square loop on the XY plane and return its
+    /// 4 oriented edges. Used by the multi-hole and pre-existing-nesting
+    /// tests to compose ad-hoc fixtures without copying the
+    /// rect-in-rect setup boilerplate.
+    fn mk_square_edges(
+        model: &mut BRepModel,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    ) -> Vec<(EdgeId, bool)> {
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::EdgeOrientation;
+
+        let v0 = model.vertices.add(x0, y0, 0.0);
+        let v1 = model.vertices.add(x1, y0, 0.0);
+        let v2 = model.vertices.add(x1, y1, 0.0);
+        let v3 = model.vertices.add(x0, y1, 0.0);
+        let mk_edge = |model: &mut BRepModel, va, vb, ps: Point3, pe: Point3| -> EdgeId {
+            let curve_id = model.curves.add(Box::new(Line::new(ps, pe)));
+            let edge = crate::primitives::edge::Edge::new(
+                0,
+                va,
+                vb,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            model.edges.add(edge)
+        };
+        let e0 = mk_edge(
+            model,
+            v0,
+            v1,
+            Point3::new(x0, y0, 0.0),
+            Point3::new(x1, y0, 0.0),
+        );
+        let e1 = mk_edge(
+            model,
+            v1,
+            v2,
+            Point3::new(x1, y0, 0.0),
+            Point3::new(x1, y1, 0.0),
+        );
+        let e2 = mk_edge(
+            model,
+            v2,
+            v3,
+            Point3::new(x1, y1, 0.0),
+            Point3::new(x0, y1, 0.0),
+        );
+        let e3 = mk_edge(
+            model,
+            v3,
+            v0,
+            Point3::new(x0, y1, 0.0),
+            Point3::new(x0, y0, 0.0),
+        );
+        vec![(e0, true), (e1, true), (e2, true), (e3, true)]
+    }
+
+    /// Degenerate input: empty fragment vector returns empty without
+    /// panicking. Guards against `groups.values()` UB on an empty
+    /// HashMap and against the `Vec::with_capacity(0 - 0)` arithmetic
+    /// being silently mis-handled.
+    #[test]
+    fn merge_pass_empty_input_returns_empty() {
+        let model = BRepModel::new();
+        let merged = merge_same_origin_fragments(
+            &model,
+            Vec::new(),
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+        assert!(merged.is_empty(), "empty input must yield empty output");
+    }
+
+    /// A single fragment in a group cannot nest with itself: the group's
+    /// `indices.len() < 2` short-circuit must skip the pair-iteration
+    /// entirely. Verifies the fragment survives unmodified.
+    #[test]
+    fn merge_pass_single_fragment_passes_through() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, _inner) = make_rect_in_rect_fixture(&mut model);
+
+        let original_face: FaceId = 99;
+        let from_solid: SolidId = 0;
+        let faces = vec![SplitFace {
+            original_face,
+            surface: surface_id,
+            boundary_edges: outer_edges.clone(),
+            classification: FaceClassification::Outside,
+            from_solid,
+            interior_point: None,
+            inner_loops: Vec::new(),
+        }];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(merged.len(), 1, "single fragment must survive untouched");
+        assert!(
+            merged[0].inner_loops.is_empty(),
+            "single fragment must not pick up any nesting",
+        );
+        assert_eq!(merged[0].boundary_edges, outer_edges);
+    }
+
+    /// Two fragments with the same `original_face` but different
+    /// `from_solid` ids belong to different groups (one per source
+    /// solid). The merge pass must not cross the group boundary even
+    /// when their UV polygons would nest. Pins the group key contract.
+    #[test]
+    fn merge_pass_skips_cross_solid_grouping() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        let original_face: FaceId = 99;
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside,
+                from_solid: 0, // solid_a
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_edges,
+                classification: FaceClassification::Inside,
+                from_solid: 1, // solid_b — different group key
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "fragments from different source solids must not merge",
+        );
+        assert!(
+            merged.iter().all(|f| f.inner_loops.is_empty()),
+            "no fragment should carry an inner_loops hint",
+        );
+    }
+
+    /// Two fragments from the same solid but different `original_face`
+    /// ids must not merge — the merge pass restores hole topology
+    /// within a single source face, not across faces. Pins the second
+    /// half of the group key contract.
+    #[test]
+    fn merge_pass_skips_cross_face_grouping() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        let faces = vec![
+            SplitFace {
+                original_face: 99,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside,
+                from_solid: 0,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face: 100, // different source face
+                surface: surface_id,
+                boundary_edges: inner_edges,
+                classification: FaceClassification::Inside,
+                from_solid: 0,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "fragments from different source faces must not merge",
+        );
+        assert!(
+            merged.iter().all(|f| f.inner_loops.is_empty()),
+            "no fragment should carry an inner_loops hint",
+        );
+    }
+
+    /// Outer fragment arrives with a pre-populated `inner_loops`
+    /// (representing nesting already discovered by an upstream pass).
+    /// The merge pass must **append** to it, not replace, so the
+    /// final outer carries both the pre-existing loop and the newly
+    /// discovered one.
+    #[test]
+    fn merge_pass_preserves_existing_inner_loops() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        // Synthesise a pre-existing inner_loops entry (a single dummy
+        // edge id with a known forward bit) so we can assert the
+        // merge pass's append-not-replace contract.
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        let dummy_vs = model.vertices.add(99.0, 99.0, 0.0);
+        let dummy_ve = model.vertices.add(99.0, 100.0, 0.0);
+        let dummy_curve = model.curves.add(Box::new(Line::new(
+            Point3::new(99.0, 99.0, 0.0),
+            Point3::new(99.0, 100.0, 0.0),
+        )));
+        let dummy_edge = model.edges.add(Edge::new(
+            0,
+            dummy_vs,
+            dummy_ve,
+            dummy_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let pre_existing = vec![(dummy_edge, true)];
+
+        let original_face: FaceId = 99;
+        let from_solid: SolidId = 0;
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside,
+                from_solid,
+                interior_point: None,
+                inner_loops: vec![pre_existing.clone()],
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_edges,
+                classification: FaceClassification::Inside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(merged.len(), 1, "inner fragment must be absorbed");
+        let outer = &merged[0];
+        assert_eq!(
+            outer.inner_loops.len(),
+            2,
+            "pre-existing inner loop must be preserved, new loop appended",
+        );
+        assert_eq!(
+            outer.inner_loops[0], pre_existing,
+            "pre-existing loop must remain at index 0 (append semantics)",
+        );
+        assert_eq!(
+            outer.inner_loops[1].len(),
+            4,
+            "newly discovered inner loop must be the absorbed inner's 4-edge boundary",
+        );
+    }
+
+    /// One outer rect with TWO disjoint inner squares nested inside.
+    /// The merge pass must absorb both inners and attach each as a
+    /// separate inner_loops entry on the survivor.
+    #[test]
+    fn merge_pass_handles_multiple_holes_in_one_outer() {
+        use crate::primitives::surface::Plane;
+
+        let mut model = BRepModel::new();
+        let plane = Plane::from_point_normal(Point3::ORIGIN, Vector3::Z).expect("xy plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+
+        // Outer 10x10 rect; two inner 1x1 squares far apart inside it.
+        let outer = mk_square_edges(&mut model, 0.0, 0.0, 10.0, 10.0);
+        let inner_a = mk_square_edges(&mut model, 1.0, 1.0, 2.0, 2.0);
+        let inner_b = mk_square_edges(&mut model, 7.0, 7.0, 8.0, 8.0);
+
+        let original_face: FaceId = 50;
+        let from_solid: SolidId = 0;
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer,
+                classification: FaceClassification::Outside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_a,
+                classification: FaceClassification::Inside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_b,
+                classification: FaceClassification::Inside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            1,
+            "both inner squares must be absorbed into the outer rect",
+        );
+        let outer = &merged[0];
+        assert_eq!(
+            outer.classification,
+            FaceClassification::Outside,
+            "the surviving fragment must be the outer one",
+        );
+        assert_eq!(
+            outer.inner_loops.len(),
+            2,
+            "outer must carry two distinct hole loops",
+        );
+        for hole in &outer.inner_loops {
+            assert_eq!(hole.len(), 4, "each hole must be a 4-edge square loop");
+        }
+    }
+
+    /// Two same-origin fragments both classified `Outside` — under
+    /// `Difference`, both survive selection (`from_a` solids' outside
+    /// fragments are kept). The merge pass therefore must NOT nest
+    /// them: nesting only fires when the outer is kept AND the inner
+    /// is dropped. This guards against the merge pass over-eagerly
+    /// absorbing legitimate sibling rings produced by non-cutter
+    /// face-face intersections.
+    #[test]
+    fn merge_pass_skips_when_both_fragments_survive_difference() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        let original_face: FaceId = 99;
+        let from_solid: SolidId = 0; // solid_a, so Outside is kept by Difference
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside,
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_edges,
+                classification: FaceClassification::Outside, // both Outside
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Difference,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "both fragments survive selection — merge must not fire",
+        );
+        assert!(
+            merged.iter().all(|f| f.inner_loops.is_empty()),
+            "no fragment should carry an inner_loops hint",
+        );
+    }
+
+    /// Mirror of the Difference case under Union: outer Outside is
+    /// kept, inner Inside is dropped → merge must fire (the kept
+    /// outer absorbs the dropped inner's reversed boundary). Pins
+    /// that the keep/drop rule is applied per-operation, not
+    /// hard-coded to Difference.
+    #[test]
+    fn merge_pass_nests_inner_in_outer_under_union() {
+        let mut model = BRepModel::new();
+        let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
+
+        let original_face: FaceId = 99;
+        let from_solid: SolidId = 0;
+        let faces = vec![
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: outer_edges,
+                classification: FaceClassification::Outside, // Union keeps Outside
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                original_face,
+                surface: surface_id,
+                boundary_edges: inner_edges,
+                classification: FaceClassification::Inside, // Union drops Inside
+                from_solid,
+                interior_point: None,
+                inner_loops: Vec::new(),
+            },
+        ];
+
+        let merged = merge_same_origin_fragments(
+            &model,
+            faces,
+            BooleanOp::Union,
+            0,
+            1,
+            &Tolerance::default(),
+        );
+
+        assert_eq!(merged.len(), 1, "inner fragment must be absorbed under Union");
+        assert_eq!(merged[0].inner_loops.len(), 1, "outer carries one hole");
+    }
+
+    /// `uv_polygon_strictly_contains` is directional / asymmetric: a
+    /// strictly smaller polygon B can be contained in A, but A cannot
+    /// be contained in B. Guards against accidentally symmetric
+    /// implementations (e.g. "do any vertex of one lie in the other").
+    #[test]
+    fn uv_polygon_strictly_contains_directional() {
+        let big: Vec<(f64, f64)> = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let small: Vec<(f64, f64)> = vec![(2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (2.0, 3.0)];
+        assert!(
+            uv_polygon_strictly_contains(&big, &small),
+            "big polygon must contain small polygon",
+        );
+        assert!(
+            !uv_polygon_strictly_contains(&small, &big),
+            "small polygon must NOT contain big polygon — directional contract",
+        );
+    }
+
+    /// Equal-vertex polygons: every vertex of inner lies ON the
+    /// boundary of outer. The ray-cast is non-strict at edges
+    /// (the half-open interval `v1 <= v && v2 > v` deliberately
+    /// counts one edge but not the other), so the result is
+    /// unspecified at vertices. Pin the observed behaviour:
+    /// `uv_polygon_strictly_contains` must NOT return true in both
+    /// directions, otherwise the merge pass would pick an arbitrary
+    /// "outer" and silently corrupt nesting for concentric duplicate
+    /// fragments.
+    #[test]
+    fn uv_polygon_strictly_contains_rejects_concentric_duplicates() {
+        let a: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let b = a.clone();
+        let a_in_b = uv_polygon_strictly_contains(&b, &a);
+        let b_in_a = uv_polygon_strictly_contains(&a, &b);
+        assert!(
+            !(a_in_b && b_in_a),
+            "duplicate concentric polygons must not be reported as containing each other \
+             in BOTH directions (a_in_b={a_in_b}, b_in_a={b_in_a})",
+        );
+    }
+
+    /// Degenerate input — either polygon has < 3 vertices — must
+    /// return false rather than panic or accept by default.
+    #[test]
+    fn uv_polygon_strictly_contains_degenerate_inputs() {
+        let triangle: Vec<(f64, f64)> = vec![(0.0, 0.0), (2.0, 0.0), (1.0, 2.0)];
+        let two_pts: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0)];
+        let one_pt: Vec<(f64, f64)> = vec![(0.5, 0.5)];
+        let empty: Vec<(f64, f64)> = vec![];
+        assert!(!uv_polygon_strictly_contains(&triangle, &two_pts));
+        assert!(!uv_polygon_strictly_contains(&two_pts, &triangle));
+        assert!(!uv_polygon_strictly_contains(&triangle, &one_pt));
+        assert!(!uv_polygon_strictly_contains(&triangle, &empty));
+        assert!(!uv_polygon_strictly_contains(&empty, &triangle));
+    }
+
+    /// Partial overlap (neither nests fully): both polygons share
+    /// some vertices on the other side of the boundary. Must reject
+    /// in both directions — the merge pass relies on this to avoid
+    /// nesting siblings produced by overlapping (but not nested)
+    /// face splits.
+    #[test]
+    fn uv_polygon_strictly_contains_partial_overlap() {
+        // Square A spans [0..2, 0..2]; square B spans [1..3, 1..3] —
+        // overlap in [1..2, 1..2] but neither contains the other.
+        let a: Vec<(f64, f64)> = vec![(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)];
+        let b: Vec<(f64, f64)> = vec![(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)];
+        assert!(
+            !uv_polygon_strictly_contains(&a, &b),
+            "overlapping non-nested polygons must not be reported as nested (a⊃b)",
+        );
+        assert!(
+            !uv_polygon_strictly_contains(&b, &a),
+            "overlapping non-nested polygons must not be reported as nested (b⊃a)",
+        );
+    }
+
+    /// `uv_point_in_polygon` on a non-convex (concave L-shape)
+    /// polygon: the ray-cast must correctly identify interior points
+    /// of the L and reject points in the concavity. Guards against
+    /// implementations that assume convex polygons.
+    #[test]
+    fn uv_point_in_polygon_concave_l_shape() {
+        // L-shape: outline of an "L" anchored at origin, 3 wide, 3 tall,
+        // with the upper-right 2x2 quadrant carved out.
+        let l: Vec<(f64, f64)> = vec![
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+        ];
+        // Interior points (inside the L itself).
+        assert!(uv_point_in_polygon(&l, (0.5, 0.5)), "in horizontal leg");
+        assert!(uv_point_in_polygon(&l, (0.5, 2.5)), "in vertical leg");
+        // Point in the carved-out quadrant — must be Outside.
+        assert!(
+            !uv_point_in_polygon(&l, (2.0, 2.0)),
+            "concavity must classify as Outside",
+        );
+        // Point far outside the L's bounding box.
+        assert!(!uv_point_in_polygon(&l, (5.0, 5.0)), "outside bbox");
     }
 }
