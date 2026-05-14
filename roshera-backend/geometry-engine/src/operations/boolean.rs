@@ -188,6 +188,29 @@ struct SplitFace {
     /// historical behavior, still correct for faces without enclosed
     /// siblings (convex and simply-connected cases).
     interior_point: Option<Point3>,
+    /// Inner hole loops attached to this face after same-origin
+    /// fragment merging (Task #36 Slice 3).
+    ///
+    /// When `split_face_by_curves` emits multiple `SplitFace`s from one
+    /// source face — e.g. an outer rectangular fragment plus a disjoint
+    /// hexagonal disc fragment from cutting a target's top face with a
+    /// hex prism — those fragments are sibling `SplitFace`s with
+    /// separate `boundary_edges`. The merge pass that runs between
+    /// classification and selection detects the UV-containment
+    /// relationship and attaches the enclosed fragment's boundary here
+    /// (with the orientation it should walk as a hole loop — i.e.
+    /// reversed relative to the outer-loop convention so its winding
+    /// is opposite). The selection / topology reconstruction passes
+    /// then build a single `Face` with both `outer_loop` and these
+    /// `inner_loops`, instead of dropping the hole or building two
+    /// disconnected components.
+    ///
+    /// Empty `Vec` is the default and matches the legacy "no holes"
+    /// behaviour — the same wire-compatible meaning as `interior_point:
+    /// None` for the centroid path. Every construction site initialises
+    /// this field to `vec![]` and only the merge pass writes non-empty
+    /// values.
+    inner_loops: Vec<Vec<(EdgeId, bool)>>,
 }
 
 /// Classification of face relative to other solid
@@ -548,24 +571,65 @@ fn surface_surface_intersection(
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     use crate::primitives::surface::SurfaceType;
 
-    // Dispatch to specialized algorithms based on surface types
-    match (surface_a.surface_type(), surface_b.surface_type()) {
-        (SurfaceType::Plane, SurfaceType::Plane) => {
-            plane_plane_intersection(surface_a, surface_b, tolerance)
-        }
-        (SurfaceType::Plane, SurfaceType::Cylinder)
-        | (SurfaceType::Cylinder, SurfaceType::Plane) => {
+    // Dispatch by analytical role, NOT surface_type alone. A RuledSurface
+    // built for an extrusion side wall reports surface_type=RuledSurface
+    // but is geometrically planar — and a Plane-vs-planar-RuledSurface
+    // intersection has a closed-form Line solution we must NOT route to
+    // the marching solver (grid sampling misses thin intersection
+    // lines, returning 0 curves and causing the boolean to silently
+    // skip the cut). Same logic for the planar-vs-Cylinder /
+    // planar-vs-Sphere paths.
+    let kind_a = analytical_surface_kind(surface_a, tolerance);
+    let kind_b = analytical_surface_kind(surface_b, tolerance);
+    use AnalyticalSurfaceKind::*;
+    match (kind_a, kind_b) {
+        (Planar, Planar) => plane_plane_intersection(surface_a, surface_b, tolerance),
+        (Planar, Cylinder) | (Cylinder, Planar) => {
             plane_cylinder_intersection(surface_a, surface_b, tolerance)
         }
-        (SurfaceType::Cylinder, SurfaceType::Cylinder) => {
-            cylinder_cylinder_intersection(surface_a, surface_b, tolerance)
-        }
-        (SurfaceType::Plane, SurfaceType::Sphere) | (SurfaceType::Sphere, SurfaceType::Plane) => {
+        (Cylinder, Cylinder) => cylinder_cylinder_intersection(surface_a, surface_b, tolerance),
+        (Planar, Sphere) | (Sphere, Planar) => {
             plane_sphere_intersection(surface_a, surface_b, tolerance)
         }
         _ => {
-            // General case: use robust marching algorithm
+            // No closed-form handler covers this pair (e.g. NURBS,
+            // RuledSurface that isn't planar). Marching solver is the
+            // last resort.
             march_surface_intersection(surface_a, surface_b, tolerance)
+        }
+    }
+}
+
+/// Analytical role of a surface for boolean-intersection dispatch.
+///
+/// Distinguishes "this surface admits a closed-form intersection with
+/// another planar/cylindrical/spherical surface" from "use the marching
+/// solver". A `RuledSurface` whose normal is constant across its UV
+/// domain (e.g. an extrusion side wall) is `Planar` here even though
+/// `surface_type()` returns `RuledSurface`.
+#[derive(Copy, Clone, Debug)]
+enum AnalyticalSurfaceKind {
+    Planar,
+    Cylinder,
+    Sphere,
+    Other,
+}
+
+fn analytical_surface_kind(
+    surface: &dyn Surface,
+    tolerance: &Tolerance,
+) -> AnalyticalSurfaceKind {
+    use crate::primitives::surface::SurfaceType;
+    match surface.surface_type() {
+        SurfaceType::Plane => AnalyticalSurfaceKind::Planar,
+        SurfaceType::Cylinder => AnalyticalSurfaceKind::Cylinder,
+        SurfaceType::Sphere => AnalyticalSurfaceKind::Sphere,
+        _ => {
+            if surface.is_planar(*tolerance) {
+                AnalyticalSurfaceKind::Planar
+            } else {
+                AnalyticalSurfaceKind::Other
+            }
         }
     }
 }
@@ -2391,6 +2455,7 @@ fn add_non_intersecting_faces(
             classification: FaceClassification::OnBoundary,
             from_solid: solid,
             interior_point: None,
+            inner_loops: Vec::new(),
         });
     }
     Ok(())
@@ -2891,12 +2956,37 @@ fn clip_line_to_planar_face(
                 received: format!("{:?}", face.surface_id),
             })?;
 
-    if surface.surface_type() != SurfaceType::Plane {
+    // Accept any planar surface, not just `Plane` — extrusion side walls
+    // are RuledSurface but geometrically planar, and the boolean
+    // dispatch already routes their intersection through the analytical
+    // plane-plane handler (see `surface_surface_intersection`). Without
+    // this generalisation the trim would silently fall through to the
+    // unbounded [0, 1] interval and break downstream face-splitting.
+    let (origin, u_dir, v_dir) = if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+        (plane.origin, plane.u_dir, plane.v_dir)
+    } else if surface.is_planar(*tolerance) {
+        let eval = match surface.evaluate_full(0.0, 0.0) {
+            Ok(e) => e,
+            Err(_) => return Ok(ClipOutcome::NotApplicable),
+        };
+        let normal = eval.normal;
+        // Build an orthonormal basis (u_dir, v_dir, normal) for the plane.
+        let helper = if normal.x.abs() < 0.9 {
+            Vector3::X
+        } else {
+            Vector3::Y
+        };
+        let u_dir = match normal.cross(&helper).normalize() {
+            Ok(v) => v,
+            Err(_) => return Ok(ClipOutcome::NotApplicable),
+        };
+        let v_dir = match normal.cross(&u_dir).normalize() {
+            Ok(v) => v,
+            Err(_) => return Ok(ClipOutcome::NotApplicable),
+        };
+        (eval.position, u_dir, v_dir)
+    } else {
         return Ok(ClipOutcome::NotApplicable);
-    }
-    let plane = match surface.as_any().downcast_ref::<Plane>() {
-        Some(p) => p,
-        None => return Ok(ClipOutcome::NotApplicable),
     };
 
     let boundary_edges = get_face_boundary_edges(model, face_id)?;
@@ -2909,9 +2999,6 @@ fn clip_line_to_planar_face(
     // orthonormal frame. Because u_dir ⟂ v_dir ⟂ normal, the in-plane
     // distance equals the 3D distance — parameter `t` on the cutting line
     // coincides with the 2D parameter after projection.
-    let origin = plane.origin;
-    let u_dir = plane.u_dir;
-    let v_dir = plane.v_dir;
     let project = |p: Point3| -> (f64, f64) {
         let d = p - origin;
         (d.dot(&u_dir), d.dot(&v_dir))
@@ -4932,6 +5019,7 @@ fn create_split_face(
         classification: FaceClassification::OnBoundary,
         from_solid: origin_solid,
         interior_point: None,
+        inner_loops: Vec::new(),
     })
 }
 
@@ -5194,22 +5282,46 @@ fn ray_surface_intersection(
     surface: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Option<f64>> {
+    // Dispatch by analytical role, NOT surface_type alone. Extrusion side
+    // walls report surface_type=RuledSurface but are geometrically planar —
+    // the closed-form ray-plane intersection must apply. Routing them to
+    // `ray_surface_numerical` (10×10 grid sampling + Newton) silently
+    // returns no intersection for thin ray-quad hits, which breaks
+    // `ray_cast_classification`'s parity count and misclassifies every
+    // split face as Outside.
+    if matches!(
+        analytical_surface_kind(surface, tolerance),
+        AnalyticalSurfaceKind::Planar,
+    ) {
+        // Ray-plane: t = (d - n·origin) / (n·direction)
+        let eval = surface.evaluate_full(0.0, 0.0)?;
+        let normal = eval.normal;
+        let plane_point = eval.position;
+
+        let denom = direction.dot(&normal);
+        if denom.abs() < tolerance.parallel_threshold() {
+            return Ok(None);
+        }
+
+        let t = (plane_point - *origin).dot(&normal) / denom;
+        if t > -tolerance.distance() {
+            return Ok(Some(t.max(0.0)));
+        } else {
+            return Ok(None);
+        }
+    }
+
     match surface.surface_type() {
         SurfaceType::Plane => {
-            // Ray-plane: t = (d - n·origin) / (n·direction)
+            // Unreachable under the planar short-circuit above, but kept
+            // for compile-time match completeness.
             let eval = surface.evaluate_full(0.0, 0.0)?;
             let normal = eval.normal;
             let plane_point = eval.position;
-
-            // For unit `direction` and unit `normal`, denom = cos(θ).
-            // Ray parallel to plane ⇔ direction ⊥ normal ⇔ |cos θ| ≈ 0;
-            // compare against sin(angle_tol).
             let denom = direction.dot(&normal);
             if denom.abs() < tolerance.parallel_threshold() {
-                // Ray is parallel to plane
                 return Ok(None);
             }
-
             let t = (plane_point - *origin).dot(&normal) / denom;
             if t > -tolerance.distance() {
                 Ok(Some(t.max(0.0)))
@@ -5341,9 +5453,22 @@ fn ray_surface_all_intersections(
     surface: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<f64>> {
+    // Mirror the analytical dispatch in `ray_surface_intersection`: any
+    // geometrically planar surface (including RuledSurface side walls
+    // from extrusions) admits a single closed-form ray-plane hit.
+    if matches!(
+        analytical_surface_kind(surface, tolerance),
+        AnalyticalSurfaceKind::Planar,
+    ) {
+        return match ray_surface_intersection(origin, direction, surface, tolerance)? {
+            Some(t) => Ok(vec![t]),
+            None => Ok(vec![]),
+        };
+    }
+
     match surface.surface_type() {
         SurfaceType::Plane => {
-            // Plane has at most one intersection
+            // Unreachable under the planar short-circuit above.
             match ray_surface_intersection(origin, direction, surface, tolerance)? {
                 Some(t) => Ok(vec![t]),
                 None => Ok(vec![]),
@@ -5994,6 +6119,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 1,
@@ -6002,6 +6128,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
         ];
 
@@ -6023,6 +6150,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 1,
@@ -6031,6 +6159,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 2,
@@ -6039,6 +6168,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
         ];
 
@@ -6107,6 +6237,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 1,
@@ -6115,6 +6246,7 @@ mod tests {
                 classification: FaceClassification::Inside,
                 from_solid: 1,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 2,
@@ -6123,6 +6255,7 @@ mod tests {
                 classification: FaceClassification::OnBoundary,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
         ];
 
@@ -6143,6 +6276,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 1,
@@ -6151,6 +6285,7 @@ mod tests {
                 classification: FaceClassification::Inside,
                 from_solid: 1,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 2,
@@ -6159,6 +6294,7 @@ mod tests {
                 classification: FaceClassification::OnBoundary,
                 from_solid: 0,
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
         ];
 
@@ -6179,6 +6315,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 0, // A outside B → keep
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 1,
@@ -6187,6 +6324,7 @@ mod tests {
                 classification: FaceClassification::Inside,
                 from_solid: 0, // A inside B → discard
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 2,
@@ -6195,6 +6333,7 @@ mod tests {
                 classification: FaceClassification::Inside,
                 from_solid: 1, // B inside A → keep (cavity wall)
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
             SplitFace {
                 original_face: 3,
@@ -6203,6 +6342,7 @@ mod tests {
                 classification: FaceClassification::Outside,
                 from_solid: 1, // B outside A → discard
                 interior_point: None,
+                inner_loops: Vec::new(),
             },
         ];
 
