@@ -48,6 +48,7 @@ use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+use geometry_engine::tessellation::edge_cache::EdgeSampleCache;
 use geometry_engine::tessellation::{tessellate_face, TessellationParams, TriangleMesh};
 
 // ---------------------------------------------------------------------
@@ -99,6 +100,7 @@ fn assert_every_face_oriented_outward<F, S>(
     );
 
     let params = TessellationParams::coarse();
+    let cache = EdgeSampleCache::new(&params);
     for face_id in face_ids {
         let face = model
             .faces
@@ -106,7 +108,7 @@ fn assert_every_face_oriented_outward<F, S>(
             .unwrap_or_else(|| panic!("[{label}] face {face_id:?} missing"));
 
         let mut mesh = TriangleMesh::new();
-        tessellate_face(face, model, &params, &mut mesh);
+        tessellate_face(face, model, &params, &cache, &mut mesh);
 
         assert!(
             !mesh.vertices.is_empty(),

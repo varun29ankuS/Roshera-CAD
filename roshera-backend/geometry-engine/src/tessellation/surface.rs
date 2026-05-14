@@ -8,6 +8,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::adaptive::compute_plane_axes;
+use super::edge_cache::{compute_curve_sample_count, EdgeSampleCache};
 use super::{AdaptiveTessellator, MeshVertex, TessellationParams, TriangleMesh};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
@@ -105,6 +106,7 @@ pub fn tessellate_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     // Get surface
@@ -114,14 +116,14 @@ pub fn tessellate_face(
     };
 
     match surface.type_name() {
-        "Plane" => tessellate_planar_face(face, model, params, mesh),
-        "Cylinder" => tessellate_cylindrical_face(face, model, params, mesh),
-        "Sphere" => tessellate_spherical_face(face, model, params, mesh),
-        "Cone" => tessellate_conical_face(face, model, params, mesh),
-        "Torus" => tessellate_toroidal_face(face, model, params, mesh),
-        "NURBS" => tessellate_nurbs_face(face, model, params, mesh),
+        "Plane" => tessellate_planar_face(face, model, params, cache, mesh),
+        "Cylinder" => tessellate_cylindrical_face(face, model, params, cache, mesh),
+        "Sphere" => tessellate_spherical_face(face, model, params, cache, mesh),
+        "Cone" => tessellate_conical_face(face, model, params, cache, mesh),
+        "Torus" => tessellate_toroidal_face(face, model, params, cache, mesh),
+        "NURBS" => tessellate_nurbs_face(face, model, params, cache, mesh),
         "CylindricalFillet" | "ToroidalFillet" | "SphericalFillet" | "VariableRadiusFillet" => {
-            tessellate_fillet_face(face, model, params, mesh)
+            tessellate_fillet_face(face, model, params, cache, mesh)
         }
         _ => {
             // RuledSurface (extruded straight-line side faces, prismatic
@@ -151,11 +153,11 @@ pub fn tessellate_face(
             let planar_tolerance =
                 Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
             if surface.is_planar(planar_tolerance) {
-                tessellate_planar_face(face, model, params, mesh);
+                tessellate_planar_face(face, model, params, cache, mesh);
             } else {
                 let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
                 tessellate_curved_adaptive(
-                    surface, face, model, params, mesh, u_min, u_max, v_min, v_max,
+                    surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
                 );
             }
         }
@@ -167,6 +169,7 @@ fn tessellate_planar_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     // Get surface and compute normal
@@ -190,7 +193,7 @@ fn tessellate_planar_face(
     // Process outer loop
     if let Some(outer_loop) = model.loops.get(face.outer_loop) {
         let start_idx = all_vertices.len();
-        sample_loop_3d_polygon(outer_loop, model, params, &mut all_vertices);
+        sample_loop_3d_polygon(outer_loop, model, cache, &mut all_vertices);
         let end_idx = all_vertices.len();
         if end_idx > start_idx {
             loop_boundaries.push((start_idx, end_idx, true)); // true = outer loop
@@ -201,7 +204,7 @@ fn tessellate_planar_face(
     for &inner_loop_id in &face.inner_loops {
         if let Some(inner_loop) = model.loops.get(inner_loop_id) {
             let start_idx = all_vertices.len();
-            sample_loop_3d_polygon(inner_loop, model, params, &mut all_vertices);
+            sample_loop_3d_polygon(inner_loop, model, cache, &mut all_vertices);
             let end_idx = all_vertices.len();
             if end_idx > start_idx {
                 loop_boundaries.push((start_idx, end_idx, false)); // false = inner loop (hole)
@@ -313,174 +316,39 @@ fn tessellate_planar_face(
 fn sample_loop_3d_polygon(
     loop_data: &crate::primitives::r#loop::Loop,
     model: &BRepModel,
-    params: &TessellationParams,
+    cache: &EdgeSampleCache,
     out: &mut Vec<Point3>,
 ) {
-    const COLLINEAR_TOL: f64 = 1e-9;
-
+    // Each edge contributes samples drawn from the canonical
+    // `EdgeSampleCache`. The cache returns `n + 1` points in the
+    // forward curve-param direction (both endpoints inclusive). To
+    // form a closed polygon we emit `n` of those per edge: the
+    // omitted point is supplied by the next edge's first sample,
+    // which by construction shares the vertex.
     for (i, &edge_id) in loop_data.edges.iter().enumerate() {
         let forward = loop_data.orientations.get(i).copied().unwrap_or(true);
-        let edge = match model.edges.get(edge_id) {
-            Some(e) => e,
-            None => continue,
-        };
-        let curve = match model.curves.get(edge.curve_id) {
-            Some(c) => c,
-            None => continue,
-        };
+        let samples = cache.get_or_compute(edge_id, model);
+        let n = samples.len();
+        if n < 2 {
+            // Degenerate or unfetchable curve: cache returns 0 or 1
+            // sample. Skip — the loop continues with the next edge.
+            continue;
+        }
 
-        let (t_start, t_end) = if forward {
-            (edge.param_range.start, edge.param_range.end)
+        if forward {
+            // Emit samples[0 ..= n-2]; samples[n-1] (end vertex) is
+            // supplied by the next edge's start sample.
+            out.extend_from_slice(&samples[..n - 1]);
         } else {
-            (edge.param_range.end, edge.param_range.start)
-        };
-
-        // Decide sampling density. Closed edges are always curved; for
-        // open edges, a 3-point collinearity check decides whether to
-        // collapse to a single sample.
-        let is_closed_edge = edge.start_vertex == edge.end_vertex;
-        let n = if is_closed_edge {
-            compute_curve_sample_count(curve, t_start, t_end, params)
-        } else {
-            let mid = (t_start + t_end) * 0.5;
-            match (
-                curve.point_at(t_start),
-                curve.point_at(mid),
-                curve.point_at(t_end),
-            ) {
-                (Ok(p_start), Ok(p_mid), Ok(p_end)) => {
-                    let v1 = p_mid - p_start;
-                    let v2 = p_end - p_start;
-                    if v1.cross(&v2).magnitude() < COLLINEAR_TOL {
-                        1
-                    } else {
-                        compute_curve_sample_count(curve, t_start, t_end, params)
-                    }
-                }
-                _ => 1,
-            }
-        };
-
-        for j in 0..n {
-            let t = t_start + (j as f64) * (t_end - t_start) / (n as f64);
-            if let Ok(p) = curve.point_at(t) {
-                out.push(p);
+            // Walk the canonical sample sequence backwards. Emit
+            // samples[n-1 ..= 1]; samples[0] (canonical start, which
+            // is the reversed-edge's end) is supplied by the next
+            // edge's first sample.
+            for j in (1..n).rev() {
+                out.push(samples[j]);
             }
         }
     }
-}
-
-/// Compute the curvature-adaptive sample count for a curve segment.
-///
-/// Probes the curve with 16 uniform parametric samples and estimates
-/// two scalars from the resulting polyline:
-///
-/// * `total_length`  — sum of chord magnitudes (lower-bound on arc length).
-/// * `total_angle`   — sum of consecutive segment turn angles
-///   (lower-bound on total tangent rotation).
-///
-/// The sample count is then the strictest of three constraints, the
-/// same triple-guard used by `arc_steps_for_quality` for primitive
-/// surface grids:
-///
-/// 1. **max_edge_length** — `n_len = ceil(total_length / max_edge_length)`.
-/// 2. **max_angle_deviation** — `n_angle = ceil(total_angle / max_angle_deviation)`.
-/// 3. **chord_tolerance (sagitta)** — from the effective mean radius
-///    `r ≈ total_length / total_angle`, the per-segment subtended angle
-///    that keeps sagitta below the tolerance is
-///    `θ_seg = 2·acos(1 − chord_tolerance / r)`, giving
-///    `n_sag = ceil(total_angle / θ_seg)`.
-///
-/// This keeps face-boundary samples in lockstep with the cylindrical /
-/// spherical / conical / toroidal tessellators (which derive their
-/// step counts from the same triple-guard over the parametric span),
-/// so cap and lateral faces agree on every closed-circle boundary
-/// point. Watertightness then survives `weld_mesh_watertight_range`
-/// without relying on the welder's spatial tolerance as a safety net.
-fn compute_curve_sample_count(
-    curve: &dyn crate::primitives::curve::Curve,
-    t_start: f64,
-    t_end: f64,
-    params: &TessellationParams,
-) -> usize {
-    const PROBE: usize = 16;
-
-    // 16-point parametric probe → polyline.
-    let mut pts: Vec<Option<Point3>> = Vec::with_capacity(PROBE + 1);
-    pts.push(curve.point_at(t_start).ok());
-    for i in 1..=PROBE {
-        let t = t_start + (i as f64) * (t_end - t_start) / (PROBE as f64);
-        pts.push(curve.point_at(t).ok());
-    }
-
-    // Total chord length (lower-bound on arc length).
-    let mut total_length = 0.0_f64;
-    for i in 1..pts.len() {
-        if let (Some(a), Some(b)) = (pts[i - 1].as_ref(), pts[i].as_ref()) {
-            total_length += (*b - *a).magnitude();
-        }
-    }
-
-    // Total turning angle (lower-bound on tangent rotation). The probe
-    // misses up to one segment of curvature per endpoint, but for any
-    // reasonably refined curve this underestimate is small and we
-    // always clamp by min_segments afterwards.
-    let mut total_angle = 0.0_f64;
-    for i in 1..pts.len() - 1 {
-        if let (Some(a), Some(b), Some(c)) =
-            (pts[i - 1].as_ref(), pts[i].as_ref(), pts[i + 1].as_ref())
-        {
-            let v1 = *b - *a;
-            let v2 = *c - *b;
-            let m1 = v1.magnitude();
-            let m2 = v2.magnitude();
-            if m1 > 1e-12 && m2 > 1e-12 {
-                let cos_t = (v1.dot(&v2) / (m1 * m2)).clamp(-1.0, 1.0);
-                total_angle += cos_t.acos();
-            }
-        }
-    }
-
-    // 1. Arc-length constraint.
-    let n_len = if params.max_edge_length > 0.0 && total_length > 0.0 {
-        (total_length / params.max_edge_length).ceil() as usize
-    } else {
-        params.min_segments
-    };
-
-    // 2. Angle-deviation constraint.
-    let n_angle = if params.max_angle_deviation > 0.0 && total_angle > 0.0 {
-        (total_angle / params.max_angle_deviation).ceil() as usize
-    } else {
-        params.min_segments
-    };
-
-    // 3. Chord-height (sagitta) constraint. Effective radius is
-    //    r = total_length / total_angle (matches a circular arc
-    //    exactly, conservative for non-uniform curvature). For
-    //    sagitta < r, the per-segment angle is well-defined.
-    let n_sag = if params.chord_tolerance > 0.0 && total_angle > 1e-9 && total_length > 0.0 {
-        let radius = total_length / total_angle;
-        if params.chord_tolerance < radius {
-            let cos_half = 1.0 - params.chord_tolerance / radius;
-            let theta_seg = 2.0 * cos_half.acos();
-            if theta_seg > 0.0 {
-                (total_angle / theta_seg).ceil() as usize
-            } else {
-                params.min_segments
-            }
-        } else {
-            params.min_segments
-        }
-    } else {
-        params.min_segments
-    };
-
-    n_len
-        .max(n_angle)
-        .max(n_sag)
-        .max(params.min_segments.max(3))
-        .min(params.max_segments)
 }
 
 /// Triangulate a planar face's outer + (optional) inner loops in the
@@ -859,6 +727,7 @@ fn tessellate_cylindrical_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    _cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     // Tessellation is void-return; if the face's surface has gone missing
@@ -945,6 +814,7 @@ fn tessellate_spherical_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    _cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     let surface = match model.surfaces.get(face.surface_id) {
@@ -1251,6 +1121,7 @@ fn tessellate_conical_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    _cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     let surface = match model.surfaces.get(face.surface_id) {
@@ -1471,6 +1342,7 @@ fn tessellate_toroidal_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    _cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     let surface = match model.surfaces.get(face.surface_id) {
@@ -1650,6 +1522,7 @@ fn tessellate_nurbs_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     let surface = match model.surfaces.get(face.surface_id) {
@@ -1665,7 +1538,7 @@ fn tessellate_nurbs_face(
     // for any other curved generic surface (see the `_ =>` arm in
     // `tessellate_face`).
     tessellate_curved_adaptive(
-        surface, face, model, params, mesh, u_min, u_max, v_min, v_max,
+        surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
     );
 }
 
@@ -1703,18 +1576,206 @@ fn tessellate_fillet_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) {
+    // Cache-driven grid. The fillet face's outer loop has a fixed
+    // contract (`operations/fillet.rs:2715`):
+    //
+    //   [trim1 fwd, cap_v1 fwd, trim2 rev, cap_v0 fwd]
+    //
+    // The four edges define the four sides of a topological rectangle
+    // in parameter space:
+    //
+    //   v=0      row (u_idx 0..=u_steps) ↔ trim1 (canonical fwd)
+    //   v=v_max  row (u_idx 0..=u_steps) ↔ trim2 (canonical fwd)
+    //   u=0      column (v_idx 0..=v_steps) ↔ cap_v0 reversed
+    //   u=u_max  column (v_idx 0..=v_steps) ↔ cap_v1 (canonical fwd)
+    //
+    // Corner consistency (each derived from BOTH a row and a column):
+    //
+    //   (0, 0)             = trim1[0]  = cap_v0[len-1] = v_t1_start
+    //   (u_max, 0)         = trim1[end]= cap_v1[0]     = v_t1_end
+    //   (0, v_max)         = trim2[0]  = cap_v0[0]     = v_t2_start
+    //   (u_max, v_max)     = trim2[end]= cap_v1[end]   = v_t2_end
+    //
+    // Boundary cells take the exact cached samples; the adjacent face's
+    // tessellator hits the same cache (via `sample_loop_3d_polygon`) so
+    // both sides of every shared edge land on the same 3D points. This
+    // is the canonical-edge-sample pattern that eliminates T-junctions
+    // between the fillet face and the trimmed planar / cylindrical
+    // neighbours.
+    //
+    // For loops with !=4 edges (zero-radius degenerate fillets etc.)
+    // we fall back to the previous UV-grid sampler, which does NOT
+    // share its boundary with neighbours — acceptable for geometrically
+    // degenerate faces and rare in practice.
+    let Some(surface) = model.surfaces.get(face.surface_id) else {
+        return;
+    };
+    let Some(outer_loop) = model.loops.get(face.outer_loop) else {
+        return;
+    };
+
+    if outer_loop.edges.len() != 4 {
+        if outer_loop.edges.len() != 3 {
+            tracing::warn!(
+                edge_count = outer_loop.edges.len(),
+                "fillet face has unexpected loop edge count; using grid fallback"
+            );
+        }
+        tessellate_fillet_face_grid_fallback(face, model, params, mesh);
+        return;
+    }
+
+    let trim1 = cache.get_or_compute(outer_loop.edges[0], model);
+    let cap_v1 = cache.get_or_compute(outer_loop.edges[1], model);
+    let trim2 = cache.get_or_compute(outer_loop.edges[2], model);
+    let cap_v0 = cache.get_or_compute(outer_loop.edges[3], model);
+
+    if trim1.len() < 2 || trim2.len() < 2 || cap_v0.len() < 2 || cap_v1.len() < 2 {
+        tessellate_fillet_face_grid_fallback(face, model, params, mesh);
+        return;
+    }
+
+    // Grid resolution. Honouring the longer cache on each axis preserves
+    // every sample the cache decided was needed. When the trim caches
+    // agree in length (the common box-fillet / symmetric-blend case),
+    // no resampling occurs and every boundary sample lands on a cached
+    // point.
+    let u_steps = (trim1.len() - 1).max(trim2.len() - 1);
+    let v_steps = (cap_v0.len() - 1).max(cap_v1.len() - 1);
+
+    // Locally resample the shorter sequence by linear interpolation.
+    // This does NOT mutate the cache; if a neighbour reads the canonical
+    // (un-resampled) cache for the same edge, its boundary samples
+    // diverge from ours only on the shorter side. In the common case
+    // they agree by construction.
+    let trim1_r = resample_polyline_to_n(&trim1, u_steps + 1);
+    let trim2_r = resample_polyline_to_n(&trim2, u_steps + 1);
+    let cap_v0_r = resample_polyline_to_n(&cap_v0, v_steps + 1);
+    let cap_v1_r = resample_polyline_to_n(&cap_v1, v_steps + 1);
+
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let mut vertex_grid: Vec<Vec<Option<u32>>> = Vec::with_capacity(v_steps + 1);
+
+    for v_idx in 0..=v_steps {
+        let v_param = if v_steps == 0 {
+            v_min
+        } else {
+            v_min + (v_idx as f64) * (v_max - v_min) / (v_steps as f64)
+        };
+        let mut row = Vec::with_capacity(u_steps + 1);
+        for u_idx in 0..=u_steps {
+            let u_param = if u_steps == 0 {
+                u_min
+            } else {
+                u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64)
+            };
+
+            let position = if v_idx == 0 {
+                trim1_r[u_idx]
+            } else if v_idx == v_steps {
+                trim2_r[u_idx]
+            } else if u_idx == 0 {
+                // cap_v0 runs v_t2_start → v_t1_start, opposite to the
+                // v=0 → v=v_steps walk, so reverse-index.
+                cap_v0_r[v_steps - v_idx]
+            } else if u_idx == u_steps {
+                cap_v1_r[v_idx]
+            } else {
+                match surface.point_at(u_param, v_param) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        row.push(None);
+                        continue;
+                    }
+                }
+            };
+
+            let normal = face
+                .normal_at(u_param, v_param, &model.surfaces)
+                .unwrap_or(Vector3::Z);
+
+            let index = mesh.add_vertex(MeshVertex {
+                position,
+                normal,
+                uv: Some((u_param, v_param)),
+            });
+            row.push(Some(index));
+        }
+        vertex_grid.push(row);
+    }
+
+    let forward = face.orientation.is_forward();
+    for v_idx in 0..v_steps {
+        for u_idx in 0..u_steps {
+            let v0 = vertex_grid[v_idx][u_idx];
+            let v1 = vertex_grid[v_idx][u_idx + 1];
+            let v2 = vertex_grid[v_idx + 1][u_idx];
+            let v3 = vertex_grid[v_idx + 1][u_idx + 1];
+            if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (v0, v1, v2, v3) {
+                if forward {
+                    mesh.add_triangle(v0, v1, v2);
+                    mesh.add_triangle(v1, v3, v2);
+                } else {
+                    mesh.add_triangle(v0, v2, v1);
+                    mesh.add_triangle(v1, v2, v3);
+                }
+            }
+        }
+    }
+}
+
+/// Linear-interpolate a polyline of `Point3` samples to exactly `n`
+/// points. Endpoints are preserved; intermediates are obtained by
+/// arclength-parameter-uniform sampling of the cached polyline.
+///
+/// Used by `tessellate_fillet_face` to bridge an axis where the two
+/// boundary caches have different sample counts. Resampled points do
+/// NOT enter the cache.
+fn resample_polyline_to_n(samples: &[Point3], n: usize) -> Vec<Point3> {
+    use crate::math::Interpolate;
+    if samples.len() == n {
+        return samples.to_vec();
+    }
+    if n == 0 {
+        return Vec::new();
+    }
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if samples.len() == 1 || n == 1 {
+        return vec![samples[0]; n];
+    }
+    let src_last = samples.len() - 1;
+    let dst_last = n - 1;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64) * (src_last as f64) / (dst_last as f64);
+        let lo = (t.floor() as usize).min(src_last);
+        let hi = (lo + 1).min(src_last);
+        let frac = t - (lo as f64);
+        out.push(samples[lo].lerp(&samples[hi], frac));
+    }
+    out
+}
+
+/// Fallback grid sampler used when the fillet face's outer loop does
+/// not have the canonical 4-edge contract. Samples the UV grid
+/// directly from `surface.point_at` without consulting the edge cache,
+/// so boundary samples may not coincide with neighbours' samples
+/// (acceptable for degenerate / unexpected topology).
+fn tessellate_fillet_face_grid_fallback(
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
     mesh: &mut TriangleMesh,
 ) {
     let Some(surface) = model.surfaces.get(face.surface_id) else {
         return;
     };
 
-    // U-direction sample count: take the maximum of compute_curve_sample_count
-    // over every non-degenerate loop edge whose 3D length exceeds the
-    // maximum cap-edge length. The loop has 2 trim edges (long, curved
-    // along the spine) and 2 cap edges (short, straight). The trim edges
-    // dominate; using the max is robust if the loop is partially
-    // collapsed (3-sided degenerate case).
     let mut u_steps = params.min_segments.max(3);
     if let Some(outer_loop) = model.loops.get(face.outer_loop) {
         let mut longest_edge_len = 0.0_f64;
@@ -1728,7 +1789,6 @@ fn tessellate_fillet_face(
             };
             let t_start = edge.param_range.start;
             let t_end = edge.param_range.end;
-            // Chord-length probe: 16 sample sum, same as compute_curve_sample_count.
             let mut len = 0.0_f64;
             let mut prev = curve.point_at(t_start).ok();
             for i in 1..=16 {
@@ -1741,12 +1801,8 @@ fn tessellate_fillet_face(
             }
             if len > longest_edge_len {
                 longest_edge_len = len;
-                longest_edge_n = compute_curve_sample_count(
-                    curve,
-                    t_start,
-                    t_end,
-                    params,
-                );
+                longest_edge_n =
+                    compute_curve_sample_count(curve, t_start, t_end, params);
             }
         }
         if longest_edge_n > u_steps {
@@ -1754,8 +1810,6 @@ fn tessellate_fillet_face(
         }
     }
 
-    // V-direction sample count: chord-length probe along the arc at u=0.5,
-    // which traces the fillet's cross-section through the spine midpoint.
     let v_steps = {
         let mut arc_length = 0.0_f64;
         let mut prev = surface.point_at(0.5, 0.0).ok();
@@ -1777,8 +1831,6 @@ fn tessellate_fillet_face(
             .min(params.max_segments)
     };
 
-    // Generate the full UV grid. No inside-loop filter is needed — the
-    // parameter domain is exactly the face's interior plus boundary.
     let mut vertex_grid: Vec<Vec<Option<u32>>> = Vec::with_capacity(v_steps + 1);
     for v_idx in 0..=v_steps {
         let v = (v_idx as f64) / (v_steps as f64);
@@ -1802,9 +1854,6 @@ fn tessellate_fillet_face(
         vertex_grid.push(row);
     }
 
-    // Triangulate the grid. Winding follows `face.orientation` so
-    // emitted geometric normals match the stored vertex normals
-    // (which `face.normal_at` already flips for backward faces).
     let forward = face.orientation.is_forward();
     for v_idx in 0..v_steps {
         for u_idx in 0..u_steps {
@@ -2292,6 +2341,7 @@ fn tessellate_curved_adaptive(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
+    _cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
     u_min: f64,
     u_max: f64,

@@ -7,6 +7,7 @@
 //! kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::edge_cache::EdgeSampleCache;
 use super::{surface, TessellationParams, ThreeJsMesh, TriangleMesh};
 use crate::primitives::{face::Face, shell::Shell, solid::Solid, topology_builder::BRepModel};
 use parking_lot::Mutex;
@@ -21,9 +22,15 @@ pub fn tessellate_solid_parallel(
 ) -> ThreeJsMesh {
     let mut mesh = ThreeJsMesh::new();
 
+    // Shared canonical edge-sample cache across the whole solid. Cloned
+    // via `Arc` into each shell tessellator so rayon workers share the
+    // same DashMap (one writer per shard, lock-free reads after first
+    // population). See `tessellation::edge_cache` for invariants.
+    let cache = Arc::new(EdgeSampleCache::new(params));
+
     // Tessellate outer shell in parallel
     if let Some(shell) = model.shells.get(solid.outer_shell) {
-        let shell_mesh = tessellate_shell_parallel(shell, model, params);
+        let shell_mesh = tessellate_shell_parallel(shell, model, params, &cache);
         mesh.merge(&shell_mesh);
     }
 
@@ -35,7 +42,7 @@ pub fn tessellate_solid_parallel(
             model
                 .shells
                 .get(shell_id)
-                .map(|shell| tessellate_shell_parallel(shell, model, params))
+                .map(|shell| tessellate_shell_parallel(shell, model, params, &cache))
         })
         .collect();
 
@@ -51,6 +58,7 @@ pub fn tessellate_shell_parallel(
     shell: &Shell,
     model: &BRepModel,
     params: &TessellationParams,
+    cache: &Arc<EdgeSampleCache>,
 ) -> ThreeJsMesh {
     // Use rayon to process faces in parallel
     let face_meshes: Vec<ThreeJsMesh> = shell
@@ -59,7 +67,7 @@ pub fn tessellate_shell_parallel(
         .filter_map(|&face_id| {
             model.faces.get(face_id).map(|face| {
                 let mut face_mesh = TriangleMesh::new();
-                surface::tessellate_face(face, model, params, &mut face_mesh);
+                surface::tessellate_face(face, model, params, cache.as_ref(), &mut face_mesh);
                 face_mesh.to_threejs()
             })
         })
@@ -136,15 +144,24 @@ impl ParallelTessellator {
         face_complexities
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Process faces in parallel with work stealing
+        // Process faces in parallel with work stealing. The shared
+        // edge-sample cache makes per-face boundary samples coincide
+        // across rayon workers.
         let meshes = Arc::new(Mutex::new(Vec::new()));
+        let cache = Arc::new(EdgeSampleCache::new(&self.params));
 
         self.thread_pool.install(|| {
             face_complexities.par_iter().for_each(|&(idx, _)| {
                 if let Some(&face_id) = shell.faces.get(idx) {
                     if let Some(face) = model.faces.get(face_id) {
                         let mut face_mesh = TriangleMesh::new();
-                        surface::tessellate_face(face, model, &self.params, &mut face_mesh);
+                        surface::tessellate_face(
+                            face,
+                            model,
+                            &self.params,
+                            cache.as_ref(),
+                            &mut face_mesh,
+                        );
 
                         let mut meshes_guard = meshes.lock();
                         meshes_guard.push(face_mesh.to_threejs());
