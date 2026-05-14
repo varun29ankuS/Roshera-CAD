@@ -82,10 +82,25 @@ export function TopBar() {
   }, [clearScene])
 
   const handleDelete = useCallback(() => {
+    // Route through the canonical REST endpoint — the same one
+    // ModelTree's context menu uses — so the kernel, timeline, and
+    // viewport stay in sync. Local removal arrives via the
+    // `ObjectDeleted` broadcast (ws-bridge.ts); the previous
+    // implementation sent a `DeleteObject` WS command that had no
+    // backend handler.
     const state = useSceneStore.getState()
-    for (const id of state.selectedIds) {
-      wsClient.send({ type: 'Command', payload: { cmd: 'DeleteObject', object_id: id } })
-      state.removeObject(id)
+    const ids = Array.from(state.selectedIds)
+    for (const id of ids) {
+      void fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' })
+        .then((resp) => {
+          if (!resp.ok) {
+            return resp.text().catch(() => '').then((text) => {
+              console.error('[topbar] delete failed:', resp.status, text)
+            })
+          }
+          return undefined
+        })
+        .catch((err) => console.error('[topbar] delete error:', err))
     }
   }, [])
 
