@@ -2191,4 +2191,1233 @@ mod tests {
         assert!((probe.y + 1.0).abs() < 1e-6, "probe.y = {}", probe.y);
         assert!(probe.z.abs() < 1e-6, "probe.z = {}", probe.z);
     }
+
+    // ============================================================
+    // Slice A.1 expansion: comprehensive assembly test gauntlet.
+    //
+    // Targets coverage gaps in the production-grade scaffolding:
+    //   - ID and type-level invariants
+    //   - Construction surface (add_part / add_subassembly / add_mate)
+    //   - Every mate-type solver path (Parallel, Perpendicular,
+    //     Distance, Angle, Cam, Both-Fixed, Flipped)
+    //   - Helper math (compose, world_origin_direction,
+    //     signed_rotation_about_axis, matrix_to_correction)
+    //   - Suppression, DOF saturation, motion limits, exploded views,
+    //     interference checks, error variants
+    // ============================================================
+
+    // ---------- ID and type invariants ----------
+
+    #[test]
+    fn component_id_new_is_unique() {
+        let a = ComponentId::new();
+        let b = ComponentId::new();
+        assert_ne!(a, b, "two fresh ComponentIds must differ");
+    }
+
+    #[test]
+    fn component_id_default_matches_new_shape() {
+        let id = ComponentId::default();
+        // Default constructs via new(); cannot equal another default
+        // (UUID v4 entropy), but must be a non-nil Uuid.
+        assert_ne!(id.0, Uuid::nil());
+    }
+
+    #[test]
+    fn component_id_is_hashable_and_clonable() {
+        use std::collections::HashMap;
+        let id = ComponentId::new();
+        let cloned = id;
+        let mut m: HashMap<ComponentId, u32> = HashMap::new();
+        m.insert(id, 42);
+        assert_eq!(m.get(&cloned).copied(), Some(42));
+    }
+
+    #[test]
+    fn mate_id_new_is_unique() {
+        let a = MateId::new();
+        let b = MateId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mate_id_default_is_non_nil() {
+        assert_ne!(MateId::default().0, Uuid::nil());
+    }
+
+    #[test]
+    fn mate_id_is_hashable() {
+        use std::collections::HashMap;
+        let id = MateId::new();
+        let mut m: HashMap<MateId, &str> = HashMap::new();
+        m.insert(id, "x");
+        assert_eq!(m.get(&id).copied(), Some("x"));
+    }
+
+    #[test]
+    fn mate_reference_face_serializes_round_trip() {
+        let r = MateReference::Face {
+            face_id: Uuid::new_v4(),
+            normal: Vector3::new(0.0, 0.0, 1.0),
+        };
+        let json = serde_json::to_string(&r).expect("serialize Face ref");
+        let back: MateReference = serde_json::from_str(&json).expect("deserialize Face ref");
+        match back {
+            MateReference::Face { normal, .. } => {
+                assert!((normal.z - 1.0).abs() < 1e-9);
+            }
+            _ => panic!("variant mismatch after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn mate_reference_edge_axis_plane_point_all_exist() {
+        let _e = MateReference::Edge {
+            edge_id: Uuid::new_v4(),
+            direction: Vector3::new(1.0, 0.0, 0.0),
+        };
+        let _a = MateReference::Axis {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            direction: Vector3::new(0.0, 1.0, 0.0),
+        };
+        let _p = MateReference::Plane {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            normal: Vector3::new(0.0, 0.0, 1.0),
+        };
+        let _v = MateReference::Point {
+            position: Point3::new(1.0, 2.0, 3.0),
+        };
+    }
+
+    #[test]
+    fn mate_type_equality_and_clone() {
+        let a = MateType::Concentric;
+        let b = MateType::Concentric;
+        assert_eq!(a, b);
+        let c = MateType::Distance(5.0);
+        assert_eq!(c, MateType::Distance(5.0));
+        assert_ne!(c, MateType::Distance(5.1));
+        let g = MateType::Gear { ratio: 2.0 };
+        assert_eq!(g, MateType::Gear { ratio: 2.0 });
+        assert_ne!(g, MateType::Gear { ratio: 3.0 });
+    }
+
+    #[test]
+    fn mate_type_distance_carries_value() {
+        let d = MateType::Distance(7.5);
+        if let MateType::Distance(v) = d {
+            assert!((v - 7.5).abs() < 1e-12);
+        } else {
+            panic!("Distance variant lost its payload");
+        }
+    }
+
+    #[test]
+    fn mate_type_angle_carries_value() {
+        let a = MateType::Angle(std::f64::consts::FRAC_PI_3);
+        if let MateType::Angle(v) = a {
+            assert!((v - std::f64::consts::FRAC_PI_3).abs() < 1e-12);
+        } else {
+            panic!("Angle variant lost its payload");
+        }
+    }
+
+    // ---------- ComponentProperties / MotionLimits / ExplodedView defaults ----------
+
+    #[test]
+    fn component_properties_default_is_visible_unsuppressed() {
+        let p = ComponentProperties::default();
+        assert!(p.visible);
+        assert!(!p.suppressed);
+        assert!(p.mass.is_none());
+        assert!(p.material.is_none());
+        assert!(p.color.is_none());
+        assert!(p.custom.is_empty());
+    }
+
+    #[test]
+    fn component_properties_roundtrips_through_json() {
+        let mut p = ComponentProperties::default();
+        p.mass = Some(2.5);
+        p.material = Some("Steel".into());
+        p.color = Some([0.5, 0.5, 0.5, 1.0]);
+        p.custom.insert("vendor".into(), "Acme".into());
+        let s = serde_json::to_string(&p).expect("serialize");
+        let back: ComponentProperties = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.mass, Some(2.5));
+        assert_eq!(back.material.as_deref(), Some("Steel"));
+        assert_eq!(back.color.unwrap()[3], 1.0);
+        assert_eq!(back.custom.get("vendor").map(|s| s.as_str()), Some("Acme"));
+    }
+
+    #[test]
+    fn motion_limits_can_carry_linear_and_angular_bounds() {
+        let m = MotionLimits {
+            linear: Some([(-10.0, 10.0), (0.0, 0.0), (-1.0, 1.0)]),
+            angular: Some([
+                (0.0, std::f64::consts::PI),
+                (0.0, 0.0),
+                (0.0, std::f64::consts::TAU),
+            ]),
+            spring_constant: Some(100.0),
+            damping: Some(0.5),
+        };
+        let l = m.linear.unwrap();
+        assert_eq!(l[0].1, 10.0);
+        let a = m.angular.unwrap();
+        assert!((a[2].1 - std::f64::consts::TAU).abs() < 1e-12);
+    }
+
+    #[test]
+    fn explosion_step_carries_translation_and_optional_rotation() {
+        let s = ExplosionStep {
+            component: ComponentId::new(),
+            translation: Vector3::new(10.0, 0.0, 0.0),
+            rotation: None,
+            duration: 1.5,
+        };
+        assert_eq!(s.translation.x, 10.0);
+        assert!(s.rotation.is_none());
+        assert_eq!(s.duration, 1.5);
+    }
+
+    #[test]
+    fn exploded_view_config_default_state_is_step_zero() {
+        let c = ExplodedViewConfig {
+            steps: Vec::new(),
+            current_step: 0,
+            auto_explode: false,
+            scale: 1.0,
+        };
+        assert_eq!(c.current_step, 0);
+        assert!(c.steps.is_empty());
+        assert!(!c.auto_explode);
+    }
+
+    // ---------- Assembly construction ----------
+
+    #[test]
+    fn assembly_new_has_no_root_component() {
+        let a = Assembly::new("empty");
+        assert!(a.root_component.is_none());
+        assert_eq!(a.name, "empty");
+        assert!(a.components.is_empty());
+        assert!(a.mates.is_empty());
+        assert!(a.tree.is_empty());
+        assert!(a.exploded_config.is_none());
+    }
+
+    #[test]
+    fn assembly_id_is_unique_across_instances() {
+        let a = Assembly::new("a");
+        let b = Assembly::new("b");
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn first_added_part_becomes_root_and_is_fixed() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        assert_eq!(a.root_component, Some(c1));
+        let comp = a.get_component(c1).expect("present");
+        assert!(comp.is_fixed, "first part must be fixed by default");
+    }
+
+    #[test]
+    fn second_added_part_is_not_fixed() {
+        let mut a = Assembly::new("a");
+        let _c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let comp = a.get_component(c2).expect("present");
+        assert!(!comp.is_fixed);
+    }
+
+    #[test]
+    fn root_component_does_not_move_on_subsequent_adds() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let _ = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let _ = a.add_part(Arc::new(BRepModel::new()), "p3");
+        assert_eq!(a.root_component, Some(c1));
+    }
+
+    #[test]
+    fn add_part_starts_with_6_dof_and_no_parent() {
+        let mut a = Assembly::new("a");
+        let c = a.add_part(Arc::new(BRepModel::new()), "p");
+        let comp = a.get_component(c).expect("present");
+        assert_eq!(comp.degrees_of_freedom, 6);
+        assert!(comp.parent.is_none());
+        assert!(comp.mate_references.is_empty());
+    }
+
+    #[test]
+    fn add_part_inserts_into_tree() {
+        let mut a = Assembly::new("a");
+        let c = a.add_part(Arc::new(BRepModel::new()), "p");
+        assert!(a.tree.contains_key(&c));
+    }
+
+    #[test]
+    fn get_component_returns_none_for_unknown_id() {
+        let a = Assembly::new("a");
+        assert!(a.get_component(ComponentId::new()).is_none());
+    }
+
+    #[test]
+    fn components_iterator_yields_every_added_part() {
+        let mut a = Assembly::new("a");
+        for i in 0..5 {
+            a.add_part(Arc::new(BRepModel::new()), format!("p{i}"));
+        }
+        let count = a.components().count();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn mates_iterator_yields_every_added_mate() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let _ = a.add_mate(MateType::Coincident, c1, "r1", c2, "r2");
+        let _ = a.add_mate(MateType::Concentric, c1, "r1", c2, "r2");
+        assert_eq!(a.mates().count(), 2);
+    }
+
+    // ---------- add_subassembly ----------
+
+    #[test]
+    fn add_subassembly_inserts_parent_and_children() {
+        let mut sub = Assembly::new("sub");
+        sub.add_part(Arc::new(BRepModel::new()), "leaf1");
+        sub.add_part(Arc::new(BRepModel::new()), "leaf2");
+
+        let mut top = Assembly::new("top");
+        let parent = top.add_subassembly(sub, "subgroup", None);
+
+        // Parent stub + two cloned children = 3 components
+        assert_eq!(top.components.len(), 3);
+        let kids = top.tree.get(&parent).expect("tree entry");
+        assert_eq!(kids.len(), 2);
+        for kid_id in kids.iter() {
+            let kid = top.get_component(*kid_id).expect("kid present");
+            assert_eq!(kid.parent, Some(parent));
+        }
+    }
+
+    #[test]
+    fn add_subassembly_assigns_fresh_ids_to_cloned_children() {
+        let mut sub = Assembly::new("sub");
+        let original = sub.add_part(Arc::new(BRepModel::new()), "leaf");
+
+        let mut top = Assembly::new("top");
+        let _ = top.add_subassembly(sub, "group", None);
+
+        // The original id must NOT survive into top.
+        assert!(
+            top.get_component(original).is_none(),
+            "sub-assembly children must get fresh IDs"
+        );
+    }
+
+    #[test]
+    fn add_subassembly_copies_mates() {
+        let mut sub = Assembly::new("sub");
+        let s1 = sub.add_part(Arc::new(BRepModel::new()), "s1");
+        let s2 = sub.add_part(Arc::new(BRepModel::new()), "s2");
+        sub.add_mate(MateType::Coincident, s1, "r1", s2, "r2")
+            .expect("sub mate accepted");
+
+        let mut top = Assembly::new("top");
+        let _ = top.add_subassembly(sub, "group", None);
+        assert_eq!(top.mates.len(), 1);
+    }
+
+    // ---------- add_mate validation ----------
+
+    #[test]
+    fn add_mate_rejects_unknown_component1() {
+        let mut a = Assembly::new("a");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let bogus = ComponentId::new();
+        let err = a
+            .add_mate(MateType::Coincident, bogus, "r1", c2, "r2")
+            .expect_err("must reject unknown component");
+        match err {
+            AssemblyError::ComponentNotFound(id) => assert_eq!(id, bogus),
+            _ => panic!("wrong error variant"),
+        }
+    }
+
+    #[test]
+    fn add_mate_rejects_unknown_component2() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let bogus = ComponentId::new();
+        let err = a
+            .add_mate(MateType::Coincident, c1, "r1", bogus, "r2")
+            .expect_err("must reject unknown component");
+        match err {
+            AssemblyError::ComponentNotFound(id) => assert_eq!(id, bogus),
+            _ => panic!("wrong error variant"),
+        }
+    }
+
+    #[test]
+    fn add_mate_captures_gear_neutrals_only_for_gear() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+
+        a.add_mate(MateType::Coincident, c1, "a1", c2, "a2")
+            .expect("coincident accepted");
+        assert!(a.gear_neutrals.is_empty(), "non-gear mates must not seed neutrals");
+
+        a.add_mate(MateType::Gear { ratio: 1.5 }, c1, "a1", c2, "a2")
+            .expect("gear accepted");
+        assert_eq!(a.gear_neutrals.len(), 1);
+    }
+
+    #[test]
+    fn add_mate_default_flip_is_false_and_unsuppressed() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let id = a
+            .add_mate(MateType::Coincident, c1, "x", c2, "y")
+            .expect("accepted");
+        let m = a.mates.get(&id).expect("mate stored");
+        assert!(!m.flip);
+        assert!(!m.suppressed);
+    }
+
+    #[test]
+    fn add_mate_records_reference_names() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let id = a
+            .add_mate(MateType::Coincident, c1, "edgeA", c2, "edgeB")
+            .expect("accepted");
+        let m = a.mates.get(&id).expect("mate stored");
+        assert_eq!(m.reference1, "edgeA");
+        assert_eq!(m.reference2, "edgeB");
+    }
+
+    // ---------- Suppressed mate behaviour ----------
+
+    #[test]
+    fn suppressed_mate_does_not_drive_solver() {
+        let mut a = Assembly::new("a");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        {
+            let mut c2m = a.components.get_mut(&c2).unwrap();
+            c2m.transform = Matrix4::from_translation(&Vector3::new(0.0, 0.0, 12.0));
+        }
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, -1.0),
+        );
+        let id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("accepted");
+
+        // Suppress and force a re-solve by perturbing comp2.
+        {
+            let mut m = a.mates.get_mut(&id).expect("mate");
+            m.suppressed = true;
+        }
+        {
+            let mut c2m = a.components.get_mut(&c2).unwrap();
+            c2m.transform = Matrix4::from_translation(&Vector3::new(0.0, 0.0, 99.0));
+        }
+        a.solve_constraints().expect("solve ok");
+        let z = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .translation_vector()
+            .z;
+        assert!(
+            (z - 99.0).abs() < 1e-6,
+            "suppressed coincident mate must not pull comp2 onto z=0"
+        );
+    }
+
+    // ---------- Parallel / Perpendicular / Distance / Angle / Cam paths ----------
+
+    #[test]
+    fn parallel_mate_aligns_directions() {
+        let mut a = Assembly::new("parallel");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "movable");
+
+        // Anchor axis = +X; movable axis = +Y. Solver must rotate
+        // comp2 so its axis becomes (close to) +X.
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        );
+        a.add_mate(MateType::Parallel, c1, "a1", c2, "a2")
+            .expect("parallel accepted");
+
+        // After solve, transform_vector on comp2's local axis should be ≈ +X.
+        let v = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .transform_vector(&Vector3::new(0.0, 1.0, 0.0));
+        assert!((v.x - 1.0).abs() < 1e-6, "vx={}", v.x);
+        assert!(v.y.abs() < 1e-6);
+        assert!(v.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn perpendicular_mate_drives_dot_product_to_zero() {
+        let mut a = Assembly::new("perp");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "movable");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        // Movable starts at 45°, not 90°.
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(s, s, 0.0),
+        );
+        a.add_mate(MateType::Perpendicular, c1, "a1", c2, "a2")
+            .expect("perpendicular accepted");
+
+        let v = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .transform_vector(&Vector3::new(s, s, 0.0));
+        let dot = v.x; // anchor is +X
+        assert!(dot.abs() < 1e-6, "dot={}", dot);
+    }
+
+    #[test]
+    fn perpendicular_mate_handles_initially_parallel_directions() {
+        // The path that triggers the "rotate by π/2 about any perpendicular"
+        // branch in perpendicular_correction.
+        let mut a = Assembly::new("perp_parallel");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "movable");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        a.add_mate(MateType::Perpendicular, c1, "a1", c2, "a2")
+            .expect("perpendicular accepted");
+
+        let v = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        assert!(v.x.abs() < 1e-6, "after π/2 flip, v.x must be 0");
+    }
+
+    #[test]
+    fn distance_mate_drives_translation_to_target() {
+        let mut a = Assembly::new("distance");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "movable");
+        // Movable at (5, 0, 0) — anchor origin at world origin.
+        {
+            let mut c = a.components.get_mut(&c2).unwrap();
+            c.transform = Matrix4::from_translation(&Vector3::new(5.0, 0.0, 0.0));
+        }
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        a.add_mate(MateType::Distance(12.0), c1, "a1", c2, "a2")
+            .expect("distance accepted");
+
+        let t = a.get_component(c2).unwrap().transform.translation_vector();
+        let d = (t.x.powi(2) + t.y.powi(2) + t.z.powi(2)).sqrt();
+        assert!((d - 12.0).abs() < 1e-6, "distance={}", d);
+    }
+
+    #[test]
+    fn distance_mate_degenerate_zero_separation_picks_anchor_direction() {
+        // The branch where current_len < 1e-14: both origins coincide,
+        // solver falls back to anchor_dir for the translation direction.
+        let mut a = Assembly::new("distance_zero");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "movable");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        a.add_mate(MateType::Distance(4.0), c1, "a1", c2, "a2")
+            .expect("distance accepted");
+
+        let t = a.get_component(c2).unwrap().transform.translation_vector();
+        assert!(
+            (t.z - 4.0).abs() < 1e-6,
+            "fallback translation must follow anchor +Z, got tz={}",
+            t.z
+        );
+    }
+
+    #[test]
+    fn angle_mate_drives_to_target_angle() {
+        let mut a = Assembly::new("angle");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "movable");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        // Movable initially at +X (zero angle); drive to π/3.
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        );
+        a.add_mate(
+            MateType::Angle(std::f64::consts::FRAC_PI_3),
+            c1,
+            "a1",
+            c2,
+            "a2",
+        )
+        .expect("angle accepted");
+
+        let v = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        let cos_angle = v.x.clamp(-1.0, 1.0);
+        let measured = cos_angle.acos();
+        assert!(
+            (measured - std::f64::consts::FRAC_PI_3).abs() < 1e-6,
+            "measured angle = {} rad",
+            measured
+        );
+    }
+
+    #[test]
+    fn cam_mate_drives_origin_onto_anchor_plane() {
+        // Cam reduces to planar tangent: comp2's origin moves onto the
+        // plane defined by (anchor_origin, anchor_dir).
+        let mut a = Assembly::new("cam");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "anchor");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "follower");
+        {
+            let mut c = a.components.get_mut(&c2).unwrap();
+            c.transform = Matrix4::from_translation(&Vector3::new(1.0, 2.0, 5.0));
+        }
+        register_plane_reference(
+            &a,
+            c1,
+            "cam",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "fol",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        a.add_mate(MateType::Cam, c1, "cam", c2, "fol")
+            .expect("cam accepted");
+
+        let t = a.get_component(c2).unwrap().transform.translation_vector();
+        assert!(t.z.abs() < 1e-6, "follower must lie on z=0, got {}", t.z);
+        assert!((t.x - 1.0).abs() < 1e-6);
+        assert!((t.y - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn both_fixed_mate_records_diagnostic_does_not_corrupt_transforms() {
+        let mut a = Assembly::new("both_fixed");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        // Pin both as fixed.
+        {
+            let mut c = a.components.get_mut(&c2).unwrap();
+            c.is_fixed = true;
+            c.transform = Matrix4::from_translation(&Vector3::new(10.0, 0.0, 0.0));
+        }
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, -1.0),
+        );
+        let id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("accepted");
+
+        let m = a.mates.get(&id).expect("mate");
+        assert!(!m.solved);
+        let err = m.error.as_deref().unwrap_or("");
+        assert!(err.contains("both") || err.contains("fixed"));
+
+        // Comp2's transform must be unchanged.
+        let t = a.get_component(c2).unwrap().transform.translation_vector();
+        assert!((t.x - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_reference_on_movable_records_specific_diagnostic() {
+        let mut a = Assembly::new("missing_ref");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        // c2 has no reference registered.
+        let id = a
+            .add_mate(MateType::Coincident, c1, "p1", c2, "missing")
+            .expect("registered");
+        let m = a.mates.get(&id).expect("mate");
+        assert!(!m.solved);
+        let err = m.error.as_deref().unwrap_or("");
+        assert!(err.contains("missing"));
+    }
+
+    // ---------- set_component_transform / simulate_motion ----------
+
+    #[test]
+    fn set_component_transform_updates_and_resolves() {
+        let mut a = Assembly::new("set_t");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let new_t = Matrix4::from_translation(&Vector3::new(1.0, 2.0, 3.0));
+        a.set_component_transform(c2, new_t).expect("ok");
+        let t = a.get_component(c2).unwrap().transform.translation_vector();
+        assert!((t.x - 1.0).abs() < 1e-9);
+        assert!((t.y - 2.0).abs() < 1e-9);
+        assert!((t.z - 3.0).abs() < 1e-9);
+        let _ = c1;
+    }
+
+    #[test]
+    fn set_component_transform_errors_on_unknown_id() {
+        let mut a = Assembly::new("set_t_err");
+        let _ = a.add_part(Arc::new(BRepModel::new()), "p");
+        let err = a
+            .set_component_transform(ComponentId::new(), Matrix4::IDENTITY)
+            .expect_err("unknown id must error");
+        assert!(matches!(err, AssemblyError::ComponentNotFound(_)));
+    }
+
+    #[test]
+    fn simulate_motion_applies_translation() {
+        let mut a = Assembly::new("motion_t");
+        let _ = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        a.simulate_motion(c2, Vector3::new(2.0, 0.0, 0.0), None)
+            .expect("ok");
+        let t = a.get_component(c2).unwrap().transform.translation_vector();
+        assert!((t.x - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn simulate_motion_applies_rotation() {
+        let mut a = Assembly::new("motion_r");
+        let _ = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let q = Quaternion::from_axis_angle(
+            &Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("axis-angle valid");
+        a.simulate_motion(c2, Vector3::new(0.0, 0.0, 0.0), Some(q))
+            .expect("ok");
+        let v = a
+            .get_component(c2)
+            .unwrap()
+            .transform
+            .transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        assert!(v.x.abs() < 1e-6);
+        assert!((v.y - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn simulate_motion_unknown_component_is_noop_but_does_not_panic() {
+        // The current implementation silently noops on unknown id (it
+        // only mutates inside `if let Some(...)`); ensure it does not
+        // surface an error or panic.
+        let mut a = Assembly::new("motion_unknown");
+        let _ = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let result = a.simulate_motion(ComponentId::new(), Vector3::new(1.0, 0.0, 0.0), None);
+        assert!(result.is_ok());
+    }
+
+    // ---------- Exploded view ----------
+
+    #[test]
+    fn create_exploded_view_manual_returns_empty_steps() {
+        let mut a = Assembly::new("explode_m");
+        a.add_part(Arc::new(BRepModel::new()), "p1");
+        a.add_part(Arc::new(BRepModel::new()), "p2");
+        let c = a.create_exploded_view(false);
+        assert!(c.steps.is_empty());
+        assert!(!c.auto_explode);
+        assert!(a.exploded_config.is_some());
+    }
+
+    #[test]
+    fn create_exploded_view_auto_emits_step_per_non_root() {
+        let mut a = Assembly::new("explode_a");
+        a.add_part(Arc::new(BRepModel::new()), "root");
+        a.add_part(Arc::new(BRepModel::new()), "p2");
+        a.add_part(Arc::new(BRepModel::new()), "p3");
+        let c = a.create_exploded_view(true);
+        // Each non-root component gets a step.
+        assert_eq!(c.steps.len(), 2);
+        for s in &c.steps {
+            assert!(s.translation.magnitude() > 0.0);
+            assert!(s.duration > 0.0);
+        }
+    }
+
+    #[test]
+    fn create_exploded_view_overwrites_previous_config() {
+        let mut a = Assembly::new("explode_overwrite");
+        a.add_part(Arc::new(BRepModel::new()), "p1");
+        let _ = a.create_exploded_view(false);
+        let c2 = a.create_exploded_view(true);
+        assert_eq!(a.exploded_config.as_ref().unwrap().auto_explode, c2.auto_explode);
+    }
+
+    // ---------- Interferences / bounding box ----------
+
+    #[test]
+    fn check_interferences_returns_empty_for_isolated_parts() {
+        // The current implementation stubs `components_interfere` to
+        // false; pin the contract so we'll catch a real impl regression.
+        let mut a = Assembly::new("int");
+        a.add_part(Arc::new(BRepModel::new()), "p1");
+        a.add_part(Arc::new(BRepModel::new()), "p2");
+        let v = a.check_interferences();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn get_bounding_box_none_for_empty_assembly() {
+        let a = Assembly::new("bb_empty");
+        assert!(a.get_bounding_box().is_none());
+    }
+
+    #[test]
+    fn get_bounding_box_some_when_unsuppressed_part_present() {
+        let mut a = Assembly::new("bb_one");
+        a.add_part(Arc::new(BRepModel::new()), "p");
+        assert!(a.get_bounding_box().is_some());
+    }
+
+    // ---------- Internal helper math ----------
+
+    #[test]
+    fn world_origin_direction_face_returns_only_direction() {
+        let r = MateReference::Face {
+            face_id: Uuid::new_v4(),
+            normal: Vector3::new(0.0, 0.0, 1.0),
+        };
+        let (o, d) = world_origin_direction(&r, &Matrix4::IDENTITY);
+        assert!(o.is_none());
+        let dv = d.expect("direction present");
+        assert!((dv.z - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn world_origin_direction_edge_returns_only_direction() {
+        let r = MateReference::Edge {
+            edge_id: Uuid::new_v4(),
+            direction: Vector3::new(1.0, 0.0, 0.0),
+        };
+        let (o, d) = world_origin_direction(&r, &Matrix4::IDENTITY);
+        assert!(o.is_none());
+        assert!(d.is_some());
+    }
+
+    #[test]
+    fn world_origin_direction_point_returns_only_origin() {
+        let r = MateReference::Point {
+            position: Point3::new(3.0, 4.0, 5.0),
+        };
+        let (o, d) = world_origin_direction(&r, &Matrix4::IDENTITY);
+        let ov = o.expect("origin present");
+        assert!((ov.x - 3.0).abs() < 1e-9);
+        assert!(d.is_none());
+    }
+
+    #[test]
+    fn world_origin_direction_axis_and_plane_carry_both() {
+        let r1 = MateReference::Axis {
+            origin: Point3::new(1.0, 0.0, 0.0),
+            direction: Vector3::new(1.0, 0.0, 0.0),
+        };
+        let (o, d) = world_origin_direction(&r1, &Matrix4::IDENTITY);
+        assert!(o.is_some() && d.is_some());
+        let r2 = MateReference::Plane {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            normal: Vector3::new(0.0, 1.0, 0.0),
+        };
+        let (o, d) = world_origin_direction(&r2, &Matrix4::IDENTITY);
+        assert!(o.is_some() && d.is_some());
+    }
+
+    #[test]
+    fn world_origin_direction_applies_transform_to_point() {
+        let r = MateReference::Point {
+            position: Point3::new(0.0, 0.0, 0.0),
+        };
+        let t = Matrix4::from_translation(&Vector3::new(1.0, 2.0, 3.0));
+        let (o, _) = world_origin_direction(&r, &t);
+        let ov = o.expect("origin");
+        assert!((ov.x - 1.0).abs() < 1e-9);
+        assert!((ov.y - 2.0).abs() < 1e-9);
+        assert!((ov.z - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compose_without_rotation_is_pure_translation() {
+        let c = compose(None, Vector3::new(1.0, 2.0, 3.0));
+        assert!((c.translation.x - 1.0).abs() < 1e-9);
+        assert!(c.rotation_angle.abs() < 1e-9);
+    }
+
+    #[test]
+    fn compose_with_rotation_sums_translation() {
+        let rot = RigidCorrection::pure_rotation(
+            Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_2,
+            Point3::new(0.0, 0.0, 0.0),
+        );
+        let c = compose(Some(rot), Vector3::new(1.0, 0.0, 0.0));
+        // Rotation preserved, translation added.
+        assert!((c.rotation_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+        assert!((c.translation.x - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rigid_correction_pure_translation_to_matrix_only_shifts() {
+        let c = RigidCorrection::pure_translation(Vector3::new(2.0, 3.0, 4.0));
+        let m = c.to_matrix();
+        let t = m.translation_vector();
+        assert!((t.x - 2.0).abs() < 1e-9);
+        let v = m.transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        assert!((v.x - 1.0).abs() < 1e-9);
+        assert!(v.y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn rigid_correction_pure_rotation_to_matrix_rotates_about_axis() {
+        let c = RigidCorrection::pure_rotation(
+            Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_2,
+            Point3::new(0.0, 0.0, 0.0),
+        );
+        let m = c.to_matrix();
+        let v = m.transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        assert!(v.x.abs() < 1e-6);
+        assert!((v.y - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rigid_correction_zero_angle_collapses_rotation_to_identity() {
+        let c = RigidCorrection::pure_rotation(
+            Vector3::new(0.0, 0.0, 1.0),
+            0.0,
+            Point3::new(0.0, 0.0, 0.0),
+        );
+        let m = c.to_matrix();
+        let v = m.transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+        assert!((v.x - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn signed_rotation_about_axis_returns_zero_for_identity() {
+        let r = signed_rotation_about_axis(&Matrix4::IDENTITY, Vector3::new(0.0, 0.0, 1.0))
+            .expect("ok");
+        assert!(r.abs() < 1e-12);
+    }
+
+    #[test]
+    fn signed_rotation_about_axis_measures_z_rotation() {
+        let q = Quaternion::from_axis_angle(
+            &Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_3,
+        )
+        .expect("axis-angle valid");
+        let m = q.to_matrix4();
+        let r = signed_rotation_about_axis(&m, Vector3::new(0.0, 0.0, 1.0)).expect("ok");
+        assert!(
+            (r - std::f64::consts::FRAC_PI_3).abs() < 1e-9,
+            "r={}",
+            r
+        );
+    }
+
+    #[test]
+    fn signed_rotation_about_axis_sign_flips_with_axis_negation() {
+        let q = Quaternion::from_axis_angle(
+            &Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_4,
+        )
+        .expect("axis-angle valid");
+        let m = q.to_matrix4();
+        let r_pos = signed_rotation_about_axis(&m, Vector3::new(0.0, 0.0, 1.0)).expect("ok");
+        let r_neg = signed_rotation_about_axis(&m, Vector3::new(0.0, 0.0, -1.0)).expect("ok");
+        assert!((r_pos + r_neg).abs() < 1e-9, "{} + {} ≠ 0", r_pos, r_neg);
+    }
+
+    #[test]
+    fn matrix_to_correction_recovers_pure_translation() {
+        let m = Matrix4::from_translation(&Vector3::new(2.0, 3.0, 4.0));
+        let c = matrix_to_correction(&m).expect("ok");
+        assert!((c.translation.x - 2.0).abs() < 1e-9);
+        assert!((c.translation.y - 3.0).abs() < 1e-9);
+        assert!((c.translation.z - 4.0).abs() < 1e-9);
+        assert!(c.rotation_angle.abs() < 1e-9);
+    }
+
+    #[test]
+    fn matrix_to_correction_recovers_rotation_angle() {
+        let q = Quaternion::from_axis_angle(
+            &Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("axis-angle valid");
+        let m = q.to_matrix4();
+        let c = matrix_to_correction(&m).expect("ok");
+        assert!((c.rotation_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    // ---------- DOF tracking ----------
+
+    #[test]
+    fn dof_drops_by_constraint_arithmetic() {
+        let mut a = Assembly::new("dof");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        a.add_mate(MateType::Coincident, c1, "p1", c2, "p2")
+            .expect("ok");
+        let comp = a.get_component(c2).expect("present");
+        // Coincident removes 3 DOF: 6 - 3 = 3.
+        assert_eq!(comp.degrees_of_freedom, 3);
+    }
+
+    #[test]
+    fn dof_saturates_at_zero_when_over_constrained() {
+        let mut a = Assembly::new("dof_sat");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_plane_reference(
+            &a,
+            c1,
+            "p1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_plane_reference(
+            &a,
+            c2,
+            "p2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        // Lock removes all 6.
+        a.add_mate(MateType::Lock, c1, "p1", c2, "p2").expect("ok");
+        // Pile on another Lock to test saturating_sub.
+        a.add_mate(MateType::Lock, c1, "p1", c2, "p2").expect("ok");
+        let comp = a.get_component(c2).expect("present");
+        assert_eq!(comp.degrees_of_freedom, 0);
+    }
+
+    // ---------- Error variants ----------
+
+    #[test]
+    fn assembly_error_component_not_found_renders_id() {
+        let id = ComponentId::new();
+        let err = AssemblyError::ComponentNotFound(id);
+        let msg = format!("{}", err);
+        assert!(msg.contains("Component not found"));
+    }
+
+    #[test]
+    fn assembly_error_reference_not_found_renders_name() {
+        let err = AssemblyError::ReferenceNotFound("face_top".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("face_top"));
+    }
+
+    #[test]
+    fn assembly_error_solver_failed_renders_detail() {
+        let err = AssemblyError::SolverFailed("singular matrix".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("Solver failed"));
+        assert!(msg.contains("singular matrix"));
+    }
+
+    #[test]
+    fn assembly_error_over_constrained_is_distinct() {
+        let a = AssemblyError::OverConstrained;
+        let b = AssemblyError::ConflictingConstraints;
+        // Both are unit variants; their Debug representation must differ.
+        assert_ne!(format!("{:?}", a), format!("{:?}", b));
+    }
+
+    // ---------- Suppressed gear mate ----------
+
+    #[test]
+    fn gear_neutrals_are_keyed_by_mate_id() {
+        let mut a = Assembly::new("gear_keys");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        register_axis_reference(
+            &a,
+            c1,
+            "a1",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        register_axis_reference(
+            &a,
+            c2,
+            "a2",
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        let m1 = a
+            .add_mate(MateType::Gear { ratio: 2.0 }, c1, "a1", c2, "a2")
+            .expect("ok");
+        let m2 = a
+            .add_mate(MateType::Gear { ratio: 3.0 }, c1, "a1", c2, "a2")
+            .expect("ok");
+        assert_eq!(a.gear_neutrals.len(), 2);
+        assert!(a.gear_neutrals.contains_key(&m1));
+        assert!(a.gear_neutrals.contains_key(&m2));
+    }
+
+    #[test]
+    fn flip_flag_persists_on_stored_mate() {
+        let mut a = Assembly::new("flip");
+        let c1 = a.add_part(Arc::new(BRepModel::new()), "p1");
+        let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
+        let id = a
+            .add_mate(MateType::Parallel, c1, "x", c2, "y")
+            .expect("ok");
+        {
+            let mut m = a.mates.get_mut(&id).expect("mate");
+            m.flip = true;
+        }
+        let stored = a.mates.get(&id).expect("mate");
+        assert!(stored.flip);
+    }
 }
