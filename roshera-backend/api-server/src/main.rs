@@ -71,6 +71,7 @@ use regex::Regex;
 
 // Import handler implementations
 use handlers_impl::*;
+use part_mgr::ActiveModel;
 
 // Import handlers - modules are now in separate files
 use handlers::*;
@@ -332,27 +333,30 @@ use std::error::Error as StdError;
 
 async fn get_geometry_wrapper(
     State(state): State<AppState>,
+    active_model: ActiveModel,
     Path(id): Path<String>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    get_geometry(Extension(auth_info), State(state), Path(id)).await
+    get_geometry(Extension(auth_info), State(state), active_model, Path(id)).await
 }
 
 async fn update_geometry_wrapper(
     State(state): State<AppState>,
+    active_model: ActiveModel,
     Path(id): Path<String>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, error_catalog::ApiError> {
-    update_geometry(State(state), Path(id), Json(payload), auth_info).await
+    update_geometry(State(state), active_model, Path(id), Json(payload), auth_info).await
 }
 
 async fn delete_geometry_wrapper(
     State(state): State<AppState>,
+    active_model: ActiveModel,
     Path(id): Path<String>,
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
-    delete_geometry(Extension(auth_info), State(state), Path(id)).await
+    delete_geometry(Extension(auth_info), State(state), active_model, Path(id)).await
 }
 
 async fn process_enhanced_ai_command_wrapper(
@@ -460,6 +464,7 @@ async fn list_roles_wrapper(
 /// ```
 async fn create_geometry(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -590,7 +595,7 @@ async fn create_geometry(
     // solids — runs under a separate read lock below so concurrent
     // writers aren't blocked on geometry that's already been built.
     let solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         let mut builder = TopologyBuilder::new(&mut model);
 
         let result = match shape_type.as_str() {
@@ -699,7 +704,7 @@ async fn create_geometry(
     // readers (frame renders, exports) proceed concurrently and — more
     // importantly — never blocks an in-flight writer behind us.
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(solid_id)
@@ -866,6 +871,7 @@ async fn tx_commit(
 /// matches the discipline used elsewhere in the server.
 async fn tx_rollback(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let tx_id = Uuid::parse_str(&id).map_err(|_| {
@@ -881,7 +887,7 @@ async fn tx_rollback(
     // preserving the codebase's "model first, tx second" lock order
     // for any future code path that holds both.
     {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         for sid in &solids {
             model.solids.remove(*sid);
         }
@@ -915,6 +921,7 @@ async fn tx_rollback(
 /// list of the operand UUIDs the frontend should drop from its scene.
 async fn boolean_operation(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -988,7 +995,7 @@ async fn boolean_operation(
     // — read-only and potentially expensive — runs under a read lock so
     // concurrent writers aren't blocked on geometry that's already built.
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         kernel_boolean(
             &mut model,
             solid_a,
@@ -1001,7 +1008,7 @@ async fn boolean_operation(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -1120,6 +1127,7 @@ async fn boolean_operation(
 /// the hollow solid replacing the original).
 async fn shell_solid(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -1197,7 +1205,7 @@ async fn shell_solid(
     // pattern as boolean_operation. Tessellation runs under read.
     let thickness_abs = thickness.abs();
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         kernel_offset_solid(
             &mut model,
             solid_id,
@@ -1214,7 +1222,7 @@ async fn shell_solid(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -1311,6 +1319,7 @@ async fn shell_solid(
 /// of the original body event rather than replacing it.
 async fn mirror_solid(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -1391,7 +1400,7 @@ async fn mirror_solid(
     // runs under a read lock so concurrent writers aren't blocked. Same
     // pattern as boolean_operation / shell_solid.
     {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         kernel_mirror(
             &mut model,
             vec![solid_id],
@@ -1403,7 +1412,7 @@ async fn mirror_solid(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(solid_id)
@@ -1492,6 +1501,7 @@ async fn mirror_solid(
 /// the body event, matching SolidWorks / Fusion behaviour.
 async fn fillet_edges_endpoint(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -1672,7 +1682,7 @@ async fn fillet_edges_endpoint(
     //     filleted; slice 3 will add per-edge options to the kernel
     //     for atomic apply.
     {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         if uniform {
             let opts = FilletOptions {
                 fillet_type: FilletType::Constant(radii_resolved[0]),
@@ -1695,7 +1705,7 @@ async fn fillet_edges_endpoint(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(solid_id)
@@ -1781,6 +1791,7 @@ async fn fillet_edges_endpoint(
 /// Fillet.
 async fn chamfer_edges_endpoint(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -1848,7 +1859,7 @@ async fn chamfer_edges_endpoint(
     })?;
 
     {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         let opts = ChamferOptions {
             chamfer_type: ChamferType::EqualDistance(distance),
             distance1: distance,
@@ -1861,7 +1872,7 @@ async fn chamfer_edges_endpoint(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(solid_id)
@@ -1954,6 +1965,7 @@ async fn chamfer_edges_endpoint(
 /// ```
 async fn pattern_linear_endpoint(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -2043,7 +2055,7 @@ async fn pattern_linear_endpoint(
         // Clone + transform under a single write lock per instance.
         // Tessellation runs under a read lock immediately after.
         let new_solid_id = {
-            let mut model = state.model.write().await;
+            let mut model = model_handle.write().await;
             let cloned = deep_clone_solid(&mut model, solid_id, None)
                 .map_err(ApiError::kernel_error)?;
             transform_solid(
@@ -2057,7 +2069,7 @@ async fn pattern_linear_endpoint(
         };
 
         let tri_mesh = {
-            let model = state.model.read().await;
+            let model = model_handle.read().await;
             let solid = model
                 .solids
                 .get(new_solid_id)
@@ -2122,6 +2134,7 @@ async fn pattern_linear_endpoint(
 /// ```
 async fn pattern_circular_endpoint(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -2227,7 +2240,7 @@ async fn pattern_circular_endpoint(
         })?;
 
         let new_solid_id = {
-            let mut model = state.model.write().await;
+            let mut model = model_handle.write().await;
             let cloned = deep_clone_solid(&mut model, solid_id, None)
                 .map_err(ApiError::kernel_error)?;
             transform_solid(&mut model, cloned, rot, TransformOptions::default())
@@ -2236,7 +2249,7 @@ async fn pattern_circular_endpoint(
         };
 
         let tri_mesh = {
-            let model = state.model.read().await;
+            let model = model_handle.read().await;
             let solid = model
                 .solids
                 .get(new_solid_id)
@@ -2307,6 +2320,7 @@ async fn pattern_circular_endpoint(
 /// payload.
 async fn create_extrude(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -2399,7 +2413,7 @@ async fn create_extrude(
     // Build profile edges + run extrude under a single write lock so a
     // concurrent request can't observe a half-built sketch.
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
 
         let mut profile_edges = Vec::with_capacity(points.len());
         for i in 0..points.len() {
@@ -2446,7 +2460,7 @@ async fn create_extrude(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -2537,6 +2551,7 @@ async fn create_extrude(
 /// merges it into the existing scene row.
 async fn extrude_face_endpoint(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -2578,7 +2593,7 @@ async fn extrude_face_endpoint(
         )
     })?;
     {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(host_solid_id)
@@ -2633,7 +2648,7 @@ async fn extrude_face_endpoint(
             )
         }
         None => {
-            let model = state.model.read().await;
+            let model = model_handle.read().await;
             let face = model.faces.get(face_id).ok_or_else(|| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
@@ -2650,7 +2665,7 @@ async fn extrude_face_endpoint(
     };
 
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         let options = ExtrudeOptions {
             direction,
             distance,
@@ -2660,7 +2675,7 @@ async fn extrude_face_endpoint(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -2759,6 +2774,7 @@ async fn extrude_face_endpoint(
 /// ```
 async fn preview_face_extrude(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -2803,7 +2819,7 @@ async fn preview_face_extrude(
     // lock — same shape as the commit endpoint, so a drag tick that
     // would commit-fail doesn't even enter the write phase here.
     let direction = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(host_solid_id)
@@ -2878,7 +2894,7 @@ async fn preview_face_extrude(
         ),
         ApiError,
     > = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         let saved_recorder = model.attach_recorder(None);
         let snap = ModelSnapshot::take(&model);
 
@@ -3401,7 +3417,8 @@ fn extract_arc_parameters(
 /// canonical UUID-keyed lookups go through the scene endpoints.
 async fn get_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if !auth_info.permissions.contains(&Permission::ViewGeometry) {
@@ -3413,7 +3430,7 @@ async fn get_geometry(
         StatusCode::BAD_REQUEST
     })?;
 
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let solid = model.solids.get(solid_id).ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(serde_json::json!({
@@ -3435,7 +3452,8 @@ async fn get_geometry(
 /// We still gate on permissions and validate that the solid exists, so
 /// callers see `403`/`404` before the architectural `405`.
 async fn update_geometry(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
     auth_info: auth_middleware::AuthInfo,
@@ -3451,7 +3469,7 @@ async fn update_geometry(
         )
         .with_details(serde_json::json!({ "received": id }))
     })?;
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     if model.solids.get(solid_id).is_none() {
         return Err(error_catalog::ApiError::solid_not_found(solid_id));
     }
@@ -3486,6 +3504,7 @@ async fn update_geometry(
 async fn delete_geometry(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
@@ -3506,7 +3525,7 @@ async fn delete_geometry(
         })?;
         (parsed, solid_id)
     } else if let Ok(numeric) = id.parse::<u32>() {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         if model.solids.get(numeric).is_none() {
             return Err(ApiError::solid_not_found(numeric));
         }
@@ -3546,7 +3565,7 @@ async fn delete_geometry(
     // solid — without it the resurrected solid would appear under a
     // fresh v4 UUID, losing selection / outliner / AI references.
     {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
         if let Err(e) = geometry_engine::operations::delete::delete_solid(
             &mut model, solid_id, /* cascade */ true,
         ) {
@@ -4446,7 +4465,10 @@ fn build_object_created_frame(
 /// scratch solids (none today, but a hedge against future use) stay
 /// invisible to the wire.
 pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
-    let model = state.model.read().await;
+    // NOTE: WS on-connect helper — no ActiveModel header available, stays on
+    // legacy default model until WS handshake learns to thread X-Roshera-Part-Id.
+    let legacy_model = &state.model;
+    let model = legacy_model.read().await;
     let mut frames = Vec::new();
     for entry in state.local_to_uuid.iter() {
         let solid_id = *entry.key();
