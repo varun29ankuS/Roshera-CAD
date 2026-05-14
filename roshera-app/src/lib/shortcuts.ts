@@ -1,7 +1,6 @@
 import { useEffect } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
-import { wsClient } from './ws-client'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -174,14 +173,30 @@ export function useKeyboardShortcuts() {
           state.setCameraPreset('isometric')
           break
 
-        // Delete selected
+        // Delete selected. Route through the canonical REST endpoint —
+        // the same one ModelTree's context menu uses — so the kernel,
+        // timeline, and viewport stay in sync. Local removal happens via
+        // the `ObjectDeleted` broadcast (ws-bridge.ts) so a server-side
+        // failure leaves the scene in sync with the kernel rather than
+        // creating ghosts. The previous implementation sent a
+        // `DeleteObject` WS command that had no backend handler, so the
+        // object vanished from the viewport but persisted in the kernel.
         case 'delete':
         case 'backspace':
           if (!ctrl) {
             e.preventDefault()
-            for (const id of state.selectedIds) {
-              wsClient.send({ type: 'Command', payload: { cmd: 'DeleteObject', object_id: id } })
-              state.removeObject(id)
+            const ids = Array.from(state.selectedIds)
+            for (const id of ids) {
+              void fetch(`${API_BASE}/api/geometry/${id}`, { method: 'DELETE' })
+                .then((resp) => {
+                  if (!resp.ok) {
+                    return resp.text().catch(() => '').then((text) => {
+                      console.error('[shortcuts] delete failed:', resp.status, text)
+                    })
+                  }
+                  return undefined
+                })
+                .catch((err) => console.error('[shortcuts] delete error:', err))
             }
           }
           break
