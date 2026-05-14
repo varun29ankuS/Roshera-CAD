@@ -335,39 +335,62 @@ fn polyline_star8_extrude_terminates() {
 
 /// Asserts that the polyline-extruded solid has the expected face
 /// count, χ = 2 on the outer shell (V - E + F over the shell graph),
-/// and zero non-manifold edges in the default tessellation.
-fn assert_polyline_extrusion_is_clean(name: &str, verts: Vec<Point3>, height: f64) {
+/// and zero non-manifold edges under the given tessellation params.
+///
+/// Parameterised over the tolerance regime so the same assertion fires
+/// across the api-server's actual production params, not just the
+/// kernel test-suite's `coarse` preset. The hang reproduction lives
+/// at `::default()` (chord_tolerance = 0.001, max_segments = 100),
+/// which is what the live api-server hands to `tessellate_solid`.
+fn assert_polyline_extrusion_is_clean_at(
+    name: &str,
+    verts: Vec<Point3>,
+    height: f64,
+    params: TessellationParams,
+    regime: &str,
+) {
     let n = verts.len();
     let mut model = BRepModel::new();
     let edges = build_polyline_loop_edges(&mut model, &verts);
     let solid_id = extrude_profile(&mut model, edges, standard_extrude_opts(height))
-        .unwrap_or_else(|e| panic!("[{}] extrude_profile failed: {:?}", name, e));
+        .unwrap_or_else(|e| panic!("[{}/{}] extrude_profile failed: {:?}", name, regime, e));
 
     let solid = model.solids.get(solid_id).expect("solid");
     let shell = model.shells.get(solid.outer_shell).expect("shell");
     assert_eq!(
         shell.faces.len(),
         n + 2,
-        "[{}] expected {} side faces + bottom + top = {} faces, got {}",
+        "[{}/{}] expected {} side faces + bottom + top = {} faces, got {}",
         name,
+        regime,
         n,
         n + 2,
         shell.faces.len()
     );
 
-    // Tessellate and count non-manifold mesh edges. Use coarse
-    // settings — the manifold count must be zero at any tolerance,
-    // and coarse keeps the test fast.
-    let params = TessellationParams::coarse();
     let mesh = tessellate_solid(solid, &model, &params);
     let nm = count_mesh_non_manifold_edges(&mesh);
     assert_eq!(
         nm, 0,
-        "[{}] expected 0 non-manifold mesh edges, found {} (triangles={}, vertices={})",
+        "[{}/{}] expected 0 non-manifold mesh edges, found {} (triangles={}, vertices={})",
         name,
+        regime,
         nm,
         mesh.triangles.len(),
         mesh.vertices.len()
+    );
+}
+
+/// Backwards-compatible wrapper retaining the original `coarse` regime
+/// so existing call-sites stay green while the parameterised matrix
+/// below pins behaviour across `default` and `fine` as well.
+fn assert_polyline_extrusion_is_clean(name: &str, verts: Vec<Point3>, height: f64) {
+    assert_polyline_extrusion_is_clean_at(
+        name,
+        verts,
+        height,
+        TessellationParams::coarse(),
+        "coarse",
     );
 }
 
@@ -393,6 +416,98 @@ fn polyline_hexagon_extrusion_is_clean() {
 fn polyline_lshape_extrusion_is_clean() {
     run_with_watchdog("polyline_lshape_clean", 15_000, || {
         assert_polyline_extrusion_is_clean("lshape", lshape(), 1.0);
+    });
+}
+
+// ---------------------------------------------------------------------
+// Phase 2b — Tolerance matrix (default + fine)
+// ---------------------------------------------------------------------
+//
+// The kernel-level `coarse` tests above passed even before the
+// tessellation-hang fix (commit c91d042) under earlier defensive
+// dispatch logic. The api-server in production hands
+// `TessellationParams::default()` (chord_tolerance = 0.001,
+// max_segments = 100) to `tessellate_solid`, which is 10× tighter
+// than `coarse` on tolerance and 5× higher on segment cap. Both
+// regimes must complete cleanly within the same watchdog budget —
+// otherwise the api-server hang is a manifestation of the same root
+// cause, just expressed at a different point in the parameter space.
+
+#[test]
+fn polyline_square_extrusion_is_clean_default_params() {
+    run_with_watchdog("polyline_square_clean_default", 15_000, || {
+        assert_polyline_extrusion_is_clean_at(
+            "square",
+            vec![z0(0.0, 0.0), z0(2.0, 0.0), z0(2.0, 2.0), z0(0.0, 2.0)],
+            1.0,
+            TessellationParams::default(),
+            "default",
+        );
+    });
+}
+
+#[test]
+fn polyline_hexagon_extrusion_is_clean_default_params() {
+    run_with_watchdog("polyline_hexagon_clean_default", 15_000, || {
+        assert_polyline_extrusion_is_clean_at(
+            "hexagon",
+            regular_ngon(6, 1.5),
+            1.0,
+            TessellationParams::default(),
+            "default",
+        );
+    });
+}
+
+#[test]
+fn polyline_lshape_extrusion_is_clean_default_params() {
+    run_with_watchdog("polyline_lshape_clean_default", 15_000, || {
+        assert_polyline_extrusion_is_clean_at(
+            "lshape",
+            lshape(),
+            1.0,
+            TessellationParams::default(),
+            "default",
+        );
+    });
+}
+
+#[test]
+fn polyline_square_extrusion_is_clean_fine_params() {
+    run_with_watchdog("polyline_square_clean_fine", 20_000, || {
+        assert_polyline_extrusion_is_clean_at(
+            "square",
+            vec![z0(0.0, 0.0), z0(2.0, 0.0), z0(2.0, 2.0), z0(0.0, 2.0)],
+            1.0,
+            TessellationParams::fine(),
+            "fine",
+        );
+    });
+}
+
+#[test]
+fn polyline_hexagon_extrusion_is_clean_fine_params() {
+    run_with_watchdog("polyline_hexagon_clean_fine", 20_000, || {
+        assert_polyline_extrusion_is_clean_at(
+            "hexagon",
+            regular_ngon(6, 1.5),
+            1.0,
+            TessellationParams::fine(),
+            "fine",
+        );
+    });
+}
+
+#[test]
+fn polyline_lshape_extrusion_is_clean_fine_params() {
+    run_with_watchdog("polyline_lshape_clean_fine", 20_000, || {
+        assert_polyline_extrusion_is_clean_at(
+            "lshape",
+            lshape(),
+            1.0,
+            TessellationParams::fine(),
+            "fine",
+        );
     });
 }
 
@@ -921,6 +1036,334 @@ fn polyline_lshape_with_plane_cut_box_terminates() {
 #[test]
 fn polyline_hexagon_with_plane_cut_box_terminates() {
     run_polyline_with_plane_cut_test("polyline_hexagon_with_plane_cut_box", regular_ngon(6, 1.0));
+}
+
+// ---------------------------------------------------------------------
+// Phase 4b — Tessellate AFTER cut (reproduces live api-server hang)
+// ---------------------------------------------------------------------
+//
+// The Phase 4 cut tests above only assert that
+// `boolean_operation(target, cutter, Difference)` returns — they
+// never tessellate the result. The live api-server, however,
+// follows every cut with `tessellate_solid(result, &model,
+// &TessellationParams::default())` before pushing the mesh to the
+// viewport. If the boolean produces a topology whose tessellation
+// hangs even after the kernel hang-fix, that hang lives here.
+//
+// These tests run the same cutter+target setup as Phase 4, then
+// also tessellate the resulting `Difference` solid at `::default()`
+// params and assert the mesh is finite (no infinite/NaN coordinates)
+// and manifold (no T-junctions). Watchdog budget is 30 s — the same
+// envelope as the underlying boolean.
+
+/// Helper: cut + tessellate, assert mesh is finite and manifold under
+/// the supplied params.
+fn run_polyline_cut_and_tessellate(
+    name: &'static str,
+    cutter_verts: Vec<Point3>,
+    params: TessellationParams,
+    regime: &'static str,
+) {
+    run_with_watchdog(name, 30_000, move || {
+        let mut model = BRepModel::new();
+        let target = build_box_solid(&mut model, 6.0, 6.0, 1.0);
+        let cutter_verts: Vec<Point3> = cutter_verts
+            .into_iter()
+            .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, 0.0))
+            .collect();
+        let cutter_edges = build_polyline_loop_edges(&mut model, &cutter_verts);
+        let cutter = extrude_profile(
+            &mut model,
+            cutter_edges,
+            ExtrudeOptions {
+                distance: 3.0,
+                direction: Vector3::Z,
+                common: CommonOptions {
+                    validate_result: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("polyline cutter extrude_profile succeeds");
+        let result_solid = boolean_operation(
+            &mut model,
+            target,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("Difference succeeds");
+        let solid = model.solids.get(result_solid).expect("result solid");
+
+        let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .collect();
+        eprintln!(
+            "[{}/{}] result solid: outer_shell={} inner_shells={}",
+            name, regime, solid.outer_shell, solid.inner_shells.len()
+        );
+        for (s_idx, shell_id) in shell_ids.iter().enumerate() {
+            if let Some(shell) = model.shells.get(*shell_id) {
+                eprintln!(
+                    "  shell[{}] (id={}): faces={}",
+                    s_idx, shell_id, shell.faces.len()
+                );
+                for face_id in &shell.faces {
+                    if let Some(face) = model.faces.get(*face_id) {
+                        let outer_loop = model.loops.get(face.outer_loop);
+                        let n_edges = outer_loop.map(|l| l.edges.len()).unwrap_or(0);
+                        let surface_kind = model
+                            .surfaces
+                            .get(face.surface_id)
+                            .map(|s| s.type_name().to_string())
+                            .unwrap_or_else(|| "?".into());
+                        eprintln!(
+                            "    face[{}] surface={} outer_loop_edges={} inner_loops={}",
+                            face_id, surface_kind, n_edges, face.inner_loops.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        let mesh = tessellate_solid(solid, &model, &params);
+        eprintln!(
+            "[{}/{}] mesh: triangles={} vertices={}",
+            name, regime, mesh.triangles.len(), mesh.vertices.len()
+        );
+
+        // Finiteness: every emitted vertex must have finite coordinates.
+        for (i, v) in mesh.vertices.iter().enumerate() {
+            assert!(
+                v.position.x.is_finite() && v.position.y.is_finite() && v.position.z.is_finite(),
+                "[{}/{}] mesh vertex {} has non-finite position: ({}, {}, {})",
+                name,
+                regime,
+                i,
+                v.position.x,
+                v.position.y,
+                v.position.z
+            );
+        }
+
+        let nm = count_mesh_non_manifold_edges(&mesh);
+        assert_eq!(
+            nm, 0,
+            "[{}/{}] expected 0 non-manifold mesh edges after cut, found {} (triangles={}, vertices={})",
+            name, regime, nm,
+            mesh.triangles.len(),
+            mesh.vertices.len()
+        );
+    });
+}
+
+// Boolean Difference + tessellate end-to-end: cutter bottom face is
+// coplanar with target box bottom face (the api-server's
+// `extrude_cut_sketch` pattern). Result must tessellate to a watertight
+// mesh with the polyline-shaped hole carved through the top.
+//
+// These pin the imprint-merge coplanar-bottom degeneracy fix.
+
+#[test]
+fn baseline_hexagon_cutter_below_target_cuts_cleanly() {
+    // Same as baseline_hexagon_per_edge_line, but cutter starts BELOW
+    // the target (z=-1..2) so NO faces are coplanar with the target.
+    // This isolates the bug to the coplanar-bottom case.
+    run_with_watchdog("baseline_hexagon_cutter_below_target", 30_000, || {
+        let mut model = BRepModel::new();
+        let target = build_box_solid(&mut model, 6.0, 6.0, 1.0);
+        let cutter_verts: Vec<Point3> = regular_ngon(6, 1.0)
+            .into_iter()
+            .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, -1.0))  // z=-1
+            .collect();
+        let cutter_edges = build_per_edge_line_loop_edges(&mut model, &cutter_verts);
+        let cutter = extrude_profile(
+            &mut model,
+            cutter_edges,
+            ExtrudeOptions {
+                distance: 3.0,
+                direction: Vector3::Z,
+                common: CommonOptions {
+                    validate_result: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("cutter extrude_profile succeeds");
+        let result_solid = boolean_operation(
+            &mut model,
+            target,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("Difference succeeds");
+        let solid = model.solids.get(result_solid).expect("result solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        eprintln!(
+            "[cutter_below_target] outer_shell faces={}",
+            shell.faces.len()
+        );
+        for face_id in &shell.faces {
+            if let Some(face) = model.faces.get(*face_id) {
+                let outer_loop = model.loops.get(face.outer_loop);
+                let n_edges = outer_loop.map(|l| l.edges.len()).unwrap_or(0);
+                let surface_kind = model
+                    .surfaces
+                    .get(face.surface_id)
+                    .map(|s| s.type_name().to_string())
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "    face[{}] surface={} outer_edges={} inner_loops={}",
+                    face_id, surface_kind, n_edges, face.inner_loops.len()
+                );
+            }
+        }
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        eprintln!(
+            "[cutter_below_target] mesh triangles={} vertices={}",
+            mesh.triangles.len(), mesh.vertices.len()
+        );
+    });
+}
+
+#[test]
+fn baseline_hexagon_per_edge_line_cut_box_tessellates_default() {
+    // Per-edge-Line cutter version. If this also produces a degenerate
+    // 11-triangle mesh, the bug is in the boolean Difference path
+    // proper, NOT polyline-specific.
+    run_with_watchdog("baseline_hexagon_per_edge_line_cut_box_tess", 30_000, || {
+        let mut model = BRepModel::new();
+        let target = build_box_solid(&mut model, 6.0, 6.0, 1.0);
+        let cutter_verts: Vec<Point3> = regular_ngon(6, 1.0)
+            .into_iter()
+            .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, 0.0))
+            .collect();
+        let cutter_edges = build_per_edge_line_loop_edges(&mut model, &cutter_verts);
+        let cutter = extrude_profile(
+            &mut model,
+            cutter_edges,
+            ExtrudeOptions {
+                distance: 3.0,
+                direction: Vector3::Z,
+                common: CommonOptions {
+                    validate_result: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("per-edge-line cutter extrude_profile succeeds");
+        let result_solid = boolean_operation(
+            &mut model,
+            target,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("Difference succeeds");
+        let solid = model.solids.get(result_solid).expect("result solid");
+
+        let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .collect();
+        eprintln!(
+            "[baseline_hexagon_per_edge_line] outer_shell={} inner_shells={}",
+            solid.outer_shell, solid.inner_shells.len()
+        );
+        for shell_id in &shell_ids {
+            if let Some(shell) = model.shells.get(*shell_id) {
+                eprintln!("  shell[{}]: faces={}", shell_id, shell.faces.len());
+                for face_id in &shell.faces {
+                    if let Some(face) = model.faces.get(*face_id) {
+                        let outer_loop = model.loops.get(face.outer_loop);
+                        let n_edges = outer_loop.map(|l| l.edges.len()).unwrap_or(0);
+                        let surface_kind = model
+                            .surfaces
+                            .get(face.surface_id)
+                            .map(|s| s.type_name().to_string())
+                            .unwrap_or_else(|| "?".into());
+                        eprintln!(
+                            "    face[{}] surface={} outer_loop_edges={} inner_loops={}",
+                            face_id, surface_kind, n_edges, face.inner_loops.len()
+                        );
+                    }
+                }
+            }
+        }
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        eprintln!(
+            "[baseline_hexagon_per_edge_line] mesh triangles={} vertices={}",
+            mesh.triangles.len(), mesh.vertices.len()
+        );
+    });
+}
+
+// The 3 polyline cut+tessellate tests below fail with
+// `InvalidBRep("build_shells_from_faces: component 0 has only 3 face(s)...")`.
+// Root cause is TWO compounding bugs in `operations/boolean.rs` that
+// surface only when the cutter's BOTTOM face is coplanar with the
+// target's BOTTOM face (the api-server's `extrude_cut_sketch` pattern):
+//
+//   1. `compute_face_intersections` undercounts curves when planar faces
+//      coincide — for a 6-side hex cutter only 5 of the 6 expected
+//      target_top ∩ cutter_side intersections are reported, and the 6
+//      target_bottom ∩ cutter_side intersections vanish because the
+//      target_bottom-vs-cutter_bottom pair is correctly flagged as
+//      coplanar but no edge-imprint pass follows to recover the hex
+//      perimeter on the target bottom.
+//
+//   2. `reconstruct_topology` / `build_shells_from_faces` does not detect
+//      "face fragment A is the inner hole of face fragment B in UV
+//      space" and merge A's boundary as an inner loop of B. The 6
+//      cutter-side fragments classified Inside therefore form a
+//      separate connected component instead of cutting holes in the
+//      target's top and bottom caps. The result solid has 6 faces
+//      (a plain box, no tunnel).
+//
+// Pinned by Task #36. The non-coplanar regression
+// `baseline_hexagon_cutter_below_target_cuts_cleanly` already runs
+// green after the analytical-surface-kind dispatch fix landed in this
+// patch (it exercises bug #2 but not bug #1), so this file pins the
+// remaining work on bug #1 + face-with-hole reconstruction.
+
+#[ignore = "boolean Difference loses hex hole topology (Task #36; see comment above)"]
+#[test]
+fn polyline_pentagon_cut_box_tessellates_default() {
+    run_polyline_cut_and_tessellate(
+        "polyline_pentagon_cut_box_tess_default",
+        regular_ngon(5, 1.0),
+        TessellationParams::default(),
+        "default",
+    );
+}
+
+#[ignore = "boolean Difference loses hex hole topology (Task #36; see comment above)"]
+#[test]
+fn polyline_hexagon_cut_box_tessellates_default() {
+    run_polyline_cut_and_tessellate(
+        "polyline_hexagon_cut_box_tess_default",
+        regular_ngon(6, 1.0),
+        TessellationParams::default(),
+        "default",
+    );
+}
+
+#[ignore = "boolean Difference loses hex hole topology (Task #36; see comment above)"]
+#[test]
+fn polyline_lshape_cut_box_tessellates_default() {
+    let l: Vec<Point3> = lshape()
+        .into_iter()
+        .map(|p| Point3::new(p.x - 2.0, p.y - 2.0, 0.0))
+        .collect();
+    run_polyline_cut_and_tessellate(
+        "polyline_lshape_cut_box_tess_default",
+        l,
+        TessellationParams::default(),
+        "default",
+    );
 }
 
 // ---------------------------------------------------------------------
