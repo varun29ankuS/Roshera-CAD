@@ -50,6 +50,16 @@ pub const ENTITY_LOOP: &str = "loop";
 pub const ENTITY_CURVE: &str = "curve";
 /// Entity-kind tag for a user-authored datum (`BRepModel::datums`).
 pub const ENTITY_DATUM: &str = "datum";
+/// Entity-kind tag for a top-level assembly (`AssemblyManager`-owned).
+/// Assemblies live outside `BRepModel` but share the recorder so their
+/// mutations appear in the same timeline / audit stream as kernel ops.
+pub const ENTITY_ASSEMBLY: &str = "assembly";
+/// Entity-kind tag for an assembly component (one occurrence of a solid
+/// inside an assembly, identified by `ComponentId`).
+pub const ENTITY_COMPONENT: &str = "component";
+/// Entity-kind tag for an assembly mate (one constraint between two
+/// `MateReference`s, identified by `MateId`).
+pub const ENTITY_MATE: &str = "mate";
 
 /// Format a single entity reference as `"<kind>:<id>"`. The numeric
 /// `id` is widened to `u64` so all kernel counter widths fit without
@@ -254,6 +264,44 @@ impl RecordedOperation {
     {
         self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_DATUM, i.into())))
     }
+
+    /// Append assembly inputs (`assembly:<uuid-as-u128>`). Assembly /
+    /// component / mate identifiers are UUIDs rather than counters, so
+    /// callers pass `Uuid::as_u128()` widened to two `u64`s — but for
+    /// recording purposes we collapse to a single `u128`-shaped `u64`
+    /// pair encoded via `Uuid::to_string()`. To keep the canonical
+    /// `<kind>:<id>` form we instead accept the already-formatted
+    /// string. Use [`with_input_refs`](Self::with_input_refs) with
+    /// [`entity_ref`] for any kind that needs a non-`u64` identifier.
+    pub fn with_input_assembly(self, uuid: impl fmt::Display) -> Self {
+        self.with_input_refs([format!("{}:{}", ENTITY_ASSEMBLY, uuid)])
+    }
+
+    /// Append assembly outputs (`assembly:<uuid>`). See
+    /// [`with_input_assembly`](Self::with_input_assembly).
+    pub fn with_output_assembly(self, uuid: impl fmt::Display) -> Self {
+        self.with_output_refs([format!("{}:{}", ENTITY_ASSEMBLY, uuid)])
+    }
+
+    /// Append component inputs (`component:<uuid>`).
+    pub fn with_input_component(self, uuid: impl fmt::Display) -> Self {
+        self.with_input_refs([format!("{}:{}", ENTITY_COMPONENT, uuid)])
+    }
+
+    /// Append component outputs (`component:<uuid>`).
+    pub fn with_output_component(self, uuid: impl fmt::Display) -> Self {
+        self.with_output_refs([format!("{}:{}", ENTITY_COMPONENT, uuid)])
+    }
+
+    /// Append mate inputs (`mate:<uuid>`).
+    pub fn with_input_mate(self, uuid: impl fmt::Display) -> Self {
+        self.with_input_refs([format!("{}:{}", ENTITY_MATE, uuid)])
+    }
+
+    /// Append mate outputs (`mate:<uuid>`).
+    pub fn with_output_mate(self, uuid: impl fmt::Display) -> Self {
+        self.with_output_refs([format!("{}:{}", ENTITY_MATE, uuid)])
+    }
 }
 
 /// Errors a recorder may surface. Geometry operations do not propagate
@@ -381,6 +429,32 @@ mod tests {
             op.outputs,
             vec!["solid:5", "face:20", "face:21", "face:22"]
         );
+    }
+
+    #[test]
+    fn assembly_entity_tags_are_canonical_wire_form() {
+        assert_eq!(ENTITY_ASSEMBLY, "assembly");
+        assert_eq!(ENTITY_COMPONENT, "component");
+        assert_eq!(ENTITY_MATE, "mate");
+    }
+
+    #[test]
+    fn assembly_builders_emit_uuid_styled_refs() {
+        let asm_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let comp_uuid = "550e8400-e29b-41d4-a716-446655440001";
+        let mate_uuid = "550e8400-e29b-41d4-a716-446655440002";
+        let op = RecordedOperation::new("assembly.add_mate")
+            .with_input_assembly(asm_uuid)
+            .with_input_component(comp_uuid)
+            .with_output_mate(mate_uuid);
+        assert_eq!(
+            op.inputs,
+            vec![
+                format!("assembly:{}", asm_uuid),
+                format!("component:{}", comp_uuid)
+            ]
+        );
+        assert_eq!(op.outputs, vec![format!("mate:{}", mate_uuid)]);
     }
 
     #[test]
