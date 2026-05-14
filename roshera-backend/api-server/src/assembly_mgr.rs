@@ -1,0 +1,974 @@
+//! Assembly module — kernel `Assembly` exposed over REST.
+//!
+//! # Why this lives in api-server, not session-manager
+//!
+//! `session-manager::HierarchyManager` already owns the project-tree
+//! `shared_types::hierarchy::Assembly` — a serialisable DTO that
+//! describes the workspace tree the frontend hangs nodes off. The
+//! kernel `geometry_engine::assembly::Assembly` is a different beast:
+//! it carries mate constraints, a Gauss-Seidel solver, gear neutrals,
+//! exploded views — none of which exist in shared-types and none of
+//! which the hierarchy tree models.
+//!
+//! Putting the kernel-assembly manager alongside the kernel
+//! `BRepModel` (api-server) keeps the dependency graph clean: we
+//! avoid adding a `session-manager → geometry-engine` edge that
+//! would pull the whole B-Rep universe into the auth/session crate.
+//! This mirrors what `sketch.rs` and `csketch.rs` do for the two
+//! kinds of sketch the kernel supports.
+//!
+//! # Concurrency
+//!
+//! Each kernel `Assembly` instance has `Arc<DashMap<_, _>>` interiors
+//! but its mutating API (`add_part`, `add_mate`, `solve_constraints`,
+//! ...) takes `&mut self`. We therefore store each assembly in an
+//! `Arc<RwLock<Assembly>>` so handlers can grab a per-assembly write
+//! lock without contending on the assembly map itself. Read-only
+//! endpoints (list / summary) take the read half so a long-running
+//! solve doesn't stall introspection.
+//!
+//! # Wire shape
+//!
+//! `Component` and `MateConstraint` carry `Arc<BRepModel>` /
+//! non-`Serialize` payloads inside the kernel, so the wire types
+//! defined below are dedicated DTOs: `AssemblySummary`,
+//! `ComponentSummary`, `MateSummary`. Frontends never see the kernel
+//! types directly — every response is a snapshot built by walking
+//! the kernel state under the read lock.
+
+use crate::error_catalog::{ApiError, ErrorCode};
+use crate::AppState;
+use axum::{
+    extract::{Path, State},
+    response::Json,
+};
+use dashmap::DashMap;
+use geometry_engine::assembly::{
+    Assembly, AssemblyError, ComponentId, ExplodedViewConfig, MateId, MateReference, MateType,
+};
+use geometry_engine::math::{Matrix4, Point3, Quaternion, Vector3};
+use geometry_engine::primitives::topology_builder::BRepModel;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+// ── Manager ─────────────────────────────────────────────────────────
+
+/// Registry of kernel assemblies keyed by the assembly's own UUID.
+///
+/// Each entry is `Arc<RwLock<Assembly>>` so a handler holding a write
+/// lock for a slow solve never blocks readers of the map itself, and
+/// concurrent reads of different assemblies don't contend. The map
+/// implementation is `DashMap` — same pattern as `SketchManager` /
+/// `CSketchManager`.
+// `Assembly` does not derive `Debug` on every interior (mate constraint
+// strings round-trip through `Debug`, but the manager wrapper is
+// otherwise opaque). We omit a `#[derive(Debug)]` on the manager so the
+// `AppState` `Clone` line stays clean.
+#[derive(Default)]
+pub struct AssemblyManager {
+    assemblies: DashMap<Uuid, Arc<RwLock<Assembly>>>,
+}
+
+impl AssemblyManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate a fresh, empty assembly with the given display name.
+    /// Returns the kernel-assigned UUID, which is also the REST path
+    /// id.
+    pub fn create(&self, name: impl Into<String>) -> Uuid {
+        let assembly = Assembly::new(name);
+        let id = assembly.id;
+        self.assemblies.insert(id, Arc::new(RwLock::new(assembly)));
+        id
+    }
+
+    /// Cloned handle to the assembly's lock. `None` for unknown ids.
+    pub fn get(&self, id: &Uuid) -> Option<Arc<RwLock<Assembly>>> {
+        self.assemblies.get(id).map(|e| Arc::clone(e.value()))
+    }
+
+    /// Remove an assembly from the registry. Returns the dropped
+    /// handle for last-mile bookkeeping (none today). `None` when
+    /// the id is unknown.
+    pub fn delete(&self, id: &Uuid) -> Option<Arc<RwLock<Assembly>>> {
+        self.assemblies.remove(id).map(|(_, v)| v)
+    }
+
+    /// Every live assembly id, in arbitrary order.
+    pub fn list(&self) -> Vec<Uuid> {
+        self.assemblies.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Count of live assemblies. Used by tests and `/healthz`-style
+    /// introspection.
+    pub fn len(&self) -> usize {
+        self.assemblies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.assemblies.is_empty()
+    }
+}
+
+// ── Wire DTOs ───────────────────────────────────────────────────────
+
+/// Wire summary for an assembly. Excludes the per-component
+/// `Arc<BRepModel>` so the response stays tractable for an outliner
+/// view; clients pull tessellation through the existing
+/// `/api/geometry/{id}` surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblySummary {
+    pub id: Uuid,
+    pub name: String,
+    pub root_component: Option<Uuid>,
+    pub components: Vec<ComponentSummary>,
+    pub mates: Vec<MateSummary>,
+    pub exploded: Option<ExplodedViewConfig>,
+}
+
+/// Wire summary for a single component instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub transform: [[f64; 4]; 4],
+    pub is_fixed: bool,
+    pub parent: Option<Uuid>,
+    pub degrees_of_freedom: u8,
+    pub mate_references: Vec<MateReferenceSummary>,
+}
+
+/// Wire form of a named `MateReference` entry on a component. The
+/// kernel stores the reference itself; we surface both the slot name
+/// (the key clients pass to `add_mate`) and the geometry payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MateReferenceSummary {
+    pub name: String,
+    #[serde(flatten)]
+    pub reference: MateReference,
+}
+
+/// Wire summary for a single mate constraint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MateSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub mate_type: MateType,
+    pub component1: Uuid,
+    pub reference1: String,
+    pub component2: Uuid,
+    pub reference2: String,
+    pub suppressed: bool,
+    pub flip: bool,
+    pub solved: bool,
+    pub error: Option<String>,
+}
+
+fn matrix_to_array(m: Matrix4) -> [[f64; 4]; 4] {
+    let mut out = [[0.0_f64; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            out[r][c] = m[(r, c)];
+        }
+    }
+    out
+}
+
+fn array_to_matrix(a: [[f64; 4]; 4]) -> Matrix4 {
+    let mut m = Matrix4::IDENTITY;
+    for r in 0..4 {
+        for c in 0..4 {
+            m[(r, c)] = a[r][c];
+        }
+    }
+    m
+}
+
+/// Snapshot an assembly under a held lock. Doesn't take or release
+/// any lock itself — the caller is responsible for read/write
+/// guarding so the snapshot is internally consistent.
+pub fn snapshot(assembly: &Assembly) -> AssemblySummary {
+    let components: Vec<ComponentSummary> = assembly
+        .components()
+        .map(|c| ComponentSummary {
+            id: c.id.0,
+            name: c.name.clone(),
+            transform: matrix_to_array(c.transform),
+            is_fixed: c.is_fixed,
+            parent: c.parent.map(|p| p.0),
+            degrees_of_freedom: c.degrees_of_freedom,
+            mate_references: c
+                .mate_references
+                .iter()
+                .map(|(k, v)| MateReferenceSummary {
+                    name: k.clone(),
+                    reference: v.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let mates: Vec<MateSummary> = assembly
+        .mates()
+        .map(|m| MateSummary {
+            id: m.id.0,
+            name: m.name.clone(),
+            mate_type: m.mate_type,
+            component1: m.component1.0,
+            reference1: m.reference1.clone(),
+            component2: m.component2.0,
+            reference2: m.reference2.clone(),
+            suppressed: m.suppressed,
+            flip: m.flip,
+            solved: m.solved,
+            error: m.error.clone(),
+        })
+        .collect();
+
+    AssemblySummary {
+        id: assembly.id,
+        name: assembly.name.clone(),
+        root_component: assembly.root_component().map(|c| c.0),
+        components,
+        mates,
+        exploded: assembly.exploded_config().cloned(),
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn not_found(id: Uuid) -> ApiError {
+    ApiError::new(
+        ErrorCode::SolidNotFound,
+        format!("assembly {} not found", id),
+    )
+    .with_hint("Create one via POST /api/assemblies first.")
+}
+
+fn map_kernel_err(e: AssemblyError) -> ApiError {
+    let msg = e.to_string();
+    let code = match e {
+        AssemblyError::ComponentNotFound(_) | AssemblyError::ReferenceNotFound(_) => {
+            ErrorCode::SolidNotFound
+        }
+        AssemblyError::OverConstrained | AssemblyError::ConflictingConstraints => {
+            ErrorCode::KernelError
+        }
+        AssemblyError::SolverFailed(_) => ErrorCode::KernelError,
+    };
+    ApiError::new(code, msg)
+}
+
+// ── Request bodies ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateAssemblyRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateAssemblyResponse {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddComponentRequest {
+    pub name: String,
+    /// Optional 4×4 row-major transform. Defaults to identity.
+    pub transform: Option<[[f64; 4]; 4]>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddComponentResponse {
+    pub component_id: Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetTransformRequest {
+    pub transform: [[f64; 4]; 4],
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterReferenceRequest {
+    pub component: Uuid,
+    pub name: String,
+    pub reference: MateReference,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddMateRequest {
+    pub mate_type: MateType,
+    pub component1: Uuid,
+    pub reference1: String,
+    pub component2: Uuid,
+    pub reference2: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddMateResponse {
+    pub mate_id: Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PatchMateRequest {
+    pub suppressed: Option<bool>,
+    pub flip: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExplodeRequest {
+    /// When true (default), auto-derive explosion vectors from the
+    /// assembly center; when false, return an empty config the
+    /// caller can populate with explicit steps.
+    #[serde(default = "default_true")]
+    pub auto: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InterferenceReport {
+    pub pairs: Vec<(Uuid, Uuid)>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimulateMotionRequest {
+    pub component: Uuid,
+    pub translation: [f64; 3],
+    /// Optional quaternion `[x, y, z, w]` for an incremental rotation
+    /// applied after the translation.
+    pub rotation: Option<[f64; 4]>,
+}
+
+// ── Route handlers ──────────────────────────────────────────────────
+
+pub async fn create_assembly(
+    State(state): State<AppState>,
+    Json(req): Json<CreateAssemblyRequest>,
+) -> Result<Json<CreateAssemblyResponse>, ApiError> {
+    if req.name.trim().is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "name must not be empty",
+        ));
+    }
+    let id = state.assemblies.create(req.name);
+    Ok(Json(CreateAssemblyResponse { id }))
+}
+
+pub async fn list_assemblies(State(state): State<AppState>) -> Json<Vec<Uuid>> {
+    Json(state.assemblies.list())
+}
+
+pub async fn get_assembly(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AssemblySummary>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let guard = handle.read().await;
+    Ok(Json(snapshot(&guard)))
+}
+
+pub async fn delete_assembly(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .assemblies
+        .delete(&id)
+        .ok_or_else(|| not_found(id))?;
+    Ok(Json(serde_json::json!({"success": true, "id": id})))
+}
+
+pub async fn add_component(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddComponentRequest>,
+) -> Result<Json<AddComponentResponse>, ApiError> {
+    if req.name.trim().is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "component name must not be empty",
+        ));
+    }
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    // Fresh empty BRepModel — the part-binding slice will hand the
+    // component a real model once part registry is wired (#23.B). The
+    // mate solver and transform pipeline don't read from the part at
+    // all, so empty is the right placeholder rather than a stub.
+    let part = Arc::new(BRepModel::new());
+    let cid = guard.add_part(part, req.name);
+    if let Some(t) = req.transform {
+        guard
+            .set_component_transform(cid, array_to_matrix(t))
+            .map_err(map_kernel_err)?;
+    }
+    Ok(Json(AddComponentResponse {
+        component_id: cid.0,
+    }))
+}
+
+pub async fn remove_component(
+    State(state): State<AppState>,
+    Path((id, comp)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    guard
+        .remove_component(ComponentId(comp))
+        .map_err(map_kernel_err)?;
+    Ok(Json(serde_json::json!({"success": true})))
+}
+
+pub async fn set_component_transform(
+    State(state): State<AppState>,
+    Path((id, comp)): Path<(Uuid, Uuid)>,
+    Json(req): Json<SetTransformRequest>,
+) -> Result<Json<AssemblySummary>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    guard
+        .set_component_transform(ComponentId(comp), array_to_matrix(req.transform))
+        .map_err(map_kernel_err)?;
+    Ok(Json(snapshot(&guard)))
+}
+
+pub async fn register_mate_reference(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RegisterReferenceRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.name.trim().is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "reference name must not be empty",
+        ));
+    }
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    guard
+        .register_mate_reference(ComponentId(req.component), req.name, req.reference)
+        .map_err(map_kernel_err)?;
+    Ok(Json(serde_json::json!({"success": true})))
+}
+
+pub async fn add_mate(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddMateRequest>,
+) -> Result<Json<AddMateResponse>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    let mid = guard
+        .add_mate(
+            req.mate_type,
+            ComponentId(req.component1),
+            req.reference1,
+            ComponentId(req.component2),
+            req.reference2,
+        )
+        .map_err(map_kernel_err)?;
+    Ok(Json(AddMateResponse { mate_id: mid.0 }))
+}
+
+pub async fn remove_mate(
+    State(state): State<AppState>,
+    Path((id, mate)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    guard.remove_mate(MateId(mate)).map_err(map_kernel_err)?;
+    Ok(Json(serde_json::json!({"success": true})))
+}
+
+pub async fn patch_mate(
+    State(state): State<AppState>,
+    Path((id, mate)): Path<(Uuid, Uuid)>,
+    Json(req): Json<PatchMateRequest>,
+) -> Result<Json<AssemblySummary>, ApiError> {
+    if req.suppressed.is_none() && req.flip.is_none() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "patch body must contain at least one of 'suppressed' or 'flip'",
+        ));
+    }
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    let mid = MateId(mate);
+    if let Some(s) = req.suppressed {
+        guard.set_mate_suppressed(mid, s).map_err(map_kernel_err)?;
+    }
+    if let Some(f) = req.flip {
+        guard.set_mate_flip(mid, f).map_err(map_kernel_err)?;
+    }
+    Ok(Json(snapshot(&guard)))
+}
+
+pub async fn solve(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AssemblySummary>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    guard.solve_constraints().map_err(map_kernel_err)?;
+    Ok(Json(snapshot(&guard)))
+}
+
+pub async fn explode(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ExplodeRequest>,
+) -> Result<Json<ExplodedViewConfig>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    let cfg = guard.create_exploded_view(req.auto);
+    Ok(Json(cfg))
+}
+
+pub async fn interferences(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<InterferenceReport>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let guard = handle.read().await;
+    let pairs = guard
+        .check_interferences()
+        .into_iter()
+        .map(|(a, b)| (a.0, b.0))
+        .collect();
+    Ok(Json(InterferenceReport { pairs }))
+}
+
+pub async fn simulate_motion(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SimulateMotionRequest>,
+) -> Result<Json<AssemblySummary>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let mut guard = handle.write().await;
+    let delta = Vector3::new(req.translation[0], req.translation[1], req.translation[2]);
+    let rot = req
+        .rotation
+        .map(|q| Quaternion::new(q[3], q[0], q[1], q[2]));
+    guard
+        .simulate_motion(ComponentId(req.component), delta, rot)
+        .map_err(map_kernel_err)?;
+    Ok(Json(snapshot(&guard)))
+}
+
+// Suppress an unused-import warning if `Point3` becomes unreferenced
+// during a future trim — kept here because future part-binding slice
+// will need it.
+#[allow(dead_code)]
+fn _force_point3_used() -> Point3 {
+    Point3::new(0.0, 0.0, 0.0)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_assembly() -> (AssemblyManager, Uuid) {
+        let mgr = AssemblyManager::new();
+        let id = mgr.create("Test");
+        (mgr, id)
+    }
+
+    async fn add_part(mgr: &AssemblyManager, id: Uuid, name: &str) -> ComponentId {
+        let handle = mgr.get(&id).expect("assembly missing");
+        let mut a = handle.write().await;
+        a.add_part(Arc::new(BRepModel::new()), name)
+    }
+
+    #[test]
+    fn create_assigns_unique_uuid() {
+        let mgr = AssemblyManager::new();
+        let a = mgr.create("A");
+        let b = mgr.create("B");
+        assert_ne!(a, b);
+        assert_eq!(mgr.len(), 2);
+        assert!(!mgr.is_empty());
+    }
+
+    #[test]
+    fn get_returns_none_for_unknown_id() {
+        let mgr = AssemblyManager::new();
+        assert!(mgr.get(&Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn delete_returns_handle_then_none() {
+        let (mgr, id) = make_assembly();
+        assert!(mgr.delete(&id).is_some());
+        assert!(mgr.delete(&id).is_none());
+        assert_eq!(mgr.len(), 0);
+        assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn list_reports_every_live_id() {
+        let mgr = AssemblyManager::new();
+        let a = mgr.create("A");
+        let b = mgr.create("B");
+        let ids = mgr.list();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_added_components() {
+        let (mgr, id) = make_assembly();
+        let _ = add_part(&mgr, id, "p1").await;
+        let _ = add_part(&mgr, id, "p2").await;
+        let handle = mgr.get(&id).unwrap();
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        assert_eq!(snap.components.len(), 2);
+        assert_eq!(snap.name, "Test");
+        assert!(snap.root_component.is_some());
+        assert_eq!(snap.mates.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_preserves_identity_transform_for_fresh_part() {
+        let (mgr, id) = make_assembly();
+        let _ = add_part(&mgr, id, "p1").await;
+        let handle = mgr.get(&id).unwrap();
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        let t = snap.components[0].transform;
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!((t[r][c] - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_round_trip_is_identity() {
+        let m = Matrix4::IDENTITY;
+        let a = matrix_to_array(m);
+        let m2 = array_to_matrix(a);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!((m[(r, c)] - m2[(r, c)]).abs() < 1e-15);
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_round_trip_preserves_translation() {
+        let mut m = Matrix4::IDENTITY;
+        m[(0, 3)] = 1.0;
+        m[(1, 3)] = 2.0;
+        m[(2, 3)] = 3.0;
+        let a = matrix_to_array(m);
+        assert_eq!(a[0][3], 1.0);
+        assert_eq!(a[1][3], 2.0);
+        assert_eq!(a[2][3], 3.0);
+        let m2 = array_to_matrix(a);
+        assert_eq!(m2[(0, 3)], 1.0);
+        assert_eq!(m2[(1, 3)], 2.0);
+        assert_eq!(m2[(2, 3)], 3.0);
+    }
+
+    #[test]
+    fn not_found_carries_solid_not_found_code() {
+        let id = Uuid::new_v4();
+        let err = not_found(id);
+        assert_eq!(err.code, ErrorCode::SolidNotFound);
+        assert!(err.error.contains(&id.to_string()));
+    }
+
+    #[test]
+    fn map_kernel_err_routes_component_not_found_to_solid_not_found() {
+        let cid = ComponentId::new();
+        let api = map_kernel_err(AssemblyError::ComponentNotFound(cid));
+        assert_eq!(api.code, ErrorCode::SolidNotFound);
+    }
+
+    #[test]
+    fn map_kernel_err_routes_reference_not_found_to_solid_not_found() {
+        let api = map_kernel_err(AssemblyError::ReferenceNotFound("foo".into()));
+        assert_eq!(api.code, ErrorCode::SolidNotFound);
+    }
+
+    #[test]
+    fn map_kernel_err_routes_over_constrained_to_kernel_error() {
+        let api = map_kernel_err(AssemblyError::OverConstrained);
+        assert_eq!(api.code, ErrorCode::KernelError);
+    }
+
+    #[test]
+    fn map_kernel_err_routes_conflicting_to_kernel_error() {
+        let api = map_kernel_err(AssemblyError::ConflictingConstraints);
+        assert_eq!(api.code, ErrorCode::KernelError);
+    }
+
+    #[test]
+    fn map_kernel_err_routes_solver_failed_to_kernel_error() {
+        let api = map_kernel_err(AssemblyError::SolverFailed("nan".into()));
+        assert_eq!(api.code, ErrorCode::KernelError);
+        assert!(api.error.contains("nan"));
+    }
+
+    #[test]
+    fn default_true_returns_true() {
+        assert!(default_true());
+    }
+
+    #[test]
+    fn explode_request_defaults_auto_to_true() {
+        let v: ExplodeRequest = serde_json::from_str("{}").unwrap();
+        assert!(v.auto);
+    }
+
+    #[test]
+    fn explode_request_honours_explicit_false() {
+        let v: ExplodeRequest = serde_json::from_str(r#"{"auto":false}"#).unwrap();
+        assert!(!v.auto);
+    }
+
+    #[test]
+    fn create_assembly_request_round_trips() {
+        let v = serde_json::to_string(&CreateAssemblyResponse { id: Uuid::nil() }).unwrap();
+        assert!(v.contains("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn add_mate_request_parses_distance_payload() {
+        let raw = r#"{
+            "mate_type": {"Distance": 5.0},
+            "component1": "00000000-0000-0000-0000-000000000001",
+            "reference1": "A",
+            "component2": "00000000-0000-0000-0000-000000000002",
+            "reference2": "B"
+        }"#;
+        let req: AddMateRequest = serde_json::from_str(raw).unwrap();
+        match req.mate_type {
+            MateType::Distance(d) => assert!((d - 5.0).abs() < 1e-15),
+            other => panic!("expected Distance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_mate_request_parses_unit_payload() {
+        let raw = r#"{
+            "mate_type": "Coincident",
+            "component1": "00000000-0000-0000-0000-000000000001",
+            "reference1": "A",
+            "component2": "00000000-0000-0000-0000-000000000002",
+            "reference2": "B"
+        }"#;
+        let req: AddMateRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.mate_type, MateType::Coincident);
+    }
+
+    #[test]
+    fn patch_mate_request_supports_only_suppressed() {
+        let raw = r#"{"suppressed": true}"#;
+        let req: PatchMateRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.suppressed, Some(true));
+        assert_eq!(req.flip, None);
+    }
+
+    #[test]
+    fn patch_mate_request_supports_only_flip() {
+        let raw = r#"{"flip": true}"#;
+        let req: PatchMateRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.flip, Some(true));
+        assert_eq!(req.suppressed, None);
+    }
+
+    #[test]
+    fn simulate_motion_request_supports_no_rotation() {
+        let raw = r#"{
+            "component": "00000000-0000-0000-0000-000000000001",
+            "translation": [1.0, 0.0, 0.0]
+        }"#;
+        let req: SimulateMotionRequest = serde_json::from_str(raw).unwrap();
+        assert!(req.rotation.is_none());
+        assert_eq!(req.translation[0], 1.0);
+    }
+
+    #[test]
+    fn register_reference_request_parses_plane() {
+        let raw = r#"{
+            "component": "00000000-0000-0000-0000-000000000001",
+            "name": "top",
+            "reference": {
+                "Plane": {
+                    "origin": [0.0, 0.0, 1.0],
+                    "normal": [0.0, 0.0, 1.0]
+                }
+            }
+        }"#;
+        let req: RegisterReferenceRequest = serde_json::from_str(raw).unwrap();
+        match req.reference {
+            MateReference::Plane { origin, normal } => {
+                assert_eq!(origin.z, 1.0);
+                assert_eq!(normal.z, 1.0);
+            }
+            other => panic!("expected Plane, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_component_via_manager_registers_part() {
+        let (mgr, id) = make_assembly();
+        let cid = add_part(&mgr, id, "first").await;
+        let handle = mgr.get(&id).unwrap();
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        assert_eq!(snap.components.len(), 1);
+        assert_eq!(snap.components[0].id, cid.0);
+        assert_eq!(snap.components[0].name, "first");
+        assert!(snap.components[0].is_fixed);
+        assert_eq!(snap.root_component, Some(cid.0));
+    }
+
+    #[tokio::test]
+    async fn second_component_is_not_fixed_and_root_unchanged() {
+        let (mgr, id) = make_assembly();
+        let first = add_part(&mgr, id, "first").await;
+        let second = add_part(&mgr, id, "second").await;
+        let handle = mgr.get(&id).unwrap();
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        assert_eq!(snap.root_component, Some(first.0));
+        let by_id = |needle: ComponentId| {
+            snap.components
+                .iter()
+                .find(|c| c.id == needle.0)
+                .cloned()
+                .unwrap()
+        };
+        assert!(by_id(first).is_fixed);
+        assert!(!by_id(second).is_fixed);
+    }
+
+    #[tokio::test]
+    async fn remove_component_drops_it() {
+        let (mgr, id) = make_assembly();
+        let cid = add_part(&mgr, id, "p").await;
+        let handle = mgr.get(&id).unwrap();
+        {
+            let mut guard = handle.write().await;
+            guard.remove_component(cid).unwrap();
+        }
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        assert_eq!(snap.components.len(), 0);
+        assert!(snap.root_component.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_mate_reference_appears_in_snapshot() {
+        let (mgr, id) = make_assembly();
+        let cid = add_part(&mgr, id, "p").await;
+        let handle = mgr.get(&id).unwrap();
+        {
+            let mut guard = handle.write().await;
+            guard
+                .register_mate_reference(
+                    cid,
+                    "top",
+                    MateReference::Plane {
+                        origin: Point3::new(0.0, 0.0, 0.0),
+                        normal: Vector3::new(0.0, 0.0, 1.0),
+                    },
+                )
+                .unwrap();
+        }
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        let refs = &snap.components[0].mate_references;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "top");
+    }
+
+    #[tokio::test]
+    async fn add_mate_and_solve_marks_solved() {
+        let (mgr, id) = make_assembly();
+        let a = add_part(&mgr, id, "a").await;
+        let b = add_part(&mgr, id, "b").await;
+        let handle = mgr.get(&id).unwrap();
+        {
+            let mut guard = handle.write().await;
+            guard
+                .register_mate_reference(
+                    a,
+                    "top",
+                    MateReference::Plane {
+                        origin: Point3::new(0.0, 0.0, 0.0),
+                        normal: Vector3::new(0.0, 0.0, 1.0),
+                    },
+                )
+                .unwrap();
+            guard
+                .register_mate_reference(
+                    b,
+                    "bot",
+                    MateReference::Plane {
+                        origin: Point3::new(0.0, 0.0, 5.0),
+                        normal: Vector3::new(0.0, 0.0, 1.0),
+                    },
+                )
+                .unwrap();
+            let _mid = guard
+                .add_mate(MateType::Coincident, a, "top", b, "bot")
+                .unwrap();
+        }
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        assert_eq!(snap.mates.len(), 1);
+        assert!(snap.mates[0].solved || snap.mates[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_clones_exploded_config() {
+        let (mgr, id) = make_assembly();
+        let _ = add_part(&mgr, id, "a").await;
+        let handle = mgr.get(&id).unwrap();
+        let cfg = {
+            let mut guard = handle.write().await;
+            guard.create_exploded_view(true)
+        };
+        let guard = handle.read().await;
+        let snap = snapshot(&guard);
+        let snap_cfg = snap.exploded.expect("exploded missing from snapshot");
+        assert_eq!(snap_cfg.auto_explode, cfg.auto_explode);
+        assert_eq!(snap_cfg.scale, cfg.scale);
+        assert_eq!(snap_cfg.steps.len(), cfg.steps.len());
+    }
+
+    #[tokio::test]
+    async fn check_interferences_returns_empty_for_default_components() {
+        // The default `components_interfere` implementation returns
+        // false (not yet implemented in the kernel). Pin that
+        // behaviour so callers know to expect an empty list until
+        // the proper bounding-box check lands.
+        let (mgr, id) = make_assembly();
+        let _ = add_part(&mgr, id, "a").await;
+        let _ = add_part(&mgr, id, "b").await;
+        let handle = mgr.get(&id).unwrap();
+        let guard = handle.read().await;
+        let report: Vec<(Uuid, Uuid)> = guard
+            .check_interferences()
+            .into_iter()
+            .map(|(a, b)| (a.0, b.0))
+            .collect();
+        assert!(report.is_empty());
+    }
+}

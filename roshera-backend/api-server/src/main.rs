@@ -7,6 +7,7 @@
 //! - Delta updates for real-time sync
 //! - Full AI integration with session awareness
 
+mod assembly_mgr;
 mod auth_middleware;
 mod branches;
 mod csketch;
@@ -178,6 +179,12 @@ pub struct AppState {
     /// geometric & dimensional constraints, Newton solver, drag,
     /// DOF analysis) over REST. See `csketch.rs`.
     pub csketches: Arc<csketch::CSketchManager>,
+
+    /// Kernel assemblies (multi-part scenes with mate constraints,
+    /// solver, exploded views). Distinct from `hierarchy_manager`,
+    /// which owns the simpler project-tree DTOs from `shared-types`.
+    /// See `assembly_mgr.rs`.
+    pub assemblies: Arc<assembly_mgr::AssemblyManager>,
 }
 
 impl AppState {
@@ -5115,6 +5122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transactions: Arc::new(transactions::TransactionManager::new()),
         sketches: Arc::new(sketch::SketchManager::new()),
         csketches: Arc::new(csketch::CSketchManager::new()),
+        assemblies: Arc::new(assembly_mgr::AssemblyManager::new()),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside
@@ -5305,6 +5313,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/csketch/{id}/infer-constraints",
             post(csketch::infer_constraints_handler),
+        )
+        // Kernel assemblies — multi-part scenes, mates, solver,
+        // exploded views, interference reports. Distinct from the
+        // `/api/hierarchy/...` project-tree surface; see
+        // `assembly_mgr.rs`.
+        .route(
+            "/api/assemblies",
+            post(assembly_mgr::create_assembly).get(assembly_mgr::list_assemblies),
+        )
+        .route(
+            "/api/assemblies/{id}",
+            get(assembly_mgr::get_assembly).delete(assembly_mgr::delete_assembly),
+        )
+        .route(
+            "/api/assemblies/{id}/components",
+            post(assembly_mgr::add_component),
+        )
+        .route(
+            "/api/assemblies/{id}/components/{comp}",
+            delete(assembly_mgr::remove_component),
+        )
+        .route(
+            "/api/assemblies/{id}/components/{comp}/transform",
+            axum::routing::patch(assembly_mgr::set_component_transform),
+        )
+        .route(
+            "/api/assemblies/{id}/references",
+            post(assembly_mgr::register_mate_reference),
+        )
+        .route("/api/assemblies/{id}/mates", post(assembly_mgr::add_mate))
+        .route(
+            "/api/assemblies/{id}/mates/{mate}",
+            delete(assembly_mgr::remove_mate)
+                .patch(assembly_mgr::patch_mate),
+        )
+        .route("/api/assemblies/{id}/solve", post(assembly_mgr::solve))
+        .route("/api/assemblies/{id}/explode", post(assembly_mgr::explode))
+        .route(
+            "/api/assemblies/{id}/interferences",
+            get(assembly_mgr::interferences),
+        )
+        .route(
+            "/api/assemblies/{id}/simulate",
+            post(assembly_mgr::simulate_motion),
         )
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /

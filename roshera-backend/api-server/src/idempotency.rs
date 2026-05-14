@@ -131,6 +131,14 @@ struct CachedResponse {
 pub struct IdempotencyStore {
     entries: DashMap<String, CachedResponse>,
     max_entries: usize,
+    /// Time-to-live for cached entries. Defaults to `CACHE_TTL` in
+    /// production; tests use a short value so the sweep path can be
+    /// exercised without subtracting a 24 h `Duration` from
+    /// `Instant::now()` — that subtraction underflows on Windows,
+    /// where the monotonic clock's origin is process start rather
+    /// than system boot, so the saturating arithmetic returns `None`
+    /// and a stale-marker construction is impossible.
+    ttl: Duration,
 }
 
 impl Default for IdempotencyStore {
@@ -138,6 +146,7 @@ impl Default for IdempotencyStore {
         Self {
             entries: DashMap::new(),
             max_entries: DEFAULT_MAX_ENTRIES,
+            ttl: CACHE_TTL,
         }
     }
 }
@@ -156,6 +165,21 @@ impl IdempotencyStore {
         Self {
             entries: DashMap::new(),
             max_entries,
+            ttl: CACHE_TTL,
+        }
+    }
+
+    /// Test-only constructor: like `with_capacity` but with a tunable
+    /// TTL. Allows the eviction tests to mark entries as expired
+    /// without backwards-subtracting a 24 h `Duration` from
+    /// `Instant::now()`, which underflows the monotonic clock on
+    /// Windows.
+    #[cfg(test)]
+    pub fn with_capacity_and_ttl(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: DashMap::new(),
+            max_entries,
+            ttl,
         }
     }
 
@@ -166,7 +190,7 @@ impl IdempotencyStore {
         let now = Instant::now();
         let cached = self.entries.get(key).map(|e| e.value().clone());
         if let Some(ref c) = cached {
-            if now.duration_since(c.inserted_at) > CACHE_TTL {
+            if now.duration_since(c.inserted_at) > self.ttl {
                 self.entries.remove(key);
                 return None;
             }
@@ -204,7 +228,7 @@ impl IdempotencyStore {
         let expired: Vec<String> = self
             .entries
             .iter()
-            .filter(|e| now.duration_since(e.value().inserted_at) > CACHE_TTL)
+            .filter(|e| now.duration_since(e.value().inserted_at) > self.ttl)
             .map(|e| e.key().clone())
             .collect();
         for k in &expired {
@@ -677,13 +701,20 @@ mod tests {
     /// When the sweep finds enough expired entries to free space, the
     /// force-eviction branch must NOT fire — recently-inserted live
     /// entries should survive even at the cap.
+    ///
+    /// Originally constructed stale entries by subtracting `CACHE_TTL`
+    /// from `Instant::now()`; that path returns `None` on Windows,
+    /// where the monotonic clock's origin is process start. The test
+    /// now uses a millisecond TTL via `with_capacity_and_ttl` and
+    /// busy-sleeps just long enough to push the "stale" entries past
+    /// the cutoff, then inserts the "live" entries after the cutoff
+    /// has passed.
     #[test]
     fn sweep_prefers_expired_over_oldest() {
-        let store = IdempotencyStore::with_capacity(4);
-        // Two entries with `inserted_at` faked to be already expired.
-        let stale_marker = Instant::now()
-            .checked_sub(CACHE_TTL + Duration::from_secs(60))
-            .expect("test machine clock supports subtracting 24h+");
+        let ttl = Duration::from_millis(10);
+        let store = IdempotencyStore::with_capacity_and_ttl(4, ttl);
+        // Two entries inserted at "now", which will become stale once
+        // we sleep past the TTL.
         for i in 0..2 {
             store.entries.insert(
                 format!("stale{i}"),
@@ -692,11 +723,15 @@ mod tests {
                     status: StatusCode::OK,
                     content_type: None,
                     body: Bytes::new(),
-                    inserted_at: stale_marker,
+                    inserted_at: Instant::now(),
                 },
             );
         }
-        // Two live entries.
+        // Wait past the TTL so the "stale" entries qualify for sweep.
+        // Comfortably > TTL to absorb scheduler jitter on Windows.
+        std::thread::sleep(ttl * 5);
+        // Two live entries inserted after the sleep — these are fresh
+        // relative to the now-current `Instant::now()`.
         for i in 0..2 {
             store.entries.insert(
                 format!("live{i}"),
