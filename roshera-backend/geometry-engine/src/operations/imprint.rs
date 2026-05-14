@@ -216,15 +216,20 @@ pub fn imprint_curves_on_face(
 
     // ------------------------------------------------------------------
     // 6. Swap original face for sub-faces inside the parent shell.
+    //
+    // F7-γ: route through `ShellStore::replace_face_with_partition` so
+    // the `face_to_shells` index is updated atomically with the face-
+    // list mutation, and invalidate the cached mass-properties of any
+    // solid that owns this face BEFORE the swap (after the swap the
+    // original face_id is gone from the shell and the linkage is
+    // harder to find).
     // ------------------------------------------------------------------
     let parent_shell = find_parent_shell(model, face_id);
     if let Some(shell_id) = parent_shell {
-        if let Some(shell) = model.shells.get_mut(shell_id) {
-            shell.remove_face(face_id);
-            for &fid in &sub_faces {
-                shell.add_face(fid);
-            }
-        }
+        model.invalidate_mass_props_for_face(face_id);
+        model
+            .shells
+            .replace_face_with_partition(shell_id, face_id, &sub_faces);
     }
 
     // ------------------------------------------------------------------
@@ -435,6 +440,62 @@ mod tests {
             ImprintOptions::default(),
         );
         assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
+    }
+
+    /// Imprint the bisecting-line case but with the unit square
+    /// registered in a shell (via `add_with_indexing` so the
+    /// `face_to_shells` mapping is seeded). After the imprint, the
+    /// original face must no longer map to the shell and the sub-
+    /// faces must each map to it. Exercises the F7-γ
+    /// `ShellStore::replace_face_with_partition` wiring.
+    #[test]
+    fn imprint_swaps_face_in_shell_and_maintains_index() {
+        use crate::primitives::shell::{Shell, ShellType};
+
+        let mut model = BRepModel::new();
+        let (face_id, _) = build_unit_square_face(&mut model);
+
+        // Register the face in a shell with index maintenance.
+        let mut shell = Shell::new(0, ShellType::Open);
+        shell.add_face(face_id);
+        let shell_id = model.shells.add_with_indexing(shell);
+        assert_eq!(model.shells.shells_with_face(face_id), &[shell_id]);
+
+        let bisector = model.curves.add(Box::new(Line::new(
+            Point3::new(0.5, -0.1, 0.0),
+            Point3::new(0.5, 1.1, 0.0),
+        )));
+        let mut opts = ImprintOptions::default();
+        opts.common.validate_result = false;
+        let result =
+            imprint_curves_on_face(&mut model, face_id, vec![bisector], opts).unwrap();
+
+        assert_eq!(result.sub_faces.len(), 2);
+        assert_eq!(result.parent_shell, Some(shell_id));
+
+        // Original face no longer maps to the shell.
+        let post = model.shells.shells_with_face(face_id);
+        assert!(
+            !post.contains(&shell_id),
+            "Original face still indexed under shell after imprint: {post:?}"
+        );
+
+        // Each sub-face maps to the shell.
+        for &sf in &result.sub_faces {
+            let m = model.shells.shells_with_face(sf);
+            assert_eq!(
+                m, &[shell_id],
+                "Sub-face {sf} should map to shell {shell_id}, got {m:?}"
+            );
+        }
+
+        // Shell's face list reflects the swap: original gone, both
+        // sub-faces present.
+        let shell_after = model.shells.get(shell_id).expect("shell exists");
+        assert!(shell_after.find_face(face_id).is_none());
+        for &sf in &result.sub_faces {
+            assert!(shell_after.find_face(sf).is_some());
+        }
     }
 
     #[test]

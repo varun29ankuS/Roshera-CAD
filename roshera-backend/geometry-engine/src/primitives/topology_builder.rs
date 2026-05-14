@@ -379,6 +379,39 @@ impl BRepModel {
         }
     }
 
+    /// Invalidate the cached `SolidMassProperties` of every solid
+    /// whose outer shell currently contains `face_id`.
+    ///
+    /// Topology-mutating ops that swap a face for sub-faces (imprint,
+    /// F7 fillet trim/sew) must call this BEFORE the swap to catch
+    /// the solid by its current face IDs — after the swap the old
+    /// face_id is gone and the linkage is harder to find. Pattern
+    /// matches the end-of-op invalidation already in
+    /// `fillet_edges` / `chamfer_edges` (Task #45 fix); this method
+    /// extends the same guarantee to face-level mutations.
+    ///
+    /// Linear scan over solids. Cheap in practice: per-model solid
+    /// counts are O(1) for typical CAD scenes; we only iterate
+    /// `solids.iter()` (already a filtered live-id iterator), and
+    /// each solid hits exactly one shell-id lookup + one face-list
+    /// `contains` call.
+    pub fn invalidate_mass_props_for_face(&mut self, face_id: crate::primitives::face::FaceId) {
+        // Two-pass to avoid an &/&mut borrow conflict on `self`.
+        let mut owners: Vec<crate::primitives::solid::SolidId> = Vec::new();
+        for (solid_id, solid) in self.solids.iter() {
+            if let Some(shell) = self.shells.get(solid.outer_shell) {
+                if shell.find_face(face_id).is_some() {
+                    owners.push(solid_id);
+                }
+            }
+        }
+        for solid_id in owners {
+            if let Some(solid) = self.solids.get_mut(solid_id) {
+                solid.invalidate_mass_props_cache();
+            }
+        }
+    }
+
     // ───────────────────────────── Datum mediators ────────────────────────────
     //
     // Datum mutations route through `BRepModel` rather than directly into

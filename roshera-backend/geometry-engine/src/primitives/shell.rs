@@ -204,6 +204,33 @@ impl Shell {
         }
     }
 
+    /// Swap `original` for every face in `sub_faces` in a single pass.
+    ///
+    /// Used by [`crate::operations::imprint::imprint_curves_on_face`]
+    /// when it replaces an imprinted face with its DCEL-extracted
+    /// sub-faces. Cheaper than `remove_face` + N × `add_face` because
+    /// the cached stats and edge-connectivity caches are invalidated
+    /// exactly once instead of `N + 1` times.
+    ///
+    /// Returns `true` if `original` was present and was replaced;
+    /// `false` if it was not in the shell (in which case the shell is
+    /// left untouched and `sub_faces` are NOT appended — the caller's
+    /// invariant "I'm replacing a known face" was violated and we
+    /// surface that as a no-op rather than silently growing the shell).
+    pub fn replace_face_with_partition(
+        &mut self,
+        original: FaceId,
+        sub_faces: &[FaceId],
+    ) -> bool {
+        let Some(pos) = self.faces.iter().position(|&id| id == original) else {
+            return false;
+        };
+        self.faces.remove(pos);
+        self.faces.extend_from_slice(sub_faces);
+        self.invalidate_cache();
+        true
+    }
+
     /// Invalidate cached data
     fn invalidate_cache(&mut self) {
         self.cached_stats = None;
@@ -1119,6 +1146,50 @@ impl ShellStore {
             .unwrap_or(&[])
     }
 
+    /// Replace `original` with `sub_faces` inside `shell_id` AND
+    /// update the `face_to_shells` index so callers that rely on
+    /// `shells_with_face` see the new mapping.
+    ///
+    /// This is the store-level entry point for the F7 imprint
+    /// pipeline. Going through it (rather than calling
+    /// `Shell::replace_face_with_partition` directly through a
+    /// `get_mut` borrow) is what keeps the index reliable across
+    /// face-splitting operations.
+    ///
+    /// Returns `true` on success. Returns `false` if `shell_id` does
+    /// not resolve or `original` was not actually in the shell —
+    /// matches `Shell::replace_face_with_partition`'s no-op contract.
+    pub fn replace_face_with_partition(
+        &mut self,
+        shell_id: ShellId,
+        original: FaceId,
+        sub_faces: &[FaceId],
+    ) -> bool {
+        let Some(shell) = self.shells.get_mut(shell_id as usize) else {
+            return false;
+        };
+        if !shell.replace_face_with_partition(original, sub_faces) {
+            return false;
+        }
+        // Index maintenance: drop `original`'s entry for this shell;
+        // append `shell_id` to every sub-face's entry. Entries for
+        // shells that never registered (fast `add` path) stay empty,
+        // which is consistent with their pre-call state.
+        if let Some(shells) = self.face_to_shells.get_mut(&original) {
+            shells.retain(|&sid| sid != shell_id);
+            if shells.is_empty() {
+                self.face_to_shells.remove(&original);
+            }
+        }
+        for &sub in sub_faces {
+            let entry = self.face_to_shells.entry(sub).or_default();
+            if !entry.contains(&shell_id) {
+                entry.push(shell_id);
+            }
+        }
+        true
+    }
+
     #[inline]
     pub fn closed_shells(&self) -> impl Iterator<Item = ShellId> + '_ {
         self.closed_shells.iter().copied()
@@ -1155,6 +1226,155 @@ impl ShellStore {
 impl Default for ShellStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod replace_face_partition_tests {
+    use super::*;
+
+    /// Build a Shell containing the four face IDs `[10, 20, 30, 40]`.
+    fn shell_with_four_faces() -> Shell {
+        let mut s = Shell::new(0, ShellType::Open);
+        s.add_face(10);
+        s.add_face(20);
+        s.add_face(30);
+        s.add_face(40);
+        s
+    }
+
+    #[test]
+    fn shell_replace_face_with_partition_swaps_in_place() {
+        let mut s = shell_with_four_faces();
+        let ok = s.replace_face_with_partition(20, &[200, 201, 202]);
+        assert!(ok);
+        // `20` is gone, three sub-faces appended.
+        assert_eq!(s.face_count(), 6);
+        assert!(s.find_face(20).is_none());
+        assert!(s.find_face(200).is_some());
+        assert!(s.find_face(201).is_some());
+        assert!(s.find_face(202).is_some());
+        // Surviving siblings stay.
+        assert!(s.find_face(10).is_some());
+        assert!(s.find_face(30).is_some());
+        assert!(s.find_face(40).is_some());
+    }
+
+    #[test]
+    fn shell_replace_face_with_partition_missing_face_is_noop() {
+        let mut s = shell_with_four_faces();
+        let ok = s.replace_face_with_partition(999, &[100, 101]);
+        assert!(!ok);
+        // Untouched on no-op — must not silently grow the shell.
+        assert_eq!(s.face_count(), 4);
+        assert!(s.find_face(100).is_none());
+        assert!(s.find_face(101).is_none());
+    }
+
+    #[test]
+    fn shell_replace_face_with_partition_empty_sub_faces_just_removes() {
+        // Edge case: `sub_faces` empty means the imprint produced no
+        // surviving regions. The shell loses the original face and
+        // gains nothing — a "consume" operation.
+        let mut s = shell_with_four_faces();
+        let ok = s.replace_face_with_partition(30, &[]);
+        assert!(ok);
+        assert_eq!(s.face_count(), 3);
+        assert!(s.find_face(30).is_none());
+    }
+
+    #[test]
+    fn store_replace_face_with_partition_maintains_face_to_shells_index() {
+        let mut store = ShellStore::new();
+        // Register two shells with indexing so `face_to_shells` is
+        // populated. (The fast `add` path skips index maintenance —
+        // covered separately by `fast_add_then_replace_seeds_index`.)
+        let mut s_a = Shell::new(0, ShellType::Closed);
+        s_a.add_face(10);
+        s_a.add_face(20);
+        let shell_a = store.add_with_indexing(s_a);
+
+        let mut s_b = Shell::new(0, ShellType::Open);
+        s_b.add_face(20); // 20 shared across the two shells.
+        s_b.add_face(30);
+        let shell_b = store.add_with_indexing(s_b);
+
+        // Sanity: pre-replace, face 20 → {shell_a, shell_b}.
+        let pre = store.shells_with_face(20);
+        assert!(pre.contains(&shell_a) && pre.contains(&shell_b));
+
+        // Replace face 20 in shell_a with sub-faces 200, 201.
+        let ok = store.replace_face_with_partition(shell_a, 20, &[200, 201]);
+        assert!(ok);
+
+        // After: face 20 → only shell_b; sub-faces → {shell_a}.
+        let post_20 = store.shells_with_face(20);
+        assert_eq!(post_20, &[shell_b]);
+        assert_eq!(store.shells_with_face(200), &[shell_a]);
+        assert_eq!(store.shells_with_face(201), &[shell_a]);
+
+        // Shell_a's face list reflects the swap.
+        let sa = store.get(shell_a).expect("shell_a still resolves");
+        assert!(sa.find_face(20).is_none());
+        assert!(sa.find_face(200).is_some());
+        assert!(sa.find_face(201).is_some());
+        // Shell_b untouched.
+        let sb = store.get(shell_b).expect("shell_b still resolves");
+        assert!(sb.find_face(20).is_some());
+    }
+
+    #[test]
+    fn store_replace_face_with_partition_drops_empty_index_entry() {
+        let mut store = ShellStore::new();
+        let mut s = Shell::new(0, ShellType::Open);
+        s.add_face(50);
+        let shell_id = store.add_with_indexing(s);
+
+        let ok = store.replace_face_with_partition(shell_id, 50, &[500]);
+        assert!(ok);
+        // After replacing the sole shell that referenced face 50, its
+        // index entry should be gone (not left as an empty Vec) so
+        // `shells_with_face(50)` returns an empty slice via the
+        // unwrap_or branch.
+        assert_eq!(store.shells_with_face(50), &[] as &[ShellId]);
+        assert_eq!(store.shells_with_face(500), &[shell_id]);
+    }
+
+    #[test]
+    fn store_replace_face_with_partition_unknown_shell_is_noop() {
+        let mut store = ShellStore::new();
+        let mut s = Shell::new(0, ShellType::Open);
+        s.add_face(10);
+        let _ = store.add_with_indexing(s);
+        // ShellId 999 doesn't exist.
+        let ok = store.replace_face_with_partition(999, 10, &[100]);
+        assert!(!ok);
+        // Index untouched.
+        assert_eq!(store.shells_with_face(100), &[] as &[ShellId]);
+    }
+
+    #[test]
+    fn fast_add_then_replace_seeds_index_for_sub_faces() {
+        // The fast `add` path skips index maintenance — so pre-replace
+        // the face_to_shells entry for the original face is empty even
+        // though the shell does contain it. The replacement still has
+        // to register the sub-faces (so future `shells_with_face` calls
+        // are reliable) AND must not crash on the missing original-face
+        // entry.
+        let mut store = ShellStore::new();
+        let mut s = Shell::new(0, ShellType::Open);
+        s.add_face(10);
+        let shell_id = store.add(s);
+        // Sanity: fast path means no entry yet.
+        assert_eq!(store.shells_with_face(10), &[] as &[ShellId]);
+
+        let ok = store.replace_face_with_partition(shell_id, 10, &[100, 101]);
+        assert!(ok);
+        // Sub-faces now indexed.
+        assert_eq!(store.shells_with_face(100), &[shell_id]);
+        assert_eq!(store.shells_with_face(101), &[shell_id]);
+        // Original-face entry stays empty (was never populated).
+        assert_eq!(store.shells_with_face(10), &[] as &[ShellId]);
     }
 }
 
