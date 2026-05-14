@@ -123,8 +123,21 @@ fn fillet_opts(radius: f64) -> FilletOptions {
 /// but the tessellator emits stretched / overlapping triangles — the
 /// visual corruption the user reported.
 fn assert_mesh_manifold(model: &BRepModel, solid: SolidId, label: &str) {
+    assert_mesh_manifold_with_params(model, solid, label, &TessellationParams::default());
+}
+
+/// Same closed-2-manifold check, but parameterised over
+/// `TessellationParams`. Used by the cross-tolerance matrix tests to
+/// pin the canonical-edge-sample cache across the regimes where
+/// sample counts diverge most.
+fn assert_mesh_manifold_with_params(
+    model: &BRepModel,
+    solid: SolidId,
+    label: &str,
+    params: &TessellationParams,
+) {
     let solid_ref = model.solids.get(solid).expect("solid stored");
-    let mesh = tessellate_solid(solid_ref, model, &TessellationParams::default());
+    let mesh = tessellate_solid(solid_ref, model, params);
     assert!(
         !mesh.triangles.is_empty(),
         "{label}: tessellation must produce at least one triangle"
@@ -737,4 +750,134 @@ fn second_fillet_on_extruded_rect_top_edge_tessellation_manifold() {
         solid,
         "after second fillet on extruded rect — mesh",
     );
+}
+
+// =====================================================================
+// Tolerance-matrix variants
+//
+// The canonical-edge-sample cache picks per-edge sample counts from
+// the cache's `compute_curve_sample_count`, which is driven by
+// `TessellationParams::{chord_tolerance, max_edge_length,
+// max_angle_deviation}`. The matrix below pins the manifoldness
+// invariant across `coarse` (loose), `default`, and `fine` (tight)
+// regimes — where the two trim caches are most likely to disagree
+// in length and the local resampling path in
+// `tessellate_fillet_face` is exercised.
+// =====================================================================
+
+fn tolerance_matrix() -> [(&'static str, TessellationParams); 3] {
+    [
+        ("coarse", TessellationParams::coarse()),
+        ("default", TessellationParams::default()),
+        ("fine", TessellationParams::fine()),
+    ]
+}
+
+#[test]
+fn first_fillet_on_top_edge_tessellation_manifold_across_tolerances() {
+    for (regime, params) in tolerance_matrix() {
+        let mut model = BRepModel::new();
+        let solid = make_box(&mut model);
+        let edges = top_edges(&model);
+        let (first_edge, _, _) = edges[0];
+        fillet_edges(&mut model, solid, vec![first_edge], fillet_opts(1.0))
+            .expect("first fillet on a top edge must succeed");
+        assert_mesh_manifold_with_params(
+            &model,
+            solid,
+            &format!("first fillet — {regime}"),
+            &params,
+        );
+    }
+}
+
+#[test]
+fn second_fillet_on_opposite_top_edge_tessellation_manifold_across_tolerances() {
+    for (regime, params) in tolerance_matrix() {
+        let mut model = BRepModel::new();
+        let solid = make_box(&mut model);
+        let edges = top_edges(&model);
+        let (first_edge, fx, fy) = edges[0];
+        let opposite = edges[1..]
+            .iter()
+            .max_by(|a, b| {
+                let da = (a.1 - fx).hypot(a.2 - fy);
+                let db = (b.1 - fx).hypot(b.2 - fy);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+            .expect("3 other top edges exist");
+        let (_, ox, oy) = opposite;
+        fillet_edges(&mut model, solid, vec![first_edge], fillet_opts(1.0))
+            .expect("first fillet must succeed");
+        let second_edge = find_top_edge_near(&model, ox, oy, 0.25)
+            .expect("opposite top edge must survive the first fillet");
+        let _ = fillet_edges(&mut model, solid, vec![second_edge], fillet_opts(1.0));
+        assert_mesh_manifold_with_params(
+            &model,
+            solid,
+            &format!("second fillet (opposite) — {regime}"),
+            &params,
+        );
+    }
+}
+
+#[test]
+fn second_fillet_on_extruded_rect_top_edge_tessellation_manifold_across_tolerances() {
+    let collect_top_edges = |m: &BRepModel| -> Vec<(EdgeId, f64, f64)> {
+        let z_top = 5.0;
+        let mut found = Vec::new();
+        for (eid, edge) in m.edges.iter() {
+            if edge.is_loop() {
+                continue;
+            }
+            let Some(v0) = m.vertices.get(edge.start_vertex) else {
+                continue;
+            };
+            let Some(v1) = m.vertices.get(edge.end_vertex) else {
+                continue;
+            };
+            if (v0.position[2] - z_top).abs() < EPS
+                && (v1.position[2] - z_top).abs() < EPS
+            {
+                found.push((
+                    eid,
+                    0.5 * (v0.position[0] + v1.position[0]),
+                    0.5 * (v0.position[1] + v1.position[1]),
+                ));
+            }
+        }
+        found
+    };
+
+    for (regime, params) in tolerance_matrix() {
+        let mut model = BRepModel::new();
+        let solid = make_extruded_box(&mut model);
+        let initial_top = collect_top_edges(&model);
+        let (first, fx, fy) = initial_top[0];
+        let (_, ox, oy) = initial_top[1..]
+            .iter()
+            .max_by(|a, b| {
+                let da = (a.1 - fx).hypot(a.2 - fy);
+                let db = (b.1 - fx).hypot(b.2 - fy);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+            .expect("3 other top edges exist");
+        fillet_edges(&mut model, solid, vec![first], fillet_opts(1.0))
+            .expect("first fillet must succeed");
+        let post_top = collect_top_edges(&model);
+        let second = post_top
+            .iter()
+            .find(|(_, mx, my)| (mx - ox).hypot(my - oy) < 0.25)
+            .map(|(id, _, _)| *id)
+            .expect("opposite top edge survives the first fillet");
+        let _ = fillet_edges(&mut model, solid, vec![second], fillet_opts(1.0));
+        assert_mesh_manifold_with_params(
+            &model,
+            solid,
+            &format!("second fillet (extruded rect) — {regime}"),
+            &params,
+        );
+    }
 }
