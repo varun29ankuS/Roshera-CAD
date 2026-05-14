@@ -2727,6 +2727,8 @@ fn create_trimmed_fillet_face(
             face2: face2_id,
             trim1_edge: edge_trim1_id,
             trim2_edge: edge_trim2_id,
+            trim1_curve: curve1_id,
+            trim2_curve: curve2_id,
             cap_v0_edge: edge_cap_v0_id,
             cap_v1_edge: edge_cap_v1_id,
             v_t1_start,
