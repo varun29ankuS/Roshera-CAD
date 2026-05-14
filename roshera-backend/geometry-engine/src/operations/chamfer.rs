@@ -1244,6 +1244,8 @@ fn create_chamfer_face(
         face2: face2_id,
         trim1_edge,
         trim2_edge,
+        trim1_curve: offset_curve1,
+        trim2_curve: offset_curve2,
         cap_v0_edge,
         cap_v1_edge,
         v_t1_start,

@@ -43,10 +43,11 @@
 
 #![allow(clippy::indexing_slicing)] // loop indices bounded by edges.len()
 
+use super::trim::{TrimCurve, TrimSide};
 use super::{OperationError, OperationResult};
 use crate::math::Tolerance;
 use crate::primitives::{
-    curve::ParameterRange,
+    curve::{CurveId, ParameterRange},
     edge::{EdgeId, EdgeOrientation},
     face::FaceId,
     r#loop::LoopId,
@@ -76,6 +77,14 @@ pub(crate) struct BlendEdgeSurgery {
     pub trim1_edge: EdgeId,
     /// New trim edge on F2 (start = `v_t2_start`, end = `v_t2_end`).
     pub trim2_edge: EdgeId,
+    /// Curve referenced by `trim1_edge`. Captured at surgery-build
+    /// time so the F7-γ imprint pass can materialise a [`TrimCurve`]
+    /// for F1 directly from the surgery, without re-looking-up the
+    /// curve via the edge store. See [`Self::to_trim_curves`].
+    pub trim1_curve: CurveId,
+    /// Curve referenced by `trim2_edge`. Same rationale as
+    /// [`Self::trim1_curve`].
+    pub trim2_curve: CurveId,
     /// Cap edge at V0 (start = `v_t2_start`, end = `v_t1_start`). The
     /// blend-face producer is required to construct cap_v0 with this
     /// orientation so the F3 cap insertion can pick a deterministic
@@ -92,6 +101,129 @@ pub(crate) struct BlendEdgeSurgery {
     pub v_t2_start: VertexId,
     /// New vertex on F2 near V1 (= end of trim2, end of cap_v1).
     pub v_t2_end: VertexId,
+}
+
+impl BlendEdgeSurgery {
+    /// Emit the two [`TrimCurve`]s implied by the rail edges, one
+    /// per adjacent face. Both are `TrimSide::Discard` full-range:
+    ///
+    /// * Discard, because the rolling-ball (fillet) / chamfer-
+    ///   bisector sweep covers the partition of F1 / F2 *between*
+    ///   the rail and the original edge — that is the partition
+    ///   F7-γ will detach from the shell and replace with the
+    ///   blend face.
+    /// * Full-range, because the rail curve is constructed to span
+    ///   exactly the trim arc — there are no entry/exit re-entry
+    ///   pairs to enumerate (cf. boolean intersection curves).
+    ///
+    /// This is the typed input that `operations::imprint::
+    /// imprint_curves_on_face` (the F7-γ entry point) will consume.
+    pub(crate) fn to_trim_curves(&self) -> [TrimCurve; 2] {
+        [
+            TrimCurve::full_range(self.trim1_curve, self.face1, TrimSide::Discard),
+            TrimCurve::full_range(self.trim2_curve, self.face2, TrimSide::Discard),
+        ]
+    }
+
+    /// Verify that every ID the surgery references still resolves
+    /// in `model`. Called immediately before [`splice_blend_edge`]
+    /// mutates state so a stale / dangling reference surfaces as a
+    /// clean error rather than a partial topology mutation.
+    ///
+    /// Covers: the four faces (`face1`, `face2`, plus the two
+    /// perpendicular faces resolved via [`find_third_face_at_vertex`]
+    /// — that resolution happens inside `splice_blend_edge` so we
+    /// do not duplicate it here), the four trim/cap edges, the two
+    /// rail curves, the original edge and its two endpoints, and
+    /// the four new boundary vertices.
+    pub(crate) fn validate_surgery(&self, model: &BRepModel) -> OperationResult<()> {
+        // Curves.
+        if model.curves.get(self.trim1_curve).is_none() {
+            return Err(OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery trim1_curve {} missing from model",
+                self.trim1_curve
+            )));
+        }
+        if model.curves.get(self.trim2_curve).is_none() {
+            return Err(OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery trim2_curve {} missing from model",
+                self.trim2_curve
+            )));
+        }
+        // Faces (the two adjacent faces being trimmed).
+        if model.faces.get(self.face1).is_none() {
+            return Err(OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery face1 {} missing from model",
+                self.face1
+            )));
+        }
+        if model.faces.get(self.face2).is_none() {
+            return Err(OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery face2 {} missing from model",
+                self.face2
+            )));
+        }
+        // Edges (original + four new blend boundary edges).
+        for (label, edge_id) in [
+            ("original_edge", self.original_edge),
+            ("trim1_edge", self.trim1_edge),
+            ("trim2_edge", self.trim2_edge),
+            ("cap_v0_edge", self.cap_v0_edge),
+            ("cap_v1_edge", self.cap_v1_edge),
+        ] {
+            if model.edges.get(edge_id).is_none() {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "BlendEdgeSurgery {} {} missing from model",
+                    label, edge_id
+                )));
+            }
+        }
+        // Vertices (original endpoints + four new boundary vertices).
+        for (label, vertex_id) in [
+            ("original_v0", self.original_v0),
+            ("original_v1", self.original_v1),
+            ("v_t1_start", self.v_t1_start),
+            ("v_t1_end", self.v_t1_end),
+            ("v_t2_start", self.v_t2_start),
+            ("v_t2_end", self.v_t2_end),
+        ] {
+            if model.vertices.get(vertex_id).is_none() {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "BlendEdgeSurgery {} {} missing from model",
+                    label, vertex_id
+                )));
+            }
+        }
+        // Rail-edge curve refs must match the captured curve IDs.
+        // Catches the case where a future blend-face builder forgets
+        // to keep the surgery's curve fields in sync with the actual
+        // edge.curve_id after re-creating an edge.
+        let edge_trim1 = model.edges.get(self.trim1_edge).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery trim1_edge {} missing",
+                self.trim1_edge
+            ))
+        })?;
+        if edge_trim1.curve_id != self.trim1_curve {
+            return Err(OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery trim1_curve {} disagrees with trim1_edge.curve_id {}",
+                self.trim1_curve, edge_trim1.curve_id
+            )));
+        }
+        let edge_trim2 = model.edges.get(self.trim2_edge).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery trim2_edge {} missing",
+                self.trim2_edge
+            ))
+        })?;
+        if edge_trim2.curve_id != self.trim2_curve {
+            return Err(OperationError::InvalidGeometry(format!(
+                "BlendEdgeSurgery trim2_curve {} disagrees with trim2_edge.curve_id {}",
+                self.trim2_curve, edge_trim2.curve_id
+            )));
+        }
+        Ok(())
+    }
 }
 
 // `validate_no_shared_corners` was the historical blanket
@@ -113,6 +245,12 @@ pub(crate) fn splice_blend_edge(
     solid_id: SolidId,
     surgery: &BlendEdgeSurgery,
 ) -> OperationResult<()> {
+    // F7-β pre-flight: verify every ID the surgery references is alive
+    // in `model`, and that the captured rail-curve IDs agree with the
+    // trim edges' actual curve refs. Failing this surfaces a stale-ID
+    // bug as a clean error before any topology mutation runs.
+    surgery.validate_surgery(model)?;
+
     // Resolve F3 / F4 BEFORE touching F1/F2 — once we re-vertex the
     // shared edges, V0 and V1 stop being incidence keys.
     let face3 = find_third_face_at_vertex(
@@ -591,6 +729,86 @@ fn traversal_terminal(
         (false, true) => edge.start_vertex,
         (false, false) => edge.end_vertex,
     })
+}
+
+#[cfg(test)]
+mod surgery_tests {
+    use super::*;
+
+    /// Build a synthetic `BlendEdgeSurgery` with arbitrary IDs. The
+    /// struct is pure data — these tests verify field-derived helpers
+    /// (`to_trim_curves`) without spinning up a `BRepModel`. The
+    /// `validate_surgery` and `splice_blend_edge` integration paths
+    /// are covered by the kernel-workflow regression suite and the
+    /// fillet/chamfer dihedral matrix.
+    fn synthetic_surgery() -> BlendEdgeSurgery {
+        BlendEdgeSurgery {
+            original_edge: 10,
+            original_v0: 1,
+            original_v1: 2,
+            face1: 100,
+            face2: 200,
+            trim1_edge: 11,
+            trim2_edge: 12,
+            trim1_curve: 7000,
+            trim2_curve: 7001,
+            cap_v0_edge: 13,
+            cap_v1_edge: 14,
+            v_t1_start: 3,
+            v_t1_end: 4,
+            v_t2_start: 5,
+            v_t2_end: 6,
+        }
+    }
+
+    #[test]
+    fn to_trim_curves_emits_one_per_face_with_correct_curve() {
+        let surgery = synthetic_surgery();
+        let trims = surgery.to_trim_curves();
+        assert_eq!(trims.len(), 2);
+
+        assert_eq!(trims[0].curve_id, 7000);
+        assert_eq!(trims[0].on_face, 100);
+        assert_eq!(trims[0].side, TrimSide::Discard);
+        assert!(trims[0].is_full_range());
+
+        assert_eq!(trims[1].curve_id, 7001);
+        assert_eq!(trims[1].on_face, 200);
+        assert_eq!(trims[1].side, TrimSide::Discard);
+        assert!(trims[1].is_full_range());
+    }
+
+    #[test]
+    fn to_trim_curves_uses_full_range_marker() {
+        // Rail trims span exactly the trim arc — no entry/exit
+        // sub-ranges to enumerate. `full_range` records that
+        // unambiguously by leaving `ranges` empty.
+        let surgery = synthetic_surgery();
+        let trims = surgery.to_trim_curves();
+        for trim in &trims {
+            assert!(trim.is_full_range());
+            assert_eq!(trim.ranges.len(), 0);
+            // covered_span() is 0 for full-range trims by carrier
+            // contract — callers must consult the curve directly.
+            assert_eq!(trim.covered_span(), 0.0);
+        }
+    }
+
+    #[test]
+    fn to_trim_curves_preserves_face_curve_pairing() {
+        // Swap face IDs and confirm the helper still pairs each
+        // curve with the correct face — guards against a future
+        // refactor accidentally crossing the wires.
+        let mut surgery = synthetic_surgery();
+        surgery.face1 = 999;
+        surgery.face2 = 888;
+        let trims = surgery.to_trim_curves();
+        assert_eq!(trims[0].on_face, 999);
+        assert_eq!(trims[1].on_face, 888);
+        // Curves stay associated with their original face slot.
+        assert_eq!(trims[0].curve_id, 7000);
+        assert_eq!(trims[1].curve_id, 7001);
+    }
 }
 
 /// Sanity helper used by tests / callers to check a loop is closed.
