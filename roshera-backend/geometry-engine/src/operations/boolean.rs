@@ -507,7 +507,154 @@ fn compute_face_intersections(
             .join(" "),
     );
 
+    // Task #36 Slice 4.5 — suppress surface-surface curves that are
+    // geometrically redundant with coplanar imprint cuts.
+    //
+    // When a Plane-Plane pair (face_a, face_b) is coplanar and
+    // `imprint_merge_coplanar_overlap` emits cuts on face_a (cop_a > 0),
+    // every adjacent face on solid_b — i.e. every face_z that shares an
+    // edge with face_b — produces a surface-surface curve along that
+    // shared edge in face_a's plane. That curve traces the same segment
+    // as one of the imprint cuts. Splitting face_a by both copies
+    // (8 cuts where 4 suffice, for a 4-sided cutter) makes
+    // `split_face_by_curves` emit degenerate fragments and the
+    // downstream shell reconstruction fails with
+    // `component has only 1 face(s)`.
+    dedup_coplanar_imprint_duplicates(model, &mut intersections, solid_a, solid_b);
+    pipeline_trace(format_args!(
+        "stage=dedup_coplanar_imprint_duplicates intersections={} curves_total={}",
+        intersections.len(),
+        intersections.iter().map(|i| i.curves.len()).sum::<usize>(),
+    ));
+
     Ok(intersections)
+}
+
+/// Faces in `solid_id` (other than `target`) that share at least one
+/// outer- or inner-loop edge with `target`.
+///
+/// In a closed-manifold B-Rep every edge is shared between exactly two
+/// faces, so this returns the topological neighbours of `target` across
+/// each of its loop edges.
+fn faces_sharing_edges_with(
+    model: &BRepModel,
+    target: FaceId,
+    solid_id: SolidId,
+) -> std::collections::HashSet<FaceId> {
+    use std::collections::HashSet;
+    let mut neighbours: HashSet<FaceId> = HashSet::new();
+
+    let target_face = match model.faces.get(target) {
+        Some(f) => f,
+        None => return neighbours,
+    };
+    let mut target_edges: HashSet<EdgeId> = HashSet::new();
+    if let Some(outer) = model.loops.get(target_face.outer_loop) {
+        target_edges.extend(outer.edges.iter().copied());
+    }
+    for &lid in &target_face.inner_loops {
+        if let Some(inner) = model.loops.get(lid) {
+            target_edges.extend(inner.edges.iter().copied());
+        }
+    }
+    if target_edges.is_empty() {
+        return neighbours;
+    }
+
+    let all_faces = match get_solid_faces(model, solid_id) {
+        Ok(f) => f,
+        Err(_) => return neighbours,
+    };
+    for fid in all_faces {
+        if fid == target {
+            continue;
+        }
+        let face_data = match model.faces.get(fid) {
+            Some(f) => f,
+            None => continue,
+        };
+        let mut shares = false;
+        if let Some(l) = model.loops.get(face_data.outer_loop) {
+            if l.edges.iter().any(|e| target_edges.contains(e)) {
+                shares = true;
+            }
+        }
+        if !shares {
+            for &lid in &face_data.inner_loops {
+                if let Some(l) = model.loops.get(lid) {
+                    if l.edges.iter().any(|e| target_edges.contains(e)) {
+                        shares = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if shares {
+            neighbours.insert(fid);
+        }
+    }
+    neighbours
+}
+
+/// Drop surface-surface intersection curves on `(face_a, face_z)` pairs
+/// where `face_z` on `solid_b` is adjacent to a `face_b` that produced
+/// coplanar imprint cuts on `face_a` in another pair, and the symmetric
+/// case where coplanar cuts land on `face_b`.
+///
+/// See call site in `compute_face_intersections` for the geometric
+/// argument. Coplanar imprint cuts already cover the shared-edge
+/// segments; this pass removes the duplicate surface-surface curves
+/// that traced the same segments via Plane-Ruled intersection.
+fn dedup_coplanar_imprint_duplicates(
+    model: &BRepModel,
+    intersections: &mut Vec<FaceIntersection>,
+    solid_a: SolidId,
+    solid_b: SolidId,
+) {
+    use std::collections::HashSet;
+    let mut skip_pairs: HashSet<(FaceId, FaceId)> = HashSet::new();
+
+    for fi in intersections.iter() {
+        let coplanar =
+            !fi.coplanar_curves_a.is_empty() || !fi.coplanar_curves_b.is_empty();
+        if !coplanar {
+            continue;
+        }
+        // When (face_a, face_b) is a coplanar imprint pair, any pair
+        // that intersects ONE of these coplanar faces with a face that
+        // shares an edge with the OTHER coplanar face produces a curve
+        // along that shared edge in the coplanar plane. That curve is
+        // either (a) part of the imprint already, or (b) outside the
+        // coplanar face's outline, where the kernel may still emit a
+        // spurious sliver due to surface-intersection clipping
+        // inaccuracies on polyline outlines. Both are non-additive cuts
+        // and should be dropped before split_face_by_curves.
+        for fz in faces_sharing_edges_with(model, fi.face_b_id, solid_b) {
+            skip_pairs.insert((fi.face_a_id, fz));
+        }
+        for fz in faces_sharing_edges_with(model, fi.face_a_id, solid_a) {
+            skip_pairs.insert((fz, fi.face_b_id));
+        }
+    }
+
+    if skip_pairs.is_empty() {
+        return;
+    }
+
+    intersections.retain_mut(|fi| {
+        let key = (fi.face_a_id, fi.face_b_id);
+        if skip_pairs.contains(&key) {
+            // Drop surface-surface curves only; the coplanar arrays on
+            // a different pair already account for the shared geometry.
+            // If this pair itself contributed coplanar cuts (rare —
+            // would mean two coplanar partners), keep the entry so its
+            // imprint survives.
+            fi.curves.clear();
+            !fi.coplanar_curves_a.is_empty() || !fi.coplanar_curves_b.is_empty()
+        } else {
+            true
+        }
+    });
 }
 
 /// Get all faces from a solid
@@ -3193,6 +3340,35 @@ fn clip_line_to_planar_face(
     // the test independent of world scale.
     let edge_param_slack = 1e-9_f64;
 
+    // Per-segment crossing computation. Each invocation tests one
+    // straight 3D edge segment against the cutting line; we factor it
+    // out so the body can iterate Polyline edges (one call per
+    // polyline segment) without duplicating the algebra.
+    let mut test_segment = |start_3d: Point3, end_3d: Point3| {
+        let (eu0, ev0) = project(start_3d);
+        let (eu1, ev1) = project(end_3d);
+        poly_uv.push((eu0, ev0));
+
+        // Cutting line L(s) = L0 + s * dL, edge E(t) = E0 + t * dE,
+        // s ∈ ℝ (filter to [0,1] later) and t ∈ [0, 1]. Solve via
+        // Cramer's rule.
+        let edu = eu1 - eu0;
+        let edv = ev1 - ev0;
+        let det = ldu * (-edv) - ldv * (-edu);
+        if det.abs() < 1e-18 {
+            // Parallel in 2D — crossings come from the adjacent
+            // non-parallel segments.
+            return;
+        }
+        let rhs_u = eu0 - lu0;
+        let rhs_v = ev0 - lv0;
+        let s = (rhs_u * (-edv) - rhs_v * (-edu)) / det;
+        let t = (ldu * rhs_v - ldv * rhs_u) / det;
+        if t >= -edge_param_slack && t <= 1.0 + edge_param_slack {
+            crossings.push(s);
+        }
+    };
+
     for &(edge_id, _) in &boundary_edges {
         let edge = model
             .edges
@@ -3212,44 +3388,44 @@ fn clip_line_to_planar_face(
                     received: format!("{:?}", edge.curve_id),
                 })?;
 
-        // Require straight-line boundary. Non-line edges in a planar face
-        // are unusual (fillets in 3D live in non-planar faces); treat as
-        // "not applicable" and let caller pass through.
-        let edge_line = match curve.as_any().downcast_ref::<Line>() {
-            Some(l) => l,
-            None => return Ok(ClipOutcome::NotApplicable),
-        };
-
-        let (eu0, ev0) = project(edge_line.start);
-        let (eu1, ev1) = project(edge_line.end);
-        poly_uv.push((eu0, ev0));
-
-        // Solve for crossing: cutting line L(s) = L0 + s * dL, edge
-        // E(t) = E0 + t * dE, where s ∈ ℝ (we'll filter to [0,1] later)
-        // and t ∈ [0, 1]. Setting L(s) = E(t) and subtracting:
-        //   [ ldu  -edu ] [s]   [ eu0 - lu0 ]
-        //   [ ldv  -edv ] [t] = [ ev0 - lv0 ]
-        // Cramer's rule.
-        let edu = eu1 - eu0;
-        let edv = ev1 - ev0;
-        let det = ldu * (-edv) - ldv * (-edu); // = -ldu*edv + ldv*edu
-        if det.abs() < 1e-18 {
-            // Parallel in 2D. Either no crossing or the cutting line lies
-            // along this edge; in either case the endpoints of the
-            // intersection with this edge will be picked up by the
-            // adjacent (non-parallel) boundary edges.
+        // Straight-line edge: trivial.
+        if let Some(edge_line) = curve.as_any().downcast_ref::<Line>() {
+            test_segment(edge_line.start, edge_line.end);
             continue;
         }
-        let rhs_u = eu0 - lu0;
-        let rhs_v = ev0 - lv0;
-        let s_num = rhs_u * (-edv) - rhs_v * (-edu); // s = s_num / det
-        let t_num = ldu * rhs_v - ldv * rhs_u; // t = t_num / det
-        let s = s_num / det;
-        let t = t_num / det;
 
-        if t >= -edge_param_slack && t <= 1.0 + edge_param_slack {
-            crossings.push(s);
+        // Polyline edge: slice to the edge's actual carrier sub-range
+        // (handles the shared-Polyline pattern where N edges reference
+        // one curve with disjoint param ranges) and iterate its
+        // straight segments. Without this path the function returned
+        // NotApplicable for any face whose outer loop used Polyline
+        // edges (e.g. polyline-extrusion cutter caps), letting the
+        // unclipped 1e6-long plane-plane line through and producing
+        // spurious cuts on every adjacent face. See Task #36.
+        use crate::primitives::curve::Polyline;
+        let edge_range = edge.param_range;
+        let sub = curve
+            .subcurve(edge_range.start, edge_range.end)
+            .map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "clip_line_to_planar_face: subcurve {:?} on {} failed: {:?}",
+                    edge_range,
+                    curve.type_name(),
+                    e
+                ))
+            })?;
+        if let Some(pl) = sub.as_any().downcast_ref::<Polyline>() {
+            let verts = &pl.vertices;
+            for i in 0..(verts.len().saturating_sub(1)) {
+                test_segment(verts[i], verts[i + 1]);
+            }
+            continue;
         }
+
+        // Other curve types (Arc / Circle / NURBS / …) on a planar
+        // face's outer loop: not handled by this analytic clipper.
+        // Let the caller pass the cutting curve through.
+        return Ok(ClipOutcome::NotApplicable);
     }
 
     // Mark poly_uv as intentionally used (for future non-convex support);
@@ -3820,7 +3996,7 @@ fn face_outer_polyline_2d(
     face_id: FaceId,
     project: &impl Fn(Point3) -> (f64, f64),
 ) -> OperationResult<Vec<(f64, f64)>> {
-    use crate::primitives::curve::Line;
+    use crate::primitives::curve::{Line, Polyline};
 
     let face = model
         .faces
@@ -3861,7 +4037,37 @@ fn face_outer_polyline_2d(
                 received: format!("{:?}", edge.curve_id),
             })?;
 
-        let n_samples: usize = if curve.as_any().downcast_ref::<Line>().is_some() {
+        // Slice to the edge's actual carrier sub-range so the cutting
+        // polygon is built from this edge's geometric extent, not the
+        // entire shared curve. Critical for the polyline-cutter pattern
+        // where one shared `Polyline` is registered N times with
+        // disjoint `param_range`s — sampling the whole curve at
+        // t ∈ [0, 1) would collapse every edge onto the same N polygon
+        // vertices, producing N×SAMPLES_PER_CURVED_EDGE duplicate
+        // points that confuse `partition_boundaries`.
+        let edge_range = edge.param_range;
+        let sub = curve
+            .subcurve(edge_range.start, edge_range.end)
+            .map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "face_outer_polyline_2d: subcurve {:?} on {} failed: {:?}",
+                    edge_range,
+                    curve.type_name(),
+                    e
+                ))
+            })?;
+
+        // Single-segment shortcut: any straight line, or a polyline
+        // sub-slice that ended up with exactly one segment (= 2
+        // vertices). Such an edge contributes one point (its start);
+        // the next edge picks up the shared end vertex.
+        let is_single_segment = sub.as_any().downcast_ref::<Line>().is_some()
+            || sub
+                .as_any()
+                .downcast_ref::<Polyline>()
+                .map(|pl| pl.segment_count() == 1)
+                .unwrap_or(false);
+        let n_samples: usize = if is_single_segment {
             1
         } else {
             SAMPLES_PER_CURVED_EDGE
@@ -3870,7 +4076,7 @@ fn face_outer_polyline_2d(
         for k in 0..n_samples {
             let t_raw = k as f64 / n_samples as f64;
             let t = if fwd { t_raw } else { 1.0 - t_raw };
-            let p = curve.point_at(t)?;
+            let p = sub.point_at(t)?;
             poly.push(project(p));
         }
     }
@@ -4040,8 +4246,12 @@ fn imprint_merge_coplanar_overlap(
     use crate::primitives::curve::Line;
     use crate::primitives::surface::Plane;
 
-    // 1. Resolve `face_a`'s plane frame (origin + u_dir + v_dir). The
-    //    immutable borrow is dropped before any `model.curves.add` call.
+    // 1. Resolve `face_a`'s plane frame (origin + u_dir + v_dir). Accept
+    //    any geometrically planar surface, not just `Plane` — after a
+    //    boolean cut the reconstructed cap face may be a RuledSurface
+    //    that is planar by construction (matches `clip_line_to_planar_face`
+    //    at lines 3277-3302). The immutable borrow is dropped before any
+    //    `model.curves.add` call.
     let (origin, u_dir, v_dir) = {
         let face_data = model
             .faces
@@ -4058,24 +4268,40 @@ fn imprint_merge_coplanar_overlap(
                 received: format!("{:?}", face_data.surface_id),
             }
         })?;
-        if surface.surface_type() != SurfaceType::Plane {
-            // The coplanar branch only fires for Plane×Plane; arriving
-            // here means broken kernel state, not user input.
+        if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+            (plane.origin, plane.u_dir, plane.v_dir)
+        } else if surface.is_planar(*tolerance) {
+            let eval = surface.evaluate_full(0.0, 0.0).map_err(|e| {
+                OperationError::InternalError(format!(
+                    "imprint_merge_coplanar_overlap: face {face_a:?} surface evaluate_full failed: {e:?}",
+                ))
+            })?;
+            let normal = eval.normal;
+            let helper = if normal.x.abs() < 0.9 {
+                Vector3::X
+            } else {
+                Vector3::Y
+            };
+            let u_dir = normal.cross(&helper).normalize().map_err(|e| {
+                OperationError::InternalError(format!(
+                    "imprint_merge_coplanar_overlap: face {face_a:?} u_dir basis build failed: {e:?}",
+                ))
+            })?;
+            let v_dir = normal.cross(&u_dir).normalize().map_err(|e| {
+                OperationError::InternalError(format!(
+                    "imprint_merge_coplanar_overlap: face {face_a:?} v_dir basis build failed: {e:?}",
+                ))
+            })?;
+            (eval.position, u_dir, v_dir)
+        } else {
+            // The coplanar branch only fires once `surface_surface_intersection`
+            // has classified the pair as coincident planes. Arriving here
+            // with a non-planar surface means broken kernel state.
             return Err(OperationError::InternalError(format!(
                 "imprint_merge_coplanar_overlap: face {face_a:?} is not planar (type {:?})",
                 surface.surface_type()
             )));
         }
-        let plane =
-            surface
-                .as_any()
-                .downcast_ref::<Plane>()
-                .ok_or_else(|| {
-                    OperationError::InternalError(format!(
-                        "imprint_merge_coplanar_overlap: face {face_a:?} marked Plane but downcast failed",
-                    ))
-                })?;
-        (plane.origin, plane.u_dir, plane.v_dir)
     };
 
     // 2. Project both faces' outer loops into the (u, v) frame.
