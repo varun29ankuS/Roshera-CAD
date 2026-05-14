@@ -1329,7 +1329,6 @@ fn baseline_hexagon_per_edge_line_cut_box_tessellates_default() {
 // patch (it exercises bug #2 but not bug #1), so this file pins the
 // remaining work on bug #1 + face-with-hole reconstruction.
 
-#[ignore = "boolean Difference loses hex hole topology (Task #36; see comment above)"]
 #[test]
 fn polyline_pentagon_cut_box_tessellates_default() {
     run_polyline_cut_and_tessellate(
@@ -1340,7 +1339,6 @@ fn polyline_pentagon_cut_box_tessellates_default() {
     );
 }
 
-#[ignore = "boolean Difference loses hex hole topology (Task #36; see comment above)"]
 #[test]
 fn polyline_hexagon_cut_box_tessellates_default() {
     run_polyline_cut_and_tessellate(
@@ -1351,7 +1349,6 @@ fn polyline_hexagon_cut_box_tessellates_default() {
     );
 }
 
-#[ignore = "boolean Difference loses hex hole topology (Task #36; see comment above)"]
 #[test]
 fn polyline_lshape_cut_box_tessellates_default() {
     let l: Vec<Point3> = lshape()

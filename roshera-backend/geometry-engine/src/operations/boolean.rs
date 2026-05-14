@@ -6171,6 +6171,33 @@ fn build_shells_from_faces(
 
             let loop_id = model.loops.add(face_loop);
 
+            // Task #36 Slice 3: materialise inner-loop hints from the
+            // merge pass as `LoopType::Inner` loops attached to the
+            // face. Each entry in `split_face.inner_loops` was
+            // produced by `merge_same_origin_fragments` as the
+            // reversed boundary of a sibling fragment that got
+            // absorbed under the active boolean operation's keep/drop
+            // rule. The reversal already happened upstream — the
+            // walk direction stored here is exactly what
+            // `LoopType::Inner` semantics expect (opposite winding
+            // to the outer loop, so the hole is traversed
+            // clockwise relative to the face's outward normal).
+            let mut inner_loop_ids: Vec<crate::primitives::r#loop::LoopId> =
+                Vec::with_capacity(split_face.inner_loops.len());
+            for hole in &split_face.inner_loops {
+                if hole.is_empty() {
+                    continue;
+                }
+                let mut hole_loop = crate::primitives::r#loop::Loop::new(
+                    0,
+                    crate::primitives::r#loop::LoopType::Inner,
+                );
+                for &(edge_id, fwd) in hole {
+                    hole_loop.add_edge(edge_id, fwd);
+                }
+                inner_loop_ids.push(model.loops.add(hole_loop));
+            }
+
             // Inherit the parent face's orientation: the split is on the
             // same surface, in the same parametric region, so the outward
             // direction of the parent is the outward direction of every
@@ -6183,9 +6210,19 @@ fn build_shells_from_faces(
                 .map(|f| f.orientation)
                 .unwrap_or(crate::primitives::face::FaceOrientation::Forward);
 
-            // Create face with surface and loop
+            // Create face with surface and outer loop, then attach
+            // any inner hole loops via `Face::add_inner_loop`. Mutate
+            // through the store after `add` so cache invalidation in
+            // `add_inner_loop` fires on the live face.
             let face = Face::new(0, split_face.surface, loop_id, inherited_orientation);
             let face_id = model.faces.add(face);
+            if !inner_loop_ids.is_empty() {
+                if let Some(face_mut) = model.faces.get_mut(face_id) {
+                    for inner_id in inner_loop_ids {
+                        face_mut.add_inner_loop(inner_id);
+                    }
+                }
+            }
 
             shell.add_face(face_id);
         }
@@ -6214,12 +6251,31 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
         return vec![];
     }
 
+    // Helper: enumerate every edge a SplitFace touches — both the
+    // outer boundary and every inner-loop hole produced by the
+    // merge pass (Task #36 Slice 3). Walking inner-loop edges in
+    // the adjacency unification is load-bearing: without it, a
+    // face-with-hole and the cutter walls bounding that hole land
+    // in disjoint components (the seam between them only appears
+    // on the inner loop), and `build_shells_from_faces` rejects
+    // the resulting solid with "component has <4 faces".
+    let all_edges = |face: &SplitFace| -> Vec<EdgeId> {
+        let total =
+            face.boundary_edges.len() + face.inner_loops.iter().map(|l| l.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend(face.boundary_edges.iter().map(|(e, _)| *e));
+        for hole in &face.inner_loops {
+            out.extend(hole.iter().map(|(e, _)| *e));
+        }
+        out
+    };
+
     // Adjacency by raw EdgeId — catches faces that genuinely share an
     // edge instance (the common pre-split case for the donor solid's
     // own faces).
     let mut edge_to_faces: HashMap<EdgeId, Vec<usize>> = HashMap::new();
     for (idx, face) in faces.iter().enumerate() {
-        for &(eid, _) in &face.boundary_edges {
+        for eid in all_edges(face) {
             edge_to_faces.entry(eid).or_default().push(idx);
         }
     }
@@ -6230,7 +6286,7 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
     // (min, max) so direction does not split the equivalence class.
     let mut vpair_to_faces: HashMap<(VertexId, VertexId), Vec<usize>> = HashMap::new();
     for (idx, face) in faces.iter().enumerate() {
-        for &(eid, _) in &face.boundary_edges {
+        for eid in all_edges(face) {
             if let Some(edge) = model.edges.get(eid) {
                 let a = edge.start_vertex;
                 let b = edge.end_vertex;
