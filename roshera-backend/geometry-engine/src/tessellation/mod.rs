@@ -5,6 +5,7 @@
 pub mod adaptive;
 pub mod cache;
 pub mod curve;
+pub mod edge_cache;
 pub mod mesh;
 pub mod parallel;
 pub mod simple_box;
@@ -17,6 +18,7 @@ pub use mesh::{MeshVertex, ThreeJsMesh, TriangleMesh};
 pub use surface::{tessellate_face, tessellate_surface};
 
 use crate::primitives::{builder::BRepModel, shell::Shell, solid::Solid};
+use edge_cache::EdgeSampleCache;
 
 /// Tessellation parameters for controlling mesh quality
 #[derive(Debug, Clone)]
@@ -146,15 +148,23 @@ pub fn tessellate_solid(
 ) -> TriangleMesh {
     let mut mesh = TriangleMesh::new();
 
+    // A single canonical edge-sample cache is shared by every face of
+    // every shell in this solid. This guarantees that any B-Rep edge
+    // bounding two or more faces sees the SAME 3D sample sequence
+    // along its length — which is the Parasolid-style invariant that
+    // eliminates tessellation T-junctions across shared edges. See
+    // `tessellation::edge_cache` for the full rationale.
+    let cache = EdgeSampleCache::new(params);
+
     // Tessellate outer shell
     if let Some(shell) = model.shells.get(solid.outer_shell) {
-        tessellate_shell(shell, model, params, &mut mesh);
+        tessellate_shell(shell, model, params, &cache, &mut mesh);
     }
 
     // Tessellate inner shells (voids)
     for &inner_shell_id in &solid.inner_shells {
         if let Some(shell) = model.shells.get(inner_shell_id) {
-            tessellate_shell(shell, model, params, &mut mesh);
+            tessellate_shell(shell, model, params, &cache, &mut mesh);
         }
     }
 
@@ -184,6 +194,7 @@ pub fn tessellate_shell(
     shell: &Shell,
     model: &BRepModel,
     params: &TessellationParams,
+    cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     let weld_start_vertices = mesh.vertices.len();
@@ -191,7 +202,7 @@ pub fn tessellate_shell(
     for &face_id in &shell.faces {
         if let Some(face) = model.faces.get(face_id) {
             let tri_start = mesh.triangles.len();
-            surface::tessellate_face(face, model, params, mesh);
+            surface::tessellate_face(face, model, params, cache, mesh);
             let tri_end = mesh.triangles.len();
             // Record which B-Rep face each new triangle came from
             for _ in tri_start..tri_end {
