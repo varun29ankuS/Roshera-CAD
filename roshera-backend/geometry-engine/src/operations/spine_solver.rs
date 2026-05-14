@@ -244,6 +244,144 @@ impl Default for SpineOptions {
     }
 }
 
+/// Sample a [`BlendRadius`] schedule at edge parameter `t ∈ [0, 1]`.
+///
+/// * `Constant(r)` — returns `r` regardless of `t`.
+/// * `Linear { start, end }` — linear interpolation `start + (end −
+///   start) · t`, with `t` clamped to `[0, 1]`.
+/// * `Variable(samples)` — piecewise-linear interpolation between
+///   adjacent `(t_i, r_i)` pairs; `t` outside the sample range
+///   clamps to the first/last sample's radius.
+///
+/// F3-ε.1: this is the single shared per-station radius resolver
+/// used by every analytic arm and by the marching corrector. The
+/// arms pass each station's edge parameter through `sample_radius`
+/// before computing offsets / contacts, so `Linear` and `Variable`
+/// schedules flow end-to-end on the surface pairs whose analytic
+/// closed form is parameterised by a single scalar radius per
+/// station.
+fn sample_radius(schedule: &BlendRadius, t: f64) -> f64 {
+    match schedule {
+        BlendRadius::Constant(r) => *r,
+        BlendRadius::Linear { start, end } => {
+            let t_c = t.clamp(0.0, 1.0);
+            start + (end - start) * t_c
+        }
+        BlendRadius::Variable(samples) => interp_variable(samples, t),
+    }
+}
+
+/// Piecewise-linear interpolation over a `Variable` radius schedule.
+///
+/// Samples are assumed to be sorted by their first component (the
+/// schedule parameter). Values of `t` outside the sample range clamp
+/// to the nearest endpoint — variable schedules are interpreted as
+/// constant-value extensions beyond their first / last sample
+/// rather than extrapolated, matching the F2-β
+/// [`BlendRadius::Variable`] documentation.
+fn interp_variable(samples: &[(f64, f64)], t: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let n = samples.len();
+    if t <= samples[0].0 {
+        return samples[0].1;
+    }
+    if t >= samples[n - 1].0 {
+        return samples[n - 1].1;
+    }
+    for window in samples.windows(2) {
+        let (t0, r0) = window[0];
+        let (t1, r1) = window[1];
+        if t >= t0 && t <= t1 {
+            let span = t1 - t0;
+            if span.abs() < f64::EPSILON {
+                return r0;
+            }
+            let alpha = (t - t0) / span;
+            return r0 + (r1 - r0) * alpha;
+        }
+    }
+    samples[n - 1].1
+}
+
+/// Return `Some(r)` when `schedule` reduces to a single constant
+/// value (within `f64::EPSILON`), `None` otherwise.
+///
+/// Drives the fast-path branch in analytic arms that emit exact
+/// `Line` / `Arc` primitives only for constant radius — variable
+/// schedules sample the analytic closed form at uniform stations
+/// and fit the spine / rails through those sample arrays.
+fn schedule_constant_value(schedule: &BlendRadius) -> Option<f64> {
+    match schedule {
+        BlendRadius::Constant(r) => Some(*r),
+        BlendRadius::Linear { start, end } => {
+            if (start - end).abs() < f64::EPSILON {
+                Some(*start)
+            } else {
+                None
+            }
+        }
+        BlendRadius::Variable(samples) => {
+            if samples.is_empty() {
+                return None;
+            }
+            let first = samples[0].1;
+            if samples.iter().all(|(_, r)| (*r - first).abs() < f64::EPSILON) {
+                Some(first)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Validate that every radius value in the schedule is strictly
+/// positive and finite. Returns the minimum value on success
+/// (useful for the F6 over-radius / curvature check), an
+/// `InvalidRadius` error on failure.
+fn validate_schedule_positive(schedule: &BlendRadius) -> OperationResult<f64> {
+    let r_min = schedule.min_value();
+    let r_max = schedule.max_value();
+    if !(r_min > 0.0 && r_min.is_finite() && r_max.is_finite()) {
+        return Err(OperationError::InvalidRadius(r_min));
+    }
+    Ok(r_min)
+}
+
+/// Build a `Box<dyn Curve>` from an ordered sequence of sample
+/// points. If the points are colinear within `tol` emit an exact
+/// `Line` (matching the analytic-arm fast path for constant
+/// radius); otherwise fit a cubic NURBS through the samples.
+///
+/// `samples.len() >= 2` is required. For `Variable` / `Linear`
+/// non-constant schedules the analytic arms enforce
+/// `samples.len() >= 4` so the cubic NURBS fit has enough control
+/// points; the `points_are_collinear` short-circuit absorbs the
+/// (rare) variable-schedule case where the resolved per-station
+/// radii happen to leave the sample locus straight in 3D.
+fn fit_curve_or_line(samples: &[Point3], tol: f64) -> OperationResult<Box<dyn Curve>> {
+    if samples.len() < 2 {
+        return Err(OperationError::InternalError(
+            "fit_curve_or_line requires at least 2 points".into(),
+        ));
+    }
+    if points_are_collinear(samples, tol) {
+        return Ok(Box::new(Line::new(samples[0], samples[samples.len() - 1])));
+    }
+    let n = samples.len();
+    // NurbsCurve::fit_to_points needs at least degree+1 control
+    // points; pick the largest degree consistent with `n`, capped
+    // at 3 (cubic — matches marched-solver convention and is what
+    // F4 expects for downstream pipe / NURBS-skin sampling).
+    let degree = 3.min(n.saturating_sub(1)).max(1);
+    Ok(Box::new(
+        NurbsCurve::fit_to_points(samples, degree, tol).map_err(|e| {
+            OperationError::NumericalError(format!("Spine/rail NURBS fit failed: {:?}", e))
+        })?,
+    ))
+}
+
 /// Resolve a spine for one connected blend chain.
 ///
 /// In F3-α we only handle single-edge chains analytically.
@@ -252,9 +390,15 @@ impl Default for SpineOptions {
 /// marching using the F2-β chain ids.
 ///
 /// `graph` carries the per-edge radius schedule (and setback fields
-/// once F3-δ honours them). If the chain head's radius cannot be
-/// resolved to a strictly positive scalar, the call returns
-/// `Ok(None)` — the legacy path handles those edges.
+/// once F3-δ honours them). F3-ε.1 lifts the previous
+/// constant-only restriction: `Linear { start, end }` and
+/// `Variable(samples)` schedules now flow end-to-end. Each analytic
+/// arm samples the schedule per-station at the resolved edge
+/// parameter, and the marching corrector threads the per-station
+/// radius into its alternate-projection update. The plane/sphere
+/// arm retains its closed-form arc construction only for constant
+/// schedules; non-constant inputs there route to the marching
+/// solver.
 pub fn solve_spine_for_chain(
     model: &BRepModel,
     chain: &[EdgeId],
@@ -269,22 +413,12 @@ pub fn solve_spine_for_chain(
         Some(b) => b,
         None => return Ok(None),
     };
-    let radius = match &blend_edge.radius {
-        BlendRadius::Constant(r) => *r,
-        BlendRadius::Linear { start, end } => {
-            // F3-β handles linear-ramp constant-radius analytic arms;
-            // F3-α treats anything non-constant as out-of-scope.
-            if (start - end).abs() < f64::EPSILON {
-                *start
-            } else {
-                return Ok(None);
-            }
-        }
-        BlendRadius::Variable(_) => return Ok(None),
-    };
-    if !(radius > 0.0 && radius.is_finite()) {
-        return Err(OperationError::InvalidRadius(radius));
-    }
+    let schedule = &blend_edge.radius;
+    // F3-ε.1: validate the schedule rather than collapsing it to a
+    // scalar. Every station radius must be strictly positive and
+    // finite; `min_value` summarises the worst case for the
+    // F6 / curvature feasibility check that comes next.
+    validate_schedule_positive(schedule)?;
 
     // Discover the two supporting faces. find_adjacent_faces walks
     // every shell and returns up to N faces incident to the edge.
@@ -313,7 +447,14 @@ pub fn solve_spine_for_chain(
 
     let mut effective_options = options.clone();
     effective_options.edge_param_trim = trim;
-    solve_spine_for_edge(model, edge_id, faces[0], faces[1], radius, &effective_options)
+    solve_spine_for_edge_with_schedule(
+        model,
+        edge_id,
+        faces[0],
+        faces[1],
+        schedule,
+        &effective_options,
+    )
 }
 
 /// Convert a chain edge's [`BlendEdge`] setbacks (arc-length
@@ -365,14 +506,16 @@ fn compute_setback_trim(
 }
 
 /// Resolve a spine for one blend edge given its two supporting
-/// faces and a constant radius.
+/// faces and a constant scalar radius.
 ///
-/// Returns `Ok(Some(_))` iff the surface pair matches an analytic
-/// arm wired in this slice (currently only plane/plane). All other
-/// pairs return `Ok(None)` and the caller falls through to the
-/// legacy bisector. `Err` is reserved for invalid inputs that no
-/// arm can handle (missing entity, non-positive radius, degenerate
-/// near-tangent geometry).
+/// Thin wrapper around [`solve_spine_for_edge_with_schedule`] that
+/// builds a [`BlendRadius::Constant`] schedule from `radius`. Kept
+/// in place so callers (today: every internal test and any
+/// external scalar-radius entry point) that don't construct a
+/// schedule themselves get the historical signature unchanged.
+/// F3-ε.1 added the `_with_schedule` variant for variable-radius
+/// flows from the chain-level entry point in
+/// [`solve_spine_for_chain`].
 pub fn solve_spine_for_edge(
     model: &BRepModel,
     edge_id: EdgeId,
@@ -384,6 +527,39 @@ pub fn solve_spine_for_edge(
     if !(radius > 0.0 && radius.is_finite()) {
         return Err(OperationError::InvalidRadius(radius));
     }
+    let schedule = BlendRadius::Constant(radius);
+    solve_spine_for_edge_with_schedule(model, edge_id, face_a, face_b, &schedule, options)
+}
+
+/// Resolve a spine for one blend edge given its two supporting
+/// faces and a [`BlendRadius`] schedule.
+///
+/// Returns `Ok(Some(_))` iff the surface pair matches an analytic
+/// arm that admits the supplied schedule, or — when
+/// [`SpineOptions::enable_marching`] is true — when the marching
+/// solver produces a converged spine. Returns `Ok(None)` only when
+/// marching is disabled and no analytic arm claims the pair (the
+/// legacy bisector path is the caller's fallback). `Err` is
+/// reserved for invalid inputs (missing entity, schedule with a
+/// non-positive radius value, degenerate near-tangent geometry).
+///
+/// F3-ε.1: per-station radius variation is supported on plane /
+/// plane and plane / cylinder analytic arms. Plane / sphere keeps
+/// its closed-form arc construction only for schedules that
+/// reduce to a single constant value; non-constant schedules
+/// there return `Ok(None)` from the analytic arm so the
+/// dispatcher routes them through the marching solver. The
+/// `AnalyticCylCylCoaxial` variant is reserved for a future slice
+/// and is not produced by any current dispatch path.
+pub fn solve_spine_for_edge_with_schedule(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face_a: FaceId,
+    face_b: FaceId,
+    schedule: &BlendRadius,
+    options: &SpineOptions,
+) -> OperationResult<Option<SpineRail>> {
+    validate_schedule_positive(schedule)?;
     let edge = model
         .edges
         .get(edge_id)
@@ -445,7 +621,7 @@ pub fn solve_spine_for_edge(
                     OperationError::InternalError("Effective plane B missing".into())
                 })?;
                 solve_plane_plane(
-                    model, &edge, edge_id, face_a, face_b, plane_a, plane_b, radius, options,
+                    model, &edge, edge_id, face_a, face_b, plane_a, plane_b, schedule, options,
                 )
                 .map(Some)
             }
@@ -458,7 +634,7 @@ pub fn solve_spine_for_edge(
                 )?;
                 solve_plane_cylinder(
                     model, &edge, edge_id, face_a, face_b, plane, cylinder,
-                    /*plane_is_a=*/ true, radius, options,
+                    /*plane_is_a=*/ true, schedule, options,
                 )
             }
             (SurfaceType::Cylinder, SurfaceType::Plane) => {
@@ -470,7 +646,7 @@ pub fn solve_spine_for_edge(
                 })?;
                 solve_plane_cylinder(
                     model, &edge, edge_id, face_a, face_b, plane, cylinder,
-                    /*plane_is_a=*/ false, radius, options,
+                    /*plane_is_a=*/ false, schedule, options,
                 )
             }
             (SurfaceType::Plane, SurfaceType::Sphere) => {
@@ -482,7 +658,7 @@ pub fn solve_spine_for_edge(
                 })?;
                 solve_plane_sphere(
                     model, &edge, edge_id, face_a, face_b, plane, sphere,
-                    /*plane_is_a=*/ true, radius, options,
+                    /*plane_is_a=*/ true, schedule, options,
                 )
             }
             (SurfaceType::Sphere, SurfaceType::Plane) => {
@@ -494,7 +670,7 @@ pub fn solve_spine_for_edge(
                 })?;
                 solve_plane_sphere(
                     model, &edge, edge_id, face_a, face_b, plane, sphere,
-                    /*plane_is_a=*/ false, radius, options,
+                    /*plane_is_a=*/ false, schedule, options,
                 )
             }
             _ => Ok(None),
@@ -505,7 +681,8 @@ pub fn solve_spine_for_edge(
         Ok(None) => {
             if options.enable_marching {
                 solve_marching(
-                    model, &edge, edge_id, face_a, face_b, surface_a, surface_b, radius, options,
+                    model, &edge, edge_id, face_a, face_b, surface_a, surface_b, schedule,
+                    options,
                 )
                 .map(Some)
             } else {
@@ -634,7 +811,7 @@ fn solve_plane_plane(
     _face_b: FaceId,
     _plane_a: &Plane,
     _plane_b: &Plane,
-    radius: f64,
+    schedule: &BlendRadius,
     options: &SpineOptions,
 ) -> OperationResult<SpineRail> {
     // Outward-oriented face normals at the edge midpoint.
@@ -686,7 +863,6 @@ fn solve_plane_plane(
             "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
         ));
     }
-    let offset_distance = radius / bisector_dot_na;
 
     // Sign convention matches `compute_rolling_ball_positions`:
     //  - Convex (dihedral > 0): ball lives inside the solid; centre
@@ -701,7 +877,21 @@ fn solve_plane_plane(
         (1.0, -1.0)
     };
 
-    let n_samples = options.min_samples.max(2);
+    // F3-ε.1: the per-station offset distance is `r_t /
+    // bisector_dot_na` where `r_t = sample_radius(schedule, t)`.
+    // For `Constant` and equal-endpoint `Linear` schedules this is
+    // a single scalar shared across every station — same as the
+    // pre-F3-ε constant-radius path. For `Linear` ramps and
+    // `Variable` tables each station's centre is offset by its own
+    // distance and the spine traces a curve through the bisector
+    // plane.
+    //
+    // Non-constant schedules need at least 4 samples so a cubic
+    // NURBS fit has enough control points. Constant schedules keep
+    // the existing `.max(2)` floor so legacy tests are unaffected.
+    let is_constant = schedule_constant_value(schedule);
+    let min_required = if is_constant.is_some() { 2 } else { 4 };
+    let n_samples = options.min_samples.max(min_required);
     let mut samples: Vec<SpineRailSample> = Vec::with_capacity(n_samples);
     let mut prev_center: Option<Point3> = None;
     let mut cumulative_arc = 0.0;
@@ -713,9 +903,15 @@ fn solve_plane_plane(
         let frac = i as f64 / (n_samples as f64 - 1.0);
         let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
-        let center = edge_point + bisector * (offset_sign * offset_distance);
-        let contact_a = center + normal_a * (contact_sign * radius);
-        let contact_b = center + normal_b * (contact_sign * radius);
+        // F3-ε.1: per-station radius sampling. `sample_radius` is a
+        // no-op pass-through for `Constant`; for `Linear` /
+        // `Variable` it returns the schedule's value at the
+        // resolved edge parameter `t`.
+        let r_t = sample_radius(schedule, t);
+        let offset_distance_t = r_t / bisector_dot_na;
+        let center = edge_point + bisector * (offset_sign * offset_distance_t);
+        let contact_a = center + normal_a * (contact_sign * r_t);
+        let contact_b = center + normal_b * (contact_sign * r_t);
 
         if let Some(prev) = prev_center {
             cumulative_arc += (center - prev).magnitude();
@@ -728,25 +924,45 @@ fn solve_plane_plane(
             center,
             contact_a,
             contact_b,
-            radius,
+            radius: r_t,
         });
     }
 
-    // The three curves are exact straight lines for plane/plane —
-    // build them as [`Line`] rather than fitting a degree-3 NURBS to
-    // 32 colinear points. This keeps the rest of the kernel
-    // unchanged (Line implements `Curve` trait used by every
-    // downstream consumer).
-    let spine_start = samples[0].center;
-    let spine_end = samples[n_samples - 1].center;
-    let rail_a_start = samples[0].contact_a;
-    let rail_a_end = samples[n_samples - 1].contact_a;
-    let rail_b_start = samples[0].contact_b;
-    let rail_b_end = samples[n_samples - 1].contact_b;
-
-    let spine: Box<dyn Curve> = Box::new(Line::new(spine_start, spine_end));
-    let rail_a: Box<dyn Curve> = Box::new(Line::new(rail_a_start, rail_a_end));
-    let rail_b: Box<dyn Curve> = Box::new(Line::new(rail_b_start, rail_b_end));
+    // For constant schedules the three curves are exact straight
+    // lines — build them as [`Line`] rather than fitting a degree-3
+    // NURBS to 32 colinear points (preserves the pre-F3-ε exact-
+    // primitive fast path).
+    //
+    // For non-constant schedules the spine is generally a planar
+    // curve in the (edge × bisector) plane and the rails are
+    // planar curves in each supporting face. [`fit_curve_or_line`]
+    // short-circuits to `Line` when the resolved sample locus
+    // *happens* to come out colinear (e.g. a perfectly linear
+    // radius ramp on a straight edge), and otherwise fits a cubic
+    // NURBS.
+    let tol = options.tolerance.distance();
+    let (spine, rail_a, rail_b) = if is_constant.is_some() {
+        let spine_start = samples[0].center;
+        let spine_end = samples[n_samples - 1].center;
+        let rail_a_start = samples[0].contact_a;
+        let rail_a_end = samples[n_samples - 1].contact_a;
+        let rail_b_start = samples[0].contact_b;
+        let rail_b_end = samples[n_samples - 1].contact_b;
+        (
+            Box::new(Line::new(spine_start, spine_end)) as Box<dyn Curve>,
+            Box::new(Line::new(rail_a_start, rail_a_end)) as Box<dyn Curve>,
+            Box::new(Line::new(rail_b_start, rail_b_end)) as Box<dyn Curve>,
+        )
+    } else {
+        let centers: Vec<Point3> = samples.iter().map(|s| s.center).collect();
+        let contacts_a: Vec<Point3> = samples.iter().map(|s| s.contact_a).collect();
+        let contacts_b: Vec<Point3> = samples.iter().map(|s| s.contact_b).collect();
+        (
+            fit_curve_or_line(&centers, tol)?,
+            fit_curve_or_line(&contacts_a, tol)?,
+            fit_curve_or_line(&contacts_b, tol)?,
+        )
+    };
 
     Ok(SpineRail {
         spine,
@@ -754,9 +970,13 @@ fn solve_plane_plane(
         rail_b,
         samples,
         // F3-γ populates frames for the marching solver. For
-        // plane/plane the spine is straight: frames are constant and
-        // F4 can reconstruct them analytically from `(bisector,
-        // edge_tangent)` if it needs them.
+        // plane/plane the spine lives in the bisector plane and
+        // (for constant radius) is straight: frames are constant
+        // and F4 can reconstruct them analytically from `(bisector,
+        // edge_tangent)` if it needs them. Variable-radius plane/
+        // plane spines also lie in the bisector plane; F4 will
+        // attach frames analytically there too once it consumes the
+        // F3-ε output (task #8).
         frames: Vec::new(),
         solver_kind: SolverKind::AnalyticPlanePlane,
     })
@@ -860,7 +1080,7 @@ fn solve_plane_cylinder(
     plane: &Plane,
     cylinder: &Cylinder,
     plane_is_a: bool,
-    radius: f64,
+    schedule: &BlendRadius,
     options: &SpineOptions,
 ) -> OperationResult<Option<SpineRail>> {
     let (plane_face, cyl_face) = if plane_is_a {
@@ -893,10 +1113,11 @@ fn solve_plane_cylinder(
     let abs_alignment = axis_alignment.abs();
 
     if (abs_alignment - 1.0).abs() < PLANE_CYL_ALIGNMENT_TOL {
-        // Perpendicular: spine is a circular arc.
+        // Perpendicular: spine is a circular arc for constant
+        // radius, a more general curve for variable schedules.
         solve_plane_cyl_perpendicular(
             model, edge, plane, cylinder, plane_face, cyl_face, plane_is_a, n_plane, n_cyl,
-            radial_dir, axis_alignment, offset_sign, radius, options,
+            radial_dir, axis_alignment, offset_sign, schedule, options,
         )
         .map(Some)
     } else if abs_alignment < PLANE_CYL_ALIGNMENT_TOL {
@@ -907,7 +1128,7 @@ fn solve_plane_cylinder(
         if (radial_alignment - 1.0).abs() < PLANE_CYL_ALIGNMENT_TOL {
             solve_plane_cyl_parallel_tangent(
                 model, edge, plane, cylinder, plane_face, cyl_face, plane_is_a, n_plane, n_cyl,
-                radial_dir, offset_sign, radius, options,
+                radial_dir, offset_sign, schedule, options,
             )
             .map(Some)
         } else {
@@ -954,7 +1175,7 @@ fn solve_plane_cyl_perpendicular(
     radial_dir: Vector3,
     axis_alignment: f64, // n_plane · cyl.axis ∈ {≈-1, ≈+1}
     offset_sign: f64,
-    radius: f64,
+    schedule: &BlendRadius,
     options: &SpineOptions,
 ) -> OperationResult<SpineRail> {
     let sign_radial = if n_cyl.dot(&radial_dir) >= 0.0 {
@@ -962,20 +1183,18 @@ fn solve_plane_cyl_perpendicular(
     } else {
         -1.0
     };
-    let r_spine = cylinder.radius + offset_sign * sign_radial * radius;
-    if !(r_spine > options.tolerance.distance()) {
-        return Err(OperationError::InvalidRadius(radius));
-    }
-
     let axis_n_plane_sign = if axis_alignment >= 0.0 { 1.0 } else { -1.0 };
     let z_plane = (plane.origin - cylinder.origin).dot(&cylinder.axis);
-    let z_spine = z_plane + offset_sign * radius * axis_n_plane_sign;
 
-    // Build samples. For each edge parameter, compute the angular
-    // position of the edge point around the cylinder axis, then
-    // construct the spine point at the same angle but at radius
-    // r_spine and axial height z_spine.
-    let n_samples = options.min_samples.max(2);
+    // F3-ε.1: every station's per-axis radius `r_t` is sampled from
+    // the schedule. The derived geometry (spine radius from axis,
+    // axial height, plane-rail circle radius) follows per-station.
+    // For `Constant` schedules these all collapse to the legacy
+    // single-arc fast path; for non-constant schedules the spine
+    // and rails are NURBS curves fitted through the sample arrays.
+    let is_constant = schedule_constant_value(schedule);
+    let min_required = if is_constant.is_some() { 2 } else { 4 };
+    let n_samples = options.min_samples.max(min_required);
     let mut samples: Vec<SpineRailSample> = Vec::with_capacity(n_samples);
     let mut prev_center: Option<Point3> = None;
     let mut cumulative_arc = 0.0;
@@ -991,6 +1210,16 @@ fn solve_plane_cyl_perpendicular(
         // F3-δ.3: trim-aware parameterisation; see solve_plane_plane.
         let frac = i as f64 / (n_samples as f64 - 1.0);
         let t = options.edge_param_trim.map(frac);
+        let r_t = sample_radius(schedule, t);
+        let r_spine_t = cylinder.radius + offset_sign * sign_radial * r_t;
+        if !(r_spine_t > options.tolerance.distance()) {
+            // Per-station feasibility: spine radius from axis must
+            // remain strictly positive (otherwise the rolling ball
+            // would intersect the cylinder axis at this station).
+            return Err(OperationError::InvalidRadius(r_t));
+        }
+        let z_spine_t = z_plane + offset_sign * r_t * axis_n_plane_sign;
+
         let edge_point = edge.evaluate(t, &model.curves)?;
         let p_off = edge_point - cylinder.origin;
         let axial_t = p_off.dot(&cylinder.axis);
@@ -1003,14 +1232,14 @@ fn solve_plane_cyl_perpendicular(
         edge_angles.push(angle);
 
         let radial_t = ref_x * angle.cos() + ref_y * angle.sin();
-        let center = cylinder.origin + cylinder.axis * z_spine + radial_t * r_spine;
+        let center = cylinder.origin + cylinder.axis * z_spine_t + radial_t * r_spine_t;
         // Contact on plane: project centre back onto the original
         // plane along n_plane.
-        let contact_plane = center - n_plane * (offset_sign * radius);
+        let contact_plane = center - n_plane * (offset_sign * r_t);
         // Contact on cylinder: same angle as centre, axial position
         // matches centre, radial r_cyl.
         let contact_cyl =
-            cylinder.origin + cylinder.axis * z_spine + radial_t * cylinder.radius;
+            cylinder.origin + cylinder.axis * z_spine_t + radial_t * cylinder.radius;
 
         if let Some(prev) = prev_center {
             cumulative_arc += (center - prev).magnitude();
@@ -1028,62 +1257,93 @@ fn solve_plane_cyl_perpendicular(
             center,
             contact_a,
             contact_b,
-            radius,
+            radius: r_t,
         });
     }
 
-    // Resolve the angular sweep for the analytic arc curves. The
-    // Arc primitive parameterises with (start_angle, sweep_angle);
-    // we reconstruct both from the first and last edge angles.
-    // Closed edges (full rim of cylinder) sweep ±2π — the direction
-    // is taken from the angle delta accumulated over samples so
-    // that the arc parameterisation tracks the edge curve.
-    //
-    // F3-δ.3: a non-FULL [`ParamTrim`] means a corner setback at one
-    // (or both) endpoints — the edge can no longer be treated as
-    // topologically closed even if [`Edge::is_loop`] is true, since
-    // the spine is intentionally retracted from at least one end.
-    let closed_for_arc = edge.is_loop() && options.edge_param_trim.is_full();
-    let (start_angle, sweep_angle) =
-        resolve_arc_parameters(&edge_angles, closed_for_arc);
+    if let Some(radius_const) = is_constant {
+        // Constant-radius fast path: emit exact circular arcs
+        // (matching pre-F3-ε behaviour bit-for-bit on every prior
+        // dihedral / cylinder regression test).
+        let r_spine = cylinder.radius + offset_sign * sign_radial * radius_const;
+        let z_spine = z_plane + offset_sign * radius_const * axis_n_plane_sign;
 
-    // Spine arc: centred on the cylinder axis at z_spine, normal
-    // aligned with cylinder.axis, radius r_spine. We pass cyl.axis
-    // directly so that Arc::evaluate(0.0) uses cyl.ref_dir as the
-    // x-direction — matching the way we built edge_angles above.
-    let spine_arc = Arc::new(
-        cylinder.origin + cylinder.axis * z_spine,
-        cylinder.axis,
-        r_spine,
-        start_angle,
-        sweep_angle,
-    )
-    .map_err(|e| OperationError::NumericalError(format!("Spine arc construction: {:?}", e)))?;
+        // Resolve the angular sweep for the analytic arc curves.
+        // The Arc primitive parameterises with (start_angle,
+        // sweep_angle); we reconstruct both from the first and last
+        // edge angles. Closed edges (full rim of cylinder) sweep
+        // ±2π — the direction is taken from the angle delta
+        // accumulated over samples so that the arc parameterisation
+        // tracks the edge curve.
+        //
+        // F3-δ.3: a non-FULL [`ParamTrim`] means a corner setback
+        // at one (or both) endpoints — the edge can no longer be
+        // treated as topologically closed even if [`Edge::is_loop`]
+        // is true, since the spine is intentionally retracted from
+        // at least one end.
+        let closed_for_arc = edge.is_loop() && options.edge_param_trim.is_full();
+        let (start_angle, sweep_angle) =
+            resolve_arc_parameters(&edge_angles, closed_for_arc);
 
-    let rail_plane_arc = Arc::new(
-        cylinder.origin + cylinder.axis * z_plane,
-        cylinder.axis,
-        r_spine,
-        start_angle,
-        sweep_angle,
-    )
-    .map_err(|e| OperationError::NumericalError(format!("Plane rail arc: {:?}", e)))?;
+        let spine_arc = Arc::new(
+            cylinder.origin + cylinder.axis * z_spine,
+            cylinder.axis,
+            r_spine,
+            start_angle,
+            sweep_angle,
+        )
+        .map_err(|e| {
+            OperationError::NumericalError(format!("Spine arc construction: {:?}", e))
+        })?;
 
-    let rail_cyl_arc = Arc::new(
-        cylinder.origin + cylinder.axis * z_spine,
-        cylinder.axis,
-        cylinder.radius,
-        start_angle,
-        sweep_angle,
-    )
-    .map_err(|e| OperationError::NumericalError(format!("Cylinder rail arc: {:?}", e)))?;
+        let rail_plane_arc = Arc::new(
+            cylinder.origin + cylinder.axis * z_plane,
+            cylinder.axis,
+            r_spine,
+            start_angle,
+            sweep_angle,
+        )
+        .map_err(|e| OperationError::NumericalError(format!("Plane rail arc: {:?}", e)))?;
 
-    let spine: Box<dyn Curve> = Box::new(spine_arc);
-    let (rail_a, rail_b): (Box<dyn Curve>, Box<dyn Curve>) = if plane_is_a {
-        (Box::new(rail_plane_arc), Box::new(rail_cyl_arc))
-    } else {
-        (Box::new(rail_cyl_arc), Box::new(rail_plane_arc))
-    };
+        let rail_cyl_arc = Arc::new(
+            cylinder.origin + cylinder.axis * z_spine,
+            cylinder.axis,
+            cylinder.radius,
+            start_angle,
+            sweep_angle,
+        )
+        .map_err(|e| OperationError::NumericalError(format!("Cylinder rail arc: {:?}", e)))?;
+
+        let spine: Box<dyn Curve> = Box::new(spine_arc);
+        let (rail_a, rail_b): (Box<dyn Curve>, Box<dyn Curve>) = if plane_is_a {
+            (Box::new(rail_plane_arc), Box::new(rail_cyl_arc))
+        } else {
+            (Box::new(rail_cyl_arc), Box::new(rail_plane_arc))
+        };
+
+        return Ok(SpineRail {
+            spine,
+            rail_a,
+            rail_b,
+            samples,
+            frames: Vec::new(),
+            solver_kind: SolverKind::AnalyticPlaneCylinder,
+        });
+    }
+
+    // Non-constant schedule: spine sample locus lies on a helix-
+    // like curve whose axis is `cylinder.axis` and whose radius /
+    // axial position both vary with the per-station radius. The
+    // plane rail sweeps a non-circular curve in the original
+    // plane; the cylinder rail stays on the cylinder surface but
+    // varies axially. NURBS-fit each sample array.
+    let tol = options.tolerance.distance();
+    let centers: Vec<Point3> = samples.iter().map(|s| s.center).collect();
+    let contacts_a: Vec<Point3> = samples.iter().map(|s| s.contact_a).collect();
+    let contacts_b: Vec<Point3> = samples.iter().map(|s| s.contact_b).collect();
+    let spine = fit_curve_or_line(&centers, tol)?;
+    let rail_a = fit_curve_or_line(&contacts_a, tol)?;
+    let rail_b = fit_curve_or_line(&contacts_b, tol)?;
 
     Ok(SpineRail {
         spine,
@@ -1159,7 +1419,7 @@ fn solve_plane_cyl_parallel_tangent(
     n_cyl: Vector3,
     radial_dir: Vector3,
     offset_sign: f64,
-    radius: f64,
+    schedule: &BlendRadius,
     options: &SpineOptions,
 ) -> OperationResult<SpineRail> {
     let sign_radial = if n_cyl.dot(&radial_dir) >= 0.0 {
@@ -1167,33 +1427,40 @@ fn solve_plane_cyl_parallel_tangent(
     } else {
         -1.0
     };
-    let r_spine = cylinder.radius + offset_sign * sign_radial * radius;
-    if !(r_spine > options.tolerance.distance()) {
-        return Err(OperationError::InvalidRadius(radius));
-    }
 
-    let n_samples = options.min_samples.max(2);
+    // F3-ε.1: per-station spine radius from the cylinder axis.
+    // For constant schedules `r_spine_t` reduces to a single
+    // scalar shared across every station and the spine collapses
+    // to a straight line parallel to the axis (the pre-F3-ε fast
+    // path). For variable schedules each station has its own
+    // radial offset and the spine is a planar curve in the
+    // (cylinder.axis, radial_dir) half-plane.
+    let is_constant = schedule_constant_value(schedule);
+    let min_required = if is_constant.is_some() { 2 } else { 4 };
+    let n_samples = options.min_samples.max(min_required);
     let mut samples: Vec<SpineRailSample> = Vec::with_capacity(n_samples);
     let mut prev_center: Option<Point3> = None;
     let mut cumulative_arc = 0.0;
 
-    // The radial direction is constant along the edge for the
-    // tangent case. We still sample because the edge may not be a
-    // perfect line numerically and downstream consumers expect a
-    // uniform sample array.
     for i in 0..n_samples {
         // F3-δ.3: trim-aware parameterisation; see solve_plane_plane.
         let frac = i as f64 / (n_samples as f64 - 1.0);
         let t = options.edge_param_trim.map(frac);
+        let r_t = sample_radius(schedule, t);
+        let r_spine_t = cylinder.radius + offset_sign * sign_radial * r_t;
+        if !(r_spine_t > options.tolerance.distance()) {
+            return Err(OperationError::InvalidRadius(r_t));
+        }
+
         let edge_point = edge.evaluate(t, &model.curves)?;
         let p_off = edge_point - cylinder.origin;
         let axial_t = p_off.dot(&cylinder.axis);
 
         // Spine point: cyl axis projection at axial_t, plus radial
         // offset in the constant radial_dir direction at distance
-        // r_spine.
-        let center = cylinder.origin + cylinder.axis * axial_t + radial_dir * r_spine;
-        let contact_plane = center - n_plane * (offset_sign * radius);
+        // r_spine_t.
+        let center = cylinder.origin + cylinder.axis * axial_t + radial_dir * r_spine_t;
+        let contact_plane = center - n_plane * (offset_sign * r_t);
         let contact_cyl =
             cylinder.origin + cylinder.axis * axial_t + radial_dir * cylinder.radius;
 
@@ -1213,28 +1480,52 @@ fn solve_plane_cyl_parallel_tangent(
             center,
             contact_a,
             contact_b,
-            radius,
+            radius: r_t,
         });
     }
 
-    // Spine and rails are straight lines for the parallel-tangent
-    // case. Build them as exact `Line`s rather than fitted NURBS.
-    let spine_start = samples[0].center;
-    let spine_end = samples[n_samples - 1].center;
-    let spine: Box<dyn Curve> = Box::new(Line::new(spine_start, spine_end));
-
-    let plane_rail_start = samples[0].contact_a;
-    let plane_rail_end = samples[n_samples - 1].contact_a;
-    let cyl_rail_start = samples[0].contact_b;
-    let cyl_rail_end = samples[n_samples - 1].contact_b;
-    // Swap if plane was face_b.
-    let (rail_a_start, rail_a_end, rail_b_start, rail_b_end) = if plane_is_a {
-        (plane_rail_start, plane_rail_end, cyl_rail_start, cyl_rail_end)
-    } else {
-        (plane_rail_start, plane_rail_end, cyl_rail_start, cyl_rail_end)
-    };
-    let rail_a: Box<dyn Curve> = Box::new(Line::new(rail_a_start, rail_a_end));
-    let rail_b: Box<dyn Curve> = Box::new(Line::new(rail_b_start, rail_b_end));
+    let (spine, rail_a, rail_b): (Box<dyn Curve>, Box<dyn Curve>, Box<dyn Curve>) =
+        if is_constant.is_some() {
+            // Constant-radius fast path: spine and both rails are
+            // exact straight lines parallel to the cylinder axis.
+            let spine_start = samples[0].center;
+            let spine_end = samples[n_samples - 1].center;
+            let plane_rail_start = samples[0].contact_a;
+            let plane_rail_end = samples[n_samples - 1].contact_a;
+            let cyl_rail_start = samples[0].contact_b;
+            let cyl_rail_end = samples[n_samples - 1].contact_b;
+            let (rail_a_start, rail_a_end, rail_b_start, rail_b_end) = if plane_is_a {
+                (
+                    plane_rail_start,
+                    plane_rail_end,
+                    cyl_rail_start,
+                    cyl_rail_end,
+                )
+            } else {
+                (
+                    plane_rail_start,
+                    plane_rail_end,
+                    cyl_rail_start,
+                    cyl_rail_end,
+                )
+            };
+            (
+                Box::new(Line::new(spine_start, spine_end)),
+                Box::new(Line::new(rail_a_start, rail_a_end)),
+                Box::new(Line::new(rail_b_start, rail_b_end)),
+            )
+        } else {
+            // Variable schedule: NURBS-fit through samples.
+            let tol = options.tolerance.distance();
+            let centers: Vec<Point3> = samples.iter().map(|s| s.center).collect();
+            let contacts_a: Vec<Point3> = samples.iter().map(|s| s.contact_a).collect();
+            let contacts_b: Vec<Point3> = samples.iter().map(|s| s.contact_b).collect();
+            (
+                fit_curve_or_line(&centers, tol)?,
+                fit_curve_or_line(&contacts_a, tol)?,
+                fit_curve_or_line(&contacts_b, tol)?,
+            )
+        };
 
     Ok(SpineRail {
         spine,
@@ -1274,9 +1565,23 @@ fn solve_plane_sphere(
     plane: &Plane,
     sphere: &Sphere,
     plane_is_a: bool,
-    radius: f64,
+    schedule: &BlendRadius,
     options: &SpineOptions,
 ) -> OperationResult<Option<SpineRail>> {
+    // F3-ε.1: this arm keeps its closed-form arc construction only
+    // for schedules that reduce to a single constant value. The
+    // sphere-side contact small circle, plane-side contact circle,
+    // and spine arc derivation are all parameterised by a single
+    // scalar radius — generalising to per-station r along a
+    // sphere's small-circle locus is messy enough that F3-ε.1
+    // routes non-constant schedules through the marching solver
+    // (task #98 follow-up may reinstate an analytic variable-
+    // radius arm for the plane / sphere case).
+    let radius = match schedule_constant_value(schedule) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
     let (plane_face, sphere_face) = if plane_is_a {
         (face_a, face_b)
     } else {
@@ -1712,7 +2017,7 @@ fn solve_marching(
     _face_b: FaceId,
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,
-    radius: f64,
+    schedule: &BlendRadius,
     options: &SpineOptions,
 ) -> OperationResult<SpineRail> {
     // 1. Establish signed dihedral and sign convention once at the
@@ -1793,6 +2098,15 @@ fn solve_marching(
         let t = options.edge_param_trim.map(frac);
         let edge_point = edge.evaluate(t, &model.curves)?;
 
+        // F3-ε.1: per-station radius sampled from the schedule.
+        // The corrector receives `r_t` so the alternate-projection
+        // Picard update pushes each contact outward by the correct
+        // station-local radius. For `Constant` this is the legacy
+        // single-scalar path; `Linear` / `Variable` schedules vary
+        // `r_t` station-to-station and the rolling ball changes
+        // size as it traces the spine.
+        let r_t = sample_radius(schedule, t);
+
         // Bisector seed at this edge parameter — same heuristic as
         // the legacy bisector path and the analytic arms' starting
         // point. Anchors the corrector on the correct edge-
@@ -1809,15 +2123,15 @@ fn solve_marching(
             })?;
             let dot_a = bisector.dot(&n_a);
             let offset_dist = if dot_a.abs() > 1e-9 {
-                radius / dot_a
+                r_t / dot_a
             } else {
-                radius
+                r_t
             };
             edge_point + bisector * (offset_sign * offset_dist)
         };
 
         let (center, contact_a, contact_b, iters) =
-            corrector(surface_a, surface_b, seed, radius, options.tolerance)?;
+            corrector(surface_a, surface_b, seed, r_t, options.tolerance)?;
         worst_iters = worst_iters.max(iters);
 
         if let Some(prev) = prev_center {
@@ -1831,7 +2145,7 @@ fn solve_marching(
             center,
             contact_a,
             contact_b,
-            radius,
+            radius: r_t,
         });
     }
 
@@ -2858,7 +3172,15 @@ mod tests {
 
         let opts = SpineOptions::default();
         let rail = solve_marching(
-            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.25, &opts,
+            &model,
+            &edge,
+            edge_id,
+            face_a,
+            face_b,
+            surface_a,
+            surface_b,
+            &BlendRadius::Constant(0.25),
+            &opts,
         )
         .expect("marching should converge on plane/plane");
 
@@ -2877,7 +3199,15 @@ mod tests {
 
         let opts = SpineOptions::default();
         let rail = solve_marching(
-            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.3, &opts,
+            &model,
+            &edge,
+            edge_id,
+            face_a,
+            face_b,
+            surface_a,
+            surface_b,
+            &BlendRadius::Constant(0.3),
+            &opts,
         )
         .expect("marching");
         match rail.solver_kind {
@@ -2910,7 +3240,15 @@ mod tests {
         let radius = 0.4;
         let opts = SpineOptions::default();
         let rail = solve_marching(
-            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, radius, &opts,
+            &model,
+            &edge,
+            edge_id,
+            face_a,
+            face_b,
+            surface_a,
+            surface_b,
+            &BlendRadius::Constant(radius),
+            &opts,
         )
         .expect("marching");
 
@@ -2953,7 +3291,15 @@ mod tests {
         let surface_a = model.surfaces.get(sa_id).expect("surface a");
         let surface_b = model.surfaces.get(sb_id).expect("surface b");
         let marched = solve_marching(
-            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, radius, &opts,
+            &model,
+            &edge,
+            edge_id,
+            face_a,
+            face_b,
+            surface_a,
+            surface_b,
+            &BlendRadius::Constant(radius),
+            &opts,
         )
         .expect("marching");
 
@@ -2997,7 +3343,15 @@ mod tests {
             ..SpineOptions::default()
         };
         let rail = solve_marching(
-            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.2, &opts,
+            &model,
+            &edge,
+            edge_id,
+            face_a,
+            face_b,
+            surface_a,
+            surface_b,
+            &BlendRadius::Constant(0.2),
+            &opts,
         )
         .expect("marching");
         assert_eq!(rail.samples.len(), 16);
@@ -3023,7 +3377,15 @@ mod tests {
 
         let opts = SpineOptions::default();
         let rail = solve_marching(
-            &model, &edge, edge_id, face_a, face_b, surface_a, surface_b, 0.2, &opts,
+            &model,
+            &edge,
+            edge_id,
+            face_a,
+            face_b,
+            surface_a,
+            surface_b,
+            &BlendRadius::Constant(0.2),
+            &opts,
         )
         .expect("marching");
 
