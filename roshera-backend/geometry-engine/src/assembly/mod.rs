@@ -480,6 +480,19 @@ impl Assembly {
         self.components.get(&id).map(|c| c.clone())
     }
 
+    /// Root (fixed) component, if any. The first call to `add_part`
+    /// installs the root; `remove_component` clears it if it matches.
+    pub fn root_component(&self) -> Option<ComponentId> {
+        self.root_component
+    }
+
+    /// Borrow the current exploded-view configuration, if any. The
+    /// configuration is set by `create_exploded_view`; callers that
+    /// need an owned copy should `.cloned()` the returned reference.
+    pub fn exploded_config(&self) -> Option<&ExplodedViewConfig> {
+        self.exploded_config.as_ref()
+    }
+
     /// Snapshot a mate constraint by ID.
     pub fn get_mate(&self, id: MateId) -> Option<MateConstraint> {
         self.mates.get(&id).map(|m| m.clone())
