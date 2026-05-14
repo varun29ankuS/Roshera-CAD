@@ -4915,8 +4915,32 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with timestamped, leveled output.
+    //
+    // Provenance requires every log line to carry a wall-clock
+    // timestamp so post-hoc audits can reconstruct the order and
+    // exact moment of every operation across hosts and time zones.
+    // The default `fmt::init()` falls back to a `SystemTime` formatter
+    // that prints `SystemTime { intervals: ... }` on Windows — not
+    // human-readable and not aligned with the `DateTime<Utc>`
+    // timestamps already stored on every recorded timeline event
+    // (timeline-engine `RecordedOperation::timestamp`).
+    //
+    // We pin the format to RFC 3339 UTC (e.g.
+    // `2026-05-14T15:30:45.123456Z`) so audit logs match what the
+    // timeline persists and what cross-host log aggregators expect.
+    // Log level is governed by `RUST_LOG` (env-filter), defaulting
+    // to INFO when unset — verbose enough to capture every mutating
+    // request without drowning in DEBUG noise.
+    use tracing_subscriber::{fmt::time::ChronoUtc, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_timer(ChronoUtc::rfc_3339())
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_env_filter(filter)
+        .init();
 
     // Initialize geometry model
     let model = Arc::new(RwLock::new(
