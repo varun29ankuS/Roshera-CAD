@@ -775,6 +775,102 @@ pub fn validate_model_enhanced(
     validator.validate_model(model, tolerance, level)
 }
 
+/// Validate that a single shell is closed: every edge contained in any
+/// loop of any face in the shell must be used by exactly two faces of
+/// the shell.
+///
+/// Returns:
+/// - an empty `Vec` if the shell is closed and manifold;
+/// - a `ConnectivityError` per offending edge otherwise.
+///
+/// Boundary edges (count = 1) are reported as
+/// `"Boundary edge {edge_id} detected in shell {shell_id} - shell is not closed"`.
+/// Non-manifold edges (count > 2) are reported as
+/// `"Non-manifold edge {edge_id} used by N faces in shell {shell_id}"`.
+///
+/// Counterpart to the parallel `check_topology_gaps` analysis, scoped
+/// to one shell and returning a per-edge error vector instead of a
+/// global model report. Used by `operations::sew` as a post-sew gate
+/// for the F7 trim/sew pipeline.
+pub fn validate_shell_closure(model: &BRepModel, shell_id: ShellId) -> Vec<ValidationError> {
+    let Some(shell) = model.shells.get(shell_id) else {
+        return vec![ValidationError::ConnectivityError {
+            message: format!("Shell {} not found", shell_id),
+            location: EntityLocation {
+                solid_id: None,
+                shell_id: Some(shell_id),
+                face_id: None,
+                loop_id: None,
+                edge_id: None,
+                vertex_id: None,
+            },
+        }];
+    };
+
+    // Tally edge usage scoped to this shell.
+    let mut edge_usage: std::collections::HashMap<EdgeId, (Vec<FaceId>, Vec<LoopId>)> =
+        std::collections::HashMap::new();
+    for &face_id in &shell.faces {
+        let Some(face) = model.faces.get(face_id) else {
+            continue;
+        };
+        let mut all_loops = Vec::with_capacity(1 + face.inner_loops.len());
+        all_loops.push(face.outer_loop);
+        all_loops.extend(&face.inner_loops);
+        for &loop_id in &all_loops {
+            let Some(loop_data) = model.loops.get(loop_id) else {
+                continue;
+            };
+            for &edge_id in &loop_data.edges {
+                let entry = edge_usage.entry(edge_id).or_default();
+                entry.0.push(face_id);
+                entry.1.push(loop_id);
+            }
+        }
+    }
+
+    let mut errors = Vec::new();
+    for (edge_id, (faces, loops)) in edge_usage {
+        match faces.len() {
+            0 => {} // unreachable: we only insert with at least one face.
+            1 => {
+                errors.push(ValidationError::ConnectivityError {
+                    message: format!(
+                        "Boundary edge {} detected in shell {} - shell is not closed",
+                        edge_id, shell_id
+                    ),
+                    location: EntityLocation {
+                        solid_id: None,
+                        shell_id: Some(shell_id),
+                        face_id: faces.first().copied(),
+                        loop_id: loops.first().copied(),
+                        edge_id: Some(edge_id),
+                        vertex_id: None,
+                    },
+                });
+            }
+            2 => {} // manifold edge.
+            n => {
+                errors.push(ValidationError::ConnectivityError {
+                    message: format!(
+                        "Non-manifold edge {} used by {} faces in shell {}",
+                        edge_id, n, shell_id
+                    ),
+                    location: EntityLocation {
+                        solid_id: None,
+                        shell_id: Some(shell_id),
+                        face_id: faces.first().copied(),
+                        loop_id: loops.first().copied(),
+                        edge_id: Some(edge_id),
+                        vertex_id: None,
+                    },
+                });
+            }
+        }
+    }
+    errors
+}
+
 /// Automatic repair functionality
 pub struct ModelRepairer {
     tolerance: Tolerance,
