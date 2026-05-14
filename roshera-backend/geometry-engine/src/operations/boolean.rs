@@ -2465,7 +2465,15 @@ fn add_non_intersecting_faces(
                 received: format!("{face_id:?}"),
             })?;
         let surface_id = face.surface_id;
-        let boundary_edges = get_face_boundary_edges(model, face_id)?;
+        // Task #36 Slice 3 completeness fix: preserve face-with-hole
+        // topology when the active boolean doesn't intersect a
+        // pre-existing holed face. The previous implementation flat-
+        // tened outer + inner loops into a single `boundary_edges` bag
+        // via `get_face_boundary_edges` and set `inner_loops: Vec::new()`,
+        // which destroyed hole topology for any chained boolean
+        // operation (e.g. cut A then cut B where B doesn't touch A's
+        // holed face — A's hole vanished).
+        let (boundary_edges, inner_loops) = get_face_outer_and_inner_loops(model, face_id)?;
         out.push(SplitFace {
             original_face: face_id,
             surface: surface_id,
@@ -2473,7 +2481,7 @@ fn add_non_intersecting_faces(
             classification: FaceClassification::OnBoundary,
             from_solid: solid,
             interior_point: None,
-            inner_loops: Vec::new(),
+            inner_loops,
         });
     }
     Ok(())
@@ -2877,6 +2885,32 @@ pub(super) fn get_face_boundary_edges(
     model: &BRepModel,
     face_id: FaceId,
 ) -> OperationResult<Vec<(EdgeId, bool)>> {
+    let (mut outer, inners) = get_face_outer_and_inner_loops(model, face_id)?;
+    for hole in inners {
+        outer.extend(hole);
+    }
+    Ok(outer)
+}
+
+/// Extract a face's outer loop and inner-loop edges as separate
+/// structured collections.
+///
+/// Companion to [`get_face_boundary_edges`] (which flattens both into
+/// a single bag for spatial queries like the line/circle clippers).
+/// Used by [`add_non_intersecting_faces`] to preserve a face-with-hole's
+/// topology when the active boolean doesn't intersect it — without
+/// the separation, a face that already carries inner loops from a
+/// prior operation would be lumped into a single outer-only
+/// [`SplitFace`] and the hole would be silently destroyed when
+/// [`build_shells_from_faces`] reconstructs the face.
+///
+/// Returns `(outer, inners)` where every entry is
+/// `Vec<(EdgeId, bool)>` matching the [`SplitFace`] convention
+/// (each pair is `(edge_id, forward_on_loop)`).
+pub(super) fn get_face_outer_and_inner_loops(
+    model: &BRepModel,
+    face_id: FaceId,
+) -> OperationResult<(Vec<(EdgeId, bool)>, Vec<Vec<(EdgeId, bool)>>)> {
     let face = model
         .faces
         .get(face_id)
@@ -2886,9 +2920,6 @@ pub(super) fn get_face_boundary_edges(
             received: format!("{:?}", face_id),
         })?;
 
-    let mut edges: Vec<(EdgeId, bool)> = Vec::new();
-
-    // Get outer loop edges, zipped with their per-edge orientations.
     let outer_loop =
         model
             .loops
@@ -2898,12 +2929,13 @@ pub(super) fn get_face_boundary_edges(
                 expected: "valid loop ID".to_string(),
                 received: format!("{:?}", face.outer_loop),
             })?;
+    let mut outer: Vec<(EdgeId, bool)> = Vec::with_capacity(outer_loop.edges.len());
     for (i, &eid) in outer_loop.edges.iter().enumerate() {
         let fwd = outer_loop.orientations.get(i).copied().unwrap_or(true);
-        edges.push((eid, fwd));
+        outer.push((eid, fwd));
     }
 
-    // Get inner loop edges, also with their orientations.
+    let mut inners: Vec<Vec<(EdgeId, bool)>> = Vec::with_capacity(face.inner_loops.len());
     for loop_id in &face.inner_loops {
         let inner_loop = model
             .loops
@@ -2913,13 +2945,15 @@ pub(super) fn get_face_boundary_edges(
                 expected: "valid loop ID".to_string(),
                 received: format!("{:?}", loop_id),
             })?;
+        let mut hole: Vec<(EdgeId, bool)> = Vec::with_capacity(inner_loop.edges.len());
         for (i, &eid) in inner_loop.edges.iter().enumerate() {
             let fwd = inner_loop.orientations.get(i).copied().unwrap_or(true);
-            edges.push((eid, fwd));
+            hole.push((eid, fwd));
         }
+        inners.push(hole);
     }
 
-    Ok(edges)
+    Ok((outer, inners))
 }
 
 /// Outcome of attempting to clip a cutting line to a face's trim boundary.
@@ -9500,5 +9534,181 @@ mod tests {
         );
         // Point far outside the L's bounding box.
         assert!(!uv_point_in_polygon(&l, (5.0, 5.0)), "outside bbox");
+    }
+
+    // =====================================================================
+    // Task #36 Slice 3 completeness — `get_face_outer_and_inner_loops`
+    // and `add_non_intersecting_faces` must preserve hole topology on
+    // faces that the active boolean doesn't intersect.
+    // =====================================================================
+
+    /// Build a Face on the XY plane carrying both an outer rectangle
+    /// loop AND one inner-square hole loop. Returns the FaceId so a
+    /// test can probe `get_face_outer_and_inner_loops` round-trip
+    /// fidelity.
+    fn build_face_with_hole_on_xy(model: &mut BRepModel) -> (FaceId, usize, usize) {
+        use crate::primitives::face::{Face, FaceOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+        use crate::primitives::surface::Plane;
+
+        let plane = Plane::from_point_normal(Point3::ORIGIN, Vector3::Z).expect("xy plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+
+        let outer_edges = mk_square_edges(model, 0.0, 0.0, 10.0, 10.0);
+        let inner_edges = mk_square_edges(model, 2.0, 2.0, 4.0, 4.0);
+        let outer_count = outer_edges.len();
+        let inner_count = inner_edges.len();
+
+        let mut outer_loop = Loop::new(0, LoopType::Outer);
+        for (eid, fwd) in &outer_edges {
+            outer_loop.add_edge(*eid, *fwd);
+        }
+        let outer_loop_id = model.loops.add(outer_loop);
+
+        let mut inner_loop = Loop::new(0, LoopType::Inner);
+        for (eid, fwd) in &inner_edges {
+            inner_loop.add_edge(*eid, *fwd);
+        }
+        let inner_loop_id = model.loops.add(inner_loop);
+
+        let mut face = Face::new(0, surface_id, outer_loop_id, FaceOrientation::Forward);
+        face.add_inner_loop(inner_loop_id);
+        let face_id = model.faces.add(face);
+
+        (face_id, outer_count, inner_count)
+    }
+
+    /// Round-trip the new helper: a face with an outer rect + one inner
+    /// hole must come back as (outer: 4 edges, inners: [hole with 4
+    /// edges]) with orientations preserved.
+    #[test]
+    fn get_face_outer_and_inner_loops_round_trip() {
+        let mut model = BRepModel::new();
+        let (face_id, outer_count, inner_count) = build_face_with_hole_on_xy(&mut model);
+
+        let (outer, inners) =
+            get_face_outer_and_inner_loops(&model, face_id).expect("face exists");
+
+        assert_eq!(outer.len(), outer_count, "outer edge count must round-trip");
+        assert_eq!(inners.len(), 1, "exactly one inner loop must survive");
+        assert_eq!(
+            inners[0].len(),
+            inner_count,
+            "inner loop edge count must round-trip",
+        );
+        for &(_, fwd) in &outer {
+            assert!(fwd, "outer loop was built forward — orientation preserved");
+        }
+        for &(_, fwd) in &inners[0] {
+            assert!(fwd, "inner loop was built forward — orientation preserved");
+        }
+    }
+
+    /// `get_face_boundary_edges` (the flat-bag variant used by spatial
+    /// clippers) must still return outer + inner combined, in that
+    /// order — the contract callers like the line/circle clippers
+    /// depend on.
+    #[test]
+    fn get_face_boundary_edges_flattens_outer_then_inner() {
+        let mut model = BRepModel::new();
+        let (face_id, outer_count, inner_count) = build_face_with_hole_on_xy(&mut model);
+
+        let flat = get_face_boundary_edges(&model, face_id).expect("face exists");
+        assert_eq!(
+            flat.len(),
+            outer_count + inner_count,
+            "flat edge bag must contain outer + inner edges",
+        );
+    }
+
+    /// `add_non_intersecting_faces`: a face that doesn't appear in the
+    /// `intersected` set must produce a `SplitFace` whose
+    /// `boundary_edges` is the outer loop ONLY and whose `inner_loops`
+    /// preserves every original inner-loop hole. Pins the Slice 3
+    /// completeness fix: previously the helper flattened outer + inner
+    /// into one `boundary_edges` bag and stamped `inner_loops:
+    /// Vec::new()`, silently destroying hole topology for any chained
+    /// boolean where the second cut doesn't touch a previously-holed
+    /// face.
+    #[test]
+    fn add_non_intersecting_faces_preserves_inner_loops() {
+        use crate::primitives::shell::Shell;
+        use crate::primitives::solid::Solid;
+
+        let mut model = BRepModel::new();
+        let (face_id, outer_count, inner_count) = build_face_with_hole_on_xy(&mut model);
+
+        // Wrap the face in a minimal Shell + Solid so `get_solid_faces`
+        // can find it. Closed-shell invariants are NOT relevant here —
+        // we only test the per-face copy logic.
+        let mut shell = Shell::new(0, crate::primitives::shell::ShellType::Open);
+        shell.add_face(face_id);
+        let shell_id = model.shells.add(shell);
+        let solid = Solid::new(0, shell_id);
+        let solid_id = model.solids.add(solid);
+
+        let mut out: Vec<SplitFace> = Vec::new();
+        add_non_intersecting_faces(&model, solid_id, &HashSet::new(), &mut out)
+            .expect("non-intersecting copy must succeed");
+
+        assert_eq!(out.len(), 1, "exactly one face was copied");
+        let sf = &out[0];
+        assert_eq!(sf.original_face, face_id, "original_face id preserved");
+        assert_eq!(
+            sf.boundary_edges.len(),
+            outer_count,
+            "boundary_edges must carry ONLY the outer loop (Slice 3 fix)",
+        );
+        assert_eq!(
+            sf.inner_loops.len(),
+            1,
+            "exactly one inner loop must be preserved (Slice 3 fix)",
+        );
+        assert_eq!(
+            sf.inner_loops[0].len(),
+            inner_count,
+            "inner loop edge count must round-trip into SplitFace",
+        );
+    }
+
+    /// A face with NO inner loops must produce a SplitFace with an
+    /// empty `inner_loops`. Pins that the Slice 3 fix doesn't
+    /// fabricate phantom holes on flat faces.
+    #[test]
+    fn add_non_intersecting_faces_no_holes_yields_empty_inner_loops() {
+        use crate::primitives::face::{Face, FaceOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+        use crate::primitives::shell::Shell;
+        use crate::primitives::solid::Solid;
+        use crate::primitives::surface::Plane;
+
+        let mut model = BRepModel::new();
+        let plane = Plane::from_point_normal(Point3::ORIGIN, Vector3::Z).expect("xy plane");
+        let surface_id = model.surfaces.add(Box::new(plane));
+        let outer_edges = mk_square_edges(&mut model, 0.0, 0.0, 5.0, 5.0);
+        let mut outer_loop = Loop::new(0, LoopType::Outer);
+        for (eid, fwd) in &outer_edges {
+            outer_loop.add_edge(*eid, *fwd);
+        }
+        let outer_loop_id = model.loops.add(outer_loop);
+        let face = Face::new(0, surface_id, outer_loop_id, FaceOrientation::Forward);
+        let face_id = model.faces.add(face);
+
+        let mut shell = Shell::new(0, crate::primitives::shell::ShellType::Open);
+        shell.add_face(face_id);
+        let shell_id = model.shells.add(shell);
+        let solid = Solid::new(0, shell_id);
+        let solid_id = model.solids.add(solid);
+
+        let mut out: Vec<SplitFace> = Vec::new();
+        add_non_intersecting_faces(&model, solid_id, &HashSet::new(), &mut out)
+            .expect("copy must succeed");
+
+        assert_eq!(out.len(), 1, "exactly one face was copied");
+        assert_eq!(out[0].boundary_edges.len(), 4, "outer rect edges");
+        assert!(
+            out[0].inner_loops.is_empty(),
+            "no original inner loops, no fabricated holes",
+        );
     }
 }
