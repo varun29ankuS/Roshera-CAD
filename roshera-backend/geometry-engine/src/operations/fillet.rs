@@ -419,27 +419,26 @@ fn create_constant_radius_fillet(
         return create_closed_edge_fillet(model, edge_id, face1_id, face2_id, radius, radius);
     }
 
-    // F3-δ.4: route through `solve_spine_for_chain` so the spine
-    // path consumes the F2-γ setbacks stored on `blend_graph`.
-    // For single-edge selections without shared corners the
-    // BlendEdge carries `start_setback = end_setback = None` and
-    // the trim collapses to `ParamTrim::FULL` — byte-equivalent to
-    // the pre-F3-δ.4 path. When the corner-patch work (F4/F5)
-    // lands and `validate_no_shared_corners` is replaced by the
-    // setback-aware dispatch, the same code path produces
-    // retracted spines without any further plumbing change. Pairs
-    // that no analytic arm handles return `None` and we fall back
-    // to the legacy bisector below.
+    // F3-δ.5: route every constant-radius chain through the spine
+    // solver. With F3-δ.2's `enable_marching: true` default and
+    // F3-δ.1's planar-RuledSurface promotion, every surface-pair
+    // tuple is claimed by either an analytic arm or the marched
+    // arm — `solve_spine_for_chain` returning `Ok(None)` for a
+    // single-edge chain is now an internal-consistency failure
+    // (the only other `Ok(None)` path is the multi-edge sentinel
+    // which we provably don't trigger here). The legacy bisector
+    // (`compute_rolling_ball_positions` + `adaptive_rolling_ball_sampling`)
+    // is deleted in this slice.
     let spine_options = super::spine_solver::SpineOptions::default();
-    let rolling_ball_data = match super::spine_solver::solve_spine_for_chain(
-        model,
-        &[edge_id],
-        blend_graph,
-        &spine_options,
-    )? {
-        Some(spine_rail) => rolling_ball_data_from_spine_rail(&spine_rail),
-        None => compute_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, radius)?,
-    };
+    let spine_rail =
+        super::spine_solver::solve_spine_for_chain(model, &[edge_id], blend_graph, &spine_options)?
+            .ok_or_else(|| {
+                OperationError::InternalError(format!(
+                    "spine solver returned no rail for single-edge chain (edge {})",
+                    edge_id
+                ))
+            })?;
+    let rolling_ball_data = rolling_ball_data_from_spine_rail(&spine_rail);
 
     // Create fillet surface (cylindrical or toroidal patch)
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
@@ -2060,184 +2059,6 @@ fn rolling_ball_data_from_spine_rail(
     data
 }
 
-/// Compute rolling ball positions for fillet
-fn compute_rolling_ball_positions(
-    model: &BRepModel,
-    edge: &Edge,
-    edge_id: EdgeId,
-    face1_id: FaceId,
-    face2_id: FaceId,
-    radius: f64,
-) -> OperationResult<RollingBallData> {
-    // Existence guard for both faces — `get_face_oriented_normal`
-    // re-fetches each face for every normal call (it has to: it
-    // needs `face.orientation.sign()`), so we don't keep the
-    // references here. Fail fast if either id is bogus.
-    let _ = model
-        .faces
-        .get(face1_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face1 not found".to_string()))?;
-    let _ = model
-        .faces
-        .get(face2_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Face2 not found".to_string()))?;
-
-    // Check for near-tangent case
-    // Compute face normals at midpoint of edge. Use the face-oriented
-    // helper so each normal points outward from the solid regardless
-    // of whether the face was constructed with `FaceOrientation::Forward`
-    // or `Backward` — both states are common in an extruded solid.
-    let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
-    let face1_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
-    let face2_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
-    let edge_tangent = edge.tangent_at(0.5, &model.curves)?;
-
-    // Project the edge tangent into face1's loop-traversal direction.
-    // `robust_face_angle` returns a signed dihedral whose sign is only a
-    // geometric invariant (positive ⇒ convex, negative ⇒ concave) when
-    // the tangent it sees is oriented along one face's CCW loop. The
-    // raw curve tangent depends on the curve's parameter direction,
-    // which is independent of face topology — using it directly makes
-    // the convex/concave classifier flip across edges that happen to
-    // be parameterized backwards relative to face1's outer loop.
-    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face1_id
-        ))
-    })?;
-    let edge_tangent_in_loop = edge_tangent * face1_loop_sign;
-
-    let angle = robust_face_angle(
-        &face1_normal,
-        &face2_normal,
-        &edge_tangent_in_loop,
-        &Tolerance::default(),
-    )?;
-    // `robust_face_angle` returns a signed dihedral in (-π, π]; concave
-    // edges flip its sign. The "near-tangent" condition is when the
-    // surfaces are nearly coplanar, i.e. |angle| close to 0 (or to π for
-    // the antiparallel-normal degeneracy). A 90° convex cube edge yields
-    // ±π/2 and must pass — the previous unsigned-style check rejected
-    // any negative dihedral (e.g. concave fillets) outright.
-    let abs_angle = angle.abs();
-    if abs_angle < 0.1 || (std::f64::consts::PI - abs_angle) < 0.1 {
-        // ~5.7 degrees from coplanar
-        return Err(OperationError::InvalidGeometry(
-            "Near-tangent surfaces require special handling".to_string(),
-        ));
-    }
-
-    // Inflection-edge guard (Task #98 slice 1). The midpoint
-    // classification above commits the rolling ball to one side of
-    // the surface for the entire edge; an edge whose dihedral flips
-    // sign along its parameter would produce a self-intersecting
-    // blend. Sample at 11 uniformly-spaced points (resolution ~10%
-    // of the edge length) — if both positive and negative dihedrals
-    // are observed above the noise floor, reject before any surface
-    // is built so the caller sees an actionable diagnostic instead
-    // of a corrupted output.
-    if detect_dihedral_inflection(model, edge, edge_id, face1_id, face2_id, 11)? {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Edge {} has a dihedral sign inflection along its parameter \
-             (convex on one segment, concave on another). A single-radius \
-             fillet cannot span an inflection without self-intersecting. \
-             Split the edge at each inflection parameter and fillet the \
-             sub-segments separately. (Task #98 slice 1 — automatic split \
-             is slice 2.)",
-            edge_id
-        )));
-    }
-
-    // Use adaptive sampling for better quality
-    let tolerance = &Tolerance::default();
-    let edge_curve = model
-        .curves
-        .get(edge.curve_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge curve not found".to_string()))?;
-    let sample_params = adaptive_rolling_ball_sampling(edge_curve, tolerance);
-    let num_samples = sample_params.len();
-    let mut data = RollingBallData {
-        centers: Vec::with_capacity(num_samples),
-        contacts1: Vec::with_capacity(num_samples),
-        contacts2: Vec::with_capacity(num_samples),
-        parameters: Vec::with_capacity(num_samples),
-        radii: Vec::with_capacity(num_samples),
-    };
-
-    for &t in &sample_params {
-        data.parameters.push(t);
-        data.radii.push(radius);
-
-        // Validate edge differentiability at this sample (tangent value
-        // is unused — we only fail if the edge is non-differentiable).
-        let edge_point = edge.evaluate(t, &model.curves)?;
-        edge.tangent_at(t, &model.curves)?;
-
-        // Get surface normals at edge point (projected, face-oriented).
-        let normal1 = get_face_oriented_normal(model, face1_id, &edge_point)?;
-        let normal2 = get_face_oriented_normal(model, face2_id, &edge_point)?;
-
-        // Calculate fillet center using rolling ball approach
-        // The fillet center is offset from the edge by radius in the direction
-        // that is equidistant from both surface normals
-        let bisector = (normal1 + normal2).normalize().map_err(|e| {
-            OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
-        })?;
-
-        // Use the signed dihedral (`angle`, computed above from
-        // `robust_face_angle`) to classify the edge:
-        //   angle > 0  → convex  (solid sticks out at this edge)
-        //   angle < 0  → concave (interior corner / cavity)
-        // The previous classifier (`normal1·normal2 < 0`) failed for
-        // the canonical 90° box edge — `dot = 0` falls into the
-        // concave branch, the ball is offset OUTSIDE the solid, and
-        // the visible curvature is inverted.
-        //
-        // For a convex edge the rolling ball lies INSIDE the solid;
-        // the bisector of the outward normals points away from the
-        // solid, so the ball center is offset along -bisector. The
-        // tangent contact on each face is then `center + r·n` (the
-        // normal points from inside back up onto the face). For a
-        // concave edge the ball lies in the cavity along +bisector,
-        // and the contact flips to `center - r·n`.
-        //
-        // Magnitude:  |center − edge| = r / sin(α/2)
-        // where α is the interior dihedral. For unit `n1`, `n2` this
-        // simplifies to `r / (bisector · n1)` because
-        //   bisector·n1 = (1 + n1·n2)/|n1+n2| = sin(α/2)
-        // The near-tangent guard above (|angle| < 0.1 or near π)
-        // already excludes the cases where this denominator collapses.
-        let bisector_dot_n1 = bisector.dot(&normal1);
-        if bisector_dot_n1.abs() < 1e-9 {
-            return Err(OperationError::NumericalError(
-                "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
-            ));
-        }
-        let offset_distance = radius / bisector_dot_n1;
-
-        let (offset_sign, contact_sign) = if angle > 0.0 {
-            // Convex: ball inside solid; contact = center + r·n
-            (-1.0, 1.0)
-        } else {
-            // Concave: ball in cavity; contact = center − r·n
-            (1.0, -1.0)
-        };
-
-        let fillet_center = edge_point + bisector * (offset_sign * offset_distance);
-        data.centers.push(fillet_center);
-
-        // Calculate contact points (where rolling ball touches each surface)
-        let contact1 = fillet_center + normal1 * (contact_sign * radius);
-        let contact2 = fillet_center + normal2 * (contact_sign * radius);
-
-        data.contacts1.push(contact1);
-        data.contacts2.push(contact2);
-    }
-
-    Ok(data)
-}
-
 /// Get the face's outward-oriented surface normal at a 3D point.
 ///
 /// Half the faces of any solid have `FaceOrientation::Backward` —
@@ -3719,57 +3540,6 @@ fn validate_filleted_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
         )));
     }
     Ok(())
-}
-
-/// Curvature-adaptive sampling for rolling-ball fillet sweeps.
-///
-/// Refines parameter samples where the curve bends fastest so the swept
-/// fillet surface stays within `tolerance.distance()` of the analytic
-/// rolling-ball envelope. Implementation: start with a coarse 8-sample
-/// uniform partition, then bisect any interval whose midpoint curvature
-/// exceeds `curvature_threshold = 1 / tolerance.distance()` (chord
-/// deviation ~ k * Δs² / 8 ≤ tolerance for that bound). Caps total
-/// samples at 256 to keep fillet construction bounded.
-fn adaptive_rolling_ball_sampling(curve: &dyn Curve, tolerance: &Tolerance) -> Vec<f64> {
-    const MIN_SAMPLES: usize = 8;
-    const MAX_SAMPLES: usize = 256;
-    let tol = tolerance.distance().max(1e-9);
-    // Curvature above this triggers refinement; chord-deviation bound
-    // becomes tight when k * (Δs)² ≈ 8 * tol.
-    let curvature_threshold = 1.0 / tol;
-
-    let mut params: Vec<f64> = (0..=MIN_SAMPLES)
-        .map(|i| i as f64 / MIN_SAMPLES as f64)
-        .collect();
-
-    // Iterative bisection passes; each pass inserts midpoints where
-    // curvature is high, until either all intervals are smooth enough
-    // or we hit MAX_SAMPLES.
-    for _pass in 0..6 {
-        if params.len() >= MAX_SAMPLES {
-            break;
-        }
-        let mut inserted = Vec::new();
-        for w in params.windows(2) {
-            let mid = 0.5 * (w[0] + w[1]);
-            // If we can't evaluate curvature at the midpoint (e.g.,
-            // straight segment yielding NumericalInstability), skip
-            // refinement for that interval — uniform spacing suffices.
-            if let Ok(k) = curve.curvature_at(mid) {
-                if k > curvature_threshold {
-                    inserted.push(mid);
-                }
-            }
-        }
-        if inserted.is_empty() {
-            break;
-        }
-        params.extend(inserted);
-        params.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
-    }
-
-    params
 }
 
 /// Validate fillet parameters
