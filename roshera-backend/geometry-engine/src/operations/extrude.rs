@@ -19,7 +19,7 @@ use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
-    curve::{Arc, Circle, Curve},
+    curve::{Arc, Circle, Curve, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::Loop,
@@ -1135,11 +1135,14 @@ fn create_ruled_surface(
         .get(top_edge)
         .ok_or_else(|| OperationError::InvalidGeometry("Top edge not found".to_string()))?;
 
-    let bottom_curve = model
+    let bottom_range = bottom_edge_data.param_range;
+    let top_range = top_edge_data.param_range;
+
+    let bottom_curve_full = model
         .curves
         .get(bottom_edge_data.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Bottom curve not found".to_string()))?;
-    let top_curve = model
+    let top_curve_full = model
         .curves
         .get(top_edge_data.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Top curve not found".to_string()))?;
@@ -1158,15 +1161,71 @@ fn create_ruled_surface(
     // sees the cone/disk caps but no cylindrical wall between them.
     // Cylinder routes to `tessellate_cylindrical_face`, which knows the
     // seam convention and tessellates correctly.
-    if let Some(cyl) = try_build_cylinder_from_circles(bottom_curve, top_curve) {
-        return Ok(Box::new(cyl));
+    //
+    // Detection runs on the underlying full curves: a closed-disk profile
+    // registers one Circle and one edge with `param_range = [0, 1]`, so
+    // the full curve IS the circle. Sub-range edges on a full-sweep arc
+    // would mean a partial-arc side face (e.g. a fillet rail), which
+    // should NOT collapse to a Cylinder — guarded by the unit-range check.
+    let bottom_full_range = bottom_curve_full.parameter_range();
+    let top_full_range = top_curve_full.parameter_range();
+    let covers_full = |edge: ParameterRange, full: ParameterRange| -> bool {
+        (edge.start - full.start).abs() < 1e-9 && (edge.end - full.end).abs() < 1e-9
+    };
+    if covers_full(bottom_range, bottom_full_range)
+        && covers_full(top_range, top_full_range)
+    {
+        if let Some(cyl) = try_build_cylinder_from_circles(bottom_curve_full, top_curve_full) {
+            return Ok(Box::new(cyl));
+        }
     }
 
-    // Build a real ruled surface S(u,v) = (1-v)·C1(u) + v·C2(u) by cloning
-    // both boundary curves. RuledSurface evaluates the linear interpolation
-    // analytically — no NURBS approximation, no sampling error.
+    // Build a real ruled surface S(u,v) = (1-v)·C1(u) + v·C2(u) using
+    // **per-edge sub-curves** extracted via `Curve::subcurve`, not the
+    // raw underlying curves.
+    //
+    // Why subcurve, not clone_box: the polyline-cutter pattern registers
+    // a single shared `Polyline` curve once and creates N edges each
+    // referencing it via `param_range = [i/N, (i+1)/N]`. Cloning the full
+    // curve makes each side face's `RuledSurface` span the entire polyline
+    // (a wrap-around prism surface) instead of a single planar facet.
+    // Downstream surface-surface intersection then fails:
+    //   - The default `Surface::is_planar` samples 11×11 normals; the
+    //     curve's `point_at` clamps out-of-range `t` to the carrier
+    //     range, producing degenerate plateaus on either side where
+    //     `RuledSurface::evaluate_full` computes `du = ZERO` and falls
+    //     back to `Vector3::Z`. That fake reference normal disagrees
+    //     with the interior sample normals, so `is_planar` returns
+    //     false.
+    //   - `analytical_surface_kind` then routes to
+    //     `march_surface_intersection`, which cannot find clean line
+    //     intersections in multi-facet topology and returns None.
+    // The visible symptom is that boolean Difference of a polyline-
+    // extruded cutter through a box drops every cutter-side × box-top
+    // intersection and the resulting topology is corrupt.
+    //
+    // For per-edge `Line` / `Circle` / full-sweep `Arc` curves with
+    // unit range this is a near no-op (`Line::subcurve(0, 1)` rebuilds
+    // an equivalent line). For the shared-Polyline pattern it slices
+    // to a single segment, restoring a clean planar quadrilateral.
     use crate::primitives::surface::RuledSurface;
-    let surface = RuledSurface::new(bottom_curve.clone_box(), top_curve.clone_box());
+    let bottom_curve = bottom_curve_full
+        .subcurve(bottom_range.start, bottom_range.end)
+        .map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Bottom subcurve extraction failed (edge {}, range [{}, {}]): {:?}",
+                bottom_edge, bottom_range.start, bottom_range.end, e
+            ))
+        })?;
+    let top_curve = top_curve_full
+        .subcurve(top_range.start, top_range.end)
+        .map_err(|e| {
+            OperationError::NumericalError(format!(
+                "Top subcurve extraction failed (edge {}, range [{}, {}]): {:?}",
+                top_edge, top_range.start, top_range.end, e
+            ))
+        })?;
+    let surface = RuledSurface::new(bottom_curve, top_curve);
     Ok(Box::new(surface))
 }
 
