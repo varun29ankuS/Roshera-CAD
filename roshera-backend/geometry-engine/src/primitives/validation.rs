@@ -871,6 +871,110 @@ pub fn validate_shell_closure(model: &BRepModel, shell_id: ShellId) -> Vec<Valid
     errors
 }
 
+/// Validate that every `PCurveId` referenced from an edge satisfies the
+/// F7-ε invariants:
+///
+/// 1. The id resolves to a live entry in `model.pcurves` (no dangling
+///    references after snapshot/restore or store rebuild).
+/// 2. The pcurve's `face` is one of the faces adjacent to the edge in
+///    the topology — a pcurve on a face that no longer borders the
+///    edge is geometrically meaningless and indicates a missed
+///    invalidation on a previous mutating operation.
+/// 3. The pcurve's `tolerance` is finite and non-negative — already
+///    enforced by `PCurveStore::add`, but re-checked here so that
+///    tolerance corruption from external mutation surfaces during
+///    full-model validation.
+///
+/// Returns an empty `Vec` when every edge's pcurves are consistent.
+/// Mismatches are returned as `ConnectivityError` (dangling /
+/// face-mismatch) or `GeometryError` (tolerance corruption) so the
+/// existing diagnostic surface treats them uniformly.
+///
+/// Cost is O(edges × pcurves_per_edge × faces_per_model) in the worst
+/// case, but each edge typically carries at most two pcurves and the
+/// adjacency lookup is amortised over a single pass.
+pub fn validate_pcurve_references(model: &BRepModel) -> Vec<ValidationError> {
+    // Build edge -> adjacent-face map in one pass over loops.
+    let mut edge_faces: std::collections::HashMap<EdgeId, Vec<FaceId>> =
+        std::collections::HashMap::new();
+    for (face_id, face) in model.faces.iter() {
+        let mut all_loops = Vec::with_capacity(1 + face.inner_loops.len());
+        all_loops.push(face.outer_loop);
+        all_loops.extend(&face.inner_loops);
+        for &loop_id in &all_loops {
+            let Some(loop_data) = model.loops.get(loop_id) else {
+                continue;
+            };
+            for &edge_id in &loop_data.edges {
+                edge_faces.entry(edge_id).or_default().push(face_id);
+            }
+        }
+    }
+
+    let mut errors = Vec::new();
+    for (edge_id, edge) in model.edges.iter() {
+        if edge.pcurves.is_empty() {
+            continue;
+        }
+        let adjacent = edge_faces.get(&edge_id).cloned().unwrap_or_default();
+        for &pcurve_id in &edge.pcurves {
+            match model.pcurves.get(pcurve_id) {
+                None => {
+                    errors.push(ValidationError::ConnectivityError {
+                        message: format!(
+                            "Edge {} references missing pcurve id {}",
+                            edge_id, pcurve_id
+                        ),
+                        location: EntityLocation {
+                            solid_id: None,
+                            shell_id: None,
+                            face_id: None,
+                            loop_id: None,
+                            edge_id: Some(edge_id),
+                            vertex_id: None,
+                        },
+                    });
+                }
+                Some(pc) => {
+                    if !pc.tolerance.is_finite() || pc.tolerance < 0.0 {
+                        errors.push(ValidationError::GeometryError {
+                            message: format!(
+                                "Edge {} pcurve {} has invalid tolerance {}",
+                                edge_id, pcurve_id, pc.tolerance
+                            ),
+                            location: EntityLocation {
+                                solid_id: None,
+                                shell_id: None,
+                                face_id: Some(pc.face),
+                                loop_id: None,
+                                edge_id: Some(edge_id),
+                                vertex_id: None,
+                            },
+                        });
+                    }
+                    if !adjacent.is_empty() && !adjacent.contains(&pc.face) {
+                        errors.push(ValidationError::ConnectivityError {
+                            message: format!(
+                                "Edge {} pcurve {} anchored to face {} which is not adjacent",
+                                edge_id, pcurve_id, pc.face
+                            ),
+                            location: EntityLocation {
+                                solid_id: None,
+                                shell_id: None,
+                                face_id: Some(pc.face),
+                                loop_id: None,
+                                edge_id: Some(edge_id),
+                                vertex_id: None,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
 /// Automatic repair functionality
 pub struct ModelRepairer {
     tolerance: Tolerance,
@@ -1212,6 +1316,145 @@ impl std::fmt::Display for ValidationWarning {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pcurve_validation_tests {
+    use super::*;
+    use crate::math::Point2;
+    use crate::primitives::curve::ParameterRange;
+    use crate::primitives::p_curve::{PCurve, PCurve2dKind};
+    use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    fn box_model() -> BRepModel {
+        let mut model = BRepModel::new();
+        {
+            let mut builder = TopologyBuilder::new(&mut model);
+            let _ = builder.create_box_3d(2.0, 3.0, 4.0);
+        }
+        model
+    }
+
+    fn line_pcurve_on_face(face: FaceId) -> PCurve {
+        PCurve::new(
+            face,
+            PCurve2dKind::Line {
+                start: Point2::ZERO,
+                end: Point2::new(1.0, 0.0),
+            },
+            ParameterRange::unit(),
+            1e-6,
+        )
+    }
+
+    #[test]
+    fn no_errors_when_no_pcurves_attached() {
+        let model = box_model();
+        let errors = validate_pcurve_references(&model);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn dangling_pcurve_id_reports_connectivity_error() {
+        let mut model = box_model();
+        // Pick a real edge from the model and point it at a
+        // never-allocated pcurve id.
+        let edge_id = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has edges");
+        let _ = model.edges.attach_pcurve(edge_id, 999);
+
+        let errors = validate_pcurve_references(&model);
+        assert_eq!(errors.len(), 1);
+        match &errors[0] {
+            ValidationError::ConnectivityError { message, location } => {
+                assert!(message.contains("missing pcurve id 999"));
+                assert_eq!(location.edge_id, Some(edge_id));
+            }
+            other => panic!("expected ConnectivityError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pcurve_on_non_adjacent_face_reports_connectivity_error() {
+        let mut model = box_model();
+        let edge_id = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has edges");
+
+        // Find a face that is NOT adjacent to this edge. Walk loops to
+        // collect adjacents and pick a face outside that set.
+        let mut adjacent_faces = std::collections::HashSet::new();
+        for (face_id, face) in model.faces.iter() {
+            let mut all_loops = vec![face.outer_loop];
+            all_loops.extend(&face.inner_loops);
+            for &lid in &all_loops {
+                if let Some(lp) = model.loops.get(lid) {
+                    if lp.edges.contains(&edge_id) {
+                        adjacent_faces.insert(face_id);
+                    }
+                }
+            }
+        }
+        let foreign_face = model
+            .faces
+            .iter()
+            .map(|(id, _)| id)
+            .find(|id| !adjacent_faces.contains(id))
+            .expect("box has at least one non-adjacent face");
+
+        let pid = model
+            .pcurves
+            .add(line_pcurve_on_face(foreign_face))
+            .expect("add pcurve");
+        let _ = model.edges.attach_pcurve(edge_id, pid);
+
+        let errors = validate_pcurve_references(&model);
+        assert_eq!(errors.len(), 1);
+        match &errors[0] {
+            ValidationError::ConnectivityError { message, .. } => {
+                assert!(message.contains("not adjacent"));
+            }
+            other => panic!("expected ConnectivityError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pcurve_on_adjacent_face_passes_validation() {
+        let mut model = box_model();
+        // Pick any edge and one of its adjacent faces.
+        let (edge_id, adjacent_face) = model
+            .faces
+            .iter()
+            .find_map(|(face_id, face)| {
+                let lid = face.outer_loop;
+                model
+                    .loops
+                    .get(lid)
+                    .and_then(|lp| lp.edges.first().copied())
+                    .map(|eid| (eid, face_id))
+            })
+            .expect("box has an edge on a face");
+
+        let pid = model
+            .pcurves
+            .add(line_pcurve_on_face(adjacent_face))
+            .expect("add pcurve");
+        let _ = model.edges.attach_pcurve(edge_id, pid);
+
+        let errors = validate_pcurve_references(&model);
+        assert!(
+            errors.is_empty(),
+            "expected no errors for legitimate pcurve attachment, got {:?}",
+            errors
+        );
     }
 }
 

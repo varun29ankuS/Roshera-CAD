@@ -236,6 +236,17 @@ pub struct BRepModel {
     pub vertices: VertexStore,
     /// Curve storage
     pub curves: CurveStore,
+    /// Parameter-space curve storage.
+    ///
+    /// Parallel to `curves` but stores 2D (u, v) curves anchored to a
+    /// specific face. Populated by operations that compute the
+    /// parameter-space image natively (imprint, surface–surface
+    /// intersection, fillet rail projection); consumers
+    /// (tessellation, trim) walk `Edge::pcurves` and look up here.
+    /// Empty for the lifetime of a model whose operations have not
+    /// yet been wired to F7-ε — that is a supported state and code
+    /// paths fall back to 3D inverse projection.
+    pub pcurves: crate::primitives::p_curve::PCurveStore,
     /// Edge storage
     pub edges: EdgeStore,
     /// Loop storage
@@ -316,6 +327,14 @@ impl BRepModel {
                 tolerance.distance(),
             ),
             curves: CurveStore::new(),
+            // Same edge capacity is a workable upper-bound heuristic
+            // for pcurve count: in the fully-populated manifold case
+            // each edge has at most two pcurves, but most edges in a
+            // typical part have zero. Sizing at one-times-edges keeps
+            // the initial allocation cheap while still avoiding an
+            // immediate reallocation when an imprint-heavy operation
+            // begins emitting pcurves.
+            pcurves: crate::primitives::p_curve::PCurveStore::with_capacity(edge_capacity),
             edges: EdgeStore::with_capacity(edge_capacity),
             loops: LoopStore::with_capacity(face_capacity), // Loops ≈ faces for typical models
             surfaces: SurfaceStore::new(),

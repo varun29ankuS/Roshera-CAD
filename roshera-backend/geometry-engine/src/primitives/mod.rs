@@ -6,6 +6,7 @@ pub mod edge;
 pub mod face;
 pub mod fillet_surfaces;
 pub mod r#loop;
+pub mod p_curve;
 pub mod shell;
 pub mod snapshot;
 pub mod solid;

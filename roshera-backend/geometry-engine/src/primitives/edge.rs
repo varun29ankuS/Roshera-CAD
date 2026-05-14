@@ -16,6 +16,8 @@
 use crate::math::{consts, ApproxEq, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{CurveId, CurveStore, ParameterRange},
+    face::FaceId,
+    p_curve::{PCurve, PCurveId, PCurveStore},
     vertex::{VertexId, INVALID_VERTEX_ID},
 };
 use dashmap::DashMap;
@@ -198,6 +200,18 @@ pub struct Edge {
     cached_length: f64,
     /// Edge tolerance (typically 1e-6 to 1e-10)
     pub tolerance: f64,
+    /// Parameter-space curve ids (one per adjacent face) attached to
+    /// this edge. Empty by default: code paths that did not compute
+    /// a (u, v) image at construction time leave the vector empty
+    /// and downstream consumers fall back to inverse-projecting the
+    /// 3D curve from `curve_id` onto the surface. Population happens
+    /// at the operations that already know the parameter-space
+    /// image (imprint, surface–surface intersection, fillet rail
+    /// projection); see [`crate::primitives::p_curve`] for the data
+    /// model. Two-entry capacity covers the manifold case; the
+    /// non-manifold case (three or more pcurves) is allocated lazily
+    /// by `Vec`.
+    pub pcurves: Vec<PCurveId>,
 }
 
 /// Edge intersection result
@@ -257,6 +271,7 @@ impl Edge {
             attributes: DEFAULT_EDGE_ATTRIBUTES,
             cached_length: f64::NAN,
             tolerance,
+            pcurves: Vec::new(),
         }
     }
 
@@ -516,6 +531,14 @@ impl Edge {
             attributes: self.attributes.clone(),
             cached_length: f64::NAN,
             tolerance: self.tolerance,
+            // Splitting a 3D edge invalidates its parameter-space
+            // images: a pcurve covers the full edge, and re-trimming
+            // it onto two half-edges requires the producing operation
+            // to compute the (u, v) clip. The split halves therefore
+            // start without pcurves and downstream consumers fall
+            // back to inverse projection until a re-imprint emits
+            // fresh pcurves.
+            pcurves: Vec::new(),
         };
 
         let second = Edge {
@@ -528,6 +551,9 @@ impl Edge {
             attributes: self.attributes.clone(),
             cached_length: f64::NAN,
             tolerance: self.tolerance,
+            // See first-half comment: parameter-space images must be
+            // recomputed after a split.
+            pcurves: Vec::new(),
         };
 
         (first, second)
@@ -583,6 +609,48 @@ impl Edge {
     #[inline(always)]
     pub fn get_tolerance(&self) -> f64 {
         self.tolerance
+    }
+
+    /// Look up the parameter-space image of this edge on the given
+    /// face, if one has been computed.
+    ///
+    /// Returns `None` when:
+    /// - the edge has no pcurves attached (the common case for code
+    ///   paths that have not yet been wired up to F7-ε), or
+    /// - none of the attached pcurves belong to `face` (e.g. a query
+    ///   for a face that is not adjacent to this edge).
+    ///
+    /// Callers must treat `None` as "no parameter-space curve
+    /// available" and fall back to inverse-projecting the 3D curve
+    /// — there is no implicit identity pcurve. The lookup is linear
+    /// in `pcurves.len()`; in the manifold case this is at most two
+    /// dereferences.
+    pub fn pcurve_for_face<'a>(
+        &self,
+        face: FaceId,
+        pcurves: &'a PCurveStore,
+    ) -> Option<&'a PCurve> {
+        for &id in &self.pcurves {
+            if let Some(pc) = pcurves.get(id) {
+                if pc.face == face {
+                    return Some(pc);
+                }
+            }
+        }
+        None
+    }
+
+    /// Attach a parameter-space curve id to this edge.
+    ///
+    /// The id is appended to `pcurves`; deduplication is the caller's
+    /// responsibility because the same edge can legitimately carry
+    /// multiple pcurves for the same face only in pathological
+    /// non-manifold configurations. In the manifold case the
+    /// producing operation already knows which face it is feeding
+    /// and will not call this twice for one (edge, face) pair.
+    #[inline]
+    pub fn attach_pcurve(&mut self, pcurve_id: PCurveId) {
+        self.pcurves.push(pcurve_id);
     }
 
     /// Adaptive tessellation based on curvature
@@ -1015,6 +1083,58 @@ impl EdgeStore {
             true
         } else {
             false
+        }
+    }
+
+    /// Attach a [`PCurveId`] to the edge with the given id.
+    ///
+    /// Returns `true` if the edge exists and the pcurve was appended,
+    /// `false` if the edge id is out of range or has been removed
+    /// (sentinel slot). Caller is responsible for ensuring the pcurve
+    /// id is valid in the model's [`PCurveStore`] — the edge store
+    /// has no cross-store visibility.
+    pub fn attach_pcurve(&mut self, id: EdgeId, pcurve_id: PCurveId) -> bool {
+        let idx = id as usize;
+        match self.edges.get_mut(idx) {
+            Some(edge) if edge.id != INVALID_EDGE_ID => {
+                edge.attach_pcurve(pcurve_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the full pcurve list on an edge.
+    ///
+    /// Used by surgery operations (face replacement, edge split-merge)
+    /// that recompute pcurves wholesale. Returns `true` on success or
+    /// `false` if the edge id is out of range / removed.
+    pub fn set_pcurves(&mut self, id: EdgeId, pcurves: Vec<PCurveId>) -> bool {
+        let idx = id as usize;
+        match self.edges.get_mut(idx) {
+            Some(edge) if edge.id != INVALID_EDGE_ID => {
+                edge.pcurves = pcurves;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop every pcurve reference on an edge.
+    ///
+    /// Called by operations whose mutation invalidates the parameter-
+    /// space images (3D curve replacement, vertex displacement that
+    /// exceeds the lift tolerance). After invalidation, downstream
+    /// consumers fall back to inverse-projecting the 3D curve until
+    /// a fresh pcurve is computed.
+    pub fn clear_pcurves(&mut self, id: EdgeId) -> bool {
+        let idx = id as usize;
+        match self.edges.get_mut(idx) {
+            Some(edge) if edge.id != INVALID_EDGE_ID => {
+                edge.pcurves.clear();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1712,5 +1832,137 @@ mod tests {
         let _b = s.add(Edge::new(0, 8, 9, 0, EdgeOrientation::Forward, ParameterRange::unit()));
         let hits = s.edges_at_vertex(5);
         assert_eq!(hits, vec![a]);
+    }
+
+    // ---- PCurve attachment --------------------------------------------------
+
+    #[test]
+    fn edge_new_starts_with_empty_pcurves() {
+        let e = Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(e.pcurves.is_empty());
+    }
+
+    #[test]
+    fn edge_attach_pcurve_appends() {
+        let mut e = Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit());
+        e.attach_pcurve(7);
+        e.attach_pcurve(9);
+        assert_eq!(e.pcurves, vec![7, 9]);
+    }
+
+    #[test]
+    fn edge_split_at_drops_pcurves_on_both_halves() {
+        // F7-ε contract: splitting invalidates parameter-space images
+        // because each pcurve covers the full pre-split edge.
+        let mut e = Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        e.attach_pcurve(3);
+        e.attach_pcurve(5);
+        let (first, second) = e.split_at(0.5);
+        assert!(first.pcurves.is_empty());
+        assert!(second.pcurves.is_empty());
+    }
+
+    #[test]
+    fn edge_pcurve_for_face_returns_match() {
+        use crate::primitives::p_curve::{PCurve, PCurve2dKind, PCurveStore};
+        use crate::math::Point2;
+
+        let mut store = PCurveStore::new();
+        let pid_a = store
+            .add(PCurve::new(
+                10,
+                PCurve2dKind::Line {
+                    start: Point2::ZERO,
+                    end: Point2::new(1.0, 0.0),
+                },
+                ParameterRange::unit(),
+                1e-6,
+            ))
+            .expect("add a");
+        let pid_b = store
+            .add(PCurve::new(
+                20,
+                PCurve2dKind::Line {
+                    start: Point2::ZERO,
+                    end: Point2::new(0.0, 1.0),
+                },
+                ParameterRange::unit(),
+                1e-6,
+            ))
+            .expect("add b");
+
+        let mut e = Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit());
+        e.attach_pcurve(pid_a);
+        e.attach_pcurve(pid_b);
+
+        let on_10 = e.pcurve_for_face(10, &store).expect("face 10 pcurve");
+        assert_eq!(on_10.face, 10);
+        let on_20 = e.pcurve_for_face(20, &store).expect("face 20 pcurve");
+        assert_eq!(on_20.face, 20);
+        assert!(e.pcurve_for_face(30, &store).is_none());
+    }
+
+    #[test]
+    fn edge_pcurve_for_face_returns_none_without_pcurves() {
+        use crate::primitives::p_curve::PCurveStore;
+        let store = PCurveStore::new();
+        let e = Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit());
+        assert!(e.pcurve_for_face(42, &store).is_none());
+    }
+
+    #[test]
+    fn edge_store_attach_pcurve_succeeds_on_valid_edge() {
+        let mut s = EdgeStore::new();
+        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert!(s.attach_pcurve(id, 42));
+        assert_eq!(s.get(id).expect("edge").pcurves, vec![42]);
+    }
+
+    #[test]
+    fn edge_store_attach_pcurve_returns_false_for_unknown() {
+        let mut s = EdgeStore::new();
+        assert!(!s.attach_pcurve(99, 1));
+    }
+
+    #[test]
+    fn edge_store_attach_pcurve_returns_false_for_removed_slot() {
+        let mut s = EdgeStore::new();
+        let id = s.add_with_indexing(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        // remove() rewires the slot to an INVALID_EDGE_ID sentinel.
+        let _ = s.remove(id);
+        assert!(!s.attach_pcurve(id, 1));
+    }
+
+    #[test]
+    fn edge_store_set_pcurves_replaces_entire_list() {
+        let mut s = EdgeStore::new();
+        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert!(s.attach_pcurve(id, 1));
+        assert!(s.attach_pcurve(id, 2));
+        assert!(s.set_pcurves(id, vec![10, 20, 30]));
+        assert_eq!(s.get(id).expect("edge").pcurves, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn edge_store_clear_pcurves_empties_list() {
+        let mut s = EdgeStore::new();
+        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        assert!(s.attach_pcurve(id, 1));
+        assert!(s.clear_pcurves(id));
+        assert!(s.get(id).expect("edge").pcurves.is_empty());
     }
 }
