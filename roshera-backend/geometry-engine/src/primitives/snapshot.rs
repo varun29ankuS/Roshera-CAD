@@ -19,12 +19,12 @@
 //!
 //! ## What the snapshot contains
 //!
-//! - All eight entity stores (`Vertex` / `Curve` / `Edge` / `Loop` /
-//!   `Surface` / `Face` / `Shell` / `Solid`) deep-copied through
-//!   each store's `pub(crate) fn deep_copy`. The deep copies own
-//!   their own `DashMap` indexes and break the `Arc<RwLock<…>>`
-//!   sharing inside each `Solid`'s `features` and `history` (see
-//!   `Solid::deep_copy`).
+//! - All nine entity stores (`Vertex` / `Curve` / `PCurve` /
+//!   `Edge` / `Loop` / `Surface` / `Face` / `Shell` / `Solid`)
+//!   deep-copied through each store's `pub(crate) fn deep_copy`.
+//!   The deep copies own their own `DashMap` indexes and break
+//!   the `Arc<RwLock<…>>` sharing inside each `Solid`'s `features`
+//!   and `history` (see `Solid::deep_copy`).
 //! - `sketch_planes`, `datums`, `datum_graph`, `location_cache`,
 //!   `tolerance` — every field of the model that contributes to
 //!   geometric identity.
@@ -55,6 +55,7 @@ use crate::primitives::datum::{DatumGraph, DatumStore, LocationDescriptorCache};
 use crate::primitives::edge::EdgeStore;
 use crate::primitives::face::FaceStore;
 use crate::primitives::r#loop::LoopStore;
+use crate::primitives::p_curve::PCurveStore;
 use crate::primitives::shell::ShellStore;
 use crate::primitives::solid::SolidStore;
 use crate::primitives::surface::SurfaceStore;
@@ -70,6 +71,7 @@ use crate::primitives::vertex::VertexStore;
 pub struct ModelSnapshot {
     vertices: VertexStore,
     curves: CurveStore,
+    pcurves: PCurveStore,
     edges: EdgeStore,
     loops: LoopStore,
     surfaces: SurfaceStore,
@@ -97,6 +99,7 @@ impl ModelSnapshot {
         Self {
             vertices: model.vertices.deep_copy(),
             curves: model.curves.deep_copy(),
+            pcurves: model.pcurves.deep_copy(),
             edges: model.edges.deep_copy(),
             loops: model.loops.deep_copy(),
             surfaces: model.surfaces.deep_copy(),
@@ -118,6 +121,7 @@ impl ModelSnapshot {
     pub fn restore(self, model: &mut BRepModel) {
         model.vertices = self.vertices;
         model.curves = self.curves;
+        model.pcurves = self.pcurves;
         model.edges = self.edges;
         model.loops = self.loops;
         model.surfaces = self.surfaces;
@@ -259,5 +263,49 @@ mod tests {
         // Make sure the box is still valid by spot-checking basic counts.
         assert!(model.vertices.len() >= 8);
         assert!(model.faces.len() >= 6);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_and_rolls_back_pcurves() {
+        use crate::math::Point2;
+        use crate::primitives::curve::ParameterRange;
+        use crate::primitives::p_curve::{PCurve, PCurve2dKind};
+
+        let mut model = BRepModel::new();
+        let seed_id = model
+            .pcurves
+            .add(PCurve::new(
+                7,
+                PCurve2dKind::Line {
+                    start: Point2::ZERO,
+                    end: Point2::new(1.0, 0.0),
+                },
+                ParameterRange::unit(),
+                1e-6,
+            ))
+            .expect("seed pcurve");
+        assert_eq!(model.pcurves.len(), 1);
+
+        let snap = ModelSnapshot::take(&model);
+
+        // Mutate the live store after the snapshot.
+        let _added = model
+            .pcurves
+            .add(PCurve::new(
+                11,
+                PCurve2dKind::Line {
+                    start: Point2::ZERO,
+                    end: Point2::new(0.0, 1.0),
+                },
+                ParameterRange::unit(),
+                1e-6,
+            ))
+            .expect("post-snapshot pcurve");
+        assert_eq!(model.pcurves.len(), 2);
+
+        snap.restore(&mut model);
+        assert_eq!(model.pcurves.len(), 1, "restore must roll back pcurve adds");
+        let kept = model.pcurves.get(seed_id).expect("seed pcurve survives");
+        assert_eq!(kept.face, 7);
     }
 }
