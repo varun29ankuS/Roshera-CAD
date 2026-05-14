@@ -19,6 +19,7 @@ mod handlers_impl;
 mod idempotency;
 mod kernel_state;
 mod metrics;
+mod part_mgr;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
 mod sketch;
 mod transactions;
@@ -185,6 +186,11 @@ pub struct AppState {
     /// which owns the simpler project-tree DTOs from `shared-types`.
     /// See `assembly_mgr.rs`.
     pub assemblies: Arc<assembly_mgr::AssemblyManager>,
+    /// Multi-document Part registry. Each tab in the frontend
+    /// addresses a distinct `BRepModel` owned by this manager. The
+    /// legacy `model` field is the implicit "active part" until the
+    /// active-part header routing (P.2) lands. See `part_mgr.rs`.
+    pub parts: Arc<part_mgr::PartManager>,
 }
 
 impl AppState {
@@ -5153,6 +5159,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assemblies: Arc::new(assembly_mgr::AssemblyManager::with_recorder(
             timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
+        // Per-tab Part manager. Shares the same `TimelineRecorder` so
+        // kernel mutations in any open part land on the active
+        // branch — see the note above on assemblies.
+        parts: Arc::new(part_mgr::PartManager::with_recorder(
+            timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+        )),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside
@@ -5387,6 +5399,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/assemblies/{id}/simulate",
             post(assembly_mgr::simulate_motion),
+        )
+        // Part documents — one per frontend tab. CRUD on the registry;
+        // geometry/sketch endpoints continue to route through the
+        // legacy `state.model` until P.2 wires per-part extraction.
+        .route(
+            "/api/parts",
+            post(part_mgr::create_part).get(part_mgr::list_parts),
+        )
+        .route(
+            "/api/parts/{id}",
+            get(part_mgr::get_part)
+                .delete(part_mgr::delete_part)
+                .patch(part_mgr::rename_part),
         )
         // Capability discovery — agent-readable surface description.
         // Agents call this once per session to learn which primitives /
