@@ -35,6 +35,13 @@ pub mod intersect;
 pub mod project;
 pub mod sew;
 
+// F7-α trim/sew carrier types. `TrimCurve` is the wire shape that
+// future F7 slices feed into `imprint::imprint_curves_on_face` — one
+// trimming curve + the face it cuts + the parameter ranges that are
+// live + which partition survives. Pure data carrier; the trim
+// application lives in F7-β (fillet's `update_adjacent_faces`).
+pub mod trim;
+
 // F2-α edge-classification cache: stamps {manifold_kind, dihedral,
 // convexity, smoothness} onto EdgeAttributes at construction time so
 // downstream consumers (blend graph, sewing, healing) can branch on

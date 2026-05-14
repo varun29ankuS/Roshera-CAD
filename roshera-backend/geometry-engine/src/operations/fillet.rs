@@ -954,37 +954,46 @@ fn cylinder_rim_fillet(
     // — using [0, 2π] would clamp every t > 1 to 1 and pile every
     // sample after the first onto the seam vertex (same trap fixed
     // in `create_cylinder_topology`).
-    let cap_trim_edge_id = model.edges.add(Edge::new(
+    // F7-α: rail/cap/seam edges thread the caller's tolerance so the
+    // F7-δ sew pass can compare gaps against the same value the edge
+    // was built with. `Tolerance::default().distance()` matches the
+    // historical 1e-6 hardcode — no semantic change vs. pre-F7-α.
+    let rail_tol = crate::math::Tolerance::default().distance();
+    let cap_trim_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         v_cap,
         v_cap,
         cap_trim_curve_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
-    let lat_trim_edge_id = model.edges.add(Edge::new(
+    let lat_trim_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         v_lat,
         v_lat,
         lat_trim_curve_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
-    let torus_seam_edge_id = model.edges.add(Edge::new(
+    let torus_seam_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         v_lat,
         v_cap,
         seam_arc_curve_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
-    let new_seam_edge_id = model.edges.add(Edge::new(
+    let new_seam_edge_id = model.edges.add(Edge::new_with_tolerance(
         0,
         seam_edge.start_vertex,
         seam_edge.end_vertex,
         new_seam_line_id,
         EdgeOrientation::Forward,
         ParameterRange::new(0.0, 1.0),
+        rail_tol,
     ));
 
     // ---- step 5: replace the rim slot in the cap loop. ----
