@@ -78,6 +78,11 @@ pub enum ErrorCode {
     TessellationEmpty,
     /// A solid referenced by ID is not present in the model.
     SolidNotFound,
+    /// `X-Roshera-Part-Id` referenced a part UUID that is not present
+    /// in the `PartManager` registry. Either the part was never
+    /// created (caller hit a stale tab id) or it was deleted out
+    /// from under this request. Non-retryable from the same id.
+    PartNotFound,
     /// The kernel returned a non-solid handle where a solid was
     /// expected (e.g. a primitive constructor returned a Face).
     KernelReturnedWrongType,
@@ -173,6 +178,7 @@ impl ErrorCode {
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             ErrorCode::SolidNotFound
+            | ErrorCode::PartNotFound
             | ErrorCode::TransactionNotFound
             | ErrorCode::BranchNotFound => StatusCode::NOT_FOUND,
 
@@ -203,6 +209,7 @@ impl ErrorCode {
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
             | ErrorCode::SolidNotFound
+            | ErrorCode::PartNotFound
             | ErrorCode::IdempotencyKeyEmpty
             | ErrorCode::IdempotencyKeyTooLong
             | ErrorCode::IdempotencyKeyReused
@@ -240,6 +247,7 @@ impl ErrorCode {
             ErrorCode::KernelError => "kernel_error",
             ErrorCode::TessellationEmpty => "tessellation_empty",
             ErrorCode::SolidNotFound => "solid_not_found",
+            ErrorCode::PartNotFound => "part_not_found",
             ErrorCode::KernelReturnedWrongType => "kernel_returned_wrong_type",
             ErrorCode::IdempotencyKeyEmpty => "idempotency_key_empty",
             ErrorCode::IdempotencyKeyTooLong => "idempotency_key_too_long",
@@ -272,6 +280,7 @@ impl ErrorCode {
             ErrorCode::KernelError,
             ErrorCode::TessellationEmpty,
             ErrorCode::SolidNotFound,
+            ErrorCode::PartNotFound,
             ErrorCode::KernelReturnedWrongType,
             ErrorCode::IdempotencyKeyEmpty,
             ErrorCode::IdempotencyKeyTooLong,
@@ -430,6 +439,21 @@ impl ApiError {
             format!("solid {solid_id} not found"),
         )
         .with_details(serde_json::json!({ "solid_id": solid_id }))
+    }
+
+    /// `X-Roshera-Part-Id` referenced a part UUID that isn't in the
+    /// `PartManager` registry. The detail carries the offending id
+    /// so the frontend can drop a stale tab.
+    pub fn part_not_found(part_id: uuid::Uuid) -> Self {
+        Self::new(
+            ErrorCode::PartNotFound,
+            format!("part {part_id} not found"),
+        )
+        .with_hint(
+            "Create a part with POST /api/parts and use the returned \
+             id in the X-Roshera-Part-Id header.",
+        )
+        .with_details(serde_json::json!({ "part_id": part_id }))
     }
 
     /// Caller is authenticated but lacks the required permission for
