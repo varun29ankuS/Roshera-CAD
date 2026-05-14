@@ -1,5 +1,6 @@
 //! Scene query endpoints for AI awareness
 
+use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -30,10 +31,13 @@ pub struct SceneQueryResponse {
 }
 
 /// Get the complete scene state
-pub async fn get_scene_state(State(state): State<AppState>) -> Json<SceneResponse> {
+pub async fn get_scene_state(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+) -> Json<SceneResponse> {
     tracing::info!("Scene state requested");
 
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let solids = state.solids.read().await;
 
     let mut objects = Vec::new();
@@ -131,11 +135,12 @@ pub async fn get_scene_state(State(state): State<AppState>) -> Json<SceneRespons
 /// Query scene objects based on criteria
 pub async fn query_scene(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(query): Json<SceneQuery>,
 ) -> Json<SceneQueryResponse> {
     tracing::info!("Scene query: {:?}", query);
 
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let solids = state.solids.read().await;
 
     let mut matching_objects = Vec::new();
@@ -269,6 +274,7 @@ pub async fn query_scene(
 /// Get detailed information about a specific object
 pub async fn get_object_details(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(object_id): Path<u32>,
 ) -> Json<SceneResponse> {
     tracing::info!("Object details requested for ID: {}", object_id);
@@ -277,7 +283,7 @@ pub async fn get_object_details(
     // the solid (cached_mass_props) and the shell/face/loop stores during
     // the divergence-theorem volume integration. The lock window is short:
     // results are cached on the solid after the first computation.
-    let mut model_guard = state.model.write().await;
+    let mut model_guard = model_handle.write().await;
     let solids = state.solids.read().await;
 
     if model_guard.solids.get(object_id).is_some() {

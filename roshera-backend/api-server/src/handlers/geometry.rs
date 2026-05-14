@@ -9,6 +9,7 @@
 //! shadowed them via `use handlers::*;`) and have been removed as part of
 //! #131 (collapse create_* handler hierarchies).
 
+use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{extract::State, http::StatusCode, response::Json};
 use shared_types::*;
@@ -30,6 +31,7 @@ fn unix_millis_now() -> u64 {
 
 pub async fn boolean_operation(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(request): Json<BooleanRequest>,
 ) -> Result<Json<BooleanResponse>, StatusCode> {
     let start = Instant::now();
@@ -74,7 +76,7 @@ pub async fn boolean_operation(
     }
 
     // Perform the boolean operation
-    let _model = state.model.write().await;
+    let _model = model_handle.write().await;
     // For now, create a combined mesh result
     let result_mesh = shared_types::GeometryResult {
         mesh: if !meshes.is_empty() {

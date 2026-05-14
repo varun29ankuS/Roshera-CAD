@@ -31,6 +31,7 @@
 //! still need `&mut`, so the lock cost is paid once per entity per
 //! process lifetime.
 
+use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -64,10 +65,11 @@ pub struct ListPartsQuery {
 /// Optional filters: `?anchor_datum_id=N`, `?name_contains=foo`.
 /// Filters are AND-ed; an empty query returns the entire model.
 pub async fn list_parts(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Query(q): Query<ListPartsQuery>,
 ) -> Json<Vec<PartSummary>> {
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let filter = ListPartsFilter {
         anchor_datum_id: q.anchor_datum_id,
         name_contains: q.name_contains,
@@ -84,10 +86,11 @@ pub async fn list_parts(
 /// returned [`PartReport`]. Subsequent calls hit the per-solid cache.
 /// Same pattern as `part_mass_properties`.
 pub async fn query_part(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
 ) -> Result<Json<PartReport>, StatusCode> {
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     model
         .query_part(id)
         .map(Json)
@@ -100,10 +103,11 @@ pub async fn query_part(
 /// Cache-warming on first call — takes a write lock because the kernel
 /// populates per-entity caches during the divergence-theorem integral.
 pub async fn part_mass_properties(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
 ) -> Result<Json<MassPropertiesReport>, StatusCode> {
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     model
         .mass_properties_for(id)
         .map(Json)
@@ -117,12 +121,13 @@ pub async fn part_mass_properties(
 /// the same mass-properties path.
 pub async fn part_mass_properties_by_uuid(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(uuid): Path<uuid::Uuid>,
 ) -> Result<Json<MassPropertiesReport>, StatusCode> {
     let solid_id = state
         .get_local_id(&uuid)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     model
         .mass_properties_for(solid_id)
         .map(Json)
@@ -132,10 +137,11 @@ pub async fn part_mass_properties_by_uuid(
 /// `GET /api/agent/parts/{id}/obb` — oriented bounding box (axes
 /// aligned to the part's principal moments of inertia).
 pub async fn part_oriented_bbox(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
 ) -> Result<Json<OrientedBBox>, StatusCode> {
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     model
         .oriented_bbox_for(id)
         .map(Json)
@@ -145,10 +151,11 @@ pub async fn part_oriented_bbox(
 /// `GET /api/agent/parts/distance/{a}/{b}` — bbox-center, AABB-gap,
 /// overlap, and direction unit vector between two parts.
 pub async fn part_distance(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path((a, b)): Path<(SolidId, SolidId)>,
 ) -> Result<Json<DistanceReport>, StatusCode> {
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     model
         .part_distance(a, b)
         .map(Json)
@@ -162,11 +169,12 @@ pub async fn part_distance(
 /// own UUID-to-SolidId resolver.
 pub async fn part_distance_by_uuid(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path((a_uuid, b_uuid)): Path<(uuid::Uuid, uuid::Uuid)>,
 ) -> Result<Json<DistanceReport>, StatusCode> {
     let a = state.get_local_id(&a_uuid).ok_or(StatusCode::NOT_FOUND)?;
     let b = state.get_local_id(&b_uuid).ok_or(StatusCode::NOT_FOUND)?;
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     model
         .part_distance(a, b)
         .map(Json)
@@ -200,13 +208,14 @@ pub struct ReanchorPartResponse {
 /// `404` when the solid id or datum id is unknown; `422` when the
 /// kernel mediator fails (e.g. transform composition rejected).
 pub async fn reanchor_part(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
     Json(req): Json<ReanchorPartRequest>,
 ) -> Result<Json<ReanchorPartResponse>, StatusCode> {
     use geometry_engine::readable::query::ReanchorError;
 
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     let offset = req.local_transform.map(Matrix4::from_rows_array);
     match model.reanchor_part(id, req.new_datum_id, offset) {
         Ok(()) => Ok(Json(ReanchorPartResponse {
@@ -232,8 +241,11 @@ pub async fn reanchor_part(
 /// the agent surface adds `subkind`, `frame_z`, and `source_kind` so
 /// an LLM can plan around what each datum actually represents without
 /// follow-up queries.
-pub async fn list_datums(State(state): State<AppState>) -> Json<Vec<DatumSummary>> {
-    let model = state.model.read().await;
+pub async fn list_datums(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+) -> Json<Vec<DatumSummary>> {
+    let model = model_handle.read().await;
     Json(model.list_datums())
 }
 
@@ -253,11 +265,12 @@ pub struct PartsNearDatumQuery {
 /// perpendicular for `Plane(_)`, line-distance for `Axis(_)`. See
 /// `BRepModel::parts_near_datum`.
 pub async fn parts_near_datum(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<DatumId>,
     Query(q): Query<PartsNearDatumQuery>,
 ) -> Json<Vec<PartProximity>> {
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     Json(model.parts_near_datum(id, q.radius))
 }
 
@@ -266,19 +279,21 @@ pub async fn parts_near_datum(
 /// `GET /api/agent/faces/{id}` — per-face report (surface type, area,
 /// boundary edges, neighbouring faces, host solid).
 pub async fn query_face(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
 ) -> Result<Json<FaceReport>, StatusCode> {
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     model.query_face(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// `GET /api/agent/edges/{id}` — per-edge report (curve kind, length,
 /// start/end vertex world coordinates).
 pub async fn query_edge(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
 ) -> Result<Json<EdgeReport>, StatusCode> {
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
     model.query_edge(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }

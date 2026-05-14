@@ -9,6 +9,7 @@
 //! read-only — rename / set_transform / delete on a default returns
 //! `409 Conflict`.
 
+use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -100,9 +101,12 @@ pub struct DatumListResponse {
 }
 
 /// `GET /api/datums` — list every datum in the active model.
-pub async fn list_datums(State(state): State<AppState>) -> Json<DatumListResponse> {
+pub async fn list_datums(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+) -> Json<DatumListResponse> {
     tracing::debug!("Listing datums");
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let datums = model
         .datums
         .snapshot()
@@ -142,10 +146,11 @@ pub struct SolidAnchorDto {
 /// `GET /api/solids/:id/anchor` — return anchor metadata for the solid,
 /// or `404` when the solid is unknown / unanchored.
 pub async fn get_solid_anchor(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
 ) -> Result<Json<SolidAnchorDto>, StatusCode> {
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let solid = model.solids.get(id).ok_or(StatusCode::NOT_FOUND)?;
     let anchor = &solid.anchor;
     let datum = model
@@ -173,11 +178,12 @@ pub async fn get_solid_anchor(
 /// of truth for visibility (the field lives on `Datum`, not in
 /// frontend-only state) so refreshes preserve the toggle.
 pub async fn set_datum_visibility(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<SetDatumVisibilityRequest>,
 ) -> Result<Json<SetDatumVisibilityResponse>, StatusCode> {
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     match model.set_datum_visibility(id, req.visible) {
         Some(_prev) => Ok(Json(SetDatumVisibilityResponse {
             id,
@@ -290,10 +296,11 @@ fn map_datum_error(err: DatumError) -> StatusCode {
 /// `400` for empty name or unrecognized axis direction. The created
 /// datum has `is_default = false`.
 pub async fn create_datum(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(req): Json<CreateDatumRequest>,
 ) -> Result<(StatusCode, Json<DatumMutationResponse>), StatusCode> {
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let id = match req {
         CreateDatumRequest::Plane { name, transform } => {
             let m = Matrix4::from_rows_array(transform);
@@ -344,7 +351,8 @@ pub async fn create_datum(
 /// `404` when the id is unknown, `409` when the target is a seeded
 /// default, `400` for empty body or empty name.
 pub async fn update_datum(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<UpdateDatumRequest>,
 ) -> Result<Json<DatumMutationResponse>, StatusCode> {
@@ -353,7 +361,7 @@ pub async fn update_datum(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     if let Some(name) = req.name {
         model.rename_datum(id, name).map_err(map_datum_error)?;
     }
@@ -375,7 +383,8 @@ pub async fn update_datum(
 /// supplied. With `cascade=detach`, each dependent solid is
 /// re-anchored to `Origin` before the datum is removed.
 pub async fn delete_datum(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<DeleteDatumQuery>,
 ) -> Result<Json<DeleteDatumResponse>, StatusCode> {
@@ -384,7 +393,7 @@ pub async fn delete_datum(
         Some("detach")
     );
 
-    let mut model = state.model.write().await;
+    let mut model = model_handle.write().await;
 
     // Default + existence checks happen inside `delete_datum`, but we
     // need to enumerate dependents first so the 409 path returns

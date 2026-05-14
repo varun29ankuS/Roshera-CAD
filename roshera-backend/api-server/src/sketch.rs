@@ -32,6 +32,7 @@
 //! managed by the issuing client (one user, one drawing).
 
 use crate::error_catalog::{ApiError, ErrorCode};
+use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -1471,6 +1472,7 @@ pub async fn set_sketch_circle_segments(
 /// is then dropped (unless `consume=false`).
 pub async fn extrude_sketch(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
     Json(body): Json<ExtrudeSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1479,7 +1481,7 @@ pub async fn extrude_sketch(
         boolean_operation, BooleanOp, BooleanOptions,
     };
     use geometry_engine::operations::extrude::{
-        create_face_from_profile, extrude_face, ExtrudeOptions,
+        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
     };
     use geometry_engine::primitives::r#loop::{Loop, LoopType};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
@@ -1569,7 +1571,7 @@ pub async fn extrude_sketch(
     }
 
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
 
         // Per-region multi-loop face construction: build one Face per
         // region with the outer shape's edges as the outer loop and
@@ -1595,8 +1597,21 @@ pub async fn extrude_sketch(
                 outer_lifted,
                 tolerance,
             )?;
-            let face_id = create_face_from_profile(&mut model, outer_edges)
-                .map_err(ApiError::kernel_error)?;
+            // Use the sketch session's known host plane rather than
+            // re-deriving it from edge samples. Newell best-fit can
+            // collapse for degenerate / collinear / near-zero-area
+            // polygons even when the host plane is perfectly defined
+            // by construction; the sketch already knows where it
+            // lives, so it must say so.
+            let plane_origin = session.plane.lift(0.0, 0.0);
+            let plane_normal = session.plane.normal();
+            let face_id = create_face_from_profile_with_plane(
+                &mut model,
+                outer_edges,
+                plane_origin,
+                plane_normal,
+            )
+            .map_err(ApiError::kernel_error)?;
 
             // Inner loops → one `LoopType::Inner` per hole, registered
             // on the face via `add_inner_loop`. The kernel's
@@ -1654,7 +1669,7 @@ pub async fn extrude_sketch(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -1807,6 +1822,7 @@ pub async fn extrude_sketch(
 /// so frontend selection / timeline references survive the cut.
 pub async fn extrude_cut_sketch(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
     Json(body): Json<ExtrudeCutSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1892,7 +1908,7 @@ pub async fn extrude_cut_sketch(
     // subtract from target" sequence so the cutter solid is never
     // observable in a partially-built state by a concurrent reader.
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
 
         // Materialise the cutter the same way `extrude_sketch` does:
         // one solid per shape, then fold outer-minus-holes per region,
@@ -1954,7 +1970,7 @@ pub async fn extrude_cut_sketch(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -2051,6 +2067,7 @@ pub async fn extrude_cut_sketch(
 /// produce the same topology after revolve as they do after extrude.
 pub async fn revolve_sketch(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<String>,
     Json(body): Json<RevolveSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -2153,7 +2170,7 @@ pub async fn revolve_sketch(
     }
 
     let result_solid_id = {
-        let mut model = state.model.write().await;
+        let mut model = model_handle.write().await;
 
         // Build edges + revolve each shape into its own solid. Hole
         // shapes are revolved into hole solids and subtracted from
@@ -2207,7 +2224,7 @@ pub async fn revolve_sketch(
     };
 
     let (tri_mesh, tessellation_ms) = {
-        let model = state.model.read().await;
+        let model = model_handle.read().await;
         let solid = model
             .solids
             .get(result_solid_id)
@@ -2371,6 +2388,7 @@ pub async fn add_sketch_shape_point(
 /// uses, so the two paths can't disagree about which faces are valid.
 pub async fn plane_from_face(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Json(body): Json<PlaneFromFaceBody>,
 ) -> Result<Json<SketchPlane>, ApiError> {
     let solid_id = state.get_local_id(&body.object_id).ok_or_else(|| {
@@ -2379,7 +2397,7 @@ pub async fn plane_from_face(
             format!("no kernel solid registered for {}", body.object_id),
         )
     })?;
-    let model = state.model.read().await;
+    let model = model_handle.read().await;
     let solid = model
         .solids
         .get(solid_id)
@@ -3147,7 +3165,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     use geometry_engine::operations::extrude::{
-        create_face_from_profile, extrude_face, ExtrudeOptions,
+        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
     };
     use geometry_engine::primitives::curve::{Line, ParameterRange};
     use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
@@ -3219,8 +3237,15 @@ mod tests {
             let outer_lifted = &shape_polygons[region.outer_shape_idx];
             let outer_edges =
                 build_loop_edges_for_test(&mut model, outer_lifted, tolerance.distance());
-            let face_id = create_face_from_profile(&mut model, outer_edges)
-                .expect("create_face_from_profile");
+            let plane_origin = session.plane.lift(0.0, 0.0);
+            let plane_normal = session.plane.normal();
+            let face_id = create_face_from_profile_with_plane(
+                &mut model,
+                outer_edges,
+                plane_origin,
+                plane_normal,
+            )
+            .expect("create_face_from_profile_with_plane");
 
             for &hole_idx in &region.hole_shape_idxs {
                 let hole_lifted = &shape_polygons[hole_idx];
