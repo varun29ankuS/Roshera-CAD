@@ -9,6 +9,8 @@
 
 mod assembly_mgr;
 mod auth_middleware;
+#[cfg(test)]
+mod blend_failed_harness;
 mod branches;
 mod csketch;
 mod delta_handlers;
