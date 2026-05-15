@@ -689,6 +689,247 @@ mod tests {
         assert_eq!(payload["r_max"], 1.25);
     }
 
+    /// Diagnostics-α Phase-2: `BlendFailure::SetbackTooLong` survives
+    /// the `OperationError → ApiError → JSON` chain with the right
+    /// discriminator and field values. Sister test to
+    /// `blend_failed_wire_shape_carries_typed_failure`, but for the
+    /// F2-γ.1 corner-compatibility gate.
+    #[test]
+    fn blend_failed_setback_too_long_wire_shape() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::SetbackTooLong {
+            vertex: 11,
+            setback: 3.5,
+            edge_length: 2.0,
+        };
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        assert_eq!(api_err.code, ErrorCode::BlendFailed);
+        assert_eq!(api_err.code.status(), StatusCode::BAD_REQUEST);
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "SetbackTooLong");
+        assert_eq!(payload["vertex"], 11);
+        assert_eq!(payload["setback"], 3.5);
+        assert_eq!(payload["edge_length"], 2.0);
+    }
+
+    /// Diagnostics-α Phase-2: `BlendFailure::DihedralInflection`
+    /// surfaces with the typed wire shape. Inflection means the
+    /// dihedral angle passes through 0 / π along the edge length —
+    /// single-radius blends are undefined across the crossing.
+    #[test]
+    fn blend_failed_dihedral_inflection_wire_shape() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::DihedralInflection {
+            edge: 4,
+            station: 0.61,
+            dihedral_deg: -0.5,
+        };
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "DihedralInflection");
+        assert_eq!(payload["edge"], 4);
+        assert_eq!(payload["station"], 0.61);
+        assert_eq!(payload["dihedral_deg"], -0.5);
+    }
+
+    /// Diagnostics-α Phase-2: `BlendFailure::SewGapTooLarge` from the
+    /// F7-δ continuity gate surfaces as the typed payload. Pins the
+    /// wire shape for the sew-side migration landed in sew.rs:778.
+    #[test]
+    fn blend_failed_sew_gap_wire_shape() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::SewGapTooLarge {
+            edge: 22,
+            gap: 0.015,
+            tolerance: 1e-6,
+        };
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "SewGapTooLarge");
+        assert_eq!(payload["edge"], 22);
+        assert_eq!(payload["gap"], 0.015);
+        assert_eq!(payload["tolerance"], 1e-6);
+    }
+
+    /// Diagnostics-α Phase-2: `BlendFailure::SpineSolverDiverged`
+    /// from the F3-γ marching corrector surfaces with edge / station
+    /// / residual fields. Pins the wire shape for the spine-side
+    /// migration landed in `spine_solver::corrector`.
+    #[test]
+    fn blend_failed_spine_solver_diverged_wire_shape() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::SpineSolverDiverged {
+            edge: 9,
+            station: 0.73,
+            residual: 4.2e-3,
+        };
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "SpineSolverDiverged");
+        assert_eq!(payload["edge"], 9);
+        assert_eq!(payload["station"], 0.73);
+        assert_eq!(payload["residual"], 4.2e-3);
+    }
+
+    /// Diagnostics-α Phase-2: `BlendFailure::VertexBlendUnsupported`
+    /// surfaces with both the nested `kind` (BlendVertexKind) and the
+    /// `reason` (VertexBlendUnsupportedReason) discriminators
+    /// preserved. This is the deepest nesting the agent surface
+    /// exposes; any drift in nested serde tags breaks corner-blend
+    /// dispatch on the consumer side.
+    #[test]
+    fn blend_failed_vertex_blend_unsupported_wire_shape() {
+        use geometry_engine::operations::blend_graph::BlendVertexKind;
+        use geometry_engine::operations::diagnostics::{
+            BlendFailure, VertexBlendUnsupportedReason,
+        };
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::VertexBlendUnsupported {
+            vertex: 17,
+            kind: BlendVertexKind::ConvexCorner { degree: 5 },
+            reason: VertexBlendUnsupportedReason::DegreeTooHigh { degree: 5 },
+        };
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "VertexBlendUnsupported");
+        assert_eq!(payload["vertex"], 17);
+        // Nested kind discriminator (externally tagged enum — JSON
+        // looks like `{"ConvexCorner": {"degree": 5}}`).
+        assert_eq!(payload["kind"]["ConvexCorner"]["degree"], 5);
+        // Nested reason discriminator (same convention).
+        assert_eq!(payload["reason"]["DegreeTooHigh"]["degree"], 5);
+    }
+
+    /// Diagnostics-α Phase-2: `BlendFailure::TopologyViolation` is the
+    /// freeform catch-all — its `detail` string must still surface
+    /// under `details.failure.detail`. Agents that branch on
+    /// `details.failure.type == "TopologyViolation"` treat this as a
+    /// non-recoverable error and surface the detail string to the
+    /// user.
+    #[test]
+    fn blend_failed_topology_violation_wire_shape() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::TopologyViolation {
+            detail: "non-manifold edge after splice".into(),
+        };
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "TopologyViolation");
+        assert_eq!(payload["detail"], "non-manifold edge after splice");
+    }
+
+    /// Every `BlendFailure` variant must map to HTTP 400 (caller-
+    /// recoverable bad request, not a server fault). This is the
+    /// status-side counterpart to the per-variant wire-shape pins;
+    /// it catches accidental moves of `ErrorCode::BlendFailed` into
+    /// the 5xx group during catalog refactors.
+    #[test]
+    fn blend_failed_status_is_400_for_every_variant() {
+        use geometry_engine::operations::blend_graph::BlendVertexKind;
+        use geometry_engine::operations::diagnostics::{
+            BlendFailure, VertexBlendUnsupportedReason,
+        };
+        use geometry_engine::operations::OperationError;
+        let variants: Vec<BlendFailure> = vec![
+            BlendFailure::RadiusExceedsCurvature {
+                edge: 0,
+                station: 0.0,
+                r_requested: 1.0,
+                r_max: 0.5,
+            },
+            BlendFailure::SetbackTooLong {
+                vertex: 0,
+                setback: 1.0,
+                edge_length: 0.5,
+            },
+            BlendFailure::DihedralInflection {
+                edge: 0,
+                station: 0.5,
+                dihedral_deg: 0.0,
+            },
+            BlendFailure::SewGapTooLarge {
+                edge: 0,
+                gap: 1.0,
+                tolerance: 1e-6,
+            },
+            BlendFailure::SpineSolverDiverged {
+                edge: 0,
+                station: 0.5,
+                residual: 1.0,
+            },
+            BlendFailure::VertexBlendUnsupported {
+                vertex: 0,
+                kind: BlendVertexKind::Cliff,
+                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+            },
+            BlendFailure::TopologyViolation {
+                detail: "x".into(),
+            },
+        ];
+        for failure in variants {
+            let api_err: ApiError = OperationError::BlendFailed(Box::new(failure.clone())).into();
+            assert_eq!(
+                api_err.code,
+                ErrorCode::BlendFailed,
+                "variant {:?} should route to BlendFailed",
+                failure
+            );
+            assert_eq!(
+                api_err.code.status(),
+                StatusCode::BAD_REQUEST,
+                "variant {:?} must surface as HTTP 400",
+                failure
+            );
+            assert!(
+                !api_err.retryable,
+                "variant {:?} must be non-retryable",
+                failure
+            );
+        }
+    }
+
+    /// The `error` field (human-readable summary) must include the
+    /// kernel-side Display output so logs and humans can read the
+    /// rejection without parsing `details.failure`. This is the
+    /// observability counterpart to the structured payload — agents
+    /// branch on `details.failure.type`, humans read `error`.
+    #[test]
+    fn blend_failed_error_message_carries_kernel_display() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::SpineSolverDiverged {
+            edge: 42,
+            station: 0.5,
+            residual: 1.2e-2,
+        };
+        let display = failure.to_string();
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let error_msg = v["error"].as_str().unwrap();
+        assert!(
+            error_msg.contains(&display),
+            "error field {:?} must include kernel display {:?}",
+            error_msg,
+            display
+        );
+        assert!(
+            error_msg.starts_with("blend failed:"),
+            "error field {:?} must be prefixed with the typed-surface marker",
+            error_msg
+        );
+    }
+
     /// Non-`BlendFailed` `OperationError` variants must still funnel
     /// through `kernel_error` so the legacy surface is preserved
     /// while the typed surface lands incrementally.
