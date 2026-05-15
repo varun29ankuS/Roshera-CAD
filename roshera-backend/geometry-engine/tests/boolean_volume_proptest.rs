@@ -206,14 +206,13 @@ proptest! {
     /// classifies inner-vs-outer here will produce confused shells in
     /// every other difference call too.
     ///
-    /// **Currently ignored** — the difference pipeline does not yet
-    /// produce the algebraic difference volume on this configuration.
-    /// Enable when the boolean engine resolves the inner-shell
-    /// orientation correctly (tracked under the broader "boolean
-    /// engine numerical-robustness" work that the Tier-1 file's
-    /// module docs reference).
+    /// Enabled after bug #51's classification-pipeline fixes
+    /// (commit 3ee1a63): the `is_point_in_face` planar-path fallback
+    /// for closed-seam circular boundaries, plus the conditional
+    /// ≥4-face manifold check, removed the spurious OnBoundary and
+    /// shell-rejection conditions that previously caused the
+    /// containing-pair difference to return wrong volumes.
     #[test]
-    #[ignore = "exposes a real kernel bug: V(big − small) ≠ V(big) − V(small) on random containing pairs (boolean engine numerical-robustness ceiling)"]
     fn prop_containment_difference_equals_diff(
         small in arb_small_dims(),
     ) {
@@ -303,15 +302,13 @@ proptest! {
     /// `OperationError::EmptyResult` or similar); we skip those cases
     /// rather than treating them as failures.
     ///
-    /// **Currently ignored** — the union pipeline does not yet
-    /// produce `V(A) + V(B)` on widely-separated box pairs. The
-    /// engine returns Ok(..) with a volume that diverges from the
-    /// analytical sum, indicating the disjoint-component shell
-    /// stitcher is still numerically fragile. Enable when the boolean
-    /// engine's disjoint-classifier path is hardened (tracked under
-    /// the broader "boolean engine numerical-robustness" work).
+    /// Enabled after bug #51's brute-force bbox pre-prune
+    /// (commit 3ee1a63): without it, far-translated box pairs
+    /// produced phantom face intersections from
+    /// `intersect_surface_plane` evaluated on the unbounded plane
+    /// equations, which shredded the participating faces and
+    /// diverged the volume sum.
     #[test]
-    #[ignore = "exposes a real kernel bug: V(A ∪ B) ≠ V(A) + V(B) on far-translated disjoint boxes (boolean engine numerical-robustness ceiling)"]
     fn prop_disjoint_union_volume_sums(
         a_dims in arb_small_dims(),
         b_dims in arb_small_dims(),
@@ -352,16 +349,11 @@ proptest! {
     /// always have a non-trivial overlap to measure. The 10%
     /// tolerance is intentionally loose — see module-level docs.
     ///
-    /// **Currently ignored** — observed failure mode is a NEGATIVE
-    /// volume from the union pipeline on random concentric boxes,
-    /// indicating an orientation flip in the resulting shell (outward
-    /// normals get inverted, the divergence-theorem volume integral
-    /// then signs-flips). The bug is upstream of inclusion-exclusion
-    /// — once `V(A∪B)` and `V(A∩B)` are individually correct, this
-    /// invariant should hold automatically. Enable in tandem with the
-    /// other two ignored properties.
+    /// Enabled after bug #51's pipeline fixes (commit 3ee1a63):
+    /// once `V(A∪B)` and `V(A∩B)` are individually correct on these
+    /// configurations the invariant holds automatically, as
+    /// predicted in the original docstring.
     #[test]
-    #[ignore = "exposes a real kernel bug: V(A ∪ B) can be negative (shell orientation flip) on random concentric box pairs (boolean engine numerical-robustness ceiling)"]
     fn prop_inclusion_exclusion_consistency(
         a_dims in arb_small_dims(),
         b_dims in arb_small_dims(),
@@ -422,7 +414,6 @@ fn neg_control_small_box_volume_is_8() {
 }
 
 #[test]
-#[ignore = "exposes the same boolean-engine orientation flip as prop_inclusion_exclusion_consistency: V(big − small) sometimes resolves to −992 instead of +992 when other tests run concurrently. Deterministic and green under --test-threads=1; flakes under parallelism. Same kernel ceiling, same fix path."]
 fn neg_control_containment_difference_volume_matches_diff() {
     // Fixed: 10×10×10 big, 2×2×2 small. Difference must have V = 1000 − 8 = 992.
     let mut model = BRepModel::new();
