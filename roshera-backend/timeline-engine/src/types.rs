@@ -287,8 +287,12 @@ pub enum Operation {
     Fillet {
         /// Edges to fillet
         edges: Vec<EntityId>,
-        /// Fillet radius
-        radius: f64,
+        /// Fillet radius profile. Accepts the legacy bare-number
+        /// form (`"radius": 0.3`) and the F3-ε.2 tagged form
+        /// (`{"kind": "linear", "start": 0.3, "end": 0.6}` etc.)
+        /// transparently — see [`BlendRadiusDto`] for the full
+        /// surface.
+        radius: BlendRadiusDto,
     },
 
     /// Add chamfer
@@ -370,6 +374,198 @@ pub enum Operation {
         /// Parameters as JSON
         parameters: serde_json::Value,
     },
+}
+
+/// Fillet radius profile DTO — the timeline-side mirror of the
+/// kernel's `geometry_engine::operations::blend_graph::BlendRadius`.
+///
+/// # Serialised forms
+///
+/// `BlendRadiusDto` accepts **two** input shapes when deserialising
+/// (backward-compat with pre-F3-ε.2 saved timelines):
+///
+/// 1. **Legacy bare number** — `"radius": 0.3` reads as
+///    `BlendRadiusDto::Constant(0.3)`. Every timeline persisted
+///    before this change uses this form; replay must continue to
+///    work.
+/// 2. **Tagged object** — `{"kind": "constant", "value": 0.3}`,
+///    `{"kind": "linear", "start": 0.3, "end": 0.6}`, or
+///    `{"kind": "variable", "samples": [[0.0, 0.3], [0.5, 0.7], [1.0, 0.3]]}`.
+///    The `kind` discriminator is lowercase; the variable form's
+///    `samples` field is a `Vec<(f64, f64)>` where each entry is
+///    `(station ∈ [0, 1], radius > 0)` and stations are strictly
+///    increasing.
+///
+/// Serialisation always emits the tagged form so freshly-written
+/// timelines have an unambiguous shape on disk.
+///
+/// # Mapping into the kernel
+///
+/// `From<&BlendRadiusDto> for geometry_engine::operations::fillet::FilletType`
+/// (provided in this crate's `operations::fillet` module) translates:
+///
+/// - `Constant(r)` → `FilletType::Constant(r)`
+/// - `Linear { start, end }` → `FilletType::Variable(start, end)`
+///   (legacy 2-point linear interp path)
+/// - `Variable(samples)` → `FilletType::VariableStations(samples)`
+///   (F3-ε.2 per-station path)
+#[derive(Debug, Clone, PartialEq)]
+pub enum BlendRadiusDto {
+    /// Single radius along the whole edge.
+    Constant(f64),
+    /// Linear interpolation between start and end of the edge.
+    Linear {
+        /// Radius at u = 0.
+        start: f64,
+        /// Radius at u = 1.
+        end: f64,
+    },
+    /// Explicit `(station, radius)` control points along `u ∈ [0, 1]`.
+    Variable(Vec<(f64, f64)>),
+}
+
+impl BlendRadiusDto {
+    /// Largest radius the profile reaches anywhere on `u ∈ [0, 1]`.
+    /// Used by upstream validators that need a single conservative
+    /// bound (e.g. F6-α curvature gate, validation.rs's positivity
+    /// check).
+    pub fn max_radius(&self) -> f64 {
+        match self {
+            BlendRadiusDto::Constant(r) => *r,
+            BlendRadiusDto::Linear { start, end } => start.max(*end),
+            BlendRadiusDto::Variable(samples) => {
+                samples.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max)
+            }
+        }
+    }
+
+    /// Smallest radius the profile reaches anywhere on `u ∈ [0, 1]`.
+    /// Used by `validate` to reject non-positive radii in any form
+    /// of the DTO. For an empty `Variable` list this returns 0.0
+    /// so the caller's `> 0` gate rejects.
+    pub fn min_radius(&self) -> f64 {
+        match self {
+            BlendRadiusDto::Constant(r) => *r,
+            BlendRadiusDto::Linear { start, end } => start.min(*end),
+            BlendRadiusDto::Variable(samples) => {
+                if samples.is_empty() {
+                    0.0
+                } else {
+                    samples
+                        .iter()
+                        .map(|&(_, r)| r)
+                        .fold(f64::INFINITY, f64::min)
+                }
+            }
+        }
+    }
+}
+
+impl Serialize for BlendRadiusDto {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            BlendRadiusDto::Constant(r) => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("kind", "constant")?;
+                m.serialize_entry("value", r)?;
+                m.end()
+            }
+            BlendRadiusDto::Linear { start, end } => {
+                let mut m = s.serialize_map(Some(3))?;
+                m.serialize_entry("kind", "linear")?;
+                m.serialize_entry("start", start)?;
+                m.serialize_entry("end", end)?;
+                m.end()
+            }
+            BlendRadiusDto::Variable(samples) => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("kind", "variable")?;
+                m.serialize_entry("samples", samples)?;
+                m.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BlendRadiusDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The DTO accepts two shapes (legacy number, tagged object).
+        // Routing through `serde_json::Value` is the most robust way
+        // to disambiguate — both shapes Deserialize into Value
+        // unambiguously and we can then probe the discriminant
+        // ourselves with full error context.
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Number(n) => n
+                .as_f64()
+                .map(BlendRadiusDto::Constant)
+                .ok_or_else(|| serde::de::Error::custom("BlendRadiusDto: legacy radius is not a finite f64")),
+            serde_json::Value::Object(map) => {
+                let kind = map
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "BlendRadiusDto: tagged form requires a 'kind' string field \
+                             (one of: constant, linear, variable)",
+                        )
+                    })?;
+                match kind {
+                    "constant" => {
+                        let value = map
+                            .get("value")
+                            .and_then(|v| v.as_f64())
+                            .ok_or_else(|| {
+                                serde::de::Error::custom(
+                                    "BlendRadiusDto::Constant: 'value' must be a number",
+                                )
+                            })?;
+                        Ok(BlendRadiusDto::Constant(value))
+                    }
+                    "linear" => {
+                        let start = map
+                            .get("start")
+                            .and_then(|v| v.as_f64())
+                            .ok_or_else(|| {
+                                serde::de::Error::custom(
+                                    "BlendRadiusDto::Linear: 'start' must be a number",
+                                )
+                            })?;
+                        let end = map
+                            .get("end")
+                            .and_then(|v| v.as_f64())
+                            .ok_or_else(|| {
+                                serde::de::Error::custom(
+                                    "BlendRadiusDto::Linear: 'end' must be a number",
+                                )
+                            })?;
+                        Ok(BlendRadiusDto::Linear { start, end })
+                    }
+                    "variable" => {
+                        let samples_v = map.get("samples").ok_or_else(|| {
+                            serde::de::Error::custom(
+                                "BlendRadiusDto::Variable: 'samples' field is required",
+                            )
+                        })?;
+                        let samples: Vec<(f64, f64)> =
+                            serde_json::from_value(samples_v.clone()).map_err(|e| {
+                                serde::de::Error::custom(format!(
+                                    "BlendRadiusDto::Variable: 'samples' must be a list of [station, radius] pairs ({e})"
+                                ))
+                            })?;
+                        Ok(BlendRadiusDto::Variable(samples))
+                    }
+                    other => Err(serde::de::Error::custom(format!(
+                        "BlendRadiusDto: unknown kind '{other}' (expected: constant, linear, variable)"
+                    ))),
+                }
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "BlendRadiusDto: expected a number (legacy) or an object with 'kind' (tagged), got {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Operation input requirements

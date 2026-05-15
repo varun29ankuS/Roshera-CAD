@@ -6,6 +6,7 @@ use super::common::{brep_to_entity_state, entity_state_to_brep, validate_edges_s
 use crate::{
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
+    types::BlendRadiusDto,
     EntityType, Operation, OperationOutputs, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
@@ -35,11 +36,14 @@ impl OperationImpl for FilletOp {
                 ));
             }
 
-            // Validate radius
-            if *radius <= 0.0 {
+            // Validate radius — covers Constant / Linear / Variable.
+            // For Variable the minimum is over all samples; for Linear
+            // it's min(start, end); for Constant it's the value.
+            let min_r = radius.min_radius();
+            if min_r <= 0.0 {
                 return Err(TimelineError::ValidationError(format!(
-                    "Fillet radius must be positive, got {}",
-                    radius
+                    "Fillet radius must be positive everywhere on the edge, got min={}",
+                    min_r
                 )));
             }
 
@@ -95,6 +99,13 @@ impl OperationImpl for FilletOp {
                 fillet_edges, FilletOptions as GeomFilletOptions, FilletType,
             };
 
+            // F3-ε.2: dispatch the BlendRadiusDto to the matching
+            // kernel FilletType variant. The `radius` scalar in
+            // GeomFilletOptions stays the conservative max — F6-α
+            // and downstream tessellation use it as a budget bound.
+            let fillet_type = blend_radius_dto_to_fillet_type(radius);
+            let conservative_radius = radius.max_radius();
+
             // Create fillet options
             let fillet_options = GeomFilletOptions {
                 common: geometry_engine::operations::CommonOptions {
@@ -104,8 +115,8 @@ impl OperationImpl for FilletOp {
                     merge_entities: true,
                     track_history: false,
                 },
-                fillet_type: FilletType::Constant(*radius),
-                radius: *radius,
+                fillet_type,
+                radius: conservative_radius,
                 propagation: geometry_engine::operations::fillet::PropagationMode::Tangent,
                 preserve_edges: true,
                 quality: geometry_engine::operations::fillet::FilletQuality::Standard,
@@ -151,7 +162,13 @@ impl OperationImpl for FilletOp {
 
                 obj.insert("last_operation".to_string(), serde_json::json!("fillet"));
                 obj.insert("fillet_count".to_string(), serde_json::json!(fillet_count));
-                obj.insert("last_fillet_radius".to_string(), serde_json::json!(radius));
+                // `last_fillet_radius` now carries the structured DTO
+                // so replay-tracking tools can read back the full
+                // profile shape, not just a scalar.
+                obj.insert(
+                    "last_fillet_radius".to_string(),
+                    serde_json::to_value(radius).unwrap_or(serde_json::Value::Null),
+                );
                 obj.insert(
                     "last_fillet_edges".to_string(),
                     serde_json::json!(edges.len()),
@@ -180,6 +197,13 @@ impl OperationImpl for FilletOp {
 
     fn estimate_resources(&self, operation: &Operation) -> ResourceEstimate {
         if let Operation::Fillet { edges, .. } = operation {
+            // Variable-radius profiles cost slightly more memory and
+            // time per edge — the sample list adds a few hundred
+            // bytes and the per-station rolling-ball sweep evaluates
+            // the closure at every parameter step — but the dominant
+            // cost is still per-edge surgery. The estimate stays
+            // edges-proportional; the small per-sample overhead falls
+            // out as below-noise inside the existing budget.
             ResourceEstimate {
                 entities_created: 0, // Fillet modifies existing entity
                 entities_modified: 1,
@@ -189,5 +213,24 @@ impl OperationImpl for FilletOp {
         } else {
             ResourceEstimate::default()
         }
+    }
+}
+
+/// Translate a [`BlendRadiusDto`] into the kernel's
+/// [`geometry_engine::operations::fillet::FilletType`] dispatch shape.
+///
+/// - `Constant(r)` → `FilletType::Constant(r)`
+/// - `Linear { start, end }` → `FilletType::Variable(start, end)`
+///   (the kernel's legacy "linear interp between endpoints" path)
+/// - `Variable(samples)` → `FilletType::VariableStations(samples)`
+///   (the F3-ε.2 per-station path)
+fn blend_radius_dto_to_fillet_type(
+    dto: &BlendRadiusDto,
+) -> geometry_engine::operations::fillet::FilletType {
+    use geometry_engine::operations::fillet::FilletType;
+    match dto {
+        BlendRadiusDto::Constant(r) => FilletType::Constant(*r),
+        BlendRadiusDto::Linear { start, end } => FilletType::Variable(*start, *end),
+        BlendRadiusDto::Variable(samples) => FilletType::VariableStations(samples.clone()),
     }
 }
