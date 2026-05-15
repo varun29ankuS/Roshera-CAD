@@ -1034,13 +1034,11 @@ fn union_disjoint_polyline_hexagons() {
 }
 
 // Overlapping-Union followup: two polyline hexagonal prisms with
-// coplanar bottoms at z=0 trip the same coplanar-imprint-merge path
-// that F36 Bug B fixed for Difference, but the Union selection branch
-// produces non-manifold mesh edges. Likely a sibling of Bug B2
-// (duplicate SSI-vs-imprint curves) but on the Union-keeps-outside
-// side. Tracked as F36 followup.
+// coplanar bottoms at z=0. The polygon_clip layer is now robust (the
+// i_overlay swap closed the shared-vertex degeneracy that previously
+// rejected this input). Now exercises the downstream coplanar imprint
+// + split path for symmetric fragment generation.
 #[test]
-#[ignore = "F36 followup: overlapping-Union polygon_clip degeneracy (pending i_overlay swap)"]
 fn union_overlapping_polyline_hexagons() {
     run_with_watchdog("union_overlapping_polyline_hexagons", 30_000, || {
         let mut model = BRepModel::new();
@@ -1132,7 +1130,6 @@ fn intersect_polyline_hexagon_into_box() {
 // Commutativity followup: blocked by the same overlapping-Union
 // merge issue above. Once that lands, this test should pass as-is.
 #[test]
-#[ignore = "F36 followup: overlapping-Union polygon_clip degeneracy (pending i_overlay swap)"]
 fn union_commutative_polyline_hexagons() {
     run_with_watchdog("union_commutative_polyline_hexagons", 40_000, || {
         // A ∪ B
