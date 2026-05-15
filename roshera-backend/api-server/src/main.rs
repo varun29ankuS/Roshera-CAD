@@ -15,6 +15,7 @@ mod branches;
 mod csketch;
 mod delta_handlers;
 mod error_catalog;
+mod fillet_payload;
 mod frame;
 mod handlers;
 mod handlers_impl;
@@ -1485,15 +1486,38 @@ async fn mirror_solid(
 }
 
 /// POST /api/geometry/fillet — round one or more edges of a solid with
-/// a constant radius.
+/// a constant, linear, or per-station variable radius.
 ///
-/// Request:
+/// Request shapes (every field except `object`/`edges` is optional but
+/// exactly one of `radius` / `radii` MUST be present):
+///
 /// ```json
-/// { "object":   "<uuid>",
-///   "edges":    [edge_id_u32, ...],   // ≥1 EdgeId from a SubElementPick
-///   "radius":   2.0
-/// }
+/// // Legacy uniform constant — every edge gets the same r.
+/// { "object": "<uuid>", "edges": [12, 13], "radius": 2.0 }
+///
+/// // Legacy per-edge constant — `radii[i]` pairs with `edges[i]`.
+/// { "object": "<uuid>", "edges": [12, 13], "radii": [1.0, 3.0] }
+///
+/// // F3-ε.2 uniform variable (linear interp endpoints, every edge).
+/// { "object": "<uuid>",
+///   "edges":  [12, 13],
+///   "radius": { "kind": "Linear", "start": 1.0, "end": 3.0 } }
+///
+/// // F3-ε.2 per-edge mixed (bare numbers and tagged profiles).
+/// { "object": "<uuid>",
+///   "edges":  [12, 13, 14],
+///   "radii":  [
+///     2.0,
+///     { "kind": "Linear", "start": 1.0, "end": 3.0 },
+///     { "kind": "Variable",
+///       "samples": [[0.0, 1.0], [0.5, 3.0], [1.0, 1.0]] }
+///   ] }
 /// ```
+///
+/// The wire shape mirrors `timeline_engine::BlendRadiusDto` exactly so
+/// the same payload survives a timeline replay round-trip. Backward
+/// compatibility for bare-number radii is baked into the DTO's manual
+/// `Deserialize`; legacy clients keep working unchanged.
 ///
 /// Identity-preserving modify: the kernel rounds edges in place
 /// (Solid::id is stable across `fillet_edges`), so the public UUID
@@ -1525,68 +1549,6 @@ async fn fillet_edges_endpoint(
         )
     })?;
 
-    // Two accepted radius shapes:
-    //   - `radius: f64`        — uniform constant for every edge (legacy).
-    //   - `radii: [f64; N]`    — per-edge constant radii, parallel to `edges`.
-    // Exactly one must be present. Mixing both is rejected so the client
-    // cannot ship an ambiguous payload.
-    let radius_field = payload.get("radius");
-    let radii_field = payload.get("radii");
-    if radius_field.is_some() && radii_field.is_some() {
-        return Err(ApiError::new(
-            ErrorCode::InvalidParameter,
-            "cannot specify both 'radius' and 'radii' — pick one".to_string(),
-        ));
-    }
-    let radius_opt: Option<f64> = match radius_field {
-        Some(v) => Some(v.as_f64().ok_or_else(|| {
-            ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("'radius' must be a number, got {v}"),
-            )
-        })?),
-        None => None,
-    };
-    if let Some(r) = radius_opt {
-        if !r.is_finite() || r <= 0.0 {
-            return Err(ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("'radius' must be a positive finite number, got {r}"),
-            ));
-        }
-    }
-    let radii_opt: Option<Vec<f64>> = match radii_field {
-        Some(v) => {
-            let arr = v.as_array().ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    "'radii' must be a JSON array of numbers".to_string(),
-                )
-            })?;
-            let mut out: Vec<f64> = Vec::with_capacity(arr.len());
-            for (i, item) in arr.iter().enumerate() {
-                let r = item.as_f64().ok_or_else(|| {
-                    ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        format!("'radii[{i}]' must be a number, got {item}"),
-                    )
-                })?;
-                if !r.is_finite() || r <= 0.0 {
-                    return Err(ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        format!("'radii[{i}]' must be a positive finite number, got {r}"),
-                    ));
-                }
-                out.push(r);
-            }
-            Some(out)
-        }
-        None => None,
-    };
-    if radius_opt.is_none() && radii_opt.is_none() {
-        return Err(ApiError::missing_field("radius"));
-    }
-
     let edges_raw = payload
         .get("edges")
         .and_then(|v| v.as_array())
@@ -1614,22 +1576,6 @@ async fn fillet_edges_endpoint(
         edges.push(n as EdgeId);
     }
 
-    // `radii` length must equal `edges` length when present. Slice 1
-    // pairs them by index — the per-edge dispatch loop below uses
-    // `radii[i]` for `edges[i]`.
-    if let Some(rs) = &radii_opt {
-        if rs.len() != edges.len() {
-            return Err(ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!(
-                    "'radii' length {} must equal 'edges' length {}",
-                    rs.len(),
-                    edges.len()
-                ),
-            ));
-        }
-    }
-
     // Reject duplicate edge ids. The per-edge loop would hit the second
     // occurrence after the first call has already consumed the edge,
     // which surfaces as a confusing kernel "edge not found" error half-
@@ -1646,6 +1592,13 @@ async fn fillet_edges_endpoint(
         }
     }
 
+    // Parse radius/radii into one `FilletType` per edge. All wire-shape
+    // validation (`radius` ↔ `radii` exclusivity, missing-field,
+    // length-match, range checks on every numeric value, malformed-DTO
+    // rejection) is encapsulated in `fillet_payload::parse_fillet_radii`.
+    // See that module's `tests/` for the full shape harness.
+    let radii_parsed = fillet_payload::parse_fillet_radii(&payload, edges.len())?;
+
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -1653,41 +1606,37 @@ async fn fillet_edges_endpoint(
         )
     })?;
 
-    // Resolve to a parallel radii vector. Back-compat single `radius`
-    // expands to `vec![r; edges.len()]`; explicit `radii` is taken as-
-    // is. The uniform check below decides between the single atomic
-    // kernel call and the per-edge loop.
-    let radii_resolved: Vec<f64> = match (&radius_opt, &radii_opt) {
-        (Some(r), None) => vec![*r; edges.len()],
-        (None, Some(rs)) => rs.clone(),
-        // The missing-both case returned `missing_field` above; the
-        // both-present case returned `InvalidParameter` above. Either
-        // way this arm is unreachable on the success path.
-        _ => unreachable!("radius/radii presence already validated"),
-    };
-    let uniform = radii_resolved.windows(2).all(|w| (w[0] - w[1]).abs() < f64::EPSILON);
-
     // Hold the model write lock only for the kernel fillet op;
     // tessellation runs under a read lock. Same pattern as boolean /
     // shell / mirror.
     //
     // Two dispatch paths:
-    //   - Uniform radii → one atomic `fillet_edges` call across every
-    //     edge. Preserves the kernel's edge-chain grouping (matters for
-    //     blend continuity when adjacent edges share a corner) and is
-    //     byte-identical to the legacy single-radius path.
-    //   - Mixed radii → one `fillet_edges` call per edge, each with
-    //     `FilletType::Constant(radii_resolved[i])` and
-    //     `PropagationMode::None` (so edge K's propagation cannot
-    //     swallow edge K+1 and break the parallel-radius invariant).
-    //     A mid-loop kernel failure leaves the solid partially
-    //     filleted; slice 3 will add per-edge options to the kernel
-    //     for atomic apply.
+    //   - All-equal `Constant(r)` across every edge → one atomic
+    //     `fillet_edges` call across the whole edge set. Preserves the
+    //     kernel's edge-chain grouping (matters for blend continuity
+    //     when adjacent edges share a corner) and is byte-identical to
+    //     the pre-F3-ε.2 single-radius path.
+    //   - Anything else (mixed constants, any Variable, any
+    //     VariableStations) → one `fillet_edges` call per edge with
+    //     `PropagationMode::None`. Propagation is suppressed so edge
+    //     K's chain cannot swallow edge K+1 and break the per-edge
+    //     profile invariant. A mid-loop kernel failure leaves the
+    //     solid partially filleted; atomic per-edge apply is queued
+    //     for a follow-up kernel slice.
+    // The DTO → `FilletType` translation is performed inside this
+    // model-lock scope via `radii_parsed.to_fillet_type(i)` rather than
+    // up-front. Rationale: `FilletType::Function(Box<dyn Fn>)` is
+    // `!Send`, so a future that held a `Vec<FilletType>` across the
+    // `model_handle.write().await` above would fail the axum `Handler`
+    // bound. `BlendRadiusDto` is `Send + Sync`, so the parser's
+    // `profiles` field crosses the await safely; the translation to
+    // the kernel dispatch shape happens immediately before the kernel
+    // call, never across a yield point.
     {
         let mut model = model_handle.write().await;
-        if uniform {
+        if radii_parsed.uniform_constant {
             let opts = FilletOptions {
-                fillet_type: FilletType::Constant(radii_resolved[0]),
+                fillet_type: radii_parsed.to_fillet_type(0),
                 propagation: PropagationMode::None,
                 ..FilletOptions::default()
             };
@@ -1696,7 +1645,7 @@ async fn fillet_edges_endpoint(
         } else {
             for (i, &edge_id) in edges.iter().enumerate() {
                 let opts = FilletOptions {
-                    fillet_type: FilletType::Constant(radii_resolved[i]),
+                    fillet_type: radii_parsed.to_fillet_type(i),
                     propagation: PropagationMode::None,
                     ..FilletOptions::default()
                 };
@@ -1705,6 +1654,11 @@ async fn fillet_edges_endpoint(
             }
         }
     };
+
+    // Bind for the downstream broadcast block — the canonical per-edge
+    // wire echo and uniform flag remain readable below.
+    let canonical_per_edge = radii_parsed.canonical_per_edge;
+    let uniform_constant = radii_parsed.uniform_constant;
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;
@@ -1730,17 +1684,21 @@ async fn fillet_edges_endpoint(
     // Identity-preserving modify: same kernel solid_id, same public
     // UUID. See chamfer for the identity rationale; same logic applies.
     let display_name = format!("Fillet {}", solid_id);
-    // Per-edge path round-trips `radii`; back-compat / uniform path
-    // round-trips a single `radius`. Downstream broadcast consumers
-    // (chat, timeline mirror) can branch on which key is present.
-    let parameters = if radii_opt.is_some() {
+    // Round-trip the parsed radius profiles in their canonical tagged
+    // form so subscribers (timeline mirror, chat, frontend feature
+    // tree) don't need to know which legacy wire shape the original
+    // POST used. Uniform Constant collapses to a single `radius`
+    // field for back-compat with the pre-F3-ε.2 broadcast contract;
+    // anything else fans out as `radii: [...]` (one tagged DTO per
+    // edge, parallel to `edges`).
+    let parameters = if uniform_constant {
         serde_json::json!({
-            "radii":  radii_resolved,
+            "radius": canonical_per_edge[0].clone(),
             "source": object_uuid.to_string(),
         })
     } else {
         serde_json::json!({
-            "radius": radii_resolved[0],
+            "radii":  canonical_per_edge,
             "source": object_uuid.to_string(),
         })
     };
