@@ -1690,7 +1690,7 @@ async fn fillet_edges_endpoint(
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
-                .map_err(ApiError::kernel_error)?;
+                .map_err(ApiError::from)?;
         } else {
             for (i, &edge_id) in edges.iter().enumerate() {
                 let opts = FilletOptions {
@@ -1699,7 +1699,7 @@ async fn fillet_edges_endpoint(
                     ..FilletOptions::default()
                 };
                 kernel_fillet(&mut model, solid_id, vec![edge_id], opts)
-                    .map_err(ApiError::kernel_error)?;
+                    .map_err(ApiError::from)?;
             }
         }
     };
@@ -1868,7 +1868,7 @@ async fn chamfer_edges_endpoint(
             propagation: PropagationMode::None,
             ..ChamferOptions::default()
         };
-        kernel_chamfer(&mut model, solid_id, edges, opts).map_err(ApiError::kernel_error)?;
+        kernel_chamfer(&mut model, solid_id, edges, opts).map_err(ApiError::from)?;
     };
 
     let (tri_mesh, tessellation_ms) = {

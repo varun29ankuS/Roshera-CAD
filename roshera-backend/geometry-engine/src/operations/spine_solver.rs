@@ -38,6 +38,7 @@
 use crate::math::frame::{parallel_transport_frames, FrameAtStation};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::operations::blend_graph::{BlendGraph, BlendRadius};
+use crate::operations::diagnostics::BlendFailure;
 use crate::operations::edge_classification::find_adjacent_faces;
 use crate::operations::fillet::{edge_orientation_in_face, get_face_oriented_normal};
 use crate::operations::fillet_robust::robust_face_angle;
@@ -1830,8 +1831,12 @@ fn solve_plane_sphere(
 // rounds with an F1-δ-style monotone-decrease guard: if the worst-case gap
 // (max of `||center − contact_i| − radius|` over i ∈ {a, b}) fails to shrink
 // for [`CORRECTOR_STALL_LIMIT`] consecutive iterations the corrector returns
-// a `PK_BLEND_SPINE_DIVERGED` numerical error. F2-δ rollback turns that
-// into a clean "model untouched" failure at the fillet entry point.
+// a typed [`BlendFailure::SpineSolverDiverged`] wrapped in
+// [`OperationError::BlendFailed`] (Diagnostics-α Phase-2) carrying the
+// edge id, station ∈ [0,1], and final residual. F2-δ rollback turns
+// that into a clean "model untouched" failure at the fillet entry
+// point, and the api-server's `From<OperationError> for ApiError`
+// surfaces it as the typed `blend_failed` HTTP wire shape.
 //
 // Frames are attached after fitting: the marched centres are fitted to a
 // cubic NURBS curve, then [`parallel_transport_frames`] produces a
@@ -1862,16 +1867,26 @@ const MARCHING_NEAR_TANGENT_RAD: f64 = 0.05;
 ///
 /// Returns `(corrected_center, contact_a, contact_b, iterations_used)`.
 ///
-/// Errors with `PK_BLEND_SPINE_DIVERGED` when the worst-case
-/// `||center − contact| − radius|` fails to monotonically decrease for
-/// [`CORRECTOR_STALL_LIMIT`] iterations, or when the iteration cap is
-/// reached with the residual still more than 10× the target tolerance.
+/// On genuine divergence (worst-case `||center − contact| − radius|`
+/// fails to monotonically decrease for [`CORRECTOR_STALL_LIMIT`]
+/// iterations, or the iteration cap is reached with the residual still
+/// more than 10× the target tolerance) the corrector returns
+/// [`OperationError::BlendFailed`] wrapping a
+/// [`BlendFailure::SpineSolverDiverged`] carrying the edge, station,
+/// and final residual — Diagnostics-α Phase-2 typed surface so agents
+/// can branch on the structured failure rather than parsing the legacy
+/// `PK_BLEND_SPINE_DIVERGED` string. Surface evaluation failures
+/// (closest_point, point_at, normal_at) remain
+/// [`OperationError::NumericalError`] because they are not blend-
+/// specific divergence — they indicate a malformed surface.
 fn corrector(
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,
     seed_center: Point3,
     radius: f64,
     tolerance: Tolerance,
+    edge_id: EdgeId,
+    station: f64,
 ) -> OperationResult<(Point3, Point3, Point3, usize)> {
     let target = tolerance.distance().max(1e-9);
     let mut center = seed_center;
@@ -1928,10 +1943,12 @@ fn corrector(
         if gap >= prev_gap * (1.0 - 1e-6) {
             stall += 1;
             if stall >= CORRECTOR_STALL_LIMIT {
-                return Err(OperationError::NumericalError(format!(
-                    "PK_BLEND_SPINE_DIVERGED: marching corrector gap not decreasing \
-                     ({:.3e} ≥ {:.3e}) for {} iterations at radius {}",
-                    gap, prev_gap, stall, radius
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::SpineSolverDiverged {
+                        edge: edge_id,
+                        station,
+                        residual: gap,
+                    },
                 )));
             }
         } else {
@@ -1986,10 +2003,12 @@ fn corrector(
         )
     })?;
     if best_gap > target * 10.0 {
-        return Err(OperationError::NumericalError(format!(
-            "PK_BLEND_SPINE_DIVERGED: marching corrector exceeded {} iterations \
-             with best gap {:.3e} (target {:.3e})",
-            MAX_CORRECTOR_ITERS, best_gap, target
+        return Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::SpineSolverDiverged {
+                edge: edge_id,
+                station,
+                residual: best_gap,
+            },
         )));
     }
     Ok((best_c, best_a, best_b, MAX_CORRECTOR_ITERS))
@@ -2130,8 +2149,15 @@ fn solve_marching(
             edge_point + bisector * (offset_sign * offset_dist)
         };
 
-        let (center, contact_a, contact_b, iters) =
-            corrector(surface_a, surface_b, seed, r_t, options.tolerance)?;
+        let (center, contact_a, contact_b, iters) = corrector(
+            surface_a,
+            surface_b,
+            seed,
+            r_t,
+            options.tolerance,
+            edge_id,
+            t,
+        )?;
         worst_iters = worst_iters.max(iters);
 
         if let Some(prev) = prev_center {

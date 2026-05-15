@@ -8,6 +8,7 @@
 //! Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use super::diagnostics::BlendFailure;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance};
 use crate::primitives::{
@@ -42,8 +43,9 @@ pub struct SewOptions {
     /// Verify geometric continuity of any edge already shared (same `EdgeId`)
     /// by 2+ input faces before mutating state. Samples 5 points along
     /// each such edge and projects onto every adjacent face's surface;
-    /// rejects with `InvalidGeometry` if any sample deviates by more than
-    /// the edge's per-edge tolerance.
+    /// rejects with [`OperationError::BlendFailed`] carrying a
+    /// [`BlendFailure::SewGapTooLarge`] payload if any sample deviates by
+    /// more than the edge's per-edge tolerance.
     ///
     /// This is the F7-δ pre-sew gate. It is a no-op for the legacy
     /// "find matching edges by sampling" flow (because those edge pairs
@@ -775,9 +777,12 @@ pub fn verify_edge_geometric_continuity(
                 })?;
                 let dev = sample.distance(&proj);
                 if dev > edge_tol {
-                    return Err(OperationError::InvalidGeometry(format!(
-                        "sew gap exceeds edge tolerance: edge {} deviates {:.3e} from face {} surface at t={:.2} (tol={:.3e})",
-                        edge_id, dev, face_id, t, edge_tol
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SewGapTooLarge {
+                            edge: edge_id,
+                            gap: dev,
+                            tolerance: edge_tol,
+                        },
                     )));
                 }
             }
@@ -887,14 +892,27 @@ mod tests {
         }
 
         match verify_edge_geometric_continuity(&model, &faces) {
-            Err(OperationError::InvalidGeometry(msg)) => {
-                assert!(
-                    msg.contains("sew gap exceeds edge tolerance"),
-                    "unexpected error message: {}",
-                    msg
-                );
-            }
-            other => panic!("expected InvalidGeometry, got {:?}", other),
+            Err(OperationError::BlendFailed(failure)) => match *failure {
+                BlendFailure::SewGapTooLarge {
+                    edge: _,
+                    gap,
+                    tolerance,
+                } => {
+                    assert!(
+                        gap > tolerance,
+                        "gap {} should exceed tolerance {}",
+                        gap,
+                        tolerance
+                    );
+                    assert!(
+                        gap > 50.0,
+                        "100-unit plane offset must surface as a large gap, got {}",
+                        gap
+                    );
+                }
+                other => panic!("expected SewGapTooLarge, got {:?}", other),
+            },
+            other => panic!("expected BlendFailed(SewGapTooLarge), got {:?}", other),
         }
     }
 

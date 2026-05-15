@@ -1,0 +1,595 @@
+//! Structured taxonomy for blend (fillet / chamfer / sew) failure modes.
+//!
+//! # Why a separate enum instead of free-form strings?
+//!
+//! Until this slice, every blend-side failure collapsed into one of
+//! [`OperationError::InvalidGeometry`], [`OperationError::InvalidInput`],
+//! or [`OperationError::NumericalError`] carrying a human-readable
+//! `String` payload. That payload is fine for a human reading a log
+//! line but useless for an agent (Claude, an MCP tool, or the
+//! frontend's diagnostic surface) trying to decide *what to do next*:
+//! "should I try a smaller radius? a different selection? a different
+//! solver?". The string format also has no stability guarantee — the
+//! kernel was free to reword it on any commit and silently break
+//! every downstream regex.
+//!
+//! [`BlendFailure`] replaces the unstructured string with a tagged
+//! enum carrying the *minimum* set of fields a caller needs to:
+//!
+//! - **Branch** on the failure category (`match` on the variant).
+//! - **Recover** automatically where possible (e.g. on
+//!   `RadiusExceedsCurvature` retry with `r_max * 0.95`).
+//! - **Localise** the offending entity for highlight / pan-to in the
+//!   viewport (every variant carries the `EdgeId` or `VertexId` that
+//!   caused the failure).
+//!
+//! # This slice (Phase-1) is additive
+//!
+//! The full Diagnostics-α plan (Task #12) ends with [`OperationError`]
+//! gaining a dedicated `BlendFailed(Box<BlendFailure>)` variant that
+//! serialises through the REST surface as JSON. Phase-1 lands the
+//! taxonomy and the [`From<BlendFailure>`] conversion only — every
+//! existing call site keeps emitting the same legacy [`OperationError`]
+//! variants, so this commit is behaviour-preserving. Subsequent
+//! slices swap failure sites to `Err(blend_failure.into())` and the
+//! payload upgrades follow naturally.
+//!
+//! # Variants
+//!
+//! Each variant maps onto a concrete failure site in the blend
+//! pipeline:
+//!
+//! | Variant                       | Site                                                          |
+//! |-------------------------------|---------------------------------------------------------------|
+//! | [`RadiusExceedsCurvature`]    | `lifecycle::validate_can_apply` (F6-α, Task #9)               |
+//! | [`SetbackTooLong`]            | `lifecycle::validate_corner_compatibility` (F2-γ.1)           |
+//! | [`DihedralInflection`]        | `fillet::detect_dihedral_inflection` (fillet.rs, Task #98)    |
+//! | [`SewGapTooLarge`]            | `sew::sew_faces` (F7-δ)                                       |
+//! | [`SpineSolverDiverged`]       | `spine_solver::solve_*` (F3-γ marching)                       |
+//! | [`VertexBlendUnsupported`]    | corner patch dispatch (F5-α / F5-β)                           |
+//! | [`TopologyViolation`]         | catch-all — replace with a specific variant when discovered   |
+//!
+//! [`RadiusExceedsCurvature`]: BlendFailure::RadiusExceedsCurvature
+//! [`SetbackTooLong`]: BlendFailure::SetbackTooLong
+//! [`DihedralInflection`]: BlendFailure::DihedralInflection
+//! [`SewGapTooLarge`]: BlendFailure::SewGapTooLarge
+//! [`SpineSolverDiverged`]: BlendFailure::SpineSolverDiverged
+//! [`VertexBlendUnsupported`]: BlendFailure::VertexBlendUnsupported
+//! [`TopologyViolation`]: BlendFailure::TopologyViolation
+
+use super::blend_graph::BlendVertexKind;
+use super::OperationError;
+use crate::primitives::edge::EdgeId;
+use crate::primitives::vertex::VertexId;
+
+/// Why a corner-patch (vertex blend) cannot be constructed at the
+/// given vertex. Carried as a field of
+/// [`BlendFailure::VertexBlendUnsupported`] so agents can branch on
+/// the *underlying topological reason* — degree vs. mixed convexity
+/// vs. non-manifold neighbourhood — rather than parsing strings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VertexBlendUnsupportedReason {
+    /// Vertex incidence exceeds the highest-supported corner patch.
+    /// F5-α (Task #10) implements the three-edge convex equal-radius
+    /// ball corner; higher degrees await F5-β.
+    DegreeTooHigh {
+        /// Number of incident blend edges at the vertex.
+        degree: usize,
+    },
+    /// At least one incident edge has no defined dihedral
+    /// ([`BlendVertexKind::Cliff`]) — non-manifold or seam topology
+    /// reached the corner. Cannot proceed without first resolving
+    /// the upstream topology.
+    NonManifoldNeighbourhood,
+    /// Incident edges mix convex and concave dihedrals
+    /// ([`BlendVertexKind::Mixed`]). Single-sign corner patches are
+    /// not defined for sign-change neighbourhoods.
+    MixedConvexity,
+    /// Vertex is [`BlendVertexKind::Smooth`] — no corner exists to
+    /// blend, the dihedral is continuous through the vertex.
+    SmoothVertex,
+}
+
+impl std::fmt::Display for VertexBlendUnsupportedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VertexBlendUnsupportedReason::DegreeTooHigh { degree } => write!(
+                f,
+                "vertex degree {} exceeds the highest-supported corner patch",
+                degree
+            ),
+            VertexBlendUnsupportedReason::NonManifoldNeighbourhood => {
+                write!(f, "non-manifold or seam edge incident at the vertex")
+            }
+            VertexBlendUnsupportedReason::MixedConvexity => {
+                write!(f, "mixed convex/concave incidence — sign change not supported")
+            }
+            VertexBlendUnsupportedReason::SmoothVertex => {
+                write!(f, "vertex is smooth — no corner to blend")
+            }
+        }
+    }
+}
+
+/// Structured taxonomy of blend (fillet / chamfer / sew) failures.
+///
+/// See the [module docs](self) for the rationale and the call-site
+/// mapping table.
+///
+/// # JSON shape
+///
+/// `BlendFailure` is internally tagged on `type`. A
+/// `RadiusExceedsCurvature` round-trips as:
+///
+/// ```json
+/// {
+///   "type": "RadiusExceedsCurvature",
+///   "edge": 7,
+///   "station": 0.42,
+///   "r_requested": 2.0,
+///   "r_max": 1.25
+/// }
+/// ```
+///
+/// This is the surface the api-server's REST and agent endpoints
+/// expose. The tag layout is part of the contract — changing it is
+/// a breaking change to the agent surface.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum BlendFailure {
+    /// The requested blend radius exceeds the local feature curvature
+    /// at the given station. Recoverable by retrying with `r ≤ r_max`.
+    RadiusExceedsCurvature {
+        /// Edge whose curvature is too tight.
+        edge: EdgeId,
+        /// Arc-length parameter ∈ [0, 1] where the test failed.
+        station: f64,
+        /// Radius the caller asked for.
+        r_requested: f64,
+        /// Largest feasible radius at this station (1 / |κ_max|).
+        r_max: f64,
+    },
+    /// Corner setback extends beyond the edge length. Adjacent blends
+    /// would overlap; F2-γ.1 rejects this at validate-time.
+    SetbackTooLong {
+        /// Vertex whose setback overruns.
+        vertex: VertexId,
+        /// Setback distance the corner patch needs.
+        setback: f64,
+        /// Length of the shortest incident edge.
+        edge_length: f64,
+    },
+    /// Dihedral angle along the edge passes through 0 / π — convexity
+    /// flips. Single-radius rolling-ball blends are undefined across
+    /// the inflection.
+    DihedralInflection {
+        /// Edge whose dihedral inverts along its length.
+        edge: EdgeId,
+        /// Parameter ∈ [0, 1] of the inflection point.
+        station: f64,
+        /// Dihedral angle at the inflection in degrees, ∈ (-180, 180).
+        dihedral_deg: f64,
+    },
+    /// Sew step (F7-δ) found a gap between the blend surface and a
+    /// trimmed neighbour exceeding `tolerance`. Usually means the
+    /// rolling-ball walk and the trim curve disagree on the seam path.
+    SewGapTooLarge {
+        /// Edge being sewn.
+        edge: EdgeId,
+        /// Measured gap.
+        gap: f64,
+        /// Tolerance the gap was compared against.
+        tolerance: f64,
+    },
+    /// Spine solver (F3-γ marching) failed to converge at the given
+    /// station. `residual` is the final residual the solver gave up
+    /// at — useful for tuning solver iteration budgets.
+    SpineSolverDiverged {
+        /// Edge whose spine is being solved.
+        edge: EdgeId,
+        /// Parameter ∈ [0, 1] where divergence occurred.
+        station: f64,
+        /// Final residual.
+        residual: f64,
+    },
+    /// Vertex (corner) blend cannot be constructed. The `kind` is the
+    /// vertex's classification per [`BlendVertexKind`]; `reason` is
+    /// the specific obstruction.
+    VertexBlendUnsupported {
+        /// Vertex whose corner cannot be patched.
+        vertex: VertexId,
+        /// Topology classification at the vertex.
+        kind: BlendVertexKind,
+        /// Specific reason within `kind`.
+        reason: VertexBlendUnsupportedReason,
+    },
+    /// Catch-all for irreducible failures not yet classified. The
+    /// `detail` string is freeform; treat occurrences as a TODO to
+    /// replace with a structured variant once the failure mode is
+    /// understood.
+    TopologyViolation {
+        /// Human-readable detail.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for BlendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlendFailure::RadiusExceedsCurvature {
+                edge,
+                station,
+                r_requested,
+                r_max,
+            } => write!(
+                f,
+                "blend radius {} at edge {} station {:.3} exceeds local curvature limit r_max={}",
+                r_requested, edge, station, r_max
+            ),
+            BlendFailure::SetbackTooLong {
+                vertex,
+                setback,
+                edge_length,
+            } => write!(
+                f,
+                "corner setback {} at vertex {} exceeds shortest incident edge length {}",
+                setback, vertex, edge_length
+            ),
+            BlendFailure::DihedralInflection {
+                edge,
+                station,
+                dihedral_deg,
+            } => write!(
+                f,
+                "edge {} dihedral inverts at station {:.3} (angle {:.3}°)",
+                edge, station, dihedral_deg
+            ),
+            BlendFailure::SewGapTooLarge {
+                edge,
+                gap,
+                tolerance,
+            } => write!(
+                f,
+                "sew gap {} at edge {} exceeds tolerance {}",
+                gap, edge, tolerance
+            ),
+            BlendFailure::SpineSolverDiverged {
+                edge,
+                station,
+                residual,
+            } => write!(
+                f,
+                "spine solver diverged at edge {} station {:.3} (residual {})",
+                edge, station, residual
+            ),
+            BlendFailure::VertexBlendUnsupported {
+                vertex,
+                kind,
+                reason,
+            } => write!(
+                f,
+                "vertex {} blend unsupported (kind {:?}): {}",
+                vertex, kind, reason
+            ),
+            BlendFailure::TopologyViolation { detail } => {
+                write!(f, "topology violation: {}", detail)
+            }
+        }
+    }
+}
+
+/// Map a structured [`BlendFailure`] onto the legacy
+/// [`OperationError`] surface so existing callers keep working
+/// without change. The mapping is fixed:
+///
+/// - **Caller-side parameter problems** → [`OperationError::InvalidInput`].
+///   The user / agent picked parameters the geometry cannot satisfy
+///   (`RadiusExceedsCurvature`, `SetbackTooLong`, `VertexBlendUnsupported`).
+/// - **Geometric / topological obstructions** → [`OperationError::InvalidGeometry`].
+///   The input is valid in isolation but the local geometry will not
+///   accept a blend at this site (`DihedralInflection`, `SewGapTooLarge`,
+///   `TopologyViolation`).
+/// - **Numerical convergence failure** → [`OperationError::NumericalError`].
+///   The solver did not converge in the allotted iteration budget
+///   (`SpineSolverDiverged`).
+///
+/// Future Phase-2 of Diagnostics-α adds an `OperationError::BlendFailed
+/// (Box<BlendFailure>)` variant; this `From` is the bridge that keeps
+/// the conversion source-compatible across the upgrade.
+impl From<BlendFailure> for OperationError {
+    fn from(failure: BlendFailure) -> Self {
+        let detail = failure.to_string();
+        match failure {
+            BlendFailure::RadiusExceedsCurvature { .. }
+            | BlendFailure::SetbackTooLong { .. }
+            | BlendFailure::VertexBlendUnsupported { .. } => {
+                OperationError::InvalidInput {
+                    parameter: "blend".to_string(),
+                    expected: "geometrically feasible blend parameters".to_string(),
+                    received: detail,
+                }
+            }
+            BlendFailure::DihedralInflection { .. }
+            | BlendFailure::SewGapTooLarge { .. }
+            | BlendFailure::TopologyViolation { .. } => {
+                OperationError::InvalidGeometry(detail)
+            }
+            BlendFailure::SpineSolverDiverged { .. } => {
+                OperationError::NumericalError(detail)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radius_exceeds_curvature_maps_to_invalid_input() {
+        let failure = BlendFailure::RadiusExceedsCurvature {
+            edge: 7,
+            station: 0.42,
+            r_requested: 2.0,
+            r_max: 1.25,
+        };
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::InvalidInput {
+                parameter,
+                received,
+                ..
+            } => {
+                assert_eq!(parameter, "blend");
+                assert!(received.contains("edge 7"));
+                assert!(received.contains("r_max=1.25"));
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn setback_too_long_maps_to_invalid_input() {
+        let failure = BlendFailure::SetbackTooLong {
+            vertex: 3,
+            setback: 1.5,
+            edge_length: 1.0,
+        };
+        let err: OperationError = failure.into();
+        assert!(matches!(err, OperationError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn dihedral_inflection_maps_to_invalid_geometry() {
+        let failure = BlendFailure::DihedralInflection {
+            edge: 11,
+            station: 0.5,
+            dihedral_deg: 180.0,
+        };
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::InvalidGeometry(detail) => {
+                assert!(detail.contains("edge 11"));
+                assert!(detail.contains("station 0.500"));
+            }
+            other => panic!("expected InvalidGeometry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sew_gap_maps_to_invalid_geometry() {
+        let failure = BlendFailure::SewGapTooLarge {
+            edge: 22,
+            gap: 0.01,
+            tolerance: 1e-6,
+        };
+        let err: OperationError = failure.into();
+        assert!(matches!(err, OperationError::InvalidGeometry(_)));
+    }
+
+    #[test]
+    fn spine_solver_divergence_maps_to_numerical_error() {
+        let failure = BlendFailure::SpineSolverDiverged {
+            edge: 5,
+            station: 0.7,
+            residual: 1e-2,
+        };
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::NumericalError(detail) => {
+                assert!(detail.contains("spine solver diverged"));
+                assert!(detail.contains("edge 5"));
+            }
+            other => panic!("expected NumericalError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vertex_blend_unsupported_carries_kind_and_reason() {
+        let failure = BlendFailure::VertexBlendUnsupported {
+            vertex: 9,
+            kind: BlendVertexKind::ConvexCorner { degree: 4 },
+            reason: VertexBlendUnsupportedReason::DegreeTooHigh { degree: 4 },
+        };
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::InvalidInput { received, .. } => {
+                assert!(received.contains("vertex 9"));
+                assert!(received.contains("DegreeTooHigh") || received.contains("degree 4"));
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn topology_violation_carries_detail() {
+        let failure = BlendFailure::TopologyViolation {
+            detail: "non-manifold edge in fillet chain".to_string(),
+        };
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::InvalidGeometry(detail) => {
+                assert!(detail.contains("non-manifold edge in fillet chain"));
+            }
+            other => panic!("expected InvalidGeometry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unsupported_reason_display_distinguishes_variants() {
+        // Spot-check that each `VertexBlendUnsupportedReason` carries
+        // distinct, non-empty wording so the formatted blend-failure
+        // string is actionable.
+        let degree = VertexBlendUnsupportedReason::DegreeTooHigh { degree: 5 }.to_string();
+        let nonman = VertexBlendUnsupportedReason::NonManifoldNeighbourhood.to_string();
+        let mixed = VertexBlendUnsupportedReason::MixedConvexity.to_string();
+        let smooth = VertexBlendUnsupportedReason::SmoothVertex.to_string();
+        for s in [&degree, &nonman, &mixed, &smooth] {
+            assert!(!s.is_empty());
+        }
+        assert_ne!(degree, nonman);
+        assert_ne!(nonman, mixed);
+        assert_ne!(mixed, smooth);
+        assert!(degree.contains("5"));
+    }
+
+    #[test]
+    fn from_preserves_display_string_in_payload() {
+        // Round-trip: the `Display` output of `BlendFailure` must be
+        // exactly the string that lands in the `OperationError`
+        // payload. This is the contract callers rely on when grepping
+        // logs during the Phase-1 → Phase-2 transition.
+        let failure = BlendFailure::RadiusExceedsCurvature {
+            edge: 1,
+            station: 0.25,
+            r_requested: 0.5,
+            r_max: 0.3,
+        };
+        let expected = failure.to_string();
+        let err: OperationError = failure.into();
+        let actual = match err {
+            OperationError::InvalidInput { received, .. } => received,
+            other => panic!("expected InvalidInput, got {:?}", other),
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn blend_failure_is_clone_and_eq() {
+        // Down-stream code (validation passes, agent diagnostics) may
+        // want to compare / clone failures — pin the derives so a
+        // future refactor that drops them is caught at compile time.
+        let a = BlendFailure::SetbackTooLong {
+            vertex: 1,
+            setback: 0.5,
+            edge_length: 0.4,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    /// JSON contract pin for the typed REST surface: a
+    /// `RadiusExceedsCurvature` failure must serialise with
+    /// `"type": "RadiusExceedsCurvature"` as the discriminator (internal
+    /// tagging on `BlendFailure`) and the inline fields the variant
+    /// declares. Agents consuming the api-server error surface
+    /// depend on this layout being stable; changing it is a breaking
+    /// change to the public contract.
+    #[test]
+    fn blend_failure_serializes_with_internally_tagged_type_field() {
+        let failure = BlendFailure::RadiusExceedsCurvature {
+            edge: 7,
+            station: 0.42,
+            r_requested: 2.0,
+            r_max: 1.25,
+        };
+        let json = serde_json::to_value(&failure).expect("serialize must succeed");
+        let obj = json.as_object().expect("serialised failure must be an object");
+        assert_eq!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("RadiusExceedsCurvature"),
+            "internally-tagged discriminator must surface as the `type` field"
+        );
+        assert_eq!(obj.get("edge").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(obj.get("r_max").and_then(|v| v.as_f64()), Some(1.25));
+
+        // Round-trip — Deserialize must reconstruct the variant
+        // bit-equivalently.
+        let restored: BlendFailure =
+            serde_json::from_value(json).expect("deserialize must succeed");
+        assert_eq!(restored, failure);
+    }
+
+    /// `VertexBlendUnsupported` carries a nested `BlendVertexKind`
+    /// (from the F2-β blend_graph module). Pin that the nested kind
+    /// is serialised in a form a JSON consumer can branch on.
+    #[test]
+    fn vertex_blend_unsupported_round_trips_nested_kind() {
+        let failure = BlendFailure::VertexBlendUnsupported {
+            vertex: 9,
+            kind: BlendVertexKind::ConvexCorner { degree: 4 },
+            reason: VertexBlendUnsupportedReason::DegreeTooHigh { degree: 4 },
+        };
+        let json = serde_json::to_value(&failure).expect("serialize must succeed");
+        let restored: BlendFailure =
+            serde_json::from_value(json).expect("deserialize must succeed");
+        assert_eq!(restored, failure);
+    }
+
+    /// Phase-2 typed-variant: `OperationError::BlendFailed` carries
+    /// the structured [`BlendFailure`] verbatim. Call sites that want
+    /// agents and the REST surface to receive the taxonomy (rather
+    /// than the legacy flattened string) construct this variant
+    /// directly. The Phase-1 `From<BlendFailure>` bridge is preserved
+    /// for source-compatibility; this test pins that the typed path
+    /// is also available and that `Display` formats it sensibly.
+    #[test]
+    fn blend_failed_variant_carries_typed_payload() {
+        let failure = BlendFailure::RadiusExceedsCurvature {
+            edge: 7,
+            station: 0.42,
+            r_requested: 2.0,
+            r_max: 1.25,
+        };
+        let expected_inner = failure.to_string();
+        let err = OperationError::BlendFailed(Box::new(failure.clone()));
+        // The typed variant preserves the BlendFailure by value so
+        // downstream consumers can pattern-match on the taxonomy.
+        match &err {
+            OperationError::BlendFailed(payload) => {
+                assert_eq!(**payload, failure);
+            }
+            other => panic!("expected BlendFailed, got {:?}", other),
+        }
+        // Display surfaces the inner failure's wording.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&expected_inner),
+            "Display must embed the BlendFailure's own Display; got {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn topology_violation_round_trips_detail() {
+        // Specific contract: the detail string of TopologyViolation
+        // is the *only* free-form payload in the taxonomy and the one
+        // most likely to be regex-grepped by callers during the
+        // Phase-1 → Phase-2 transition. Preserve it bit-exact.
+        let detail = "unexpected non-manifold edge id 42 between F3 and F7";
+        let failure = BlendFailure::TopologyViolation {
+            detail: detail.to_string(),
+        };
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::InvalidGeometry(msg) => {
+                assert!(
+                    msg.contains(detail),
+                    "TopologyViolation detail must survive the conversion verbatim; got {:?}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidGeometry, got {:?}", other),
+        }
+    }
+}

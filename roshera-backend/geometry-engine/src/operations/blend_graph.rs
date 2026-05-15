@@ -130,7 +130,7 @@ pub struct BlendEdge {
 ///   handle a sign change.
 /// * `Cliff`: at least one incident edge is non-manifold or has no
 ///   defined dihedral; corner construction is not attempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BlendVertexKind {
     Smooth,
     ConvexCorner { degree: usize },

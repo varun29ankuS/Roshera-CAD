@@ -15,6 +15,7 @@
 
 use super::blend_graph::{self, BlendGraph, BlendRadius};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::feasibility;
 use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
@@ -146,6 +147,30 @@ pub fn fillet_edges(
                 edges: &edges,
             },
         )?;
+
+        // F6-α: radius vs. curvature feasibility gate. Catches the
+        // common "rolling ball larger than the cylinder / sphere it
+        // sits against" case before the spine solver burns its
+        // marching iteration budget diverging on an infeasible
+        // request. Conservative — analytic surfaces only; cones,
+        // ruled, and NURBS surfaces are pass-through pending F6-β
+        // sampling-based curvature evaluation. Failures surface as
+        // the typed Diagnostics-α Phase-2
+        // `OperationError::BlendFailed(BlendFailure::RadiusExceedsCurvature)`
+        // so callers can recover with `r ≤ r_max * 0.95` without
+        // string-parsing.
+        let max_radius = match &options.fillet_type {
+            FilletType::Constant(r) => *r,
+            FilletType::Variable(r1, r2) => r1.max(*r2),
+            // `Function` and `Chord` paths don't have a closed-form
+            // upper bound here; F6-α leaves them to the existing
+            // downstream validation. Sampling them is F6-β.
+            FilletType::Function(_) | FilletType::Chord(_) => 0.0,
+        };
+        if max_radius > 0.0 {
+            feasibility::validate_radius_against_curvature(model, &edges, max_radius)
+                .map_err(|f| OperationError::BlendFailed(Box::new(f)))?;
+        }
     }
 
     // F2-δ transactional wrapper: any Err out of the body restores
