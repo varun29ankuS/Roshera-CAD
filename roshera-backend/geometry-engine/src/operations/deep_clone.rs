@@ -8,7 +8,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::{OperationError, OperationResult};
-use crate::math::{Point3, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     curve::CurveId,
     edge::{Edge, EdgeId},
@@ -76,20 +76,40 @@ pub fn clone_vertices(
     Ok(new_ids)
 }
 
-/// Deep clone curves
+/// Deep clone curves with optional translation offset.
+///
+/// When `offset` is `Some`, the cloned curve's geometry (control points,
+/// endpoints, parametrisation origin) is translated by the offset via
+/// `Curve::transform(&Matrix4::from_translation(&offset))`. This keeps
+/// the cloned curves geometrically consistent with the translated
+/// vertices produced by `clone_vertices(.., Some(offset), ..)`.
+///
+/// Without this translation, `deep_clone_solid(model, A, Some(offset))`
+/// produces a topologically-valid but geometrically-broken solid where
+/// vertex positions sit at `A+offset` while curve carriers still live
+/// at A's original location — which causes downstream operations such
+/// as `clip_line_to_planar_face` to project line crossings into the
+/// wrong plane basis.
 pub fn clone_curves(
     model: &mut BRepModel,
     curve_ids: &[CurveId],
+    offset: Option<Vector3>,
     context: &mut CloneContext,
 ) -> OperationResult<Vec<CurveId>> {
     let mut new_ids = Vec::new();
 
     for &curve_id in curve_ids {
-        // Use existing clone_curve method
-        let new_id = model
-            .curves
-            .clone_curve(curve_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Failed to clone curve".to_string()))?;
+        let new_id = if let Some(off) = offset {
+            let curve = model.curves.get(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Curve not found for deep clone".to_string())
+            })?;
+            let translated = curve.transform(&Matrix4::from_translation(&off));
+            model.curves.add(translated)
+        } else {
+            model.curves.clone_curve(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Failed to clone curve".to_string())
+            })?
+        };
 
         context.curve_map.insert(curve_id, new_id);
         new_ids.push(new_id);
@@ -182,19 +202,33 @@ pub fn clone_loops(
     Ok(new_ids)
 }
 
-/// Deep clone surfaces
+/// Deep clone surfaces with optional translation offset.
+///
+/// When `offset` is `Some`, the cloned surface's geometry (Plane origin,
+/// NURBS control net, sweep base curve, etc.) is translated via
+/// `Surface::transform(&Matrix4::from_translation(&offset))`. Same
+/// rationale as `clone_curves`: keeps surface carriers consistent
+/// with translated vertices and edges.
 pub fn clone_surfaces(
     model: &mut BRepModel,
     surface_ids: &[SurfaceId],
+    offset: Option<Vector3>,
     context: &mut CloneContext,
 ) -> OperationResult<Vec<SurfaceId>> {
     let mut new_ids = Vec::new();
 
     for &surface_id in surface_ids {
-        // Use existing clone_surface method
-        let new_id = model.surfaces.clone_surface(surface_id).ok_or_else(|| {
-            OperationError::InvalidGeometry("Failed to clone surface".to_string())
-        })?;
+        let new_id = if let Some(off) = offset {
+            let surface = model.surfaces.get(surface_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Surface not found for deep clone".to_string())
+            })?;
+            let translated = surface.transform(&Matrix4::from_translation(&off));
+            model.surfaces.add(translated)
+        } else {
+            model.surfaces.clone_surface(surface_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Failed to clone surface".to_string())
+            })?
+        };
 
         context.surface_map.insert(surface_id, new_id);
         new_ids.push(new_id);
@@ -370,10 +404,13 @@ pub fn deep_clone_solid(
     all_faces.sort_unstable();
     all_faces.dedup();
 
-    // Clone in dependency order
+    // Clone in dependency order. The `vertex_offset` is threaded into the
+    // curve and surface clones as well — vertex positions, curve carriers,
+    // and surface carriers must all translate together to keep the cloned
+    // solid geometrically consistent.
     clone_vertices(model, &all_vertices, vertex_offset, &mut context)?;
-    clone_curves(model, &all_curves, &mut context)?;
-    clone_surfaces(model, &all_surfaces, &mut context)?;
+    clone_curves(model, &all_curves, vertex_offset, &mut context)?;
+    clone_surfaces(model, &all_surfaces, vertex_offset, &mut context)?;
     clone_edges(model, &all_edges, &mut context)?;
     clone_loops(model, &all_loops, &mut context)?;
     clone_faces(model, &all_faces, &mut context)?;
@@ -458,10 +495,12 @@ pub fn deep_clone_faces(
     all_surfaces.sort_unstable();
     all_surfaces.dedup();
 
-    // Clone in dependency order
+    // Clone in dependency order. `deep_clone_faces` is not used with a
+    // translation offset (partial face cloning for boolean splits, etc.),
+    // so pass `None` to curves/surfaces.
     clone_vertices(model, &all_vertices, None, &mut context)?;
-    clone_curves(model, &all_curves, &mut context)?;
-    clone_surfaces(model, &all_surfaces, &mut context)?;
+    clone_curves(model, &all_curves, None, &mut context)?;
+    clone_surfaces(model, &all_surfaces, None, &mut context)?;
     clone_edges(model, &all_edges, &mut context)?;
     clone_loops(model, &all_loops, &mut context)?;
     let new_faces = clone_faces(model, &faces_to_clone, &mut context)?;

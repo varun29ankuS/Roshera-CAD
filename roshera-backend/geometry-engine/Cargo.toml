@@ -21,6 +21,15 @@ tokio = { version = "1.0", features = ["sync", "time", "rt"] }
 # axis-stacked holes (see polyline_cut_harness::sequential_chain_4_cuts).
 cdt = "0.1"
 
+# 2D polygon Boolean operations (Intersection, Union, Difference, Xor)
+# for the coplanar-face imprint-merge path. Pure Rust, robust against
+# shared vertices, T-junctions, collinear edges, and self-intersections
+# — all the degeneracies that the in-house Greiner-Hormann clipper
+# rejected as InvalidGeometry. See polygon_clip.rs for the shim layer
+# and union_overlapping_polyline_hexagons / union_commutative_polyline_hexagons
+# for the original failure mode.
+i_overlay = "6"
+
 # SIMD optimizations
 wide = "0.7"              # Portable SIMD operations
 simdeez = "1.0"          # Cross-platform SIMD

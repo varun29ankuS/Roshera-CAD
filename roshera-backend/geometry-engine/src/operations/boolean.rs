@@ -2779,17 +2779,246 @@ fn split_face_by_curves(
     // Create intersection graph
     let mut graph = IntersectionGraph::new();
 
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]   split_face_by_curves: face={:?} boundary_edges={} curves={}",
+            face_id,
+            boundary_edges.len(),
+            curves.len()
+        );
+        for &(eid, _) in &boundary_edges {
+            if let Some(e) = model.edges.get(eid) {
+                let sp = model.vertices.get_position(e.start_vertex);
+                let ep = model.vertices.get_position(e.end_vertex);
+                eprintln!(
+                    "[bool]     boundary edge={:?} sv={:?}@{:?} ev={:?}@{:?}",
+                    eid, e.start_vertex, sp, e.end_vertex, ep
+                );
+            }
+        }
+        for &cid in curves {
+            if let Some(c) = model.curves.get(cid) {
+                let s = c.evaluate(0.0).ok().map(|p| p.position);
+                let e = c.evaluate(1.0).ok().map(|p| p.position);
+                eprintln!(
+                    "[bool]     cut curve={:?} start={:?} end={:?}",
+                    cid, s, e
+                );
+            }
+        }
+    }
+
     // Add existing boundary edges to graph (orientation is irrelevant
     // here — the graph is undirected and only needs edge identity).
     for &(edge_id, _) in &boundary_edges {
         graph.add_edge(edge_id, EdgeType::Boundary);
     }
 
+    // Cache face boundary vertex positions for cut-endpoint snapping.
+    //
+    // Why: `create_edge_from_curve` resolves cut endpoints via
+    // `VertexStore::add_or_find` against the GLOBAL vertex store. For two
+    // operand solids that share coincident 3D corners (overlapping coplanar
+    // faces meeting at the same vertex), each solid was built with its own
+    // VertexId for the corner, so `add_or_find` returns whichever id was
+    // registered first. If face_a's corners were registered first, then a
+    // cut for face_b inherits face_a's vertex ids — leaving the cut edges
+    // disconnected from face_b's boundary cycle in the DCEL arrangement,
+    // and face_b yields zero split regions (silent fragment loss).
+    //
+    // Fix: after creating each cut edge, snap its endpoints to face_id's
+    // own boundary vertices when geometrically coincident within tolerance.
+    let snap_tol = options.common.tolerance.distance();
+    let boundary_vertices: Vec<(VertexId, Point3)> = boundary_edges
+        .iter()
+        .flat_map(|&(eid, _)| {
+            let e = model.edges.get(eid);
+            e.into_iter().flat_map(|edge| {
+                [edge.start_vertex, edge.end_vertex]
+                    .into_iter()
+                    .filter_map(|vid| {
+                        model
+                            .vertices
+                            .get_position(vid)
+                            .map(|p| (vid, Point3::new(p[0], p[1], p[2])))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let snap_vertex_to_boundary = |vid: VertexId, model: &BRepModel| -> VertexId {
+        let pos = match model.vertices.get_position(vid) {
+            Some(p) => Point3::new(p[0], p[1], p[2]),
+            None => return vid,
+        };
+        for &(bvid, bpos) in &boundary_vertices {
+            if bvid == vid {
+                return vid;
+            }
+            let dx = pos.x - bpos.x;
+            let dy = pos.y - bpos.y;
+            let dz = pos.z - bpos.z;
+            if dx * dx + dy * dy + dz * dz <= snap_tol * snap_tol {
+                return bvid;
+            }
+        }
+        vid
+    };
+
+    // Boundary edge vertex-pair set (undirected) — used to filter cuts
+    // that, after endpoint snapping, coincide with an existing boundary
+    // edge. Such cuts contribute no new topology to the planar
+    // arrangement (they retrace an edge of the outer loop) but their
+    // presence as a second directed edge between the same vertex pair
+    // confuses the DCEL cycle walk, which then extracts zero loops and
+    // silently drops the face. The motivating case: the polyline-Union
+    // path generates a vertical "cut" along the shared seam of two
+    // touching prisms; the cut snaps to the existing vertical edge of
+    // the side face, leaving the side as the unsplit face it always
+    // was.
+    let boundary_pairs: HashSet<(VertexId, VertexId)> = boundary_edges
+        .iter()
+        .filter_map(|&(eid, _)| {
+            model.edges.get(eid).and_then(|e| {
+                if e.start_vertex == crate::primitives::vertex::INVALID_VERTEX_ID
+                    || e.end_vertex == crate::primitives::vertex::INVALID_VERTEX_ID
+                    || e.start_vertex == e.end_vertex
+                {
+                    None
+                } else {
+                    let a = e.start_vertex;
+                    let b = e.end_vertex;
+                    Some(if a < b { (a, b) } else { (b, a) })
+                }
+            })
+        })
+        .collect();
+
     // Add splitting curves to graph
+    let mut active_cut_count = 0usize;
     for &curve_id in curves {
         // Create edges from curves
         let edge_id = create_edge_from_curve(model, curve_id)?;
+
+        // Snap cut-edge endpoints to face boundary vertices when coincident.
+        let (orig_sv, orig_ev) = {
+            let e = model
+                .edges
+                .get(edge_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "cut edge_id".to_string(),
+                    expected: "edge inserted in this function".to_string(),
+                    received: format!("{:?}", edge_id),
+                })?;
+            (e.start_vertex, e.end_vertex)
+        };
+        let snapped_sv = snap_vertex_to_boundary(orig_sv, model);
+        let snapped_ev = snap_vertex_to_boundary(orig_ev, model);
+        if snapped_sv != orig_sv || snapped_ev != orig_ev {
+            if let Some(e) = model.edges.get_mut(edge_id) {
+                e.start_vertex = snapped_sv;
+                e.end_vertex = snapped_ev;
+            }
+        }
+
+        // Skip cuts coincident with an existing boundary edge.
+        //
+        // Such a cut retraces an edge of the outer loop (typical for a
+        // vertical seam where two prisms touch at a coincident corner)
+        // and contributes no new topology. Leaving it in the graph as
+        // a second directed edge between the same vertex pair confuses
+        // the DCEL cycle walk: it then extracts zero loops, silently
+        // dropping the face from the split-face stream.
+        //
+        // Guard: only filter when the face has BOTH endpoints of the
+        // cut on its own boundary. Cuts whose endpoints sit elsewhere
+        // (e.g. a coplanar-imprint cut from the OTHER operand whose
+        // endpoints snapped onto coincident foreign vertices) are
+        // unrelated geometry and must remain in the graph — filtering
+        // them silently drops valid imprint cuts. For the disjoint
+        // Union case (parallel-coplanar face planes far apart) the
+        // cuts reference the foreign solid's boundary; neither
+        // endpoint sits on `face_id`'s boundary, the filter is
+        // bypassed, and the face survives `extract_regions` intact.
+        let cut_pair = if snapped_sv == crate::primitives::vertex::INVALID_VERTEX_ID
+            || snapped_ev == crate::primitives::vertex::INVALID_VERTEX_ID
+            || snapped_sv == snapped_ev
+        {
+            None
+        } else if snapped_sv < snapped_ev {
+            Some((snapped_sv, snapped_ev))
+        } else {
+            Some((snapped_ev, snapped_sv))
+        };
+        let boundary_vid_set: HashSet<VertexId> =
+            boundary_vertices.iter().map(|&(vid, _)| vid).collect();
+        let both_endpoints_on_boundary = cut_pair
+            .as_ref()
+            .map(|&(a, b)| boundary_vid_set.contains(&a) && boundary_vid_set.contains(&b))
+            .unwrap_or(false);
+        let coincides_with_boundary = both_endpoints_on_boundary
+            && cut_pair
+                .as_ref()
+                .map(|p| boundary_pairs.contains(p))
+                .unwrap_or(false);
+
+        if pipeline_trace_enabled() {
+            if let Some(e) = model.edges.get(edge_id) {
+                eprintln!(
+                    "[bool]     cut edge={:?} sv={:?} ev={:?} (orig sv={:?} ev={:?}) coincides_with_boundary={}",
+                    edge_id, e.start_vertex, e.end_vertex, orig_sv, orig_ev, coincides_with_boundary
+                );
+            }
+        }
+        if coincides_with_boundary {
+            continue;
+        }
         graph.add_edge(edge_id, EdgeType::Splitting);
+        active_cut_count += 1;
+    }
+
+    // Short-circuit: every cut was filtered as boundary-coincident.
+    // The face has no interior splits — return it as-is with the
+    // unsplit boundary loop.
+    if active_cut_count == 0 {
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "face_id".to_string(),
+                expected: "valid face ID".to_string(),
+                received: format!("{:?}", face_id),
+            })?;
+        let original_face = face_id;
+        let surface = face.surface_id;
+        let inner_loops_original: Vec<Vec<(EdgeId, bool)>> = face
+            .inner_loops
+            .iter()
+            .filter_map(|lid| model.loops.get(*lid))
+            .map(|lp| {
+                lp.edges
+                    .iter()
+                    .zip(lp.orientations.iter())
+                    .map(|(eid, &forward)| (*eid, forward))
+                    .collect()
+            })
+            .collect();
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]     split_face_by_curves: face={:?} all cuts coincident with boundary — returning unsplit face",
+                face_id
+            );
+        }
+        return Ok(vec![SplitFace {
+            original_face,
+            surface,
+            boundary_edges: boundary_edges.clone(),
+            classification: FaceClassification::Outside,
+            from_solid: origin_solid,
+            inner_loops: inner_loops_original,
+            interior_point: None,
+        }]);
     }
 
     // Pre-split closed self-loop edges (full circles, periodic curves)
@@ -2826,6 +3055,17 @@ fn split_face_by_curves(
                 })?;
         super::face_arrangement::extract_regions(&arrangement, model, surface)
     };
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]     post-arrangement face={:?} loops_extracted={}",
+            face_id,
+            loops.len()
+        );
+        for (i, lp) in loops.iter().enumerate() {
+            let eids: Vec<EdgeId> = lp.iter().map(|(e, _)| *e).collect();
+            eprintln!("[bool]       loop[{}] edges={:?}", i, eids);
+        }
+    }
 
     // Pre-existing-hole absorption. When the input face already has
     // inner_loops (e.g. holes from a previous boolean cut), the DCEL
@@ -3699,10 +3939,11 @@ fn clip_line_to_planar_face(
         None
     };
 
-    match best {
-        Some((t_min, t_max)) => Ok(ClipOutcome::Trimmed(t_min, t_max)),
-        None => Ok(ClipOutcome::Misses),
-    }
+    let outcome = match best {
+        Some((t_min, t_max)) => ClipOutcome::Trimmed(t_min, t_max),
+        None => ClipOutcome::Misses,
+    };
+    Ok(outcome)
 }
 
 /// Outcome of clipping a closed cutting circle to a planar face.
@@ -6775,10 +7016,172 @@ fn reconstruct_topology(
 ///
 /// Creates proper B-Rep topology: for each face, create a Loop from its boundary edges,
 /// create a Face referencing the surface and loop, add faces to a Shell.
+/// Rewrite each face's edge references so that geometrically coincident
+/// edges (different `EdgeId`s at the same 3D positions, the artefact of
+/// independent vertex registration across operand solids) collapse onto
+/// a single canonical `EdgeId`. See the call site in
+/// `build_shells_from_faces` for the motivating failure mode.
+///
+/// Orientation contract: each `(EdgeId, forward)` pair in
+/// `boundary_edges` / `inner_loops` records whether the loop traverses
+/// the edge `start_vertex → end_vertex` (`forward=true`) or
+/// `end_vertex → start_vertex` (`forward=false`). When we substitute
+/// the canonical edge for a duplicate that ran in the opposite
+/// direction, we flip `forward` so the loop's geometric walk is
+/// unchanged.
+fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace]) {
+    // Step 1: collect every vertex touched by any face's edges, with
+    // its 3D position. De-duplicate by VertexId so positions are read
+    // exactly once.
+    let mut touched_vids: Vec<(VertexId, [f64; 3])> = Vec::new();
+    {
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        for face in faces.iter() {
+            let walk = face
+                .boundary_edges
+                .iter()
+                .chain(face.inner_loops.iter().flatten());
+            for &(eid, _) in walk {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if vid == crate::primitives::vertex::INVALID_VERTEX_ID {
+                            continue;
+                        }
+                        if !seen.insert(vid) {
+                            continue;
+                        }
+                        if let Some(pos) = model.vertices.get_position(vid) {
+                            touched_vids.push((vid, pos));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: pairwise canonicalise vertices by 3D position. The first
+    // VertexId at each geometric position wins. O(N²) where N = unique
+    // touched vertices — bounded by a few dozen for typical Boolean
+    // outputs, negligible vs. upstream arrangement cost.
+    let position_tol_sq: f64 = 1e-12;
+    let mut canon_v: HashMap<VertexId, VertexId> = HashMap::new();
+    for i in 0..touched_vids.len() {
+        let (vid, pos) = touched_vids[i];
+        let mut canon = vid;
+        for j in 0..i {
+            let (other_vid, other_pos) = touched_vids[j];
+            let dx = pos[0] - other_pos[0];
+            let dy = pos[1] - other_pos[1];
+            let dz = pos[2] - other_pos[2];
+            if dx * dx + dy * dy + dz * dz <= position_tol_sq {
+                canon = *canon_v.get(&other_vid).unwrap_or(&other_vid);
+                break;
+            }
+        }
+        canon_v.insert(vid, canon);
+    }
+
+    // Step 3: build the canonical-edge map. Key is the unordered
+    // (canonical_vid, canonical_vid) pair; value records the chosen
+    // canonical EdgeId AND the canonical direction (which endpoint
+    // it considers `start`) so we can decide whether to flip the
+    // `forward` bit when remapping a duplicate.
+    let mut canon_e: HashMap<(VertexId, VertexId), (EdgeId, VertexId, VertexId)> = HashMap::new();
+    {
+        let mut seen_e: HashSet<EdgeId> = HashSet::new();
+        for face in faces.iter() {
+            let walk = face
+                .boundary_edges
+                .iter()
+                .chain(face.inner_loops.iter().flatten());
+            for &(eid, _) in walk {
+                if !seen_e.insert(eid) {
+                    continue;
+                }
+                if let Some(edge) = model.edges.get(eid) {
+                    let cs = *canon_v.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+                    let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
+                    if cs == ce {
+                        continue;
+                    }
+                    let key = if cs < ce { (cs, ce) } else { (ce, cs) };
+                    canon_e.entry(key).or_insert((eid, cs, ce));
+                }
+            }
+        }
+    }
+
+    // Step 4: rewrite each face's boundary_edges and inner_loops to
+    // point to the canonical edge. Orientation flip handled per the
+    // contract above.
+    let remap = |entry: (EdgeId, bool), model: &BRepModel| -> (EdgeId, bool) {
+        let (eid, forward) = entry;
+        let edge = match model.edges.get(eid) {
+            Some(e) => e,
+            None => return entry,
+        };
+        let cs = *canon_v.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+        let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
+        if cs == ce {
+            return entry;
+        }
+        let key = if cs < ce { (cs, ce) } else { (ce, cs) };
+        if let Some(&(canon_eid, canon_cs, _canon_ce)) = canon_e.get(&key) {
+            if canon_eid == eid {
+                return entry;
+            }
+            let same_direction = cs == canon_cs;
+            let new_forward = if same_direction { forward } else { !forward };
+            return (canon_eid, new_forward);
+        }
+        entry
+    };
+
+    let mut remapped = 0usize;
+    let mut total = 0usize;
+    for face in faces.iter_mut() {
+        for entry in face.boundary_edges.iter_mut() {
+            total += 1;
+            let old = *entry;
+            *entry = remap(*entry, model);
+            if entry.0 != old.0 {
+                remapped += 1;
+            }
+        }
+        for hole in face.inner_loops.iter_mut() {
+            for entry in hole.iter_mut() {
+                total += 1;
+                let old = *entry;
+                *entry = remap(*entry, model);
+                if entry.0 != old.0 {
+                    remapped += 1;
+                }
+            }
+        }
+    }
+
+    if pipeline_trace_enabled() {
+        let mut canonical_count = 0usize;
+        for (vid, canon) in &canon_v {
+            if vid != canon {
+                canonical_count += 1;
+            }
+        }
+        pipeline_trace(format_args!(
+            "stage=canonicalise_face_edges_by_position touched_vids={} canonical_collapses={} unique_canonical_edges={} edge_remaps={}/{}",
+            touched_vids.len(),
+            canonical_count,
+            canon_e.len(),
+            remapped,
+            total,
+        ));
+    }
+}
+
 /// Groups faces into connected shells by shared edges.
 fn build_shells_from_faces(
     model: &mut BRepModel,
-    faces: Vec<SplitFace>,
+    mut faces: Vec<SplitFace>,
     options: &BooleanOptions,
     operation: BooleanOp,
     solid_b: SolidId,
@@ -6790,6 +7193,31 @@ fn build_shells_from_faces(
             options.allow_non_manifold,
         )));
     }
+
+    // Canonicalise geometrically coincident edges across operand solids.
+    //
+    // Why: when two operand solids are constructed independently (each
+    // calling `model.vertices.add` for its own corners — the production
+    // case for any non-trivial Boolean Union), every shared geometric
+    // edge between them is represented twice in the `EdgeStore`: once
+    // with operand-A's VertexIds, once with operand-B's. The per-face
+    // split pipeline never touches these — each face keeps the edges
+    // its own loop walk produced — so the resulting shell carries
+    // duplicate edges along every seam. `group_faces_by_adjacency`'s
+    // geometric vertex-pair pass groups the FACES into one component,
+    // but downstream tessellation still emits one mesh edge per
+    // `EdgeId`, producing non-manifold counts proportional to the
+    // seam length (12 for the overlapping-hexagon union: 4 vertical
+    // seams + 4 cap-cut seams × 2 caps).
+    //
+    // Fix: before grouping, rewrite each face's `boundary_edges` and
+    // `inner_loops` to point to a single canonical `EdgeId` per
+    // geometric edge. Two edges are "geometrically the same" when both
+    // endpoints map to the same canonical vertex (position-equivalent
+    // within tolerance). Orientation is preserved: when the canonical
+    // edge runs against the face's traversal direction, flip the
+    // `forward` bit.
+    canonicalise_face_edges_by_position(model, &mut faces);
 
     // Group faces into connected components by shared edges
     let components = group_faces_by_adjacency(&faces, model);
@@ -7042,6 +7470,92 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
         }
     }
 
+    // Geometric (position-canonicalised) vertex-pair adjacency.
+    //
+    // Why: two operand solids built independently (the common case for
+    // boolean Union of separately constructed parts) can have
+    // geometrically coincident corner vertices that nevertheless carry
+    // distinct `VertexId`s — vertex deduplication via
+    // `VertexStore::add_or_find` is opt-in and not all construction
+    // paths use it (e.g. polyline-loop builders that use the raw
+    // `vertices.add` API). After per-face splitting, fragments from
+    // solid_a hold one VertexId at a shared seam while geometrically
+    // coincident fragments from solid_b hold another, and the pure
+    // ID-based vpair pass above leaves them in disjoint components.
+    // `build_shells_from_faces` then reports a "component has < 4
+    // face(s)" failure or, when the operand fragment counts happen to
+    // match, fuses them as nested shells with non-manifold edges along
+    // the geometric seam.
+    //
+    // Fix: collect every VertexId touched by any face's boundary,
+    // canonicalise pairwise by 3D position within tolerance (the first
+    // VertexId at each position wins), and re-key the vertex-pair
+    // adjacency on canonical ids. O(N²) in the number of distinct
+    // touched vertices, which is bounded by a few dozen for typical
+    // boolean-result face counts — negligible vs. the asymptotic cost
+    // of arrangement extraction upstream.
+    let position_tol_sq: f64 = 1e-12;
+    let mut touched_vids: Vec<(VertexId, [f64; 3])> = Vec::new();
+    {
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        for face in faces {
+            for eid in all_edges(face) {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if vid == crate::primitives::vertex::INVALID_VERTEX_ID {
+                            continue;
+                        }
+                        if !seen.insert(vid) {
+                            continue;
+                        }
+                        if let Some(pos) = model.vertices.get_position(vid) {
+                            touched_vids.push((vid, pos));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut canonical_for_vid: HashMap<VertexId, VertexId> = HashMap::new();
+    for i in 0..touched_vids.len() {
+        let (vid, pos) = touched_vids[i];
+        let mut canon = vid;
+        for j in 0..i {
+            let (other_vid, other_pos) = touched_vids[j];
+            let dx = pos[0] - other_pos[0];
+            let dy = pos[1] - other_pos[1];
+            let dz = pos[2] - other_pos[2];
+            if dx * dx + dy * dy + dz * dz <= position_tol_sq {
+                canon = *canonical_for_vid.get(&other_vid).unwrap_or(&other_vid);
+                break;
+            }
+        }
+        canonical_for_vid.insert(vid, canon);
+    }
+
+    let mut pos_pair_to_faces: HashMap<(VertexId, VertexId), Vec<usize>> = HashMap::new();
+    for (idx, face) in faces.iter().enumerate() {
+        for eid in all_edges(face) {
+            if let Some(edge) = model.edges.get(eid) {
+                let a = edge.start_vertex;
+                let b = edge.end_vertex;
+                if a == crate::primitives::vertex::INVALID_VERTEX_ID
+                    || b == crate::primitives::vertex::INVALID_VERTEX_ID
+                    || a == b
+                {
+                    continue;
+                }
+                let ca = *canonical_for_vid.get(&a).unwrap_or(&a);
+                let cb = *canonical_for_vid.get(&b).unwrap_or(&b);
+                if ca == cb {
+                    continue;
+                }
+                let key = if ca < cb { (ca, cb) } else { (cb, ca) };
+                pos_pair_to_faces.entry(key).or_default().push(idx);
+            }
+        }
+    }
+
     // Also group by original face (faces from the same original face are related)
     let mut orig_to_faces: HashMap<FaceId, Vec<usize>> = HashMap::new();
     for (idx, face) in faces.iter().enumerate() {
@@ -7079,6 +7593,16 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
     // Union faces that share an endpoint vertex pair — the geometric
     // edge identity that survives per-face EdgeId re-stamping.
     for face_indices in vpair_to_faces.values() {
+        for i in 1..face_indices.len() {
+            union(&mut parent, face_indices[0], face_indices[i]);
+        }
+    }
+
+    // Union faces that share an endpoint POSITION pair — the seam
+    // identity that survives independent vertex registration across
+    // operand solids (see comment block above the `touched_vids`
+    // collection for the motivating failure mode).
+    for face_indices in pos_pair_to_faces.values() {
         for i in 1..face_indices.len() {
             union(&mut parent, face_indices[0], face_indices[i]);
         }
