@@ -74,8 +74,26 @@ impl Default for FilletOptions {
 pub enum FilletType {
     /// Constant radius along edge
     Constant(f64),
-    /// Variable radius (start, end)
+    /// Variable radius interpolated linearly between the start and end
+    /// of the edge. Equivalent to `VariableStations(vec![(0.0, start),
+    /// (1.0, end)])`; kept as a distinct variant because the linear
+    /// case is by far the most common and avoids a heap allocation.
     Variable(f64, f64),
+    /// Variable radius with explicit control stations along the edge
+    /// parameter. Each entry is `(station, radius)` with `station ∈
+    /// [0, 1]`. The kernel interpolates linearly between adjacent
+    /// stations. F3-ε.1 plumbs this through `spine_solver`; F3-ε.2
+    /// exposes it on the kernel surface so timeline / REST / AI can
+    /// drive a true per-station variable fillet (e.g. a tear-drop
+    /// where the radius peaks mid-edge instead of monotonically
+    /// growing).
+    ///
+    /// Invariants enforced by `validate_fillet_inputs`:
+    /// - Non-empty.
+    /// - Stations strictly increasing.
+    /// - First station ≥ 0.0, last ≤ 1.0.
+    /// - Every radius > 0.
+    VariableStations(Vec<(f64, f64)>),
     /// Radius function along edge parameter
     Function(Box<dyn Fn(f64) -> f64>),
     /// Chord length fillet
@@ -87,6 +105,9 @@ impl std::fmt::Debug for FilletType {
         match self {
             FilletType::Constant(r) => f.debug_tuple("Constant").field(r).finish(),
             FilletType::Variable(r1, r2) => f.debug_tuple("Variable").field(r1).field(r2).finish(),
+            FilletType::VariableStations(samples) => {
+                f.debug_tuple("VariableStations").field(samples).finish()
+            }
             FilletType::Function(_) => f.debug_tuple("Function").field(&"<function>").finish(),
             FilletType::Chord(c) => f.debug_tuple("Chord").field(c).finish(),
         }
@@ -98,6 +119,7 @@ impl Clone for FilletType {
         match self {
             FilletType::Constant(r) => FilletType::Constant(*r),
             FilletType::Variable(r1, r2) => FilletType::Variable(*r1, *r2),
+            FilletType::VariableStations(samples) => FilletType::VariableStations(samples.clone()),
             FilletType::Function(_) => FilletType::Constant(5.0), // Fallback to constant
             FilletType::Chord(c) => FilletType::Chord(*c),
         }
@@ -162,6 +184,16 @@ pub fn fillet_edges(
         let max_radius = match &options.fillet_type {
             FilletType::Constant(r) => *r,
             FilletType::Variable(r1, r2) => r1.max(*r2),
+            // Per-station upper bound is the largest sample radius;
+            // F6-α uses it to gate against the analytic curvature
+            // limit. Empty list is rejected later by
+            // `validate_fillet_inputs`; here we treat it as 0.0 so
+            // F6-α is a no-op and the input validator owns the
+            // rejection.
+            FilletType::VariableStations(samples) => samples
+                .iter()
+                .map(|&(_, r)| r)
+                .fold(0.0_f64, f64::max),
             // `Function` and `Chord` paths don't have a closed-form
             // upper bound here; F6-α leaves them to the existing
             // downstream validation. Sampling them is F6-β.
@@ -189,10 +221,23 @@ pub fn fillet_edges(
         // and rejecting only `r1` (as the original loop did) lets a
         // pathological `r2` slip through to surgery time where it would
         // surface a less actionable error.
+        // Per-station shape requires structural validation before
+        // we walk the radii: empty list, out-of-order stations,
+        // stations outside [0, 1], or non-positive radii must surface
+        // as `InvalidInput` here (caller-side problem), not deep in
+        // the surgery loop where the diagnostic would point at the
+        // wrong layer.
+        if let FilletType::VariableStations(samples) = &options.fillet_type {
+            validate_variable_stations(samples)?;
+        }
+
         for &edge_id in &edges {
             let radii_to_check: Vec<f64> = match &options.fillet_type {
                 FilletType::Constant(r) => vec![*r],
                 FilletType::Variable(r1, r2) => vec![*r1, *r2],
+                FilletType::VariableStations(samples) => {
+                    samples.iter().map(|&(_, r)| r).collect()
+                }
                 // Function radii are validated per-sample inside the
                 // surgery loop; the placeholder of 1.0 only exercises the
                 // structural bounds here (edge length non-zero, edge
@@ -209,7 +254,16 @@ pub fn fillet_edges(
         let radius = match &options.fillet_type {
             FilletType::Constant(r) => *r,
             FilletType::Variable(r1, _) => *r1, // Use start radius for validation
-            FilletType::Function(_) => 0.0,     // Will validate per point
+            // Use the first station's radius as the representative
+            // value for the legacy `radius` validation gate. The
+            // full curve has already been bounds-checked above; this
+            // path only guards against the `radius <= 0` rejection
+            // that comes next.
+            FilletType::VariableStations(samples) => samples
+                .first()
+                .map(|&(_, r)| r)
+                .unwrap_or(0.0),
+            FilletType::Function(_) => 0.0, // Will validate per point
             FilletType::Chord(c) => *c,
         };
 
@@ -350,6 +404,12 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType) -> BlendRadius {
             start: *r1,
             end: *r2,
         },
+        // F3-ε.2: per-station variable radius maps directly to the
+        // kernel's `BlendRadius::Variable` shape, which `spine_solver`
+        // already consumes (F3-ε.1). The samples are passed verbatim;
+        // structural invariants (non-empty, monotone, in [0,1])
+        // were enforced upstream by `validate_variable_stations`.
+        FilletType::VariableStations(samples) => BlendRadius::Variable(samples.clone()),
         // The Function and Chord paths don't expose a closed-form
         // sampling here; report Constant(1.0) as a placeholder so
         // the edge is still classified into the graph. F4 will
@@ -357,6 +417,104 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType) -> BlendRadius {
         FilletType::Function(_) => BlendRadius::Constant(1.0),
         FilletType::Chord(c) => BlendRadius::Constant(*c),
     }
+}
+
+/// Validate the structural invariants of a
+/// `FilletType::VariableStations` payload. Failure surfaces as
+/// `OperationError::InvalidInput` because the problem is in the
+/// caller-supplied selection, not in the topology.
+///
+/// Rules:
+/// - Non-empty.
+/// - Stations strictly increasing.
+/// - First station ≥ 0.0, last ≤ 1.0.
+/// - Every radius > 0 and finite.
+fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
+    if samples.is_empty() {
+        return Err(OperationError::InvalidInput {
+            parameter: "fillet_type.VariableStations".into(),
+            expected: "non-empty list of (station, radius) samples".into(),
+            received: "empty list".into(),
+        });
+    }
+    for (i, &(s, r)) in samples.iter().enumerate() {
+        if !s.is_finite() || !r.is_finite() {
+            return Err(OperationError::InvalidInput {
+                parameter: format!("fillet_type.VariableStations[{i}]"),
+                expected: "finite station and radius".into(),
+                received: format!("station={s}, radius={r}"),
+            });
+        }
+        if r <= 0.0 {
+            return Err(OperationError::InvalidInput {
+                parameter: format!("fillet_type.VariableStations[{i}].radius"),
+                expected: "> 0".into(),
+                received: format!("{r}"),
+            });
+        }
+    }
+    if samples[0].0 < 0.0 {
+        return Err(OperationError::InvalidInput {
+            parameter: "fillet_type.VariableStations[0].station".into(),
+            expected: "≥ 0.0".into(),
+            received: format!("{}", samples[0].0),
+        });
+    }
+    let last_station = samples[samples.len() - 1].0;
+    if last_station > 1.0 {
+        return Err(OperationError::InvalidInput {
+            parameter: "fillet_type.VariableStations[last].station".into(),
+            expected: "≤ 1.0".into(),
+            received: format!("{last_station}"),
+        });
+    }
+    for window in samples.windows(2) {
+        if window[1].0 <= window[0].0 {
+            return Err(OperationError::InvalidInput {
+                parameter: "fillet_type.VariableStations.station".into(),
+                expected: "strictly increasing".into(),
+                received: format!("{} → {}", window[0].0, window[1].0),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a piecewise-linear radius profile at parameter `u`.
+///
+/// `samples` must satisfy the invariants enforced by
+/// `validate_variable_stations`: non-empty, stations strictly
+/// increasing, first ≥ 0, last ≤ 1, every radius > 0 and finite.
+///
+/// Out-of-range `u` is clamped to the nearest endpoint (constant
+/// extension). This is the same convention used by `BlendRadius`'s
+/// internal sampler in `blend_graph.rs` so the kernel-layer fillet
+/// dispatch and the spine-solver sampling agree on the radius
+/// profile shape.
+fn piecewise_linear_radius(samples: &[(f64, f64)], u: f64) -> f64 {
+    // Invariants: samples non-empty, monotone. Endpoints clamp.
+    if u <= samples[0].0 {
+        return samples[0].1;
+    }
+    let last = samples.len() - 1;
+    if u >= samples[last].0 {
+        return samples[last].1;
+    }
+    // Locate the interval (linear scan is fine — station counts
+    // are small, typically 2-8).
+    for window in samples.windows(2) {
+        let (s0, r0) = window[0];
+        let (s1, r1) = window[1];
+        if u >= s0 && u <= s1 {
+            // Strictly increasing guarantees s1 > s0.
+            let t = (u - s0) / (s1 - s0);
+            return r0 + t * (r1 - r0);
+        }
+    }
+    // Unreachable given the invariants — kept as a safety net so
+    // a future violation surfaces with a defined value rather
+    // than panicking.
+    samples[last].1
 }
 
 fn create_fillet_chain(
@@ -392,6 +550,26 @@ fn create_fillet_chain(
                 *r2,
                 blend_graph,
             )?,
+            FilletType::VariableStations(samples) => {
+                // Per-station variable radius: build a piecewise-linear
+                // evaluator over the stations and route through the
+                // existing function-radius surgery path. The structural
+                // invariants (non-empty, monotone, in [0,1]) were
+                // checked by `validate_variable_stations` at the top
+                // of `fillet_edges`, so the evaluator can rely on
+                // them.
+                let samples = samples.clone();
+                let evaluator: Box<dyn Fn(f64) -> f64> =
+                    Box::new(move |u: f64| piecewise_linear_radius(&samples, u));
+                create_function_radius_fillet(
+                    model,
+                    edge_id,
+                    face1_id,
+                    face2_id,
+                    &evaluator,
+                    blend_graph,
+                )?
+            }
             FilletType::Function(f) => {
                 create_function_radius_fillet(model, edge_id, face1_id, face2_id, f, blend_graph)?
             }
@@ -3707,6 +3885,190 @@ mod tests {
         assert_ne!(PropagationMode::None, PropagationMode::Tangent);
         assert_ne!(PropagationMode::Tangent, PropagationMode::Smooth);
         assert_ne!(PropagationMode::Smooth, PropagationMode::All);
+    }
+
+    // =================================================================
+    // F3-ε.2 kernel-layer harness: FilletType::VariableStations
+    // =================================================================
+    //
+    // These tests pin (a) the structural invariants the kernel
+    // enforces on a per-station payload, (b) the piecewise-linear
+    // evaluator's correctness against hand-computed reference
+    // values, and (c) the `FilletType → BlendRadius` bridge so the
+    // shape passed downstream to spine_solver / BlendGraph is
+    // exactly what the spec says.
+
+    #[test]
+    fn variable_stations_validator_accepts_minimal_two_point() {
+        let samples = vec![(0.0, 1.0), (1.0, 2.0)];
+        assert!(validate_variable_stations(&samples).is_ok());
+    }
+
+    #[test]
+    fn variable_stations_validator_accepts_full_unit_range_with_interior() {
+        let samples = vec![(0.0, 1.0), (0.25, 1.5), (0.5, 2.0), (0.75, 1.5), (1.0, 1.0)];
+        assert!(validate_variable_stations(&samples).is_ok());
+    }
+
+    #[test]
+    fn variable_stations_validator_rejects_empty() {
+        let err = validate_variable_stations(&[]).unwrap_err();
+        match err {
+            OperationError::InvalidInput { parameter, .. } => {
+                assert!(
+                    parameter.contains("VariableStations"),
+                    "parameter must name the offending field; got {parameter}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_stations_validator_rejects_non_increasing_stations() {
+        let samples = vec![(0.5, 1.0), (0.5, 2.0)]; // equal stations
+        let err = validate_variable_stations(&samples).unwrap_err();
+        assert!(matches!(err, OperationError::InvalidInput { .. }));
+
+        let samples = vec![(0.6, 1.0), (0.4, 2.0)]; // decreasing
+        let err = validate_variable_stations(&samples).unwrap_err();
+        assert!(matches!(err, OperationError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn variable_stations_validator_rejects_station_below_zero() {
+        let samples = vec![(-0.1, 1.0), (1.0, 2.0)];
+        let err = validate_variable_stations(&samples).unwrap_err();
+        match err {
+            OperationError::InvalidInput { parameter, .. } => {
+                assert!(parameter.contains("station"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_stations_validator_rejects_station_above_one() {
+        let samples = vec![(0.0, 1.0), (1.5, 2.0)];
+        let err = validate_variable_stations(&samples).unwrap_err();
+        assert!(matches!(err, OperationError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn variable_stations_validator_rejects_non_positive_radius() {
+        let samples = vec![(0.0, 0.0), (1.0, 1.0)];
+        let err = validate_variable_stations(&samples).unwrap_err();
+        match err {
+            OperationError::InvalidInput { parameter, expected, .. } => {
+                assert!(parameter.contains("radius"));
+                assert_eq!(expected, "> 0");
+            }
+            other => panic!("expected InvalidInput on radius, got {other:?}"),
+        }
+
+        let samples = vec![(0.0, 1.0), (1.0, -1.0)];
+        let err = validate_variable_stations(&samples).unwrap_err();
+        assert!(matches!(err, OperationError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn variable_stations_validator_rejects_non_finite() {
+        let samples = vec![(0.0, f64::NAN), (1.0, 2.0)];
+        assert!(validate_variable_stations(&samples).is_err());
+        let samples = vec![(f64::INFINITY, 1.0), (1.0, 2.0)];
+        assert!(validate_variable_stations(&samples).is_err());
+    }
+
+    #[test]
+    fn piecewise_linear_radius_endpoint_clamps() {
+        let samples = vec![(0.0, 1.0), (1.0, 3.0)];
+        // u below first station clamps to first radius.
+        assert!((piecewise_linear_radius(&samples, -0.1) - 1.0).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 0.0) - 1.0).abs() < 1e-12);
+        // u above last clamps to last radius.
+        assert!((piecewise_linear_radius(&samples, 1.5) - 3.0).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 1.0) - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn piecewise_linear_radius_midpoint_is_linear_mean() {
+        let samples = vec![(0.0, 1.0), (1.0, 3.0)];
+        assert!((piecewise_linear_radius(&samples, 0.5) - 2.0).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 0.25) - 1.5).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 0.75) - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn piecewise_linear_radius_non_monotone_profile() {
+        // Tear-drop profile: peak at u=0.5.
+        let samples = vec![(0.0, 1.0), (0.5, 3.0), (1.0, 1.0)];
+        assert!((piecewise_linear_radius(&samples, 0.0) - 1.0).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 0.5) - 3.0).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 1.0) - 1.0).abs() < 1e-12);
+        // Midpoint of first segment.
+        assert!((piecewise_linear_radius(&samples, 0.25) - 2.0).abs() < 1e-12);
+        // Midpoint of second segment.
+        assert!((piecewise_linear_radius(&samples, 0.75) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn piecewise_linear_radius_single_sample_returns_constant() {
+        let samples = vec![(0.5, 2.5)];
+        // All u values clamp to the single sample's radius.
+        assert!((piecewise_linear_radius(&samples, 0.0) - 2.5).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 0.5) - 2.5).abs() < 1e-12);
+        assert!((piecewise_linear_radius(&samples, 1.0) - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_maps_variable_stations_to_variable() {
+        let samples = vec![(0.0, 1.0), (0.5, 2.0), (1.0, 1.5)];
+        let ft = FilletType::VariableStations(samples.clone());
+        match fillet_type_to_blend_radius(&ft) {
+            BlendRadius::Variable(out) => assert_eq!(out, samples),
+            other => panic!("expected BlendRadius::Variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_constant_still_maps_to_constant() {
+        // Regression pin: adding VariableStations must not alter
+        // the existing Constant → Constant / Variable(2) → Linear
+        // mappings used by every legacy fillet path.
+        match fillet_type_to_blend_radius(&FilletType::Constant(2.0)) {
+            BlendRadius::Constant(r) => assert!((r - 2.0).abs() < 1e-12),
+            other => panic!("expected BlendRadius::Constant, got {other:?}"),
+        }
+        match fillet_type_to_blend_radius(&FilletType::Variable(1.0, 3.0)) {
+            BlendRadius::Linear { start, end } => {
+                assert!((start - 1.0).abs() < 1e-12);
+                assert!((end - 3.0).abs() < 1e-12);
+            }
+            other => panic!("expected BlendRadius::Linear, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fillet_type_variable_stations_clones_independently() {
+        let original = FilletType::VariableStations(vec![(0.0, 1.0), (1.0, 2.0)]);
+        let copy = original.clone();
+        // Both Debug to the same string; the underlying samples
+        // are owned by independent Vecs (Clone == deep on Vec).
+        let s_orig = format!("{:?}", original);
+        let s_copy = format!("{:?}", copy);
+        assert_eq!(s_orig, s_copy);
+        assert!(s_orig.contains("VariableStations"));
+    }
+
+    #[test]
+    fn fillet_type_variable_stations_debug_includes_samples() {
+        let ft = FilletType::VariableStations(vec![(0.25, 1.5), (0.75, 2.5)]);
+        let s = format!("{:?}", ft);
+        assert!(s.contains("VariableStations"));
+        assert!(s.contains("0.25"));
+        assert!(s.contains("1.5"));
+        assert!(s.contains("0.75"));
+        assert!(s.contains("2.5"));
     }
 
     #[test]
