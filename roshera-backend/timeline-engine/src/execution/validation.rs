@@ -212,11 +212,15 @@ impl ValidationRule for OperationSpecificRule {
             }
 
             Operation::Fillet { edges, radius } => {
-                // Validate radius
-                if *radius <= 0.0 {
-                    return Err(TimelineError::ValidationError(
-                        "Fillet radius must be positive".to_string(),
-                    ));
+                // Validate radius — for variable / linear profiles we
+                // need EVERY sample positive, not just one; using the
+                // DTO's `min_radius` accessor catches profile-internal
+                // violations the legacy `*radius <= 0.0` couldn't see.
+                if radius.min_radius() <= 0.0 {
+                    return Err(TimelineError::ValidationError(format!(
+                        "Fillet radius must be positive everywhere on the edge (min={})",
+                        radius.min_radius()
+                    )));
                 }
 
                 // Need at least one edge
