@@ -612,6 +612,18 @@ fn triangulate_planar_polygon(
     match cdt::triangulate_contours(&pts2d, &contours) {
         Ok(tris) => tris.into_iter().map(|(a, b, c)| [a, b, c]).collect(),
         Err(e) => {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[tess] cdt failed: {:?}  outer=[{},{}) holes={}",
+                    e, outer_range.0, outer_range.1, inner_ranges.len()
+                );
+                for (i, c) in contours.iter().enumerate() {
+                    eprintln!("  contour[{}] len={} indices={:?}", i, c.len(), c);
+                }
+                for (i, p) in pts2d.iter().enumerate() {
+                    eprintln!("  pt[{}] = ({:.6}, {:.6})", i, p.0, p.1);
+                }
+            }
             tracing::warn!(
                 "triangulate_planar_polygon: cdt failed ({:?}); emitting no triangles",
                 e

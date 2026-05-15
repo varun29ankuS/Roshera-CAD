@@ -401,7 +401,9 @@ pub fn boolean_operation(
         }
 
         // Step 5: Reconstruct topology from selected faces
-        let result_solid = reconstruct_topology(model, selected_faces, &options)?;
+        let result_solid = reconstruct_topology(
+            model, selected_faces, &options, operation, solid_b,
+        )?;
         pipeline_trace(format_args!(
             "stage=reconstruct_topology result_solid={}",
             result_solid,
@@ -2825,6 +2827,30 @@ fn split_face_by_curves(
         super::face_arrangement::extract_regions(&arrangement, model, surface)
     };
 
+    // Pre-existing-hole absorption. When the input face already has
+    // inner_loops (e.g. holes from a previous boolean cut), the DCEL
+    // arrangement re-emits each hole's boundary as a separate CCW
+    // cycle whose interior point lies inside the hole. Left as-is,
+    // each such cycle becomes a phantom `Outside` SplitFace that:
+    //
+    //   * is selected by `select_faces_for_operation` (Outside is the
+    //     "keep" verdict for Difference on the A solid),
+    //   * shares edges only with the cut-1 walls (via the hole
+    //     boundary), so `group_faces_by_adjacency` groups it with
+    //     the cut-1 walls into a SECOND connected component,
+    //   * forces `reconstruct_topology` to emit a second shell that
+    //     `Solid::add_inner_shell` files as an inner shell — the
+    //     outer-shell face count drops by exactly that many phantoms
+    //     plus the corresponding cut-1 walls.
+    //
+    // The fix routes hole cycles back to the outer cycle that
+    // contains them as `inner_loops` on the resulting SplitFace,
+    // mirroring the runtime hole-attachment that
+    // `merge_same_origin_fragments` already does for newly-created
+    // Inside fragments under Difference.
+    let (loops, attached_holes) =
+        partition_outer_and_pre_existing_hole_cycles(loops, model, surface_id, face_id);
+
     // Detect cycle nesting and compute corrected interior points for any
     // "annular" faces whose naive centroid would land inside an enclosed
     // sibling cycle. For simply-connected faces (no nested siblings) the
@@ -2837,10 +2863,219 @@ fn split_face_by_curves(
     for (idx, loop_edges) in loops.into_iter().enumerate() {
         let mut split_face = create_split_face(surface_id, loop_edges, face_id, origin_solid)?;
         split_face.interior_point = interior_points.get(idx).copied().flatten();
+        if let Some(holes) = attached_holes.get(idx) {
+            split_face.inner_loops.extend(holes.iter().cloned());
+        }
         split_faces.push(split_face);
     }
 
     Ok(split_faces)
+}
+
+/// Partition cycles emitted by `extract_regions` into "outer fragment"
+/// cycles and "pre-existing hole" cycles, and route each hole to the
+/// outer fragment whose interior contains it.
+///
+/// **Why**: when the input face already has `inner_loops` (e.g. a hole
+/// imprinted by a previous boolean), the DCEL arrangement walks every
+/// CCW cycle and emits each as a separate region — including the
+/// hole's own boundary, traversed CCW from inside the hole. That
+/// "phantom" cycle has positive signed area and survives the
+/// `extract_regions` filter, but its interior is empty space (no
+/// material). Downstream stages cannot tell it apart from a real
+/// outer fragment, so it becomes a separate SplitFace, leaks into
+/// `select_faces_for_operation`, and breaks topology reconstruction
+/// (phantom-keyed connected components become spurious inner shells).
+///
+/// **Detection**: build an orthonormal tangent frame at the face's
+/// anchor; project each cycle and each of the input face's existing
+/// `inner_loops` to 2D; a cycle whose centroid lies inside any
+/// original `inner_loop` polygon is a pre-existing hole.
+///
+/// **Routing**: for every hole, find the outer cycle whose 2D polygon
+/// contains the hole's centroid and attach the **reversed** hole edge
+/// list (winding flipped to match the `LoopType::Inner` convention)
+/// to that outer cycle's slot in `attached_holes`. Holes whose outer
+/// cannot be identified are dropped — leaving the kernel in the
+/// pre-fix behaviour for that fragment, which is safe (the fragment
+/// returns as an outer cycle and downstream stages handle the
+/// resulting topology as before).
+fn partition_outer_and_pre_existing_hole_cycles(
+    loops: Vec<Vec<(EdgeId, bool)>>,
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+) -> (Vec<Vec<(EdgeId, bool)>>, Vec<Vec<Vec<(EdgeId, bool)>>>) {
+    let n = loops.len();
+    let no_holes = || -> Vec<Vec<Vec<(EdgeId, bool)>>> { vec![Vec::new(); n] };
+
+    if n == 0 {
+        return (loops, Vec::new());
+    }
+
+    // Gather the input face's existing inner_loops as edge sequences.
+    let original_inner_loop_edges: Vec<Vec<EdgeId>> = match model.faces.get(face_id) {
+        Some(face) => face
+            .inner_loops
+            .iter()
+            .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
+            .collect(),
+        None => return (loops, no_holes()),
+    };
+    if original_inner_loop_edges.is_empty() {
+        return (loops, no_holes());
+    }
+
+    let surface = match model.surfaces.get(surface_id) {
+        Some(s) => s,
+        None => return (loops, no_holes()),
+    };
+
+    // 3D vertex polygons for the surviving cycles. Used downstream
+    // to attach each phantom hole to the outer cycle whose 2D
+    // polygon contains its centroid. The pre-existing-hole edges
+    // themselves don't need 2D projection — phantom-hole detection
+    // is by edge-set identity below, not by centroid containment.
+    let cycle_verts_3d: Vec<Vec<Point3>> = loops
+        .iter()
+        .map(|cycle| {
+            let eids: Vec<EdgeId> = cycle.iter().map(|(e, _)| *e).collect();
+            extract_cycle_vertices_3d(&eids, model)
+        })
+        .collect();
+
+    // Anchor for the tangent frame: centroid of cycle vertices.
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut sz = 0.0f64;
+    let mut count = 0usize;
+    for v in cycle_verts_3d.iter().flatten() {
+        sx += v.x;
+        sy += v.y;
+        sz += v.z;
+        count += 1;
+    }
+    if count == 0 {
+        return (loops, no_holes());
+    }
+    let anchor = Point3::new(
+        sx / count as f64,
+        sy / count as f64,
+        sz / count as f64,
+    );
+
+    let tol = Tolerance::default();
+    let (u0, v0) = match surface.closest_point(&anchor, tol) {
+        Ok(uv) => uv,
+        Err(_) => return (loops, no_holes()),
+    };
+    let sp = match surface.evaluate_full(u0, v0) {
+        Ok(s) => s,
+        Err(_) => return (loops, no_holes()),
+    };
+    let origin = sp.position;
+    let e1 = match sp.du.normalize() {
+        Ok(v) => v,
+        Err(_) => return (loops, no_holes()),
+    };
+    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
+    let e2 = match dv_perp.normalize() {
+        Ok(v) => v,
+        Err(_) => return (loops, no_holes()),
+    };
+
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
+
+    let cycle_polys_2d: Vec<Vec<(f64, f64)>> = cycle_verts_3d
+        .iter()
+        .map(|verts| verts.iter().map(project).collect())
+        .collect();
+
+    let centroid_2d = |poly: &[(f64, f64)]| -> Option<(f64, f64)> {
+        if poly.len() < 3 {
+            return None;
+        }
+        let (cx, cy) = poly
+            .iter()
+            .fold((0.0f64, 0.0f64), |(ax, ay), &(x, y)| (ax + x, ay + y));
+        let m = poly.len() as f64;
+        Some((cx / m, cy / m))
+    };
+
+    // Classify each cycle as a phantom of a pre-existing hole.
+    //
+    // **Identity test**: a DCEL phantom hole cycle re-traces the SAME
+    // edges as the original `inner_loop` (it just walks them in the
+    // opposite direction, since `LoopType::Inner` is stored CW
+    // relative to the face normal). Match by edge-set equality
+    // (direction-ignoring).
+    //
+    // This replaces an earlier centroid-in-polygon heuristic that
+    // misfired when an outer cycle's centroid happened to coincide
+    // with one of the inner_loops' centroids — e.g. when the outer
+    // perimeter of a 12×6 box cap has centroid (6, 3) and a prior
+    // cut created a hole at cx=6 with centroid (6, 3). Both
+    // centroids project to the same UV point and the outer cap got
+    // misclassified as a hole, collapsing the entire cap fragment.
+    // See `sequential_chain_4_cuts` (task #43).
+    use std::collections::HashSet;
+    let original_edge_sets: Vec<HashSet<EdgeId>> = original_inner_loop_edges
+        .iter()
+        .map(|edges| edges.iter().copied().collect())
+        .collect();
+    let mut is_hole = vec![false; n];
+    for i in 0..n {
+        let cycle_edges: HashSet<EdgeId> =
+            loops[i].iter().map(|(e, _)| *e).collect();
+        for original in &original_edge_sets {
+            if !original.is_empty() && cycle_edges == *original {
+                is_hole[i] = true;
+                break;
+            }
+        }
+    }
+
+    let outer_indices: Vec<usize> = (0..n).filter(|&i| !is_hole[i]).collect();
+    let hole_indices: Vec<usize> = (0..n).filter(|&i| is_hole[i]).collect();
+
+    if hole_indices.is_empty() {
+        return (loops, no_holes());
+    }
+
+    // Attach each hole to the outer whose 2D polygon contains its
+    // centroid. Reverse the edge list and flip each forward bit so the
+    // hole winding is opposite the outer's, per LoopType::Inner.
+    let mut attachments: Vec<Vec<Vec<(EdgeId, bool)>>> = vec![Vec::new(); outer_indices.len()];
+    for &h in &hole_indices {
+        let hc = match centroid_2d(&cycle_polys_2d[h]) {
+            Some(c) => c,
+            None => continue,
+        };
+        let mut chosen: Option<usize> = None;
+        for (pos, &o) in outer_indices.iter().enumerate() {
+            if cycle_polys_2d[o].len() >= 3
+                && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o])
+            {
+                chosen = Some(pos);
+                break;
+            }
+        }
+        if let Some(pos) = chosen {
+            let reversed: Vec<(EdgeId, bool)> = loops[h]
+                .iter()
+                .rev()
+                .map(|(e, fwd)| (*e, !*fwd))
+                .collect();
+            attachments[pos].push(reversed);
+        }
+    }
+
+    let outer_loops: Vec<Vec<(EdgeId, bool)>> =
+        outer_indices.iter().map(|&i| loops[i].clone()).collect();
+    (outer_loops, attachments)
 }
 
 /// Compute a corrected interior point for each extracted DCEL cycle in the
@@ -6278,7 +6513,95 @@ fn is_point_in_face(
                 received: format!("{:?}", face.surface_id),
             })?;
 
-    // First check: is the point on the surface?
+    // For surfaces dispatched as `AnalyticalSurfaceKind::Planar` (including
+    // RuledSurface side walls from polyline extrusions that are
+    // geometrically flat rectangles), do the entire point-in-face test
+    // in 3D plane-projected 2D coordinates, bypassing the unreliable
+    // `closest_point` UV map.
+    //
+    // Rationale: `RuledSurface::closest_point` uses 31×11 coarse grid
+    // sampling that (a) returns UV coordinates with 0.03–0.1 unit
+    // residual error and (b) CLAMPS to UV bounds for points outside the
+    // surface's parameter rectangle. The clamp is the load-bearing bug:
+    // a ray-plane hit at (4.260, 4.260, 2.260) lies ON the pentagon
+    // wall V1-V2's plane (signed_dist ≈ 0) but is BEYOND vertex V1 in
+    // the wall direction (u ≈ -0.85). closest_point clamps to UV
+    // (0.0, 0.8) — a point on the polygon's LEFT edge — and the
+    // subsequent UV polygon test counts a crossing of the polygon's
+    // RIGHT edge (u_cross=1.0, test_u=0.0 < 1.0), yielding "inside"
+    // even though the hit is outside the wall. This double-counts ray
+    // crossings during interior-point classification, flipping the
+    // pentagon fragment from Inside to Outside in Difference selection.
+    //
+    // Plane-projected 2D bypasses both the residual error and the
+    // clamp: the test point is verified on the plane via signed
+    // distance, then projected into an orthonormal in-plane basis
+    // together with the boundary cycle vertices (which are exact 3D
+    // points on the plane). The 2D point-in-polygon test runs against
+    // the polygon's true plane footprint with no UV remapping.
+    if matches!(
+        analytical_surface_kind(surface, tolerance),
+        AnalyticalSurfaceKind::Planar,
+    ) {
+        let eval = surface.evaluate_full(0.0, 0.0)?;
+        let signed_dist = (*point - eval.position).dot(&eval.normal);
+        if signed_dist.abs() > tolerance.distance() * 10.0 {
+            return Ok(false);
+        }
+        // Build an orthonormal plane basis (e1, e2) perpendicular to
+        // the surface normal. Pick the world axis least aligned with
+        // the normal as the seed, project out the normal component,
+        // and renormalize; e2 = n × e1.
+        let n = eval.normal;
+        let helper = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else if n.y.abs() <= n.z.abs() {
+            Vector3::new(0.0, 1.0, 0.0)
+        } else {
+            Vector3::new(0.0, 0.0, 1.0)
+        };
+        let e1 = match (helper - n * helper.dot(&n)).normalize() {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        let e2 = n.cross(&e1);
+
+        let project = |p: &Point3| -> (f64, f64) {
+            let d = *p - eval.position;
+            (d.dot(&e1), d.dot(&e2))
+        };
+
+        let outer_loop = match model.loops.get(face.outer_loop) {
+            Some(l) => l,
+            None => return Ok(true),
+        };
+        if outer_loop.edges.is_empty() {
+            return Ok(true);
+        }
+        let cycle_vertices = extract_cycle_vertices_3d(&outer_loop.edges, model);
+        if cycle_vertices.len() < 3 {
+            return Ok(true);
+        }
+        let polygon: Vec<(f64, f64)> = cycle_vertices.iter().map(project).collect();
+        let (test_x, test_y) = project(point);
+
+        let mut crossings = 0;
+        let n_p = polygon.len();
+        for i in 0..n_p {
+            let (x1, y1) = polygon[i];
+            let (x2, y2) = polygon[(i + 1) % n_p];
+            if (y1 <= test_y && y2 > test_y) || (y2 <= test_y && y1 > test_y) {
+                let t_cross = (test_y - y1) / (y2 - y1);
+                let x_cross = x1 + t_cross * (x2 - x1);
+                if test_x < x_cross {
+                    crossings += 1;
+                }
+            }
+        }
+        return Ok(crossings % 2 == 1);
+    }
+
+    // Non-planar path: original closest_point + UV polygon test.
     let (u, v) = surface.closest_point(point, *tolerance)?;
     let surf_point = surface.point_at(u, v)?;
     let dist = (*point - surf_point).magnitude();
@@ -6408,14 +6731,25 @@ fn select_faces_for_operation(
     kept
 }
 
-/// Reconstruct topology from selected faces
+/// Reconstruct topology from selected faces.
+///
+/// `operation` and `solid_b` are threaded through so
+/// `build_shells_from_faces` can flip the orientation of B-origin
+/// faces in `BooleanOp::Difference`. Without this flip, the cutter's
+/// side walls retain their cutter-outward normal (pointing radially
+/// away from the cutter centre) — which, after Difference, points
+/// INTO the surrounding material rather than into the hole. Mass
+/// properties then integrate +V_hole instead of -V_hole and report
+/// V(box - hole) ≈ V_box + V_hole.
 fn reconstruct_topology(
     model: &mut BRepModel,
     faces: Vec<SplitFace>,
     options: &BooleanOptions,
+    operation: BooleanOp,
+    solid_b: SolidId,
 ) -> OperationResult<SolidId> {
     // Build shells from faces
-    let shells = build_shells_from_faces(model, faces, options)?;
+    let shells = build_shells_from_faces(model, faces, options, operation, solid_b)?;
 
     // Create solid from shells
     if shells.is_empty() {
@@ -6446,6 +6780,8 @@ fn build_shells_from_faces(
     model: &mut BRepModel,
     faces: Vec<SplitFace>,
     options: &BooleanOptions,
+    operation: BooleanOp,
+    solid_b: SolidId,
 ) -> OperationResult<Vec<ShellId>> {
     if faces.is_empty() {
         return Err(OperationError::InvalidBRep(format!(
@@ -6458,27 +6794,38 @@ fn build_shells_from_faces(
     // Group faces into connected components by shared edges
     let components = group_faces_by_adjacency(&faces, model);
 
-    // Diagnostic: dump component contents (orig_face, surface_type, edge ids)
-    // so we can see exactly which face is becoming a singleton, and whether
-    // its edges should be shared with neighbours but aren't.
-    for (i, component) in components.iter().enumerate() {
-        for &idx in component {
-            let f = &faces[idx];
-            let st = model
-                .surfaces
-                .get(f.surface)
-                .map(|s| format!("{:?}", s.surface_type()))
-                .unwrap_or_else(|| "?".to_string());
-            let edge_ids: Vec<EdgeId> = f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
-            tracing::debug!(
-                "build_shells: comp={} face_idx={} orig={} surf={} type={} edges={:?}",
+    if pipeline_trace_enabled() {
+        pipeline_trace(format_args!(
+            "stage=build_shells components={}",
+            components.len()
+        ));
+        for (i, component) in components.iter().enumerate() {
+            pipeline_trace(format_args!(
+                "  component={} face_count={}",
                 i,
-                idx,
-                f.original_face,
-                f.surface,
-                st,
-                edge_ids
-            );
+                component.len()
+            ));
+            for &idx in component {
+                let f = &faces[idx];
+                let edge_ids: Vec<EdgeId> =
+                    f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
+                let inner_edge_ids: Vec<Vec<EdgeId>> = f
+                    .inner_loops
+                    .iter()
+                    .map(|h| h.iter().map(|&(eid, _)| eid).collect())
+                    .collect();
+                pipeline_trace(format_args!(
+                    "    face_idx={} orig={} solid={} class={:?} inner_loops={} \
+                     edges={:?} inner_edges={:?}",
+                    idx,
+                    f.original_face,
+                    f.from_solid,
+                    f.classification,
+                    f.inner_loops.len(),
+                    edge_ids,
+                    inner_edge_ids,
+                ));
+            }
         }
     }
 
@@ -6582,6 +6929,26 @@ fn build_shells_from_faces(
                 .get(split_face.original_face)
                 .map(|f| f.orientation)
                 .unwrap_or(crate::primitives::face::FaceOrientation::Forward);
+
+            // Difference flips B-origin face orientations: the cutter's
+            // side walls inherit normals pointing radially outward from
+            // the cutter (away from the cutter's interior). In the
+            // result (A − B), those same walls now bound the hole;
+            // "outward from result material" points INTO the hole, i.e.
+            // the OPPOSITE of cutter-outward. Without this flip, mass
+            // properties integrates +V_hole instead of −V_hole and a
+            // box with a pentagon-shaped through-hole reports volume
+            // V_box + V_hole rather than V_box − V_hole. Union and
+            // Intersection keep B-origin normals as-is because in
+            // those results the cutter's outward direction is the
+            // outward direction.
+            let inherited_orientation = if matches!(operation, BooleanOp::Difference)
+                && split_face.from_solid == solid_b
+            {
+                inherited_orientation.flipped()
+            } else {
+                inherited_orientation
+            };
 
             // Create face with surface and outer loop, then attach
             // any inner hole loops via `Face::add_inner_loop`. Mutate
