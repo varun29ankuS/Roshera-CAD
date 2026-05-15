@@ -15,6 +15,12 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 tracing = "0.1"
 tokio = { version = "1.0", features = ["sync", "time", "rt"] }
 
+# Constrained Delaunay Triangulation for multi-hole planar faces.
+# Pure Rust, Shewchuk-style robust adaptive geometric predicates.
+# Replaces the Eberly bridge + ear-clip path which broke down on N≥4
+# axis-stacked holes (see polyline_cut_harness::sequential_chain_4_cuts).
+cdt = "0.1"
+
 # SIMD optimizations
 wide = "0.7"              # Portable SIMD operations
 simdeez = "1.0"          # Cross-platform SIMD

@@ -540,46 +540,37 @@ fn sample_loop_3d_polygon(
 /// Triangulate a planar face's outer + (optional) inner loops in the
 /// face's tangent plane.
 ///
-/// Algorithm: bridged ear-clipping (Hertel 1985, also used by
-/// mapbox/earcut). Bullet-proof for any simple polygon, with or without
-/// holes, runs in O((n+h)²) where n = total vertex count, h = hole count.
+/// Algorithm: Constrained Delaunay Triangulation (CDT) via the
+/// [`cdt`](https://crates.io/crates/cdt) crate. Pure-Rust implementation
+/// using Shewchuk-style robust adaptive geometric predicates for
+/// orient2d / in_circle, so the multi-hole degeneracies that defeat
+/// ear-clipping (collinear hole vertices, axis-stacked rectangular
+/// holes producing N×collinear bridge targets) are handled by exact
+/// arithmetic rather than tolerance-tuning.
 ///
 /// Steps:
 ///
 ///   1. Project all vertices to 2D using `compute_plane_axes(normal)`.
-///   2. Force the outer loop CCW and every hole CW (shoelace signed-
-///      area test). This convention matches `ear_clip_2d`'s positive-
-///      cross-product ear test.
-///   3. Sort holes by max-x descending and bridge each into the running
-///      outer polygon by:
-///        a. Choosing M = the hole's rightmost vertex.
-///        b. Casting a ray from M in +x; finding the closest outer edge
-///           it pierces.
-///        c. Picking the edge endpoint with larger x as the bridge
-///           target P, then refining: if any reflex outer vertex lies
-///           strictly inside triangle (M, ray-hit, P), the closest such
-///           vertex (smallest |angle from +x|, ties broken by squared
-///           distance) becomes P instead. This guarantees segment MP
-///           does not cross the polygon boundary (Eberly 2008,
-///           "Triangulation by Ear Clipping").
-///        d. Splicing the hole's CW walk into the outer at position P
-///           using two synthetic duplicate vertices for M and P; the
-///           result is a simple polygon with a thin notch.
-///   4. Ear-clip the bridged polygon.
-///   5. Remap synthetic duplicates back to their original 3D indices so
-///      the output mesh has no orphan vertices.
+///      `compute_plane_axes` builds (u, v) such that `u × v = normal`,
+///      so CCW-in-2D corresponds to the +normal outward direction.
+///   2. Build closed contours (last index repeats first) — one for
+///      the outer loop, one per hole. `cdt::triangulate_contours`
+///      flood-fills from the convex hull and erases triangles outside
+///      the constraint boundaries, so winding direction does not
+///      matter: only the edge set defines what's "inside".
+///   3. Run `cdt::triangulate_contours`; map the returned
+///      `(usize, usize, usize)` triples to `[usize; 3]`.
 ///
-/// This unifies the previously-separate hole-free and holed paths on a
-/// single algorithm. The previous implementation routed holed faces
-/// through a Bowyer-Watson + constraint-enforcement chain whose
-/// `enforce_edge_constraint` step silently corrupted the triangulation
-/// (cavity boundary edges were collected but never used; a naïve
-/// sort-by-angle fallback only worked for fan-shaped cavities). On
-/// axis-aligned quads it produced triangles outside the polygon,
-/// the retain filter dropped them all, and the face emitted zero
-/// triangles. Bridged ear-clipping has no super-triangle, no cavity
-/// retriangulation, and no retain filter — there is nowhere for
-/// triangles to silently disappear.
+/// Triangles are emitted CCW in the 2D tangent-plane basis (standard
+/// Delaunay convention). Since `u × v = normal`, CCW-in-2D = positive
+/// surface normal, satisfying the caller's winding contract in
+/// `tessellate_planar_face` without an explicit flip.
+///
+/// Replaces a prior bridged ear-clipping path (Eberly 2008) that
+/// repeatedly broke on N≥4 axis-stacked holes — each new hole introduced
+/// new collinearities that defeated the strict/closed point-in-triangle
+/// test in a new way. CDT is set-based, not walk-based, so the same
+/// failure mode is mathematically impossible.
 fn triangulate_planar_polygon(
     vertices: &[Point3],
     loop_boundaries: &[(usize, usize, bool)],
@@ -595,221 +586,47 @@ fn triangulate_planar_polygon(
         .filter_map(|&(s, e, _)| if e - s >= 3 { Some((s, e)) } else { None })
         .collect();
 
-    // Project to 2D in the face's tangent plane.
+    // Project all 3D vertices to 2D in the face's tangent plane.
     let (u_axis, v_axis) = compute_plane_axes(normal);
     let origin = vertices[outer_range.0];
-    let mut vertices_2d: Vec<(f64, f64)> = vertices
+    let pts2d: Vec<(f64, f64)> = vertices
         .iter()
         .map(|p| {
             let r = *p - origin;
             (r.dot(&u_axis), r.dot(&v_axis))
         })
         .collect();
-    // Track the original 3D index for every (possibly synthetic) 2D
-    // vertex. Synthetic duplicates introduced by hole-bridging carry the
-    // 3D index of the vertex they shadow.
-    let mut index_remap: Vec<usize> = (0..vertices_2d.len()).collect();
 
-    // Outer (force CCW).
-    let mut outer: Vec<usize> = (outer_range.0..outer_range.1).collect();
-    if polygon_signed_area_2d(&vertices_2d, &outer) < 0.0 {
-        outer.reverse();
-    }
-
-    if inner_ranges.is_empty() {
-        let mut tris = Vec::new();
-        ear_clip_2d(&vertices_2d, &outer, &mut tris);
-        return tris;
-    }
-
-    // Holes (force each CW), sorted by max-x descending so we bridge
-    // the rightmost hole first.
-    let mut holes: Vec<Vec<usize>> = inner_ranges
-        .iter()
-        .map(|&(s, e)| {
-            let mut h: Vec<usize> = (s..e).collect();
-            if polygon_signed_area_2d(&vertices_2d, &h) > 0.0 {
-                h.reverse();
-            }
-            h
-        })
+    // Build closed contours. cdt requires each contour's last index
+    // to equal its first.
+    let outer_contour: Vec<usize> = (outer_range.0..outer_range.1)
+        .chain(std::iter::once(outer_range.0))
         .collect();
-    holes.sort_by(|a, b| {
-        let amx = polygon_max_x(a, &vertices_2d);
-        let bmx = polygon_max_x(b, &vertices_2d);
-        bmx.partial_cmp(&amx).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let mut contours: Vec<Vec<usize>> = Vec::with_capacity(1 + inner_ranges.len());
+    contours.push(outer_contour);
+    for &(s, e) in &inner_ranges {
+        let hole_contour: Vec<usize> = (s..e).chain(std::iter::once(s)).collect();
+        contours.push(hole_contour);
+    }
 
-    for hole in holes {
-        if !bridge_hole_into_outer(&mut outer, &hole, &mut vertices_2d, &mut index_remap) {
+    match cdt::triangulate_contours(&pts2d, &contours) {
+        Ok(tris) => tris.into_iter().map(|(a, b, c)| [a, b, c]).collect(),
+        Err(e) => {
             tracing::warn!(
-                "triangulate_planar_polygon: failed to bridge hole into outer; \
-                 face will be tessellated without this hole"
+                "triangulate_planar_polygon: cdt failed ({:?}); emitting no triangles",
+                e
             );
+            Vec::new()
         }
     }
-
-    let mut bridged_tris: Vec<[usize; 3]> = Vec::new();
-    ear_clip_2d(&vertices_2d, &outer, &mut bridged_tris);
-
-    // Collapse synthetic-duplicate indices back to their original 3D
-    // indices. After this remap, two indices in the same triangle may
-    // refer to the same 3D vertex only on the bridge degenerate
-    // (zero-area) triangles; those are filtered out below.
-    bridged_tris
-        .into_iter()
-        .filter_map(|[a, b, c]| {
-            let ra = index_remap[a];
-            let rb = index_remap[b];
-            let rc = index_remap[c];
-            if ra == rb || rb == rc || ra == rc {
-                None
-            } else {
-                Some([ra, rb, rc])
-            }
-        })
-        .collect()
-}
-
-/// Maximum x-coordinate among the indexed 2D points.
-fn polygon_max_x(polygon: &[usize], vertices_2d: &[(f64, f64)]) -> f64 {
-    polygon
-        .iter()
-        .map(|&i| vertices_2d[i].0)
-        .fold(f64::NEG_INFINITY, f64::max)
-}
-
-/// Bridge a single hole into `outer`. Returns false if no visible bridge
-/// target could be found (degenerate input — caller emits a warning and
-/// skips this hole).
-///
-/// Mutates `vertices_2d` and `index_remap` to add two synthetic duplicate
-/// vertices (one for the outer-bridge target, one for the hole's
-/// rightmost vertex). Synthetic duplicates carry the same 2D coords and
-/// the same `index_remap[i]` as their originals — `ear_clip_2d` treats
-/// them as independent vertices for its index-equality "same vertex"
-/// check, but the final `index_remap` collapse undoes the duplication
-/// in the emitted triangles.
-fn bridge_hole_into_outer(
-    outer: &mut Vec<usize>,
-    hole: &[usize],
-    vertices_2d: &mut Vec<(f64, f64)>,
-    index_remap: &mut Vec<usize>,
-) -> bool {
-    if hole.len() < 3 {
-        return false;
-    }
-
-    // 1. M = rightmost hole vertex (break x ties by larger y).
-    let m_in_hole = (0..hole.len())
-        .max_by(|&a, &b| {
-            let pa = vertices_2d[hole[a]];
-            let pb = vertices_2d[hole[b]];
-            pa.0.partial_cmp(&pb.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| pa.1.partial_cmp(&pb.1).unwrap_or(std::cmp::Ordering::Equal))
-        })
-        .unwrap_or(0);
-    let m_idx = hole[m_in_hole];
-    let m = vertices_2d[m_idx];
-
-    // 2. Ray from M in +x. Find outer edge with min x-intersection > M.x.
-    let n_outer = outer.len();
-    let mut best_hit: Option<(f64, usize)> = None;
-    for i in 0..n_outer {
-        let a = vertices_2d[outer[i]];
-        let b = vertices_2d[outer[(i + 1) % n_outer]];
-        // Half-open span check avoids double-counting at shared y.
-        let spans = (a.1 <= m.1 && m.1 < b.1) || (b.1 <= m.1 && m.1 < a.1);
-        if !spans {
-            continue;
-        }
-        let dy = b.1 - a.1;
-        if dy.abs() < 1e-14 {
-            continue;
-        }
-        let t = (m.1 - a.1) / dy;
-        let x = a.0 + t * (b.0 - a.0);
-        if x > m.0 - 1e-14 && best_hit.map_or(true, |(bx, _)| x < bx) {
-            best_hit = Some((x, i));
-        }
-    }
-    let (hit_x, hit_edge) = match best_hit {
-        Some(h) => h,
-        None => return false,
-    };
-
-    // 3. Initial P = endpoint of (outer[hit_edge], outer[hit_edge+1]) with larger x.
-    let a_pos = hit_edge;
-    let b_pos = (hit_edge + 1) % n_outer;
-    let a_pt = vertices_2d[outer[a_pos]];
-    let b_pt = vertices_2d[outer[b_pos]];
-    let mut p_pos = if a_pt.0 >= b_pt.0 { a_pos } else { b_pos };
-    let mut p_pt = vertices_2d[outer[p_pos]];
-
-    // 4. Refine: if any reflex outer vertex lies strictly inside triangle
-    //    (M, hit_point, P), the bridge MP crosses the boundary. Pick the
-    //    closest such reflex vertex (smallest |angle from M's +x axis|,
-    //    ties broken by squared distance) as P instead.
-    let hit_pt = (hit_x, m.1);
-    let mut best_angle = (p_pt.1 - m.1).atan2(p_pt.0 - m.0).abs();
-    let mut best_dist2 = (p_pt.0 - m.0).powi(2) + (p_pt.1 - m.1).powi(2);
-    for i in 0..n_outer {
-        if i == p_pos {
-            continue;
-        }
-        let v = vertices_2d[outer[i]];
-        let prev = vertices_2d[outer[(i + n_outer - 1) % n_outer]];
-        let next = vertices_2d[outer[(i + 1) % n_outer]];
-        // CCW ⇒ reflex iff (curr - prev) × (next - prev) ≤ 0.
-        let cross = (v.0 - prev.0) * (next.1 - prev.1) - (v.1 - prev.1) * (next.0 - prev.0);
-        if cross > 0.0 {
-            continue;
-        }
-        if !point_in_triangle_2d(&v, &m, &hit_pt, &p_pt) {
-            continue;
-        }
-        let angle = (v.1 - m.1).atan2(v.0 - m.0).abs();
-        let dist2 = (v.0 - m.0).powi(2) + (v.1 - m.1).powi(2);
-        if angle < best_angle - 1e-14 || ((angle - best_angle).abs() <= 1e-14 && dist2 < best_dist2)
-        {
-            p_pos = i;
-            p_pt = v;
-            best_angle = angle;
-            best_dist2 = dist2;
-        }
-    }
-
-    // 5. Splice. Insert into outer immediately after position p_pos:
-    //    [M_dup, hole walked CW from m_in_hole+1 wrapping to m_in_hole-1,
-    //     M (original), P_dup]
-    //
-    // Synthetic duplicates carry the original 3D index via `index_remap`
-    // so the final triangle remap collapses them back.
-    let m_dup = vertices_2d.len();
-    vertices_2d.push(m);
-    index_remap.push(index_remap[m_idx]);
-    let p_orig_idx = outer[p_pos];
-    let p_dup = vertices_2d.len();
-    vertices_2d.push(p_pt);
-    index_remap.push(index_remap[p_orig_idx]);
-
-    let mut spliced = Vec::with_capacity(outer.len() + hole.len() + 2);
-    spliced.extend_from_slice(&outer[..=p_pos]);
-    spliced.push(m_dup);
-    let h_len = hole.len();
-    for k in 1..h_len {
-        spliced.push(hole[(m_in_hole + k) % h_len]);
-    }
-    spliced.push(m_idx);
-    spliced.push(p_dup);
-    spliced.extend_from_slice(&outer[p_pos + 1..]);
-    *outer = spliced;
-    true
 }
 
 /// Signed area of a polygon described by indices into `vertices_2d`.
-/// Positive ⇒ CCW, negative ⇒ CW. Uses the shoelace formula.
+/// Positive ⇒ CCW, negative ⇒ CW. Uses the shoelace formula. Kept as a
+/// test-only utility after the CDT migration removed all production
+/// callers; the algorithm-level regression tests in `mod tests` below
+/// still assert its sign-convention invariant.
+#[cfg(test)]
 fn polygon_signed_area_2d(vertices_2d: &[(f64, f64)], polygon: &[usize]) -> f64 {
     let n = polygon.len();
     if n < 3 {
@@ -822,90 +639,6 @@ fn polygon_signed_area_2d(vertices_2d: &[(f64, f64)], polygon: &[usize]) -> f64 
         area += x1 * y2 - x2 * y1;
     }
     area * 0.5
-}
-
-/// Triangulate a simple polygon in 2D using ear clipping.
-/// Appends resulting triangles to `output`.
-fn ear_clip_2d(vertices: &[(f64, f64)], polygon: &[usize], output: &mut Vec<[usize; 3]>) {
-    if polygon.len() < 3 {
-        return;
-    }
-    if polygon.len() == 3 {
-        output.push([polygon[0], polygon[1], polygon[2]]);
-        return;
-    }
-
-    let mut remaining: Vec<usize> = polygon.to_vec();
-
-    let mut max_iterations = remaining.len() * remaining.len();
-    let mut i = 0;
-
-    while remaining.len() > 3 && max_iterations > 0 {
-        max_iterations -= 1;
-        let n = remaining.len();
-        let prev = remaining[(i + n - 1) % n];
-        let curr = remaining[i % n];
-        let next = remaining[(i + 1) % n];
-
-        let p0 = vertices[prev];
-        let p1 = vertices[curr];
-        let p2 = vertices[next];
-
-        // Check if this is a convex (ear) vertex
-        let cross = (p1.0 - p0.0) * (p2.1 - p0.1) - (p1.1 - p0.1) * (p2.0 - p0.0);
-        if cross <= 1e-14 {
-            // Not convex, skip
-            i = (i + 1) % remaining.len();
-            continue;
-        }
-
-        // Check that no other vertex lies inside this ear triangle
-        let mut is_ear = true;
-        for &vi in &remaining {
-            if vi == prev || vi == curr || vi == next {
-                continue;
-            }
-            if point_in_triangle_2d(&vertices[vi], &p0, &p1, &p2) {
-                is_ear = false;
-                break;
-            }
-        }
-
-        if is_ear {
-            output.push([prev, curr, next]);
-            remaining.remove(i % remaining.len());
-            if i >= remaining.len() && !remaining.is_empty() {
-                i = 0;
-            }
-        } else {
-            i = (i + 1) % remaining.len();
-        }
-    }
-
-    // Emit final triangle
-    if remaining.len() == 3 {
-        output.push([remaining[0], remaining[1], remaining[2]]);
-    }
-}
-
-/// Check if point p is inside triangle (a, b, c) using barycentric coordinates
-fn point_in_triangle_2d(p: &(f64, f64), a: &(f64, f64), b: &(f64, f64), c: &(f64, f64)) -> bool {
-    let v0 = (c.0 - a.0, c.1 - a.1);
-    let v1 = (b.0 - a.0, b.1 - a.1);
-    let v2 = (p.0 - a.0, p.1 - a.1);
-
-    let dot00 = v0.0 * v0.0 + v0.1 * v0.1;
-    let dot01 = v0.0 * v1.0 + v0.1 * v1.1;
-    let dot02 = v0.0 * v2.0 + v0.1 * v2.1;
-    let dot11 = v1.0 * v1.0 + v1.1 * v1.1;
-    let dot12 = v1.0 * v2.0 + v1.1 * v2.1;
-
-    let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
-    let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
-    let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
-
-    // Point is inside if u >= 0, v >= 0, u + v <= 1 (with tolerance)
-    u > 1e-10 && v > 1e-10 && (u + v) < 1.0 - 1e-10
 }
 
 /// Tessellate a cylindrical face
