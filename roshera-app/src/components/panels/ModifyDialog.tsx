@@ -28,16 +28,39 @@ import { Button } from '@/components/ui/button'
 import { useSceneStore, type SelectionMode } from '@/stores/scene-store'
 import { cn } from '@/lib/utils'
 
-export type ModifyMode = 'fillet' | 'fillet-variable' | 'chamfer' | 'shell'
+export type ModifyMode =
+  | 'fillet'
+  | 'fillet-variable'
+  | 'fillet-linear'
+  | 'fillet-stations'
+  | 'chamfer'
+  | 'shell'
 
 /**
- * Discriminated apply payload. `fillet-variable` carries a parallel
- * `radii` array (one entry per picked edge, in pick order); every other
- * mode keeps the single-value contract.
+ * Discriminated apply payload.
+ *
+ * - `fillet` / `chamfer` / `shell` ship a single value (legacy contract).
+ * - `fillet-variable` ships one constant radius per picked edge in
+ *   pick order (the radius is constant *along the edge*, but the array
+ *   is per-edge).
+ * - `fillet-linear` ships one (start, end) pair applied uniformly to
+ *   every picked edge — radius interpolates linearly along each edge.
+ * - `fillet-stations` ships one parameter-station table applied
+ *   uniformly to every picked edge — radius is sampled at the listed
+ *   `(station ∈ [0, 1], radius)` pairs and the kernel rolling-ball
+ *   solver interpolates between them.
+ *
+ * The api-server's `fillet_payload` parser routes `radius: number`
+ * to `Constant`, `radius: { kind: "linear", … }` to `Linear`, and
+ * `radius: { kind: "variable", samples: … }` to `Variable`. The
+ * `fillet-variable` mode keeps its bare-number-per-edge `radii` shape;
+ * the parser accepts that as N parallel `Constant` profiles.
  */
 export type ModifyApplyPayload =
   | { mode: 'fillet' | 'chamfer' | 'shell'; value: number }
   | { mode: 'fillet-variable'; radii: number[] }
+  | { mode: 'fillet-linear'; start: number; end: number }
+  | { mode: 'fillet-stations'; samples: Array<[number, number]> }
 
 interface ModifyDialogProps {
   open: boolean
@@ -45,6 +68,24 @@ interface ModifyDialogProps {
   onOpenChange: (next: boolean) => void
   onApply: (payload: ModifyApplyPayload) => void
 }
+
+/**
+ * Profile axis (independent of `perEdge`):
+ *
+ * - `'constant'` — one positive number (single field, or one per edge
+ *   when `perEdge` is set). Maps to `BlendRadiusDto::Constant` on the
+ *   wire.
+ * - `'linear'`   — start + end positive numbers. Radius interpolates
+ *   linearly along each edge. Maps to `BlendRadiusDto::Linear`.
+ * - `'stations'` — table of `(station ∈ [0, 1], radius > 0)` rows.
+ *   Maps to `BlendRadiusDto::Variable`.
+ *
+ * Only `'constant'` is compatible with `perEdge: true` today —
+ * Linear/Stations are uniform across all picked edges. If you ever
+ * need per-edge Linear/Stations, prefer a richer dialog over
+ * combinatorial mode names.
+ */
+type FilletProfile = 'constant' | 'linear' | 'stations'
 
 interface ModeSpec {
   title: string
@@ -58,6 +99,8 @@ interface ModeSpec {
    * sets this today.
    */
   perEdge: boolean
+  /** Profile shape — see [`FilletProfile`]. Non-fillet modes are `'constant'`. */
+  profile: FilletProfile
   okLabel: string
   /** Step for the +/- buttons in the numeric input. */
   step: number
@@ -70,6 +113,7 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     defaultValue: 2,
     needsEdges: true,
     perEdge: false,
+    profile: 'constant',
     okLabel: 'OK',
     step: 0.5,
   },
@@ -79,6 +123,27 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     defaultValue: 2,
     needsEdges: true,
     perEdge: true,
+    profile: 'constant',
+    okLabel: 'OK',
+    step: 0.5,
+  },
+  'fillet-linear': {
+    title: 'Fillet (linear start→end)',
+    inputLabel: 'Radius',
+    defaultValue: 2,
+    needsEdges: true,
+    perEdge: false,
+    profile: 'linear',
+    okLabel: 'OK',
+    step: 0.5,
+  },
+  'fillet-stations': {
+    title: 'Fillet (per-station)',
+    inputLabel: 'Radius',
+    defaultValue: 2,
+    needsEdges: true,
+    perEdge: false,
+    profile: 'stations',
     okLabel: 'OK',
     step: 0.5,
   },
@@ -88,6 +153,7 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     defaultValue: 1,
     needsEdges: true,
     perEdge: false,
+    profile: 'constant',
     okLabel: 'OK',
     step: 0.5,
   },
@@ -97,6 +163,7 @@ const MODE_SPECS: Record<ModifyMode, ModeSpec> = {
     defaultValue: 1,
     needsEdges: false,
     perEdge: false,
+    profile: 'constant',
     okLabel: 'OK',
     step: 0.25,
   },
@@ -118,6 +185,25 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   // user typed) mirroring `valueRaw` so the input round-trips and the
   // user can see "1." mid-type without it parsing to 1 prematurely.
   const [radiiRaw, setRadiiRaw] = useState<Map<number, string>>(() => new Map())
+
+  // Linear-profile inputs (`fillet-linear` only). Two scalar fields,
+  // start and end radii at the edge endpoints. Defaults are seeded
+  // from the spec on each open via the reset effect below.
+  const [linearStartRaw, setLinearStartRaw] = useState<string>('')
+  const [linearEndRaw, setLinearEndRaw] = useState<string>('')
+
+  // Per-station table (`fillet-stations` only). Each row is a
+  // `(station, radius)` pair as the user typed it. Rows are added /
+  // removed by the user; reordering is via array index, not a stable
+  // key, because (unlike picked edges) there is no external identity
+  // to track. The list is constructed with a sensible default on
+  // first open (3 evenly-spaced stations with the spec default
+  // radius), giving the user something concrete to edit.
+  interface StationRow {
+    station: string
+    radius: string
+  }
+  const [stationsRaw, setStationsRaw] = useState<StationRow[]>([])
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   // Remember the prior selection mode so we can restore it on close —
@@ -132,6 +218,24 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   useEffect(() => {
     if (!open || !spec || !mode) return
     setValueRaw(String(spec.defaultValue))
+    // Linear: same default at both endpoints — the user immediately
+    // sees a recognisable starting state and edits whichever endpoint
+    // they want to change.
+    if (spec.profile === 'linear') {
+      setLinearStartRaw(String(spec.defaultValue))
+      setLinearEndRaw(String(spec.defaultValue * 1.5))
+    }
+    // Stations: three evenly-spaced rows with the spec default radius.
+    // Three is the smallest table that demonstrates "shaped along the
+    // edge" (start, middle, end) without overwhelming the user; they
+    // can add or remove rows from there.
+    if (spec.profile === 'stations') {
+      setStationsRaw([
+        { station: '0', radius: String(spec.defaultValue) },
+        { station: '0.5', radius: String(spec.defaultValue * 1.5) },
+        { station: '1', radius: String(spec.defaultValue) },
+      ])
+    }
     if (spec.needsEdges) {
       priorModeRef.current = selectionMode
       if (selectionMode !== 'edge') setSelectionMode('edge')
@@ -214,9 +318,67 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   const allRadiiValid =
     parsedRadii.length === pickedEdges.length &&
     parsedRadii.every((n) => Number.isFinite(n) && n > 0)
-  const canApply = spec?.perEdge
-    ? selectionValid && allRadiiValid
-    : valueValid && selectionValid
+
+  // Parse the Linear endpoints — fields trim+parse as positive finite
+  // numbers. Empty strings parse to NaN so `valid` reflects "user
+  // hasn't typed yet" identically to "user typed garbage".
+  const parsedLinearStart = useMemo(() => {
+    const t = linearStartRaw.trim()
+    if (t === '') return Number.NaN
+    const n = Number(t)
+    return Number.isFinite(n) ? n : Number.NaN
+  }, [linearStartRaw])
+  const parsedLinearEnd = useMemo(() => {
+    const t = linearEndRaw.trim()
+    if (t === '') return Number.NaN
+    const n = Number(t)
+    return Number.isFinite(n) ? n : Number.NaN
+  }, [linearEndRaw])
+  const linearValid =
+    Number.isFinite(parsedLinearStart) &&
+    parsedLinearStart > 0 &&
+    Number.isFinite(parsedLinearEnd) &&
+    parsedLinearEnd > 0
+
+  // Parse the station table. Each row produces a `[station, radius]`
+  // tuple; rows with empty / unparseable values keep NaN and the
+  // table is rejected as a whole. Station range is [0, 1] inclusive —
+  // matching the kernel's `validate_fillet_inputs` + the api-server's
+  // `fillet_payload` validator.
+  const parsedSamples = useMemo<Array<[number, number]>>(() => {
+    return stationsRaw.map((row) => {
+      const s = row.station.trim()
+      const r = row.radius.trim()
+      const sn = s === '' ? Number.NaN : Number(s)
+      const rn = r === '' ? Number.NaN : Number(r)
+      return [
+        Number.isFinite(sn) ? sn : Number.NaN,
+        Number.isFinite(rn) ? rn : Number.NaN,
+      ]
+    })
+  }, [stationsRaw])
+  const stationsValid =
+    parsedSamples.length > 0 &&
+    parsedSamples.every(
+      ([s, r]) =>
+        Number.isFinite(s) &&
+        s >= 0 &&
+        s <= 1 &&
+        Number.isFinite(r) &&
+        r > 0,
+    )
+
+  // Dispatch validity per profile. `perEdge` is mutually exclusive
+  // with Linear/Stations today (see ModeSpec doc), so the branches
+  // don't overlap.
+  const canApply = (() => {
+    if (!spec) return false
+    if (!selectionValid) return false
+    if (spec.perEdge) return allRadiiValid
+    if (spec.profile === 'linear') return linearValid
+    if (spec.profile === 'stations') return stationsValid
+    return valueValid
+  })()
 
   // Publish a live cross-section preview to the viewport. Only fillet
   // and chamfer participate — shell preview is whole-solid and would
@@ -225,11 +387,19 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   // The preview clears automatically when the dialog closes via the
   // cleanup return.
   useEffect(() => {
+    // Preview is a single uniform-radius cross-section: it can only
+    // represent the constant uniform `fillet` and `chamfer` modes.
+    // Per-edge constants, Linear (varying along edge), and Stations
+    // (per-station table) all have no single radius to draw, and
+    // `shell` is whole-solid (Task #85). Anything else clears the
+    // preview so a stale shape doesn't linger.
     if (
       !open ||
       !mode ||
       mode === 'shell' ||
       mode === 'fillet-variable' ||
+      mode === 'fillet-linear' ||
+      mode === 'fillet-stations' ||
       !valueValid
     ) {
       setModifyPreview(null)
@@ -245,11 +415,26 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
     if (!mode || !spec || !canApply) return
     if (mode === 'fillet-variable') {
       onApply({ mode, radii: parsedRadii })
+    } else if (mode === 'fillet-linear') {
+      onApply({ mode, start: parsedLinearStart, end: parsedLinearEnd })
+    } else if (mode === 'fillet-stations') {
+      onApply({ mode, samples: parsedSamples })
     } else {
       onApply({ mode, value: parsedValue })
     }
     close()
-  }, [mode, spec, canApply, parsedValue, parsedRadii, onApply, close])
+  }, [
+    mode,
+    spec,
+    canApply,
+    parsedValue,
+    parsedRadii,
+    parsedLinearStart,
+    parsedLinearEnd,
+    parsedSamples,
+    onApply,
+    close,
+  ])
 
   // Keyboard: Enter applies, Escape cancels.
   useEffect(() => {
@@ -296,6 +481,62 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
       const map = new Map(prev)
       map.set(edgeId, String(rounded))
       return map
+    })
+  }
+
+  // Linear-endpoint stepper. Reused by both fields via a setter
+  // parameter — the logic is identical (positive-only, 4 sig-fig
+  // rounding) so factoring it keeps the +/- buttons consistent.
+  const stepLinear = (
+    raw: string,
+    setRaw: (s: string) => void,
+    delta: number,
+  ) => {
+    const trimmed = raw.trim()
+    const curr = trimmed === '' ? Number.NaN : Number(trimmed)
+    const base = Number.isFinite(curr) ? curr : spec.defaultValue
+    const next = base + delta
+    if (next <= 0) return
+    setRaw(String(Math.round(next * 10000) / 10000))
+  }
+
+  // Per-station mutators. Append uses a sensible new station value
+  // (midpoint between the last row's station and 1, or 0.5 for an
+  // empty table) so the user rarely needs to retype the position.
+  // Remove is gated to a minimum of one row — the kernel handles a
+  // single-station table as a constant radius, but zero stations is
+  // a wire-shape error per `fillet_payload::validate_dto`.
+  const updateStation = (
+    i: number,
+    field: 'station' | 'radius',
+    value: string,
+  ) => {
+    setStationsRaw((prev) => {
+      const next = prev.slice()
+      next[i] = { ...next[i], [field]: value }
+      return next
+    })
+  }
+  const addStation = () => {
+    setStationsRaw((prev) => {
+      const lastStation = prev.length > 0
+        ? Number(prev[prev.length - 1].station.trim())
+        : Number.NaN
+      const seed = Number.isFinite(lastStation)
+        ? Math.min(1, (lastStation + 1) / 2)
+        : 0.5
+      return [
+        ...prev,
+        { station: String(seed), radius: String(spec.defaultValue) },
+      ]
+    })
+  }
+  const removeStation = (i: number) => {
+    setStationsRaw((prev) => {
+      if (prev.length <= 1) return prev
+      const next = prev.slice()
+      next.splice(i, 1)
+      return next
     })
   }
 
@@ -364,7 +605,8 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
           </div>
         )}
 
-        {!spec.perEdge && (
+        {/* Single shared radius — `fillet` / `chamfer` / `shell`. */}
+        {!spec.perEdge && spec.profile === 'constant' && (
           <Field label={spec.inputLabel}>
             <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
               <input
@@ -404,6 +646,160 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
             {!valueValid && (
               <span className="text-[11px] font-mono text-destructive">
                 Must be a positive number.
+              </span>
+            )}
+          </Field>
+        )}
+
+        {/* Linear profile — start + end radii, uniform across edges. */}
+        {spec.profile === 'linear' && (
+          <Field label="Radius at endpoints">
+            <div className="grid grid-cols-2 gap-2">
+              {([
+                {
+                  label: 'Start',
+                  raw: linearStartRaw,
+                  setRaw: setLinearStartRaw,
+                  parsed: parsedLinearStart,
+                  refIt: true,
+                },
+                {
+                  label: 'End',
+                  raw: linearEndRaw,
+                  setRaw: setLinearEndRaw,
+                  parsed: parsedLinearEnd,
+                  refIt: false,
+                },
+              ] as const).map((field) => {
+                const rowValid = Number.isFinite(field.parsed) && field.parsed > 0
+                return (
+                  <div key={field.label} className="flex flex-col gap-1">
+                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+                      {field.label}
+                    </span>
+                    <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                      <input
+                        ref={field.refIt ? inputRef : undefined}
+                        type="text"
+                        inputMode="decimal"
+                        value={field.raw}
+                        onChange={(e) => field.setRaw(e.target.value)}
+                        className={cn(
+                          'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                          !rowValid && 'text-destructive',
+                        )}
+                        placeholder={String(spec.defaultValue)}
+                        aria-label={`${field.label} radius`}
+                      />
+                      <span className="flex items-center bg-muted px-2 font-mono text-[11px] text-muted-foreground">
+                        mm
+                      </span>
+                      <div className="flex flex-col border-l border-input">
+                        <button
+                          type="button"
+                          onClick={() => stepLinear(field.raw, field.setRaw, spec.step)}
+                          className="flex h-4 items-center justify-center px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          aria-label={`Increase ${field.label.toLowerCase()} radius`}
+                        >
+                          <ChevronUp className="h-3 w-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => stepLinear(field.raw, field.setRaw, -spec.step)}
+                          className="flex h-4 items-center justify-center border-t border-input px-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          aria-label={`Decrease ${field.label.toLowerCase()} radius`}
+                        >
+                          <ChevronDown className="h-3 w-3" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            {!linearValid && (
+              <span className="text-[11px] font-mono text-destructive">
+                Both endpoints must be positive numbers.
+              </span>
+            )}
+          </Field>
+        )}
+
+        {/* Stations profile — table of (station, radius) rows. */}
+        {spec.profile === 'stations' && (
+          <Field label="Station radii">
+            <div className="flex max-h-[240px] flex-col gap-1 overflow-y-auto pr-1">
+              <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 pb-1 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+                <span>Station (0–1)</span>
+                <span>Radius (mm)</span>
+                <span className="w-6" />
+              </div>
+              {stationsRaw.map((row, i) => {
+                const [sp, rp] = parsedSamples[i]
+                const sValid = Number.isFinite(sp) && sp >= 0 && sp <= 1
+                const rValid = Number.isFinite(rp) && rp > 0
+                return (
+                  <div
+                    key={i}
+                    className="grid grid-cols-[1fr_1fr_auto] items-stretch gap-1.5"
+                  >
+                    <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                      <input
+                        ref={i === 0 ? inputRef : undefined}
+                        type="text"
+                        inputMode="decimal"
+                        value={row.station}
+                        onChange={(e) => updateStation(i, 'station', e.target.value)}
+                        className={cn(
+                          'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                          !sValid && 'text-destructive',
+                        )}
+                        placeholder="0.5"
+                        aria-label={`Station ${i + 1} parameter`}
+                      />
+                    </div>
+                    <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={row.radius}
+                        onChange={(e) => updateStation(i, 'radius', e.target.value)}
+                        className={cn(
+                          'h-8 min-w-0 flex-1 bg-transparent px-2 font-mono text-[13px] outline-none',
+                          !rValid && 'text-destructive',
+                        )}
+                        placeholder={String(spec.defaultValue)}
+                        aria-label={`Station ${i + 1} radius`}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeStation(i)}
+                      disabled={stationsRaw.length <= 1}
+                      className={cn(
+                        'flex h-8 w-6 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors',
+                        stationsRaw.length <= 1
+                          ? 'cursor-not-allowed opacity-40'
+                          : 'hover:bg-muted hover:text-foreground',
+                      )}
+                      aria-label={`Remove station ${i + 1}`}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+            <button
+              type="button"
+              onClick={addStation}
+              className="mt-1 self-start rounded-md border border-dashed border-border px-2 py-1 text-[11px] font-mono text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+            >
+              + Add station
+            </button>
+            {!stationsValid && (
+              <span className="text-[11px] font-mono text-destructive">
+                Every station must be in [0, 1] with a positive radius.
               </span>
             )}
           </Field>
