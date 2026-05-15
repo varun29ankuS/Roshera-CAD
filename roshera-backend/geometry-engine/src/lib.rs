@@ -9,6 +9,7 @@ pub mod performance;
 pub mod primitives;
 pub mod readable;
 pub mod sketch2d;
+pub mod spatial;
 pub mod tessellation;
 
 #[cfg(feature = "export")]

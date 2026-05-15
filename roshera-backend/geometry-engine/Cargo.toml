@@ -30,6 +30,13 @@ cdt = "0.1"
 # for the original failure mode.
 i_overlay = "6"
 
+# R*-tree spatial index for kernel broad-phase queries (face-pair pruning
+# in boolean ops, edge-proximity queries, datum-anchor lookups). Pure
+# Rust, no nalgebra dep, dynamic insert/remove. Exposed via the
+# `spatial::SpatialIndex` trait so the impl can be swapped (GPU LBVH,
+# learned index, etc.) without touching call sites. See spatial/mod.rs.
+rstar = "0.12"
+
 # SIMD optimizations
 wide = "0.7"              # Portable SIMD operations
 simdeez = "1.0"          # Cross-platform SIMD
