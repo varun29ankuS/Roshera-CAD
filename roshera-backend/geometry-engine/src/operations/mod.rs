@@ -64,6 +64,24 @@ pub mod blend_graph;
 // via the same pre-flight dispatch.
 pub mod lifecycle;
 
+// Diagnostics-α: structured taxonomy for blend (fillet / chamfer /
+// sew) failure modes. `BlendFailure` replaces the free-form strings
+// downstream of validate / spine / sew / corner-patch with a tagged
+// enum carrying edge / vertex / parameter context so agents can
+// branch on the failure variant. Phase-1 lands the taxonomy and the
+// `From<BlendFailure> for OperationError` bridge; future slices swap
+// call sites to `Err(blend_failure.into())`.
+pub mod diagnostics;
+
+// F6-α radius vs. curvature feasibility gate: pre-flight check that
+// runs after `lifecycle::validate_can_apply` and rejects fillets
+// whose requested radius would not fit a rolling ball against the
+// adjacent faces' analytic curvature. First production consumer of
+// `OperationError::BlendFailed` (Diagnostics-α Phase-2 typed
+// surface). Cone / Ruled / NURBS surfaces are MVP pass-through;
+// sampling-based curvature is F6-β.
+pub mod feasibility;
+
 // Internal helpers for boolean face splitting (DCEL-based planar arrangement).
 // Not part of the public API — used by `boolean::split_face_by_curves` only.
 pub(crate) mod face_arrangement;
@@ -178,6 +196,18 @@ pub enum OperationError {
     /// curve-intersection. Callers should route to an imprint-then-merge path
     /// or report the limitation to the user.
     CoplanarFaces(String),
+
+    /// Structured blend (fillet / chamfer / sew) failure carrying the
+    /// full [`diagnostics::BlendFailure`] taxonomy rather than a
+    /// stringified payload. Diagnostics-α Phase-2: this is the typed
+    /// surface call sites should migrate to over time. The legacy
+    /// `From<BlendFailure>` bridge in `diagnostics.rs` still flattens
+    /// onto `InvalidInput` / `InvalidGeometry` / `NumericalError` for
+    /// source-compatibility with Phase-1 callers; new sites that want
+    /// agents and the REST surface to receive the structured variant
+    /// should construct this directly via
+    /// `OperationError::BlendFailed(Box::new(failure))`.
+    BlendFailed(Box<diagnostics::BlendFailure>),
 }
 
 impl From<crate::math::MathError> for OperationError {
@@ -216,6 +246,7 @@ impl std::fmt::Display for OperationError {
                 parameter, expected, received
             ),
             OperationError::CoplanarFaces(msg) => write!(f, "Coplanar faces: {}", msg),
+            OperationError::BlendFailed(failure) => write!(f, "Blend failed: {}", failure),
         }
     }
 }

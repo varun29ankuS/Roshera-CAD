@@ -73,6 +73,16 @@ pub enum ErrorCode {
     // ── Kernel surface ────────────────────────────────────────────
     /// The kernel rejected the operation (topology, tolerance, etc.).
     KernelError,
+    /// The kernel returned a structured
+    /// [`geometry_engine::operations::diagnostics::BlendFailure`]
+    /// (fillet / chamfer / sew). The typed payload is serialised
+    /// verbatim into `details.failure` so agents can branch on the
+    /// `type` field — e.g. `RadiusExceedsCurvature` exposes
+    /// `r_requested`, `r_max`, and the offending `edge` for a
+    /// trivial "retry at r_max * 0.95" recovery. Diagnostics-α
+    /// Phase-2 typed-surface variant. Non-retryable — the caller
+    /// must change inputs (radius, selection, …) before retrying.
+    BlendFailed,
     /// The kernel succeeded but tessellation produced no triangles —
     /// almost always a kernel defect, never a client bug.
     TessellationEmpty,
@@ -167,6 +177,7 @@ impl ErrorCode {
             | ErrorCode::InvalidParameter
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
+            | ErrorCode::BlendFailed
             | ErrorCode::IdempotencyKeyEmpty
             | ErrorCode::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
 
@@ -208,6 +219,7 @@ impl ErrorCode {
             | ErrorCode::InvalidParameter
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
+            | ErrorCode::BlendFailed
             | ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
             | ErrorCode::IdempotencyKeyEmpty
@@ -245,6 +257,7 @@ impl ErrorCode {
             ErrorCode::UnknownShapeType => "unknown_shape_type",
             ErrorCode::InvalidJson => "invalid_json",
             ErrorCode::KernelError => "kernel_error",
+            ErrorCode::BlendFailed => "blend_failed",
             ErrorCode::TessellationEmpty => "tessellation_empty",
             ErrorCode::SolidNotFound => "solid_not_found",
             ErrorCode::PartNotFound => "part_not_found",
@@ -278,6 +291,7 @@ impl ErrorCode {
             ErrorCode::UnknownShapeType,
             ErrorCode::InvalidJson,
             ErrorCode::KernelError,
+            ErrorCode::BlendFailed,
             ErrorCode::TessellationEmpty,
             ErrorCode::SolidNotFound,
             ErrorCode::PartNotFound,
@@ -412,6 +426,42 @@ impl ApiError {
             .with_details(serde_json::json!({ "kernel_message": s }))
     }
 
+    /// Structured blend failure (Diagnostics-α Phase-2): the kernel
+    /// returned [`geometry_engine::operations::diagnostics::BlendFailure`]
+    /// and we surface the taxonomy verbatim. The `failure` field of
+    /// `details` is the internally-tagged JSON the kernel emits
+    /// (`{"type": "RadiusExceedsCurvature", "edge": 7, ...}`), so an
+    /// agent can branch on `details.failure.type` without parsing the
+    /// human-readable `error` field.
+    ///
+    /// Returned as HTTP 400 because the failure is — by construction —
+    /// a caller-supplied infeasibility (radius too large for local
+    /// curvature, setback too long, mixed convexity, …). Retrying the
+    /// same request will fail identically; the agent must change its
+    /// inputs before retrying.
+    pub fn blend_failed(
+        failure: &geometry_engine::operations::diagnostics::BlendFailure,
+    ) -> Self {
+        // `BlendFailure: Display` carries an actionable human summary
+        // (e.g. "blend radius 2 at edge 7 station 0.420 exceeds local
+        // curvature limit r_max=1.25"). Surface it on the `error`
+        // field so logs / fallback consumers still get the message.
+        let message = failure.to_string();
+        // Serialise the typed payload. The kernel's `BlendFailure`
+        // derives `serde::Serialize` with `#[serde(tag = "type")]`,
+        // so this is guaranteed to succeed for every variant; the
+        // `unwrap_or_else` fallback is paranoia — if it ever fires
+        // the wire shape still satisfies the catalog contract.
+        let payload = serde_json::to_value(failure).unwrap_or_else(|_| {
+            serde_json::json!({
+                "type": "TopologyViolation",
+                "detail": message.clone(),
+            })
+        });
+        Self::new(ErrorCode::BlendFailed, format!("blend failed: {message}"))
+            .with_details(serde_json::json!({ "failure": payload }))
+    }
+
     /// Kernel returned a handle of an unexpected variant.
     pub fn kernel_returned_wrong_type(detail: impl std::fmt::Display) -> Self {
         Self::new(
@@ -505,6 +555,26 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Map a kernel [`geometry_engine::operations::OperationError`] onto
+/// an [`ApiError`]. The typed [`BlendFailed`](ErrorCode::BlendFailed)
+/// variant is preserved end-to-end with its full taxonomy in
+/// `details.failure`; every other variant is funnelled through
+/// [`ApiError::kernel_error`] (legacy stringified surface).
+///
+/// Call sites that previously had `.map_err(ApiError::kernel_error)`
+/// can become `.map_err(ApiError::from)` — and any kernel site that
+/// returns `OperationError::BlendFailed(...)` will start surfacing
+/// structured JSON to agents instead of a flattened message.
+impl From<geometry_engine::operations::OperationError> for ApiError {
+    fn from(err: geometry_engine::operations::OperationError) -> Self {
+        use geometry_engine::operations::OperationError;
+        match err {
+            OperationError::BlendFailed(failure) => ApiError::blend_failed(&failure),
+            other => ApiError::kernel_error(other),
+        }
+    }
+}
+
 /// Adapter for handlers that already return
 /// `Result<_, (StatusCode, Json<Value>)>` so they can migrate to
 /// `ApiError` incrementally without changing every signature in one
@@ -582,6 +652,57 @@ mod tests {
             let json_str = serde_json::to_value(code).unwrap();
             assert_eq!(json_str.as_str().unwrap(), code.as_str());
         }
+    }
+
+    /// Diagnostics-α Phase-2: a `BlendFailure::RadiusExceedsCurvature`
+    /// returned from the kernel as
+    /// `OperationError::BlendFailed(...)` must surface as HTTP 400
+    /// with the typed JSON payload nested under `details.failure`.
+    /// Agents pattern-match on `details.failure.type` (the kernel's
+    /// internally-tagged discriminator) to recover automatically —
+    /// changing this wire shape is a breaking change to the agent
+    /// surface.
+    #[test]
+    fn blend_failed_wire_shape_carries_typed_failure() {
+        use geometry_engine::operations::diagnostics::BlendFailure;
+        use geometry_engine::operations::OperationError;
+        let failure = BlendFailure::RadiusExceedsCurvature {
+            edge: 7,
+            station: 0.42,
+            r_requested: 2.0,
+            r_max: 1.25,
+        };
+        let op_err = OperationError::BlendFailed(Box::new(failure));
+        let api_err: ApiError = op_err.into();
+        assert_eq!(api_err.code, ErrorCode::BlendFailed);
+        assert_eq!(api_err.code.status(), StatusCode::BAD_REQUEST);
+        assert!(!api_err.retryable);
+
+        let v = serde_json::to_value(&api_err).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["error_code"], "blend_failed");
+        assert!(v["error"].as_str().unwrap().contains("r_max=1.25"));
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "RadiusExceedsCurvature");
+        assert_eq!(payload["edge"], 7);
+        assert_eq!(payload["r_requested"], 2.0);
+        assert_eq!(payload["r_max"], 1.25);
+    }
+
+    /// Non-`BlendFailed` `OperationError` variants must still funnel
+    /// through `kernel_error` so the legacy surface is preserved
+    /// while the typed surface lands incrementally.
+    #[test]
+    fn non_blend_operation_error_funnels_through_kernel_error() {
+        use geometry_engine::operations::OperationError;
+        let op_err = OperationError::InvalidGeometry("non-manifold edge".into());
+        let api_err: ApiError = op_err.into();
+        assert_eq!(api_err.code, ErrorCode::KernelError);
+        let v = serde_json::to_value(&api_err).unwrap();
+        assert!(v["details"]["kernel_message"]
+            .as_str()
+            .unwrap()
+            .contains("non-manifold edge"));
     }
 
     #[test]

@@ -1564,6 +1564,7 @@ impl OperationError {
             OperationError::InvalidPattern(_) => "invalid_pattern",
             OperationError::InvalidInput { .. } => "invalid_input",
             OperationError::CoplanarFaces(_) => "coplanar_faces",
+            OperationError::BlendFailed(_) => "blend_failed",
         }
     }
 
