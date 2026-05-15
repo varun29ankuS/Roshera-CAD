@@ -495,6 +495,189 @@ async function sendDirectFilletVariable(radii: number[]) {
 }
 
 /**
+ * Linear-profile fillet — single (start, end) pair applied uniformly
+ * to every picked edge. Radius interpolates linearly along each edge,
+ * which the api-server routes to `BlendRadiusDto::Linear` → kernel
+ * `FilletType::Variable(start, end)`.
+ *
+ * Wire shape: `{ object, edges, radius: { kind: "linear", start, end } }`.
+ */
+async function sendDirectFilletLinear(start: number, end: number) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const sceneState = useSceneStore.getState()
+  const selectedIds = Array.from(sceneState.selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Fillet.',
+    })
+    return
+  }
+  if (!Number.isFinite(start) || start <= 0 || !Number.isFinite(end) || end <= 0) {
+    addMessage({
+      role: 'assistant',
+      content: 'Linear fillet endpoints must be positive finite numbers.',
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  const edges = sceneState.subElementSelections
+    .filter((s) => s.type === 'edge' && s.objectId === object)
+    .map((s) => s.index)
+
+  if (edges.length === 0) {
+    addMessage({
+      role: 'assistant',
+      content:
+        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+    })
+    return
+  }
+
+  addMessage({
+    role: 'user',
+    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (linear ${start} → ${end})`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/fillet`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        object,
+        edges,
+        radius: { kind: 'linear', start, end },
+      }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with linear profile ${start} → ${end}.`,
+      objectsAffected: [String(data.object.id)],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
+ * Per-station fillet — single `samples` table applied uniformly to
+ * every picked edge. The api-server routes the table to
+ * `BlendRadiusDto::Variable(samples)` → kernel
+ * `FilletType::VariableStations(samples)`, which the rolling-ball
+ * solver interpolates across.
+ *
+ * Wire shape: `{ object, edges, radius: { kind: "variable",
+ *               samples: [[s0, r0], [s1, r1], …] } }`.
+ *
+ * `samples[i]` is `[station ∈ [0, 1], radius > 0]`. Range checks
+ * here are defence-in-depth — the dialog already gates Apply on the
+ * same predicate and the api-server re-validates at the wire edge.
+ */
+async function sendDirectFilletStations(samples: Array<[number, number]>) {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const sceneState = useSceneStore.getState()
+  const selectedIds = Array.from(sceneState.selectedIds)
+
+  if (selectedIds.length !== 1) {
+    addMessage({
+      role: 'assistant',
+      content: 'Select exactly one solid before running Fillet.',
+    })
+    return
+  }
+  if (samples.length === 0) {
+    addMessage({
+      role: 'assistant',
+      content: 'Add at least one (station, radius) row before running Fillet.',
+    })
+    return
+  }
+  const bad = samples.find(
+    ([s, r]) =>
+      !Number.isFinite(s) ||
+      s < 0 ||
+      s > 1 ||
+      !Number.isFinite(r) ||
+      r <= 0,
+  )
+  if (bad) {
+    addMessage({
+      role: 'assistant',
+      content: 'Every station must be in [0, 1] with a positive radius.',
+    })
+    return
+  }
+
+  const [object] = selectedIds
+  const edges = sceneState.subElementSelections
+    .filter((s) => s.type === 'edge' && s.objectId === object)
+    .map((s) => s.index)
+
+  if (edges.length === 0) {
+    addMessage({
+      role: 'assistant',
+      content:
+        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+    })
+    return
+  }
+
+  const summary = samples
+    .map(([s, r]) => `(${s}, ${r})`)
+    .join(', ')
+
+  addMessage({
+    role: 'user',
+    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with ${samples.length} station${samples.length === 1 ? '' : 's'}: ${summary}`,
+  })
+  setProcessing(true)
+
+  try {
+    const resp = await fetch(`${API_BASE}/geometry/fillet`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        object,
+        edges,
+        radius: { kind: 'variable', samples },
+      }),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}))
+      throw new Error(errBody?.error || `${resp.status}`)
+    }
+    const data = await resp.json()
+    if (data?.success !== true || !data.object) {
+      throw new Error(data?.error || 'malformed response')
+    }
+    addMessage({
+      role: 'assistant',
+      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with ${samples.length} station${samples.length === 1 ? '' : 's'}.`,
+      objectsAffected: [String(data.object.id)],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Direct REST chamfer mirroring sendDirectFillet. Equal-distance
  * chamfer (distance1 == distance2 == distance) — most common case.
  */
@@ -1101,6 +1284,12 @@ export function ToolBar() {
       case 'fillet-variable':
         sendDirectFilletVariable(payload.radii)
         break
+      case 'fillet-linear':
+        sendDirectFilletLinear(payload.start, payload.end)
+        break
+      case 'fillet-stations':
+        sendDirectFilletStations(payload.samples)
+        break
       case 'chamfer':
         sendDirectChamfer(payload.value)
         break
@@ -1241,6 +1430,16 @@ export function ToolBar() {
               icon: Disc,
               label: 'Fillet (per-edge radii)',
               action: () => openModify('fillet-variable'),
+            },
+            {
+              icon: Disc,
+              label: 'Fillet (linear start→end)',
+              action: () => openModify('fillet-linear'),
+            },
+            {
+              icon: Disc,
+              label: 'Fillet (per-station)',
+              action: () => openModify('fillet-stations'),
             },
             {
               icon: Hexagon,
