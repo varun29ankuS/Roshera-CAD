@@ -71,6 +71,7 @@ use geometry_engine::primitives::{
     builder::BRepModel,
     curve::{Line, ParameterRange, Polyline},
     edge::{Edge, EdgeId, EdgeOrientation},
+    face::FaceId,
     solid::SolidId,
     vertex::VertexId,
 };
@@ -247,6 +248,114 @@ fn translate_xy(verts: &[Point3], dx: f64, dy: f64) -> Vec<Point3> {
 // ---------------------------------------------------------------------
 // Quality metrics
 // ---------------------------------------------------------------------
+
+/// Diagnostic: print every non-manifold edge with its triangle-share
+/// count and endpoint positions. Gated behind `ROSHERA_MESH_TRACE=1`.
+fn dump_non_manifold_edges(mesh: &TriangleMesh, ctx: &str) {
+    use std::collections::HashMap;
+    let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
+    for tri in &mesh.triangles {
+        for k in 0..3 {
+            let a = tri[k];
+            let b = tri[(k + 1) % 3];
+            let key = if a < b { (a, b) } else { (b, a) };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    eprintln!("{} dump_non_manifold_edges: {} verts {} tris", ctx, mesh.vertices.len(), mesh.triangles.len());
+    let mut bad: Vec<_> = counts
+        .iter()
+        .filter(|&(_, &c)| c != 2)
+        .collect();
+    bad.sort_by_key(|(k, _)| **k);
+    let has_face_map = mesh.face_map.len() == mesh.triangles.len();
+    for (key_ref, count_ref) in &bad {
+        let (a, b) = **key_ref;
+        let c = **count_ref;
+        let pa = mesh.vertices[a as usize].position;
+        let pb = mesh.vertices[b as usize].position;
+        eprintln!(
+            "  nm edge v{:>4}->v{:<4} shares={} ({:.4},{:.4},{:.4}) -> ({:.4},{:.4},{:.4})",
+            a, b, c, pa.x, pa.y, pa.z, pb.x, pb.y, pb.z,
+        );
+        // List triangles touching this edge with their face_id.
+        for (ti, tri) in mesh.triangles.iter().enumerate() {
+            let mut hit = false;
+            for k in 0..3 {
+                let x = tri[k];
+                let y = tri[(k + 1) % 3];
+                let tkey = if x < y { (x, y) } else { (y, x) };
+                if tkey == (a, b) { hit = true; break; }
+            }
+            if hit {
+                let fid = if has_face_map { mesh.face_map[ti] } else { 0 };
+                eprintln!("    tri[{}] = [{}, {}, {}] face={}", ti, tri[0], tri[1], tri[2], fid);
+            }
+        }
+    }
+}
+
+/// Diagnostic: dump every face in `solid_id`'s outer shell with its
+/// outer-loop and inner-loop edge IDs and vertex 3D positions. Gated
+/// behind `ROSHERA_MESH_TRACE=1`. Used to detect duplicated inner loops
+/// or mis-sampled hole-edge positions during sequential-cut debugging.
+fn dump_face_topology(model: &BRepModel, solid_id: SolidId, ctx: &str) {
+    eprintln!("{} dump_face_topology:", ctx);
+    let solid = match model.solids.get(solid_id) {
+        Some(s) => s,
+        None => { eprintln!("  <no such solid {:?}>", solid_id); return; }
+    };
+    let shell_id = solid.outer_shell;
+    drop(solid);
+    let shell = match model.shells.get(shell_id) {
+        Some(s) => s,
+        None => { eprintln!("  <no shell {:?}>", shell_id); return; }
+    };
+    let face_ids: Vec<FaceId> = shell.faces.clone();
+    drop(shell);
+    for fid in face_ids {
+        let face = match model.faces.get(fid) {
+            Some(f) => f,
+            None => continue,
+        };
+        let outer_loop_id = face.outer_loop;
+        let inner_loop_ids = face.inner_loops.clone();
+        drop(face);
+
+        let dump_loop = |label: &str, lid| {
+            let lp = match model.loops.get(lid) {
+                Some(l) => l,
+                None => { eprintln!("    {} <missing loop {:?}>", label, lid); return; }
+            };
+            let edges = lp.edges.clone();
+            let orients = lp.orientations.clone();
+            drop(lp);
+            eprintln!("    {} loop={:?} edges={}", label, lid, edges.len());
+            for (i, eid) in edges.iter().enumerate() {
+                let edge = match model.edges.get(*eid) {
+                    Some(e) => e,
+                    None => { eprintln!("      [{}] edge={:?} <missing>", i, eid); continue; }
+                };
+                let s_vid = edge.start_vertex;
+                let e_vid = edge.end_vertex;
+                drop(edge);
+                let sp = model.vertices.get(s_vid).map(|v| v.position).unwrap_or([0.0; 3].into());
+                let ep = model.vertices.get(e_vid).map(|v| v.position).unwrap_or([0.0; 3].into());
+                let fwd = orients.get(i).copied().unwrap_or(true);
+                eprintln!(
+                    "      [{}] edge={:?} fwd={} ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4})",
+                    i, eid, fwd, sp[0], sp[1], sp[2], ep[0], ep[1], ep[2],
+                );
+            }
+        };
+
+        eprintln!("  face={:?}:", fid);
+        dump_loop("outer", outer_loop_id);
+        for ilid in inner_loop_ids {
+            dump_loop("inner", ilid);
+        }
+    }
+}
 
 /// Count edges in the tessellated mesh whose unordered (v_min, v_max)
 /// pair is shared by anything other than exactly two triangles. A
@@ -617,16 +726,7 @@ fn assert_volume_invariant(
     );
 }
 
-// Followup: inner-shell hole-volume sign appears inverted in
-// `Solid::compute_mass_properties` — V(box-hole) returns V_box + V_hole
-// instead of V_box - V_hole, suggesting through-hole inner-shell face
-// orientations contribute with the wrong divergence-theorem sign.
-// Mesh is geometrically correct (Phase A passes watertight); the bug
-// lives in the analytical mass-props path, not the boolean. Tracked
-// as a Task #51 followup, separate from F36 polyline coverage.
-
 #[test]
-#[ignore = "Task #51 followup: hole-volume sign inversion in mass-props"]
 fn volume_pentagon_cut() {
     run_with_watchdog("volume_pentagon_cut", 20_000, || {
         let verts = regular_ngon(5, 1.0);
@@ -636,7 +736,6 @@ fn volume_pentagon_cut() {
 }
 
 #[test]
-#[ignore = "Task #51 followup: hole-volume sign inversion in mass-props"]
 fn volume_hexagon_cut() {
     run_with_watchdog("volume_hexagon_cut", 20_000, || {
         let verts = regular_ngon(6, 1.0);
@@ -646,7 +745,6 @@ fn volume_hexagon_cut() {
 }
 
 #[test]
-#[ignore = "Task #51 followup: hole-volume sign inversion in mass-props"]
 fn volume_octagon_cut() {
     run_with_watchdog("volume_octagon_cut", 20_000, || {
         let verts = regular_ngon(8, 1.0);
@@ -656,7 +754,6 @@ fn volume_octagon_cut() {
 }
 
 #[test]
-#[ignore = "Task #51 followup: hole-volume sign inversion in mass-props"]
 fn volume_lshape_cut() {
     run_with_watchdog("volume_lshape_cut", 20_000, || {
         // L-shape area = 12.0 (4×4 outer minus 2×2 notch).
@@ -788,6 +885,10 @@ fn run_sequential_cut_chain(n_cuts: usize, name: &'static str) {
             let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
             assert_mesh_finite(&mesh, &format!("[{}/cut={}]", name, i + 1));
             let nm = count_mesh_non_manifold_edges(&mesh);
+            if nm > 0 && std::env::var("ROSHERA_MESH_TRACE").is_ok() {
+                dump_non_manifold_edges(&mesh, &format!("[{}/cut={}]", name, i + 1));
+                dump_face_topology(&model, current, &format!("[{}/cut={}]", name, i + 1));
+            }
             assert_eq!(
                 nm, 0,
                 "[{}/cut={}] non-manifold mesh edges = {}",
@@ -828,19 +929,19 @@ fn sequential_chain_1_cut() {
 // followup, separate from the watertight-quality lock.
 
 #[test]
-#[ignore = "F36 followup: sequential-cut face-count growth invariant"]
+
 fn sequential_chain_2_cuts() {
     run_sequential_cut_chain(2, "sequential_chain_2");
 }
 
 #[test]
-#[ignore = "F36 followup: sequential-cut face-count growth invariant"]
+
 fn sequential_chain_3_cuts() {
     run_sequential_cut_chain(3, "sequential_chain_3");
 }
 
 #[test]
-#[ignore = "F36 followup: sequential-cut face-count growth invariant"]
+
 fn sequential_chain_4_cuts() {
     run_sequential_cut_chain(4, "sequential_chain_4");
 }
@@ -939,7 +1040,7 @@ fn union_disjoint_polyline_hexagons() {
 // (duplicate SSI-vs-imprint curves) but on the Union-keeps-outside
 // side. Tracked as F36 followup.
 #[test]
-#[ignore = "F36 followup: overlapping-Union coplanar-imprint merge"]
+#[ignore = "F36 followup: overlapping-Union polygon_clip degeneracy (pending i_overlay swap)"]
 fn union_overlapping_polyline_hexagons() {
     run_with_watchdog("union_overlapping_polyline_hexagons", 30_000, || {
         let mut model = BRepModel::new();
@@ -977,7 +1078,7 @@ fn union_overlapping_polyline_hexagons() {
 // fragments still has a coplanar-pair degeneracy. Tracked as F36
 // followup.
 #[test]
-#[ignore = "F36 followup: Intersection selection-branch coplanar merge"]
+
 fn intersect_polyline_hexagon_into_box() {
     run_with_watchdog("intersect_polyline_hexagon_into_box", 25_000, || {
         let mut model = BRepModel::new();
@@ -1031,7 +1132,7 @@ fn intersect_polyline_hexagon_into_box() {
 // Commutativity followup: blocked by the same overlapping-Union
 // merge issue above. Once that lands, this test should pass as-is.
 #[test]
-#[ignore = "F36 followup: overlapping-Union coplanar-imprint merge"]
+#[ignore = "F36 followup: overlapping-Union polygon_clip degeneracy (pending i_overlay swap)"]
 fn union_commutative_polyline_hexagons() {
     run_with_watchdog("union_commutative_polyline_hexagons", 40_000, || {
         // A ∪ B
