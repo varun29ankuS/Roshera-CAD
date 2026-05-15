@@ -120,8 +120,18 @@ impl OperationImpl for TransformOp {
                         if let Some(arr) = existing.as_array() {
                             if arr.len() == 4 {
                                 let existing_matrix = array_from_json(arr)?;
+                                // Column-vector convention: the existing
+                                // matrix represents all prior transforms;
+                                // the new `transformation` is applied
+                                // after it. So `v' = T_new * T_existing * v`
+                                // and the cumulative matrix is
+                                // `T_new * T_existing`. Earlier this was
+                                // `existing * new`, which silently composed
+                                // in reverse and corrupted transform history
+                                // for any solid that received more than one
+                                // transform.
                                 let cumulative_matrix =
-                                    multiply_matrices(&existing_matrix, transformation);
+                                    multiply_matrices(transformation, &existing_matrix);
                                 serde_json::json!(cumulative_matrix)
                             } else {
                                 serde_json::json!(transformation)

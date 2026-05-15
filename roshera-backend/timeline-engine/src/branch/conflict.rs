@@ -254,9 +254,15 @@ impl ConflictResolver {
                     transformation: t2,
                 },
             ) => {
-                // If same entities, combine transformations
+                // If same entities, combine transformations. With column-vector
+                // convention `v' = M * v`, applying op1 first and then op2 to
+                // a point `p` produces `v = T2 * (T1 * p) = (T2 * T1) * p`,
+                // so the merged matrix is `T2 * T1`, not `T1 * T2`. The
+                // earlier `multiply_matrices(t1, t2)` form silently composed
+                // the transforms in reverse order — that's the bug the
+                // `test_transform_merging` test was pinning.
                 if e1 == e2 {
-                    let combined_transform = self.multiply_matrices(t1, t2);
+                    let combined_transform = self.multiply_matrices(t2, t1);
                     Some(Operation::Transform {
                         entities: e1.clone(),
                         transformation: combined_transform,

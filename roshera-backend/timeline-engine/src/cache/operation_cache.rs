@@ -34,17 +34,50 @@ impl OperationCache {
         }
     }
 
-    /// Get cached operation result
+    /// Get cached operation result.
+    ///
+    /// Every call lands in exactly one of three stat buckets:
+    /// - **Hit**: key found and not expired → `stats.hits += 1`.
+    /// - **Miss (cold branch)**: this branch has never been written to,
+    ///   so its lru sub-cache doesn't exist yet → `stats.misses += 1`.
+    /// - **Miss (key absent or expired)**: branch exists, key wasn't
+    ///   there or has aged past `ttl_seconds` → `stats.misses += 1`
+    ///   and, for the expired case, `item_count` / `size_bytes` are
+    ///   decremented so the stats don't drift over time.
+    ///
+    /// TTL comparison is done in milliseconds so `ttl_seconds = 0`
+    /// behaves as "expire immediately" (sub-second age previously
+    /// rounded to 0 whole seconds, never tripped `> 0`).
     pub fn get(&self, branch_id: BranchId, key: &str) -> Option<OperationOutputs> {
-        let branch_cache = self.branch_caches.get(&branch_id)?;
+        let branch_cache = match self.branch_caches.get(&branch_id) {
+            Some(c) => c,
+            None => {
+                // Cold branch — still a miss; count it so cache-hit-rate
+                // metrics reflect every lookup, not just lookups against
+                // a branch that happens to have something cached.
+                self.update_stats(|s| s.misses += 1);
+                return None;
+            }
+        };
         let mut cache = branch_cache.write();
 
         if let Some(item) = cache.get_mut(key) {
-            // Check if expired
+            // Expiration uses milliseconds so a TTL of 0 means "expire
+            // immediately" (with seconds, age in the same second
+            // rounded to 0 and the strict `>` never tripped). `>=`
+            // because at exactly TTL elapsed the item is considered
+            // expired — a 1-second TTL means "valid for up to 1 s",
+            // not "valid for 1 s and one whole extra second".
             let age = Utc::now() - item.cached_at;
-            if age.num_seconds() as u64 > self.ttl_seconds {
+            let ttl_ms = (self.ttl_seconds as i64).saturating_mul(1000);
+            if age.num_milliseconds() >= ttl_ms {
+                let popped_size = item.size_bytes;
                 cache.pop(key);
-                self.update_stats(|s| s.misses += 1);
+                self.update_stats(|s| {
+                    s.misses += 1;
+                    s.item_count = s.item_count.saturating_sub(1);
+                    s.size_bytes = s.size_bytes.saturating_sub(popped_size);
+                });
                 return None;
             }
 
