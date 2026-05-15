@@ -3100,6 +3100,34 @@ fn split_face_by_curves(
         }]);
     }
 
+    // T-junction pre-split: when a cut endpoint snapped to a boundary
+    // corner (so cut and boundary edge share one vertex) and the cut's
+    // OTHER endpoint sits on the interior of a different boundary
+    // edge, `compute_edge_intersections` cannot detect the T-junction
+    // — its pair iterator skips edge pairs that share any vertex
+    // (boolean.rs:5469-5474). The DCEL then leaves the cut endpoint
+    // dangling on the unsplit boundary edge, `extract_regions` walks
+    // the original boundary loop as a single region, and the cut
+    // contributes no split. Symptom: overlapping-box Union returns
+    // V ≈ 4/3 instead of 3/2 because the bottom and top caps each
+    // drop two of three expected fragments.
+    //
+    // Fix: explicitly project every cut endpoint not on the boundary
+    // vertex set onto every boundary edge's curve and split the
+    // boundary at the projection when it falls strictly inside the
+    // edge's parametric range.
+    presplit_boundary_t_junctions(&mut graph, model, &options.common.tolerance)?;
+
+    // After T-junction splits, a cut that was partially collinear
+    // with a boundary edge (one endpoint at a corner, the other on
+    // the edge's interior) now retraces one of the new sub-edges
+    // and forms a duplicate directed edge between the same vertex
+    // pair. The DCEL cycle walk extracts zero loops in that case
+    // and silently drops the face. The original
+    // `coincides_with_boundary` filter at the top of this function
+    // ran before the pre-split and couldn't see the new sub-edge.
+    drop_cuts_coincident_with_boundary(&mut graph);
+
     // Pre-split closed self-loop edges (full circles, periodic curves)
     // before crossing detection. The DCEL planar arrangement filters
     // edges where start_vertex == end_vertex, and `compute_edge_intersections`
@@ -5431,6 +5459,322 @@ fn presplit_closed_loop_edges(
     }
 
     Ok(())
+}
+
+/// Split boundary edges at T-junctions before crossing detection.
+///
+/// Every cut-edge endpoint vertex that lies on the INTERIOR of a
+/// boundary edge (not on either of its existing endpoints) causes the
+/// boundary edge to be split at that point. The split inserts the
+/// cut-endpoint vertex into the boundary cycle so the DCEL arrangement
+/// in `super::face_arrangement` can walk through it.
+///
+/// # Why this exists
+///
+/// `compute_edge_intersections` pair-iterates the graph and skips
+/// pairs that share any vertex (boolean.rs:5469-5474) — the standard
+/// "topologically connected, no need to intersect" guard. But when a
+/// Greiner-Hormann coplanar imprint produces a cut whose start
+/// snapped to a boundary corner and whose end lies on the interior
+/// of a different boundary edge, the cut and that boundary edge
+/// share one vertex (the corner). The shared-vertex skip then
+/// silently drops the T-junction: no projection is computed, no
+/// split is queued, and the boundary cycle never learns about the
+/// cut-end. The arrangement then walks the original boundary loop
+/// as a single region and the cut contributes no split — the face
+/// is returned unsplit.
+///
+/// Symptom in production: two unit boxes offset by 0.5 along x.
+/// Bottom and top caps each have a single interior cut (along
+/// x=0) plus three cuts that partially or fully overlap A's
+/// boundary edges. The full-overlap cuts are filtered by the
+/// `coincides_with_boundary` rule; the partial-overlap cuts'
+/// interior endpoints sit on boundary-edge interiors at
+/// (0, ±0.5, ±0.5). Without T-junction splitting, each cap
+/// extracts only the outer boundary loop, the boolean classifies
+/// the whole cap by a single centroid, and the Union volume
+/// collapses from the expected 3/2 to ≈ 4/3 — exactly the wrong
+/// fragments end up selected.
+///
+/// # Algorithm
+///
+/// 1. Snapshot the set of cut-endpoint vertex ids NOT already in
+///    the boundary vertex set.
+/// 2. For each such vid, project its 3D position onto every
+///    boundary edge's curve via `Curve::closest_point`.
+/// 3. Accept the projection iff the 3D residual is within tolerance
+///    AND the curve parameter falls strictly inside the boundary
+///    edge's parametric range (an endpoint-coincident hit is not a
+///    T-junction).
+/// 4. Apply splits per boundary edge in curve-parameter order using
+///    the same `Edge::split_at` + graph-rewrite pattern as
+///    `compute_edge_intersections`.
+fn presplit_boundary_t_junctions(
+    graph: &mut IntersectionGraph,
+    model: &mut BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<()> {
+    graph.resolve_vertices(model);
+
+    let boundary_edges: Vec<EdgeId> = graph
+        .edges
+        .iter()
+        .filter(|(_, ge)| ge.edge_type == EdgeType::Boundary)
+        .map(|(&eid, _)| eid)
+        .collect();
+
+    if boundary_edges.is_empty() {
+        return Ok(());
+    }
+
+    let boundary_vid_set: HashSet<VertexId> = graph
+        .edges
+        .iter()
+        .filter(|(_, ge)| ge.edge_type == EdgeType::Boundary)
+        .flat_map(|(_, ge)| [ge.start_vertex, ge.end_vertex])
+        .filter(|&v| v != u32::MAX)
+        .collect();
+
+    let cut_endpoint_vids: HashSet<VertexId> = graph
+        .edges
+        .iter()
+        .filter(|(_, ge)| ge.edge_type == EdgeType::Splitting)
+        .flat_map(|(_, ge)| [ge.start_vertex, ge.end_vertex])
+        .filter(|&v| v != u32::MAX && !boundary_vid_set.contains(&v))
+        .collect();
+
+    if cut_endpoint_vids.is_empty() {
+        return Ok(());
+    }
+
+    let tol = tolerance.distance();
+    let tol_sq = tol * tol;
+
+    // Keyed on boundary EdgeId; values are (curve_parameter, vertex_id).
+    // We store the CURVE parameter (not edge-local) so the application
+    // loop below can re-project onto each remaining sub-edge's
+    // parametric range — same idiom as `compute_edge_intersections`.
+    let mut edge_splits: HashMap<EdgeId, Vec<(f64, VertexId)>> = HashMap::new();
+
+    const ENDPOINT_EPS: f64 = 1e-9;
+
+    for &cut_vid in &cut_endpoint_vids {
+        let cut_pos = match model.vertices.get_position(cut_vid) {
+            Some(p) => Point3::new(p[0], p[1], p[2]),
+            None => continue,
+        };
+
+        for &bnd_eid in &boundary_edges {
+            let edge = match model.edges.get(bnd_eid) {
+                Some(e) => e.clone(),
+                None => continue,
+            };
+            let curve = match model.curves.get(edge.curve_id) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let (t_curve, projected) = match curve.closest_point(&cut_pos, *tolerance) {
+                Ok(hit) => hit,
+                Err(_) => continue,
+            };
+
+            let dx = projected.x - cut_pos.x;
+            let dy = projected.y - cut_pos.y;
+            let dz = projected.z - cut_pos.z;
+            if dx * dx + dy * dy + dz * dz > tol_sq {
+                continue;
+            }
+
+            let range_len = edge.param_range.end - edge.param_range.start;
+            if range_len.abs() < 1e-15 {
+                continue;
+            }
+            let local_t = (t_curve - edge.param_range.start) / range_len;
+            if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
+                continue;
+            }
+
+            edge_splits
+                .entry(bnd_eid)
+                .or_default()
+                .push((t_curve, cut_vid));
+        }
+    }
+
+    if edge_splits.is_empty() {
+        return Ok(());
+    }
+
+    for (edge_id, mut splits) in edge_splits {
+        splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Dedup adjacent entries with the same vertex id (two cuts
+        // ending at one T-junction on the same boundary edge).
+        splits.dedup_by(|a, b| a.1 == b.1);
+
+        let edge_type = graph
+            .edges
+            .get(&edge_id)
+            .map(|ge| ge.edge_type)
+            .unwrap_or(EdgeType::Boundary);
+
+        let original_edge = match model.edges.get(edge_id) {
+            Some(e) => e.clone(),
+            None => continue,
+        };
+
+        graph.edges.remove(&edge_id);
+        for node in graph.nodes.values_mut() {
+            node.incident_edges.remove(&edge_id);
+        }
+
+        let mut remaining_edge = original_edge;
+
+        for (curve_t, split_vid) in &splits {
+            let range_len = remaining_edge.param_range.end - remaining_edge.param_range.start;
+            if range_len.abs() < 1e-15 {
+                continue;
+            }
+            let local_t = (*curve_t - remaining_edge.param_range.start) / range_len;
+            if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
+                continue;
+            }
+            // A second T-junction whose split vertex already sits on
+            // one end of the remaining sub-edge is a no-op (an earlier
+            // split in this loop already resolved it).
+            if *split_vid == remaining_edge.start_vertex
+                || *split_vid == remaining_edge.end_vertex
+            {
+                continue;
+            }
+
+            let (mut first_half, second_half) = remaining_edge.split_at(local_t);
+            first_half.end_vertex = *split_vid;
+
+            let first_id = model.edges.add(first_half);
+            let first_ge = GraphEdge {
+                edge_id: first_id,
+                edge_type,
+                start_vertex: model
+                    .edges
+                    .get(first_id)
+                    .map(|e| e.start_vertex)
+                    .unwrap_or(u32::MAX),
+                end_vertex: *split_vid,
+            };
+            graph.edges.insert(first_id, first_ge);
+
+            if let Some(sv) = model.edges.get(first_id).map(|e| e.start_vertex) {
+                graph
+                    .nodes
+                    .entry(sv)
+                    .or_insert_with(|| GraphNode {
+                        incident_edges: HashSet::new(),
+                    })
+                    .incident_edges
+                    .insert(first_id);
+            }
+            graph
+                .nodes
+                .entry(*split_vid)
+                .or_insert_with(|| GraphNode {
+                    incident_edges: HashSet::new(),
+                })
+                .incident_edges
+                .insert(first_id);
+
+            let mut next = second_half;
+            next.start_vertex = *split_vid;
+            remaining_edge = next;
+        }
+
+        let final_id = model.edges.add(remaining_edge.clone());
+        let final_ge = GraphEdge {
+            edge_id: final_id,
+            edge_type,
+            start_vertex: remaining_edge.start_vertex,
+            end_vertex: remaining_edge.end_vertex,
+        };
+        graph.edges.insert(final_id, final_ge);
+        for &vid in &[remaining_edge.start_vertex, remaining_edge.end_vertex] {
+            if vid != 0 && vid != u32::MAX {
+                graph
+                    .nodes
+                    .entry(vid)
+                    .or_insert_with(|| GraphNode {
+                        incident_edges: HashSet::new(),
+                    })
+                    .incident_edges
+                    .insert(final_id);
+            }
+        }
+    }
+
+    if pipeline_trace_enabled() {
+        eprintln!("[bool]     presplit_boundary_t_junctions: applied");
+    }
+
+    Ok(())
+}
+
+/// Drop splitting edges whose vertex pair coincides with the vertex
+/// pair of an existing boundary edge.
+///
+/// After `presplit_boundary_t_junctions`, a cut that shared a corner
+/// vertex with a boundary edge and whose other endpoint sat on that
+/// boundary edge's interior now retraces a freshly created
+/// boundary sub-edge. Leaving the cut in the graph creates a
+/// duplicate directed edge between the same vertex pair, which the
+/// DCEL arrangement walks as a digon — `extract_regions` then
+/// returns an empty cycle list and the face is silently dropped.
+///
+/// The `coincides_with_boundary` filter that already runs inside the
+/// cut-creation loop catches the same situation for cuts that fully
+/// overlap a single boundary edge that existed PRIOR to T-junction
+/// splitting; this function is its post-split counterpart.
+fn drop_cuts_coincident_with_boundary(graph: &mut IntersectionGraph) {
+    let boundary_pairs: HashSet<(VertexId, VertexId)> = graph
+        .edges
+        .iter()
+        .filter(|(_, ge)| ge.edge_type == EdgeType::Boundary)
+        .filter_map(|(_, ge)| {
+            let a = ge.start_vertex;
+            let b = ge.end_vertex;
+            if a == u32::MAX || b == u32::MAX || a == b {
+                None
+            } else if a < b {
+                Some((a, b))
+            } else {
+                Some((b, a))
+            }
+        })
+        .collect();
+
+    let redundant: Vec<EdgeId> = graph
+        .edges
+        .iter()
+        .filter(|(_, ge)| ge.edge_type == EdgeType::Splitting)
+        .filter_map(|(&eid, ge)| {
+            let a = ge.start_vertex;
+            let b = ge.end_vertex;
+            if a == u32::MAX || b == u32::MAX || a == b {
+                return None;
+            }
+            let pair = if a < b { (a, b) } else { (b, a) };
+            if boundary_pairs.contains(&pair) {
+                Some(eid)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for eid in redundant {
+        graph.edges.remove(&eid);
+        for node in graph.nodes.values_mut() {
+            node.incident_edges.remove(&eid);
+        }
+    }
 }
 
 /// Compute intersections between edges in the intersection graph.
