@@ -37,7 +37,7 @@
 //!
 //! # Ignored sub-cases (pre-existing kernel bugs, not broad-phase)
 //!
-//! Three tests are `#[ignore]`d with the inline rationale. They surfaced
+//! Two tests are `#[ignore]`d with the inline rationale. They surfaced
 //! after the topology-isolation fix above made it possible to actually
 //! reach the boolean pipeline with valid inputs; each is an independent
 //! kernel issue tracked separately (see the per-test docstring).
@@ -181,26 +181,17 @@ fn overlapping_boxes_union_correct_volume() {
 }
 
 /// Single Difference cut: a 4×4×4 box minus a strictly-contained
-/// 2×2×2 hole at offset (1,1,1). V = 64 − 8 = 56. Below threshold
-/// (6×6 = 36 pairs) — pins that the brute-force path produces the
-/// same answer as before the broad-phase wire-in.
-///
-/// IGNORED — exposes a pre-existing kernel limitation: when one solid
-/// is fully contained in another (strict containment), the Difference
-/// path's shell-stitcher fails with "component 0 has only 3 face(s);
-/// closed manifold requires ≥4". A proper B-Rep result needs an inner-
-/// cavity shell (the 2×2×2 hole becomes an interior void), and the
-/// current `build_shells_from_faces` doesn't construct one. Below the
-/// broad-phase threshold, so unrelated to pruning. Tracked as bug
-/// #49 (inner-shell handling for contained Difference) — a multi-
-/// slice kernel feature, not a quick fix.
+/// 2×2×2 hole offset by (0.3, 0.4, 0.5). The inner box lands at
+/// corners (-0.7,-0.6,-0.5)→(1.3,1.4,1.5), entirely inside the outer
+/// (-2,-2,-2)→(2,2,2) with no coincident face planes. V = 64 − 8 = 56.
+/// Below threshold (6×6 = 36 pairs) — pins that the brute-force path
+/// produces the same answer as before the broad-phase wire-in.
 #[test]
-#[ignore = "kernel: Difference with strictly-contained inner solid needs inner-shell support (bug #49)"]
 fn single_difference_cut_below_threshold() {
     let mut model = BRepModel::new();
     let a = make_box(&mut model, 4.0, 4.0, 4.0);
     let b = make_box(&mut model, 2.0, 2.0, 2.0);
-    translate(&mut model, b, Vector3::new(1.0, 1.0, 1.0));
+    translate(&mut model, b, Vector3::new(0.3, 0.4, 0.5));
 
     let result = boolean_operation(
         &mut model,
