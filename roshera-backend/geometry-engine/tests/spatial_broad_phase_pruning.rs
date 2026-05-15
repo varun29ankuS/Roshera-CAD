@@ -37,9 +37,9 @@
 //!
 //! # Ignored sub-cases (pre-existing kernel bugs, not broad-phase)
 //!
-//! Two tests are `#[ignore]`d with the inline rationale. They surfaced
+//! One test is `#[ignore]`d with the inline rationale. It surfaced
 //! after the topology-isolation fix above made it possible to actually
-//! reach the boolean pipeline with valid inputs; each is an independent
+//! reach the boolean pipeline with valid inputs; it is an independent
 //! kernel issue tracked separately (see the per-test docstring).
 
 #![allow(clippy::expect_used)]
@@ -154,15 +154,16 @@ fn disjoint_cylinders_broad_phase_path() {
 /// reject the intersecting face pair (one face of A meets one face
 /// of B on a square in the plane x=0.5). V = 2 − 0.5 = 1.5.
 ///
-/// IGNORED — exposes a pre-existing Union-overlap bug: after vertex
-/// isolation, A and B are topologically separate, but the boolean
-/// returns V ≈ 4/3 ≈ 1.333 instead of 1.5. Below the broad-phase
-/// threshold (36 face pairs < 64), so unrelated to pruning. The 4/3
-/// ratio suggests a face-selection error in `select_faces_for_operation`
-/// for partial-overlap Union — a separate kernel investigation
-/// (tracked as bug #50).
+/// Before bug #50 was fixed this case returned V ≈ 4/3 instead of
+/// 3/2: the cap-face coplanar imprint produced cut edges whose
+/// endpoints landed on the interior of A's boundary edges, but the
+/// shared-vertex skip in `compute_edge_intersections` (boolean.rs)
+/// prevented the T-junction from being detected. The fix is the
+/// `presplit_boundary_t_junctions` pass in
+/// `operations/boolean.rs`, which projects every interior cut
+/// endpoint onto the boundary curves and splits the boundary
+/// before crossing detection runs.
 #[test]
-#[ignore = "kernel: overlapping-box Union returns 4/3 instead of 3/2 — separate from broad-phase (bug #50)"]
 fn overlapping_boxes_union_correct_volume() {
     let mut model = BRepModel::new();
     let a = make_box(&mut model, 1.0, 1.0, 1.0);
