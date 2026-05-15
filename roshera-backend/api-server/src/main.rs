@@ -16,6 +16,8 @@ mod csketch;
 mod delta_handlers;
 mod error_catalog;
 mod fillet_payload;
+#[cfg(test)]
+mod fillet_radius_harness;
 mod frame;
 mod handlers;
 mod handlers_impl;
