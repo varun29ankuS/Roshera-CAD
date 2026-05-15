@@ -224,7 +224,11 @@ impl OperationImpl for FilletOp {
 ///   (the kernel's legacy "linear interp between endpoints" path)
 /// - `Variable(samples)` → `FilletType::VariableStations(samples)`
 ///   (the F3-ε.2 per-station path)
-fn blend_radius_dto_to_fillet_type(
+///
+/// Exposed publicly so consumers outside timeline-engine that
+/// own a `BlendRadiusDto` (e.g. the api-server REST surface) can
+/// reuse the canonical mapping rather than re-implementing it.
+pub fn blend_radius_dto_to_fillet_type(
     dto: &BlendRadiusDto,
 ) -> geometry_engine::operations::fillet::FilletType {
     use geometry_engine::operations::fillet::FilletType;

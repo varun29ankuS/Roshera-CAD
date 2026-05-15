@@ -22,7 +22,7 @@ pub use create_primitive::CreatePrimitiveOp;
 pub use create_sketch::CreateSketchOp;
 pub use delete::DeleteOp;
 pub use extrude::ExtrudeOp;
-pub use fillet::FilletOp;
+pub use fillet::{blend_radius_dto_to_fillet_type, FilletOp};
 pub use loft::LoftOp;
 pub use modify::ModifyOp;
 pub use pattern::PatternOp;
