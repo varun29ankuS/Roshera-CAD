@@ -508,10 +508,31 @@ fn compute_face_intersections(
         }
         pairs
     } else {
+        // Below the R*-tree threshold the brute-force loop still has
+        // to prune face pairs whose bboxes don't overlap. Without this
+        // check, every Plane-Cylinder pair on two far-apart cylinders
+        // (e.g. caps of A vs. lateral of B at 50 units distance)
+        // proceeds to `intersect_faces`, which evaluates
+        // `intersect_surface_plane` on the UNBOUNDED Plane and
+        // Cylinder surfaces and returns a phantom circle at
+        // `x = 50 ± r` — entirely outside both faces. The cuts then
+        // shred the caps along non-existent imprint loops and the
+        // boolean drops solid B entirely (Union volume collapses to
+        // ≈ 2π/3 instead of 2π). The bbox check is a cheap O(1) AABB
+        // overlap that closes this gap and matches the broad-phase
+        // path's semantics.
+        let bboxes_b: Vec<(FaceId, BBox)> = faces_b
+            .iter()
+            .map(|&fb| (fb, bbox_for(model, fb)))
+            .collect();
+        let tol = options.common.tolerance;
         let mut pairs = Vec::with_capacity(total_pairs);
         for &face_a in &faces_a {
-            for &face_b in &faces_b {
-                pairs.push((face_a, face_b));
+            let bbox_a = bbox_for(model, face_a);
+            for &(face_b, ref bbox_b) in &bboxes_b {
+                if bbox_a.intersects_tolerance(bbox_b, tol) {
+                    pairs.push((face_a, face_b));
+                }
             }
         }
         pairs
@@ -7243,10 +7264,50 @@ fn is_point_in_face(
             return Ok(true);
         }
         let cycle_vertices = extract_cycle_vertices_3d(&outer_loop.edges, model);
-        if cycle_vertices.len() < 3 {
-            return Ok(true);
-        }
-        let polygon: Vec<(f64, f64)> = cycle_vertices.iter().map(project).collect();
+        let polygon: Vec<(f64, f64)> = if cycle_vertices.len() >= 3 {
+            cycle_vertices.iter().map(project).collect()
+        } else {
+            // Boundary has fewer than 3 corner vertices — typical for
+            // cap faces bounded by a single closed seam edge (e.g.
+            // cylinder caps, where the lone boundary edge is a closed
+            // circle with start_vertex == end_vertex). Falling through
+            // to `return Ok(true)` here was a load-bearing bug: every
+            // point on the cap's plane was reported "inside" any other
+            // cap face that shared the same plane, so the coincident-
+            // boundary check at the top of
+            // `classify_face_relative_to_solid` fired OnBoundary for
+            // disjoint-cylinder Union (two coplanar caps at z=0 that
+            // are geometrically 50 units apart in x) and the boolean
+            // dropped the cap fragments. Densely sample each boundary
+            // edge's curve to build a real polygon footprint instead.
+            let mut samples: Vec<(f64, f64)> = Vec::new();
+            const SAMPLES_PER_EDGE: u32 = 32;
+            for &edge_id in &outer_loop.edges {
+                let edge = match model.edges.get(edge_id) {
+                    Some(e) => e,
+                    None => return Ok(false),
+                };
+                let curve = match model.curves.get(edge.curve_id) {
+                    Some(c) => c,
+                    None => return Ok(false),
+                };
+                let span = edge.param_range.end - edge.param_range.start;
+                for i in 0..SAMPLES_PER_EDGE {
+                    let t = edge.param_range.start
+                        + span * (i as f64) / (SAMPLES_PER_EDGE as f64);
+                    if let Ok(pt) = curve.point_at(t) {
+                        samples.push(project(&pt));
+                    }
+                }
+            }
+            if samples.len() < 3 {
+                // Boundary genuinely unrecoverable — fall back to
+                // "not in face" so caller doesn't get a spurious
+                // OnBoundary.
+                return Ok(false);
+            }
+            samples
+        };
         let (test_x, test_y) = project(point);
 
         let mut crossings = 0;
@@ -7680,18 +7741,46 @@ fn build_shells_from_faces(
         }
     }
 
-    // Closed-manifold sanity: a closed orientable surface needs ≥4 faces
-    // (tetrahedron). If non-manifold results aren't allowed, reject under-sized
-    // components up front rather than emitting a degenerate shell.
+    // Closed-manifold sanity: an all-planar closed orientable surface
+    // needs ≥4 faces (tetrahedron). Components that contain at least
+    // one analytical curved face (cylinder/sphere/cone/...) can close
+    // with fewer faces — a sphere primitive is 1 face, a cone 2, a
+    // closed-seam cylinder 3 — because closed-seam edges are
+    // self-loops that don't require a partner face to be manifold.
+    // Reject under-sized polyhedral components up front rather than
+    // emit a degenerate shell; for components with at least one
+    // curved face, only reject empty.
     if !options.allow_non_manifold {
         for (i, component) in components.iter().enumerate() {
-            if component.len() < 4 {
+            if component.is_empty() {
                 return Err(OperationError::InvalidBRep(format!(
-                    "build_shells_from_faces: component {} has only {} face(s); \
-                     closed manifold requires ≥4 (set allow_non_manifold=true to bypass)",
+                    "build_shells_from_faces: component {} has no faces",
                     i,
-                    component.len(),
                 )));
+            }
+            if component.len() < 4 {
+                let tol = options.common.tolerance;
+                let all_planar = component.iter().all(|&idx| {
+                    let face = &faces[idx];
+                    model
+                        .surfaces
+                        .get(face.surface)
+                        .map(|s| {
+                            matches!(
+                                analytical_surface_kind(s, &tol),
+                                AnalyticalSurfaceKind::Planar
+                            )
+                        })
+                        .unwrap_or(true)
+                });
+                if all_planar {
+                    return Err(OperationError::InvalidBRep(format!(
+                        "build_shells_from_faces: component {} has only {} planar face(s); \
+                         closed polyhedral manifold requires ≥4 (set allow_non_manifold=true to bypass)",
+                        i,
+                        component.len(),
+                    )));
+                }
             }
         }
     }

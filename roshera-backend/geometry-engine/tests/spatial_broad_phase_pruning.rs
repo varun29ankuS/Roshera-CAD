@@ -35,12 +35,23 @@
 //! that code path here, but it protects every transform-then-boolean
 //! workflow in the kernel.
 //!
-//! # Ignored sub-cases (pre-existing kernel bugs, not broad-phase)
+//! # Companion fixes (bugs #50 and #51)
 //!
-//! One test is `#[ignore]`d with the inline rationale. It surfaced
-//! after the topology-isolation fix above made it possible to actually
-//! reach the boolean pipeline with valid inputs; it is an independent
-//! kernel issue tracked separately (see the per-test docstring).
+//! Two further unrelated kernel bugs were surfaced and fixed while
+//! writing this suite:
+//!
+//! - **#50** (overlapping unit boxes, brute-force path) — the T-
+//!   junction pre-split in `presplit_boundary_t_junctions`
+//!   (boolean.rs) now splits boundary edges whose interior is hit by
+//!   a cut endpoint, so Greiner-Hormann imprint cuts that land on a
+//!   boundary-edge interior are detected and merged correctly.
+//! - **#51** (disjoint cylinders, brute-force path) — the brute-force
+//!   `compute_face_intersections` loop now does bbox pre-pruning that
+//!   matches the broad-phase path's semantics; `is_point_in_face`
+//!   densely samples curves when the boundary has fewer than 3 corner
+//!   vertices (closed-seam circular caps); and the shell-builder no
+//!   longer rejects valid analytical-cap components (cone=2, cylinder
+//!   =3 faces) under the spurious ≥4 polyhedral-shell heuristic.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -110,25 +121,28 @@ fn disjoint_unit_boxes_brute_force_path() {
     );
 }
 
-/// Two disjoint cylinders far apart. Cylinder topology has more
-/// faces (lateral + 2 caps), and tessellated lateral has many
-/// faces in some kernels — total pair count exceeds the broad-phase
-/// threshold, exercising the `RstarIndex` path. V(A) + V(B) ≈ 2π.
+/// Two disjoint cylinders far apart. Each cylinder has 3 faces
+/// (cap + closed-seam lateral + cap) for a total of 9 pairs, BELOW
+/// the broad-phase threshold of 64. Exercises the brute-force path's
+/// bbox pre-prune (bug #51): without it, the unbounded
+/// `intersect_surface_plane` between A's caps and B's lateral
+/// reports phantom imprint circles 50 units away that shred the
+/// caps. V(A) + V(B) = 2π.
 ///
-/// IGNORED — exposes a pre-existing pipeline bug in disjoint-cylinder
-/// Union: after `isolate_shared_topology` lands in `transform.rs`, B's
-/// seam vertices are correctly cloned and translated, so A and B are
-/// topologically isolated and geometrically disjoint. The boolean
-/// nevertheless returns a solid whose mesh-integrated volume is
-/// V ≈ 2π/3 instead of 2π. The 2π/3 ratio strongly suggests the
-/// Union path drops two of the six cylinder faces (cap + lateral
-/// pair) when assembling a non-manifold disjoint result; the
-/// disjoint-box variant succeeds because boxes have no seam edges.
-/// Tracked as a follow-up; broad-phase wire-in itself is unaffected
-/// (this is a downstream bug in shell stitching for closed-edge
-/// loops, not in the pruning pass).
+/// Before bug #51 was fixed this case failed in three compounding
+/// ways: (a) `compute_face_intersections` below the broad-phase
+/// threshold skipped bbox pruning entirely, so disjoint Plane-
+/// Cylinder pairs at 50 units distance produced phantom imprint
+/// curves; (b) `is_point_in_face` fell through to `Ok(true)` for
+/// any face whose boundary loop had fewer than 3 corner vertices,
+/// which is every cylinder cap (single closed seam edge), so the
+/// coincident-boundary check at the top of
+/// `classify_face_relative_to_solid` spuriously fired OnBoundary for
+/// pairs of disjoint coplanar caps; (c) `build_shells_from_faces`
+/// rejected 3-face components under a ≥4 polyhedral-shell heuristic
+/// even though closed-seam cylinders are perfectly valid closed
+/// manifolds with that face count.
 #[test]
-#[ignore = "kernel: disjoint-cylinder Union drops faces around the seam — separate from broad-phase"]
 fn disjoint_cylinders_broad_phase_path() {
     let mut model = BRepModel::new();
     let a = make_cylinder(&mut model, 1.0, 1.0);

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc da45bfb0bf4ec8540e5576d63c22c5b89146f8f8cd66374b91669b55b71dd47f # shrinks to a_dims = (11.888290083335038, 14.795310141690017, 6.790020898554585), b_dims = (2.0, 2.0, 6.811719253740188)
+cc 559c2436c32aa695ec70a21d8b9c25f4da6cc988e1abd6dbd94599d4bd411b7b # shrinks to a_dims = (5.018189264043698, 2.0, 11.037997855100619), b_dims = (4.872428133630894, 2.0, 10.80540554931081)
