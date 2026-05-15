@@ -14,7 +14,7 @@
 //! length. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{bbox::BBox, consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{CurveId, CurveStore},
     edge::{EdgeId, EdgeStore},
@@ -628,6 +628,99 @@ impl Face {
             .cached_stats
             .as_ref()
             .expect("cached_stats populated above when None"))
+    }
+
+    /// Conservative axis-aligned bounding box for this face, used as the
+    /// broad-phase key in [`crate::spatial::SpatialIndex`] (boolean face-
+    /// pair pruning, edge proximity queries, datum-anchor lookups).
+    ///
+    /// Computed as the union of:
+    ///
+    /// 1. **Loop vertex positions** — exact for planar faces (the face
+    ///    is the planar polygon bounded by the loop), and a lower bound
+    ///    for curved faces (vertices lie on the face boundary).
+    /// 2. **UV-grid surface samples** — captures interior bulges on
+    ///    curved faces (cylinder/sphere/torus/NURBS) that the loop
+    ///    vertices alone would miss.
+    ///
+    /// The combined bbox is then inflated by a small relative + absolute
+    /// margin so the filter stays conservative: a broad-phase false
+    /// positive merely costs an unnecessary narrow-phase intersection
+    /// test, but a false negative would silently drop a real intersection
+    /// and corrupt the boolean result.
+    ///
+    /// Loop-vertex sampling is essential because
+    /// [`Self::compute_bbox_and_centroid`] uses surface-UV sampling,
+    /// which for planar faces only covers the surface's `[0,1]²` UV
+    /// patch — a fixed 1×1 world-space region independent of the
+    /// actual face extent. A face larger than a unit square would
+    /// produce a bbox biased toward the surface origin and miss its
+    /// true world bounds entirely.
+    ///
+    /// Returns `None` only when every loop vertex AND every UV sample
+    /// fails to evaluate. Callers should treat `None` as "do not prune;
+    /// fall back to brute-force inclusion" (use [`BBox::INFINITE`]).
+    pub fn bbox(
+        &self,
+        loop_store: &LoopStore,
+        edge_store: &EdgeStore,
+        vertex_store: &VertexStore,
+        surface_store: &SurfaceStore,
+    ) -> Option<BBox> {
+        let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut any_sample = false;
+
+        // Loop-vertex sampling: walk every outer + inner loop and
+        // accumulate vertex positions.
+        for loop_id in self.all_loops() {
+            let Some(loop_) = loop_store.get(loop_id) else { continue };
+            let Ok(vertex_ids) = loop_.vertices_cached(edge_store) else { continue };
+            for vid in vertex_ids {
+                let Some(vertex) = vertex_store.get(vid) else { continue };
+                let p = vertex.position;
+                min.x = min.x.min(p[0]);
+                min.y = min.y.min(p[1]);
+                min.z = min.z.min(p[2]);
+                max.x = max.x.max(p[0]);
+                max.y = max.y.max(p[1]);
+                max.z = max.z.max(p[2]);
+                any_sample = true;
+            }
+        }
+
+        // Surface-sample sampling: captures interior bulges on curved
+        // surfaces that loop vertices alone miss (the loop sits on the
+        // boundary; a hemisphere's apex is interior). Skipped for
+        // planar surfaces — the loop is exact.
+        let is_planar = surface_store
+            .get(self.surface_id)
+            .map(|s| matches!(s.surface_type(), SurfaceType::Plane))
+            .unwrap_or(false);
+        if !is_planar {
+            if let Ok((s_min, s_max, _)) = self.compute_bbox_and_centroid(surface_store, 64) {
+                if s_min.x.is_finite() && s_max.x.is_finite() {
+                    min.x = min.x.min(s_min.x);
+                    min.y = min.y.min(s_min.y);
+                    min.z = min.z.min(s_min.z);
+                    max.x = max.x.max(s_max.x);
+                    max.y = max.y.max(s_max.y);
+                    max.z = max.z.max(s_max.z);
+                    any_sample = true;
+                }
+            }
+        }
+
+        if !any_sample || !min.x.is_finite() || !max.x.is_finite() {
+            return None;
+        }
+
+        // 1% relative + 1e-6 absolute margin. Relative term covers
+        // curved-surface sample-grid undershoot between grid points;
+        // absolute term handles near-zero-extent (seam-edge) faces.
+        let extent = (max - min).magnitude();
+        let pad = (extent * 0.01).max(1e-6);
+        Some(BBox::new_validated(min, max).expand(pad))
     }
 
     /// Compute accurate surface area using parametric integration

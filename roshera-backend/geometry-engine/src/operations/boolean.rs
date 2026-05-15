@@ -41,7 +41,7 @@
 
 use super::lifecycle::{self, OpSpec};
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Matrix3, Point3, Tolerance, Vector3};
+use crate::math::{bbox::BBox, Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Curve, CurveId},
     edge::{Edge, EdgeId},
@@ -52,6 +52,7 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::VertexId,
 };
+use crate::spatial::{RstarIndex, SpatialIndex};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -430,7 +431,37 @@ pub fn boolean_operation(
     })
 }
 
-/// Compute all face-face intersections between two solids
+/// Below this face-pair count, brute-force iteration beats the cost of
+/// building a throwaway `RstarIndex`. Empirically the break-even on
+/// modern x86 sits around 6×6 = 36 to 10×10 = 100 face pairs; 64 is the
+/// conservative midpoint that never regresses small-N booleans (two
+/// boxes = 36 pairs stays on the brute path) while still pruning every
+/// cylinder-vs-cylinder, sphere-vs-sphere, or filleted-assembly case
+/// where N × M ≫ 100.
+const BROAD_PHASE_PAIR_THRESHOLD: usize = 64;
+
+/// Compute all face-face intersections between two solids.
+///
+/// # Broad-phase pruning
+///
+/// For sufficiently large face counts (above
+/// [`BROAD_PHASE_PAIR_THRESHOLD`]), face-pair candidates are first
+/// filtered through an [`RstarIndex`] keyed on each face's
+/// AABB ([`Face::bbox`]). Only pairs whose conservative bboxes
+/// intersect are passed to the narrow-phase [`intersect_faces`].
+///
+/// The bbox is grown by a small relative margin in [`Face::bbox`] so
+/// the filter is conservative: a touching boolean (faces sharing only
+/// a coincident plane) survives the broad phase and proceeds to the
+/// coplanar-imprint path. Below the threshold the legacy O(|A| × |B|)
+/// brute-force loop is used unchanged — index construction cost
+/// dominates savings at small N.
+///
+/// The `pair_curves_by_type` diagnostic histogram counts only pairs
+/// that survive the broad phase, i.e. pairs the narrow phase actually
+/// evaluated. The pruned count is logged separately so a regression in
+/// bbox tightness (false negatives) or topology (drifted face extents)
+/// shows up as a sudden swing in survivor ratio.
 fn compute_face_intersections(
     model: &mut BRepModel,
     solid_a: SolidId,
@@ -443,64 +474,112 @@ fn compute_face_intersections(
     let faces_a = get_solid_faces(model, solid_a)?;
     let faces_b = get_solid_faces(model, solid_b)?;
 
-    // Test all face pairs for intersection
+    // Broad-phase: build an `RstarIndex` over `faces_b`, then for each
+    // `face_a` query the index for `face_b` candidates whose bboxes
+    // intersect. Below threshold we keep the brute-force loop —
+    // building the index would cost more than it saves.
+    //
+    // `Face::bbox` returns `Option<BBox>`. When it returns `None`
+    // (degenerate surface, every UV sample failed), we cannot prune
+    // safely — fall back to brute-force inclusion for that face by
+    // marking its bbox as `BBox::INFINITE`, which intersects every
+    // candidate envelope so the broad phase becomes a passthrough.
+    let total_pairs = faces_a.len() * faces_b.len();
+    let use_broad_phase = total_pairs > BROAD_PHASE_PAIR_THRESHOLD;
+
+    let bbox_for = |model: &BRepModel, face_id: FaceId| -> BBox {
+        model
+            .faces
+            .get(face_id)
+            .and_then(|f| f.bbox(&model.loops, &model.edges, &model.vertices, &model.surfaces))
+            .unwrap_or(BBox::INFINITE)
+    };
+
+    let candidate_pairs: Vec<(FaceId, FaceId)> = if use_broad_phase {
+        let index: RstarIndex<FaceId> = RstarIndex::bulk_load(
+            faces_b.iter().map(|&fb| (fb, bbox_for(model, fb))),
+        );
+        let mut pairs = Vec::new();
+        for &face_a in &faces_a {
+            let query = bbox_for(model, face_a);
+            for face_b in index.query_aabb(query) {
+                pairs.push((face_a, face_b));
+            }
+        }
+        pairs
+    } else {
+        let mut pairs = Vec::with_capacity(total_pairs);
+        for &face_a in &faces_a {
+            for &face_b in &faces_b {
+                pairs.push((face_a, face_b));
+            }
+        }
+        pairs
+    };
+
+    let tested_pairs = candidate_pairs.len();
+    let pruned_pairs = total_pairs.saturating_sub(tested_pairs);
+
+    // Test surviving face pairs for intersection
     let mut pair_curves_by_type: HashMap<String, (usize, usize)> = HashMap::new();
-    for &face_a in &faces_a {
-        for &face_b in &faces_b {
-            // Capture surface-type pair for the diagnostic histogram, BEFORE
-            // calling `intersect_faces` (which takes &mut model).
-            let pair_key = {
-                let ta = model
-                    .faces
-                    .get(face_a)
-                    .and_then(|f| model.surfaces.get(f.surface_id))
-                    .map(|s| format!("{:?}", s.surface_type()))
-                    .unwrap_or_else(|| "?".into());
-                let tb = model
-                    .faces
-                    .get(face_b)
-                    .and_then(|f| model.surfaces.get(f.surface_id))
-                    .map(|s| format!("{:?}", s.surface_type()))
-                    .unwrap_or_else(|| "?".into());
-                if ta <= tb {
-                    format!("{}-{}", ta, tb)
-                } else {
-                    format!("{}-{}", tb, ta)
-                }
-            };
-            let entry = pair_curves_by_type.entry(pair_key.clone()).or_insert((0, 0));
-            entry.0 += 1; // pairs tested
-            let result = intersect_faces(model, face_a, face_b, options)?;
-            if pipeline_trace_enabled() {
-                match &result {
-                    Some(fi) => eprintln!(
-                        "  tested face_a={} face_b={} types={} → curves={} cop_a={} cop_b={}",
-                        face_a, face_b, pair_key, fi.curves.len(),
-                        fi.coplanar_curves_a.len(), fi.coplanar_curves_b.len(),
-                    ),
-                    None => eprintln!(
-                        "  tested face_a={} face_b={} types={} → None",
-                        face_a, face_b, pair_key,
-                    ),
-                }
+    for (face_a, face_b) in candidate_pairs {
+        // Capture surface-type pair for the diagnostic histogram, BEFORE
+        // calling `intersect_faces` (which takes &mut model).
+        let pair_key = {
+            let ta = model
+                .faces
+                .get(face_a)
+                .and_then(|f| model.surfaces.get(f.surface_id))
+                .map(|s| format!("{:?}", s.surface_type()))
+                .unwrap_or_else(|| "?".into());
+            let tb = model
+                .faces
+                .get(face_b)
+                .and_then(|f| model.surfaces.get(f.surface_id))
+                .map(|s| format!("{:?}", s.surface_type()))
+                .unwrap_or_else(|| "?".into());
+            if ta <= tb {
+                format!("{}-{}", ta, tb)
+            } else {
+                format!("{}-{}", tb, ta)
             }
-            if let Some(intersection) = result {
-                entry.1 += intersection.curves.len(); // curves produced
-                intersections.push(intersection);
+        };
+        let entry = pair_curves_by_type.entry(pair_key.clone()).or_insert((0, 0));
+        entry.0 += 1; // pairs tested
+        let result = intersect_faces(model, face_a, face_b, options)?;
+        if pipeline_trace_enabled() {
+            match &result {
+                Some(fi) => eprintln!(
+                    "  tested face_a={} face_b={} types={} → curves={} cop_a={} cop_b={}",
+                    face_a, face_b, pair_key, fi.curves.len(),
+                    fi.coplanar_curves_a.len(), fi.coplanar_curves_b.len(),
+                ),
+                None => eprintln!(
+                    "  tested face_a={} face_b={} types={} → None",
+                    face_a, face_b, pair_key,
+                ),
             }
+        }
+        if let Some(intersection) = result {
+            entry.1 += intersection.curves.len(); // curves produced
+            intersections.push(intersection);
         }
     }
 
     // Diagnostic: how many curves did each surface-type pair produce?
     // The "0 curves" rows reveal which pair (e.g. Plane-Sphere) silently
-    // failed to generate cutting curves.
+    // failed to generate cutting curves. Broad-phase stats (total /
+    // tested / pruned) reveal pruning effectiveness.
     let mut summary: Vec<(String, (usize, usize))> = pair_curves_by_type.into_iter().collect();
     summary.sort_by(|a, b| a.0.cmp(&b.0));
     debug!(
         target: "geometry_engine::boolean",
-        "compute_face_intersections: faces_a={} faces_b={} → {} intersections; pair-stats: {}",
+        "compute_face_intersections: faces_a={} faces_b={} pairs={}/{}/pruned={} → {} intersections; pair-stats: {}",
         faces_a.len(),
         faces_b.len(),
+        tested_pairs,
+        total_pairs,
+        pruned_pairs,
         intersections.len(),
         summary
             .iter()

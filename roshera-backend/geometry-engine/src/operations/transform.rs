@@ -14,7 +14,7 @@ use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::{
     edge::EdgeId, face::FaceId, solid::SolidId, topology_builder::BRepModel, vertex::VertexId,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Options for transform operations
 #[derive(Debug, Clone)]
@@ -72,7 +72,19 @@ fn transform_solid_body(
     let solid = solid_id;
 
     // Get all entities in solid
-    let entities = get_solid_entities(model, solid)?;
+    let mut entities = get_solid_entities(model, solid)?;
+
+    // Detach this solid's vertices from any other solid that happens to
+    // share them. `VertexStore::add_or_find` is the canonical primitive-
+    // construction primitive and deduplicates coincident positions; two
+    // primitives built at the same coordinates (e.g. two `create_box_3d`
+    // calls at the origin) silently share their corner vertices. An
+    // in-place transform would then mutate the foreign solid's geometry
+    // — see `tests/spatial_broad_phase_pruning.rs::disjoint_unit_boxes_*`
+    // for the regression that exposed this. Cloning the shared vertices
+    // (and rewriting this solid's edge endpoints to reference the
+    // clones) contains the transform to the target topology.
+    isolate_shared_topology(model, solid, &mut entities)?;
 
     // Transform vertices
     transform_vertices(model, &entities.vertices, &transform)?;
@@ -407,6 +419,115 @@ fn transform_surfaces(
             return Err(OperationError::InvalidGeometry(format!(
                 "transform_surfaces: surface {surface_id} not found in store"
             )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Detach a target solid's vertices from any other solid that shares them.
+///
+/// Primitive constructors (`create_box_3d`, `create_cylinder_3d`, polygon
+/// builders, …) deduplicate coincident vertex positions through
+/// [`VertexStore::add_or_find`]. The dedup is correct within a single
+/// primitive — a polygon's closing edge must reuse the start vertex
+/// rather than introducing a hairline gap — but it spans primitives,
+/// so two coincidentally-placed builds (e.g. two boxes constructed at
+/// the origin before one is translated away) silently share their
+/// corner vertices.
+///
+/// An in-place `transform_solid` on either share-holder then walks
+/// the shared vertex set via `get_solid_entities` and mutates the
+/// positions, corrupting the foreign solid's loops. Symptoms surface
+/// as misclassified faces in boolean ops, broken bbox queries, and
+/// non-manifold output meshes.
+///
+/// The fix is to clone every shared vertex before the transform fires,
+/// rewrite *this* solid's edge endpoints to point at the clones, and
+/// update the entity snapshot so the downstream `transform_vertices`
+/// call mutates only the cloned vertices. The foreign solid retains
+/// the originals, untouched.
+///
+/// Edges and curves are not shared cross-primitive (each
+/// `create_*` site calls `EdgeStore::add` / `CurveStore::add`, not
+/// `add_or_find`), so they do not require an analogous pass.
+fn isolate_shared_topology(
+    model: &mut BRepModel,
+    target_solid: SolidId,
+    target_entities: &mut SolidEntities,
+) -> OperationResult<()> {
+    // Snapshot the IDs of every *other* solid up front so we can release
+    // the immutable borrow on `model.solids` before re-borrowing through
+    // `get_solid_entities`.
+    let other_solid_ids: Vec<SolidId> = model
+        .solids
+        .iter()
+        .filter_map(|(id, _)| (id != target_solid).then_some(id))
+        .collect();
+
+    if other_solid_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut foreign_vertices: HashSet<VertexId> = HashSet::new();
+    for other_id in other_solid_ids {
+        // A foreign solid may itself have inconsistent topology (e.g.
+        // a partly-built scratch solid mid-operation); tolerate that
+        // by skipping rather than aborting the transform.
+        if let Ok(other) = get_solid_entities(model, other_id) {
+            foreign_vertices.extend(other.vertices);
+        }
+    }
+
+    if foreign_vertices.is_empty() {
+        return Ok(());
+    }
+
+    // Identify which of this solid's vertices are also referenced by
+    // some foreign solid.
+    let shared: Vec<VertexId> = target_entities
+        .vertices
+        .iter()
+        .copied()
+        .filter(|v| foreign_vertices.contains(v))
+        .collect();
+
+    if shared.is_empty() {
+        return Ok(());
+    }
+
+    // Clone each shared vertex at its current position and build the
+    // old → new remap.
+    let mut remap: HashMap<VertexId, VertexId> = HashMap::with_capacity(shared.len());
+    for old_id in shared {
+        let pos = model.vertices.get_position(old_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "isolate_shared_topology: vertex {old_id} not found in store"
+            ))
+        })?;
+        let new_id = model.vertices.add(pos[0], pos[1], pos[2]);
+        remap.insert(old_id, new_id);
+    }
+
+    // Rewrite this solid's edge endpoints to reference the cloned vertices.
+    for &edge_id in &target_entities.edges {
+        let Some(edge) = model.edges.get_mut(edge_id) else {
+            continue;
+        };
+        if let Some(&new_s) = remap.get(&edge.start_vertex) {
+            edge.start_vertex = new_s;
+        }
+        if let Some(&new_e) = remap.get(&edge.end_vertex) {
+            edge.end_vertex = new_e;
+        }
+    }
+
+    // Update the entity snapshot so `transform_vertices` mutates the
+    // clones rather than the originals (which now belong solely to the
+    // foreign solid).
+    for v in target_entities.vertices.iter_mut() {
+        if let Some(&new_id) = remap.get(v) {
+            *v = new_id;
         }
     }
 
