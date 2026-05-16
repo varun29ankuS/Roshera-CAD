@@ -48,7 +48,8 @@ use geometry_engine::assembly::{
 };
 use geometry_engine::math::{Matrix4, Point3, Quaternion, Vector3};
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
-use geometry_engine::primitives::topology_builder::BRepModel;
+use geometry_engine::primitives::topology_builder::{BRepModel, TopologyBuilder};
+use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -318,11 +319,46 @@ pub struct AddComponentRequest {
     pub name: String,
     /// Optional 4×4 row-major transform. Defaults to identity.
     pub transform: Option<[[f64; 4]; 4]>,
+    /// Optional primitive geometry to seed the component's BRepModel.
+    /// When omitted the component is created with an empty model
+    /// (caller is expected to bind a part later via a future
+    /// part-registry slice). The primitive is built in the
+    /// component's *local* frame; the world pose is the `transform`.
+    pub primitive: Option<ComponentPrimitive>,
+}
+
+/// Primitive geometry kinds accepted by `add_component`. Externally
+/// tagged on the wire (`{ "type": "Box", "dx": 10, ... }`) so the
+/// TypeScript client can dispatch on the tag directly. `Serialize`
+/// is derived so the timeline `RecordedOperation` parameter dump
+/// round-trips the primitive descriptor exactly as it came in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ComponentPrimitive {
+    Box { dx: f64, dy: f64, dz: f64 },
+    Cylinder { radius: f64, height: f64 },
+    Sphere { radius: f64 },
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AddComponentResponse {
     pub component_id: Uuid,
+}
+
+/// Wire form of a tessellated component mesh — same shape Three.js
+/// expects on `BufferGeometry.setAttribute`/`setIndex`. Flattened
+/// positions/normals (3 floats per vertex) and an indices buffer
+/// (3 indices per triangle).
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentMeshResponse {
+    pub component_id: Uuid,
+    pub vertices: Vec<f32>,
+    pub normals: Vec<f32>,
+    pub indices: Vec<u32>,
+    /// Triangle count = `indices.len() / 3`; surfaced so the client
+    /// can short-circuit empty-component renders without a length
+    /// check on the buffer.
+    pub triangle_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -448,14 +484,66 @@ pub async fn add_component(
     }
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let mut guard = handle.write().await;
-    // Fresh empty BRepModel — the part-binding slice will hand the
-    // component a real model once part registry is wired (#23.B). The
-    // mate solver and transform pipeline don't read from the part at
-    // all, so empty is the right placeholder rather than a stub.
-    let part = Arc::new(BRepModel::new());
+    // Snapshot the existing-component count BEFORE adding the new
+    // component. When the caller doesn't supply a transform we use
+    // this to space new components along +X so they don't pile up
+    // at the origin (overlapping geometry buries the transform
+    // gizmo handles, making the assembly unusable in the viewport).
+    let existing_count = guard.components().count();
+    // Build the component's BRepModel. If the caller passed a
+    // primitive, materialise it via `TopologyBuilder`; otherwise the
+    // model stays empty (legacy behaviour — caller binds a part
+    // later). The primitive is built in the component's local frame
+    // at the origin; the world pose lives in `transform`.
+    let mut model = BRepModel::new();
+    if let Some(primitive) = req.primitive.clone() {
+        let mut builder = TopologyBuilder::new(&mut model);
+        match primitive {
+            ComponentPrimitive::Box { dx, dy, dz } => {
+                builder.create_box_3d(dx, dy, dz).map_err(|e| {
+                    ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+                })?;
+            }
+            ComponentPrimitive::Cylinder { radius, height } => {
+                builder
+                    .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)
+                    .map_err(|e| {
+                        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+                    })?;
+            }
+            ComponentPrimitive::Sphere { radius } => {
+                builder
+                    .create_sphere_3d(Point3::ORIGIN, radius)
+                    .map_err(|e| {
+                        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+                    })?;
+            }
+        }
+    }
+    let part = Arc::new(model);
     let name = req.name.clone();
     let cid = guard.add_part(part, req.name);
-    if let Some(t) = req.transform {
+    // Caller-supplied transform wins. Otherwise, if this assembly
+    // already had components, lay the new one down at +X = N * 30mm
+    // so its geometry doesn't fully overlap an existing component.
+    // 30mm is intentionally larger than the default-primitive bounds
+    // (10mm box, 5mm cylinder/sphere radius) coming from
+    // AddComponentDialog so the visible gap is unambiguous.
+    let applied_transform: Option<[[f64; 4]; 4]> = match req.transform {
+        Some(t) => Some(t),
+        None if existing_count > 0 => {
+            let offset = existing_count as f64 * 30.0;
+            let mut m = [[0.0_f64; 4]; 4];
+            m[0][0] = 1.0;
+            m[1][1] = 1.0;
+            m[2][2] = 1.0;
+            m[3][3] = 1.0;
+            m[0][3] = offset;
+            Some(m)
+        }
+        None => None,
+    };
+    if let Some(t) = applied_transform {
         guard
             .set_component_transform(cid, array_to_matrix(t))
             .map_err(map_kernel_err)?;
@@ -465,13 +553,73 @@ pub async fn add_component(
         RecordedOperation::new("assembly.add_component")
             .with_parameters(serde_json::json!({
                 "name": name,
-                "transform": req.transform,
+                "transform": applied_transform,
+                "primitive": req.primitive,
             }))
             .with_input_assembly(id)
             .with_output_component(cid.0),
     );
     Ok(Json(AddComponentResponse {
         component_id: cid.0,
+    }))
+}
+
+/// Tessellate a single component's BRepModel into a Three.js-shaped
+/// mesh payload. The mesh is delivered in the component's *local*
+/// frame; the client applies the per-component transform on its
+/// Object3D — that way solver / transform updates only require a
+/// matrix push on the existing mesh, not a re-fetch.
+///
+/// Returns an empty mesh (vertex/index/triangle counts = 0) when the
+/// component carries no solids (e.g. fresh `add_component` without a
+/// primitive payload). 404 only when the assembly or component id is
+/// unknown.
+pub async fn get_component_mesh(
+    State(state): State<AppState>,
+    Path((id, comp)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ComponentMeshResponse>, ApiError> {
+    let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
+    let guard = handle.read().await;
+    let component = guard
+        .get_component(ComponentId(comp))
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::SolidNotFound,
+                format!("component {} not found in assembly {}", comp, id),
+            )
+        })?;
+    let params = TessellationParams::default();
+    // Single canonical buffer per component — every solid in the
+    // BRepModel contributes triangles to the same flat
+    // positions/normals/indices arrays, indices rebased per-solid so
+    // the caller can upload a single BufferGeometry.
+    let mut vertices: Vec<f32> = Vec::new();
+    let mut normals: Vec<f32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for (_, solid) in component.part.solids.iter() {
+        let mesh = tessellate_solid(solid, &component.part, &params);
+        let base = (vertices.len() / 3) as u32;
+        for v in &mesh.vertices {
+            vertices.push(v.position.x as f32);
+            vertices.push(v.position.y as f32);
+            vertices.push(v.position.z as f32);
+            normals.push(v.normal.x as f32);
+            normals.push(v.normal.y as f32);
+            normals.push(v.normal.z as f32);
+        }
+        for tri in &mesh.triangles {
+            indices.push(base + tri[0]);
+            indices.push(base + tri[1]);
+            indices.push(base + tri[2]);
+        }
+    }
+    let triangle_count = indices.len() / 3;
+    Ok(Json(ComponentMeshResponse {
+        component_id: comp,
+        vertices,
+        normals,
+        indices,
+        triangle_count,
     }))
 }
 

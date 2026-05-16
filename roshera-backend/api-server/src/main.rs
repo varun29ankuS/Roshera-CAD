@@ -5377,6 +5377,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::patch(assembly_mgr::set_component_transform),
         )
         .route(
+            "/api/assemblies/{id}/components/{comp}/mesh",
+            get(assembly_mgr::get_component_mesh),
+        )
+        .route(
             "/api/assemblies/{id}/references",
             post(assembly_mgr::register_mate_reference),
         )

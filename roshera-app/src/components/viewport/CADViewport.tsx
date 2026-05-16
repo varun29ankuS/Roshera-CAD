@@ -8,6 +8,7 @@ import { CameraController } from './CameraController'
 import { Datums } from './Datums'
 import { SceneObjects } from './SceneObjects'
 import { TransformGizmo } from './TransformGizmo'
+import { AssemblyTransformGizmo } from './AssemblyTransformGizmo'
 import { ExtrudeGizmo } from './ExtrudeGizmo'
 import { SelectionOutline } from './SelectionOutline'
 import { SubElementHighlight } from './SubElementHighlight'
@@ -16,7 +17,10 @@ import { ViewportContextMenu } from './ViewportContextMenu'
 import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { SketchOverlay } from './SketchOverlay'
 import { SketchPanel } from '@/components/panels/SketchPanel'
+import { MateSuggestionPopover } from '@/components/panels/MateSuggestionPopover'
 import { isStandardPlane, useSceneStore, type SketchPlane } from '@/stores/scene-store'
+import { useAssemblyStore } from '@/stores/assembly-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 import type * as THREE from 'three'
 
 export function CADViewport() {
@@ -54,6 +58,10 @@ export function CADViewport() {
 
   const handlePointerMissed = useCallback(() => {
     deselectAll()
+    // An empty-space click during a mate-pick flow is the cleanest
+    // "cancel" gesture in the SolidWorks / Fusion vocabulary — drop
+    // both legs of the pending mate so the next pick starts fresh.
+    useAssemblyStore.getState().clearPendingMate()
   }, [deselectAll])
 
   // Suppress the browser's native context menu over the entire viewport
@@ -90,6 +98,7 @@ export function CADViewport() {
         <GizmoNav />
         <SceneObjects />
         <TransformGizmo />
+        <AssemblyTransformGizmo />
         <SubElementHighlight />
         <ModifyPreview />
         <ExtrudeGizmo />
@@ -103,11 +112,13 @@ export function CADViewport() {
       <SketchCoordReadout />
       <ViewportHints />
       <ModeBanner />
+      <MatePickHintBanner />
       <SectionViewPanel />
       <ViewportContextMenu />
       <ExtrudeHoverTooltip />
       <CSketchDofHud />
       <SketchPanel />
+      <MateSuggestionPopover />
     </div>
   )
 }
@@ -350,6 +361,59 @@ function ModeBanner() {
       >
         Exit
       </button>
+    </div>
+  )
+}
+
+/**
+ * Top-center hint banner specific to the assembly mate-pick flow.
+ *
+ * Shows whenever the user is in face selection mode while an assembly
+ * document is active. The banner tracks the two-stage pick state:
+ *
+ *   - No picks yet → "Click a face on component A".
+ *   - One pick captured → "Now pick a face on a different component"
+ *     plus a cancel button (also bound to Esc by the popover).
+ *
+ * When both legs are picked the `MateSuggestionPopover` takes over at
+ * the click site, so the banner hides itself. Pure presentational —
+ * reads `pendingMate` from the assembly store and exposes
+ * `clearPendingMate` as its only action.
+ */
+function MatePickHintBanner() {
+  const mode = useDocModeStore((s) => s.mode)
+  const selectionMode = useSceneStore((s) => s.selectionMode)
+  const pendingMate = useAssemblyStore((s) => s.pendingMate)
+  const clearPendingMate = useAssemblyStore((s) => s.clearPendingMate)
+
+  if (mode !== 'assembly') return null
+  if (selectionMode !== 'face') return null
+  // Once the second pick lands, the popover at the click site is the
+  // canonical surface; the banner gets out of the way.
+  if (pendingMate.ref2) return null
+
+  const stage = pendingMate.ref1 ? 'second' : 'first'
+  const title = stage === 'first' ? 'PICK FACE 1' : 'PICK FACE 2'
+  const hint =
+    stage === 'first'
+      ? 'Click a face on the first component'
+      : 'Click a face on a different component · Esc to cancel'
+
+  return (
+    <div className="absolute top-14 left-1/2 -translate-x-1/2 pointer-events-auto cad-panel px-4 py-2 flex items-center gap-3 text-[11px] uppercase tracking-wider">
+      <span className="w-2 h-2 rounded-full bg-foreground animate-pulse" />
+      <span className="text-foreground font-semibold">{title}</span>
+      <span className="text-muted-foreground">{hint}</span>
+      {stage === 'second' && (
+        <button
+          type="button"
+          onClick={clearPendingMate}
+          className="ml-2 px-2 py-0.5 border border-border/60 hover:border-border text-muted-foreground hover:text-foreground transition-colors"
+          title="Cancel mate pick (Esc)"
+        >
+          Cancel
+        </button>
+      )}
     </div>
   )
 }

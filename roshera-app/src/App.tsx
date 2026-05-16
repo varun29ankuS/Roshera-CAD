@@ -8,6 +8,7 @@ import { AIChatPanel } from '@/components/panels/AIChatPanel'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
+import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
 import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
 import { CommandPalette } from '@/components/CommandPalette'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
@@ -76,6 +77,8 @@ export function App() {
             sheet inspector. */}
         {docMode === 'drawing' ? (
           <DrawingsWorkspace />
+        ) : docMode === 'assembly' ? (
+          <AssemblyWorkspace />
         ) : (
           <>
             <ToolBar />

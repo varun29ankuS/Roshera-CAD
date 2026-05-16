@@ -168,7 +168,7 @@ export function CommandPalette() {
       drawing: 'Drawing',
       assembly: 'Assembly',
     }
-    for (const mode of ['part', 'drawing'] as DocumentMode[]) {
+    for (const mode of ['part', 'assembly', 'drawing'] as DocumentMode[]) {
       cmds.push({
         id: `workspace.${mode}`,
         label: `Switch to ${workspaceLabels[mode]}`,

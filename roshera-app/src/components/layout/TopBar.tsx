@@ -71,17 +71,16 @@ async function exportGeometry(format: string) {
 
 // Workspace switcher. Mirrors SolidWorks's File-menu pattern: the user
 // is *always* in a workspace; the chip on the right of the TopBar names
-// the current one and the dropdown lets you switch. Assembly is hidden
-// from the chooser until ASM1 lands a real workspace — the doc-mode
-// store still accepts it, but exposing a stub UI would be worse than
-// not exposing it at all.
+// the current one and the dropdown lets you switch. All three modes
+// (Modeling / Assembly / Drawing) are exposed now that the Assembly
+// workspace ships the mate editor + outliner shell.
 const WORKSPACE_LABELS: Record<DocumentMode, string> = {
   part: 'Modeling',
   assembly: 'Assembly',
   drawing: 'Drawing',
 }
 
-const WORKSPACE_CHOICES: DocumentMode[] = ['part', 'drawing']
+const WORKSPACE_CHOICES: DocumentMode[] = ['part', 'assembly', 'drawing']
 
 export function TopBar() {
   const clearScene = useSceneStore((s) => s.clearScene)
@@ -272,10 +271,8 @@ export function TopBar() {
         {/* Workspace switcher. Tucked into the right-side TopBar so
             it is reachable from anywhere but never competes with the
             primary File/Edit/View menus for attention. The dropdown
-            only renders the workspaces that are *currently usable*:
-            Modeling (always) and Drawing. Assembly is hidden until
-            ASM1 lands a real workspace (the store still accepts it,
-            so we won't paint over previously-persisted state). */}
+            renders every workspace the app currently ships — Modeling,
+            Assembly, and Drawing. */}
         <Menubar className="border-none bg-transparent h-7 px-0">
           <MenubarMenu>
             <MenubarTrigger

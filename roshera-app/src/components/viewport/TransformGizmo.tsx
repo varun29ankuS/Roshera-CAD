@@ -24,8 +24,17 @@ export function TransformGizmo() {
   // whole-object translate/rotate/scale gizmo render on top of those
   // produces overlapping affordances and stray rotation rings around a
   // face-extrude arrow. Restrict to `object` mode.
+  //
+  // Assembly components (scene-store ids prefixed `asm-comp:`) have
+  // their own gizmo (`AssemblyTransformGizmo`) that commits through
+  // `setComponentTransform` REST instead of the WS Transform command,
+  // so we bail here to keep the two paths from racing.
+  const isAssemblyComponent = selectedId?.startsWith('asm-comp:') ?? false
   const showGizmo =
-    selectedObj && activeTool !== 'select' && selectionMode === 'object'
+    selectedObj &&
+    activeTool !== 'select' &&
+    selectionMode === 'object' &&
+    !isAssemblyComponent
 
   const targetMesh = useMemo((): Object3D | null => {
     if (!selectedId) return null
