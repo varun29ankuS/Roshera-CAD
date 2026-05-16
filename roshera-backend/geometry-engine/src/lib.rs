@@ -3,6 +3,7 @@
 //! A high-performance boundary representation (B-Rep) engine for aerospace CAD applications.
 
 pub mod assembly;
+pub mod drawing;
 pub mod math;
 pub mod operations;
 pub mod performance;
