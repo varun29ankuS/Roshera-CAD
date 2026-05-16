@@ -2,7 +2,6 @@ import { useEffect, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
-import { DocumentModeTabs } from '@/components/layout/DocumentModeTabs'
 import { CADViewport } from '@/components/viewport/CADViewport'
 import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { AIChatPanel } from '@/components/panels/AIChatPanel'
@@ -61,9 +60,13 @@ export function App() {
   return (
     <div className="flex flex-col h-screen w-screen bg-background text-foreground select-none">
       <ViewportBridge />
+      {/* The active workspace (Modeling / Drawing / future Assembly) is
+          chosen from the right-side switcher in `TopBar`. We never
+          present the three as equal sibling tabs because they aren't —
+          Modeling is the dominant mode; Drawing is derived; Assembly
+          combines existing parts. Treating them as a top-level tab
+          strip implied otherwise. */}
       <TopBar />
-      {/* Top-level document-mode tabs (Part / Assembly / Drawing). */}
-      <DocumentModeTabs />
       <div className="flex flex-1 min-h-0">
         {/* The Drawing workspace replaces the 3D pipeline entirely:
             no ToolBar (modelling primitives are irrelevant in a 2D

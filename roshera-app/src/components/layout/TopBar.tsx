@@ -14,6 +14,7 @@ import {
 import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
+import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
 import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
 import { wsClient } from '@/lib/ws-client'
@@ -67,6 +68,20 @@ async function exportGeometry(format: string) {
   }
 }
 
+// Workspace switcher. Mirrors SolidWorks's File-menu pattern: the user
+// is *always* in a workspace; the chip on the right of the TopBar names
+// the current one and the dropdown lets you switch. Assembly is hidden
+// from the chooser until ASM1 lands a real workspace — the doc-mode
+// store still accepts it, but exposing a stub UI would be worse than
+// not exposing it at all.
+const WORKSPACE_LABELS: Record<DocumentMode, string> = {
+  part: 'Modeling',
+  assembly: 'Assembly',
+  drawing: 'Drawing',
+}
+
+const WORKSPACE_CHOICES: DocumentMode[] = ['part', 'drawing']
+
 export function TopBar() {
   const clearScene = useSceneStore((s) => s.clearScene)
   const setCameraPreset = useSceneStore((s) => s.setCameraPreset)
@@ -75,6 +90,8 @@ export function TopBar() {
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
   const selectionMode = useSceneStore((s) => s.selectionMode)
   const status = useWSStore((s) => s.status)
+  const docMode = useDocModeStore((s) => s.mode) ?? 'part'
+  const setDocMode = useDocModeStore((s) => s.setMode)
 
   const handleNewProject = useCallback(() => {
     clearScene()
@@ -231,6 +248,37 @@ export function TopBar() {
       <div className="flex-1" />
 
       <div className="flex items-center gap-2 px-2">
+        {/* Workspace switcher. Tucked into the right-side TopBar so
+            it is reachable from anywhere but never competes with the
+            primary File/Edit/View menus for attention. The dropdown
+            only renders the workspaces that are *currently usable*:
+            Modeling (always) and Drawing. Assembly is hidden until
+            ASM1 lands a real workspace (the store still accepts it,
+            so we won't paint over previously-persisted state). */}
+        <Menubar className="border-none bg-transparent h-7 px-0">
+          <MenubarMenu>
+            <MenubarTrigger
+              className="text-xs px-2 py-0.5 h-6 gap-1"
+              title="Switch workspace"
+            >
+              <span className="text-muted-foreground">Workspace:</span>
+              <span className="font-medium">{WORKSPACE_LABELS[docMode]}</span>
+              <span className="text-muted-foreground text-[10px]">▾</span>
+            </MenubarTrigger>
+            <MenubarContent align="end">
+              {WORKSPACE_CHOICES.map((m) => (
+                <MenubarItem
+                  key={m}
+                  onClick={() => setDocMode(m)}
+                  className={docMode === m ? 'bg-accent' : ''}
+                >
+                  {WORKSPACE_LABELS[m]}
+                </MenubarItem>
+              ))}
+            </MenubarContent>
+          </MenubarMenu>
+        </Menubar>
+
         <button
           onClick={useThemeStore.getState().toggleTheme}
           className="cad-icon-btn h-6 w-6"
