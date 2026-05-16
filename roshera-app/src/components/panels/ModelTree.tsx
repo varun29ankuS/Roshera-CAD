@@ -424,6 +424,65 @@ function sketchesToNodes(sketches: Map<string, ServerSketchSession>): TreeNode[]
     })
 }
 
+/**
+ * Index objects by the sketch id they were produced from. Each
+ * extrude / extrude_cut result carries
+ * `analyticalGeometry.params.sketch_id` (set by `extrude_sketch` in
+ * api-server/src/sketch.rs); we read it back so the tree can nest the
+ * source sketch *under* the resulting solid — the convention every
+ * mainstream CAD package uses and the explicit design intent recorded
+ * on `ExtrudeSketchBody.consume` (default `false` precisely so the
+ * sketch persists for re-edit).
+ *
+ * Returns a `sketchId -> ownerObjectId` map. Sketches that don't
+ * appear in this map are still in the "drawing" phase and render at
+ * root.
+ */
+function indexSketchOwners(objects: Map<string, CADObject>): Map<string, string> {
+  const owners = new Map<string, string>()
+  for (const obj of objects.values()) {
+    const params = obj.analyticalGeometry?.params as
+      | Record<string, unknown>
+      | undefined
+    const sketchId = params?.['sketch_id']
+    if (typeof sketchId === 'string' && sketchId.length > 0) {
+      // First writer wins — if a sketch was extruded, then later
+      // (re-)extruded into a second body, the original producer keeps
+      // the lineage badge so the tree shape stays stable across edits.
+      if (!owners.has(sketchId)) {
+        owners.set(sketchId, obj.id)
+      }
+    }
+  }
+  return owners
+}
+
+/**
+ * Walk a forest and graft owned sketches into the matching solid's
+ * children list. Pure function — returns a new forest, leaves the
+ * input nodes untouched so React's referential-equality reconciliation
+ * does the right thing on the unaffected branches.
+ */
+function nestSketchesUnderOwners(
+  nodes: TreeNode[],
+  sketchesByOwnerId: Map<string, TreeNode[]>,
+): TreeNode[] {
+  return nodes.map((node) => {
+    const nestedChildren = node.children
+      ? nestSketchesUnderOwners(node.children, sketchesByOwnerId)
+      : []
+    const owned = sketchesByOwnerId.get(node.id) ?? []
+    const merged = [...nestedChildren, ...owned]
+    if (merged.length === 0) {
+      // Preserve the original `children: undefined` shape so the
+      // expand arm renders as a leaf (`─`) instead of an empty
+      // collapsible.
+      return node
+    }
+    return { ...node, children: merged }
+  })
+}
+
 // ─── Build tree from local scene store (fallback) ───────────────────
 
 function sceneToNodes(
@@ -613,20 +672,46 @@ export function ModelTree({
   // Tree composition order (top → bottom):
   //   1. Datums  — canonical reference frame, listed first so users
   //      see "the world's axes" before any feature placed in it.
-  //   2. Sketches — sources users sketch *into*; visually grouped
-  //      above solids the way every CAD package's tree convention
-  //      does. Sketch-vs-feature lineage (which extrude consumed
-  //      which sketch) is the Features mode's job — Browser mode
-  //      stays a pure backend mirror with no synthesized children.
-  //   3. Bodies — backend assembly hierarchy when populated;
+  //   2. Bodies — backend assembly hierarchy when populated;
   //      otherwise a flat scene-store mirror of `ObjectCreated`
-  //      broadcasts (still backend-sourced, just unparented).
+  //      broadcasts. Each body that was produced from a sketch
+  //      (link via `analyticalGeometry.params.sketch_id`) has that
+  //      source sketch grafted as a child — mainstream CAD
+  //      convention, and the explicit reason
+  //      `ExtrudeSketchBody.consume` defaults to `false` server-side.
+  //   3. Standalone sketches — sessions that haven't been extruded
+  //      yet. Once extrusion runs they migrate under the resulting
+  //      body automatically on the next render.
   const localNodes = sceneToNodes(objects, objectOrder)
-  const sketchNodes = sketchesToNodes(serverSketches)
-  const objectNodes =
+  const allSketchNodes = sketchesToNodes(serverSketches)
+  const baseObjectNodes =
     backendNodes && backendNodes.length > 0 ? backendNodes : localNodes
   const datumNodes = datumsToNodes(datums)
-  const treeNodes = [...datumNodes, ...sketchNodes, ...objectNodes]
+
+  // Split sketches into "owned" (parent body exists in the scene) and
+  // "standalone" (still in the drawing / pre-extrude phase). The
+  // ownership index is built from the canonical scene-store object
+  // map regardless of which object source feeds the tree, because the
+  // `analyticalGeometry.params.sketch_id` link lives on every object
+  // broadcast and is the single source of lineage truth.
+  const sketchOwners = indexSketchOwners(objects)
+  const sketchesByOwnerId = new Map<string, TreeNode[]>()
+  const standaloneSketchNodes: TreeNode[] = []
+  for (const sketchNode of allSketchNodes) {
+    const ownerId = sketchOwners.get(sketchNode.id)
+    if (ownerId !== undefined) {
+      const existing = sketchesByOwnerId.get(ownerId)
+      if (existing) {
+        existing.push(sketchNode)
+      } else {
+        sketchesByOwnerId.set(ownerId, [sketchNode])
+      }
+    } else {
+      standaloneSketchNodes.push(sketchNode)
+    }
+  }
+  const objectNodes = nestSketchesUnderOwners(baseObjectNodes, sketchesByOwnerId)
+  const treeNodes = [...datumNodes, ...objectNodes, ...standaloneSketchNodes]
 
   const handleToggleVisibility = useCallback(
     (id: string) => {
