@@ -14,6 +14,7 @@ mod blend_failed_harness;
 mod branches;
 mod csketch;
 mod delta_handlers;
+mod drawing_mgr;
 mod error_catalog;
 mod fillet_payload;
 #[cfg(test)]
@@ -192,6 +193,11 @@ pub struct AppState {
     /// which owns the simpler project-tree DTOs from `shared-types`.
     /// See `assembly_mgr.rs`.
     pub assemblies: Arc<assembly_mgr::AssemblyManager>,
+    /// Drawing registry — 2D views projected from kernel solids,
+    /// SVG-renderable. Distinct lifecycle from assemblies; views
+    /// resolve solid ids against the active model at projection time.
+    /// See `drawing_mgr.rs`.
+    pub drawings: Arc<drawing_mgr::DrawingManager>,
     /// Multi-document Part registry. Each tab in the frontend
     /// addresses a distinct `BRepModel` owned by this manager. The
     /// legacy `model` field is the implicit "active part" until the
@@ -5143,6 +5149,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assemblies: Arc::new(assembly_mgr::AssemblyManager::with_recorder(
             timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
+        // Drawings share the same timeline recorder so view-add /
+        // view-remove events land on the active branch alongside
+        // every other kernel mutation. See drawing_mgr.rs.
+        drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(
+            timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+        )),
         // Per-tab Part manager. Shares the same `TimelineRecorder` so
         // kernel mutations in any open part land on the active
         // branch — see the note above on assemblies.
@@ -5384,6 +5396,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/assemblies/{id}/simulate",
             post(assembly_mgr::simulate_motion),
         )
+        // Kernel drawings — 2D projected views of solids, SVG export.
+        // Distinct from assemblies; see `drawing_mgr.rs`.
+        .route(
+            "/api/drawings",
+            post(drawing_mgr::create_drawing).get(drawing_mgr::list_drawings),
+        )
+        .route(
+            "/api/drawings/{id}",
+            get(drawing_mgr::get_drawing).delete(drawing_mgr::delete_drawing),
+        )
+        .route(
+            "/api/drawings/{id}/views",
+            post(drawing_mgr::add_view),
+        )
+        .route(
+            "/api/drawings/{id}/views/{view_id}",
+            delete(drawing_mgr::remove_view),
+        )
+        .route("/api/drawings/{id}/svg", get(drawing_mgr::export_svg))
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.
