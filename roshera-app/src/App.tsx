@@ -2,14 +2,17 @@ import { useEffect, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
+import { DocumentModeTabs } from '@/components/layout/DocumentModeTabs'
 import { CADViewport } from '@/components/viewport/CADViewport'
 import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { AIChatPanel } from '@/components/panels/AIChatPanel'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { Timeline } from '@/components/panels/Timeline'
+import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
 import { ViewportBridge } from '@/lib/viewport-bridge'
 
@@ -22,6 +25,10 @@ function isDemosRoute(): boolean {
 export function App() {
   useKeyboardShortcuts()
   const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
+  // Default to Part workspace when nothing has been chosen yet so the
+  // UI is never blank. The tab strip still mirrors the store so users
+  // can switch freely.
+  const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   const [browserOpen, setBrowserOpen] = useState(true)
   const [route, setRoute] = useState<'workspace' | 'demos'>(
     isDemosRoute() ? 'demos' : 'workspace',
@@ -55,34 +62,48 @@ export function App() {
     <div className="flex flex-col h-screen w-screen bg-background text-foreground select-none">
       <ViewportBridge />
       <TopBar />
+      {/* Top-level document-mode tabs (Part / Assembly / Drawing). */}
+      <DocumentModeTabs />
       <div className="flex flex-1 min-h-0">
-        <ToolBar />
+        {/* The Drawing workspace replaces the 3D pipeline entirely:
+            no ToolBar (modelling primitives are irrelevant in a 2D
+            sheet workspace), no PropertiesPanel, no Timeline strip.
+            The kernel still drives the projection; this pane is the
+            sheet inspector. */}
+        {docMode === 'drawing' ? (
+          <DrawingsWorkspace />
+        ) : (
+          <>
+            <ToolBar />
 
-        {/* Viewport + Fusion-style floating overlays */}
-        <div className="relative flex-1 overflow-hidden">
-          <CADViewport />
-          <AIChatPanel />
+            {/* Viewport + Fusion-style floating overlays */}
+            <div className="relative flex-1 overflow-hidden">
+              <CADViewport />
+              <AIChatPanel />
 
-          {/* Browser — single consolidated panel. The header chip is
-              always visible and acts as the collapse toggle; an
-              inline segmented control flips the body between the
-              assembly hierarchy ("parts") and the timeline-derived
-              feature tree ("features"). Only the header carries its
-              own outline, so the chip stays as an anchor even when
-              the tree is hidden. */}
-          <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] flex flex-col overflow-hidden">
-            <ModelTree
-              expanded={browserOpen}
-              onToggle={() => setBrowserOpen((open) => !open)}
-            />
-          </div>
-        </div>
+              {/* Browser — single consolidated panel. The header chip is
+                  always visible and acts as the collapse toggle; an
+                  inline segmented control flips the body between the
+                  assembly hierarchy ("parts") and the timeline-derived
+                  feature tree ("features"). Only the header carries its
+                  own outline, so the chip stays as an anchor even when
+                  the tree is hidden. */}
+              <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] flex flex-col overflow-hidden">
+                <ModelTree
+                  expanded={browserOpen}
+                  onToggle={() => setBrowserOpen((open) => !open)}
+                />
+              </div>
+            </div>
 
-        {/* Right panel: Properties (conditional) */}
-        {hasSelection && <PropertiesPanel />}
+            {/* Right panel: Properties (conditional) */}
+            {hasSelection && <PropertiesPanel />}
+          </>
+        )}
       </div>
-      {/* Timeline — horizontal strip, full width */}
-      <Timeline />
+      {/* Timeline — horizontal strip, full width. Hidden in Drawing
+          mode where the sheet *is* the work product. */}
+      {docMode !== 'drawing' && <Timeline />}
       <StatusBar />
     </div>
   )
