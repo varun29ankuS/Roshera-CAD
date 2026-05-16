@@ -1,7 +1,16 @@
-//! STEP file format support (ISO 10303)
+//! STEP file format writer (ISO 10303-21 export).
 //!
-//! Provides export and import functionality for the STEP format
-//! STEP AP203 (Configuration Controlled Design) and AP214 (Automotive Design)
+//! Builds an ASCII exchange structure for a `BRepModel` or `Assembly` and
+//! writes it to disk. Defaults to AP242 (Managed Model-Based 3D
+//! Engineering, MIM long-form). AP214 (Automotive Design) and AP203
+//! (Configuration Controlled Design) remain selectable through
+//! [`StepExportOptions::application_protocol`] for round-trip parity
+//! with legacy systems, but new Roshera exports always declare AP242.
+//!
+//! The import path is **not** in this module — see `super::mod` for the
+//! parser + dispatch architecture. This file is intentionally
+//! export-only so the writer can evolve independently of the importer
+//! (IMP5 in `plans/step-import-universal.md`).
 
 use crate::formats::ros_snapshot::BRepSnapshot;
 use chrono::{DateTime, Utc};
@@ -68,16 +77,32 @@ pub struct StepWriter<W: Write> {
     entity_counter: u32,
     /// Map from internal IDs to STEP entity IDs
     id_map: HashMap<Uuid, StepId>,
+    /// Application protocol declared in the FILE_SCHEMA header.
+    protocol: StepApplicationProtocol,
 }
 
 impl<W: Write> StepWriter<W> {
-    /// Create a new STEP writer
+    /// Create a new STEP writer targeting the default application
+    /// protocol (AP242).
     pub fn new(writer: W) -> Self {
+        Self::with_protocol(writer, StepApplicationProtocol::default())
+    }
+
+    /// Create a new STEP writer with an explicit application protocol.
+    /// The protocol drives the `FILE_SCHEMA` string emitted by
+    /// [`Self::write_header`].
+    pub fn with_protocol(writer: W, protocol: StepApplicationProtocol) -> Self {
         Self {
             writer: BufWriter::new(writer),
             entity_counter: 1,
             id_map: HashMap::new(),
+            protocol,
         }
+    }
+
+    /// The application protocol this writer declares in its header.
+    pub fn protocol(&self) -> StepApplicationProtocol {
+        self.protocol
     }
 
     /// Get the next entity ID
@@ -123,8 +148,15 @@ impl<W: Write> StepWriter<W> {
             header.authorization
         )?;
 
-        // FILE_SCHEMA
-        writeln!(self.writer, "FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));")?;
+        // FILE_SCHEMA — declares the application protocol of this
+        // exchange. Default is AP242 (Managed Model-Based 3D
+        // Engineering, MIM long-form); legacy AP214 / AP203 paths
+        // remain available via [`Self::with_protocol`].
+        writeln!(
+            self.writer,
+            "FILE_SCHEMA(('{}'));",
+            self.protocol.schema_name()
+        )?;
         writeln!(self.writer, "ENDSEC;")?;
 
         Ok(())
@@ -1221,66 +1253,11 @@ pub async fn export_assembly_to_step(
     Ok(())
 }
 
-/// Import B-Rep model from STEP format
-pub async fn import_step_to_brep(path: &Path) -> Result<BRepModel, ExportError> {
-    // Open file
-    let file = std::fs::File::open(path).map_err(|_| ExportError::ExportFailed {
-        reason: format!("Failed to read file: {}", path.to_string_lossy()),
-    })?;
-
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    // Check ISO header
-    let first_line = lines
-        .next()
-        .ok_or_else(|| ExportError::ExportFailed {
-            reason: "Empty STEP file".to_string(),
-        })?
-        .map_err(|e| ExportError::ExportFailed {
-            reason: format!("Failed to read STEP file: {}", e),
-        })?;
-
-    if !first_line.starts_with("ISO-10303-21") {
-        return Err(ExportError::ExportFailed {
-            reason: "Not a valid STEP file (missing ISO-10303-21 header)".to_string(),
-        });
-    }
-
-    // Parse all lines into a single buffer, stripping comments
-    let mut data_section = String::new();
-    let mut in_data = false;
-    for line_result in lines {
-        let line = line_result.map_err(|e| ExportError::ExportFailed {
-            reason: format!("Failed to read STEP file: {}", e),
-        })?;
-        let trimmed = line.trim();
-        if trimmed == "DATA;" {
-            in_data = true;
-            continue;
-        }
-        if trimmed == "ENDSEC;" && in_data {
-            break;
-        }
-        if in_data {
-            data_section.push_str(trimmed);
-            data_section.push(' ');
-        }
-    }
-
-    // Parse entities: #N=TYPE(...);
-    let entities = parse_step_entities(&data_section)?;
-
-    // Build B-Rep model from parsed entities
-    let model = reconstruct_brep_from_step(&entities)?;
-
-    Ok(model)
-}
-
 /// STEP export options
 #[derive(Debug, Clone)]
 pub struct StepExportOptions {
-    /// Application protocol to use (AP203 or AP214)
+    /// Application protocol to use (AP242, AP214, or AP203). Defaults
+    /// to AP242 — Roshera's canonical export protocol.
     pub application_protocol: StepApplicationProtocol,
     /// Include color information
     pub include_colors: bool,
@@ -1290,696 +1267,54 @@ pub struct StepExportOptions {
     pub tolerance: f64,
 }
 
-/// STEP application protocols
+/// STEP application protocols.
+///
+/// AP242 is the canonical Roshera export target. AP214 and AP203 are
+/// retained for compatibility with downstream tools that have not
+/// migrated yet; new code should leave the default in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepApplicationProtocol {
-    /// Configuration Controlled Design
+    /// AP203 — Configuration Controlled Design (legacy mechanical).
     AP203,
-    /// Automotive Design
+    /// AP214 — Core Data for Automotive Mechanical Design Processes
+    /// (legacy automotive).
     AP214,
+    /// AP242 — Managed Model-Based 3D Engineering, MIM long-form.
+    /// The default for all new exports.
+    AP242,
+}
+
+impl StepApplicationProtocol {
+    /// Schema name written into the STEP `FILE_SCHEMA` header for
+    /// this protocol. Matches the canonical short-form schema
+    /// identifier emitted by mainstream CAD systems (e.g. NX,
+    /// CATIA, SolidWorks).
+    pub fn schema_name(self) -> &'static str {
+        match self {
+            Self::AP203 => "CONFIG_CONTROL_DESIGN",
+            Self::AP214 => "AUTOMOTIVE_DESIGN",
+            Self::AP242 => "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF",
+        }
+    }
+}
+
+impl Default for StepApplicationProtocol {
+    fn default() -> Self {
+        // AP242 is Roshera's canonical export protocol.
+        Self::AP242
+    }
 }
 
 impl Default for StepExportOptions {
     fn default() -> Self {
         Self {
-            application_protocol: StepApplicationProtocol::AP203,
+            application_protocol: StepApplicationProtocol::default(),
             include_colors: true,
             include_layers: true,
             tolerance: 1e-6,
         }
     }
 }
-
-// ── STEP Import Parser ──────────────────────────────────────────────────────
-
-/// A parsed STEP entity with its type name and raw argument string
-#[derive(Debug, Clone)]
-struct StepEntity {
-    id: u32,
-    type_name: String,
-    args: String,
-}
-
-/// Parse all `#N=TYPE(...)` entities from the DATA section text
-fn parse_step_entities(data: &str) -> Result<HashMap<u32, StepEntity>, ExportError> {
-    let mut entities = HashMap::new();
-    // Regex-free parser: split on `;` then parse each statement
-    for statement in data.split(';') {
-        let stmt = statement.trim();
-        if stmt.is_empty() {
-            continue;
-        }
-        // Find #N=TYPE(...)
-        let Some(hash_pos) = stmt.find('#') else {
-            continue;
-        };
-        let after_hash = &stmt[hash_pos + 1..];
-        let Some(eq_pos) = after_hash.find('=') else {
-            continue;
-        };
-        let id_str = after_hash[..eq_pos].trim();
-        let Ok(id) = id_str.parse::<u32>() else {
-            continue;
-        };
-        let rhs = after_hash[eq_pos + 1..].trim();
-        // Find type name (everything before first '(')
-        let Some(paren_pos) = rhs.find('(') else {
-            continue;
-        };
-        let type_name = rhs[..paren_pos].trim().to_uppercase();
-        // Extract args between outermost parens
-        let args_start = paren_pos + 1;
-        // Find matching closing paren (handle nesting)
-        let mut depth = 1;
-        let mut args_end = args_start;
-        for (i, ch) in rhs[args_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        args_end = args_start + i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let args = rhs[args_start..args_end].to_string();
-        entities.insert(
-            id,
-            StepEntity {
-                id,
-                type_name,
-                args,
-            },
-        );
-    }
-    Ok(entities)
-}
-
-/// Parse a comma-separated list of f64 values from a STEP argument like "1.0,2.0,3.0"
-fn parse_real_list(s: &str) -> Vec<f64> {
-    s.split(',')
-        .filter_map(|v| v.trim().parse::<f64>().ok())
-        .collect()
-}
-
-/// Parse a STEP entity reference like "#123" into a u32 ID
-fn parse_ref(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if s.starts_with('#') {
-        s[1..].parse::<u32>().ok()
-    } else {
-        None
-    }
-}
-
-/// Parse a comma-separated list of STEP references like "#1,#2,#3"
-fn parse_ref_list(s: &str) -> Vec<u32> {
-    s.split(',').filter_map(|v| parse_ref(v)).collect()
-}
-
-/// Split top-level comma-separated args (respecting nested parens)
-fn split_step_args(args: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut depth = 0;
-    let mut current = String::new();
-    for ch in args.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                result.push(current.trim().to_string());
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    let last = current.trim().to_string();
-    if !last.is_empty() {
-        result.push(last);
-    }
-    result
-}
-
-/// Extract coordinates from a CARTESIAN_POINT entity
-fn extract_point(entities: &HashMap<u32, StepEntity>, id: u32) -> Option<[f64; 3]> {
-    let entity = entities.get(&id)?;
-    if entity.type_name != "CARTESIAN_POINT" {
-        return None;
-    }
-    let args = split_step_args(&entity.args);
-    // args[0] = name string, args[1] = (x,y,z)
-    if args.len() < 2 {
-        return None;
-    }
-    let coords_str = args[1].trim();
-    let coords_inner = coords_str
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(coords_str);
-    let vals = parse_real_list(coords_inner);
-    if vals.len() >= 3 {
-        Some([vals[0], vals[1], vals[2]])
-    } else if vals.len() == 2 {
-        Some([vals[0], vals[1], 0.0])
-    } else {
-        None
-    }
-}
-
-/// Extract direction from a DIRECTION entity
-fn extract_direction(entities: &HashMap<u32, StepEntity>, id: u32) -> Option<[f64; 3]> {
-    let entity = entities.get(&id)?;
-    if entity.type_name != "DIRECTION" {
-        return None;
-    }
-    let args = split_step_args(&entity.args);
-    if args.len() < 2 {
-        return None;
-    }
-    let coords_str = args[1].trim();
-    let coords_inner = coords_str
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(coords_str);
-    let vals = parse_real_list(coords_inner);
-    if vals.len() >= 3 {
-        Some([vals[0], vals[1], vals[2]])
-    } else {
-        None
-    }
-}
-
-/// Extract location and axis from AXIS2_PLACEMENT_3D
-fn extract_axis2_placement(
-    entities: &HashMap<u32, StepEntity>,
-    id: u32,
-) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
-    let entity = entities.get(&id)?;
-    if entity.type_name != "AXIS2_PLACEMENT_3D" {
-        return None;
-    }
-    let args = split_step_args(&entity.args);
-    // args: name, location_ref, axis_ref, ref_direction_ref
-    if args.len() < 2 {
-        return None;
-    }
-    let location = parse_ref(&args[1]).and_then(|r| extract_point(entities, r))?;
-    let axis = if args.len() > 2 {
-        parse_ref(&args[2])
-            .and_then(|r| extract_direction(entities, r))
-            .unwrap_or([0.0, 0.0, 1.0])
-    } else {
-        [0.0, 0.0, 1.0]
-    };
-    let ref_dir = if args.len() > 3 {
-        parse_ref(&args[3])
-            .and_then(|r| extract_direction(entities, r))
-            .unwrap_or([1.0, 0.0, 0.0])
-    } else {
-        [1.0, 0.0, 0.0]
-    };
-    Some((location, axis, ref_dir))
-}
-
-/// Reconstruct a BRepModel from parsed STEP entities
-fn reconstruct_brep_from_step(
-    entities: &HashMap<u32, StepEntity>,
-) -> Result<BRepModel, ExportError> {
-    use geometry_engine::math::{Point3, Tolerance, Vector3};
-    use geometry_engine::primitives::{
-        curve::ParameterRange,
-        edge::{Edge, EdgeOrientation},
-        face::FaceOrientation,
-        r#loop::{Loop, LoopType},
-        shell::{Shell, ShellType},
-        solid::Solid,
-    };
-
-    let mut model = BRepModel::new();
-    let tolerance = Tolerance::default();
-
-    // Type aliases for readability
-    type VertexId = geometry_engine::primitives::vertex::VertexId;
-    type CurveId = geometry_engine::primitives::curve::CurveId;
-    type SurfaceId = geometry_engine::primitives::surface::SurfaceId;
-    type EdgeId = geometry_engine::primitives::edge::EdgeId;
-    type LoopId = geometry_engine::primitives::r#loop::LoopId;
-    type FaceId = geometry_engine::primitives::face::FaceId;
-    type ShellId = geometry_engine::primitives::shell::ShellId;
-
-    // Map from STEP entity ID -> internal store ID for each entity type
-    let mut vertex_id_map: HashMap<u32, VertexId> = HashMap::new();
-    let mut curve_id_map: HashMap<u32, CurveId> = HashMap::new();
-    let mut surface_id_map: HashMap<u32, SurfaceId> = HashMap::new();
-    let mut edge_id_map: HashMap<u32, EdgeId> = HashMap::new();
-
-    // Pass 1: Import CARTESIAN_POINTs as vertices
-    for (&step_id, entity) in entities {
-        if entity.type_name == "CARTESIAN_POINT" {
-            if let Some(coords) = extract_point(entities, step_id) {
-                let vid = model.vertices.add_or_find(
-                    coords[0],
-                    coords[1],
-                    coords[2],
-                    tolerance.distance(),
-                );
-                vertex_id_map.insert(step_id, vid);
-            }
-        }
-    }
-
-    // Pass 2: Import curves (LINE, CIRCLE, B_SPLINE_CURVE_WITH_KNOTS)
-    for (&step_id, entity) in entities {
-        match entity.type_name.as_str() {
-            "LINE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 3 {
-                    if let Some(start_ref) = parse_ref(&args[1]) {
-                        if let Some(start_pt) = extract_point(entities, start_ref) {
-                            // Create a line curve
-                            let p1 = Point3::new(start_pt[0], start_pt[1], start_pt[2]);
-                            let line = geometry_engine::primitives::curve::Line::new(
-                                p1,
-                                // Direction from VECTOR entity
-                                Vector3::new(1.0, 0.0, 0.0), // default, refined below
-                            );
-                            // Try to extract actual direction from the vector ref
-                            if let Some(vec_ref) = parse_ref(&args[2]) {
-                                if let Some(vec_entity) = entities.get(&vec_ref) {
-                                    if vec_entity.type_name == "VECTOR" {
-                                        let vec_args = split_step_args(&vec_entity.args);
-                                        if vec_args.len() >= 2 {
-                                            if let Some(dir_ref) = parse_ref(&vec_args[1]) {
-                                                if let Some(dir) =
-                                                    extract_direction(entities, dir_ref)
-                                                {
-                                                    let line =
-                                                        geometry_engine::primitives::curve::Line::new(
-                                                            p1,
-                                                            Vector3::new(dir[0], dir[1], dir[2]),
-                                                        );
-                                                    let cid = model.curves.add(Box::new(line));
-                                                    curve_id_map.insert(step_id, cid);
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let cid = model.curves.add(Box::new(line));
-                            curve_id_map.insert(step_id, cid);
-                        }
-                    }
-                }
-            }
-            "CIRCLE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 3 {
-                    if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((center, normal, _ref_dir)) =
-                            extract_axis2_placement(entities, axis_ref)
-                        {
-                            if let Ok(radius) = args[2].trim().parse::<f64>() {
-                                let arc = geometry_engine::primitives::curve::Arc::new(
-                                    Point3::new(center[0], center[1], center[2]),
-                                    Vector3::new(normal[0], normal[1], normal[2]),
-                                    radius,
-                                    0.0,
-                                    std::f64::consts::TAU,
-                                );
-                                if let Ok(arc) = arc {
-                                    let cid = model.curves.add(Box::new(arc));
-                                    curve_id_map.insert(step_id, cid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Pass 3: Import surfaces (PLANE, CYLINDRICAL_SURFACE, SPHERICAL_SURFACE, etc.)
-    for (&step_id, entity) in entities {
-        match entity.type_name.as_str() {
-            "PLANE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 2 {
-                    if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((origin, normal, ref_dir)) =
-                            extract_axis2_placement(entities, axis_ref)
-                        {
-                            let plane = geometry_engine::primitives::surface::Plane::new(
-                                Point3::new(origin[0], origin[1], origin[2]),
-                                Vector3::new(normal[0], normal[1], normal[2]),
-                                Vector3::new(ref_dir[0], ref_dir[1], ref_dir[2]),
-                            );
-                            if let Ok(plane) = plane {
-                                let sid = model.surfaces.add(Box::new(plane));
-                                surface_id_map.insert(step_id, sid);
-                            }
-                        }
-                    }
-                }
-            }
-            "CYLINDRICAL_SURFACE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 3 {
-                    if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((origin, axis, _)) = extract_axis2_placement(entities, axis_ref)
-                        {
-                            if let Ok(radius) = args[2].trim().parse::<f64>() {
-                                let cyl = geometry_engine::primitives::surface::Cylinder::new(
-                                    Point3::new(origin[0], origin[1], origin[2]),
-                                    Vector3::new(axis[0], axis[1], axis[2]),
-                                    radius,
-                                );
-                                if let Ok(cyl) = cyl {
-                                    let sid = model.surfaces.add(Box::new(cyl));
-                                    surface_id_map.insert(step_id, sid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "SPHERICAL_SURFACE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 3 {
-                    if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((center, _, _)) = extract_axis2_placement(entities, axis_ref) {
-                            if let Ok(radius) = args[2].trim().parse::<f64>() {
-                                let sphere = geometry_engine::primitives::surface::Sphere::new(
-                                    Point3::new(center[0], center[1], center[2]),
-                                    radius,
-                                );
-                                if let Ok(sphere) = sphere {
-                                    let sid = model.surfaces.add(Box::new(sphere));
-                                    surface_id_map.insert(step_id, sid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "CONICAL_SURFACE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 4 {
-                    if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((apex, axis, _)) = extract_axis2_placement(entities, axis_ref) {
-                            if let (Ok(_radius), Ok(half_angle_deg)) =
-                                (args[2].trim().parse::<f64>(), args[3].trim().parse::<f64>())
-                            {
-                                let cone = geometry_engine::primitives::surface::Cone::new(
-                                    Point3::new(apex[0], apex[1], apex[2]),
-                                    Vector3::new(axis[0], axis[1], axis[2]),
-                                    half_angle_deg.to_radians(),
-                                );
-                                if let Ok(cone) = cone {
-                                    let sid = model.surfaces.add(Box::new(cone));
-                                    surface_id_map.insert(step_id, sid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "TOROIDAL_SURFACE" => {
-                let args = split_step_args(&entity.args);
-                if args.len() >= 4 {
-                    if let Some(axis_ref) = parse_ref(&args[1]) {
-                        if let Some((center, axis, _)) = extract_axis2_placement(entities, axis_ref)
-                        {
-                            if let (Ok(major_r), Ok(minor_r)) =
-                                (args[2].trim().parse::<f64>(), args[3].trim().parse::<f64>())
-                            {
-                                let torus = geometry_engine::primitives::surface::Torus::new(
-                                    Point3::new(center[0], center[1], center[2]),
-                                    Vector3::new(axis[0], axis[1], axis[2]),
-                                    major_r,
-                                    minor_r,
-                                );
-                                if let Ok(torus) = torus {
-                                    let sid = model.surfaces.add(Box::new(torus));
-                                    surface_id_map.insert(step_id, sid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Pass 4: Import EDGE_CURVE entities
-    for (&step_id, entity) in entities {
-        if entity.type_name == "EDGE_CURVE" {
-            let args = split_step_args(&entity.args);
-            // args: name, start_vertex_ref, end_vertex_ref, curve_ref, same_sense
-            if args.len() >= 4 {
-                // Resolve vertex references (VERTEX_POINT -> CARTESIAN_POINT)
-                let start_vid = parse_ref(&args[1])
-                    .and_then(|vr| resolve_vertex_point(entities, vr))
-                    .and_then(|pt_id| vertex_id_map.get(&pt_id).copied());
-                let end_vid = parse_ref(&args[2])
-                    .and_then(|vr| resolve_vertex_point(entities, vr))
-                    .and_then(|pt_id| vertex_id_map.get(&pt_id).copied());
-                let curve_cid = parse_ref(&args[3]).and_then(|cr| curve_id_map.get(&cr).copied());
-
-                if let (Some(sv), Some(ev)) = (start_vid, end_vid) {
-                    // Use a default curve if not found
-                    let cid = curve_cid.unwrap_or_else(|| {
-                        // Create a placeholder line curve
-                        let line = geometry_engine::primitives::curve::Line::new(
-                            Point3::new(0.0, 0.0, 0.0),
-                            Vector3::new(1.0, 0.0, 0.0),
-                        );
-                        model.curves.add(Box::new(line))
-                    });
-
-                    let edge = Edge::new(
-                        0,
-                        sv,
-                        ev,
-                        cid,
-                        EdgeOrientation::Forward,
-                        ParameterRange::new(0.0, 1.0),
-                    );
-                    let eid = model.edges.add(edge);
-                    edge_id_map.insert(step_id, eid);
-                }
-            }
-        }
-    }
-
-    // Pass 5: Import EDGE_LOOP -> Loop, FACE_OUTER_BOUND/FACE_BOUND -> Face, CLOSED_SHELL/OPEN_SHELL -> Shell
-    let mut loop_id_map: HashMap<u32, LoopId> = HashMap::new();
-    let mut face_bound_loop_map: HashMap<u32, (LoopId, bool)> = HashMap::new();
-    let mut face_id_map: HashMap<u32, FaceId> = HashMap::new();
-    let mut shell_id_map: HashMap<u32, ShellId> = HashMap::new();
-
-    // 5a: EDGE_LOOPs
-    for (&step_id, entity) in entities {
-        if entity.type_name == "EDGE_LOOP" {
-            let args = split_step_args(&entity.args);
-            if args.len() >= 2 {
-                let refs_str = args[1].trim();
-                let refs_inner = refs_str
-                    .strip_prefix('(')
-                    .and_then(|s| s.strip_suffix(')'))
-                    .unwrap_or(refs_str);
-                let edge_refs = parse_ref_list(refs_inner);
-
-                let mut lp = Loop::new(0, LoopType::Outer);
-                for er in &edge_refs {
-                    // Edge refs might be ORIENTED_EDGE entities
-                    if let Some(eid) = resolve_oriented_edge(entities, *er, &edge_id_map) {
-                        lp.add_edge(eid, true);
-                    }
-                }
-                let lid = model.loops.add(lp);
-                loop_id_map.insert(step_id, lid);
-            }
-        }
-    }
-
-    // 5b: FACE_OUTER_BOUND and FACE_BOUND
-    for (&step_id, entity) in entities {
-        if entity.type_name == "FACE_OUTER_BOUND" || entity.type_name == "FACE_BOUND" {
-            let args = split_step_args(&entity.args);
-            if args.len() >= 2 {
-                let is_outer = entity.type_name == "FACE_OUTER_BOUND";
-                if let Some(loop_ref) = parse_ref(&args[1]) {
-                    if let Some(&lid) = loop_id_map.get(&loop_ref) {
-                        face_bound_loop_map.insert(step_id, (lid, is_outer));
-                    }
-                }
-            }
-        }
-    }
-
-    // 5c: ADVANCED_FACE
-    for (&step_id, entity) in entities {
-        if entity.type_name == "ADVANCED_FACE" {
-            let args = split_step_args(&entity.args);
-            // args: name, (bound_refs), surface_ref, same_sense
-            if args.len() >= 3 {
-                let bounds_str = args[1].trim();
-                let bounds_inner = bounds_str
-                    .strip_prefix('(')
-                    .and_then(|s| s.strip_suffix(')'))
-                    .unwrap_or(bounds_str);
-                let bound_refs = parse_ref_list(bounds_inner);
-
-                let surface_ref = parse_ref(&args[2]);
-                let sid = surface_ref.and_then(|sr| surface_id_map.get(&sr).copied());
-
-                // Find outer loop from bounds
-                let mut outer_loop_id = None;
-                for &br in &bound_refs {
-                    if let Some(&(lid, is_outer)) = face_bound_loop_map.get(&br) {
-                        if is_outer {
-                            outer_loop_id = Some(lid);
-                            break;
-                        }
-                    }
-                }
-                // If no explicit outer, take the first bound
-                if outer_loop_id.is_none() {
-                    for &br in &bound_refs {
-                        if let Some(&(lid, _)) = face_bound_loop_map.get(&br) {
-                            outer_loop_id = Some(lid);
-                            break;
-                        }
-                    }
-                }
-
-                if let (Some(surface_id), Some(loop_id)) = (sid, outer_loop_id) {
-                    let face = geometry_engine::primitives::face::Face::new(
-                        0,
-                        surface_id,
-                        loop_id,
-                        FaceOrientation::Forward,
-                    );
-                    let fid = model.faces.add(face);
-                    face_id_map.insert(step_id, fid);
-                }
-            }
-        }
-    }
-
-    // 5d: CLOSED_SHELL and OPEN_SHELL
-    for (&step_id, entity) in entities {
-        if entity.type_name == "CLOSED_SHELL" || entity.type_name == "OPEN_SHELL" {
-            let args = split_step_args(&entity.args);
-            if args.len() >= 2 {
-                let faces_str = args[1].trim();
-                let faces_inner = faces_str
-                    .strip_prefix('(')
-                    .and_then(|s| s.strip_suffix(')'))
-                    .unwrap_or(faces_str);
-                let face_refs = parse_ref_list(faces_inner);
-
-                let shell_type = if entity.type_name == "CLOSED_SHELL" {
-                    ShellType::Closed
-                } else {
-                    ShellType::Open
-                };
-                let mut shell = Shell::new(0, shell_type);
-                for &fr in &face_refs {
-                    if let Some(&fid) = face_id_map.get(&fr) {
-                        shell.add_face(fid);
-                    }
-                }
-                let shell_id = model.shells.add(shell);
-                shell_id_map.insert(step_id, shell_id);
-            }
-        }
-    }
-
-    // Pass 6: Import MANIFOLD_SOLID_BREP
-    for (_step_id, entity) in entities {
-        if entity.type_name == "MANIFOLD_SOLID_BREP" {
-            let args = split_step_args(&entity.args);
-            if args.len() >= 2 {
-                if let Some(shell_ref) = parse_ref(&args[1]) {
-                    if let Some(&shell_id) = shell_id_map.get(&shell_ref) {
-                        let solid = Solid::new(0, shell_id);
-                        model.solids.add(solid);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(model)
-}
-
-/// Resolve a VERTEX or VERTEX_POINT entity to its CARTESIAN_POINT ID
-fn resolve_vertex_point(entities: &HashMap<u32, StepEntity>, vertex_ref: u32) -> Option<u32> {
-    let entity = entities.get(&vertex_ref)?;
-    match entity.type_name.as_str() {
-        "VERTEX_POINT" | "VERTEX" => {
-            let args = split_step_args(&entity.args);
-            // args: name, point_ref
-            if args.len() >= 2 {
-                parse_ref(&args[1])
-            } else {
-                None
-            }
-        }
-        "CARTESIAN_POINT" => Some(vertex_ref),
-        _ => None,
-    }
-}
-
-/// Resolve an ORIENTED_EDGE to get the underlying edge ID
-fn resolve_oriented_edge(
-    entities: &HashMap<u32, StepEntity>,
-    oriented_edge_ref: u32,
-    edge_id_map: &HashMap<u32, geometry_engine::primitives::edge::EdgeId>,
-) -> Option<geometry_engine::primitives::edge::EdgeId> {
-    let entity = entities.get(&oriented_edge_ref)?;
-    match entity.type_name.as_str() {
-        "ORIENTED_EDGE" => {
-            let args = split_step_args(&entity.args);
-            // args: name, *, *, edge_ref, orientation
-            if args.len() >= 4 {
-                let edge_ref = parse_ref(&args[3])?;
-                edge_id_map.get(&edge_ref).copied()
-            } else {
-                None
-            }
-        }
-        "EDGE_CURVE" => edge_id_map.get(&oriented_edge_ref).copied(),
-        _ => None,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Tests
-//
-// Inline `#[cfg(test)]` block exercising the public StepWriter surface
-// + the private parser helpers (accessible because we're in the same
-// module). These tests run in-memory against `Vec<u8>` writers — no
-// filesystem, no async — so they execute without `tokio::test`. The
-// async `export_brep_to_step` / `export_assembly_to_step` /
-// `import_step_to_brep` entry points are thin orchestration wrappers
-// over the writers tested here; their logic is covered transitively
-// by exercising every primitive.
-// ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2065,8 +1400,46 @@ mod tests {
         assert!(out.contains("FILE_DESCRIPTION"));
         assert!(out.contains("Roshera CAD Model"));
         assert!(out.contains("FILE_NAME"));
-        assert!(out.contains("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'))"));
+        // Default protocol is AP242 — see StepApplicationProtocol::default.
+        assert!(
+            out.contains("FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF'))"),
+            "default writer must declare AP242, got: {out}"
+        );
         assert!(out.contains("ENDSEC;"));
+    }
+
+    #[test]
+    fn write_header_honours_legacy_ap214_protocol() {
+        // `with_protocol` overrides the AP242 default. Used when
+        // round-tripping with vendors that have not migrated yet.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w =
+                StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP214);
+            let h = StepHeader::default();
+            w.write_header(&h).expect("AP214 header write must succeed");
+        }
+        let out = String::from_utf8(buf).expect("STEP output must be UTF-8");
+        assert!(
+            out.contains("FILE_SCHEMA(('AUTOMOTIVE_DESIGN'))"),
+            "AP214 writer must declare AUTOMOTIVE_DESIGN, got: {out}"
+        );
+    }
+
+    #[test]
+    fn write_header_honours_legacy_ap203_protocol() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w =
+                StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP203);
+            let h = StepHeader::default();
+            w.write_header(&h).expect("AP203 header write must succeed");
+        }
+        let out = String::from_utf8(buf).expect("STEP output must be UTF-8");
+        assert!(
+            out.contains("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'))"),
+            "AP203 writer must declare CONFIG_CONTROL_DESIGN, got: {out}"
+        );
     }
 
     // ─── B. Section markers ────────────────────────────────────────
@@ -2459,204 +1832,13 @@ mod tests {
         assert_eq!(format_id_list(&[]), "");
     }
 
-    // ─── H. Parser helpers ────────────────────────────────────────
-
-    #[test]
-    fn parse_real_list_basic() {
-        assert_eq!(parse_real_list("1.0,2.0,3.0"), vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn parse_real_list_handles_whitespace() {
-        assert_eq!(parse_real_list(" 1.0 , 2.0 , 3.0 "), vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn parse_real_list_skips_invalid() {
-        assert_eq!(parse_real_list("1.0,abc,3.0"), vec![1.0, 3.0]);
-    }
-
-    #[test]
-    fn parse_real_list_empty() {
-        let v: Vec<f64> = parse_real_list("");
-        assert!(v.is_empty());
-    }
-
-    #[test]
-    fn parse_ref_strips_hash() {
-        assert_eq!(parse_ref("#42"), Some(42));
-        assert_eq!(parse_ref("  #7  "), Some(7));
-    }
-
-    #[test]
-    fn parse_ref_rejects_non_hash() {
-        assert_eq!(parse_ref("42"), None);
-        assert_eq!(parse_ref(""), None);
-        assert_eq!(parse_ref("$"), None);
-    }
-
-    #[test]
-    fn parse_ref_list_basic() {
-        assert_eq!(parse_ref_list("#1,#2,#3"), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn parse_ref_list_skips_unparseable() {
-        assert_eq!(parse_ref_list("#1,$,#3"), vec![1, 3]);
-    }
-
-    #[test]
-    fn split_step_args_simple() {
-        assert_eq!(
-            split_step_args("'foo','bar',1.0"),
-            vec!["'foo'", "'bar'", "1.0"]
-        );
-    }
-
-    #[test]
-    fn split_step_args_respects_nested_parens() {
-        // Nested parens must NOT be split on inner commas
-        assert_eq!(
-            split_step_args("'name',(1.0,2.0,3.0),#5"),
-            vec!["'name'", "(1.0,2.0,3.0)", "#5"]
-        );
-    }
-
-    #[test]
-    fn split_step_args_deeply_nested() {
-        assert_eq!(
-            split_step_args("'a',((1,2),(3,4)),'b'"),
-            vec!["'a'", "((1,2),(3,4))", "'b'"]
-        );
-    }
-
-    #[test]
-    fn parse_step_entities_single() {
-        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse should succeed");
-        assert_eq!(entities.len(), 1);
-        let e = entities.get(&1).expect("entity #1 missing");
-        assert_eq!(e.id, 1);
-        assert_eq!(e.type_name, "CARTESIAN_POINT");
-        assert!(e.args.contains("0.0,0.0,0.0"));
-    }
-
-    #[test]
-    fn parse_step_entities_multiple() {
-        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0)); #2=DIRECTION('',(0.0,0.0,1.0)); #3=VECTOR('',#2,5.0);";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert_eq!(entities.len(), 3);
-        assert_eq!(entities.get(&2).map(|e| e.type_name.as_str()), Some("DIRECTION"));
-        assert_eq!(entities.get(&3).map(|e| e.type_name.as_str()), Some("VECTOR"));
-    }
-
-    #[test]
-    fn parse_step_entities_uppercases_type_name() {
-        // Type names should be normalised to uppercase regardless of input casing
-        let data = "#1=cartesian_point('',(0.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert_eq!(
-            entities.get(&1).map(|e| e.type_name.as_str()),
-            Some("CARTESIAN_POINT")
-        );
-    }
-
-    #[test]
-    fn parse_step_entities_skips_malformed() {
-        // No '#' — silently skipped, not error
-        let data = "garbage_without_hash; #1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert_eq!(entities.len(), 1);
-    }
-
-    // ─── I. Extract helpers ────────────────────────────────────────
-
-    #[test]
-    fn extract_point_from_cartesian_point() {
-        let data = "#1=CARTESIAN_POINT('name',(1.0,2.0,3.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        let p = extract_point(&entities, 1).expect("extract failed");
-        assert_eq!(p, [1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn extract_point_returns_none_for_wrong_type() {
-        let data = "#1=DIRECTION('',(0.0,0.0,1.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert!(extract_point(&entities, 1).is_none());
-    }
-
-    #[test]
-    fn extract_point_returns_none_for_missing_id() {
-        let entities: HashMap<u32, StepEntity> = HashMap::new();
-        assert!(extract_point(&entities, 1).is_none());
-    }
-
-    #[test]
-    fn extract_direction_from_direction_entity() {
-        let data = "#1=DIRECTION('',(1.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        let d = extract_direction(&entities, 1).expect("extract failed");
-        assert_eq!(d, [1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn extract_direction_returns_none_for_cartesian_point() {
-        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert!(extract_direction(&entities, 1).is_none());
-    }
-
-    #[test]
-    fn extract_axis2_placement_full() {
-        let data = "\
-            #1=CARTESIAN_POINT('',(1.0,2.0,3.0)); \
-            #2=DIRECTION('',(0.0,0.0,1.0)); \
-            #3=DIRECTION('',(1.0,0.0,0.0)); \
-            #4=AXIS2_PLACEMENT_3D('',#1,#2,#3);";
-        let entities = parse_step_entities(data).expect("parse failed");
-        let (loc, axis, ref_dir) = extract_axis2_placement(&entities, 4).expect("extract failed");
-        assert_eq!(loc, [1.0, 2.0, 3.0]);
-        assert_eq!(axis, [0.0, 0.0, 1.0]);
-        assert_eq!(ref_dir, [1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn extract_axis2_placement_returns_none_for_wrong_type() {
-        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert!(extract_axis2_placement(&entities, 1).is_none());
-    }
-
-    #[test]
-    fn resolve_vertex_point_through_vertex_point_entity() {
-        let data = "\
-            #1=CARTESIAN_POINT('',(0.0,0.0,0.0)); \
-            #2=VERTEX_POINT('',#1);";
-        let entities = parse_step_entities(data).expect("parse failed");
-        assert_eq!(resolve_vertex_point(&entities, 2), Some(1));
-    }
-
-    #[test]
-    fn resolve_vertex_point_through_cartesian_point_passthrough() {
-        let data = "#1=CARTESIAN_POINT('',(0.0,0.0,0.0));";
-        let entities = parse_step_entities(data).expect("parse failed");
-        // Direct CARTESIAN_POINT id is returned as-is.
-        assert_eq!(resolve_vertex_point(&entities, 1), Some(1));
-    }
-
-    #[test]
-    fn resolve_vertex_point_returns_none_for_unknown() {
-        let entities: HashMap<u32, StepEntity> = HashMap::new();
-        assert!(resolve_vertex_point(&entities, 99).is_none());
-    }
-
     // ─── J. StepExportOptions ──────────────────────────────────────
 
     #[test]
     fn step_export_options_default() {
         let opts = StepExportOptions::default();
-        assert_eq!(opts.application_protocol, StepApplicationProtocol::AP203);
+        // Roshera's canonical export protocol is AP242.
+        assert_eq!(opts.application_protocol, StepApplicationProtocol::AP242);
         assert!(opts.include_colors);
         assert!(opts.include_layers);
         assert_eq!(opts.tolerance, 1e-6);
@@ -2665,7 +1847,33 @@ mod tests {
     #[test]
     fn step_application_protocol_distinct() {
         assert_ne!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP214);
+        assert_ne!(StepApplicationProtocol::AP214, StepApplicationProtocol::AP242);
+        assert_ne!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP242);
         assert_eq!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP203);
+    }
+
+    #[test]
+    fn step_application_protocol_default_is_ap242() {
+        assert_eq!(
+            StepApplicationProtocol::default(),
+            StepApplicationProtocol::AP242
+        );
+    }
+
+    #[test]
+    fn step_application_protocol_schema_names() {
+        assert_eq!(
+            StepApplicationProtocol::AP203.schema_name(),
+            "CONFIG_CONTROL_DESIGN"
+        );
+        assert_eq!(
+            StepApplicationProtocol::AP214.schema_name(),
+            "AUTOMOTIVE_DESIGN"
+        );
+        assert_eq!(
+            StepApplicationProtocol::AP242.schema_name(),
+            "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF"
+        );
     }
 
     // ─── K. Assembly constraint name mapping ───────────────────────
@@ -2726,63 +1934,4 @@ mod tests {
         assert!(out_p.contains("PARALLEL_CONSTRAINT"));
     }
 
-    // ─── L. Round-trip: write → reparse ────────────────────────────
-
-    #[test]
-    fn round_trip_cartesian_point_via_parser() {
-        let out = write_into(|w| {
-            w.write_cartesian_point(&[1.5, -2.25, 3.125])?;
-            Ok(())
-        });
-        // Parse what we wrote and recover the coordinates
-        let entities = parse_step_entities(&out).expect("parse failed");
-        let p = extract_point(&entities, 1).expect("extract failed");
-        assert!((p[0] - 1.5).abs() < 1e-9);
-        assert!((p[1] - (-2.25)).abs() < 1e-9);
-        assert!((p[2] - 3.125).abs() < 1e-9);
-    }
-
-    #[test]
-    fn round_trip_direction_via_parser() {
-        let out = write_into(|w| {
-            w.write_direction(&[0.0, 1.0, 0.0])?;
-            Ok(())
-        });
-        let entities = parse_step_entities(&out).expect("parse failed");
-        let d = extract_direction(&entities, 1).expect("extract failed");
-        assert_eq!(d, [0.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn round_trip_axis2_placement_via_parser() {
-        let out = write_into(|w| {
-            w.write_axis2_placement_3d(
-                &[1.0, 2.0, 3.0],
-                Some(&[0.0, 0.0, 1.0]),
-                Some(&[1.0, 0.0, 0.0]),
-            )?;
-            Ok(())
-        });
-        let entities = parse_step_entities(&out).expect("parse failed");
-        // 1=loc, 2=axis, 3=refdir, 4=placement
-        let (loc, axis, ref_dir) = extract_axis2_placement(&entities, 4).expect("extract failed");
-        assert_eq!(loc, [1.0, 2.0, 3.0]);
-        assert_eq!(axis, [0.0, 0.0, 1.0]);
-        assert_eq!(ref_dir, [1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn round_trip_multiple_points_distinct_ids() {
-        let out = write_into(|w| {
-            w.write_cartesian_point(&[1.0, 0.0, 0.0])?;
-            w.write_cartesian_point(&[0.0, 1.0, 0.0])?;
-            w.write_cartesian_point(&[0.0, 0.0, 1.0])?;
-            Ok(())
-        });
-        let entities = parse_step_entities(&out).expect("parse failed");
-        assert_eq!(entities.len(), 3);
-        assert_eq!(extract_point(&entities, 1), Some([1.0, 0.0, 0.0]));
-        assert_eq!(extract_point(&entities, 2), Some([0.0, 1.0, 0.0]));
-        assert_eq!(extract_point(&entities, 3), Some([0.0, 0.0, 1.0]));
-    }
 }
