@@ -13,7 +13,18 @@ use super::projection::{
     DEFAULT_CURVE_SAMPLES,
 };
 use super::svg::render_drawing_svg;
-use super::types::{Drawing, Polyline2d, ProjectionType, SheetSize, ViewExtent};
+use super::types::{Drawing, Polyline2d, ProjectionType, SheetSize, ViewExtent, ViewSource};
+use uuid::Uuid;
+
+/// Pin a deterministic, all-zero part_id for in-test
+/// `project_solid_view` calls — the in-memory model resolver doesn't
+/// look at part_id, so any UUID does.
+fn nil_view_source(solid_id: crate::primitives::solid::SolidId) -> ViewSource {
+    ViewSource::Part {
+        part_id: Uuid::nil(),
+        solid_id,
+    }
+}
 
 use crate::math::{Point3, Vector3};
 use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
@@ -208,7 +219,10 @@ fn box_front_view_extent_matches_geometry() {
     let (model, solid) = build_box(10.0, 20.0, 30.0);
     let view = project_solid_view(
         &model,
-        solid,
+        crate::drawing::types::ViewSource::Part {
+            part_id: uuid::Uuid::nil(),
+            solid_id: solid,
+        },
         ProjectionType::Front,
         "Front",
         [0.0, 0.0],
@@ -235,7 +249,10 @@ fn box_top_view_extent_matches_geometry() {
     let (model, solid) = build_box(10.0, 20.0, 30.0);
     let view = project_solid_view(
         &model,
-        solid,
+        crate::drawing::types::ViewSource::Part {
+            part_id: uuid::Uuid::nil(),
+            solid_id: solid,
+        },
         ProjectionType::Top,
         "Top",
         [0.0, 0.0],
@@ -314,7 +331,7 @@ fn svg_envelope_contains_sheet_size_and_views() {
     let mut drawing = Drawing::new("box-test", SheetSize::A4);
     let view = project_solid_view(
         &model,
-        solid,
+        nil_view_source(solid),
         ProjectionType::Front,
         "Front",
         [50.0, 100.0],
@@ -364,7 +381,7 @@ fn drawing_add_remove_view_round_trips() {
     let mut drawing = Drawing::new("rt", SheetSize::A3);
     let view = project_solid_view(
         &model,
-        solid,
+        nil_view_source(solid),
         ProjectionType::Front,
         "Front",
         [0.0, 0.0],
