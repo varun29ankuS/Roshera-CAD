@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
+import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -61,6 +62,18 @@ export function useKeyboardShortcuts() {
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       const target = e.target as HTMLElement
+      const ctrl = e.ctrlKey || e.metaKey
+
+      // Ctrl/Cmd-K opens the command palette. This is the one shortcut
+      // that must work *even when the user is typing in an input*, so
+      // we handle it before the input-typing bail-out below — same
+      // behaviour as VS Code, Linear, Figma, Notion, etc.
+      if (ctrl && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        useCommandPaletteStore.getState().toggle()
+        return
+      }
+
       if (
         target.tagName === 'INPUT' ||
         target.tagName === 'TEXTAREA' ||
@@ -69,7 +82,6 @@ export function useKeyboardShortcuts() {
         return
       }
 
-      const ctrl = e.ctrlKey || e.metaKey
       const state = useSceneStore.getState()
 
       // Inside sketch mode the SketchPanel owns Enter/Esc/Backspace
