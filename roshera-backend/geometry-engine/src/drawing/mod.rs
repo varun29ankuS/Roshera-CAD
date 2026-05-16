@@ -23,17 +23,21 @@
 //! SVG rendering lives in [`svg`]; REST and frontend integration lives
 //! in `api-server` and `roshera-app` respectively.
 
+pub mod dxf;
+pub mod pdf;
 pub mod projection;
 pub mod svg;
 pub mod types;
 
+pub use dxf::{render_drawing_dxf, DxfRenderError};
+pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
     project_solid_edges, project_solid_view, view_matrix_for_projection, ProjectionError,
 };
 pub use svg::render_drawing_svg;
 pub use types::{
     Drawing, DrawingId, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize,
-    ViewExtent,
+    TitleBlock, ViewExtent, ViewSource,
 };
 
 #[cfg(test)]

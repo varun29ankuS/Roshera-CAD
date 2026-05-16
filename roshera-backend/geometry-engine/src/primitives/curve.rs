@@ -2282,7 +2282,7 @@ impl Curve for NurbsCurve {
     fn project_point(&self, point: &Point3, tolerance: Tolerance) -> Vec<(f64, Point3)> {
         // Use closest point algorithm with multiple starting points
         let n_samples = 10;
-        let mut results = Vec::new();
+        let mut results: Vec<(f64, Point3)> = Vec::new();
 
         for i in 0..=n_samples {
             let t_init = i as f64 / n_samples as f64;

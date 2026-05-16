@@ -37,6 +37,19 @@ i_overlay = "6"
 # learned index, etc.) without touching call sites. See spatial/mod.rs.
 rstar = "0.12"
 
+# Drawing-export deliverables. SVG is rendered in-house (drawing/svg.rs);
+# these crates carry the two industry-standard formats every shop also
+# expects: PDF for review/archival, DXF for editable handoff. DWG is not
+# shipped because it requires the proprietary ODA Teigha SDK; downstream
+# users can convert DXF → DWG via the free ODA File Converter.
+#
+# `svg2pdf` (typst) renders our SVG through usvg → PDF — pure Rust, no
+# rasterization, identical vector output to the on-screen sheet.
+# `dxf` (IxMilia/dxf-rs) walks our `Drawing` struct directly so the
+# exported file carries editable model-space geometry per view layer.
+svg2pdf = "0.13"
+dxf = "0.6"
+
 # SIMD optimizations
 wide = "0.7"              # Portable SIMD operations
 simdeez = "1.0"          # Cross-platform SIMD

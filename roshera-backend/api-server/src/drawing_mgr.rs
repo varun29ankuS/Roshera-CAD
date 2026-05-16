@@ -24,7 +24,6 @@
 //! same pattern: add fields to the kernel type, the wire follows.
 
 use crate::error_catalog::{ApiError, ErrorCode};
-use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -33,11 +32,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::drawing::{
-    project_solid_view, render_drawing_svg, Drawing, DrawingId, ProjectedViewId, ProjectionType,
-    SheetSize,
+    project_solid_view, render_drawing_dxf, render_drawing_pdf, render_drawing_svg, Drawing,
+    DrawingId, ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
-use geometry_engine::primitives::solid::SolidId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -131,13 +129,63 @@ pub struct CreateDrawingResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RenameDrawingRequest {
+    pub name: String,
+}
+
+/// Partial-update payload for `PATCH /api/drawings/{id}/title-block`.
+///
+/// Every field is optional — only fields the caller actually wants to
+/// change need to appear in the JSON body. Unsupplied fields are left
+/// untouched. To clear a field, send an empty string (or `null` for
+/// `drawing_number` to revert to the auto-derived id).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateTitleBlockRequest {
+    #[serde(default)]
+    pub drawn_by: Option<String>,
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub material: Option<String>,
+    /// `Some(Some("..."))` sets the override, `Some(None)` clears it,
+    /// `None` leaves it unchanged. Serialized as: omit → unchanged,
+    /// `null` → clear, string → set.
+    #[serde(default, deserialize_with = "deserialize_optional_option_string")]
+    pub drawing_number: Option<Option<String>>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub sheet_index: Option<u32>,
+    #[serde(default)]
+    pub sheet_count: Option<u32>,
+}
+
+/// Treat a missing key as "no change" and an explicit `null` as
+/// "clear the value". serde's default-deserialize collapses both into
+/// `None`, which would prevent the caller from distinguishing the two.
+fn deserialize_optional_option_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Inner Option<String> handles `null` vs. string. Wrapping in
+    // Some(...) marks the field as "present".
+    let inner: Option<String> = Option::deserialize(deserializer)?;
+    Ok(Some(inner))
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AddViewRequest {
     /// Display name for the view ("Front", "Detail A", etc.).
     pub name: String,
-    /// Which solid to project. Resolved against the currently active
-    /// [`BRepModel`](geometry_engine::primitives::topology_builder::BRepModel)
-    /// held by [`AppState`](crate::AppState).
-    pub solid_id: SolidId,
+    /// Durable reference to the geometry being projected. The part_id
+    /// inside the source is resolved against
+    /// [`PartManager`](crate::part_mgr::PartManager) at projection
+    /// time; the resulting [`ProjectedView::source`] is stored on the
+    /// view so subsequent renders and round-trips remain pinned to the
+    /// same part regardless of the active tab.
+    pub source: ViewSource,
     /// Projection preset.
     pub projection: ProjectionType,
     /// Sheet-space placement of the view's local origin, in millimetres.
@@ -212,6 +260,108 @@ pub async fn get_drawing(
     Ok(Json(guard.clone()))
 }
 
+pub async fn rename_drawing(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RenameDrawingRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let new_name = req.name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "name must not be empty",
+        ));
+    }
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let old_name = {
+        let mut guard = handle.write().await;
+        let prev = guard.name.clone();
+        guard.name = new_name.clone();
+        prev
+    };
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.rename")
+            .with_parameters(serde_json::json!({
+                "old_name": old_name,
+                "new_name": new_name,
+            }))
+            .with_input_drawing(id)
+            .with_output_drawing(id),
+    );
+    Ok(Json(serde_json::json!({ "success": true, "id": id, "name": new_name })))
+}
+
+pub async fn update_title_block(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateTitleBlockRequest>,
+) -> Result<Json<TitleBlock>, ApiError> {
+    // Reject obvious nonsense up-front; the renderer can survive bad
+    // values but the user would never see why their sheet label looked
+    // weird.
+    if let Some(idx) = req.sheet_index {
+        if idx == 0 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "sheet_index must be ≥ 1",
+            ));
+        }
+    }
+    if let Some(count) = req.sheet_count {
+        if count == 0 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "sheet_count must be ≥ 1",
+            ));
+        }
+    }
+
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let updated = {
+        let mut guard = handle.write().await;
+        let tb = &mut guard.title_block;
+        if let Some(v) = req.drawn_by {
+            tb.drawn_by = v;
+        }
+        if let Some(v) = req.date {
+            tb.date = v;
+        }
+        if let Some(v) = req.material {
+            tb.material = v;
+        }
+        if let Some(slot) = req.drawing_number {
+            // Outer Some = field present; inner option = set/clear.
+            tb.drawing_number = slot.filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = req.revision {
+            tb.revision = v;
+        }
+        if let Some(v) = req.sheet_index {
+            tb.sheet_index = v;
+        }
+        if let Some(v) = req.sheet_count {
+            tb.sheet_count = v;
+        }
+        // Final consistency: if sheet_count < sheet_index, bump count
+        // so the rendered "N OF M" never lies.
+        if tb.sheet_count < tb.sheet_index {
+            tb.sheet_count = tb.sheet_index;
+        }
+        tb.clone()
+    };
+
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.title_block.update")
+            .with_parameters(serde_json::json!({
+                "title_block": &updated,
+            }))
+            .with_input_drawing(id)
+            .with_output_drawing(id),
+    );
+
+    Ok(Json(updated))
+}
+
 pub async fn delete_drawing(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -230,7 +380,6 @@ pub async fn delete_drawing(
 
 pub async fn add_view(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
     Json(req): Json<AddViewRequest>,
 ) -> Result<Json<AddViewResponse>, ApiError> {
@@ -248,13 +397,26 @@ pub async fn add_view(
     }
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
 
+    // Resolve the BRepModel from the durable part_id carried on the
+    // request. Doing this here keeps the view source explicit on the
+    // wire (no dependency on which tab the client happens to have
+    // active) and makes the recorded event reproducible.
+    let ViewSource::Part { part_id, .. } = req.source;
+    let model_handle = state.parts.get(&part_id).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("part {part_id} not found"),
+        )
+        .with_hint("Create the part first or pass a known part_id.")
+    })?;
+
     // Project the view *outside* the drawing's lock — the projection
-    // only needs a read lock on the active BRepModel.
+    // only needs a read lock on the resolved BRepModel.
     let view = {
         let model_guard = model_handle.read().await;
         project_solid_view(
             &model_guard,
-            req.solid_id,
+            req.source,
             req.projection,
             req.name.clone(),
             req.position_mm,
@@ -270,7 +432,7 @@ pub async fn add_view(
 
     let view_id = view.id;
     let projection = view.projection;
-    let solid_id = view.solid_id;
+    let source = view.source;
     let position = view.position_mm;
     let scale = view.scale;
     let polyline_count = view.polylines.len();
@@ -284,7 +446,7 @@ pub async fn add_view(
         RecordedOperation::new("drawing.add_view")
             .with_parameters(serde_json::json!({
                 "name": name,
-                "solid_id": solid_id,
+                "source": source,
                 "projection": projection,
                 "position_mm": position,
                 "scale": scale,
@@ -341,6 +503,72 @@ pub async fn export_svg(
         .into_response())
 }
 
+/// Build a content-disposition value with a sanitised filename based on
+/// the drawing name. Falls back to the drawing UUID if the name is
+/// empty or sanitises down to nothing.
+fn content_disposition(name: &str, drawing_id: Uuid, extension: &str) -> String {
+    let mut sanitised: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    sanitised = sanitised.trim_matches('_').to_string();
+    if sanitised.is_empty() {
+        sanitised = drawing_id.to_string();
+    }
+    format!("attachment; filename=\"{sanitised}.{extension}\"")
+}
+
+pub async fn export_pdf(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (bytes, name) = {
+        let guard = handle.read().await;
+        let bytes = render_drawing_pdf(&guard).map_err(|e| {
+            ApiError::new(ErrorCode::KernelError, format!("pdf render failed: {e}"))
+        })?;
+        (bytes, guard.name.clone())
+    };
+    let disposition = content_disposition(&name, id, "pdf");
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/pdf".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+pub async fn export_dxf(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (bytes, name) = {
+        let guard = handle.read().await;
+        let bytes = render_drawing_dxf(&guard).map_err(|e| {
+            ApiError::new(ErrorCode::KernelError, format!("dxf render failed: {e}"))
+        })?;
+        (bytes, guard.name.clone())
+    };
+    let disposition = content_disposition(&name, id, "dxf");
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/vnd.dxf; charset=utf-8".to_string(),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 // ── Recorder accessor helpers (assembled on the RecordedOperation
 // builder so the wire shape mirrors `with_*_assembly` + `with_*_solid`)
 // ────────────────────────────────────────────────────────────────────
@@ -375,8 +603,20 @@ mod tests {
     use geometry_engine::operations::recorder::{
         OperationRecorder, RecordedOperation, RecorderError,
     };
+    use geometry_engine::primitives::solid::SolidId;
     use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
     use std::sync::Mutex as StdMutex;
+
+    /// Build a `ViewSource::Part` with a nil part_id for kernel-level
+    /// tests that don't go through the PartManager resolver. Tests that
+    /// exercise the REST handler use a real part_id resolved from
+    /// `AppState::parts`.
+    fn nil_source(solid_id: SolidId) -> ViewSource {
+        ViewSource::Part {
+            part_id: Uuid::nil(),
+            solid_id,
+        }
+    }
 
     // ── Fixtures ────────────────────────────────────────────────────
 
@@ -533,7 +773,7 @@ mod tests {
         let (model, solid_id) = build_box_model(10.0, 10.0, 10.0);
         let view = geometry_engine::drawing::project_solid_view(
             &model,
-            solid_id,
+            nil_source(solid_id),
             ProjectionType::Front,
             "Front",
             [0.0, 0.0],
@@ -560,7 +800,7 @@ mod tests {
         let (model, solid_id) = build_box_model(5.0, 5.0, 5.0);
         let view = geometry_engine::drawing::project_solid_view(
             &model,
-            solid_id,
+            nil_source(solid_id),
             ProjectionType::Top,
             "Top",
             [0.0, 0.0],
@@ -656,21 +896,29 @@ mod tests {
 
     #[test]
     fn add_view_request_parses_with_defaults() {
+        let part_id = Uuid::new_v4();
         let req: AddViewRequest = serde_json::from_value(serde_json::json!({
             "name": "Front",
-            "solid_id": 1u64,
+            "source": {"kind": "part", "part_id": part_id, "solid_id": 1u64},
             "projection": {"kind": "front"},
         }))
         .unwrap();
         assert_eq!(req.position_mm, [0.0, 0.0]);
         assert_eq!(req.scale, 1.0);
+        match req.source {
+            ViewSource::Part { part_id: p, solid_id } => {
+                assert_eq!(p, part_id);
+                assert_eq!(solid_id, 1);
+            }
+        }
     }
 
     #[test]
     fn add_view_request_accepts_position_and_scale() {
+        let part_id = Uuid::new_v4();
         let req: AddViewRequest = serde_json::from_value(serde_json::json!({
             "name": "Detail",
-            "solid_id": 7u64,
+            "source": {"kind": "part", "part_id": part_id, "solid_id": 7u64},
             "projection": {"kind": "right"},
             "position_mm": [120.5, 80.25],
             "scale": 2.5,
@@ -683,15 +931,16 @@ mod tests {
 
     #[test]
     fn add_view_request_rejects_missing_projection() {
+        let part_id = Uuid::new_v4();
         let res: Result<AddViewRequest, _> = serde_json::from_value(serde_json::json!({
             "name": "x",
-            "solid_id": 1u64,
+            "source": {"kind": "part", "part_id": part_id, "solid_id": 1u64},
         }));
         assert!(res.is_err());
     }
 
     #[test]
-    fn add_view_request_rejects_missing_solid_id() {
+    fn add_view_request_rejects_missing_source() {
         let res: Result<AddViewRequest, _> = serde_json::from_value(serde_json::json!({
             "name": "x",
             "projection": {"kind": "front"},
@@ -852,7 +1101,7 @@ mod tests {
         let (model, sid) = build_box_model(20.0, 20.0, 20.0);
         let view = geometry_engine::drawing::project_solid_view(
             &model,
-            sid,
+            nil_source(sid),
             ProjectionType::Front,
             "Front",
             [0.0, 0.0],
@@ -867,7 +1116,7 @@ mod tests {
         let (model, sid) = build_box_model(20.0, 20.0, 20.0);
         let view = geometry_engine::drawing::project_solid_view(
             &model,
-            sid,
+            nil_source(sid),
             ProjectionType::Top,
             "Top",
             [0.0, 0.0],
@@ -884,7 +1133,7 @@ mod tests {
         let (model, sid) = build_box_model(10.0, 10.0, 10.0);
         let view = geometry_engine::drawing::project_solid_view(
             &model,
-            sid,
+            nil_source(sid),
             ProjectionType::Isometric,
             "Iso",
             [0.0, 0.0],
@@ -901,7 +1150,7 @@ mod tests {
         // produced by the kernel so it always misses.
         let err = geometry_engine::drawing::project_solid_view(
             &model,
-            geometry_engine::primitives::solid::INVALID_SOLID_ID,
+            nil_source(geometry_engine::primitives::solid::INVALID_SOLID_ID),
             ProjectionType::Front,
             "X",
             [0.0, 0.0],
@@ -924,7 +1173,7 @@ mod tests {
         let (model, sid) = build_box_model(50.0, 50.0, 50.0);
         let view = geometry_engine::drawing::project_solid_view(
             &model,
-            sid,
+            nil_source(sid),
             ProjectionType::Front,
             "Front",
             [100.0, 80.0],
@@ -989,7 +1238,12 @@ mod tests {
             (ProjectionType::Isometric, "I", [200.0, 200.0]),
         ] {
             let v = geometry_engine::drawing::project_solid_view(
-                &model, sid, proj, name, pos, 1.0,
+                &model,
+                nil_source(sid),
+                proj,
+                name,
+                pos,
+                1.0,
             )
             .unwrap();
             handle.write().await.add_view(v);

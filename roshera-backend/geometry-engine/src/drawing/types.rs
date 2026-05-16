@@ -170,6 +170,46 @@ impl ViewExtent {
     }
 }
 
+/// Tagged reference to the geometry a [`ProjectedView`] is rendering.
+///
+/// The kernel stores **explicit, durable** references — UUIDs that
+/// survive tab switches, server restarts, and branch swaps. Earlier
+/// revisions stored a bare `solid_id: SolidId` that was resolved
+/// against whatever `BRepModel` happened to be the "active" one when
+/// the view was re-rendered; that was correct only by accident and
+/// broke as soon as the user switched parts.
+///
+/// Today only the `Part` variant is wired end-to-end. The `Assembly`
+/// variant is the documented forward-extension point — it will carry
+/// an assembly id + the placed-instance id once the assembly →
+/// solid-with-transform resolver is wired through the projection
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ViewSource {
+    /// Geometry from a standalone part. `part_id` selects the
+    /// `BRepModel` stored in `PartManager`; `solid_id` indexes a
+    /// solid inside that model.
+    Part {
+        part_id: Uuid,
+        solid_id: SolidId,
+    },
+}
+
+impl ViewSource {
+    /// Human-readable label for diagnostics + the SVG/DXF/PDF view
+    /// caption. Used by the renderers when no view name was supplied.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Part { part_id, solid_id } => {
+                let id = part_id.to_string();
+                let prefix: String = id.chars().take(8).collect();
+                format!("part:{prefix}#{solid_id}")
+            }
+        }
+    }
+}
+
 /// A single view placed on a sheet.
 ///
 /// `polylines` are stored in view-space (the local 2D frame established
@@ -180,7 +220,9 @@ pub struct ProjectedView {
     pub id: ProjectedViewId,
     pub name: String,
     pub projection: ProjectionType,
-    pub solid_id: SolidId,
+    /// Durable reference to the geometry being rendered. See
+    /// [`ViewSource`] for the resolver contract.
+    pub source: ViewSource,
     /// Sheet-space placement of the view-space origin, in millimetres.
     pub position_mm: [f64; 2],
     /// View-to-sheet scale. `1.0` = 1 model-unit equals 1 mm on the
@@ -244,6 +286,52 @@ impl SheetSize {
     }
 }
 
+/// User-editable metadata that fills the title-block cells.
+///
+/// The renderer reads every cell except `TITLE` (which mirrors
+/// `Drawing::name`), `SCALE` (derived from the first view), and `SIZE`
+/// (derived from `sheet_size`) from this struct. `drawing_number` is
+/// optional — when `None`, the renderer falls back to the deterministic
+/// `RSH-{first-8-of-uuid}` id.
+///
+/// All free-form fields are plain strings so the user can type
+/// whatever convention they follow (date locales, material codes,
+/// internal part numbers). The kernel does not parse or validate them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TitleBlock {
+    /// Engineer / draftsman who produced the drawing. Empty string =
+    /// renderer shows a dash.
+    pub drawn_by: String,
+    /// Date the drawing was produced/released. Free-form string.
+    pub date: String,
+    /// Material specification.
+    pub material: String,
+    /// Override for the auto-generated drawing number. `None` =
+    /// renderer falls back to the deterministic short id.
+    pub drawing_number: Option<String>,
+    /// Revision letter or string (engineering convention: `A`, `B`, …
+    /// or `0`, `1`, …). Empty string treated as `-`.
+    pub revision: String,
+    /// 1-based index of this sheet within a multi-sheet drawing.
+    pub sheet_index: u32,
+    /// Total number of sheets. Renders as `SHEET {index} OF {count}`.
+    pub sheet_count: u32,
+}
+
+impl Default for TitleBlock {
+    fn default() -> Self {
+        Self {
+            drawn_by: String::new(),
+            date: String::new(),
+            material: String::new(),
+            drawing_number: None,
+            revision: "A".to_string(),
+            sheet_index: 1,
+            sheet_count: 1,
+        }
+    }
+}
+
 /// A drawing document — a collection of [`ProjectedView`]s on a single
 /// sheet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +340,10 @@ pub struct Drawing {
     pub name: String,
     pub sheet_size: SheetSize,
     pub views: Vec<ProjectedView>,
+    /// User-editable title-block metadata. Defaulted on creation;
+    /// patched via `PATCH /api/drawings/{id}/title-block`.
+    #[serde(default)]
+    pub title_block: TitleBlock,
 }
 
 impl Drawing {
@@ -261,6 +353,7 @@ impl Drawing {
             name: name.into(),
             sheet_size,
             views: Vec::new(),
+            title_block: TitleBlock::default(),
         }
     }
 

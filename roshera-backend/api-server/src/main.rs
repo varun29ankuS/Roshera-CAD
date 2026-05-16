@@ -5408,7 +5408,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/api/drawings/{id}",
-            get(drawing_mgr::get_drawing).delete(drawing_mgr::delete_drawing),
+            get(drawing_mgr::get_drawing)
+                .delete(drawing_mgr::delete_drawing),
+        )
+        .route(
+            "/api/drawings/{id}/rename",
+            axum::routing::patch(drawing_mgr::rename_drawing),
+        )
+        .route(
+            "/api/drawings/{id}/title-block",
+            axum::routing::patch(drawing_mgr::update_title_block),
         )
         .route(
             "/api/drawings/{id}/views",
@@ -5419,6 +5428,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             delete(drawing_mgr::remove_view),
         )
         .route("/api/drawings/{id}/svg", get(drawing_mgr::export_svg))
+        .route("/api/drawings/{id}/pdf", get(drawing_mgr::export_pdf))
+        .route("/api/drawings/{id}/dxf", get(drawing_mgr::export_dxf))
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.

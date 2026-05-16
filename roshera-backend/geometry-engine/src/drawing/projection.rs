@@ -225,17 +225,25 @@ pub fn project_solid_edges(
 /// One-shot: project a solid and build a complete [`ProjectedView`]
 /// ready to drop into a [`Drawing`](super::types::Drawing).
 ///
+/// `source` is the durable reference that will be stored on the view
+/// — the caller resolves the source's part_id to the `BRepModel`
+/// passed in `model`, and the projector uses the source's `solid_id`
+/// internally to pick the right solid out of that model.
+///
 /// `name` should be a short human label (e.g. "Front", "Detail A").
 /// `position_mm` is the sheet-space placement of the view's local
 /// origin; `scale` is the view-to-sheet scale factor.
 pub fn project_solid_view(
     model: &BRepModel,
-    solid_id: SolidId,
+    source: super::types::ViewSource,
     projection: ProjectionType,
     name: impl Into<String>,
     position_mm: [f64; 2],
     scale: f64,
 ) -> Result<ProjectedView, ProjectionError> {
+    let solid_id = match source {
+        super::types::ViewSource::Part { solid_id, .. } => solid_id,
+    };
     let polylines = project_solid_edges(model, solid_id, projection, DEFAULT_CURVE_SAMPLES)?;
     let mut extent = ViewExtent::empty();
     for pl in &polylines {
@@ -247,7 +255,7 @@ pub fn project_solid_view(
         id: ProjectedViewId::new(),
         name: name.into(),
         projection,
-        solid_id,
+        source,
         position_mm,
         scale,
         polylines,
