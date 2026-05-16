@@ -15,6 +15,7 @@ import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
+import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
 import { wsClient } from '@/lib/ws-client'
@@ -92,6 +93,7 @@ export function TopBar() {
   const status = useWSStore((s) => s.status)
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   const setDocMode = useDocModeStore((s) => s.setMode)
+  const openCommandPalette = useCommandPaletteStore((s) => s.openWith)
 
   const handleNewProject = useCallback(() => {
     clearScene()
@@ -248,6 +250,25 @@ export function TopBar() {
       <div className="flex-1" />
 
       <div className="flex items-center gap-2 px-2">
+        {/* Command palette trigger. The hotkey lives in
+            `lib/shortcuts.ts`; this chip is the visible affordance so
+            new users discover it without having to read docs. The
+            label uses ⌘ on macOS-class platforms and Ctrl elsewhere
+            so the hint matches the actual modifier the OS reports. */}
+        <button
+          type="button"
+          onClick={() => openCommandPalette()}
+          title="Command palette (Ctrl/Cmd-K)"
+          className="cad-focus inline-flex items-center gap-1.5 h-6 px-2 rounded border border-border/60 bg-background/40 hover:bg-accent/30 text-[11px] text-muted-foreground"
+        >
+          <span>Commands</span>
+          <kbd className="font-mono text-[10px] text-foreground/80 border border-border/60 rounded px-1">
+            {typeof navigator !== 'undefined' && /mac/i.test(navigator.platform)
+              ? '⌘K'
+              : 'Ctrl K'}
+          </kbd>
+        </button>
+
         {/* Workspace switcher. Tucked into the right-side TopBar so
             it is reachable from anywhere but never competes with the
             primary File/Edit/View menus for attention. The dropdown

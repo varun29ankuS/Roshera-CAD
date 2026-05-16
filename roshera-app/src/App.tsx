@@ -9,6 +9,7 @@ import { ModelTree } from '@/components/panels/ModelTree'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
+import { CommandPalette } from '@/components/CommandPalette'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
@@ -108,6 +109,11 @@ export function App() {
           mode where the sheet *is* the work product. */}
       {docMode !== 'drawing' && <Timeline />}
       <StatusBar />
+      {/* Command palette — fixed-position overlay; reachable from
+          every workspace via Ctrl/Cmd-K. Mounted unconditionally so
+          the keybinding works the moment the app loads, not after
+          the first interaction. */}
+      <CommandPalette />
     </div>
   )
 }
