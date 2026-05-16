@@ -25,6 +25,15 @@ byteorder = "1.5"
 rmp-serde = "1"
 chrono = "0.4"
 
+# ISO 10303-21 STEP file parser. We use only the schema-agnostic
+# `ruststep::parser` layer (lexer + AST: Exchange / DataSection /
+# EntityInstance / Record / Parameter) — the generated AP203 typed
+# structs from `espr` are intentionally NOT consumed. Our entity →
+# BRepModel mapping lives in `formats/step/handlers/`.
+#
+# Apache-2.0 licensed. ~7 KLoC.
+ruststep = "0.4"
+
 [dev-dependencies]
 tempfile = "3.8"
 tokio-test = "0.4"
