@@ -2,10 +2,14 @@ import { useRef, useMemo, useCallback, useEffect } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
+import { useAssemblyStore } from '@/stores/assembly-store'
 import { resolveCssVar } from '@/lib/css-color'
 import { wsClient } from '@/lib/ws-client'
 import * as THREE from 'three'
 import type { ThreeEvent } from '@react-three/fiber'
+
+const ASM_OBJ_PREFIX = 'asm-comp:'
 
 interface CADMeshProps {
   object: CADObject
@@ -119,6 +123,7 @@ export function CADMesh({ object, isSelected: _isSelected, isHovered }: CADMeshP
   }, [object.material, editingSketch, clippingPlanes])
 
   const toggleSubElementSelection = useSceneStore((s) => s.toggleSubElementSelection)
+  const addPendingPick = useAssemblyStore((s) => s.addPendingPick)
 
   // Resolve a Three.js raycast triangle index to the kernel `FaceId`. The
   // backend tessellator stores one FaceId per triangle in `mesh.faceIds`
@@ -146,6 +151,46 @@ export function CADMesh({ object, isSelected: _isSelected, isHovered }: CADMeshP
 
       if (selectionMode === 'object') {
         selectObject(object.id, e.shiftKey)
+        return
+      }
+
+      // Assembly mate-pick fast path. In assembly doc mode, a face
+      // click on an `asm-comp:*` mesh feeds the pending-mate flow
+      // instead of the part-mode sub-element selection. We capture
+      // the pick in *component-local* coordinates so the kernel's
+      // `MateReference::Plane` carries through correctly when the
+      // solver later applies the component transform.
+      const docMode = useDocModeStore.getState().mode
+      const isAssemblyComponent = object.id.startsWith(ASM_OBJ_PREFIX)
+      if (docMode === 'assembly' && isAssemblyComponent && selectionMode === 'face') {
+        const mesh = meshRef.current
+        const face = e.face
+        if (!mesh || !face) return
+
+        const worldPoint: [number, number, number] = [
+          e.point.x,
+          e.point.y,
+          e.point.z,
+        ]
+
+        // Origin → local frame via the inverse world matrix.
+        const localOrigin = mesh.worldToLocal(e.point.clone())
+
+        // Normal → local frame. The face normal is in object-local
+        // space already (it lives on the BufferGeometry), so we
+        // forward it directly. We *do* normalize defensively in case
+        // the tessellator shipped a non-unit normal.
+        const ln = face.normal.clone().normalize()
+
+        const componentId = object.id.slice(ASM_OBJ_PREFIX.length)
+        const native = e.nativeEvent
+        addPendingPick({
+          componentId,
+          origin: [localOrigin.x, localOrigin.y, localOrigin.z],
+          normal: [ln.x, ln.y, ln.z],
+          worldPoint,
+          screen: { x: native.clientX, y: native.clientY },
+        })
         return
       }
 
@@ -184,7 +229,7 @@ export function CADMesh({ object, isSelected: _isSelected, isHovered }: CADMeshP
         request_id: `pick-${object.id}-${elementIndex}-${Date.now()}`,
       })
     },
-    [sketchActive, selectObject, toggleSubElementSelection, resolveFaceId, object.id, selectionMode],
+    [sketchActive, selectObject, toggleSubElementSelection, resolveFaceId, object.id, selectionMode, addPendingPick],
   )
 
   const setHoveredSubElement = useSceneStore((s) => s.setHoveredSubElement)
