@@ -1120,7 +1120,7 @@ function CSketchDimensions({ plane }: { plane: SketchPlane }) {
                 // slice H's diagnosis panel exists.
                 console.warn(
                   `csketch constraint ${l.constraintId} conflict:`,
-                  err.conflict,
+                  err.details,
                 )
               } else {
                 console.error('csketch constraint update failed:', err)
@@ -1971,7 +1971,7 @@ function CSketchCircles({ plane }: { plane: SketchPlane }) {
   return (
     <group name="csketch-circles">
       {summary.circles.map((c) => {
-        const pts: Array<[number, number, number]> = []
+        const pts: THREE.Vector3[] = []
         for (let i = 0; i <= CSKETCH_CIRCLE_SEGMENTS; i++) {
           const t = (i / CSKETCH_CIRCLE_SEGMENTS) * Math.PI * 2
           const u = c.cx + c.radius * Math.cos(t)

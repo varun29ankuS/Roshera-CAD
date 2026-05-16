@@ -1,4 +1,4 @@
-import { create } from 'zustand'
+import { create, type StateCreator } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import type * as THREE from 'three'
 import {
@@ -851,8 +851,17 @@ interface SceneState {
   setGlRef: (gl: THREE.WebGLRenderer | null) => void
 }
 
-export const useSceneStore = create<SceneState>()(
-  subscribeWithSelector((set, get) => ({
+// Explicit `StateCreator` annotation. Without it, TypeScript infers
+// the returned object literal's type (with `objectOrder: never[]`
+// etc.) instead of widening to `SceneState`, and every inner arrow
+// method loses contextual parameter typing — producing the cascade
+// of TS7006 "implicit any" errors. The middleware-tuple argument
+// `[['zustand/subscribeWithSelector', never]]` tells Zustand the
+// returned creator carries the `subscribe.withSelector` shape.
+const sceneCreator: StateCreator<
+  SceneState,
+  [['zustand/subscribeWithSelector', never]]
+> = (set, get) => ({
     objects: new Map(),
     objectOrder: [],
     selectedIds: new Set(),
@@ -1638,7 +1647,7 @@ export const useSceneStore = create<SceneState>()(
       // synchronously below, so there's nothing for the queue to
       // hold; clearing it prevents stale ops from leaking into the
       // edited session.
-      resetSketchPendingState('switched to existing sketch')
+      clearSketchReady('switched to existing sketch')
 
       const shapes = session!.shapes
       const last = shapes[shapes.length - 1]
@@ -1922,5 +1931,8 @@ export const useSceneStore = create<SceneState>()(
     setSceneRef: (scene) => set({ sceneRef: scene }),
     setCameraRef: (camera) => set({ cameraRef: camera }),
     setGlRef: (gl) => set({ glRef: gl }),
-  })),
+  })
+
+export const useSceneStore = create<SceneState>()(
+  subscribeWithSelector(sceneCreator),
 )

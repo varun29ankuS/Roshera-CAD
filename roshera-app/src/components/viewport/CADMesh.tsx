@@ -13,7 +13,7 @@ interface CADMeshProps {
   isHovered: boolean
 }
 
-export function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
+export function CADMesh({ object, isSelected: _isSelected, isHovered }: CADMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null!)
   const selectObject = useSceneStore((s) => s.selectObject)
   const setHovered = useSceneStore((s) => s.setHovered)
