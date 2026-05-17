@@ -5400,7 +5400,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Build router with all routes
+    let app = build_router(state);
+
+    // Start server
+    let addr = "0.0.0.0:8081";
+    tracing::info!("Starting Roshera CAD API server on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Compose the full Axum router. Extracted from `main()` so integration
+/// tests can build the same routing surface and drive it through
+/// `tower::ServiceExt::oneshot` without standing up a TCP listener.
+///
+/// State threading: handlers are registered against `Router<AppState>`
+/// during the route chain; `.with_state(state)` collapses the generic
+/// to `Router<()>` at the end so the returned router can be served
+/// directly or composed into a test harness.
+///
+/// The viewport-bridge sub-surface is mounted only when
+/// `ROSHERA_DEV_BRIDGE=1` is in the environment — matching the
+/// production gate so tests pick up exactly the routes a real server
+/// would expose.
+pub(crate) fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         // Root and health
         .route("/", get(root))
@@ -5879,8 +5904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // preflight OPTIONS, which the idempotency layer would otherwise
     // pass through trivially), then idempotency intercepts mutating
     // verbs, then the inner router dispatches to the handler.
-    let app = app
-        .with_state(state)
+    app.with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,
@@ -5890,14 +5914,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        );
-
-    // Start server
-    let addr = "0.0.0.0:8081";
-    tracing::info!("Starting Roshera CAD API server on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        )
 }
