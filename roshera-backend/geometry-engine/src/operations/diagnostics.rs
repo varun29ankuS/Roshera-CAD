@@ -88,6 +88,11 @@ pub enum VertexBlendUnsupportedReason {
     /// Vertex is [`BlendVertexKind::Smooth`] — no corner exists to
     /// blend, the dihedral is continuous through the vertex.
     SmoothVertex,
+    /// Incident blend edges carry per-edge radii that disagree beyond
+    /// numerical tolerance. The F5-α equal-radius apex-sphere corner
+    /// assumes one ball radius across all incident edges; mixed-
+    /// radius corners need an n-rail / Gregory patch (F5-β).
+    MixedRadii,
 }
 
 impl std::fmt::Display for VertexBlendUnsupportedReason {
@@ -106,6 +111,9 @@ impl std::fmt::Display for VertexBlendUnsupportedReason {
             }
             VertexBlendUnsupportedReason::SmoothVertex => {
                 write!(f, "vertex is smooth — no corner to blend")
+            }
+            VertexBlendUnsupportedReason::MixedRadii => {
+                write!(f, "incident blend radii disagree — apex sphere undefined")
             }
         }
     }

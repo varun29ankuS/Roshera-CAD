@@ -375,10 +375,27 @@ fn validate_corner_compatibility(
     };
 
     let vertex_kind = graph.vertex(vertex).map(|v| v.kind);
+
+    // F5-α (Task #10): three-edge convex equal-radius ball corner is
+    // handled inline by `fillet::create_fillet_transitions` after the
+    // per-edge cylinder fillets emerge with their spines retracted to
+    // the apex circle by `blend_graph::compute_setbacks`. The gate
+    // here only needs to confirm the corner classification; the
+    // concurrent-axes feasibility test runs against the live fillet
+    // surfaces inside the transitions dispatcher, where a non-
+    // concurrent (skewed / non-rectilinear) input surfaces as a typed
+    // `BlendFailure::VertexBlendUnsupported`. Higher-degree convex
+    // corners (F5-γ) and concave / mixed corners (F5-δ) continue to
+    // be rejected through the existing arms below.
+    if let Some(BlendVertexKind::ConvexCorner { degree: 3 }) = vertex_kind {
+        return Ok(());
+    }
+
     match blend_graph::compute_setbacks(&probe_model, &mut graph) {
         Ok(()) => {
             // Setbacks resolved — corner is geometrically feasible
-            // but F5 corner-blend synthesis is not yet implemented.
+            // but corner-patch synthesis for this vertex kind is not
+            // yet implemented (F5-γ / F5-δ).
             let setback_summary = graph
                 .edge(ei)
                 .and_then(|e| {
@@ -392,8 +409,9 @@ fn validate_corner_compatibility(
             Err(OperationError::NotImplemented(format!(
                 "Edges {} and {} share corner vertex {} ({:?}). \
                  Setback is geometrically feasible (≈ {:.4} for a unit radius), \
-                 but corner-patch synthesis (Task #82 / F5) is not yet \
-                 implemented. Apply each edge in a separate fillet/chamfer call.",
+                 but corner-patch synthesis for this vertex kind is not yet \
+                 implemented (Task #82 / F5-γ / F5-δ). Apply each edge in a \
+                 separate fillet/chamfer call.",
                 ei, ej, vertex, vertex_kind, setback_summary
             )))
         }

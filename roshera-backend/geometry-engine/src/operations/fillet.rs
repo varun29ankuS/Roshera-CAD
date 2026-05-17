@@ -13,7 +13,8 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::blend_graph::{self, BlendGraph, BlendRadius};
+use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind};
+use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::feasibility;
 use super::lifecycle::{self, OpSpec};
@@ -21,12 +22,13 @@ use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
-    curve::{Curve, Line, ParameterRange},
+    curve::{Arc, Curve, Line, ParameterRange},
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId},
     fillet_surfaces::{CylindricalFillet, ToroidalFillet, VariableRadiusFillet},
+    r#loop::{Loop, LoopType},
     solid::SolidId,
-    surface::{Cylinder, Surface},
+    surface::{Cylinder, Sphere, Surface},
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -293,22 +295,54 @@ pub fn fillet_edges(
         let mut blend_graph = blend_graph::build(model, &blend_selection)?;
         blend_graph::compute_setbacks(model, &mut blend_graph)?;
 
+        // F5-α: snapshot the original sharp-vertex position for every
+        // BlendGraph corner *before* per-edge fillets retract their
+        // spines and `update_adjacent_faces` splices the neighbourhood.
+        // After the chain pass the original vertex may still exist in
+        // the model but with disconnected incident edges; reading the
+        // position now keeps the apex-sphere outward direction stable
+        // regardless of how the surgery resolves the corner cleanup.
+        let corner_positions: HashMap<VertexId, Point3> = blend_graph
+            .corners()
+            .filter_map(|c| {
+                model.vertices.get(c.id).map(|v| {
+                    let p = v.position;
+                    (c.id, Point3::new(p[0], p[1], p[2]))
+                })
+            })
+            .collect();
+
         // Group edges into fillet chains
         let edge_chains = group_edges_into_chains(model, &selected_edges)?;
 
         // Create fillet surfaces for each chain
-        let mut fillet_faces = Vec::new();
+        let mut fillet_faces: Vec<FaceId> = Vec::new();
+        let mut edge_to_face: HashMap<EdgeId, FaceId> = HashMap::new();
         let mut surgeries = Vec::new();
         for chain in edge_chains {
-            let (chain_faces, chain_surgeries) =
+            let (chain_edge_faces, chain_surgeries) =
                 create_fillet_chain(model, solid_id, chain, &options, &blend_graph)?;
-            fillet_faces.extend(chain_faces);
+            for (edge_id, face_id) in &chain_edge_faces {
+                edge_to_face.insert(*edge_id, *face_id);
+                fillet_faces.push(*face_id);
+            }
             surgeries.extend(chain_surgeries);
         }
 
         // Re-stitch the surrounding topology and add fillet faces to the
         // outer shell so the resulting B-Rep is watertight.
         update_adjacent_faces(model, solid_id, &fillet_faces, &surgeries)?;
+
+        // F5-α: corner-blend dispatch. After per-edge fillets have been
+        // spliced in (so their cap arcs are committed to the shell),
+        // emit the corner-sphere face for every BlendGraph corner the
+        // dispatcher recognises (today: ConvexCorner{degree:3} with
+        // equal radius + concurrent axes). Other corner kinds pass
+        // through; supported kinds outside today's MVP surface as
+        // typed BlendFailure::VertexBlendUnsupported.
+        let corner_faces =
+            create_fillet_transitions(model, solid_id, &blend_graph, &edge_to_face, &corner_positions)?;
+        fillet_faces.extend(corner_faces);
 
         // Validate result if requested
         if options.common.validate_result {
@@ -350,37 +384,6 @@ pub fn fillet_edges(
 
         Ok(fillet_faces)
     })
-}
-
-/// Apply fillet to vertices (create spherical patches)
-pub fn fillet_vertices(
-    model: &mut BRepModel,
-    solid_id: SolidId,
-    vertices: Vec<VertexId>,
-    radius: f64,
-    options: FilletOptions,
-) -> OperationResult<Vec<FaceId>> {
-    // Validate inputs
-    validate_vertex_fillet_inputs(model, solid_id, &vertices, radius)?;
-
-    let mut fillet_faces = Vec::new();
-
-    for vertex_id in vertices {
-        // Get all edges connected to this vertex
-        let connected_edges = get_edges_at_vertex(model, solid_id, vertex_id)?;
-
-        // Create spherical patch at vertex
-        let sphere_faces =
-            create_vertex_blend(model, solid_id, vertex_id, &connected_edges, radius)?;
-        fillet_faces.extend(sphere_faces);
-    }
-
-    // Validate result if requested
-    if options.common.validate_result {
-        validate_filleted_solid(model, solid_id)?;
-    }
-
-    Ok(fillet_faces)
 }
 
 /// Create a fillet chain along connected edges.
@@ -523,8 +526,8 @@ fn create_fillet_chain(
     edges: Vec<EdgeId>,
     options: &FilletOptions,
     blend_graph: &BlendGraph,
-) -> OperationResult<(Vec<FaceId>, Vec<BlendEdgeSurgery>)> {
-    let mut fillet_faces = Vec::new();
+) -> OperationResult<(Vec<(EdgeId, FaceId)>, Vec<BlendEdgeSurgery>)> {
+    let mut edge_faces: Vec<(EdgeId, FaceId)> = Vec::new();
     let mut surgeries = Vec::new();
 
     for &edge_id in &edges {
@@ -578,21 +581,19 @@ fn create_fillet_chain(
             }
         };
 
-        fillet_faces.push(fillet_face);
+        edge_faces.push((edge_id, fillet_face));
         if let Some(s) = surgery {
             surgeries.push(s);
         }
     }
 
-    // Create transition surfaces where fillets meet. Transition faces
-    // are produced by a separate corner-blend pipeline and are not
-    // simple edge replacements — they don't carry surgery.
-    if options.preserve_edges && edges.len() > 1 {
-        let transitions = create_fillet_transitions(model, &edges, &fillet_faces)?;
-        fillet_faces.extend(transitions);
-    }
+    // F5-α: corner-sphere emission has moved out of the per-chain
+    // pipeline into `fillet_edges`. The BlendGraph is global to the
+    // selection, and a single corner's three incident edges may
+    // straddle multiple chains — the dispatcher must see all chain
+    // results before walking corners.
 
-    Ok((fillet_faces, surgeries))
+    Ok((edge_faces, surgeries))
 }
 
 /// Create a constant radius fillet
@@ -1727,49 +1728,28 @@ struct IncidentEdgeClassification {
     blend: Option<EdgeBlendDescriptor>,
 }
 
-/// Result of classifying every edge incident to the vertex.
-///
-/// Slice 1 produces this struct; slice 2 will consume it to emit the
-/// sphere/face SSI trimming curves and stitch the patch into the shell.
-/// The geometry-only contract for slice 1 is:
-///
-///   * `incidents.len()` matches the number of edges actually meeting
-///     the vertex in the B-Rep (deduplicated by EdgeId).
-///   * `filleted_incidents` is the subset of `incidents` whose `blend`
-///     is `Some`, in the same order.
-///   * `sphere_center` is the least-squares-best point lying on every
-///     filleted-incident's axis line. The residual `max_axis_distance`
-///     is bounded by `1e-6` — exceeding that signals non-concurrent
-///     axes (the math problem has no exact solution, which physically
-///     means three or more edge fillets cannot all be tangent to a
-///     single sphere of the given radius). The caller turns that into
-///     an `InvalidGeometry` so the user gets a specific diagnostic.
-///   * `sphere_radius` equals the (single) shared radius of all
-///     filleted incidents. Mixed radii across incidents are rejected
-///     upstream.
-#[derive(Debug, Clone)]
-struct VertexBlendContext {
-    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
-    vertex_id: VertexId,
-    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
-    vertex_position: Point3,
-    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
-    incidents: Vec<IncidentEdgeClassification>,
-    #[allow(dead_code)] // consumed by slice 2 sphere-face stitching
-    filleted_incidents: Vec<IncidentEdgeClassification>,
-    sphere_center: Point3,
-    sphere_radius: f64,
-}
-
 /// Classify the surface pair `(face1, face2)` adjacent to one edge.
 ///
 /// Returns `Some(EdgeBlendDescriptor)` when exactly one of the two
-/// faces is a finite cylindrical surface — that face is the edge
+/// faces is a recognised cylindrical edge-blend — that face is the
 /// fillet just produced by `fillet_edges`, and its axis carries the
-/// information needed to place the corner sphere. Returns `None` when
-/// neither face is a recognized cylindrical blend (the incident edge
-/// was not filleted) and when both faces are cylinders (ambiguous —
-/// a fillet-of-fillet scenario, deferred to Task #102).
+/// information needed to place the corner sphere. Two surface kinds
+/// qualify:
+///
+///   * Raw [`Cylinder`] — produced by the pre-F4-α path and by
+///     a handful of specialised closed-edge specialisations
+///     (`cylinder_rim_fillet`).
+///   * [`CylindricalFillet`] — the F4-α analytic dispatch output
+///     for plane/plane and coaxial-cylinder/cylinder edges. Even
+///     though it reports `SurfaceType::Cylinder`, it is a distinct
+///     wrapper type carrying spine + per-station frame fields; the
+///     vertex-blend classifier reads the cylinder axis/origin/radius
+///     out of those fields.
+///
+/// Returns `None` when neither face is a recognised blend (the
+/// incident edge was not filleted) and when both faces are cylindrical
+/// blends (ambiguous — a fillet-of-fillet scenario, deferred to Task
+/// #102).
 fn classify_blend_for_edge(
     model: &BRepModel,
     face1: FaceId,
@@ -1780,26 +1760,167 @@ fn classify_blend_for_edge(
     let s1 = model.surfaces.get(f1.surface_id)?;
     let s2 = model.surfaces.get(f2.surface_id)?;
 
-    let cyl1 = s1.as_any().downcast_ref::<Cylinder>();
-    let cyl2 = s2.as_any().downcast_ref::<Cylinder>();
+    // Extract (axis, axis_origin, radius) from either a raw Cylinder
+    // or a CylindricalFillet. Returns None when the surface is neither.
+    let extract = |surf: &dyn Surface| -> Option<(Vector3, Point3, f64)> {
+        if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+            return Some((c.axis, c.origin, c.radius));
+        }
+        if let Some(f) = surf.as_any().downcast_ref::<CylindricalFillet>() {
+            // For the analytic plane/plane and coaxial-cylinder kparts
+            // the axis is constant along the spine, so axis_field[0]
+            // gives the cylinder direction. A point on the axis is
+            // any spine sample; the start of the spine curve is the
+            // simplest exact choice. Both bits are debug-asserted as
+            // unit-norm / on-spine in `from_analytic_kpart`.
+            let axis = *f.axis_field.first()?;
+            let axis_origin = f.spine.evaluate(0.0).ok()?.position;
+            return Some((axis, axis_origin, f.radius));
+        }
+        None
+    };
 
-    match (cyl1, cyl2) {
-        (Some(c), None) => Some(EdgeBlendDescriptor {
+    let blend1 = extract(s1);
+    let blend2 = extract(s2);
+    match (blend1, blend2) {
+        (Some((axis, axis_origin, radius)), None) => Some(EdgeBlendDescriptor {
             face_id: face1,
-            axis: c.axis,
-            axis_origin: c.origin,
-            radius: c.radius,
+            axis,
+            axis_origin,
+            radius,
         }),
-        (None, Some(c)) => Some(EdgeBlendDescriptor {
+        (None, Some((axis, axis_origin, radius))) => Some(EdgeBlendDescriptor {
             face_id: face2,
-            axis: c.axis,
-            axis_origin: c.origin,
-            radius: c.radius,
+            axis,
+            axis_origin,
+            radius,
         }),
-        // Two cylinders or two non-cylinders both opt out of slice-1
-        // classification; slice 2 / Task #102 will broaden this.
+        // Two cylindrical blends or two non-cylindrical surfaces both
+        // opt out of F5-α classification; F5-β / Task #102 will
+        // broaden this to cover fillet-of-fillet.
         _ => None,
     }
+}
+
+/// Walk `fillet_face_id`'s outer loop and return the `EdgeId` of the
+/// cap arc whose underlying [`Arc`] is centred on `sphere_center`
+/// within `1e-6` (plane units).
+///
+/// A cylindrical edge fillet's outer loop has four edges: two `trim`
+/// edges on the adjacent original faces (the rolling-ball contact
+/// rails) plus two `cap` edges (the rolling-ball cross-section arcs
+/// at each end of the edge). Both caps are [`Arc`] primitives;
+/// their centres sit at the two rolling-ball centres along the edge.
+/// For the equal-radius F5-α corner case, the V-side cap's centre
+/// coincides exactly with the sphere centre C (geometric uniqueness
+/// of the rolling ball tangent to both adjacent original faces at
+/// radius r), so a centre-coincidence test identifies the right cap.
+///
+/// Returns `None` if the face is missing, its outer loop is missing,
+/// no edge of the loop carries an `Arc`, or no Arc centre is within
+/// tolerance of `sphere_center`.
+fn find_cap_arc_edge_at_vertex(
+    model: &BRepModel,
+    fillet_face_id: FaceId,
+    sphere_center: Point3,
+) -> Option<EdgeId> {
+    const CENTER_TOL_SQ: f64 = 1.0e-12; // (1e-6)^2 in squared distance
+    let face = model.faces.get(fillet_face_id)?;
+    let outer_loop = model.loops.get(face.outer_loop)?;
+    for &edge_id in &outer_loop.edges {
+        let edge = model.edges.get(edge_id)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        if let Some(arc) = curve.as_any().downcast_ref::<Arc>() {
+            let d = arc.center - sphere_center;
+            if d.x * d.x + d.y * d.y + d.z * d.z <= CENTER_TOL_SQ {
+                return Some(edge_id);
+            }
+        }
+    }
+    None
+}
+
+/// Verify that the three cap-arc edges `cap_arc_edges` form a closed
+/// triangular cycle in the BRep, and recover both the corner-vertex
+/// sequence (A, B, C) and the per-edge "follow start→end?" flag for
+/// the new sphere-face loop.
+///
+/// The cycle is found by:
+///   1. Anchor `A = edges[0].start_vertex`, `B = edges[0].end_vertex`.
+///   2. Find which of `edges[1]`, `edges[2]` is incident to `B`; the
+///      matching edge's other endpoint is `C`, and its forward flag
+///      is `true` iff its `start_vertex == B`.
+///   3. The remaining edge must connect `C → A`; its forward flag is
+///      `true` iff its `start_vertex == C`.
+///
+/// `forwards[i]` is the flag for `cap_arc_edges[i]` in the input
+/// order — the caller adds edges to the new sphere-face loop in that
+/// same order.
+fn verify_cap_arcs_form_closed_triangle(
+    model: &BRepModel,
+    cap_arc_edges: &[EdgeId; 3],
+) -> Result<([VertexId; 3], [bool; 3]), BlendFailure> {
+    let mut endpoints = [(0u32, 0u32); 3];
+    for (i, &edge_id) in cap_arc_edges.iter().enumerate() {
+        let edge = model.edges.get(edge_id).ok_or_else(|| {
+            BlendFailure::TopologyViolation {
+                detail: format!(
+                    "cap-arc edge {:?} missing from model during corner-blend cycle check",
+                    edge_id
+                ),
+            }
+        })?;
+        endpoints[i] = (edge.start_vertex, edge.end_vertex);
+    }
+
+    let a = endpoints[0].0;
+    let b = endpoints[0].1;
+
+    // Which of edges 1, 2 carries B as an endpoint?
+    let pick_middle = |i: usize| -> Option<(bool, VertexId)> {
+        if endpoints[i].0 == b {
+            Some((true, endpoints[i].1))
+        } else if endpoints[i].1 == b {
+            Some((false, endpoints[i].0))
+        } else {
+            None
+        }
+    };
+    let (next_idx, last_idx, next_forward, c) = if let Some((fwd, c)) = pick_middle(1) {
+        (1usize, 2usize, fwd, c)
+    } else if let Some((fwd, c)) = pick_middle(2) {
+        (2usize, 1usize, fwd, c)
+    } else {
+        return Err(BlendFailure::TopologyViolation {
+            detail: format!(
+                "corner cap-arc edges do not form a closed triangle: edge 0 ends at \
+                 vertex {:?} but neither of the other two cap arcs is incident to it",
+                b
+            ),
+        });
+    };
+
+    let last_forward = if endpoints[last_idx].0 == c && endpoints[last_idx].1 == a {
+        true
+    } else if endpoints[last_idx].1 == c && endpoints[last_idx].0 == a {
+        false
+    } else {
+        return Err(BlendFailure::TopologyViolation {
+            detail: format!(
+                "corner cap-arc edges do not form a closed triangle: a={:?}, b={:?}, \
+                 c={:?}, but the remaining cap arc has endpoints {:?} — does not \
+                 close the cycle",
+                a, b, c, endpoints[last_idx]
+            ),
+        });
+    };
+
+    let mut forwards = [true; 3];
+    forwards[0] = true;
+    forwards[next_idx] = next_forward;
+    forwards[last_idx] = last_forward;
+
+    Ok(([a, b, c], forwards))
 }
 
 /// Solve for the point closest to every axis line `(q_i, u_i)`.
@@ -1904,224 +2025,109 @@ fn compute_concurrent_axes_center(
     Ok(Point3::new(c.x, c.y, c.z))
 }
 
-/// Gather the full classification context for a vertex blend.
+/// Apex-sphere corner emission for the F5-α three-edge convex
+/// equal-radius case.
 ///
-/// Slice-1 invariants enforced here:
+/// Called from [`create_fillet_transitions`] once per
+/// `BlendVertexKind::ConvexCorner { degree: 3 }` after the per-edge
+/// cylinder fillets have been spliced in. The caller supplies the
+/// pre-computed sphere geometry (centre / radius derived from
+/// `compute_concurrent_axes_center` over the three cylindrical-
+/// fillet axes) and the three fillet `FaceId`s; this helper performs
+/// the surgery that closes the triangular hole:
 ///
-///   1. The vertex must have **at least three** incident edges
-///      (a convex corner of a polyhedron has ≥ 3; fewer indicates a
-///      seam or boundary vertex that does not admit a spherical
-///      corner blend).
-///   2. **At least three** of those incident edges must be filleted
-///      cylinder blends (sphere/cylinder/cylinder/cylinder is the
-///      minimal vertex-blend configuration; sphere/cylinder/cylinder
-///      degenerates to an edge-blend extension, Task #100).
-///   3. All filleted-incident radii must agree with the requested
-///      `radius` to within `1e-9`. Mixed-radius vertex blends are a
-///      separate kernel construct (rolling ball of varying radius)
-///      tracked under Task #99.
-///   4. The axis lines of the filleted incidents must be concurrent
-///      to within `1e-6` of the least-squares-best center. Non-
-///      concurrent axes signal a non-rectilinear corner whose
-///      single-radius vertex blend does not exist; the caller raises
-///      `InvalidGeometry`.
-fn gather_vertex_blend_context(
-    model: &BRepModel,
-    solid_id: SolidId,
-    vertex_id: VertexId,
-    requested_radius: f64,
-) -> OperationResult<VertexBlendContext> {
-    let vertex = model
-        .vertices
-        .get(vertex_id)
-        .ok_or_else(|| OperationError::InvalidGeometry(format!(
-            "vertex {:?} not found",
-            vertex_id
-        )))?;
-    let vertex_position = Point3::new(
-        vertex.position[0],
-        vertex.position[1],
-        vertex.position[2],
-    );
-
-    let edge_ids = get_edges_at_vertex(model, solid_id, vertex_id)?;
-    if edge_ids.len() < 3 {
-        return Err(OperationError::InvalidGeometry(format!(
-            "vertex {:?} has {} incident edge(s); vertex blend requires at \
-             least 3 incident edges (a 3-edge corner is the minimum that \
-             bounds a spherical patch)",
-            vertex_id,
-            edge_ids.len()
-        )));
-    }
-
-    let mut incidents = Vec::with_capacity(edge_ids.len());
-    let mut filleted = Vec::new();
-    for edge_id in edge_ids {
-        let adjacent_faces = get_adjacent_faces(model, solid_id, edge_id)?;
-        let blend = classify_blend_for_edge(model, adjacent_faces.0, adjacent_faces.1);
-        let classification = IncidentEdgeClassification {
-            edge_id,
-            adjacent_faces,
-            blend: blend.clone(),
-        };
-        if blend.is_some() {
-            filleted.push(classification.clone());
-        }
-        incidents.push(classification);
-    }
-
-    if filleted.len() < 3 {
-        return Err(OperationError::InvalidGeometry(format!(
-            "vertex {:?} has only {} filleted incident edge(s); vertex blend \
-             requires at least 3 filleted incident edges meeting at the \
-             corner (apply fillet_edges to the 3+ edges that share the \
-             vertex before requesting fillet_vertices)",
-            vertex_id,
-            filleted.len()
-        )));
-    }
-
-    // Radius agreement: every filleted incident must carry the same
-    // radius (== requested_radius). Mixed radii are out of scope.
-    let radius_tol = 1.0e-9_f64.max(requested_radius * 1.0e-9);
-    for incident in &filleted {
-        // Safe: `filleted` only contains items with blend = Some.
-        #[allow(clippy::expect_used)]
-        // Reason: invariant established by the `if blend.is_some()` push above.
-        let blend = incident
-            .blend
-            .as_ref()
-            .expect("filleted incidents always carry a blend descriptor");
-        if (blend.radius - requested_radius).abs() > radius_tol {
-            return Err(OperationError::InvalidGeometry(format!(
-                "vertex {:?}: edge fillet on incident edge {:?} has radius \
-                 {} which does not match the requested vertex blend radius \
-                 {} (mixed-radius vertex blends are not supported in slice 1)",
-                vertex_id, incident.edge_id, blend.radius, requested_radius
-            )));
-        }
-    }
-
-    let sphere_center = compute_concurrent_axes_center(&filleted, vertex_id)?;
-
-    // Residual check: every axis line must pass through `sphere_center`
-    // within 1e-6 (plane units). The least-squares solver succeeds for
-    // any 3+ non-coplanar axes, so a finite residual here means the
-    // input axes literally do not meet — geometrically invalid.
-    let mut max_residual = 0.0_f64;
-    for incident in &filleted {
-        #[allow(clippy::expect_used)]
-        // Reason: filleted incidents always carry a blend (see above).
-        let blend = incident
-            .blend
-            .as_ref()
-            .expect("filleted incidents always carry a blend descriptor");
-        let d = sphere_center - blend.axis_origin;
-        // Distance from `sphere_center` to line (q, u): |d − (d·u) u|.
-        let proj = blend.axis.x * d.x + blend.axis.y * d.y + blend.axis.z * d.z;
-        let perp = Vector3::new(
-            d.x - proj * blend.axis.x,
-            d.y - proj * blend.axis.y,
-            d.z - proj * blend.axis.z,
-        );
-        let r = (perp.x * perp.x + perp.y * perp.y + perp.z * perp.z).sqrt();
-        if r > max_residual {
-            max_residual = r;
-        }
-    }
-    if max_residual > 1.0e-6 {
-        return Err(OperationError::InvalidGeometry(format!(
-            "vertex {:?}: edge-fillet axes are not concurrent to within 1e-6 \
-             (max residual = {:.3e}); the corner does not admit a constant-\
-             radius spherical blend",
-            vertex_id, max_residual
-        )));
-    }
-
-    Ok(VertexBlendContext {
-        vertex_id,
-        vertex_position,
-        incidents,
-        filleted_incidents: filleted,
-        sphere_center,
-        sphere_radius: requested_radius,
-    })
-}
-
-/// Create spherical blend at a vertex.
+/// 1. Locate the three V-side cap arcs on the incident fillet
+///    faces. Each cap arc's centre coincides exactly with the
+///    sphere centre by the F5-α invariant (rolling-ball tangent to
+///    two original faces at radius `r` is geometrically unique on
+///    a flat dihedral), so [`find_cap_arc_edge_at_vertex`] picks
+///    out the right cap by centre-coincidence. Failure surfaces as
+///    `BlendFailure::TopologyViolation` — that means the upstream
+///    concurrent-axes promise was violated by a numerically off-
+///    circle cap.
+/// 2. Verify the three cap arcs form a closed triangular cycle
+///    `P_A → P_B → P_C → P_A` and recover the per-arc forward /
+///    backward orientation flag for the new sphere-face loop.
+/// 3. Build a [`Sphere`] surface at `(sphere_center, sphere_radius)`,
+///    pick an outward-pointing orientation, add a new face backed
+///    by that surface and the three-edge loop, and register the
+///    face on the solid's outer shell.
 ///
-/// Slice 1 (Task #104) implements the **classification + sphere
-/// placement** half of the vertex blend pipeline:
-///
-///   * Every incident edge at the vertex is looked up.
-///   * Each incident is classified as either a filleted edge-blend
-///     (one adjacent face is a cylindrical surface produced by a
-///     prior `fillet_edges` call) or an unfilleted edge.
-///   * The corner sphere's center is the point that lies on every
-///     filleted-incident's axis line, solved via the projector-matrix
-///     least-squares formulation in `compute_concurrent_axes_center`.
-///   * Pre-conditions (≥3 incidents, ≥3 filleted, matching radii,
-///     concurrent axes within 1e-6) are validated; failures surface
-///     as `InvalidGeometry` with a diagnostic that names the actual
-///     defect.
-///
-/// Slice 2 (Task #82, pending) will use the resulting
-/// `VertexBlendContext` to compute the sphere/cylinder SSI trimming
-/// curves, build the sphere face, re-trim the adjacent fillet faces,
-/// and stitch the patch into the shell. Until slice 2 lands, this
-/// function returns `OperationError::NotImplemented` after a
-/// successful classification — but the diagnostic now includes the
-/// concrete sphere center and radius, so the math is verifiable from
-/// the error message alone.
-fn create_vertex_blend(
+/// Per-corner Euler delta: ΔV = 0, ΔE = 0, ΔF = +1. The three cap
+/// arcs were boundary edges (each used by exactly one fillet face's
+/// loop); the new sphere face turns them into interior edges shared
+/// between the sphere face and one fillet face each. V − E + F goes
+/// from `2 − 1 = 1` (open triangular hole) to `2`, restoring
+/// watertightness.
+fn apply_apex_sphere_corner(
     model: &mut BRepModel,
     solid_id: SolidId,
     vertex_id: VertexId,
-    edges: &[EdgeId],
-    radius: f64,
-) -> OperationResult<Vec<FaceId>> {
-    // Top-level radius guard. `validate_vertex_fillet_inputs` is the
-    // canonical gate for this in the public API, but `create_vertex_blend`
-    // also lives behind an internal call path that should not assume the
-    // public validator has run.
-    if !radius.is_finite() || radius <= 0.0 {
-        return Err(OperationError::InvalidRadius(radius));
+    fillet_face_ids: &[FaceId; 3],
+    sphere_center: Point3,
+    sphere_radius: f64,
+    vertex_outward: Vector3,
+) -> OperationResult<FaceId> {
+    // Step 1 — locate the three V-side cap arcs.
+    let mut cap_arc_edges: [EdgeId; 3] = [0; 3];
+    for (i, &face_id) in fillet_face_ids.iter().enumerate() {
+        cap_arc_edges[i] = find_cap_arc_edge_at_vertex(model, face_id, sphere_center)
+            .ok_or_else(|| {
+                OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
+                    vertex: vertex_id,
+                    kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                    reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                }))
+            })?;
     }
 
-    // Validate referenced edge/curve topology up-front so invalid input
-    // surfaces as InvalidGeometry rather than being masked by the
-    // NotImplemented branch downstream.
-    for &edge_id in edges {
-        let edge = model
-            .edges
-            .get(edge_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
-        model
-            .curves
-            .get(edge.curve_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+    // Step 2 — verify the cap arcs close a triangle and recover the
+    // per-arc forward/backward flag for the sphere-face loop.
+    let (_corner_vertices, loop_forwards) =
+        verify_cap_arcs_form_closed_triangle(model, &cap_arc_edges)
+            .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
+
+    // Step 3 — build the sphere surface, pick an outward face
+    // orientation, add the face and register it on the outer shell.
+    let sphere = Sphere::new(sphere_center, sphere_radius).map_err(|e| {
+        OperationError::NumericalError(format!("corner sphere construction failed: {:?}", e))
+    })?;
+
+    let orientation = orient_face_for_outward(&sphere, vertex_outward)?;
+    let surface_id = model.surfaces.add(Box::new(sphere));
+
+    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    for i in 0..3 {
+        blend_loop.add_edge(cap_arc_edges[i], loop_forwards[i]);
     }
+    let loop_id = model.loops.add(blend_loop);
 
-    let context = gather_vertex_blend_context(model, solid_id, vertex_id, radius)?;
+    let mut face = Face::new(0, surface_id, loop_id, orientation);
+    face.outer_loop = loop_id;
+    let face_id = model.faces.add(face);
 
-    // Slice 1 stops here: classification + sphere placement are done,
-    // but the sphere/cylinder SSI surgery is slice 2 (Task #82).
-    Err(OperationError::NotImplemented(format!(
-        "Vertex blend at vertex {:?}: classified {} incident edge(s), {} of \
-         which are filleted cylinder blends; corner sphere center = \
-         ({:.6}, {:.6}, {:.6}), radius = {}. The sphere/cylinder SSI \
-         trimming and patch-stitching surgery is not yet implemented \
-         (tracked as Task #82). Apply edge fillets only.",
-        vertex_id,
-        context.incidents.len(),
-        context.filleted_incidents.len(),
-        context.sphere_center.x,
-        context.sphere_center.y,
-        context.sphere_center.z,
-        context.sphere_radius
-    )))
+    let shell_id = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Solid {} not found", solid_id)))?
+        .outer_shell;
+    let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Outer shell {} not found", shell_id))
+    })?;
+    shell.add_face(face_id);
+
+    Ok(face_id)
 }
+
+// `gather_vertex_blend_context` and `create_vertex_blend` were the
+// pre-F5-α scaffolding for the standalone `fillet_vertices` public
+// API. F5-α moves corner emission inline into `fillet_edges` via
+// `create_fillet_transitions` walking the BlendGraph, so the
+// standalone API and both helpers are gone. The surgery they
+// performed survives, factored as `apply_apex_sphere_corner` above
+// and the unchanged `find_cap_arc_edge_at_vertex` /
+// `verify_cap_arcs_form_closed_triangle` /
+// `compute_concurrent_axes_center` helpers above.
 
 /// Look up `edge_id` in `face_id`'s outer + inner loops and return the
 /// orientation sign (+1.0 if the edge appears forward in the loop,
@@ -3355,26 +3361,257 @@ fn create_trimmed_fillet_face(
     Ok((model.faces.add(face), surgery))
 }
 
-/// Create transition surfaces between fillets.
-///
-/// Stub: a complete implementation would emit corner-blending patches at
-/// vertices where multiple fillets meet (typically spherical or N-sided).
-/// Until that lands, this returns an empty vec and emits a single warning
-/// per call so callers know the corner blends are missing rather than
-/// silently producing a topologically incomplete result.
-fn create_fillet_transitions(
-    _model: &mut BRepModel,
-    _edges: &[EdgeId],
-    fillet_faces: &[FaceId],
-) -> OperationResult<Vec<FaceId>> {
-    if !fillet_faces.is_empty() {
-        tracing::warn!(
-            "create_fillet_transitions: corner-blend generation not implemented; \
-             {} fillet face(s) emitted without inter-fillet transition patches",
-            fillet_faces.len()
-        );
+/// Extract `(axis, axis_origin, radius)` from a freshly created
+/// cylindrical-fillet face. Mirrors the inner closure of
+/// [`classify_blend_for_edge`] but applies to a single known face
+/// rather than searching a pair. Returns `None` if the face's
+/// surface is neither a raw [`Cylinder`] nor a [`CylindricalFillet`]
+/// — F5-α only supports the cylindrical edge-blend case.
+fn extract_fillet_cylinder_descriptor(
+    model: &BRepModel,
+    face_id: FaceId,
+) -> Option<EdgeBlendDescriptor> {
+    let face = model.faces.get(face_id)?;
+    let surf = model.surfaces.get(face.surface_id)?;
+    if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+        return Some(EdgeBlendDescriptor {
+            face_id,
+            axis: c.axis,
+            axis_origin: c.origin,
+            radius: c.radius,
+        });
     }
-    Ok(Vec::new())
+    if let Some(f) = surf.as_any().downcast_ref::<CylindricalFillet>() {
+        let axis = *f.axis_field.first()?;
+        let axis_origin = f.spine.evaluate(0.0).ok()?.position;
+        return Some(EdgeBlendDescriptor {
+            face_id,
+            axis,
+            axis_origin,
+            radius: f.radius,
+        });
+    }
+    None
+}
+
+/// Emit corner-sphere transition faces at every BlendGraph corner
+/// the F5-α dispatcher recognises.
+///
+/// MVP scope (F5-α / Task #10):
+/// - `BlendVertexKind::ConvexCorner { degree: 3 }`
+/// - all three incident blend edges produced a cylindrical fillet
+///   face (raw `Cylinder` or `CylindricalFillet`)
+/// - radii agree within `1e-9`
+/// - the three cylinder axes are concurrent (least-squares residual
+///   from [`compute_concurrent_axes_center`] ≤ `1e-6`)
+///
+/// When all four conditions hold this calls
+/// [`apply_apex_sphere_corner`] which:
+///   1. locates the V-side cap arcs on each incident fillet face by
+///      centre-coincidence with the apex sphere centre
+///   2. verifies the three caps close a triangle
+///   3. emits a [`Sphere`] face with the cap-arc loop as its outer
+///      boundary, registers it on the outer shell
+///
+/// Out-of-MVP variants surface as typed
+/// `BlendFailure::VertexBlendUnsupported` so callers can branch on
+/// the structured reason:
+/// - degree ≠ 3 → `DegreeTooHigh`
+/// - mismatched radii → `MixedRadii`
+/// - non-concurrent axes → `NonManifoldNeighbourhood`
+/// - one of the incident edges had no fillet face produced (e.g.
+///   propagation dropped it) → corner is silently skipped — its
+///   neighbourhood is not three-cylinder anyway and the shell stays
+///   watertight without a sphere
+///
+/// `ConcaveCorner` / `Mixed` / `Cliff` are filtered out by the
+/// `BlendGraph::corners()` iterator's classification — F5-δ widens
+/// coverage to those. `Smooth` vertices never reach
+/// `corners()` (their dihedral is continuous so no patch is needed).
+fn create_fillet_transitions(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    blend_graph: &BlendGraph,
+    edge_to_face: &HashMap<EdgeId, FaceId>,
+    corner_positions: &HashMap<VertexId, Point3>,
+) -> OperationResult<Vec<FaceId>> {
+    const RADIUS_TOL: f64 = 1.0e-9;
+    const AXES_RESIDUAL_TOL: f64 = 1.0e-6;
+
+    let mut new_faces: Vec<FaceId> = Vec::new();
+
+    for corner in blend_graph.corners() {
+        let degree = match corner.kind {
+            BlendVertexKind::ConvexCorner { degree } => degree,
+            // Concave / Mixed corners are F5-δ territory. The
+            // lifecycle gate already rejects them with the right
+            // typed surface; nothing for the transitions pass to
+            // do.
+            _ => continue,
+        };
+
+        if degree != 3 {
+            // Non-degree-3 ConvexCorner vertices reach this iterator
+            // legitimately during single-edge fillets (degree 1, the
+            // edge's endpoint) and two-edge non-shared-vertex
+            // selections (degree 1 at every endpoint). Those cases
+            // need no corner patch — the per-edge cylinder fillet
+            // already closes the topology. Multi-edge shared corners
+            // with degree ≠ 3 (e.g. a four-edge prism apex, F5-γ
+            // territory) are pre-rejected by
+            // `lifecycle::validate_corner_compatibility`; if a
+            // degree-2/4/… corner somehow surfaced here it should
+            // skip silently rather than poison an otherwise valid
+            // multi-edge pass.
+            continue;
+        }
+
+        if corner.incident_blend_edges.len() != 3 {
+            // The classifier promised degree 3 but the incidence
+            // list disagrees — should not happen given BlendGraph's
+            // own consistency invariant; treat as non-manifold and
+            // skip this corner so the rest of the dispatch can
+            // proceed.
+            continue;
+        }
+
+        // Resolve the three fillet face ids. If any incident edge
+        // is missing a face (shouldn't happen for a degree-3 corner
+        // unless propagation dropped a member), skip the corner —
+        // there is nothing to seal because the cylindrical fillets
+        // simply do not all exist.
+        let mut face_ids = [0u32; 3];
+        let mut all_present = true;
+        for (i, eid) in corner.incident_blend_edges.iter().enumerate() {
+            match edge_to_face.get(eid) {
+                Some(f) => face_ids[i] = *f,
+                None => {
+                    all_present = false;
+                    break;
+                }
+            }
+        }
+        if !all_present {
+            continue;
+        }
+
+        // Pull cylinder descriptors from each fillet face surface.
+        let mut descriptors: Vec<EdgeBlendDescriptor> = Vec::with_capacity(3);
+        for fid in &face_ids {
+            match extract_fillet_cylinder_descriptor(model, *fid) {
+                Some(d) => descriptors.push(d),
+                None => {
+                    // A fillet face whose surface isn't a cylinder
+                    // means the F5-α MVP doesn't apply here — bail
+                    // with a typed unsupported reason rather than
+                    // silently corrupting the shell.
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::VertexBlendUnsupported {
+                            vertex: corner.id,
+                            kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                            reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                        },
+                    )));
+                }
+            }
+        }
+
+        // F5-α MVP — equal radii required.
+        let r0 = descriptors[0].radius;
+        if descriptors
+            .iter()
+            .any(|d| (d.radius - r0).abs() > RADIUS_TOL)
+        {
+            return Err(OperationError::BlendFailed(Box::new(
+                BlendFailure::VertexBlendUnsupported {
+                    vertex: corner.id,
+                    kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                    reason: VertexBlendUnsupportedReason::MixedRadii,
+                },
+            )));
+        }
+
+        // Assemble classifications and solve for the apex sphere
+        // centre. `compute_concurrent_axes_center` reuses the same
+        // least-squares solver the pre-F5-α `gather_vertex_blend_
+        // context` used; here we feed the live fillet-face
+        // descriptors instead of re-walking the pre-fillet
+        // topology.
+        let classifications: Vec<IncidentEdgeClassification> = corner
+            .incident_blend_edges
+            .iter()
+            .zip(face_ids.iter())
+            .zip(descriptors.iter())
+            .map(|((eid, fid), descriptor)| IncidentEdgeClassification {
+                edge_id: *eid,
+                adjacent_faces: (*fid, *fid),
+                blend: Some(descriptor.clone()),
+            })
+            .collect();
+
+        let sphere_center = compute_concurrent_axes_center(&classifications, corner.id)?;
+
+        // Residual check: distance from the solved centre to each
+        // axis line. If any incident axis is more than
+        // `AXES_RESIDUAL_TOL` away, the corner is not really
+        // rectilinear — surface a typed diagnostic so the caller
+        // sees the structured failure instead of a downstream
+        // garbage sphere.
+        let max_residual = descriptors
+            .iter()
+            .map(|d| {
+                let q = d.axis_origin;
+                let u = d.axis;
+                let v = sphere_center - q;
+                let dot = v.x * u.x + v.y * u.y + v.z * u.z;
+                let perp = Vector3::new(v.x - dot * u.x, v.y - dot * u.y, v.z - dot * u.z);
+                (perp.x * perp.x + perp.y * perp.y + perp.z * perp.z).sqrt()
+            })
+            .fold(0.0_f64, f64::max);
+        if max_residual > AXES_RESIDUAL_TOL {
+            return Err(OperationError::BlendFailed(Box::new(
+                BlendFailure::VertexBlendUnsupported {
+                    vertex: corner.id,
+                    kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                    reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                },
+            )));
+        }
+
+        // Outward direction at the corner: the original sharp vertex
+        // sits *outside* the apex sphere — the segment from sphere
+        // centre to vertex points away from the solid material.
+        // `corner_positions` snapshotted the vertex position before
+        // per-edge surgery so the read is well-defined regardless of
+        // whether the splice has since orphaned the vertex.
+        let vertex_pos = corner_positions.get(&corner.id).copied().ok_or_else(|| {
+            OperationError::InternalError(format!(
+                "corner vertex {} missing from snapshot taken before fillet chains ran",
+                corner.id
+            ))
+        })?;
+        let outward_raw = vertex_pos - sphere_center;
+        let vertex_outward = outward_raw.normalize().map_err(|_| {
+            OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
+                vertex: corner.id,
+                kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+            }))
+        })?;
+
+        let face_id = apply_apex_sphere_corner(
+            model,
+            solid_id,
+            corner.id,
+            &face_ids,
+            sphere_center,
+            r0,
+            vertex_outward,
+        )?;
+        new_faces.push(face_id);
+    }
+
+    Ok(new_faces)
 }
 
 /// Re-stitch the topology around freshly created fillet faces.
@@ -4043,37 +4280,6 @@ fn validate_fillet_inputs(
     Ok(())
 }
 
-/// Validate vertex fillet inputs
-fn validate_vertex_fillet_inputs(
-    model: &BRepModel,
-    solid_id: SolidId,
-    vertices: &[VertexId],
-    radius: f64,
-) -> OperationResult<()> {
-    // Check solid exists
-    if model.solids.get(solid_id).is_none() {
-        return Err(OperationError::InvalidGeometry(
-            "Solid not found".to_string(),
-        ));
-    }
-
-    // Check vertices exist
-    for &vertex_id in vertices {
-        if model.vertices.get(vertex_id).is_none() {
-            return Err(OperationError::InvalidGeometry(
-                "Vertex not found".to_string(),
-            ));
-        }
-    }
-
-    // Check radius
-    if radius <= 0.0 {
-        return Err(OperationError::InvalidRadius(radius));
-    }
-
-    Ok(())
-}
-
 /// Validate filleted solid via the kernel's parallel B-Rep validator.
 ///
 /// Runs `Standard`-level validation (topology connectivity + basic geometry
@@ -4525,51 +4731,6 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_fillet_inputs(&model, solid_id, &[edge_id], &opts).is_ok());
-    }
-
-    // -------------------------------------------------------------------
-    // validate_vertex_fillet_inputs
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn validate_vertex_fillet_inputs_rejects_unknown_solid() {
-        let model = BRepModel::new();
-        let result = validate_vertex_fillet_inputs(&model, 99_999, &[0], 1.0);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
-    }
-
-    #[test]
-    fn validate_vertex_fillet_inputs_rejects_unknown_vertex() {
-        let mut model = BRepModel::new();
-        let solid_id = build_unit_box(&mut model);
-        let result = validate_vertex_fillet_inputs(&model, solid_id, &[99_999], 1.0);
-        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
-    }
-
-    #[test]
-    fn validate_vertex_fillet_inputs_rejects_zero_radius() {
-        let mut model = BRepModel::new();
-        let solid_id = build_unit_box(&mut model);
-        let v = model.vertices.add(0.0, 0.0, 0.0);
-        let result = validate_vertex_fillet_inputs(&model, solid_id, &[v], 0.0);
-        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
-    }
-
-    #[test]
-    fn validate_vertex_fillet_inputs_rejects_negative_radius() {
-        let mut model = BRepModel::new();
-        let solid_id = build_unit_box(&mut model);
-        let v = model.vertices.add(0.0, 0.0, 0.0);
-        let result = validate_vertex_fillet_inputs(&model, solid_id, &[v], -0.1);
-        assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
-    }
-
-    #[test]
-    fn validate_vertex_fillet_inputs_accepts_valid_input() {
-        let mut model = BRepModel::new();
-        let solid_id = build_unit_box(&mut model);
-        let v = model.vertices.add(0.0, 0.0, 0.0);
-        assert!(validate_vertex_fillet_inputs(&model, solid_id, &[v], 0.5).is_ok());
     }
 
     // -------------------------------------------------------------------
