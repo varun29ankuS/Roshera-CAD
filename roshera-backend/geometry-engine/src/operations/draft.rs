@@ -931,6 +931,7 @@ fn draft_single_face_variable(
         grid_resolution: 20,
         marching_step: 0.02,
         max_curves: 5,
+        ..Default::default()
     };
 
     let mut all_drafted_points: Vec<Point3> = Vec::new();
@@ -1011,6 +1012,7 @@ fn draft_single_face_tangent(
         grid_resolution: 25,
         marching_step: 0.015,
         max_curves: 10,
+        ..Default::default()
     };
 
     let curves = intersect_surface_plane(surface, neutral_center, draft_direction, &int_config)?;
@@ -1118,6 +1120,7 @@ fn draft_single_face_stepped(
         grid_resolution: 20,
         marching_step: 0.02,
         max_curves: 5,
+        ..Default::default()
     };
 
     // Validate the step boundaries by intersecting the surface at each height.
@@ -1220,6 +1223,7 @@ fn compute_face_plane_intersection(
         grid_resolution: 25,
         marching_step: 0.015,
         max_curves: 10,
+        ..Default::default()
     };
 
     let curves = intersect_surface_plane(surface, plane_origin, plane_normal, &int_config)?;

@@ -2921,6 +2921,202 @@ async fn preview_face_extrude(
     })))
 }
 
+/// Plane-solid section preview.
+///
+/// Computes filled cross-section "cap" meshes where a cutting plane
+/// intersects the solids in the active model. Returns one cap per
+/// closed cross-section loop per solid. The plane is a pure display
+/// query — no model mutation, no timeline event, no WS broadcast.
+///
+/// Body:
+///   { plane_origin: [f64;3],
+///     plane_normal: [f64;3],
+///     solids?: [Uuid] }    // None = all solids in the active model
+///
+/// Response:
+///   { caps: [{ solid_id: Uuid,
+///              plane_origin: [f64;3],
+///              plane_normal: [f64;3],
+///              vertices: Vec<f32>,
+///              indices:  Vec<u32>,
+///              normals:  Vec<f32> }] }
+///
+/// Empty result when the plane misses every solid; per-solid kernel
+/// failures are logged via `tracing::warn` and that solid is skipped
+/// (the partial cap set still returns), mirroring the kernel's
+/// degrade-gracefully policy in `section_solid_by_plane`.
+async fn post_section_preview(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::{Point3, Tolerance, Vector3};
+    use geometry_engine::operations::section::section_solid_by_plane;
+
+    let parse_vec3 = |field: &str| -> Result<[f64; 3], ApiError> {
+        let arr = payload
+            .get(field)
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| ApiError::missing_field(field))?;
+        if arr.len() != 3 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'{field}' must be an array of 3 numbers, got {}", arr.len()),
+            ));
+        }
+        let mut out = [0.0_f64; 3];
+        for (i, v) in arr.iter().enumerate() {
+            let n = v.as_f64().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'{field}[{i}]' must be a number, got {v}"),
+                )
+            })?;
+            if !n.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("'{field}[{i}]' must be finite, got {n}"),
+                ));
+            }
+            out[i] = n;
+        }
+        Ok(out)
+    };
+
+    let plane_origin = parse_vec3("plane_origin")?;
+    let plane_normal = parse_vec3("plane_normal")?;
+    let normal_mag_sq = plane_normal[0].powi(2) + plane_normal[1].powi(2) + plane_normal[2].powi(2);
+    if normal_mag_sq < 1e-18 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'plane_normal' must be non-zero, got [{:.6},{:.6},{:.6}]",
+                plane_normal[0], plane_normal[1], plane_normal[2]
+            ),
+        ));
+    }
+
+    // Resolve target solids. `solids` is optional: when present, every
+    // entry must resolve to a registered kernel solid; when absent we
+    // section every live solid in the active model. The all-solids
+    // path is what the frontend will use 99% of the time — a single
+    // section plane sliced across the whole scene.
+    let requested_uuids: Option<Vec<uuid::Uuid>> = match payload.get("solids") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "'solids' must be an array of UUID strings".to_string(),
+                )
+            })?;
+            let mut uuids = Vec::with_capacity(arr.len());
+            for (i, item) in arr.iter().enumerate() {
+                let s = item.as_str().ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'solids[{i}]' must be a UUID string"),
+                    )
+                })?;
+                let u = uuid::Uuid::parse_str(s).map_err(|_| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'solids[{i}]' is not a valid UUID: {s}"),
+                    )
+                })?;
+                uuids.push(u);
+            }
+            Some(uuids)
+        }
+    };
+
+    let origin = Point3::new(plane_origin[0], plane_origin[1], plane_origin[2]);
+    let normal = Vector3::new(plane_normal[0], plane_normal[1], plane_normal[2]);
+    let tolerance = Tolerance::default();
+
+    // Section preview is a read-only query: a read lock is sufficient
+    // and lets multiple concurrent slider drags / collaborator previews
+    // proceed without serialising on the write lock used by mutation
+    // endpoints.
+    let model = model_handle.read().await;
+
+    // Build the (solid_id, uuid) work list. When no specific solids are
+    // requested we walk every live solid in the model; otherwise each
+    // requested UUID resolves to its kernel SolidId (drop anything that
+    // doesn't — the caller may have included a stale id from a
+    // collaborator-deleted body).
+    let mut targets: Vec<(geometry_engine::primitives::solid::SolidId, uuid::Uuid)> = Vec::new();
+    match requested_uuids {
+        Some(uuids) => {
+            for u in uuids {
+                if let Some(local) = state.get_local_id(&u) {
+                    targets.push((local, u));
+                }
+            }
+        }
+        None => {
+            for (sid, _solid) in model.solids.iter() {
+                if let Some(u) = state.get_uuid(sid) {
+                    targets.push((sid, u));
+                }
+            }
+        }
+    }
+
+    let mut caps_dto: Vec<serde_json::Value> = Vec::new();
+    for (solid_id, uuid) in targets {
+        let caps = match section_solid_by_plane(&model, solid_id, origin, normal, tolerance) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "section_preview: solid {solid_id} ({uuid}) failed: {:?}",
+                    e
+                );
+                continue;
+            }
+        };
+        for cap in caps {
+            let mut vertices: Vec<f32> = Vec::with_capacity(cap.vertices.len() * 3);
+            for v in &cap.vertices {
+                vertices.push(v.x as f32);
+                vertices.push(v.y as f32);
+                vertices.push(v.z as f32);
+            }
+            let mut indices: Vec<u32> = Vec::with_capacity(cap.indices.len() * 3);
+            for tri in &cap.indices {
+                indices.push(tri[0]);
+                indices.push(tri[1]);
+                indices.push(tri[2]);
+            }
+            let mut normals: Vec<f32> = Vec::with_capacity(cap.normals.len() * 3);
+            for n in &cap.normals {
+                normals.push(n.x as f32);
+                normals.push(n.y as f32);
+                normals.push(n.z as f32);
+            }
+            caps_dto.push(serde_json::json!({
+                "solid_id": uuid.to_string(),
+                "plane_origin": [
+                    cap.plane_origin.x,
+                    cap.plane_origin.y,
+                    cap.plane_origin.z,
+                ],
+                "plane_normal": [
+                    cap.plane_normal.x,
+                    cap.plane_normal.y,
+                    cap.plane_normal.z,
+                ],
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+            }));
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "caps": caps_dto })))
+}
+
 // Auth handlers (login, logout, refresh_token) live in handlers::auth and are
 // brought into scope via `use handlers::*;`. The export endpoint dispatches to
 // handlers::export::export_mesh.
@@ -5236,6 +5432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/geometry/chamfer", post(chamfer_edges_endpoint))
         .route("/api/geometry/pattern/linear", post(pattern_linear_endpoint))
         .route("/api/geometry/pattern/circular", post(pattern_circular_endpoint))
+        .route("/api/section/preview", post(post_section_preview))
         // 2D sketch sessions — backend-owned source of truth for the
         // click-to-place workflow. Frontend creates a session, streams
         // points / plane / tool changes through the REST surface, and

@@ -33,6 +33,7 @@ pub mod transform;
 pub mod imprint;
 pub mod intersect;
 pub mod project;
+pub mod section;
 pub mod sew;
 
 // F7-α trim/sew carrier types. `TrimCurve` is the wire shape that
