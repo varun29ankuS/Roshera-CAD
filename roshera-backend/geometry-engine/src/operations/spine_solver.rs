@@ -1894,6 +1894,18 @@ fn corrector(
     let mut stall: usize = 0;
     let mut best: Option<(Point3, Point3, Point3, f64)> = None;
 
+    // Debug trace gate: set `ROSHERA_SPINE_TRACE=1` in the env to get
+    // a per-iteration residual log on divergence. Compiled into every
+    // build so production reproductions can opt in without rebuilding.
+    // The std::env::var() call is once-per-station; the inner loop
+    // only allocates if the trace is enabled.
+    let trace = std::env::var("ROSHERA_SPINE_TRACE").is_ok();
+    let mut trajectory: Vec<(usize, f64, f64, f64, Point3)> = if trace {
+        Vec::with_capacity(MAX_CORRECTOR_ITERS + 1)
+    } else {
+        Vec::new()
+    };
+
     for iter in 1..=MAX_CORRECTOR_ITERS {
         let (ua, va) = surface_a.closest_point(&center, tolerance).map_err(|e| {
             OperationError::NumericalError(format!(
@@ -1926,6 +1938,10 @@ fn corrector(
         let gap_b = (db - radius).abs();
         let gap = gap_a.max(gap_b);
 
+        if trace {
+            trajectory.push((iter, gap, gap_a, gap_b, center));
+        }
+
         // Track the best (lowest-gap) iterate so we can return it on
         // iteration exhaustion if it's "close enough".
         best = match best {
@@ -1943,6 +1959,17 @@ fn corrector(
         if gap >= prev_gap * (1.0 - 1e-6) {
             stall += 1;
             if stall >= CORRECTOR_STALL_LIMIT {
+                if trace {
+                    emit_corrector_trace(
+                        "stall",
+                        edge_id,
+                        station,
+                        radius,
+                        target,
+                        seed_center,
+                        &trajectory,
+                    );
+                }
                 return Err(OperationError::BlendFailed(Box::new(
                     BlendFailure::SpineSolverDiverged {
                         edge: edge_id,
@@ -2003,6 +2030,17 @@ fn corrector(
         )
     })?;
     if best_gap > target * 10.0 {
+        if trace {
+            emit_corrector_trace(
+                "iter_cap",
+                edge_id,
+                station,
+                radius,
+                target,
+                seed_center,
+                &trajectory,
+            );
+        }
         return Err(OperationError::BlendFailed(Box::new(
             BlendFailure::SpineSolverDiverged {
                 edge: edge_id,
@@ -2012,6 +2050,43 @@ fn corrector(
         )));
     }
     Ok((best_c, best_a, best_b, MAX_CORRECTOR_ITERS))
+}
+
+/// Print a per-iteration residual trace to stderr for a diverging
+/// corrector run. Gated by `ROSHERA_SPINE_TRACE=1` in [`corrector`].
+///
+/// `kind` is `"stall"` (monotone-decrease guard tripped) or
+/// `"iter_cap"` (iteration budget exhausted with residual above the
+/// `target * 10.0` acceptance band). The output is a single block per
+/// failure so reproduction logs are greppable by edge / station.
+fn emit_corrector_trace(
+    kind: &str,
+    edge_id: EdgeId,
+    station: f64,
+    radius: f64,
+    target: f64,
+    seed_center: Point3,
+    trajectory: &[(usize, f64, f64, f64, Point3)],
+) {
+    let mut buf = String::new();
+    buf.push_str(&format!(
+        "[spine-corrector-diverged kind={} edge={:?} station={:.6} radius={:.6} target={:.3e} seed=({:.6},{:.6},{:.6})]\n",
+        kind,
+        edge_id,
+        station,
+        radius,
+        target,
+        seed_center.x,
+        seed_center.y,
+        seed_center.z,
+    ));
+    for &(iter, gap, gap_a, gap_b, center) in trajectory {
+        buf.push_str(&format!(
+            "  iter={:>2} gap={:.6e} gap_a={:.6e} gap_b={:.6e} center=({:.6},{:.6},{:.6})\n",
+            iter, gap, gap_a, gap_b, center.x, center.y, center.z,
+        ));
+    }
+    eprint!("{}", buf);
 }
 
 /// Marching solver for surface pairs that no analytic arm recognises.
