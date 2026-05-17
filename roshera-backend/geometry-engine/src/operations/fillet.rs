@@ -643,8 +643,19 @@ fn create_constant_radius_fillet(
             })?;
     let rolling_ball_data = rolling_ball_data_from_spine_rail(&spine_rail);
 
-    // Create fillet surface (cylindrical or toroidal patch)
-    let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
+    // F4-α.1: route through the typed BlendSurfaceCarrier derived
+    // from `spine_rail.solver_kind` + per-station radius constancy,
+    // not the legacy `(is_straight_edge × is_constant_radius)`
+    // sample-based heuristic. The carrier is the surface-emission
+    // contract; the constructors it routes to are unchanged in this
+    // slice (F4-α.2 will switch them to read the carrier's analytic
+    // axis from the supporting faces rather than re-fitting from
+    // sample arrays).
+    let carrier = super::blend_surface_carrier::BlendSurfaceCarrier::from_spine_rail(
+        &spine_rail,
+        &spine_options.tolerance,
+    );
+    let fillet_surface = create_blend_surface_for_carrier(carrier, &rolling_ball_data)?;
     let surface_id = model.surfaces.add(fillet_surface);
 
     // Create trimming curves on adjacent faces
@@ -2307,7 +2318,16 @@ pub(crate) fn get_face_oriented_normal(
     Ok(normal * face.orientation.sign())
 }
 
-/// Create surface from rolling ball data
+/// Create surface from rolling ball data.
+///
+/// **Legacy heuristic dispatch** retained for callers that do not
+/// produce a [`SpineRail`] — today that is exclusively the variable-
+/// radius path (`create_variable_radius_fillet`) which still routes
+/// through `compute_variable_rolling_ball_positions`'s legacy
+/// bisector. The constant-radius path now goes through
+/// [`create_blend_surface_for_carrier`] which dispatches on the
+/// solver's `solver_kind` rather than re-deriving the geometry from
+/// sample arrays.
 fn create_rolling_ball_surface(data: &RollingBallData) -> OperationResult<Box<dyn Surface>> {
     // Analyze the rolling ball data to determine surface type
     let is_straight_edge = is_edge_straight(data);
@@ -2322,6 +2342,30 @@ fn create_rolling_ball_surface(data: &RollingBallData) -> OperationResult<Box<dy
     } else {
         // Create general NURBS fillet for variable radius
         create_nurbs_fillet_surface(data)
+    }
+}
+
+/// F4-α.1 — carrier-driven blend surface construction.
+///
+/// Route the [`BlendSurfaceCarrier`] derived from the
+/// [`super::spine_solver::SpineRail`] to the appropriate surface
+/// constructor. Unlike [`create_rolling_ball_surface`] this skips
+/// the sample-based heuristic — the carrier already encodes the
+/// dispatch decision the spine solver's `solver_kind` warranted.
+///
+/// The constructors themselves are unchanged in F4-α.1 (they still
+/// read `RollingBallData`'s sampled centre / contact arrays);
+/// F4-α.2 will rebuild the analytic constructors to read the
+/// supporting face's analytic axis directly.
+fn create_blend_surface_for_carrier(
+    carrier: super::blend_surface_carrier::BlendSurfaceCarrier,
+    data: &RollingBallData,
+) -> OperationResult<Box<dyn Surface>> {
+    use super::blend_surface_carrier::BlendSurfaceCarrier;
+    match carrier {
+        BlendSurfaceCarrier::Cylindrical => create_cylindrical_fillet_surface(data),
+        BlendSurfaceCarrier::Toroidal => create_toroidal_fillet_surface(data),
+        BlendSurfaceCarrier::GeneralNurbs => create_nurbs_fillet_surface(data),
     }
 }
 
