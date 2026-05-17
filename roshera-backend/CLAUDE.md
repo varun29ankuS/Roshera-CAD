@@ -275,10 +275,9 @@ Real, up-to-date references in this repo:
 - `roshera-backend/geometry-engine/src/primitives/primitive_tests/EVIL_EDGE_CASES.md`
 
 Repo root: `README.md`, `BENCHMARKS.md`, `KERNEL_AUDIT_2026-04-19.md`,
-`ARCHITECTURE-ANALYSIS.md`, `CONTRIBUTING.md`, `DEPENDENCY_ANALYSIS.md`,
-`DEPENDENCY_GRAPH.md`. Anything else at the repo root that pre-dates
-April 2026 should be assumed deleted; if it re-appears, treat it as
-stale and verify before citing.
+`KERNEL_IMPROVEMENT_PLAN.md`. Anything else at the repo root that
+pre-dates April 2026 should be assumed deleted; if it re-appears,
+treat it as stale and verify before citing.
 
 ---
 

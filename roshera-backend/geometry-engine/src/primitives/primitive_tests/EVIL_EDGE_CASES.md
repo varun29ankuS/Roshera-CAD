@@ -1,155 +1,156 @@
-# Evil Edge Case Tests - CAD Robustness at Scale
+# Evil Edge Case Tests
 
-## Overview
+These tests go beyond the happy path. Each one stresses a specific
+weakness in typical B-Rep implementations: a known place where naive
+code crashes, corrupts the model, or silently produces garbage.
 
-These tests go beyond "happy path" topology to expose the pathological cases that crash most CAD engines. Each test is designed to stress a specific weakness in typical B-Rep implementations.
+## Categories
 
-## Test Categories
+### 1. Degenerate geometry
 
-### 1. Degenerate Geometry
-Tests that create mathematically valid but geometrically degenerate entities.
+Mathematically valid inputs that are geometrically degenerate.
 
-#### test_zero_area_face
-- **What**: Triangle with three collinear points
-- **Why It's Evil**: Zero-area faces break:
-  - Normal vector calculations (0/0 = undefined)
-  - Boolean classification algorithms 
-  - Tessellation routines
-  - Area-weighted computations
-- **Roshera's Handling**: ✅ Creates successfully, handles gracefully
+#### `test_zero_area_face`
 
-#### test_zero_length_edge
-- **What**: Edge where start vertex == end vertex
-- **Why It's Evil**: Self-loops break:
-  - Edge traversal algorithms
-  - Loop orientation calculations
-  - Parametric evaluation (t=0 and t=1 are same point)
-- **Roshera's Handling**: ✅ Allows creation, maintains topology
+- Triangle from three collinear points.
+- Breaks normal-vector computation (0/0), boolean classification,
+  tessellation, and area-weighted properties.
+- Roshera: creates successfully, validation flags it as degenerate.
 
-### 2. Pathological Topology
-Tests that create topologically valid but problematic configurations.
+#### `test_zero_length_edge`
 
-#### test_self_intersecting_loop
-- **What**: Figure-8 loop that crosses itself
-- **Why It's Evil**: Self-intersections break:
-  - Inside/outside classification
-  - Face orientation algorithms
-  - Boolean operations
-  - Winding number calculations
-- **Roshera's Handling**: ✅ Creates successfully (validation intentionally missing!)
+- Edge whose start vertex equals its end vertex.
+- Breaks edge traversal, loop orientation, parametric evaluation
+  (t=0 and t=1 are the same point).
+- Roshera: creation succeeds; length returns 0.
 
-#### test_non_manifold_vertex
-- **What**: Two triangles touching at single vertex (bowtie)
-- **Why It's Evil**: Non-manifold vertices break:
-  - Shell closure algorithms
-  - Vertex normal calculations
-  - Mesh generation
-  - Solid validity checks
-- **Roshera's Handling**: ✅ Handles non-manifold topology
+### 2. Pathological topology
 
-### 3. Mutation Operations
-Tests that modify existing topology (not just create).
+Topologically valid but problematic configurations.
 
-#### test_vertex_deletion_cascading
-- **What**: Delete vertex and validate cascade cleanup
-- **Why It's Evil**: Incomplete cleanup causes:
-  - Dangling edge references
-  - Invalid face boundaries
-  - Memory corruption
-  - Topology inconsistency
-- **Roshera's Handling**: ✅ Proper referential integrity
+#### `test_self_intersecting_loop`
 
-#### test_edge_modification_topology_consistency
-- **What**: Modify edge parameters while maintaining topology
-- **Why It's Evil**: Parameter changes can:
-  - Break loop closure
-  - Invalidate face boundaries
-  - Corrupt traversal order
-  - Create gaps in topology
-- **Roshera's Handling**: ✅ Maintains consistency
+- Figure-8 loop that crosses itself.
+- Breaks inside/outside classification, face orientation, boolean
+  operations, winding-number calculations.
+- Roshera: creation succeeds; the self-intersection validator is the
+  next layer up (intentionally not on the constructor).
 
-## Why These Tests Matter
+#### `test_non_manifold_vertex`
 
-### Industry Context
-Most industry-leading CAD kernels have decades of patches for these edge cases. A single unhandled case can:
-- Crash boolean operations
-- Corrupt entire models
-- Create non-watertight geometry
-- Break downstream manufacturing
+- Two triangles touching at a single shared vertex (bowtie).
+- Breaks shell-closure algorithms, vertex-normal calculation, and
+  some mesh-export formats.
+- Roshera: handles non-manifold topology; manifold-only operations
+  return a typed error.
 
-### Roshera's Advantage
-By testing these cases from day one:
-1. **Robustness by Design** - Not patches on patches
-2. **Clean Architecture** - DashMap handles concurrent mutations
-3. **Explicit Handling** - Know what we support vs. reject
-4. **AI-Ready** - AI agents will create weird geometry
+### 3. Mutation operations
 
-## Implementation Patterns
+Tests that modify existing topology, not just create.
 
-### Creating Degenerate Geometry
+#### `test_vertex_deletion_cascading`
+
+- Delete a vertex and verify cascading cleanup.
+- Incomplete cleanup leaves dangling edge references, invalid face
+  boundaries, and inconsistent topology.
+- Roshera: referential integrity through the cascade is enforced.
+
+#### `test_edge_modification_topology_consistency`
+
+- Modify an edge's parameters while keeping topology consistent.
+- Parameter changes can break loop closure, invalidate face
+  boundaries, corrupt traversal order, or open gaps in topology.
+- Roshera: consistency is maintained; cached length/parameter data is
+  invalidated.
+
+## Why these tests matter
+
+Every kernel that has shipped to production has accumulated patches
+for cases like these. Writing them down explicitly and testing them
+from day one is the alternative to discovering each one the hard way.
+
+The actual mitigation surface in the kernel:
+
+1. DashMap-based topology stores: concurrent mutation without a
+   global lock.
+2. Explicit handling: every operation has a documented behaviour for
+   degenerate inputs, including "rejected with a typed error".
+3. Clean errors: typed `OperationError` variants, never a silent
+   `None` or panic.
+4. Documented limits: when an operation can't handle a case, the
+   docs say so.
+
+## Implementation patterns
+
+### Creating degenerate geometry
+
 ```rust
-// Zero-area face - three collinear points
+// Zero-area face — three collinear points
 let v1 = Point3::new(0.0, 0.0, 0.0);
-let v2 = Point3::new(1.0, 0.0, 0.0);  
-let v3 = Point3::new(2.0, 0.0, 0.0);  // Collinear!
+let v2 = Point3::new(1.0, 0.0, 0.0);
+let v3 = Point3::new(2.0, 0.0, 0.0);  // collinear
 
-// Zero-length edge - same start/end
-let edge = Edge::new(0, vertex_id, vertex_id, curve_id, 
+// Zero-length edge — same start and end
+let edge = Edge::new(0, vertex_id, vertex_id, curve_id,
                      EdgeOrientation::Forward, ParameterRange::unit());
 ```
 
-### Testing Non-Manifold Conditions
+### Non-manifold configurations
+
 ```rust
-// Bowtie configuration - shared vertex only
+// Bowtie — two triangles share exactly one vertex, no shared edge.
 let center = model.vertices.add_or_find(0.0, 0.0, 0.0, tolerance);
-// Triangle 1 uses center
-// Triangle 2 uses center  
-// No shared edges - non-manifold!
+// Triangle 1 uses `center`.
+// Triangle 2 uses `center`.
+// No shared edges → non-manifold vertex.
 ```
 
-### Mutation Testing
+### Mutation tests
+
 ```rust
-// Test cascading deletion
+// Cascading deletion
 model.vertices.remove(vertex_id);
-// Verify: All edges using vertex are gone
-// Verify: All faces using those edges are invalid
-// Verify: No dangling references remain
+// Assert: every edge that referenced vertex_id is gone.
+// Assert: every face that used those edges is invalid or gone.
+// Assert: no dangling references remain in the spatial index.
 ```
 
-## Future Evil Tests
+## Future tests (not yet in the suite)
 
-### Concurrency Stress
-- 1000 threads creating/deleting simultaneously
-- Race conditions in topology updates
-- Deadlock scenarios in operations
+### Concurrency stress
 
-### Numerical Degeneracy
-- Near-zero length edges (1e-15)
-- Near-parallel faces (angle < 1e-10)
-- Near-coincident vertices
+- 1000 threads creating and deleting topology in parallel.
+- Race conditions in DashMap shard rebalances.
+- Deadlock scenarios involving the recorder MPSC channel.
 
-### Topological Complexity
-- Genus-1000 surfaces
-- 100k face shells
-- Deeply nested void shells
+### Numerical degeneracy
 
-### Boolean Nightmares
-- Coplanar face intersections
-- Tangent surface contacts
-- Coincident edge overlaps
+- Near-zero-length edges (1e-15).
+- Near-parallel faces (angle < 1e-10).
+- Near-coincident vertices straddling tolerance.
 
-## Validation Strategy
+### Topological complexity
 
-Each evil case should:
-1. **Create** the pathological geometry
-2. **Validate** it's handled gracefully (no crash)
-3. **Operate** on it (tessellate, boolean, etc.)
-4. **Document** the behavior (supported vs. rejected)
+- Genus-1000 surfaces.
+- 100k-face shells.
+- Deeply nested void shells.
 
-## Key Insight
+### Boolean stress
 
-The difference between a research CAD kernel and a production one is how it handles these evil cases. Roshera's strategy:
-- **Explicit handling** over silent failure
-- **Clean errors** over undefined behavior  
-- **Document limits** over claiming perfection
-- **Test everything** over hoping for the best
+- Coplanar face intersections.
+- Tangent surface contacts.
+- Coincident edge overlaps.
+
+## Validation pattern
+
+Each test follows the same shape:
+
+1. Construct the pathological geometry.
+2. Verify the kernel doesn't crash.
+3. Run a downstream operation (tessellate, boolean, mass props).
+4. Document the behaviour — supported, rejected with typed error, or
+   silently degraded (and which).
+
+A kernel that crashes is worse than one that runs slowly. A kernel
+that silently produces wrong output is worse than one that returns
+an error. The tests enforce that ordering.
