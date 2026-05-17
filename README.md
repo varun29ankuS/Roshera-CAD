@@ -25,7 +25,7 @@
 
 ---
 
-Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine (no wrapper around OpenCASCADE or Parasolid) whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
+Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
 
 The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. Many things work, many things don't — see [Status](#status) for what's actually usable today.
 
@@ -48,6 +48,21 @@ roshera-backend/
 
 roshera-app/           React + Three.js + TypeScript browser client
 ```
+
+## Direction
+
+The kernel is the product. The viewport you see in the screenshots is one
+client of it, written to prove the bridge works at human latency. The
+same REST + WebSocket surface drives agents.
+
+Where this is going: agents that pick faces, fillet edges, run sections,
+and walk a part the way a designer would — by reasoning over the
+readable surface (named features, persistent IDs, the timeline of
+events that produced the current state), not by parsing triangle soup.
+A CLI client and an MCP server are next on the list, then embeddings
+and retrieval over the timeline so an agent can answer questions like
+"how did this corner get to be 4mm" without re-deriving the model from
+scratch.
 
 ## Status
 

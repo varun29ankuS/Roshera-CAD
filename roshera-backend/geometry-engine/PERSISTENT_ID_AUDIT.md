@@ -149,9 +149,6 @@ PIDs from inputs' PIDs and a role descriptor. Replay with edited
 parameters re-derives the same PIDs as long as the role descriptors
 are stable.
 
-OCC's variant: shape history maps + hashing. Parasolid's variant:
-attribute-tagged faces + the operation's "feature" tag.
-
 ---
 
 ## 5. Proposed integration seam (design only — not implemented)
@@ -400,7 +397,3 @@ These get answered in the slice 40-A PR, not this audit.
   Modeling.
 - Hoffmann, C. (1989). *Geometric and Solid Modeling*, Ch. 7
   (history-based modeling).
-- Open CASCADE: `BRepBuilderAPI_MakeShape::Modified/Generated` —
-  reference for shape-history map.
-- Parasolid v34 docs: `PK_TOPOL_track` — reference for tracking
-  topology through ops.

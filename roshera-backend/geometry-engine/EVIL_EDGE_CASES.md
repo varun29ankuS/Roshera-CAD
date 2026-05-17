@@ -1,233 +1,144 @@
 # Evil Edge Cases in CAD Topology
 
-## Overview
+The "happy path" — well-formed, manifold, watertight geometry from a
+single thread of execution — is the easy 5%. The other 95% is what
+actually trips kernels: degenerate output from booleans, concurrent
+mutation from multiple agents, hostile inputs from imported files,
+pathological configurations from sloppy CAM workflows.
 
-This document describes the "evil edge cases" that trip up most CAD engines at scale. These are the pathological cases that go beyond the happy path and test the robustness of topology handling, concurrent modifications, and degenerate geometry.
+This file lists the cases we explicitly test (or want to test), why
+each one breaks naive implementations, and where the test lives.
 
-## Why These Tests Matter
+## Implemented cases
 
-Most CAD systems work well with:
-- Well-formed geometry (manifold, watertight)
-- Sequential operations (single-threaded)
-- Valid inputs (non-degenerate)
-- Clean topology (no self-intersections)
+### 1. Vertex deletion cascading (`test_vertex_deletion_cascading`)
 
-But real-world usage includes:
-- Degenerate geometry from boolean operations
-- Concurrent modifications from multiple users/AI agents
-- Invalid inputs from external files
-- Pathological cases from complex operations
+Delete a vertex that is referenced by edges and faces.
 
-## Evil Edge Cases Implemented
+- Hits referential integrity through the cascade.
+- Stresses topology consistency maintenance and dangling references.
+- Stresses spatial index cleanup.
 
-### 1. Vertex Deletion Cascading (`test_vertex_deletion_cascading`)
+Expected: edges using the vertex are removed, faces that depend on
+those edges are removed, no dangling references remain, the topology
+stays valid.
 
-**What It Tests**: Deleting a vertex that's referenced by edges and faces.
+Real scenario: user deletes a corner vertex of a complex model.
 
-**Why It's Evil**: 
-- Tests referential integrity through cascading deletes
-- Challenges topology consistency maintenance
-- Exposes dangling reference bugs
-- Tests cleanup of spatial indices
+### 2. Edge modification topology consistency (`test_edge_modification_topology_consistency`)
 
-**Expected Behavior**: 
-- Edges referencing the vertex should be removed
-- Faces using those edges should be removed
-- No dangling references should remain
-- Topology should remain valid
+Modify an edge's parameters while keeping topology coherent.
 
-**Real-World Scenario**: User deletes a corner vertex of a complex model.
+- Tests whether the change preserves vertex connectivity.
+- Stresses face boundary validity.
+- Stresses loop traversal after the edit.
+- Stresses cache invalidation.
 
-### 2. Edge Modification Topology Consistency (`test_edge_modification_topology_consistency`)
+Expected: edge endpoints unchanged, face loops still traversable, the
+cached length/parameter data is invalidated.
 
-**What It Tests**: Modifying edge parameters while maintaining topology.
+Real scenario: tweaking a curve during design iteration.
 
-**Why It's Evil**:
-- Tests whether modifications preserve connectivity
-- Challenges face boundary validity
-- Tests loop traversal after changes
-- Exposes cache invalidation issues
+### 3. Zero-area face (`test_zero_area_face`)
 
-**Expected Behavior**:
-- Edge remains connected to same vertices
-- Face loops remain traversable
-- Parameter changes don't break topology
-- Cached data is properly invalidated
+Three collinear vertices form a face.
 
-**Real-World Scenario**: Adjusting edge curves during design iteration.
+- Normal vector goes undefined (0/0).
+- Boolean classification breaks.
+- Tessellation produces no output or inverted output.
+- Mass properties divide by zero.
 
-### 3. Zero-Area Face (`test_zero_area_face`)
+Expected: creation succeeds (sliver faces appear as transient state
+in real workflows), area returns ≈ 0, validation flags it as
+degenerate, operations downstream skip rather than crash.
 
-**What It Tests**: Creating a face with three collinear vertices.
+Real scenario: sliver faces from boolean intersection on near-coplanar
+inputs.
 
-**Why It's Evil**:
-- Zero area breaks many geometric algorithms
-- Normal vector computation becomes undefined
-- Area-based calculations (mass properties) fail
-- Boolean operations produce degenerate results
+### 4. Zero-length edge (`test_zero_length_edge`)
 
-**Expected Behavior**:
-- System shouldn't crash
-- Area computation returns 0 or near-0
-- Validation should flag as degenerate
-- Operations should handle gracefully
+Edge where the start vertex equals the end vertex.
 
-**Real-World Scenario**: Boolean operations producing sliver faces.
+- Self-loops break edge traversal.
+- Tangent at t=0 is undefined.
+- Arc-length parameterization breaks.
 
-### 4. Zero-Length Edge (`test_zero_length_edge`)
+Expected: edge creation succeeds (intermediate state during edits),
+length returns 0, traversal terminates instead of looping forever,
+validation flags it.
 
-**What It Tests**: Creating an edge where start vertex equals end vertex.
+Real scenario: intermediate state during an operation that hasn't
+fully resolved.
 
-**Why It's Evil**:
-- Self-loops break traversal algorithms
-- Tangent vector computation fails
-- Length-based parameterization undefined
-- Tessellation algorithms crash
+### 5. Self-intersecting loop (`test_self_intersecting_loop`)
 
-**Expected Behavior**:
-- Edge creation succeeds (may be needed temporarily)
-- Length computation returns 0
-- Traversal algorithms handle self-loops
-- Validation flags as degenerate
+A figure-8 loop crosses itself.
 
-**Real-World Scenario**: Intermediate state during complex operations.
+- Inside/outside classification stops being well-defined.
+- Winding number is ambiguous.
+- Tessellation flips triangles across the crossing.
 
-### 5. Self-Intersecting Loop (`test_self_intersecting_loop`)
+Expected: creation succeeds, validation detects the self-intersection,
+boolean operations either refuse or produce a documented result.
 
-**What It Tests**: Creating a figure-8 loop that intersects itself.
+Real scenario: sketch entities crossing each other before the user
+cleans them up.
 
-**Why It's Evil**:
-- Breaks inside/outside classification
-- Winding number computation fails
-- Area calculation becomes ambiguous
-- Tessellation produces inverted triangles
+### 6. Non-manifold vertex (`test_non_manifold_vertex`)
 
-**Expected Behavior**:
-- Loop creation succeeds (for flexibility)
-- Validation detects self-intersection
-- Boolean operations handle gracefully
-- Rendering shows the intersection
+Two faces meeting at exactly one shared vertex (bowtie).
 
-**Real-World Scenario**: Sketch with crossing paths before cleanup.
+- Manifold neighbourhood queries become ambiguous.
+- Shell-closure algorithms can't decide which side is interior.
+- Some export formats reject the input.
 
-### 6. Non-Manifold Vertex (`test_non_manifold_vertex`)
+Expected: creation succeeds, non-manifold detection identifies it,
+shell building handles it, operations that require manifold input
+return a typed error.
 
-**What It Tests**: Two faces touching at a single vertex (bowtie configuration).
+Real scenario: assembly contact points or imported geometry from a
+mesh source.
 
-**Why It's Evil**:
-- Breaks manifold assumptions
-- Neighborhood queries become ambiguous
-- Shell algorithms fail
-- Export to some formats impossible
+## Cases queued but not yet implemented
 
-**Expected Behavior**:
-- Topology creation succeeds
-- Non-manifold detection works
-- Shell building handles correctly
-- Appropriate error on manifold-only operations
+The following tests are useful but not yet in the suite. Listed here so
+nobody re-discovers them as gaps.
 
-**Real-World Scenario**: Complex assemblies with touching parts.
+### Concurrent topology mutation
 
-## Additional Evil Cases to Implement
+Multiple threads simultaneously adding/removing vertices, modifying
+edges, creating/deleting faces, running booleans. Validates that the
+DashMap-based topology stores stay coherent under contention.
 
-### Concurrent Mutation Stress
+### Topology corruption recovery
 
-```rust
-#[test]
-fn test_concurrent_topology_mutations() {
-    // Multiple threads simultaneously:
-    // - Adding/removing vertices
-    // - Modifying edges
-    // - Creating/deleting faces
-    // - Running boolean operations
-}
-```
+Intentionally corrupt the topology (dangling references, broken loops)
+and exercise the validator's self-healing path.
 
-### Topology Corruption Recovery
+### Extreme scale
 
-```rust
-#[test]
-fn test_topology_self_healing() {
-    // Intentionally corrupt topology
-    // Test automatic repair mechanisms
-    // Verify healed topology is valid
-}
-```
+Boolean operation on inputs with 1M+ faces. Hits memory efficiency and
+algorithmic complexity in the broad-phase pruning.
 
-### Extreme Scale
+### Numerical degeneracy
 
-```rust
-#[test]
-fn test_million_face_boolean() {
-    // Boolean operation on models with 1M+ faces
-    // Tests memory efficiency
-    // Tests algorithmic complexity
-}
-```
+Vertices separated by less than tolerance; nearly parallel faces;
+almost-tangent surfaces. The classic numerical-robustness sweep.
 
-### Numerical Degeneracy
+## How the kernel mitigates these
 
-```rust
-#[test]
-fn test_near_coincident_geometry() {
-    // Vertices separated by < tolerance
-    // Nearly parallel faces
-    // Almost tangent surfaces
-}
-```
+- DashMap-based topology stores: no global lock during mutation, each
+  store operation is internally atomic.
+- Tolerance-based comparisons throughout: no hardcoded `1e-12`
+  literals at call sites, callers thread `Tolerance` in.
+- Event-sourced timeline: intermediate invalid states are transient
+  and rollback is structural rather than ad-hoc.
+- Multi-level validation: a quick check on every operation, a deep
+  check on demand.
 
-## Why Roshera Handles These Better
+## Testing philosophy
 
-### 1. DashMap Architecture
-- Thread-safe concurrent modifications
-- No global locks during topology changes
-- Each operation is atomic
-
-### 2. Tolerance-Based System
-- Robust handling of near-degenerate cases
-- Configurable tolerance for different scenarios
-- Numerical stability built-in
-
-### 3. Event-Based Timeline
-- Operations can be rolled back
-- Intermediate invalid states are temporary
-- History tracking for debugging
-
-### 4. Comprehensive Validation
-- Multi-level validation (quick/standard/deep)
-- Self-healing capabilities
-- Clear error reporting
-
-## Testing Philosophy
-
-**"If it can go wrong, test it"**
-
-1. **Assume Malicious Input**: Test as if users are trying to break the system
-2. **Stress Concurrency**: Real systems have multiple users/AI agents
-3. **Embrace Degeneracy**: Real geometry is messy
-4. **Test at Scale**: Performance cliffs hide at large scales
-5. **Validate Everything**: Never trust, always verify
-
-## Metrics for Success
-
-A robust CAD kernel should:
-- Handle all evil cases without crashing
-- Degrade gracefully (slow > crash)
-- Report issues clearly
-- Recover when possible
-- Maintain data integrity
-
-## Integration with CI/CD
-
-These evil edge case tests should:
-- Run on every PR
-- Have performance benchmarks
-- Track regression over time
-- Generate coverage reports
-- Alert on new failures
-
-## Conclusion
-
-Evil edge cases separate toy CAD systems from production-ready kernels. By explicitly testing these pathological cases, Roshera ensures robustness that matches or exceeds commercial CAD systems.
-
-Remember: **Users will find every edge case, usually in production, usually on deadline.**
+Users find every edge case, usually in production, usually on a
+deadline. Tests assume malicious or sloppy input, stress concurrency,
+and run at realistic scale. A kernel that crashes is worse than one
+that runs slowly.
