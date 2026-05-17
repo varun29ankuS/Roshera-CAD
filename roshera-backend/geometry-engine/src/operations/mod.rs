@@ -117,6 +117,13 @@ pub mod recorder;
 // to the legacy path).
 pub mod spine_solver;
 
+// F4-α.1 — analytic-when-possible blend surface carrier. Derives a
+// typed `BlendSurfaceCarrier` from the spine solver's `solver_kind`
+// + per-station radius constancy, replacing the discrete-sample
+// heuristic the fillet pipeline used to make routing decisions on.
+// Dispatch table is pinned by `tests/fillet_analytic_surface_contract.rs`.
+pub mod blend_surface_carrier;
+
 // AI integration
 pub mod ai_operations_registry;
 
