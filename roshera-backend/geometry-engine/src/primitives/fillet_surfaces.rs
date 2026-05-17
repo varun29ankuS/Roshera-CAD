@@ -233,6 +233,93 @@ impl CylindricalFillet {
         })
     }
 
+    /// F4-α.2 analytic-kpart constructor.
+    ///
+    /// `Self::new` runs a 20-sample loop to recover the (z, x, y) frame
+    /// at each station. For the analytic dispatch arms
+    /// (`AnalyticPlanePlane`, `AnalyticCylCylCoaxial`) the spine is an
+    /// exact [`Line`] and the contact curves are themselves analytic-
+    /// exact: the frame is **constant along u** by construction, so
+    /// resampling 20 times computes the same closed-form frame 20
+    /// times. This constructor builds the frame **once** at the spine
+    /// midpoint and stores it as constant fields, mirroring the OCCT
+    /// `ChFiKPart_ComputeData::Plate` pattern (kpart: closed-form
+    /// blend parameters read from the supporting analytic surfaces,
+    /// not re-fitted from samples). The endpoints of the spine + each
+    /// contact curve give a single exact frame; the F4-α dispatcher
+    /// guarantees the inputs are analytic-exact.
+    ///
+    /// The resulting [`CylindricalFillet`] is byte-equivalent to one
+    /// built by [`Self::new`] for analytic inputs (modulo the 20× FP
+    /// repetition in the legacy path). Future maintenance that touches
+    /// `axis_at` / `frame_x_at` etc. must continue to honour both
+    /// constructors — the stored fields shape is identical.
+    pub fn from_analytic_kpart(
+        spine: Box<dyn Curve>,
+        radius: f64,
+        contact1: Box<dyn Curve>,
+        contact2: Box<dyn Curve>,
+    ) -> MathResult<Self> {
+        if radius <= 0.0 {
+            return Err(MathError::InvalidParameter(
+                "Fillet radius must be positive".into(),
+            ));
+        }
+
+        let spine_pr = spine.parameter_range();
+        let spine_mid_t = (spine_pr.start + spine_pr.end) * 0.5;
+        let spine_mid = spine.evaluate(spine_mid_t)?.position;
+        let z_axis = spine.tangent_at(spine_mid_t)?.normalize()?;
+
+        // Contact curves are evaluated at their midpoint. For analytic
+        // arms the contact parameterisation matches the spine's so the
+        // midpoint is the right sample; for fitted curves callers
+        // should use `Self::new` instead.
+        let c1_pr = contact1.parameter_range();
+        let c1_mid_t = (c1_pr.start + c1_pr.end) * 0.5;
+        let c2_pr = contact2.parameter_range();
+        let c2_mid_t = (c2_pr.start + c2_pr.end) * 0.5;
+        let contact1_point = contact1.evaluate(c1_mid_t)?.position;
+        let contact2_point = contact2.evaluate(c2_mid_t)?.position;
+
+        let v1 = (contact1_point - spine_mid).normalize()?;
+        let v2 = (contact2_point - spine_mid).normalize()?;
+        let v1_perp = (v1 - z_axis * v1.dot(&z_axis)).normalize()?;
+        let v2_perp = (v2 - z_axis * v2.dot(&z_axis)).normalize()?;
+
+        let frame_x = v1_perp;
+        let frame_y_unsigned = z_axis.cross(&frame_x);
+        let frame_y = if v2_perp.dot(&frame_y_unsigned) >= 0.0 {
+            frame_y_unsigned
+        } else {
+            -frame_y_unsigned
+        };
+        let cos_a = v2_perp.dot(&frame_x).clamp(-1.0, 1.0);
+        let sin_a = v2_perp.dot(&frame_y).max(0.0);
+        let end_angle = sin_a.atan2(cos_a);
+
+        // Two-element constant fields. A single-element field would
+        // make `(u * (len-1) as f64) as usize` collapse to 0 for every
+        // u — correct but a special case the `axis_at` etc. helpers
+        // weren't designed around. Two identical samples flow through
+        // the existing idx-clamp logic without a code-path change.
+        let axis_field = vec![z_axis, z_axis];
+        let frame_x_field = vec![frame_x, frame_x];
+        let frame_y_field = vec![frame_y, frame_y];
+        let angle_span = vec![(0.0, end_angle), (0.0, end_angle)];
+
+        Ok(Self {
+            spine,
+            radius,
+            contact1,
+            contact2,
+            axis_field,
+            frame_x_field,
+            frame_y_field,
+            angle_span,
+        })
+    }
+
     /// Get axis direction at parameter
     fn axis_at(&self, u: f64) -> MathResult<Vector3> {
         let idx = (u * (self.axis_field.len() - 1) as f64) as usize;
@@ -580,6 +667,61 @@ impl ToroidalFillet {
             minor_radius: fillet_radius,
             center_curve,
             angle_bounds: (0.0, std::f64::consts::PI * 0.5),
+            contact1,
+            contact2,
+        })
+    }
+
+    /// F4-α.2 analytic-kpart constructor.
+    ///
+    /// `Self::new` recovers the major (osculating) radius by fitting a
+    /// circumscribed circle to three samples on the spine curve. For
+    /// the analytic dispatch arms (`AnalyticPlaneCylinder`,
+    /// `AnalyticPlaneSphere`) the spine is an exact [`Arc`] whose
+    /// `radius` field already carries the major radius — and the F4-α
+    /// dispatcher reads it directly from the supporting Cylinder /
+    /// Sphere axis. This constructor accepts that closed-form value
+    /// rather than re-deriving it from samples, matching the OCCT
+    /// `ChFiKPart_ComputeData::Cyl` / `::Sphere` pattern.
+    ///
+    /// `angle_bounds` defaults to (0, π/2) — the standard quarter-arc
+    /// for a 90° dihedral. The dispatcher computes the actual angle
+    /// span from the supporting faces' dihedral and passes it in.
+    /// Variable-dihedral cases (oblique plane/cylinder) are routed to
+    /// `GeneralNurbs` by the carrier and never reach this constructor.
+    pub fn from_analytic_kpart(
+        center_curve: Box<dyn Curve>,
+        fillet_radius: f64,
+        contact1: Box<dyn Curve>,
+        contact2: Box<dyn Curve>,
+        major_radius: f64,
+        angle_bounds: (f64, f64),
+    ) -> MathResult<Self> {
+        if fillet_radius <= 0.0 {
+            return Err(MathError::InvalidParameter(
+                "Fillet radius must be positive".into(),
+            ));
+        }
+        if major_radius <= 0.0 || !major_radius.is_finite() {
+            return Err(MathError::InvalidParameter(format!(
+                "Toroidal fillet major radius must be positive and finite (got {major_radius})"
+            )));
+        }
+        if !angle_bounds.0.is_finite()
+            || !angle_bounds.1.is_finite()
+            || angle_bounds.1 <= angle_bounds.0
+        {
+            return Err(MathError::InvalidParameter(format!(
+                "Toroidal angle bounds must be finite with start < end (got {:?})",
+                angle_bounds
+            )));
+        }
+
+        Ok(Self {
+            major_radius,
+            minor_radius: fillet_radius,
+            center_curve,
+            angle_bounds,
             contact1,
             contact2,
         })
@@ -1554,3 +1696,353 @@ impl Surface for VariableRadiusFillet {
 //         }
 //     }
 // }
+
+// =====================================================================
+// F4-α.2 kpart constructor tests
+// =====================================================================
+//
+// These tests pin the analytic-kpart contract for `from_analytic_kpart`
+// on both [`CylindricalFillet`] and [`ToroidalFillet`]. The kpart
+// constructor stores a *constant* frame (2 identical samples) — the
+// `axis_field.len() == 2` check is the observable signature that
+// distinguishes the kpart path from the legacy [`CylindricalFillet::new`]
+// 20-sample path. The F4-α dispatcher in `operations/fillet.rs` relies
+// on these constructors being byte-faithful to the legacy ones for
+// analytic-exact inputs.
+
+#[cfg(test)]
+mod kpart_tests {
+    use super::*;
+    use crate::primitives::curve::{Arc, Line};
+
+    /// Build a synthetic plane/plane fillet: spine along +X, contacts
+    /// at 90° to each other in the YZ plane (face_a ⊥ Y, face_b ⊥ Z).
+    /// Spine sits one unit above the origin in the bisector direction.
+    fn plane_plane_inputs(radius: f64) -> (Box<dyn Curve>, Box<dyn Curve>, Box<dyn Curve>) {
+        // 90° dihedral, ball radius `radius`. Spine = line at
+        // (0, radius, radius) along +X. Contacts at:
+        //   contact_a: (t, 0, radius) — on face_a (y=0 plane)
+        //   contact_b: (t, radius, 0) — on face_b (z=0 plane)
+        let spine = Box::new(Line::new(
+            Point3::new(0.0, radius, radius),
+            Point3::new(1.0, radius, radius),
+        )) as Box<dyn Curve>;
+        let contact_a = Box::new(Line::new(
+            Point3::new(0.0, 0.0, radius),
+            Point3::new(1.0, 0.0, radius),
+        )) as Box<dyn Curve>;
+        let contact_b = Box::new(Line::new(
+            Point3::new(0.0, radius, 0.0),
+            Point3::new(1.0, radius, 0.0),
+        )) as Box<dyn Curve>;
+        (spine, contact_a, contact_b)
+    }
+
+    #[test]
+    fn cylindrical_kpart_stores_constant_frame() {
+        let (spine, c1, c2) = plane_plane_inputs(0.5);
+        let fillet = CylindricalFillet::from_analytic_kpart(spine, 0.5, c1, c2).unwrap();
+
+        // The kpart-path signature: constant fields stored as two
+        // identical samples (vs. 20 samples from `Self::new`).
+        assert_eq!(fillet.axis_field.len(), 2);
+        assert_eq!(fillet.frame_x_field.len(), 2);
+        assert_eq!(fillet.frame_y_field.len(), 2);
+        assert_eq!(fillet.angle_span.len(), 2);
+        // Both samples carry the identical analytic frame.
+        assert!((fillet.axis_field[0] - fillet.axis_field[1]).magnitude() < 1e-15);
+        assert!((fillet.frame_x_field[0] - fillet.frame_x_field[1]).magnitude() < 1e-15);
+        assert!((fillet.frame_y_field[0] - fillet.frame_y_field[1]).magnitude() < 1e-15);
+        assert_eq!(fillet.angle_span[0], fillet.angle_span[1]);
+    }
+
+    #[test]
+    fn cylindrical_kpart_axis_aligns_with_spine() {
+        let radius = 0.5;
+        let (spine, c1, c2) = plane_plane_inputs(radius);
+        let fillet = CylindricalFillet::from_analytic_kpart(spine, radius, c1, c2).unwrap();
+        // Spine direction = +X.
+        let z = fillet.axis_field[0];
+        assert!((z - Vector3::X).magnitude() < 1e-12, "axis = {:?}", z);
+    }
+
+    #[test]
+    fn cylindrical_kpart_v0_lands_on_contact1() {
+        // The frame contract: v = 0 puts the surface point on
+        // contact1; v = 1 puts it on contact2. The kpart constructor
+        // must honour the same contract as `Self::new`.
+        let radius = 0.5;
+        let (spine, c1, c2) = plane_plane_inputs(radius);
+        let fillet = CylindricalFillet::from_analytic_kpart(spine, radius, c1, c2).unwrap();
+        // At u=0.5, v=0: should be at contact_a midpoint (0.5, 0, radius).
+        let p0 = fillet.point_at(0.5, 0.0).unwrap();
+        let expected_contact_a = Point3::new(0.5, 0.0, radius);
+        assert!(
+            (p0 - expected_contact_a).magnitude() < 1e-9,
+            "v=0 expected {:?}, got {:?}",
+            expected_contact_a,
+            p0,
+        );
+        // At u=0.5, v=1: should be at contact_b midpoint (0.5, radius, 0).
+        let p1 = fillet.point_at(0.5, 1.0).unwrap();
+        let expected_contact_b = Point3::new(0.5, radius, 0.0);
+        assert!(
+            (p1 - expected_contact_b).magnitude() < 1e-9,
+            "v=1 expected {:?}, got {:?}",
+            expected_contact_b,
+            p1,
+        );
+    }
+
+    #[test]
+    fn cylindrical_kpart_surface_radius_equals_fillet_radius() {
+        // Every point on the fillet surface lies at exactly `radius`
+        // from the spine — by definition of a rolling-ball blend.
+        let radius = 0.7;
+        let (spine, c1, c2) = plane_plane_inputs(radius);
+        let fillet = CylindricalFillet::from_analytic_kpart(
+            spine.clone_box(),
+            radius,
+            c1,
+            c2,
+        )
+        .unwrap();
+        for i in 0..5 {
+            for j in 0..5 {
+                let u = i as f64 / 4.0;
+                let v = j as f64 / 4.0;
+                let surface_point = fillet.point_at(u, v).unwrap();
+                let spine_point = spine.evaluate(u).unwrap().position;
+                let dist = (surface_point - spine_point).magnitude();
+                assert!(
+                    (dist - radius).abs() < 1e-9,
+                    "(u={}, v={}): dist = {}, expected {}",
+                    u,
+                    v,
+                    dist,
+                    radius,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cylindrical_kpart_matches_legacy_constructor_for_analytic_inputs() {
+        // For analytic-exact inputs the kpart and legacy constructors
+        // must agree to ~FP precision. This is the kpart-correctness
+        // claim: same arithmetic, computed once instead of 20×.
+        let radius = 0.5;
+        let (spine_k, c1_k, c2_k) = plane_plane_inputs(radius);
+        let (spine_l, c1_l, c2_l) = plane_plane_inputs(radius);
+        let kpart =
+            CylindricalFillet::from_analytic_kpart(spine_k, radius, c1_k, c2_k).unwrap();
+        let legacy = CylindricalFillet::new(spine_l, radius, c1_l, c2_l).unwrap();
+        // Sample a 5×5 grid and compare positions.
+        for i in 0..5 {
+            for j in 0..5 {
+                let u = i as f64 / 4.0;
+                let v = j as f64 / 4.0;
+                let pk = kpart.point_at(u, v).unwrap();
+                let pl = legacy.point_at(u, v).unwrap();
+                assert!(
+                    (pk - pl).magnitude() < 1e-9,
+                    "(u={}, v={}): kpart={:?}, legacy={:?}",
+                    u,
+                    v,
+                    pk,
+                    pl,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cylindrical_kpart_rejects_non_positive_radius() {
+        let (spine, c1, c2) = plane_plane_inputs(0.5);
+        assert!(CylindricalFillet::from_analytic_kpart(spine, -0.5, c1, c2).is_err());
+        let (spine, c1, c2) = plane_plane_inputs(0.5);
+        assert!(CylindricalFillet::from_analytic_kpart(spine, 0.0, c1, c2).is_err());
+    }
+
+    /// Build a synthetic plane/cylinder fillet: cylinder of radius 5
+    /// along +Z at origin, plane z=0. Convex blend with fillet radius
+    /// 0.5 → torus with major_radius = 5.5, minor_radius = 0.5,
+    /// centred at z = 0.5 in the +Z direction.
+    fn plane_cylinder_inputs(
+        cyl_radius: f64,
+        fillet_radius: f64,
+    ) -> (Box<dyn Curve>, Box<dyn Curve>, Box<dyn Curve>, f64) {
+        let major = cyl_radius + fillet_radius;
+        let spine = Box::new(
+            Arc::new(
+                Point3::new(0.0, 0.0, fillet_radius),
+                Vector3::Z,
+                major,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            )
+            .unwrap(),
+        ) as Box<dyn Curve>;
+        // Contact on cylinder (radial offset cyl_radius from axis at z = fillet_radius).
+        let contact_a = Box::new(
+            Arc::new(
+                Point3::new(0.0, 0.0, fillet_radius),
+                Vector3::Z,
+                cyl_radius,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            )
+            .unwrap(),
+        ) as Box<dyn Curve>;
+        // Contact on plane z=0 (radial offset major from axis at z = 0).
+        let contact_b = Box::new(
+            Arc::new(
+                Point3::ORIGIN,
+                Vector3::Z,
+                major,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            )
+            .unwrap(),
+        ) as Box<dyn Curve>;
+        (spine, contact_a, contact_b, major)
+    }
+
+    #[test]
+    fn toroidal_kpart_stores_major_radius_exactly() {
+        let (spine, c1, c2, major) = plane_cylinder_inputs(5.0, 0.5);
+        let fillet = ToroidalFillet::from_analytic_kpart(
+            spine,
+            0.5,
+            c1,
+            c2,
+            major,
+            (0.0, std::f64::consts::FRAC_PI_2),
+        )
+        .unwrap();
+        // The kpart constructor stores major_radius bit-exact — no
+        // 3-point circumscribed-circle estimate involved.
+        assert_eq!(fillet.major_radius, major);
+        assert_eq!(fillet.minor_radius, 0.5);
+        assert_eq!(fillet.angle_bounds, (0.0, std::f64::consts::FRAC_PI_2));
+    }
+
+    #[test]
+    fn toroidal_kpart_rejects_invalid_major_radius() {
+        let (spine, c1, c2, _) = plane_cylinder_inputs(5.0, 0.5);
+        // Zero major radius is invalid.
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine.clone_box(),
+            0.5,
+            c1.clone_box(),
+            c2.clone_box(),
+            0.0,
+            (0.0, std::f64::consts::FRAC_PI_2),
+        )
+        .is_err());
+        // Negative major radius is invalid.
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine.clone_box(),
+            0.5,
+            c1.clone_box(),
+            c2.clone_box(),
+            -1.0,
+            (0.0, std::f64::consts::FRAC_PI_2),
+        )
+        .is_err());
+        // NaN major radius is invalid.
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine,
+            0.5,
+            c1,
+            c2,
+            f64::NAN,
+            (0.0, std::f64::consts::FRAC_PI_2),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn toroidal_kpart_rejects_invalid_angle_bounds() {
+        let (spine, c1, c2, major) = plane_cylinder_inputs(5.0, 0.5);
+        // end <= start is invalid.
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine.clone_box(),
+            0.5,
+            c1.clone_box(),
+            c2.clone_box(),
+            major,
+            (1.0, 0.5),
+        )
+        .is_err());
+        // Equal start/end is invalid.
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine.clone_box(),
+            0.5,
+            c1.clone_box(),
+            c2.clone_box(),
+            major,
+            (0.5, 0.5),
+        )
+        .is_err());
+        // NaN angle bound is invalid.
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine,
+            0.5,
+            c1,
+            c2,
+            major,
+            (0.0, f64::NAN),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn toroidal_kpart_rejects_non_positive_fillet_radius() {
+        let (spine, c1, c2, major) = plane_cylinder_inputs(5.0, 0.5);
+        assert!(ToroidalFillet::from_analytic_kpart(
+            spine,
+            -0.5,
+            c1,
+            c2,
+            major,
+            (0.0, std::f64::consts::FRAC_PI_2),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn toroidal_kpart_surface_radius_equals_minor_radius() {
+        // Every point on the torus must be at exactly `minor_radius`
+        // from the center curve (= the rolling-ball spine).
+        let cyl_r = 5.0;
+        let fillet_r = 0.5;
+        let (spine, c1, c2, major) = plane_cylinder_inputs(cyl_r, fillet_r);
+        let fillet = ToroidalFillet::from_analytic_kpart(
+            spine.clone_box(),
+            fillet_r,
+            c1,
+            c2,
+            major,
+            (0.0, std::f64::consts::FRAC_PI_2),
+        )
+        .unwrap();
+        for i in 0..5 {
+            for j in 0..5 {
+                let u = i as f64 / 4.0;
+                let v = j as f64 / 4.0;
+                let surface_point = fillet.point_at(u, v).unwrap();
+                let spine_point = spine.evaluate(u).unwrap().position;
+                let dist = (surface_point - spine_point).magnitude();
+                assert!(
+                    (dist - fillet_r).abs() < 1e-9,
+                    "(u={}, v={}): dist = {}, expected {}",
+                    u,
+                    v,
+                    dist,
+                    fillet_r,
+                );
+            }
+        }
+    }
+}
