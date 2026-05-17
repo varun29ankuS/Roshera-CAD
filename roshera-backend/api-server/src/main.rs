@@ -27,6 +27,8 @@ mod kernel_state;
 mod metrics;
 mod part_mgr;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
+#[cfg(test)]
+mod router_integration_tests;
 mod sketch;
 mod transactions;
 mod viewport_bridge;
