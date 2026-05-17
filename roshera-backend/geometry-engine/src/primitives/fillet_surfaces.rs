@@ -298,6 +298,55 @@ impl CylindricalFillet {
         let sin_a = v2_perp.dot(&frame_y).max(0.0);
         let end_angle = sin_a.atan2(cos_a);
 
+        // F4-α.4 — structural invariants the analytic kpart path must
+        // satisfy. `axis_at`/`frame_x_at`/`frame_y_at` index into the
+        // per-station fields with `(u*(n-1)) as usize`; a length-1
+        // field collapses to a special case, and a non-orthonormal
+        // triad propagates as a non-orthonormal SurfaceFrame through
+        // every downstream evaluator (tangents, normals, tessellation).
+        // debug_assert is right here: release builds skip the cost,
+        // dev/test builds catch a constructor regression at the source
+        // rather than as garbled geometry several layers downstream.
+        debug_assert!(
+            (z_axis.magnitude() - 1.0).abs() < 1e-9,
+            "kpart cylindrical: spine tangent must be unit-length \
+             (got |z| = {})",
+            z_axis.magnitude()
+        );
+        debug_assert!(
+            (frame_x.magnitude() - 1.0).abs() < 1e-9,
+            "kpart cylindrical: frame_x must be unit-length \
+             (got |x| = {})",
+            frame_x.magnitude()
+        );
+        debug_assert!(
+            (frame_y.magnitude() - 1.0).abs() < 1e-9,
+            "kpart cylindrical: frame_y must be unit-length \
+             (got |y| = {})",
+            frame_y.magnitude()
+        );
+        debug_assert!(
+            z_axis.dot(&frame_x).abs() < 1e-9,
+            "kpart cylindrical: z ⊥ x violated (z·x = {})",
+            z_axis.dot(&frame_x)
+        );
+        debug_assert!(
+            z_axis.dot(&frame_y).abs() < 1e-9,
+            "kpart cylindrical: z ⊥ y violated (z·y = {})",
+            z_axis.dot(&frame_y)
+        );
+        debug_assert!(
+            frame_x.dot(&frame_y).abs() < 1e-9,
+            "kpart cylindrical: x ⊥ y violated (x·y = {})",
+            frame_x.dot(&frame_y)
+        );
+        debug_assert!(
+            end_angle > 0.0 && end_angle <= std::f64::consts::PI + 1e-9,
+            "kpart cylindrical: end_angle must be in (0, π] \
+             (got {})",
+            end_angle
+        );
+
         // Two-element constant fields. A single-element field would
         // make `(u * (len-1) as f64) as usize` collapse to 0 for every
         // u — correct but a special case the `axis_at` etc. helpers
@@ -307,6 +356,18 @@ impl CylindricalFillet {
         let frame_x_field = vec![frame_x, frame_x];
         let frame_y_field = vec![frame_y, frame_y];
         let angle_span = vec![(0.0, end_angle), (0.0, end_angle)];
+
+        // F4-α.4 — per-station field shape invariants. The `axis_at`
+        // family assumes all four fields have the same length and
+        // both elements equal under the constancy assumption.
+        debug_assert_eq!(axis_field.len(), 2);
+        debug_assert_eq!(frame_x_field.len(), 2);
+        debug_assert_eq!(frame_y_field.len(), 2);
+        debug_assert_eq!(angle_span.len(), 2);
+        debug_assert_eq!(axis_field[0], axis_field[1]);
+        debug_assert_eq!(frame_x_field[0], frame_x_field[1]);
+        debug_assert_eq!(frame_y_field[0], frame_y_field[1]);
+        debug_assert_eq!(angle_span[0], angle_span[1]);
 
         Ok(Self {
             spine,
@@ -716,6 +777,31 @@ impl ToroidalFillet {
                 angle_bounds
             )));
         }
+
+        // F4-α.4 — analytic kpart geometric invariants. The
+        // `Result`-returning checks above guard caller-visible
+        // contract violations (negative radii, malformed bounds);
+        // the debug-only asserts here pin the deeper geometric
+        // guarantees the F4-α dispatcher relies on when it routes
+        // here. A regression that violates any of these means the
+        // dispatcher routed a non-analytic case to the kpart arm —
+        // which would also be caught by the F4-α.1 contract test,
+        // but earlier and with a more localised signal here.
+        debug_assert!(
+            major_radius > fillet_radius,
+            "kpart toroidal: major_radius must strictly exceed \
+             minor_radius (got major = {}, minor = {}); a torus with \
+             R ≤ r self-pinches and is rejected by Torus::new",
+            major_radius,
+            fillet_radius
+        );
+        debug_assert!(
+            angle_bounds.1 - angle_bounds.0 <= std::f64::consts::TAU + 1e-9,
+            "kpart toroidal: angle sweep must not exceed 2π \
+             (got [{}, {}])",
+            angle_bounds.0,
+            angle_bounds.1
+        );
 
         Ok(Self {
             major_radius,
