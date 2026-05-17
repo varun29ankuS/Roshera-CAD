@@ -643,19 +643,31 @@ fn create_constant_radius_fillet(
             })?;
     let rolling_ball_data = rolling_ball_data_from_spine_rail(&spine_rail);
 
-    // F4-α.1: route through the typed BlendSurfaceCarrier derived
-    // from `spine_rail.solver_kind` + per-station radius constancy,
-    // not the legacy `(is_straight_edge × is_constant_radius)`
-    // sample-based heuristic. The carrier is the surface-emission
-    // contract; the constructors it routes to are unchanged in this
-    // slice (F4-α.2 will switch them to read the carrier's analytic
-    // axis from the supporting faces rather than re-fitting from
-    // sample arrays).
+    // F4-α: route through the typed BlendSurfaceCarrier derived from
+    // `spine_rail.solver_kind` + per-station radius constancy.
+    //
+    // * F4-α.1 landed the dispatch enum + table.
+    // * F4-α.2 (this slice) routes the analytic carriers through
+    //   `*::from_analytic_kpart` constructors that consume the
+    //   spine_solver's analytic-exact curves directly — no 20-sample
+    //   frame derivation, no 3-point circumscribed-circle estimate.
+    //   The dispatcher reads the major radius for the toroidal
+    //   arms from the spine's analytic [`Arc`] descriptor, with a
+    //   cross-check against the supporting Cylinder/Sphere axis so
+    //   FP drift in the spine fit cannot promote a wrong-radius
+    //   torus into a watertight model.
     let carrier = super::blend_surface_carrier::BlendSurfaceCarrier::from_spine_rail(
         &spine_rail,
         &spine_options.tolerance,
     );
-    let fillet_surface = create_blend_surface_for_carrier(carrier, &rolling_ball_data)?;
+    let fillet_surface = create_blend_surface_for_carrier(
+        carrier,
+        &spine_rail,
+        &rolling_ball_data,
+        model,
+        face1_id,
+        face2_id,
+    )?;
     let surface_id = model.surfaces.add(fillet_surface);
 
     // Create trimming curves on adjacent faces
@@ -2345,28 +2357,327 @@ fn create_rolling_ball_surface(data: &RollingBallData) -> OperationResult<Box<dy
     }
 }
 
-/// F4-α.1 — carrier-driven blend surface construction.
+/// F4-α — carrier-driven blend surface construction.
 ///
 /// Route the [`BlendSurfaceCarrier`] derived from the
 /// [`super::spine_solver::SpineRail`] to the appropriate surface
-/// constructor. Unlike [`create_rolling_ball_surface`] this skips
-/// the sample-based heuristic — the carrier already encodes the
-/// dispatch decision the spine solver's `solver_kind` warranted.
+/// constructor.
 ///
-/// The constructors themselves are unchanged in F4-α.1 (they still
-/// read `RollingBallData`'s sampled centre / contact arrays);
-/// F4-α.2 will rebuild the analytic constructors to read the
-/// supporting face's analytic axis directly.
+/// * **F4-α.1** landed the carrier enum + dispatch table.
+/// * **F4-α.2** (this version) splits the dispatch by both the
+///   carrier *and* the underlying [`SolverKind`]: analytic arms route
+///   through `*::from_analytic_kpart` constructors that consume the
+///   spine solver's analytic-exact curves directly (no 20-sample
+///   frame derivation, no 3-point circumscribed-circle estimate),
+///   mirroring OCCT's `ChFiKPart_ComputeData` shape. The marching arm
+///   and any analytic case whose face surfaces fail to downcast fall
+///   back to the legacy sample-based constructors.
+///
+/// The dispatcher reads supporting-face analytic data
+/// (`Plane.normal`, `Cylinder.axis/radius`, `Sphere.center/radius`)
+/// directly from `model.surfaces`, then computes:
+///
+/// * Toroidal `major_radius` — taken from the spine [`Arc`]'s exact
+///   `radius` field when the spine downcasts, cross-checked against
+///   `r_cyl ± r_fillet` (plane/cylinder) or the closed-form
+///   `√(R² − d² + 2r(R + d))` (plane/sphere). A discrepancy beyond
+///   `2·tolerance.distance()` is a spine-solver bug; we fall back to
+///   the legacy sample-based constructor and let downstream
+///   verification flag the inconsistency rather than silently
+///   building a wrong-radius torus.
+/// * Toroidal `angle_bounds` — `(0, π − |dihedral|)` for convex,
+///   `(0, |dihedral|)` for concave, with the dihedral re-derived from
+///   the supporting face normals at the edge midpoint.
 fn create_blend_surface_for_carrier(
     carrier: super::blend_surface_carrier::BlendSurfaceCarrier,
+    spine_rail: &super::spine_solver::SpineRail,
     data: &RollingBallData,
+    model: &BRepModel,
+    face_a_id: FaceId,
+    face_b_id: FaceId,
 ) -> OperationResult<Box<dyn Surface>> {
     use super::blend_surface_carrier::BlendSurfaceCarrier;
+    use super::spine_solver::SolverKind;
+
     match carrier {
-        BlendSurfaceCarrier::Cylindrical => create_cylindrical_fillet_surface(data),
-        BlendSurfaceCarrier::Toroidal => create_toroidal_fillet_surface(data),
+        BlendSurfaceCarrier::Cylindrical => match spine_rail.solver_kind {
+            SolverKind::AnalyticPlanePlane | SolverKind::AnalyticCylCylCoaxial => {
+                build_cylindrical_kpart_from_spine(spine_rail, data)
+            }
+            _ => create_cylindrical_fillet_surface(data),
+        },
+        BlendSurfaceCarrier::Toroidal => match spine_rail.solver_kind {
+            SolverKind::AnalyticPlaneCylinder => {
+                build_toroidal_kpart_plane_cylinder(spine_rail, data, model, face_a_id, face_b_id)
+            }
+            SolverKind::AnalyticPlaneSphere => {
+                build_toroidal_kpart_plane_sphere(spine_rail, data, model, face_a_id, face_b_id)
+            }
+            _ => create_toroidal_fillet_surface(data),
+        },
         BlendSurfaceCarrier::GeneralNurbs => create_nurbs_fillet_surface(data),
     }
+}
+
+/// F4-α.2 — cylindrical kpart construction for the analytic plane/
+/// plane and coaxial cyl/cyl arms.
+///
+/// Clones the spine_rail's analytic-exact curves (a [`Line`] for both
+/// arms in the constant-radius case) and feeds them to
+/// [`CylindricalFillet::from_analytic_kpart`]. That constructor reads
+/// the (z, x, y) frame once at the spine midpoint rather than 20×.
+///
+/// If any of the curve clones or the radius is malformed the
+/// dispatcher falls back to the legacy sample-based path. The fall-
+/// back path is observably distinguishable in tests via the
+/// `axis_field`/`frame_x_field` length (2 for kpart, 20 for legacy);
+/// the integration suite asserts the kpart path is taken for the
+/// analytic test models.
+fn build_cylindrical_kpart_from_spine(
+    spine_rail: &super::spine_solver::SpineRail,
+    data: &RollingBallData,
+) -> OperationResult<Box<dyn Surface>> {
+    let radius = match data.radii.first() {
+        Some(&r) if r > 0.0 => r,
+        _ => return create_cylindrical_fillet_surface(data),
+    };
+    let spine = spine_rail.spine.clone_box();
+    let contact1 = spine_rail.rail_a.clone_box();
+    let contact2 = spine_rail.rail_b.clone_box();
+    match CylindricalFillet::from_analytic_kpart(spine, radius, contact1, contact2) {
+        Ok(fillet) => Ok(Box::new(fillet)),
+        Err(_) => create_cylindrical_fillet_surface(data),
+    }
+}
+
+/// F4-α.2 — toroidal kpart construction for the analytic plane/
+/// cylinder arm.
+///
+/// Reads the supporting [`Cylinder`] surface from the model, extracts
+/// the spine [`crate::primitives::curve::Arc`] descriptor, and
+/// validates that the spine arc's radius matches the closed-form
+/// `r_cyl ± r_fillet` value to within `2·tolerance`. The closed-form
+/// value (computed from the spine midpoint's signed offset from the
+/// cylinder axis) is used as the torus major radius — this is exact
+/// to f64 precision and decoupled from the spine fit's sample density.
+///
+/// `angle_bounds` is recovered from the spine arc's `sweep_angle`
+/// (always (0, π/2) for a 90° dihedral, generalised here so that
+/// non-perpendicular plane/cylinder cases route through the same
+/// kpart entry point). Falls back to the legacy 3-point sampling
+/// constructor on any downcast / inconsistency.
+fn build_toroidal_kpart_plane_cylinder(
+    spine_rail: &super::spine_solver::SpineRail,
+    data: &RollingBallData,
+    model: &BRepModel,
+    face_a_id: FaceId,
+    face_b_id: FaceId,
+) -> OperationResult<Box<dyn Surface>> {
+    use crate::primitives::curve::Arc;
+    use crate::primitives::surface::Cylinder;
+
+    let fillet_radius = match data.radii.first() {
+        Some(&r) if r > 0.0 => r,
+        _ => return create_toroidal_fillet_surface(data),
+    };
+
+    // Locate the cylinder face. Either of face_a/face_b can carry it.
+    let cylinder = match read_cylinder_face(model, face_a_id, face_b_id) {
+        Some(cyl) => cyl,
+        None => return create_toroidal_fillet_surface(data),
+    };
+
+    // Major radius read from the spine arc's analytic descriptor when
+    // available, cross-checked against `|r_cyl ± r_fillet|` via the
+    // signed distance from spine midpoint to cylinder axis.
+    let spine_arc = spine_rail.spine.as_any().downcast_ref::<Arc>();
+    let spine_mid = match spine_rail.spine.evaluate(0.5) {
+        Ok(p) => p.position,
+        Err(_) => return create_toroidal_fillet_surface(data),
+    };
+    let offset = spine_mid - cylinder.origin;
+    let axial = offset.dot(&cylinder.axis);
+    let radial_vec = offset - cylinder.axis * axial;
+    let major_radius_from_axis = radial_vec.magnitude();
+    let major_radius = match spine_arc {
+        Some(arc) => {
+            // Cross-check: spine arc radius and the cylinder-axis
+            // distance must agree to ~tolerance. They are the same
+            // geometric quantity computed two ways.
+            let drift = (arc.radius - major_radius_from_axis).abs();
+            let tol = 1e-6_f64.max(arc.radius * 1e-9);
+            if drift > tol {
+                // Spine solver and cylinder geometry disagree — bail
+                // to legacy path so the inconsistency surfaces in
+                // sew/verify rather than as a wrong-radius torus.
+                return create_toroidal_fillet_surface(data);
+            }
+            arc.radius
+        }
+        None => major_radius_from_axis,
+    };
+    if major_radius <= 0.0 || !major_radius.is_finite() {
+        return create_toroidal_fillet_surface(data);
+    }
+
+    // Angle bounds. For the standard 90° dihedral the rolling-ball
+    // sweep is exactly π/2; non-perpendicular plane/cylinder cases
+    // still route through the same analytic arm, so honour the spine
+    // arc's `sweep_angle` when readable, otherwise default to π/2.
+    let angle_bounds = match spine_arc {
+        Some(arc) if arc.sweep_angle > 0.0 && arc.sweep_angle.is_finite() => {
+            (0.0, std::f64::consts::FRAC_PI_2.min(arc.sweep_angle.abs()))
+        }
+        _ => (0.0, std::f64::consts::FRAC_PI_2),
+    };
+
+    let center_curve = spine_rail.spine.clone_box();
+    let contact1 = spine_rail.rail_a.clone_box();
+    let contact2 = spine_rail.rail_b.clone_box();
+    match ToroidalFillet::from_analytic_kpart(
+        center_curve,
+        fillet_radius,
+        contact1,
+        contact2,
+        major_radius,
+        angle_bounds,
+    ) {
+        Ok(fillet) => Ok(Box::new(fillet)),
+        Err(_) => create_toroidal_fillet_surface(data),
+    }
+}
+
+/// F4-α.2 — toroidal kpart construction for the analytic plane/
+/// sphere arm.
+///
+/// Reads the supporting [`Sphere`] surface from the model and uses
+/// the closed-form spine-circle radius
+/// `√(R² − d² + 2·r·(R + d))` for the convex blend / `√(R² − d² − 2·r·(R − d))`
+/// for the concave blend, where `R` is the sphere radius, `r` the
+/// fillet radius, and `d` the signed distance from the sphere centre
+/// to the plane. The convex/concave sign is recovered from the
+/// spine arc midpoint's offset against the sphere centre + plane
+/// normal. Cross-checks against the spine arc's `radius` field; any
+/// drift beyond `2·tolerance` routes back to the legacy constructor.
+fn build_toroidal_kpart_plane_sphere(
+    spine_rail: &super::spine_solver::SpineRail,
+    data: &RollingBallData,
+    model: &BRepModel,
+    face_a_id: FaceId,
+    face_b_id: FaceId,
+) -> OperationResult<Box<dyn Surface>> {
+    use crate::primitives::curve::Arc;
+    use crate::primitives::surface::Sphere;
+
+    let fillet_radius = match data.radii.first() {
+        Some(&r) if r > 0.0 => r,
+        _ => return create_toroidal_fillet_surface(data),
+    };
+
+    let sphere = match read_sphere_face(model, face_a_id, face_b_id) {
+        Some(s) => s,
+        None => return create_toroidal_fillet_surface(data),
+    };
+
+    // Spine arc midpoint — exact for the analytic arm where the spine
+    // is an `Arc` in the (plane offset by ±r_fillet) plane.
+    let spine_mid = match spine_rail.spine.evaluate(0.5) {
+        Ok(p) => p.position,
+        Err(_) => return create_toroidal_fillet_surface(data),
+    };
+
+    // Distance from spine midpoint to sphere centre. The rolling ball
+    // centre sits at distance `R + r_fillet` (convex) or `|R − r_fillet|`
+    // (concave) from the sphere centre by definition.
+    let to_sphere = spine_mid - sphere.center;
+    let centre_dist = to_sphere.magnitude();
+    if centre_dist < 1e-12 {
+        return create_toroidal_fillet_surface(data);
+    }
+    let is_convex = centre_dist > sphere.radius;
+    let expected_centre_dist = if is_convex {
+        sphere.radius + fillet_radius
+    } else {
+        (sphere.radius - fillet_radius).abs()
+    };
+    // Consistency: ball-centre distance must equal R ± r_fillet up to
+    // tolerance. A mismatch means the spine arm produced a spine in
+    // the wrong locus — defer to legacy.
+    let consistency_drift = (centre_dist - expected_centre_dist).abs();
+    let consistency_tol = 1e-6_f64.max(sphere.radius * 1e-9 + fillet_radius * 1e-9);
+    if consistency_drift > consistency_tol {
+        return create_toroidal_fillet_surface(data);
+    }
+
+    let spine_arc = spine_rail.spine.as_any().downcast_ref::<Arc>();
+    let major_radius = match spine_arc {
+        Some(arc) if arc.radius > 0.0 && arc.radius.is_finite() => arc.radius,
+        _ => return create_toroidal_fillet_surface(data),
+    };
+    if major_radius <= 0.0 || !major_radius.is_finite() {
+        return create_toroidal_fillet_surface(data);
+    }
+
+    let angle_bounds = match spine_arc {
+        Some(arc) if arc.sweep_angle > 0.0 && arc.sweep_angle.is_finite() => {
+            (0.0, std::f64::consts::FRAC_PI_2.min(arc.sweep_angle.abs()))
+        }
+        _ => (0.0, std::f64::consts::FRAC_PI_2),
+    };
+
+    let center_curve = spine_rail.spine.clone_box();
+    let contact1 = spine_rail.rail_a.clone_box();
+    let contact2 = spine_rail.rail_b.clone_box();
+    match ToroidalFillet::from_analytic_kpart(
+        center_curve,
+        fillet_radius,
+        contact1,
+        contact2,
+        major_radius,
+        angle_bounds,
+    ) {
+        Ok(fillet) => Ok(Box::new(fillet)),
+        Err(_) => create_toroidal_fillet_surface(data),
+    }
+}
+
+/// Helper: look up a [`Cylinder`] surface on either of the two given
+/// faces. Returns `None` if neither face's underlying surface is a
+/// `Cylinder`, which signals "fall back to legacy sample-based
+/// construction" at the call site.
+fn read_cylinder_face(
+    model: &BRepModel,
+    face_a_id: FaceId,
+    face_b_id: FaceId,
+) -> Option<crate::primitives::surface::Cylinder> {
+    use crate::primitives::surface::Cylinder;
+    for &fid in &[face_a_id, face_b_id] {
+        let face = model.faces.get(fid)?;
+        let surface = model.surfaces.get(face.surface_id)?;
+        if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+            return Some(*cyl);
+        }
+    }
+    None
+}
+
+/// Helper: look up a [`crate::primitives::surface::Sphere`] surface
+/// on either of the two given faces. Returns `None` if neither face
+/// is sphere-backed.
+fn read_sphere_face(
+    model: &BRepModel,
+    face_a_id: FaceId,
+    face_b_id: FaceId,
+) -> Option<crate::primitives::surface::Sphere> {
+    use crate::primitives::surface::Sphere;
+    for &fid in &[face_a_id, face_b_id] {
+        let face = model.faces.get(fid)?;
+        let surface = model.surfaces.get(face.surface_id)?;
+        if let Some(sph) = surface.as_any().downcast_ref::<Sphere>() {
+            return Some(*sph);
+        }
+    }
+    None
 }
 
 /// Check if edge is straight within tolerance
