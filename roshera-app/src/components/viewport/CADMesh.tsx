@@ -113,7 +113,14 @@ export function CADMesh({ object, isSelected: _isSelected, isHovered }: CADMeshP
       transparent: editingSketch || object.material.opacity < 1,
       opacity,
       depthWrite: editingSketch ? false : true,
-      side: THREE.DoubleSide,
+      // When section view is active, switch to `FrontSide` so the cut
+      // opening doesn't leak the back-facing inner walls of the solid
+      // through the clipped half-space. The matching SectionCap mesh
+      // (one per closed cross-section loop) fills the opening with
+      // real geometry on the cutting plane — see SectionCap.tsx.
+      // Without this gate the solid reads as hollow whenever section
+      // is enabled (CADMesh.tsx pre-SEC.3 behaviour).
+      side: sectionView.enabled ? THREE.FrontSide : THREE.DoubleSide,
       // Section View. Toggling `clippingPlanes` between [] and [plane]
       // doesn't trigger a re-mount; Three honours the new array on the
       // next frame as long as `gl.localClippingEnabled` is true (set

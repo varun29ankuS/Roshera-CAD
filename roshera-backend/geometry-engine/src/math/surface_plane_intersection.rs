@@ -63,6 +63,15 @@ pub struct SurfacePlaneIntersectionConfig {
     pub grid_resolution: usize,
     pub marching_step: f64,
     pub max_curves: usize,
+    /// Optional override for the (u, v) parameter rectangle searched for
+    /// zero-crossings, as `((u_min, u_max), (v_min, v_max))`. When `None`
+    /// the search uses `surface.parameter_bounds()` clamped to
+    /// `±1e6`. Callers with a tighter known domain (e.g. a section
+    /// preview that already knows the face's lifted UV extent) should
+    /// supply it here — the default 30×30 grid is hopelessly coarse on
+    /// an unbounded plane and misses any feature smaller than a few
+    /// percent of the clamp range.
+    pub param_bounds_override: Option<((f64, f64), (f64, f64))>,
 }
 
 impl Default for SurfacePlaneIntersectionConfig {
@@ -72,6 +81,7 @@ impl Default for SurfacePlaneIntersectionConfig {
             grid_resolution: 30,
             marching_step: 0.01,
             max_curves: 50,
+            param_bounds_override: None,
         }
     }
 }
@@ -136,7 +146,9 @@ pub fn intersect_surface_plane(
         .normalize()
         .map_err(|_| MathError::InvalidParameter("plane_normal must be non-zero".into()))?;
 
-    let ((raw_u_min, raw_u_max), (raw_v_min, raw_v_max)) = surface.parameter_bounds();
+    let ((raw_u_min, raw_u_max), (raw_v_min, raw_v_max)) = config
+        .param_bounds_override
+        .unwrap_or_else(|| surface.parameter_bounds());
 
     // Clamp infinite parameter domains to a practical working range.
     let clamp_bound = 1e6;
@@ -402,7 +414,9 @@ fn newton_correct(
 ) -> Option<ParametricIntersectionPoint> {
     let tol = config.tolerance.distance();
     let max_iter = 20;
-    let ((raw_u_min, raw_u_max), (raw_v_min, raw_v_max)) = surface.parameter_bounds();
+    let ((raw_u_min, raw_u_max), (raw_v_min, raw_v_max)) = config
+        .param_bounds_override
+        .unwrap_or_else(|| surface.parameter_bounds());
     let clamp_bound = 1e6;
     let u_min = raw_u_min.max(-clamp_bound);
     let u_max = raw_u_max.min(clamp_bound);
@@ -610,6 +624,7 @@ mod tests {
             grid_resolution: 20,
             marching_step: 0.02,
             max_curves: 10,
+            ..Default::default()
         };
 
         let curves = intersect_surface_plane(&surface, Point3::ZERO, Vector3::Z, &config)

@@ -571,7 +571,7 @@ fn sample_loop_3d_polygon(
 /// new collinearities that defeated the strict/closed point-in-triangle
 /// test in a new way. CDT is set-based, not walk-based, so the same
 /// failure mode is mathematically impossible.
-fn triangulate_planar_polygon(
+pub(crate) fn triangulate_planar_polygon(
     vertices: &[Point3],
     loop_boundaries: &[(usize, usize, bool)],
     normal: &Vector3,
@@ -1806,7 +1806,7 @@ fn tessellate_fillet_face_grid_fallback(
 }
 
 /// Get parameter bounds for a face from its loops
-fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, f64) {
+pub(crate) fn get_face_parameter_bounds(face: &Face, model: &BRepModel) -> (f64, f64, f64, f64) {
     let mut u_min = f64::MAX;
     let mut u_max = f64::MIN;
     let mut v_min = f64::MAX;
@@ -1940,6 +1940,22 @@ fn update_bounds_from_loop(
         *v_min = v_min.min(v);
         *v_max = v_max.max(v);
     }
+}
+
+/// Public re-export of the winding-number face-membership test.
+///
+/// Required by `operations::section` for NURBS / Ruled / Offset /
+/// SurfaceOfRevolution face-domain trimming: those surfaces don't have
+/// axis-aligned rectangular parameter domains, so the cheap UV-bbox
+/// test from `get_face_parameter_bounds` over-includes regions that
+/// fall outside the face's trim loops. The point-in-face winding test
+/// is the only correct boundary check for general parametric faces.
+///
+/// Forwards directly to the file-local `is_point_inside_face`; kept as
+/// a separate public name so the tessellation module's internal API
+/// stays stable.
+pub(crate) fn point_inside_face_uv(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
+    is_point_inside_face(u, v, face, model)
 }
 
 /// Check if a parameter point is inside face boundaries using winding number algorithm

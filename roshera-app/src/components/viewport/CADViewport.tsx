@@ -7,6 +7,7 @@ import { SceneLighting } from './SceneLighting'
 import { CameraController } from './CameraController'
 import { Datums } from './Datums'
 import { SceneObjects } from './SceneObjects'
+import { SectionCaps } from './SectionCaps'
 import { TransformGizmo } from './TransformGizmo'
 import { AssemblyTransformGizmo } from './AssemblyTransformGizmo'
 import { ExtrudeGizmo } from './ExtrudeGizmo'
@@ -21,6 +22,7 @@ import { MateSuggestionPopover } from '@/components/panels/MateSuggestionPopover
 import { isStandardPlane, useSceneStore, type SketchPlane } from '@/stores/scene-store'
 import { useAssemblyStore } from '@/stores/assembly-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
+import { fetchSectionPreview } from '@/lib/section-api'
 import type * as THREE from 'three'
 
 export function CADViewport() {
@@ -29,6 +31,9 @@ export function CADViewport() {
   const setGlRef = useSceneStore((s) => s.setGlRef)
   const setSceneRef = useSceneStore((s) => s.setSceneRef)
   const deselectAll = useSceneStore((s) => s.deselectAll)
+  const sectionView = useSceneStore((s) => s.sectionView)
+  const setSectionCaps = useSceneStore((s) => s.setSectionCaps)
+  const clearSectionCaps = useSceneStore((s) => s.clearSectionCaps)
 
   useEffect(() => {
     const el = containerRef.current
@@ -42,6 +47,80 @@ export function CADViewport() {
     observer.observe(el)
     return () => observer.disconnect()
   }, [setViewportSize])
+
+  // Section preview: whenever the cutting plane changes (enable /
+  // axis / offset / flip), debounce briefly then ask the kernel for
+  // the cross-section caps. The kernel returns triangulated polygons
+  // lying on the plane — `SectionCaps` renders them so the cut reads
+  // as filled material instead of the hollow shell the bare clipping
+  // plane would leave.
+  //
+  // Debounce is ~50 ms so a slider drag doesn't fire one request per
+  // pixel; the request itself is cheap (read-only, kernel-side), but
+  // the network round-trip dominates at high drag rates. `flipped`
+  // does not affect cap geometry (the kernel emits the same loop
+  // either way) so we deliberately omit it from the dependency list
+  // — flipping just inverts which solid half-space is culled, the
+  // caps stay put.
+  useEffect(() => {
+    if (!sectionView.enabled) {
+      clearSectionCaps()
+      return
+    }
+    const axisIndex = sectionView.axis === 'x' ? 0 : sectionView.axis === 'y' ? 1 : 2
+    const planeOrigin: [number, number, number] = [0, 0, 0]
+    planeOrigin[axisIndex] = sectionView.offset
+    // Send the plane normal in the direction of the *surviving*
+    // half-space (negated when `flipped`). The kernel returns cap
+    // vertex normals equal to the plane normal it received, so
+    // wiring the flipped-aware normal here means cap normals always
+    // point outward from the visible half — matches the convention
+    // a hatched / lit cap would need (SEC.4+).
+    const sign = sectionView.flipped ? -1 : 1
+    const planeNormal: [number, number, number] = [0, 0, 0]
+    planeNormal[axisIndex] = sign
+    let cancelled = false
+    const t = window.setTimeout(() => {
+      // eslint-disable-next-line no-console
+      console.log(
+        '[section] requesting preview',
+        'origin=',
+        planeOrigin,
+        'normal=',
+        planeNormal,
+      )
+      fetchSectionPreview(planeOrigin, planeNormal)
+        .then((caps) => {
+          // eslint-disable-next-line no-console
+          console.log(
+            '[section] got',
+            caps.length,
+            'caps:',
+            caps.map((c) => ({
+              solidId: c.solidId.slice(0, 8),
+              verts: c.vertices.length / 3,
+              tris: c.indices.length / 3,
+            })),
+          )
+          if (!cancelled) setSectionCaps(caps)
+        })
+        .catch((err) => {
+          // eslint-disable-next-line no-console
+          console.warn('[section] preview fetch failed:', err)
+        })
+    }, 50)
+    return () => {
+      cancelled = true
+      window.clearTimeout(t)
+    }
+  }, [
+    sectionView.enabled,
+    sectionView.axis,
+    sectionView.offset,
+    sectionView.flipped,
+    setSectionCaps,
+    clearSectionCaps,
+  ])
 
   const handleCreated = useCallback(
     (state: { gl: THREE.WebGLRenderer; scene: THREE.Scene }) => {
@@ -97,6 +176,7 @@ export function CADViewport() {
         <Datums />
         <GizmoNav />
         <SceneObjects />
+        <SectionCaps />
         <TransformGizmo />
         <AssemblyTransformGizmo />
         <SubElementHighlight />

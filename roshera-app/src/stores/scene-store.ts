@@ -19,6 +19,7 @@ import {
   type SketchSolveReport,
   type SolveOptions,
 } from '@/lib/csketch-api'
+import type { SectionCapMesh } from '@/lib/section-api'
 
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
@@ -561,6 +562,17 @@ interface SceneState {
   /** Cutting-plane state for Section View. See {@link SectionViewState}. */
   sectionView: SectionViewState
 
+  /**
+   * Triangulated cross-section caps keyed by the parent solid's id
+   * (which IS the kernel UUID — see ws-bridge.ts::ObjectCreated).
+   * Populated on demand by `CADViewport`'s section effect whenever
+   * the plane state changes; cleared whenever section view is turned
+   * off. One entry per cap loop, so a single solid that the plane
+   * crosses in two disjoint places contributes two entries — the map
+   * stores `SectionCapMesh[]` to preserve that multiplicity.
+   */
+  sectionCaps: Map<string, SectionCapMesh[]>
+
   // Viewport
   viewportSize: { width: number; height: number }
 
@@ -631,6 +643,12 @@ interface SceneState {
   setGridSettings: (settings: Partial<GridSettings>) => void
   setSectionView: (settings: Partial<SectionViewState>) => void
   toggleSectionView: () => void
+  /** Replace the live cap set with the result of the most recent
+   *  section-preview fetch. Caps grouped by parent solid id. */
+  setSectionCaps: (caps: SectionCapMesh[]) => void
+  /** Drop every cap. Called when section view is turned off so the
+   *  viewport stops drawing stale geometry. */
+  clearSectionCaps: () => void
   setViewportSize: (size: { width: number; height: number }) => void
   openContextMenu: (menu: { x: number; y: number; objectId: string; faceId?: number }) => void
   closeContextMenu: () => void
@@ -899,6 +917,7 @@ const sceneCreator: StateCreator<
       offset: 0,
       flipped: false,
     },
+    sectionCaps: new Map(),
     viewportSize: { width: 0, height: 0 },
     contextMenu: null,
     sketch: {
@@ -1132,6 +1151,22 @@ const sceneCreator: StateCreator<
       set((state) => ({
         sectionView: { ...state.sectionView, enabled: !state.sectionView.enabled },
       })),
+
+    setSectionCaps: (caps) =>
+      set(() => {
+        const grouped = new Map<string, SectionCapMesh[]>()
+        for (const cap of caps) {
+          const bucket = grouped.get(cap.solidId)
+          if (bucket) {
+            bucket.push(cap)
+          } else {
+            grouped.set(cap.solidId, [cap])
+          }
+        }
+        return { sectionCaps: grouped }
+      }),
+
+    clearSectionCaps: () => set({ sectionCaps: new Map() }),
 
     setViewportSize: (size) => set({ viewportSize: size }),
 
