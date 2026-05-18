@@ -1879,6 +1879,244 @@ fn find_cap_arc_edge_at_vertex(
     None
 }
 
+/// F5-β cap-arc lookup keyed by the cylinder's axis line.
+///
+/// Mixed-radii corners break the F5-α
+/// [`find_cap_arc_edge_at_vertex`] invariant that every cap arc on
+/// every incident fillet face shares the same centre point (the apex
+/// sphere centre). For a 3-edge corner with `r_0 ≠ r_1 ≠ r_2` the
+/// three V-side cap centres `C_i` are pairwise distinct: each lies
+/// on its own cylinder axis at the foot of the perpendicular from
+/// the apex point `A`. The legacy centre-coincidence test rejects
+/// every cap.
+///
+/// This helper matches a cap arc by the *cylinder axis line* it
+/// belongs to instead:
+///
+/// 1. `arc.normal` must be parallel (or anti-parallel) to
+///    `cylinder_axis`. Tolerance: `|arc.normal × cylinder_axis| <
+///    1.0e-9` (both are unit vectors).
+/// 2. `arc.center` must lie on the cylinder axis line through
+///    `cylinder_origin` with direction `cylinder_axis`. Tolerance:
+///    point-to-line distance `≤ 1.0e-7`.
+///
+/// A cylindrical fillet face has two cap arcs (V-side and far-side
+/// caps). Both pass conditions 1 and 2, so the helper picks the cap
+/// whose centre is closer to `corner_apex` — the V-side cap is by
+/// construction the one nearest the corner.
+///
+/// Returns `None` when the face is missing, its outer loop is
+/// missing, or no qualifying arc is found.
+fn find_cap_arc_edge_by_cylinder_axis(
+    model: &BRepModel,
+    fillet_face_id: FaceId,
+    cylinder_origin: Point3,
+    cylinder_axis: Vector3,
+    corner_apex: Point3,
+) -> Option<EdgeId> {
+    const NORMAL_PARALLEL_TOL_SQ: f64 = 1.0e-18; // (1e-9)^2
+    const AXIS_DISTANCE_TOL_SQ: f64 = 1.0e-14;   // (1e-7)^2
+
+    let face = model.faces.get(fillet_face_id)?;
+    let outer_loop = model.loops.get(face.outer_loop)?;
+
+    let mut best: Option<(EdgeId, f64)> = None;
+    for &edge_id in &outer_loop.edges {
+        let edge = model.edges.get(edge_id)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let arc = match curve.as_any().downcast_ref::<Arc>() {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Parallel-normal check: |arc.normal × cylinder_axis|² below tol.
+        let cross = arc.normal.cross(&cylinder_axis);
+        let cross_sq = cross.x * cross.x + cross.y * cross.y + cross.z * cross.z;
+        if cross_sq > NORMAL_PARALLEL_TOL_SQ {
+            continue;
+        }
+
+        // Axis-line distance check: dist² = |v|² − (v·u)² (u is unit).
+        let v = arc.center - cylinder_origin;
+        let dot = v.x * cylinder_axis.x + v.y * cylinder_axis.y + v.z * cylinder_axis.z;
+        let v_sq = v.x * v.x + v.y * v.y + v.z * v.z;
+        let dist_sq = (v_sq - dot * dot).max(0.0);
+        if dist_sq > AXIS_DISTANCE_TOL_SQ {
+            continue;
+        }
+
+        // Prefer the cap nearest the corner apex (the V-side cap).
+        let d = arc.center - corner_apex;
+        let d_apex_sq = d.x * d.x + d.y * d.y + d.z * d.z;
+        match best {
+            None => best = Some((edge_id, d_apex_sq)),
+            Some((_, prev)) if d_apex_sq < prev => best = Some((edge_id, d_apex_sq)),
+            _ => {}
+        }
+    }
+    best.map(|(eid, _)| eid)
+}
+
+/// Reason a pair of V-side cap circles failed to intersect.
+///
+/// Returned by [`intersect_two_caps`]; the caller maps each variant
+/// onto a typed `BlendFailure` with full vertex / kind context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntersectCapsError {
+    /// `u_i × u_j ≈ 0`: cylinder axes parallel — the two cap planes
+    /// are parallel (or identical) so no transverse intersection.
+    AxesParallel,
+    /// Quadratic discriminant negative — the two circles lie in
+    /// transverse planes but do not meet (gap exceeds `r_i + r_j` or
+    /// circles are too far apart laterally).
+    NoIntersection,
+    /// Linear-system solve for the plane-plane line anchor was
+    /// singular (should not happen if `AxesParallel` is rejected
+    /// first; defensive).
+    LinearSystemSingular,
+}
+
+/// Intersect two V-side cap circles `cap_i` and `cap_j` of a mixed-
+/// radii 3-edge corner.
+///
+/// `cap_i` lies in the plane through `c_i` perpendicular to `u_i`,
+/// with radius `r_i`; same for `cap_j`. The two planes are distinct
+/// when `u_i ∦ u_j` (the rectilinear-corner precondition), so their
+/// intersection is a line `L_ij`. Each cap is a circle on its own
+/// plane; the corner-patch vertex `P_{ij}` is one of the at-most-
+/// two points where the two cap circles cross.
+///
+/// # Algorithm
+///
+/// 1. Set `d_ij = (u_i × u_j).normalize()`. This is the direction of
+///    `L_ij`.
+/// 2. Anchor `P_0` on `L_ij` by solving the 3×3 system
+///    ```text
+///    u_i  · P_0 = u_i  · c_i
+///    u_j  · P_0 = u_j  · c_j
+///    d_ij · P_0 = d_ij · ((c_i + c_j) / 2)
+///    ```
+///    The third row picks the unique anchor on `L_ij` closest in
+///    `d_ij` parameter to the midpoint of `c_i, c_j` — purely a
+///    parameterisation choice, the resulting `x(s) = P_0 + s · d_ij`
+///    covers `L_ij` for all `s ∈ ℝ`. The matrix has rows
+///    `[u_i; u_j; d_ij]`; it is invertible iff `{u_i, u_j, u_i × u_j}`
+///    spans ℝ³, i.e. iff `u_i ∦ u_j`.
+/// 3. Substitute into `|x − c_i|² = r_i²`. Since `d_ij ⊥ u_i` by
+///    construction, the quadratic is
+///    ```text
+///    s² + 2 s ((P_0 − c_i) · d_ij) + (|P_0 − c_i|² − r_i²) = 0
+///    ```
+/// 4. `Δ = ((P_0 − c_i) · d_ij)² − (|P_0 − c_i|² − r_i²)`. If
+///    `Δ < 0` the cap circles do not intersect — return
+///    [`IntersectCapsError::NoIntersection`].
+/// 5. Numerical sanity: each candidate must also lie on the second
+///    circle (`|x − c_j|² ≈ r_j²` within `1.0e-9`). Mathematically
+///    automatic; the check catches gross floating-point drift.
+/// 6. Pick the root maximising `(x − vertex) · vertex_outward` — the
+///    V-side of the corner. No positivity gate: for typical
+///    perpendicular-cube corners both candidates sit *inside* the
+///    cube (negative score), and the relevant criterion is "which is
+///    closer to V" — i.e. the *larger* (least-negative) score wins.
+///    A no-intersection geometry has already been caught by the
+///    discriminant gate at step 4.
+#[allow(clippy::too_many_arguments)]
+fn intersect_two_caps(
+    c_i: Point3,
+    u_i: Vector3,
+    r_i: f64,
+    c_j: Point3,
+    u_j: Vector3,
+    r_j: f64,
+    vertex: Point3,
+    vertex_outward: Vector3,
+) -> Result<Point3, IntersectCapsError> {
+    const AXES_PARALLEL_TOL_SQ: f64 = 1.0e-18; // (1e-9)^2
+    const CIRCLE_SANITY_TOL: f64 = 1.0e-9;
+
+    // Step 1 — direction of the plane-plane intersection line.
+    let d_raw = u_i.cross(&u_j);
+    let d_norm_sq = d_raw.x * d_raw.x + d_raw.y * d_raw.y + d_raw.z * d_raw.z;
+    if d_norm_sq <= AXES_PARALLEL_TOL_SQ {
+        return Err(IntersectCapsError::AxesParallel);
+    }
+    let d_norm = d_norm_sq.sqrt();
+    let d_ij = Vector3::new(d_raw.x / d_norm, d_raw.y / d_norm, d_raw.z / d_norm);
+
+    // Step 2 — anchor P_0 on L_ij via 3×3 solve.
+    let mat = Matrix3::from_rows(&u_i, &u_j, &d_ij);
+    let m = Vector3::new(
+        (c_i.x + c_j.x) * 0.5,
+        (c_i.y + c_j.y) * 0.5,
+        (c_i.z + c_j.z) * 0.5,
+    );
+    let rhs = Vector3::new(
+        u_i.x * c_i.x + u_i.y * c_i.y + u_i.z * c_i.z,
+        u_j.x * c_j.x + u_j.y * c_j.y + u_j.z * c_j.z,
+        d_ij.x * m.x + d_ij.y * m.y + d_ij.z * m.z,
+    );
+    let inv = mat
+        .inverse()
+        .map_err(|_| IntersectCapsError::LinearSystemSingular)?;
+    let p0_vec = inv.transform_vector(&rhs);
+    let p0 = Point3::new(p0_vec.x, p0_vec.y, p0_vec.z);
+
+    // Step 3 — quadratic coefficients (a = 1 since d_ij is unit).
+    let w = p0 - c_i;
+    let b_half = w.x * d_ij.x + w.y * d_ij.y + w.z * d_ij.z;
+    let w_sq = w.x * w.x + w.y * w.y + w.z * w.z;
+    let c_coeff = w_sq - r_i * r_i;
+
+    // Step 4 — discriminant.
+    let disc = b_half * b_half - c_coeff;
+    if disc < 0.0 {
+        return Err(IntersectCapsError::NoIntersection);
+    }
+    let sqrt_disc = disc.sqrt();
+    let s_plus = -b_half + sqrt_disc;
+    let s_minus = -b_half - sqrt_disc;
+
+    let make_candidate = |s: f64| -> Point3 {
+        Point3::new(
+            p0.x + s * d_ij.x,
+            p0.y + s * d_ij.y,
+            p0.z + s * d_ij.z,
+        )
+    };
+    let on_second_circle = |x: Point3| -> bool {
+        let dx = x.x - c_j.x;
+        let dy = x.y - c_j.y;
+        let dz = x.z - c_j.z;
+        ((dx * dx + dy * dy + dz * dz).sqrt() - r_j).abs() <= CIRCLE_SANITY_TOL
+    };
+    let v_side_score = |x: Point3| -> f64 {
+        (x.x - vertex.x) * vertex_outward.x
+            + (x.y - vertex.y) * vertex_outward.y
+            + (x.z - vertex.z) * vertex_outward.z
+    };
+
+    let cand_plus = make_candidate(s_plus);
+    let cand_minus = make_candidate(s_minus);
+
+    // Step 5 — numerical sanity on the second circle.
+    let plus_ok = on_second_circle(cand_plus);
+    let minus_ok = on_second_circle(cand_minus);
+    if !plus_ok && !minus_ok {
+        return Err(IntersectCapsError::NoIntersection);
+    }
+
+    // Step 6 — pick V-side candidate maximising the outward score.
+    let plus_score = v_side_score(cand_plus);
+    let minus_score = v_side_score(cand_minus);
+
+    let best_point = if plus_ok && (!minus_ok || plus_score >= minus_score) {
+        cand_plus
+    } else {
+        cand_minus
+    };
+    Ok(best_point)
+}
+
 /// Verify that the three cap-arc edges `cap_arc_edges` form a closed
 /// triangular cycle in the BRep, and recover both the corner-vertex
 /// sequence (A, B, C) and the per-edge "follow start→end?" flag for
@@ -2186,6 +2424,112 @@ fn apply_apex_sphere_corner(
     }
 
     Ok(face_id)
+}
+
+/// F5-β triangular-NURBS corner emission skeleton — mixed-radii path.
+///
+/// Called from [`create_fillet_transitions`] for a degree-3 convex
+/// corner whose three incident fillet radii are not all equal. The
+/// equal-radius case still routes through [`apply_apex_sphere_corner`].
+///
+/// # F5-β.1 status
+///
+/// This slice (Task #88) lands the underlying helpers
+/// ([`find_cap_arc_edge_by_cylinder_axis`], [`intersect_two_caps`])
+/// and the steps-1-3 skeleton. The public surface remains
+/// `BlendFailure::VertexBlendUnsupported { reason: MixedRadii }`
+/// because steps 4-8 (cap-arc trimming, seam re-anchoring,
+/// triangular NURBS surface emission, face registration, corner
+/// vertex drop) ship in F5-β.2 and F5-β.3.
+///
+/// # Steps implemented in F5-β.1
+///
+/// 1. Locate the V-side cap-arc edge on each incident fillet face by
+///    cylinder-axis match (`find_cap_arc_edge_by_cylinder_axis`).
+///    Failure → `NonManifoldNeighbourhood`.
+/// 2. Compute per-cylinder cap centre
+///    `C_i = q_i + ((A − q_i) · u_i) · u_i` for each i. Pure
+///    arithmetic — cannot fail.
+/// 3. Compute pairwise intersection points `P_{ij}` for `(i, j) ∈
+///    {(0, 1), (1, 2), (2, 0)}` via [`intersect_two_caps`]. Failure
+///    (axes parallel, no intersection, or singular linear solve) →
+///    `NonManifoldNeighbourhood`.
+///
+/// After steps 1-3 the function emits the structured `MixedRadii`
+/// failure, preserving the public contract until F5-β.3 lifts it.
+#[allow(clippy::too_many_arguments)]
+fn apply_triangular_nurbs_corner(
+    model: &mut BRepModel,
+    _solid_id: SolidId,
+    vertex_id: VertexId,
+    vertex_pos: Point3,
+    fillet_face_ids: &[FaceId; 3],
+    cylinder_axes: &[(Point3, Vector3, f64); 3],
+    corner_apex: Point3,
+    vertex_outward: Vector3,
+) -> OperationResult<FaceId> {
+    // Step 1 — locate the three V-side cap-arc edges by cylinder axis.
+    let mut cap_arc_edges: [EdgeId; 3] = [0; 3];
+    for i in 0..3 {
+        let (q, u, _r) = cylinder_axes[i];
+        cap_arc_edges[i] =
+            find_cap_arc_edge_by_cylinder_axis(model, fillet_face_ids[i], q, u, corner_apex)
+                .ok_or_else(|| {
+                    OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
+                        vertex: vertex_id,
+                        kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    }))
+                })?;
+    }
+
+    // Step 2 — per-cylinder cap centres C_i = q_i + ((A − q_i) · u_i) u_i.
+    let mut cap_centres = [Point3::new(0.0, 0.0, 0.0); 3];
+    for i in 0..3 {
+        let (q, u, _) = cylinder_axes[i];
+        let v = corner_apex - q;
+        let t = v.x * u.x + v.y * u.y + v.z * u.z;
+        cap_centres[i] = Point3::new(q.x + t * u.x, q.y + t * u.y, q.z + t * u.z);
+    }
+
+    // Step 3 — pairwise cap-circle intersection points P_{ij}.
+    let pairs: [(usize, usize); 3] = [(0, 1), (1, 2), (2, 0)];
+    let mut p_ij = [Point3::new(0.0, 0.0, 0.0); 3];
+    for (k, &(i, j)) in pairs.iter().enumerate() {
+        let (_, u_i, r_i) = cylinder_axes[i];
+        let (_, u_j, r_j) = cylinder_axes[j];
+        p_ij[k] = intersect_two_caps(
+            cap_centres[i],
+            u_i,
+            r_i,
+            cap_centres[j],
+            u_j,
+            r_j,
+            vertex_pos,
+            vertex_outward,
+        )
+        .map_err(|_| {
+            OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
+                vertex: vertex_id,
+                kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+            }))
+        })?;
+    }
+
+    // F5-β.1 skeleton: helpers wired, but surgery (steps 4-8) ships
+    // in F5-β.2 / F5-β.3. The public contract continues to emit a
+    // typed `MixedRadii` failure until that point so callers see no
+    // behavioural change relative to the F5-α dispatcher.
+    let _ = cap_arc_edges;
+    let _ = p_ij;
+    Err(OperationError::BlendFailed(Box::new(
+        BlendFailure::VertexBlendUnsupported {
+            vertex: vertex_id,
+            kind: BlendVertexKind::ConvexCorner { degree: 3 },
+            reason: VertexBlendUnsupportedReason::MixedRadii,
+        },
+    )))
 }
 
 // `gather_vertex_blend_context` and `create_vertex_blend` were the
@@ -3593,27 +3937,23 @@ fn create_fillet_transitions(
             }
         }
 
-        // F5-α MVP — equal radii required.
+        // F5-β dispatcher — branch on per-edge radius equality.
+        // Equal radii (`F5-α MVP`) route through
+        // `apply_apex_sphere_corner` and emit a spherical apex face.
+        // Mixed radii route through the F5-β triangular-NURBS skeleton
+        // (still emits the structured `MixedRadii` failure at the end
+        // of F5-β.1; F5-β.3 lifts that).
         let r0 = descriptors[0].radius;
-        if descriptors
+        let radii_equal = descriptors
             .iter()
-            .any(|d| (d.radius - r0).abs() > RADIUS_TOL)
-        {
-            return Err(OperationError::BlendFailed(Box::new(
-                BlendFailure::VertexBlendUnsupported {
-                    vertex: corner.id,
-                    kind: BlendVertexKind::ConvexCorner { degree: 3 },
-                    reason: VertexBlendUnsupportedReason::MixedRadii,
-                },
-            )));
-        }
+            .all(|d| (d.radius - r0).abs() <= RADIUS_TOL);
 
-        // Assemble classifications and solve for the apex sphere
-        // centre. `compute_concurrent_axes_center` reuses the same
-        // least-squares solver the pre-F5-α `gather_vertex_blend_
-        // context` used; here we feed the live fillet-face
-        // descriptors instead of re-walking the pre-fillet
-        // topology.
+        // Assemble classifications and solve for the corner apex
+        // point. `compute_concurrent_axes_center` is radius-
+        // independent — it returns the least-squares closest point
+        // to all three cylinder axis lines. For equal radii this is
+        // the apex sphere centre; for mixed radii this is the F5-β
+        // corner anchor `A` used to derive per-cylinder cap centres.
         let classifications: Vec<IncidentEdgeClassification> = corner
             .incident_blend_edges
             .iter()
@@ -3626,38 +3966,43 @@ fn create_fillet_transitions(
             })
             .collect();
 
-        let sphere_center = compute_concurrent_axes_center(&classifications, corner.id)?;
+        let corner_apex = compute_concurrent_axes_center(&classifications, corner.id)?;
 
-        // Residual check: distance from the solved centre to each
-        // axis line. If any incident axis is more than
-        // `AXES_RESIDUAL_TOL` away, the corner is not really
-        // rectilinear — surface a typed diagnostic so the caller
-        // sees the structured failure instead of a downstream
-        // garbage sphere.
-        let max_residual = descriptors
-            .iter()
-            .map(|d| {
-                let q = d.axis_origin;
-                let u = d.axis;
-                let v = sphere_center - q;
-                let dot = v.x * u.x + v.y * u.y + v.z * u.z;
-                let perp = Vector3::new(v.x - dot * u.x, v.y - dot * u.y, v.z - dot * u.z);
-                (perp.x * perp.x + perp.y * perp.y + perp.z * perp.z).sqrt()
-            })
-            .fold(0.0_f64, f64::max);
-        if max_residual > AXES_RESIDUAL_TOL {
-            return Err(OperationError::BlendFailed(Box::new(
-                BlendFailure::VertexBlendUnsupported {
-                    vertex: corner.id,
-                    kind: BlendVertexKind::ConvexCorner { degree: 3 },
-                    reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
-                },
-            )));
+        // Residual check: distance from the solved apex to each axis
+        // line. For mixed radii the residual can legitimately exceed
+        // zero even at a perfectly rectilinear corner (the axes are
+        // not concurrent when `r_i` differ), so the residual gate
+        // only applies to the equal-radius branch where the apex IS
+        // the sphere centre and must coincide with every axis. Mixed
+        // radii fall to the F5-β LS interpretation: `A` is the
+        // closest point, not a point ON every axis.
+        if radii_equal {
+            let max_residual = descriptors
+                .iter()
+                .map(|d| {
+                    let q = d.axis_origin;
+                    let u = d.axis;
+                    let v = corner_apex - q;
+                    let dot = v.x * u.x + v.y * u.y + v.z * u.z;
+                    let perp =
+                        Vector3::new(v.x - dot * u.x, v.y - dot * u.y, v.z - dot * u.z);
+                    (perp.x * perp.x + perp.y * perp.y + perp.z * perp.z).sqrt()
+                })
+                .fold(0.0_f64, f64::max);
+            if max_residual > AXES_RESIDUAL_TOL {
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::VertexBlendUnsupported {
+                        vertex: corner.id,
+                        kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    },
+                )));
+            }
         }
 
         // Outward direction at the corner: the original sharp vertex
-        // sits *outside* the apex sphere — the segment from sphere
-        // centre to vertex points away from the solid material.
+        // sits *outside* the corner cavity — the segment from corner
+        // apex to vertex points away from the solid material.
         // `corner_positions` snapshotted the vertex position before
         // per-edge surgery so the read is well-defined regardless of
         // whether the splice has since orphaned the vertex.
@@ -3667,7 +4012,7 @@ fn create_fillet_transitions(
                 corner.id
             ))
         })?;
-        let outward_raw = vertex_pos - sphere_center;
+        let outward_raw = vertex_pos - corner_apex;
         let vertex_outward = outward_raw.normalize().map_err(|_| {
             OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
                 vertex: corner.id,
@@ -3676,16 +4021,47 @@ fn create_fillet_transitions(
             }))
         })?;
 
-        let face_id = apply_apex_sphere_corner(
-            model,
-            solid_id,
-            corner.id,
-            &face_ids,
-            sphere_center,
-            r0,
-            vertex_outward,
-        )?;
-        new_faces.push(face_id);
+        if radii_equal {
+            let face_id = apply_apex_sphere_corner(
+                model,
+                solid_id,
+                corner.id,
+                &face_ids,
+                corner_apex,
+                r0,
+                vertex_outward,
+            )?;
+            new_faces.push(face_id);
+        } else {
+            let cylinder_axes: [(Point3, Vector3, f64); 3] = [
+                (
+                    descriptors[0].axis_origin,
+                    descriptors[0].axis,
+                    descriptors[0].radius,
+                ),
+                (
+                    descriptors[1].axis_origin,
+                    descriptors[1].axis,
+                    descriptors[1].radius,
+                ),
+                (
+                    descriptors[2].axis_origin,
+                    descriptors[2].axis,
+                    descriptors[2].radius,
+                ),
+            ];
+            let face_id = apply_triangular_nurbs_corner(
+                model,
+                solid_id,
+                corner.id,
+                vertex_pos,
+                &face_ids,
+                &cylinder_axes,
+                corner_apex,
+                vertex_outward,
+            )?;
+            new_faces.push(face_id);
+        }
     }
 
     Ok(new_faces)
@@ -5715,6 +6091,342 @@ mod tests {
                 (angle - pi_over_two).abs()
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // F5-β.1 (Task #88) — circle-circle cap intersection +
+    // per-cylinder cap-arc lookup helpers.
+    //
+    // `intersect_two_caps` is a pure-math primitive — these tests pin
+    // its discriminant, axis-parallel rejection, V-side
+    // disambiguation, and mixed-radii correctness on hand-crafted
+    // inputs whose intersection points are derivable in closed form.
+    //
+    // `find_cap_arc_edge_by_cylinder_axis` is exercised against a
+    // hand-built BRep with one fillet face carrying one or two Arc
+    // edges; the test confirms parallel-normal + axis-distance
+    // gating and the "pick closer to apex" tie-break.
+    // ------------------------------------------------------------------
+
+    fn vec3(x: f64, y: f64, z: f64) -> Vector3 {
+        Vector3::new(x, y, z)
+    }
+
+    fn pt(x: f64, y: f64, z: f64) -> Point3 {
+        Point3::new(x, y, z)
+    }
+
+    fn approx_eq_pt(a: Point3, b: Point3, tol: f64) -> bool {
+        (a.x - b.x).abs() <= tol && (a.y - b.y).abs() <= tol && (a.z - b.z).abs() <= tol
+    }
+
+    #[test]
+    fn intersect_two_caps_equal_radii_perpendicular_picks_v_side() {
+        // Two unit circles centred at origin, one in plane y=0 with
+        // normal +y, one in plane x=0 with normal +x. They cross at
+        // (0, 0, +1) and (0, 0, -1). vertex_outward = +z picks the
+        // +z candidate.
+        let p = intersect_two_caps(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 2.0),     // vertex along +z
+            vec3(0.0, 0.0, 1.0),   // outward +z
+        )
+        .expect("two unit caps must intersect");
+        assert!(
+            approx_eq_pt(p, pt(0.0, 0.0, 1.0), 1.0e-9),
+            "expected (0,0,1) got {:?}",
+            p
+        );
+    }
+
+    #[test]
+    fn intersect_two_caps_v_side_flip_picks_opposite_candidate() {
+        // Same geometry as above, but vertex_outward = -z must pick
+        // (0, 0, -1) instead of (0, 0, +1).
+        let p = intersect_two_caps(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, -2.0),
+            vec3(0.0, 0.0, -1.0),
+        )
+        .expect("two unit caps must intersect");
+        assert!(
+            approx_eq_pt(p, pt(0.0, 0.0, -1.0), 1.0e-9),
+            "outward flip must select -z candidate; got {:?}",
+            p
+        );
+    }
+
+    #[test]
+    fn intersect_two_caps_mixed_radii_known_intersection() {
+        // Cap 0: centre (3, 0, 4), normal +y, radius 5 — passes
+        //        through (0, 0, 0) and (0, 0, 8) on line L = {x=0, y=0}.
+        // Cap 1: centre (0, 1, 4), normal +x, radius sqrt(17) — also
+        //        passes through (0, 0, 0) and (0, 0, 8).
+        // Radii are unmistakably mixed (5 ≠ sqrt(17) ≈ 4.123).
+        // vertex at (0, 0, 10), outward = +z: max (P-V)·outward
+        // selects (0, 0, 8) (score = -2) over (0, 0, 0) (score = -10).
+        let r1 = (17.0_f64).sqrt();
+        let p = intersect_two_caps(
+            pt(3.0, 0.0, 4.0),
+            vec3(0.0, 1.0, 0.0),
+            5.0,
+            pt(0.0, 1.0, 4.0),
+            vec3(1.0, 0.0, 0.0),
+            r1,
+            pt(0.0, 0.0, 10.0),
+            vec3(0.0, 0.0, 1.0),
+        )
+        .expect("mixed-radii caps intersect at (0,0,0) and (0,0,8)");
+        assert!(
+            approx_eq_pt(p, pt(0.0, 0.0, 8.0), 1.0e-9),
+            "expected (0,0,8) (the +z candidate); got {:?}",
+            p
+        );
+    }
+
+    #[test]
+    fn intersect_two_caps_axes_parallel_rejected() {
+        // Same-direction axes ⇒ d_ij = u_i × u_j = 0 ⇒ AxesParallel.
+        let err = intersect_two_caps(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 5.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 10.0),
+            vec3(0.0, 0.0, 1.0),
+        )
+        .expect_err("parallel cylinder axes must reject");
+        assert_eq!(err, IntersectCapsError::AxesParallel);
+    }
+
+    #[test]
+    fn intersect_two_caps_anti_parallel_axes_rejected() {
+        // u_i and u_j antiparallel ⇒ cross product still zero ⇒
+        // AxesParallel.
+        let err = intersect_two_caps(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 5.0),
+            vec3(0.0, -1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 10.0),
+            vec3(0.0, 0.0, 1.0),
+        )
+        .expect_err("antiparallel cylinder axes must reject");
+        assert_eq!(err, IntersectCapsError::AxesParallel);
+    }
+
+    #[test]
+    fn intersect_two_caps_no_intersection_when_caps_too_far() {
+        // Two unit caps in perpendicular planes, but C_0 and C_1
+        // separated along L_ij by ~10 — distance from P_0 to C_i on
+        // the line is large, |P_0 − C_i|² − r_i² > b_half² so
+        // discriminant negative.
+        let err = intersect_two_caps(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 10.0),
+            vec3(1.0, 0.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 5.0),
+            vec3(0.0, 0.0, 1.0),
+        )
+        .expect_err("caps separated by ~10 with unit radii cannot meet");
+        assert_eq!(err, IntersectCapsError::NoIntersection);
+    }
+
+    #[test]
+    fn intersect_two_caps_sanity_filter_rejects_off_circle_candidate() {
+        // Cap 0: centre (0,0,0) radius 1 in plane y=0 → meets line
+        //        L_ij = {x=0, y=0} at z = ±1.
+        // Cap 1: centre (0,0,2) radius 1 in plane x=0 → meets L_ij at
+        //        z = 1 and z = 3.
+        // The discriminant solve produces two candidates on the
+        // y=0/x=0 line; only (0, 0, 1) lies on both circles. The
+        // sanity check at step 5 must drop the (0, 0, -1) candidate
+        // (off cap 1) so the V-side selection picks (0, 0, 1).
+        let p = intersect_two_caps(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 2.0),
+            vec3(1.0, 0.0, 0.0),
+            1.0,
+            pt(0.0, 0.0, 5.0),
+            vec3(0.0, 0.0, 1.0),
+        )
+        .expect("caps share exactly one common point at (0,0,1)");
+        assert!(
+            approx_eq_pt(p, pt(0.0, 0.0, 1.0), 1.0e-7),
+            "expected (0,0,1) after off-circle candidate filtered; got {:?}",
+            p
+        );
+    }
+
+    // -------- find_cap_arc_edge_by_cylinder_axis tests --------
+
+    /// Build a minimal BRep face holding `arcs` as outer-loop edges.
+    /// Surface is a placeholder Sphere — the lookup helper only reads
+    /// the loop's curves, not the surface.
+    fn build_face_with_arcs(model: &mut BRepModel, arcs: Vec<Arc>) -> FaceId {
+        use crate::primitives::face::FaceOrientation;
+        let surface_id = model
+            .surfaces
+            .add(Box::new(Sphere::new(pt(0.0, 0.0, 0.0), 1.0).expect("sphere")));
+        let mut lp = Loop::new(0, LoopType::Outer);
+        for arc in arcs {
+            let v0 = model.vertices.add(0.0, 0.0, 0.0);
+            let v1 = model.vertices.add(0.0, 0.0, 0.0);
+            let curve_id = model.curves.add(Box::new(arc));
+            let edge = Edge::new_auto_range(0, v0, v1, curve_id, EdgeOrientation::Forward);
+            let edge_id = model.edges.add(edge);
+            lp.add_edge(edge_id, true);
+        }
+        let loop_id = model.loops.add(lp);
+        let mut face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        face.outer_loop = loop_id;
+        model.faces.add(face)
+    }
+
+    #[test]
+    fn find_cap_arc_edge_by_cylinder_axis_picks_unique_match() {
+        let mut model = BRepModel::new();
+        // Arc centred on cylinder axis (line x=0, z=0, varies y),
+        // normal aligned with axis +y, radius 1.
+        let arc = Arc::new(
+            pt(0.0, 2.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let face_id = build_face_with_arcs(&mut model, vec![arc]);
+        let found = find_cap_arc_edge_by_cylinder_axis(
+            &model,
+            face_id,
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            pt(0.0, 0.0, 0.0),
+        );
+        assert!(found.is_some(), "matching arc must be located");
+    }
+
+    #[test]
+    fn find_cap_arc_edge_by_cylinder_axis_prefers_nearest_to_apex() {
+        let mut model = BRepModel::new();
+        // Two arcs both on cylinder axis (line x=0, z=0): one at
+        // y=1 (V-side cap, nearer apex at origin), one at y=10
+        // (far-side cap). The helper must return the y=1 one.
+        let v_side = Arc::new(
+            pt(0.0, 1.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("v-side arc");
+        let far_side = Arc::new(
+            pt(0.0, 10.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("far-side arc");
+        let face_id = build_face_with_arcs(&mut model, vec![v_side, far_side]);
+
+        let found_edge_id = find_cap_arc_edge_by_cylinder_axis(
+            &model,
+            face_id,
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            pt(0.0, 0.0, 0.0),
+        )
+        .expect("at least one arc must match");
+
+        // Resolve the arc behind the returned edge and verify its
+        // centre is the V-side one.
+        let edge = model.edges.get(found_edge_id).expect("edge");
+        let curve = model.curves.get(edge.curve_id).expect("curve");
+        let arc = curve
+            .as_any()
+            .downcast_ref::<Arc>()
+            .expect("matched edge must carry an Arc");
+        assert!(
+            (arc.center.y - 1.0).abs() < 1.0e-9,
+            "expected V-side arc at y=1, got centre {:?}",
+            arc.center
+        );
+    }
+
+    #[test]
+    fn find_cap_arc_edge_by_cylinder_axis_rejects_off_axis_centre() {
+        let mut model = BRepModel::new();
+        // Arc centred at (5, 0, 0) with normal +y — normal is OK
+        // (parallel to axis) but centre is 5 units off the line
+        // x=0, z=0. Helper must reject.
+        let arc = Arc::new(
+            pt(5.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let face_id = build_face_with_arcs(&mut model, vec![arc]);
+        let found = find_cap_arc_edge_by_cylinder_axis(
+            &model,
+            face_id,
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            pt(0.0, 0.0, 0.0),
+        );
+        assert!(
+            found.is_none(),
+            "arc centred 5 units off axis must not match"
+        );
+    }
+
+    #[test]
+    fn find_cap_arc_edge_by_cylinder_axis_rejects_perpendicular_normal() {
+        let mut model = BRepModel::new();
+        // Arc on the cylinder axis line but with normal perpendicular
+        // to the cylinder axis — wrong cap orientation.
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let face_id = build_face_with_arcs(&mut model, vec![arc]);
+        let found = find_cap_arc_edge_by_cylinder_axis(
+            &model,
+            face_id,
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            pt(0.0, 0.0, 0.0),
+        );
+        assert!(
+            found.is_none(),
+            "arc normal perpendicular to axis must not match"
+        );
     }
 }
 
