@@ -26,10 +26,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::math::vector3::Vector3;
-use crate::operations::edge_classification::classify_and_cache;
+use crate::math::matrix3::Matrix3;
+use crate::math::vector3::{Point3, Vector3};
+use crate::operations::edge_classification::{classify_and_cache, find_adjacent_faces};
 use crate::operations::{OperationError, OperationResult};
 use crate::primitives::edge::{EdgeId, ManifoldKind};
+use crate::primitives::face::FaceOrientation;
+use crate::primitives::surface::Plane;
 use crate::primitives::topology_builder::BRepModel;
 use crate::primitives::vertex::VertexId;
 
@@ -637,6 +640,325 @@ pub fn compute_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> OperationR
                 if is_start {
                     be.start_setback = Some(setback);
                 } else if is_end {
+                    be.end_setback = Some(setback);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Refine per-edge setbacks for `ConvexCorner { degree: 3 }` apex
+/// corners where every incident blend edge lies between two planar
+/// adjacent faces (the F5-α scope).
+///
+/// **Motivation.** `compute_setbacks` writes the Hoffmann
+/// smooth-closure value `r·cos(θ_min/2)` at every corner: for a
+/// rectilinear (90° dihedral) three-edge corner this gives
+/// `r/√2 ≈ 0.707·r`, which retracts the cylinder spine to where
+/// two adjacent cylinders meet tangentially — the correct value for
+/// the *two-edge* smooth case but **wrong** for apex-sphere
+/// termination. F5-α emits a corner sphere of radius `r` whose
+/// centre `C` coincides with the rolling-ball centre tangent to all
+/// three faces at the corner; each cylinder spine must retract all
+/// the way to `C` so the V-side cap arc lands on the sphere centre.
+/// For a unit-cube corner the correct setback is `r` (full
+/// retraction); the Hoffmann value falls short by `r·(1 − cos(π/4))`
+/// ≈ `0.293·r`.
+///
+/// **Geometry.** For each incident blend edge `i` at the corner
+/// vertex `V`:
+///
+///   * The two adjacent faces are planes with outward unit normals
+///     `n_a`, `n_b` (oriented per `face.orientation`).
+///   * The cylinder axis is parallel to the edge tangent and passes
+///     through the point `P_i = V − (r / (1 + n_a·n_b))·(n_a + n_b)`
+///     (the inward perpendicular offset of `V` that lies on both
+///     planes' `+r` offset surfaces). For perpendicular normals
+///     this reduces to `P_i = V − r·(n_a + n_b)`.
+///   * `P_i` is the V-end of the spine *without* setback, i.e. the
+///     projection of `V` onto the axis line.
+///
+/// The apex sphere centre `C` is the point equidistant (distance
+/// `r`) from all three faces, hence the least-squares intersection
+/// of the three predicted cylinder axes. The same projector-sum
+/// solve used by `fillet::compute_concurrent_axes_center` is inlined
+/// here so this module stays independent of the upper-layer dispatch
+/// code:
+///
+/// ```text
+///   C = (Σ M_i)^{-1} · (Σ M_i · q_i),  M_i = I − u_i u_iᵀ,  q_i = P_i.
+/// ```
+///
+/// The apex-aware setback per edge is then `(C − P_i)·u_i_outgoing`,
+/// where `u_i_outgoing` is the unit edge-tangent at `V` oriented
+/// "into" the cylinder (the same direction
+/// [`compute_setbacks`] uses for `θ_min`). For the rectilinear
+/// box-corner case this evaluates to exactly `r`.
+///
+/// **Side effects.** On a corner that meets every precondition,
+/// overwrites `start_setback`/`end_setback` on each of the three
+/// incident `BlendEdge`s with the apex-aware value. Corners that do
+/// not meet the preconditions (any adjacent face non-planar; mixed
+/// radii across the three edges; rank-deficient axis system;
+/// numerically near-anti-parallel face normals) are silently left
+/// alone — the upstream Hoffmann setback survives. The lifecycle
+/// gate at `fillet.rs` is responsible for rejecting unsupported
+/// configurations before they reach the synthesis pass; this
+/// function never produces a diagnostic of its own.
+///
+/// **Idempotency.** Two consecutive calls produce the same final
+/// setback values (the second call reads the apex-aware values
+/// produced by the first and computes the same answer because all
+/// inputs — `V`, plane normals, radii, edge tangents — are
+/// unchanged).
+///
+/// Must be called *after* [`compute_setbacks`] so the Hoffmann
+/// baseline is in place for any corner that does not match the
+/// F5-α scope.
+pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> OperationResult<()> {
+    // Snapshot the work list so we can mutate `graph.edges` without
+    // borrowing `graph.vertices` immutably at the same time.
+    let work: Vec<(VertexId, Vec<EdgeId>)> = graph
+        .vertices
+        .iter()
+        .filter_map(|(vid, v)| match v.kind {
+            BlendVertexKind::ConvexCorner { degree: 3 } if v.incident_blend_edges.len() == 3 => {
+                Some((*vid, v.incident_blend_edges.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    for (vertex_id, blend_edges) in work {
+        let vertex = match model.vertices.get(vertex_id) {
+            Some(v) => v,
+            None => continue,
+        };
+        let v_pos = Point3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
+
+        // Step 1: for each incident blend edge, predict the cylinder
+        // axis (origin + direction) and capture the outgoing edge
+        // tangent at V. Any non-planar adjacent face or near-anti-
+        // parallel normal pair (1 + n_a·n_b ≈ 0) drops the corner
+        // out of F5-α scope and we leave its Hoffmann setbacks in
+        // place.
+        struct EdgePrediction {
+            edge_id: EdgeId,
+            p_start: Point3,
+            axis_dir: Vector3,
+            is_start: bool,
+        }
+        const ANTI_PARALLEL_TOL: f64 = 1.0e-9;
+
+        let mut predictions: Vec<EdgePrediction> = Vec::with_capacity(3);
+        let mut radius_ref: Option<f64> = None;
+        let mut bail = false;
+        for &eid in &blend_edges {
+            let edge = match model.edges.get(eid) {
+                Some(e) => e,
+                None => {
+                    bail = true;
+                    break;
+                }
+            };
+            let faces = find_adjacent_faces(model, eid);
+            if faces.len() != 2 {
+                bail = true;
+                break;
+            }
+            let mut normals: [Vector3; 2] = [Vector3::new(0.0, 0.0, 0.0); 2];
+            let mut planar = true;
+            for i in 0..2 {
+                let face = match model.faces.get(faces[i]) {
+                    Some(f) => f,
+                    None => {
+                        planar = false;
+                        break;
+                    }
+                };
+                let surface = match model.surfaces.get(face.surface_id) {
+                    Some(s) => s,
+                    None => {
+                        planar = false;
+                        break;
+                    }
+                };
+                let plane = match surface.as_any().downcast_ref::<Plane>() {
+                    Some(p) => p,
+                    None => {
+                        planar = false;
+                        break;
+                    }
+                };
+                let mut n = plane.normal;
+                if face.orientation == FaceOrientation::Backward {
+                    n = Vector3::new(-n.x, -n.y, -n.z);
+                }
+                normals[i] = n;
+            }
+            if !planar {
+                bail = true;
+                break;
+            }
+
+            let n_a = normals[0];
+            let n_b = normals[1];
+            let c = n_a.dot(&n_b);
+            if (1.0 + c).abs() < ANTI_PARALLEL_TOL {
+                bail = true;
+                break;
+            }
+
+            // Outgoing edge tangent at V (same convention as
+            // `compute_setbacks`).
+            let is_start = edge.start_vertex == vertex_id;
+            let is_end = edge.end_vertex == vertex_id;
+            if !is_start && !is_end {
+                bail = true;
+                break;
+            }
+            let outgoing = if is_start {
+                edge.tangent_at(0.0_f64, &model.curves).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "tangent_at(0) failed for edge {}: {:?}",
+                        eid, e
+                    ))
+                })?
+            } else {
+                let t_end = edge.tangent_at(1.0_f64, &model.curves).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "tangent_at(1) failed for edge {}: {:?}",
+                        eid, e
+                    ))
+                })?;
+                Vector3::new(-t_end.x, -t_end.y, -t_end.z)
+            };
+
+            // Radius — must agree across all three edges (the
+            // lifecycle gate already enforces this, but we re-check
+            // locally rather than trust an out-of-band invariant).
+            let r = graph
+                .edges
+                .get(&eid)
+                .map(|be| be.radius.min_value())
+                .unwrap_or(0.0_f64);
+            if !(r > 0.0 && r.is_finite()) {
+                bail = true;
+                break;
+            }
+            if let Some(r_ref) = radius_ref {
+                if (r - r_ref).abs() > 1.0e-12 {
+                    bail = true;
+                    break;
+                }
+            } else {
+                radius_ref = Some(r);
+            }
+
+            // Cylinder axis origin: V − (r/(1+c))·(n_a + n_b).
+            let scale = r / (1.0 + c);
+            let sum = n_a + n_b;
+            let p_start = Point3::new(
+                v_pos.x - scale * sum.x,
+                v_pos.y - scale * sum.y,
+                v_pos.z - scale * sum.z,
+            );
+
+            // Axis direction: parallel to n_a × n_b, oriented along
+            // the outgoing edge tangent. Falling back to the
+            // outgoing tangent itself when the cross product is
+            // numerically degenerate is unnecessary — the
+            // anti-parallel guard above already ruled it out, and
+            // by construction `outgoing ≈ n_a × n_b` for a
+            // straight edge between two planes.
+            let cross = n_a.cross(&n_b);
+            let axis_unit = match cross.normalize() {
+                Ok(u) => {
+                    if u.dot(&outgoing) >= 0.0 {
+                        u
+                    } else {
+                        Vector3::new(-u.x, -u.y, -u.z)
+                    }
+                }
+                Err(_) => {
+                    bail = true;
+                    break;
+                }
+            };
+
+            predictions.push(EdgePrediction {
+                edge_id: eid,
+                p_start,
+                axis_dir: axis_unit,
+                is_start,
+            });
+        }
+        if bail || predictions.len() != 3 {
+            continue;
+        }
+
+        // Step 2: least-squares concurrent-axes solve for the apex
+        // sphere centre C. Same projector-sum formulation used by
+        // `fillet::compute_concurrent_axes_center`; inlined here to
+        // keep `blend_graph` independent of upper-layer dispatch.
+        let mut a = [0.0_f64; 9]; // column-major 3x3
+        let mut b = Vector3::new(0.0, 0.0, 0.0);
+        for pred in &predictions {
+            let u = pred.axis_dir;
+            let q = pred.p_start;
+            let m00 = 1.0 - u.x * u.x;
+            let m11 = 1.0 - u.y * u.y;
+            let m22 = 1.0 - u.z * u.z;
+            let m01 = -u.x * u.y;
+            let m02 = -u.x * u.z;
+            let m12 = -u.y * u.z;
+            a[0] += m00;
+            a[4] += m11;
+            a[8] += m22;
+            a[3] += m01;
+            a[1] += m01;
+            a[6] += m02;
+            a[2] += m02;
+            a[7] += m12;
+            a[5] += m12;
+
+            // M·q = q − (u·q)·u.
+            let dot = u.x * q.x + u.y * q.y + u.z * q.z;
+            b.x += q.x - dot * u.x;
+            b.y += q.y - dot * u.y;
+            b.z += q.z - dot * u.z;
+        }
+        let mat = Matrix3::from_cols(a);
+        if mat.determinant().abs() < 1.0e-9 {
+            // Rank-deficient: leave Hoffmann setbacks in place.
+            continue;
+        }
+        let inv = match mat.inverse() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let c_vec = inv.transform_vector(&b);
+        let apex = Point3::new(c_vec.x, c_vec.y, c_vec.z);
+
+        // Step 3: per-edge apex setback. By construction
+        // `(apex − p_start)` is parallel to `axis_dir`, so the dot
+        // product is the signed arc-length along the spine from
+        // the V-end to the apex; the magnitude is the retraction
+        // we need.
+        for pred in &predictions {
+            let delta = Vector3::new(
+                apex.x - pred.p_start.x,
+                apex.y - pred.p_start.y,
+                apex.z - pred.p_start.z,
+            );
+            let signed = delta.dot(&pred.axis_dir);
+            let setback = signed.abs();
+            if let Some(be) = graph.edges.get_mut(&pred.edge_id) {
+                if pred.is_start {
+                    be.start_setback = Some(setback);
+                } else {
                     be.end_setback = Some(setback);
                 }
             }

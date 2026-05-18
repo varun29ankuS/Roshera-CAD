@@ -211,19 +211,6 @@ fn build_corner_blend() -> (BRepModel, SolidId, Vec<FaceId>) {
 }
 
 #[test]
-#[ignore = "F5-α.3 — corner-aware splice now succeeds, but the setback \
-            written by blend_graph::compute_setbacks uses the Hoffmann \
-            smooth-closure formula r·cos(θ_min/2), which for a 90° \
-            corner gives r/√2 ≈ 0.707·r retraction. For apex-sphere \
-            termination each cylinder spine must retract to the apex \
-            point itself (full r retraction in the rectilinear case), \
-            so the V-side cap arcs land on the sphere centre. \
-            apply_apex_sphere_corner identifies cap arcs by centre \
-            coincidence with the sphere centre, so it currently \
-            rejects with NonManifoldNeighbourhood. F5-α.3 makes \
-            compute_setbacks apex-aware for ConvexCorner { degree: 3 } \
-            (projection of (V − C) onto the outgoing spine direction). \
-            See plan peppy-petting-hare.md."]
 fn box_corner_three_edge_fillet_produces_watertight_solid() {
     let (model, solid_id, face_ids) = build_corner_blend();
 
@@ -249,9 +236,6 @@ fn box_corner_three_edge_fillet_produces_watertight_solid() {
 }
 
 #[test]
-#[ignore = "F5-α.3 — see watertightness test for the setback-formula \
-            blocker. Once compute_setbacks is apex-aware this test \
-            re-arms unmodified."]
 fn vertex_blend_sphere_face_carries_correct_centre_and_radius() {
     let (model, _solid_id, face_ids) = build_corner_blend();
     let sphere_face = find_sphere_face(&model, &face_ids);
@@ -298,9 +282,6 @@ fn vertex_blend_sphere_face_carries_correct_centre_and_radius() {
 }
 
 #[test]
-#[ignore = "F5-α.3 — see watertightness test for the setback-formula \
-            blocker. Once compute_setbacks is apex-aware this test \
-            re-arms unmodified."]
 fn vertex_blend_sphere_face_shares_three_cap_arcs_with_cylindrical_fillets() {
     let (model, solid_id, face_ids) = build_corner_blend();
     let sphere_face = find_sphere_face(&model, &face_ids);
