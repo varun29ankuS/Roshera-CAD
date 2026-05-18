@@ -8058,5 +8058,422 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // F5-β.5.5 — synthetic non-orthogonal three-cylinder corner fixture
+    //
+    // The mixed-radii NURBS triangular-patch emission path inside
+    // `apply_triangular_nurbs_corner` cannot fire end-to-end through
+    // `fillet_edges` today: rectilinear box corners overdetermine the
+    // pairwise cap-circle intersection (proof + worked example in the
+    // module-doc of `tests/fillet_three_edge_corner_mixed_radii.rs`),
+    // and `TopologyBuilder` does not yet construct tetrahedral / skew-
+    // prism solids whose three corner edges are non-orthogonal.
+    //
+    // This fixture hand-builds the *output* of the per-edge fillet
+    // pass (three cylindrical fillet faces with V-side cap arcs) on a
+    // synthetic three-cylinder corner whose axes are non-coplanar:
+    //
+    //     u_0 = +Y           q_0 = C_0 = (3, 0, 4)   r_0 = 5
+    //     u_1 = +X           q_1 = C_1 = (0, 1, 4)   r_1 = √17
+    //     u_2 = (1,1,1)/√3   q_2 = C_2 = (3, 1, 4)   r_2 = √26
+    //
+    // with corner_apex A = (0, 0, 8) — the unique intersection of the
+    // three cap planes y=0, x=0, x+y+z=8. The pairwise cap-circle
+    // intersections (V-side, picked against vertex_pos=(3,2,4) and
+    // vertex_outward=-Z) are exact rational points:
+    //
+    //     P_{01} = (0, 0, 0)    [cap0 ∩ cap1]
+    //     P_{12} = (0, 5, 3)    [cap1 ∩ cap2]
+    //     P_{20} = (7, 0, 1)    [cap2 ∩ cap0]
+    //
+    // All six radial-distance and axial-projection checks satisfy
+    // |Δ| = 0 exactly, so the fixture never lands on
+    // `trim_cap_arc_in_place`'s tolerance gate.
+    //
+    // The far-side cap arcs + seam Lines exist only so each fillet
+    // face's outer loop is closeable; they sit at C_i + 100·u_i so
+    // `find_cap_arc_edge_by_cylinder_axis` (which prefers the cap
+    // nearest `corner_apex`) reliably picks the V-side.
+    // -------------------------------------------------------------------
+
+    /// Returns `(model, solid_id, vertex_id, vertex_pos, [fillet_face;3],
+    /// [(q_i,u_i,r_i);3], corner_apex, vertex_outward)` ready to feed
+    /// into [`apply_triangular_nurbs_corner`].
+    #[allow(clippy::too_many_lines)]
+    fn build_synthetic_three_cylinder_corner() -> (
+        BRepModel,
+        SolidId,
+        VertexId,
+        Point3,
+        [FaceId; 3],
+        [(Point3, Vector3, f64); 3],
+        Point3,
+        Vector3,
+    ) {
+        use crate::primitives::face::FaceOrientation;
+        use crate::primitives::shell::{Shell, ShellType};
+        use crate::primitives::solid::Solid;
+        use crate::primitives::surface::Cylinder;
+
+        let mut model = BRepModel::new();
+
+        // Three cylinder axes (q_i = C_i picks t=0 on the axis line so
+        // the function's recomputed C_i = q + ((A-q)·u)·u lands on q
+        // exactly — verified by (A-C_i)·u_i = 0 for all three).
+        let u_0 = Vector3::new(0.0, 1.0, 0.0);
+        let u_1 = Vector3::new(1.0, 0.0, 0.0);
+        let inv_sqrt3 = 1.0 / 3.0_f64.sqrt();
+        let u_2 = Vector3::new(inv_sqrt3, inv_sqrt3, inv_sqrt3);
+        let c_0 = Point3::new(3.0, 0.0, 4.0);
+        let c_1 = Point3::new(0.0, 1.0, 4.0);
+        let c_2 = Point3::new(3.0, 1.0, 4.0);
+        let r_0 = 5.0;
+        let r_1 = 17.0_f64.sqrt();
+        let r_2 = 26.0_f64.sqrt();
+
+        let cylinder_axes: [(Point3, Vector3, f64); 3] =
+            [(c_0, u_0, r_0), (c_1, u_1, r_1), (c_2, u_2, r_2)];
+        let corner_apex = Point3::new(0.0, 0.0, 8.0);
+        let vertex_pos = Point3::new(3.0, 2.0, 4.0);
+        let vertex_outward = Vector3::new(0.0, 0.0, -1.0);
+        let corner_vertex = model
+            .vertices
+            .add(vertex_pos.x, vertex_pos.y, vertex_pos.z);
+
+        // Register the three cylindrical surfaces.
+        let mut fillet_face_ids = [0u32; 3];
+        let far_offset = 100.0;
+
+        for i in 0..3 {
+            let (q, u, r) = cylinder_axes[i];
+            let cyl = Cylinder::new(q, u, r).expect("synthetic cylinder");
+            let surface_id = model.surfaces.add(Box::new(cyl));
+
+            // V-side cap arc: full 90° sweep at center C_i (the cap is
+            // the circle in the plane through C_i perpendicular to u_i,
+            // radius r_i). Pre-trim sweep is irrelevant — the trim
+            // pass overwrites both start and sweep — but the arc must
+            // exist with the right (center, normal, radius).
+            let arc_v = Arc::new(q, u, r, 0.0, std::f64::consts::FRAC_PI_2)
+                .expect("synthetic V-side cap arc");
+            // Pre-trim arc endpoints (will be discarded by trim, but
+            // the seam Lines need to anchor at the right positions
+            // so the outer loop closes geometrically).
+            let p_v_start = arc_v.evaluate(0.0).expect("V-arc start").position;
+            let p_v_end = arc_v.evaluate(1.0).expect("V-arc end").position;
+            let curve_v = model.curves.add(Box::new(arc_v));
+
+            // Far-side cap arc: at q + far_offset·u, same normal +
+            // radius. Sits beyond the V-side cap so the
+            // nearest-to-corner_apex tie-breaker in
+            // `find_cap_arc_edge_by_cylinder_axis` always picks the
+            // V-side cap.
+            let far_center = Point3::new(
+                q.x + far_offset * u.x,
+                q.y + far_offset * u.y,
+                q.z + far_offset * u.z,
+            );
+            let arc_far = Arc::new(far_center, u, r, 0.0, std::f64::consts::FRAC_PI_2)
+                .expect("synthetic far-side cap arc");
+            let p_f_start = arc_far.evaluate(0.0).expect("far-arc start").position;
+            let p_f_end = arc_far.evaluate(1.0).expect("far-arc end").position;
+            let curve_far = model.curves.add(Box::new(arc_far));
+
+            // V-side vertices.
+            let v_start = model.vertices.add(p_v_start.x, p_v_start.y, p_v_start.z);
+            let v_end = model.vertices.add(p_v_end.x, p_v_end.y, p_v_end.z);
+            // Far-side vertices.
+            let f_start = model.vertices.add(p_f_start.x, p_f_start.y, p_f_start.z);
+            let f_end = model.vertices.add(p_f_end.x, p_f_end.y, p_f_end.z);
+
+            // V-side cap arc edge.
+            let v_edge = model.edges.add(Edge::new_auto_range(
+                0,
+                v_start,
+                v_end,
+                curve_v,
+                EdgeOrientation::Forward,
+            ));
+            // Far-side cap arc edge.
+            let f_edge = model.edges.add(Edge::new_auto_range(
+                0,
+                f_start,
+                f_end,
+                curve_far,
+                EdgeOrientation::Forward,
+            ));
+
+            // Two straight seam Lines connecting V-side to far-side.
+            // seam_a: v_end → f_end (one cylinder generator).
+            let seam_a_line = Line::new(p_v_end, p_f_end);
+            let seam_a_curve = model.curves.add(Box::new(seam_a_line));
+            let seam_a = model.edges.add(Edge::new_auto_range(
+                0,
+                v_end,
+                f_end,
+                seam_a_curve,
+                EdgeOrientation::Forward,
+            ));
+            // seam_b: f_start → v_start (closes the loop).
+            let seam_b_line = Line::new(p_f_start, p_v_start);
+            let seam_b_curve = model.curves.add(Box::new(seam_b_line));
+            let seam_b = model.edges.add(Edge::new_auto_range(
+                0,
+                f_start,
+                v_start,
+                seam_b_curve,
+                EdgeOrientation::Forward,
+            ));
+
+            // Outer loop: V-cap (fwd) → seam_a (fwd) → far-cap (rev)
+            // → seam_b (fwd). The far-cap is traversed backwards
+            // because v_end→f_end→f_start→v_start is the cycle.
+            let mut outer = Loop::new(0, LoopType::Outer);
+            outer.add_edge(v_edge, true);
+            outer.add_edge(seam_a, true);
+            outer.add_edge(f_edge, false);
+            outer.add_edge(seam_b, true);
+            let loop_id = model.loops.add(outer);
+
+            let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+            fillet_face_ids[i] = model.faces.add(face);
+        }
+
+        // Outer shell + solid wrapping the three fillet faces. The
+        // shell is `Open` because the fixture is not a closed
+        // manifold; `apply_triangular_nurbs_corner` does not require
+        // closure, only that `solid.outer_shell` exists.
+        let mut shell = Shell::new(0, ShellType::Open);
+        for &face_id in &fillet_face_ids {
+            shell.add_face(face_id);
+        }
+        let shell_id = model.shells.add(shell);
+        let solid = Solid::new(0, shell_id);
+        let solid_id = model.solids.add(solid);
+
+        (
+            model,
+            solid_id,
+            corner_vertex,
+            vertex_pos,
+            fillet_face_ids,
+            cylinder_axes,
+            corner_apex,
+            vertex_outward,
+        )
+    }
+
+    /// Precondition: the three cap circles pairwise intersect at the
+    /// derived exact-rational points `(0,0,0)`, `(0,5,3)`, `(7,0,1)`.
+    /// If this fails the fixture geometry is wrong; everything
+    /// downstream depending on it is moot.
+    #[test]
+    fn synthetic_three_cylinder_corner_fixture_satisfies_pairwise_caps() {
+        let (_, _, _, vertex_pos, _, cylinder_axes, corner_apex, vertex_outward) =
+            build_synthetic_three_cylinder_corner();
+
+        // Compute cap centres exactly as apply_triangular_nurbs_corner
+        // does at Step 2.
+        let mut cap_centres = [Point3::new(0.0, 0.0, 0.0); 3];
+        for i in 0..3 {
+            let (q, u, _) = cylinder_axes[i];
+            let v = corner_apex - q;
+            let t = v.x * u.x + v.y * u.y + v.z * u.z;
+            cap_centres[i] = Point3::new(q.x + t * u.x, q.y + t * u.y, q.z + t * u.z);
+        }
+        let (_, u_0, r_0) = cylinder_axes[0];
+        let (_, u_1, r_1) = cylinder_axes[1];
+        let (_, u_2, r_2) = cylinder_axes[2];
+
+        let p_01 = intersect_two_caps(
+            cap_centres[0],
+            u_0,
+            r_0,
+            cap_centres[1],
+            u_1,
+            r_1,
+            vertex_pos,
+            vertex_outward,
+        )
+        .expect("cap 0 ∩ cap 1 must intersect");
+        let p_12 = intersect_two_caps(
+            cap_centres[1],
+            u_1,
+            r_1,
+            cap_centres[2],
+            u_2,
+            r_2,
+            vertex_pos,
+            vertex_outward,
+        )
+        .expect("cap 1 ∩ cap 2 must intersect");
+        let p_20 = intersect_two_caps(
+            cap_centres[2],
+            u_2,
+            r_2,
+            cap_centres[0],
+            u_0,
+            r_0,
+            vertex_pos,
+            vertex_outward,
+        )
+        .expect("cap 2 ∩ cap 0 must intersect");
+
+        let approx_eq = |a: Point3, b: Point3| -> bool {
+            (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9 && (a.z - b.z).abs() < 1e-9
+        };
+        assert!(
+            approx_eq(p_01, Point3::new(0.0, 0.0, 0.0)),
+            "p_01 = {:?}, expected (0,0,0)",
+            p_01
+        );
+        assert!(
+            approx_eq(p_12, Point3::new(0.0, 5.0, 3.0)),
+            "p_12 = {:?}, expected (0,5,3)",
+            p_12
+        );
+        assert!(
+            approx_eq(p_20, Point3::new(7.0, 0.0, 1.0)),
+            "p_20 = {:?}, expected (7,0,1)",
+            p_20
+        );
+
+        // The three intersection points must form a non-degenerate
+        // triangle (no two coincide).
+        assert!(!approx_eq(p_01, p_12));
+        assert!(!approx_eq(p_12, p_20));
+        assert!(!approx_eq(p_20, p_01));
+    }
+
+    /// Precondition: each of the three fillet faces has exactly one
+    /// V-side cap arc resolvable by
+    /// `find_cap_arc_edge_by_cylinder_axis`. If the lookup ever
+    /// returns the far-side arc instead, the trim pass writes to the
+    /// wrong edge and the test below silently corrupts the topology.
+    #[test]
+    fn synthetic_three_cylinder_corner_fixture_cap_arcs_resolvable() {
+        let (model, _, _, _, fillet_face_ids, cylinder_axes, corner_apex, _) =
+            build_synthetic_three_cylinder_corner();
+
+        for i in 0..3 {
+            let (q, u, _r) = cylinder_axes[i];
+            let edge_id =
+                find_cap_arc_edge_by_cylinder_axis(&model, fillet_face_ids[i], q, u, corner_apex)
+                    .unwrap_or_else(|| {
+                        panic!("cap arc lookup failed on synthetic face {}", i)
+                    });
+            // The picked arc's centre must be the V-side cap centre
+            // (= q, since we placed q at C_i), not the far-side one
+            // (q + 100·u).
+            let edge = model.edges.get(edge_id).expect("edge");
+            let curve = model.curves.get(edge.curve_id).expect("curve");
+            let arc = curve
+                .as_any()
+                .downcast_ref::<Arc>()
+                .expect("cap arc must be an Arc curve");
+            let dx = arc.center.x - q.x;
+            let dy = arc.center.y - q.y;
+            let dz = arc.center.z - q.z;
+            assert!(
+                dx * dx + dy * dy + dz * dz < 1e-18,
+                "cap arc lookup picked the far-side arc on face {} \
+                 (centre = {:?}, expected V-side at {:?})",
+                i,
+                arc.center,
+                q
+            );
+        }
+    }
+
+    /// F5-β.5.5 — the headline test. Feeds the synthetic non-
+    /// orthogonal three-cylinder corner directly into
+    /// `apply_triangular_nurbs_corner` and pins the four invariants
+    /// of a successful NURBS-emission path:
+    ///
+    /// 1. Exactly one new face is added to the model.
+    /// 2. The new face is backed by a `GeneralNurbsSurface`.
+    /// 3. The new face's outer loop has exactly three edges (the
+    ///    three trimmed cap arcs).
+    /// 4. The new face is registered on the solid's outer shell.
+    ///
+    /// Together (1-4) prove the kernel can close a mixed-radii
+    /// triangular corner hole with a rational bi-quadratic NURBS
+    /// patch. End-to-end coverage through `fillet_edges` is deferred
+    /// to whenever `TopologyBuilder` grows a non-rectilinear solid
+    /// constructor (tetrahedron / skew wedge) — see the
+    /// `#[ignore]` reason on
+    /// `mixed_radii_synthetic_corner_emits_general_nurbs_face` in
+    /// `tests/fillet_three_edge_corner_mixed_radii.rs`.
+    #[test]
+    fn apply_triangular_nurbs_corner_emits_general_nurbs_face_on_synthetic_corner() {
+        use crate::primitives::surface::GeneralNurbsSurface;
+
+        let (
+            mut model,
+            solid_id,
+            vertex_id,
+            vertex_pos,
+            fillet_face_ids,
+            cylinder_axes,
+            corner_apex,
+            vertex_outward,
+        ) = build_synthetic_three_cylinder_corner();
+
+        let pre_face_count = model.faces.len();
+
+        let new_face_id = apply_triangular_nurbs_corner(
+            &mut model,
+            solid_id,
+            vertex_id,
+            vertex_pos,
+            &fillet_face_ids,
+            &cylinder_axes,
+            corner_apex,
+            vertex_outward,
+        )
+        .expect("synthetic three-cylinder corner must emit a NURBS face");
+
+        // (1) ΔF = +1.
+        assert_eq!(
+            model.faces.len(),
+            pre_face_count + 1,
+            "expected exactly one new face after NURBS-corner emission"
+        );
+
+        // (2) New face's surface is GeneralNurbsSurface.
+        let new_face = model.faces.get(new_face_id).expect("new face exists");
+        let surf = model
+            .surfaces
+            .get(new_face.surface_id)
+            .expect("new face surface exists");
+        assert!(
+            surf.as_any().downcast_ref::<GeneralNurbsSurface>().is_some(),
+            "corner face must be backed by GeneralNurbsSurface"
+        );
+
+        // (3) Outer loop has exactly three edges (one per trimmed
+        // cap arc).
+        let outer_loop = model
+            .loops
+            .get(new_face.outer_loop)
+            .expect("new face outer loop exists");
+        assert_eq!(
+            outer_loop.edges.len(),
+            3,
+            "corner-patch outer loop must hold three cap-arc edges"
+        );
+
+        // (4) The new face is registered on the solid's outer shell.
+        let solid = model.solids.get(solid_id).expect("solid exists");
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .expect("outer shell exists");
+        assert!(
+            shell.faces.contains(&new_face_id),
+            "new corner face must be registered on solid's outer shell"
+        );
+    }
 }
 

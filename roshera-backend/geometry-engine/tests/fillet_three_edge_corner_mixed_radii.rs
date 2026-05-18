@@ -66,6 +66,15 @@
 //!   * Property tests sweep `r ∈ [0.5, 2.0]³` and confirm the
 //!     dispatcher's pre/post-invariants hold across the whole
 //!     domain.
+//!
+//! **NURBS-emission success path**: pinned by
+//! `apply_triangular_nurbs_corner_emits_general_nurbs_face_on_synthetic_corner`
+//! in `fillet.rs::tests` (kernel-internal unit test on a hand-tuned
+//! three-cylinder synthetic with non-coplanar axis directions
+//! `u_0 = +Y`, `u_1 = +X`, `u_2 = (1,1,1)/√3`). The end-to-end path
+//! through `fillet_edges` on a non-orthogonal solid remains gated
+//! on a non-rectilinear-solid fixture in `TopologyBuilder` and is
+//! tracked separately.
 
 use std::collections::{HashMap, HashSet};
 
@@ -611,20 +620,21 @@ fn mixed_radii_box_corner_rejects_with_typed_non_manifold() {
 }
 
 #[test]
-#[ignore = "Needs FilletOptions::PerEdgeRadii (F5-β.5) AND a synthetic \
-            three-cylinder fixture whose cap circles pairwise intersect \
-            (the box-corner geometry is geometrically incompatible — see \
-            module doc). Until F5-β.6 ships the synthetic fixture, the \
-            NURBS-patch-emission path is exercised only by direct unit \
-            tests on `apply_triangular_nurbs_corner` in `fillet.rs`."]
+#[ignore = "End-to-end gate: needs a TopologyBuilder solid whose three \
+            edges at one vertex are non-orthogonal (e.g., tetrahedron or \
+            skew wedge), so the per-edge fillet pass produces cylinder \
+            axes that pairwise admit cap-circle intersection. The NURBS \
+            emission code path itself is covered by the kernel unit test \
+            `apply_triangular_nurbs_corner_emits_general_nurbs_face_on_synthetic_corner` \
+            in `fillet.rs` (F5-β.5.5)."]
 fn mixed_radii_synthetic_corner_emits_general_nurbs_face() {
-    // Expected once F5-β.6 ships the synthetic three-cylinder
-    // fixture:
+    // Expected once `TopologyBuilder` grows a non-rectilinear solid
+    // constructor whose per-edge fillet pass converges to cylinder
+    // axes that pairwise admit cap-circle intersection:
     //
     //   let (model, solid_id, face_ids) =
-    //       build_synthetic_three_cylinder_corner([5.0, sqrt(17), 5.0])
-    //           .expect("hand-tuned radii satisfy pairwise cap-cap \
-    //                    intersection");
+    //       build_non_orthogonal_corner_solid_and_fillet(...)
+    //           .expect("non-orthogonal corner fillet converges");
     //   assert!(find_nurbs_face(&model, &face_ids).is_some());
     //   let (v, e, f) = shell_census(&model, solid_id);
     //   assert_eq!(v as i64 - e as i64 + f as i64, 2);
