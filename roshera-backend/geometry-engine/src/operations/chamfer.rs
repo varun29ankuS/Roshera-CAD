@@ -1252,6 +1252,12 @@ fn create_chamfer_face(
         v_t1_end,
         v_t2_start,
         v_t2_end,
+        // F5-α.2 — chamfer does not yet support 3-edge convex apex
+        // emission; that work is filed under chamfer-ε. Default both
+        // flags to `false` so every splice continues to run the
+        // legacy V0/V1-side topology fix-up.
+        original_v0_corner_shared: false,
+        original_v1_corner_shared: false,
     };
 
     Ok((face_id, surgery))

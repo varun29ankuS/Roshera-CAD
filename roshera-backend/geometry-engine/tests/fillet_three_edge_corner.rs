@@ -28,33 +28,39 @@
 //!     those edges is used by exactly two faces (sphere face + one
 //!     cylindrical fillet), confirming the corner is closed.
 //!
-//! ## F5-α.1 / F5-α.2 split
+//! ## F5-α slice map
 //!
-//! These tests currently fail with
-//! `InvalidGeometry("BlendEdgeSurgery original_v0 missing from model")`
-//! because the existing per-edge splice in
-//! `operations::edge_blend_topology::splice_blend_edge` was
-//! explicitly designed for the case where each vertex has at most
-//! **one** incident blend edge (see the module-level
-//! "Manifold assumption" doc, items 1–3). For three corner-sharing
-//! fillets all referencing the same `original_v0`, the first
-//! splice removes that vertex and the second splice's
-//! `validate_surgery` fails before any topology mutation runs.
+//! * **F5-α.1** (commit `feat(fillet): F5-α — infrastructure …`)
+//!   landed everything *up to* the splice: lifecycle gate
+//!   relaxation, BlendGraph wiring, the
+//!   `create_fillet_transitions` dispatcher, the
+//!   `apply_apex_sphere_corner` helper (with the surgery body), and
+//!   the `MixedRadii` diagnostic.
 //!
-//! F5-α.1 (the slice that landed in `feat(fillet): F5-α —
-//! infrastructure …`) pinned everything *up to* the splice:
-//! lifecycle gate relaxation, BlendGraph wiring, the
-//! `create_fillet_transitions` dispatcher, the `apply_apex_sphere_corner`
-//! helper (loaded with the surgery body), and the `MixedRadii`
-//! diagnostic. F5-α.2 is the corner-aware splice — it threads a
-//! per-endpoint `corner_shared` flag into `BlendEdgeSurgery`, skips
-//! the V-side `find_third_face_at_vertex` / cap insertion / vertex
-//! removal / pred-succ rewire when that endpoint is the shared
-//! corner, and adds the apex-vertex merge (deduping P_a^1 vs P_a^3
-//! etc.) inside `apply_apex_sphere_corner` so the three cap arcs
-//! land on three shared vertices instead of six.
+//! * **F5-α.2** (this slice — corner-aware splice) threads a
+//!   per-endpoint `corner_shared` flag into `BlendEdgeSurgery` and
+//!   makes `splice_blend_edge` skip the V-side
+//!   `find_third_face_at_vertex` / cap insertion / vertex removal /
+//!   pred-succ rewire when that endpoint is the shared corner.
+//!   With F5-α.2, three corner-sharing per-edge fillets all
+//!   referencing the same `original_v0` no longer abort
+//!   `validate_surgery` on the second splice.
 //!
-//! Each `#[ignore]` below points at F5-α.2 so that
+//! * **F5-α.3** (next slice — apex-aware setbacks) refines
+//!   `blend_graph::compute_setbacks` so that, for
+//!   `BlendVertexKind::ConvexCorner { degree: 3 }` (and the
+//!   concurrent-axes case generally), the per-edge setback retracts
+//!   the spine to the apex sphere centre instead of the Hoffmann
+//!   smooth-closure point `r·cos(θ_min/2)`. Without this, each
+//!   cylinder fillet's V-side cap arc lands at `r·(1 − cos(θ/2))`
+//!   short of the apex (e.g. `0.293·r` for a 90° corner), and
+//!   `apply_apex_sphere_corner` rejects with
+//!   `VertexBlendUnsupportedReason::NonManifoldNeighbourhood`
+//!   because `find_cap_arc_edge_at_vertex` looks for centre
+//!   coincidence with the apex sphere centre. F5-α.2 is necessary
+//!   but not sufficient.
+//!
+//! Each `#[ignore]` below points at F5-α.3 so that
 //! `cargo test --test fillet_three_edge_corner` is silent in the
 //! interim and `cargo test -- --ignored fillet_three_edge_corner`
 //! re-arms the contract for the next slice.
@@ -205,10 +211,19 @@ fn build_corner_blend() -> (BRepModel, SolidId, Vec<FaceId>) {
 }
 
 #[test]
-#[ignore = "F5-α.2 (task #85): per-edge splice rejects three corner-sharing \
-            fillets because original_v0 is removed by the first splice before \
-            the second can validate. Unblocks with corner-shared flags on \
-            BlendEdgeSurgery + apex vertex merge in apply_apex_sphere_corner."]
+#[ignore = "F5-α.3 — corner-aware splice now succeeds, but the setback \
+            written by blend_graph::compute_setbacks uses the Hoffmann \
+            smooth-closure formula r·cos(θ_min/2), which for a 90° \
+            corner gives r/√2 ≈ 0.707·r retraction. For apex-sphere \
+            termination each cylinder spine must retract to the apex \
+            point itself (full r retraction in the rectilinear case), \
+            so the V-side cap arcs land on the sphere centre. \
+            apply_apex_sphere_corner identifies cap arcs by centre \
+            coincidence with the sphere centre, so it currently \
+            rejects with NonManifoldNeighbourhood. F5-α.3 makes \
+            compute_setbacks apex-aware for ConvexCorner { degree: 3 } \
+            (projection of (V − C) onto the outgoing spine direction). \
+            See plan peppy-petting-hare.md."]
 fn box_corner_three_edge_fillet_produces_watertight_solid() {
     let (model, solid_id, face_ids) = build_corner_blend();
 
@@ -234,7 +249,9 @@ fn box_corner_three_edge_fillet_produces_watertight_solid() {
 }
 
 #[test]
-#[ignore = "F5-α.2 (task #85): see watertightness test docstring."]
+#[ignore = "F5-α.3 — see watertightness test for the setback-formula \
+            blocker. Once compute_setbacks is apex-aware this test \
+            re-arms unmodified."]
 fn vertex_blend_sphere_face_carries_correct_centre_and_radius() {
     let (model, _solid_id, face_ids) = build_corner_blend();
     let sphere_face = find_sphere_face(&model, &face_ids);
@@ -281,7 +298,9 @@ fn vertex_blend_sphere_face_carries_correct_centre_and_radius() {
 }
 
 #[test]
-#[ignore = "F5-α.2 (task #85): see watertightness test docstring."]
+#[ignore = "F5-α.3 — see watertightness test for the setback-formula \
+            blocker. Once compute_setbacks is apex-aware this test \
+            re-arms unmodified."]
 fn vertex_blend_sphere_face_shares_three_cap_arcs_with_cylindrical_fillets() {
     let (model, solid_id, face_ids) = build_corner_blend();
     let sphere_face = find_sphere_face(&model, &face_ids);

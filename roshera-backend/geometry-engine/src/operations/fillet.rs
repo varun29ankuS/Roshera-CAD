@@ -520,6 +520,22 @@ fn piecewise_linear_radius(samples: &[(f64, f64)], u: f64) -> f64 {
     samples[last].1
 }
 
+/// F5-α.2 — true when `vertex` is classified by `blend_graph` as a
+/// 3-edge convex apex (three convex blend edges in this pass share
+/// this vertex). When true, `BlendEdgeSurgery` flags this side of the
+/// edge as corner-shared so [`splice_blend_edge`] skips the V-side
+/// rewires + cap insertion + vertex removal, leaving that work to
+/// [`apply_apex_sphere_corner`] after every per-edge splice has run.
+///
+/// Returns `false` for any other classification (degree ≠ 3, concave,
+/// mixed, smooth, cliff, or absent from the graph).
+fn is_three_edge_convex_corner(blend_graph: &BlendGraph, vertex: VertexId) -> bool {
+    matches!(
+        blend_graph.vertex(vertex).map(|v| v.kind),
+        Some(BlendVertexKind::ConvexCorner { degree: 3 })
+    )
+}
+
 fn create_fillet_chain(
     model: &mut BRepModel,
     solid_id: SolidId,
@@ -582,7 +598,18 @@ fn create_fillet_chain(
         };
 
         edge_faces.push((edge_id, fillet_face));
-        if let Some(s) = surgery {
+        if let Some(mut s) = surgery {
+            // F5-α.2 — stamp corner-shared flags on the freshly built
+            // surgery so `splice_blend_edge` skips the V0/V1-side
+            // pred/succ rewires, third-face cap insertion, and vertex
+            // removal at any endpoint that the BlendGraph classifies as
+            // a 3-edge convex apex shared with two sibling fillets in
+            // this same pass. `apply_apex_sphere_corner` takes over the
+            // cap insertion (via the sphere face's loop) and the
+            // corner-vertex removal once the per-edge splices have all
+            // run.
+            s.original_v0_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v0);
+            s.original_v1_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v1);
             surgeries.push(s);
         }
     }
@@ -2116,6 +2143,36 @@ fn apply_apex_sphere_corner(
     })?;
     shell.add_face(face_id);
 
+    // F5-α.2 — drop the original sharp corner vertex.
+    //
+    // Each per-edge splice for the three corner edges kept `vertex_id`
+    // alive because its `original_v*_corner_shared` flag was set (see
+    // [`splice_blend_edge`]). After every cylindrical fillet's trim
+    // arc has been spliced in and the apex sphere face has been added
+    // to the outer shell, no edge in the model references `vertex_id`:
+    //
+    // * The three corner edges themselves are removed during their
+    //   own [`splice_blend_edge`] calls.
+    // * Each adjacent face's loop now references the apex-side
+    //   P-vertex (P_a / P_b / P_c) where the two corresponding trim
+    //   arcs meet, courtesy of `VertexStore::add_or_find`'s
+    //   tolerance dedup at trim-arc construction time. The sharp
+    //   corner is geometrically replaced by these three tangent
+    //   points.
+    //
+    // We defensively scan the live edge store and only drop the
+    // vertex if no edge still references it. If something upstream
+    // diverged from the invariant — e.g. a fourth, non-corner blend
+    // edge happened to share the vertex — leaving the vertex in the
+    // store is safe; dropping it would invalidate that fourth edge.
+    let still_referenced = model
+        .edges
+        .iter()
+        .any(|(_, e)| e.start_vertex == vertex_id || e.end_vertex == vertex_id);
+    if !still_referenced {
+        model.vertices.remove(vertex_id);
+    }
+
     Ok(face_id)
 }
 
@@ -3299,6 +3356,14 @@ fn create_trimmed_fillet_face(
             v_t1_end,
             v_t2_start,
             v_t2_end,
+            // F5-α.2 — defaults; the caller (`create_fillet_chain`) sets
+            // these to `true` after construction when the BlendGraph
+            // classifies the corresponding endpoint as a
+            // `ConvexCorner { degree: 3 }` apex shared with two other
+            // blend edges in this pass. `create_trimmed_fillet_face` does
+            // not consult the BlendGraph directly.
+            original_v0_corner_shared: false,
+            original_v1_corner_shared: false,
         };
         (lid, Some(surgery))
     };
