@@ -294,6 +294,18 @@ pub fn fillet_edges(
             .collect();
         let mut blend_graph = blend_graph::build(model, &blend_selection)?;
         blend_graph::compute_setbacks(model, &mut blend_graph)?;
+        // F5-α.3: refine setbacks at `ConvexCorner { degree: 3 }`
+        // apex corners. The Hoffmann smooth-closure value from
+        // `compute_setbacks` is correct for a two-edge corner whose
+        // adjacent cylinders meet tangentially; for apex-sphere
+        // termination each cylinder spine must retract all the way
+        // to the rolling-ball centre `C` so the V-side cap arc lands
+        // on the apex. For a rectilinear box corner this overrides
+        // `r·cos(π/4) ≈ 0.707·r` with `r`; corners outside the
+        // F5-α scope (non-planar adjacencies, mixed radii, rank-
+        // deficient axes) are silently left at the Hoffmann
+        // baseline.
+        blend_graph::compute_apex_setbacks(model, &mut blend_graph)?;
 
         // F5-α: snapshot the original sharp-vertex position for every
         // BlendGraph corner *before* per-edge fillets retract their
