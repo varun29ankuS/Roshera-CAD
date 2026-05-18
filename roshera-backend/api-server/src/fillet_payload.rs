@@ -62,7 +62,9 @@
 
 use crate::error_catalog::{ApiError, ErrorCode};
 use geometry_engine::operations::fillet::FilletType;
+use geometry_engine::primitives::edge::EdgeId;
 use serde_json::Value;
+use std::collections::HashMap;
 use timeline_engine::operations::blend_radius_dto_to_fillet_type;
 use timeline_engine::BlendRadiusDto;
 
@@ -97,6 +99,15 @@ pub struct FilletRadii {
     /// preserves edge-chain grouping for the kernel's blend-
     /// continuity machinery.
     pub uniform_constant: bool,
+    /// `true` when every profile is a `Constant(r)`, regardless of
+    /// equality. F5-β.5.3 uses this in combination with
+    /// `!uniform_constant` to route distinct per-edge constants
+    /// through a single atomic [`FilletType::PerEdgeConstant`] kernel
+    /// call rather than the per-edge fallback loop — required so the
+    /// BlendGraph sees the shared corner as a single 3-edge vertex
+    /// and the mixed-radii corner dispatcher (F5-β.3) becomes
+    /// reachable from the wire surface.
+    pub all_constant: bool,
 }
 
 impl FilletRadii {
@@ -106,6 +117,41 @@ impl FilletRadii {
     /// crosses an `.await`.
     pub fn to_fillet_type(&self, i: usize) -> FilletType {
         blend_radius_dto_to_fillet_type(&self.profiles[i])
+    }
+
+    /// Build a [`HashMap<EdgeId, f64>`] mapping each edge in `edges`
+    /// to its `Constant(r)` profile value, returning `Some` iff every
+    /// profile is a `Constant`. Returns `None` when any profile is
+    /// `Linear` / `Variable` (caller falls back to the per-edge loop)
+    /// or when `edges.len() != self.profiles.len()` (caller bug — the
+    /// parser already enforces equal length, so the mismatch path is
+    /// defensive).
+    ///
+    /// The map is the input shape for
+    /// [`FilletType::PerEdgeConstant`], which routes a single atomic
+    /// `fillet_edges` call carrying distinct per-edge constants. This
+    /// is what unblocks the mixed-radii corner dispatcher from the
+    /// public wire surface.
+    pub fn to_per_edge_constant_map(&self, edges: &[EdgeId]) -> Option<HashMap<EdgeId, f64>> {
+        if !self.all_constant || edges.len() != self.profiles.len() {
+            return None;
+        }
+        let mut map = HashMap::with_capacity(edges.len());
+        for (&eid, profile) in edges.iter().zip(self.profiles.iter()) {
+            match profile {
+                BlendRadiusDto::Constant(r) => {
+                    map.insert(eid, *r);
+                }
+                // Defensive — `all_constant` invariant guarantees every
+                // profile matches `Constant(_)`, so this arm is
+                // unreachable when the parser produced `self`. Treat a
+                // mismatch as a contract violation by the caller and
+                // surface the lossy outcome (no map) rather than
+                // inserting garbage.
+                _ => return None,
+            }
+        }
+        Some(map)
     }
 }
 
@@ -132,10 +178,15 @@ pub fn parse_fillet_radii(
             let dto = parse_dto(r, "radius")?;
             let canonical = canonicalise(&dto);
             let uniform_constant = matches!(dto, BlendRadiusDto::Constant(_));
+            // Uniform `radius: Constant(r)` populates every slot with
+            // the same `Constant` — so `all_constant` is just
+            // `uniform_constant` for the single-radius shape.
+            let all_constant = uniform_constant;
             Ok(FilletRadii {
                 profiles: vec![dto; edge_count],
                 canonical_per_edge: vec![canonical; edge_count],
                 uniform_constant,
+                all_constant,
             })
         }
         (None, Some(rs)) => {
@@ -169,10 +220,18 @@ pub fn parse_fillet_radii(
                 }),
                 _ => false,
             };
+            // `all_constant` ⊇ `uniform_constant`: every profile is a
+            // `Constant`, but the values may differ. F5-β.5.3 routes
+            // this case through the new `PerEdgeConstant` kernel
+            // variant.
+            let all_constant = profiles
+                .iter()
+                .all(|p| matches!(p, BlendRadiusDto::Constant(_)));
             Ok(FilletRadii {
                 profiles,
                 canonical_per_edge,
                 uniform_constant,
+                all_constant,
             })
         }
     }
@@ -637,5 +696,121 @@ mod tests {
         let p = json!({ "radius": { "kind": "linear", "end": 2.0 } });
         let err = parse_fillet_radii(&p, 1).expect_err("missing start");
         assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    // --- F5-β.5.3: all_constant flag + per-edge-constant map -------
+
+    #[test]
+    fn all_constant_flag_fires_for_uniform_radii() {
+        let p = json!({ "radii": [2.0, 2.0, 2.0] });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        assert!(r.uniform_constant);
+        assert!(
+            r.all_constant,
+            "uniform Constants are necessarily all-Constant"
+        );
+    }
+
+    #[test]
+    fn all_constant_flag_fires_for_distinct_constants() {
+        // The headline F5-β.5.3 case — distinct constants per edge.
+        // `uniform_constant` is false but `all_constant` is true, so
+        // the endpoint routes through the new PerEdgeConstant arm.
+        let p = json!({ "radii": [1.0, 1.5, 2.0] });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        assert!(!r.uniform_constant, "distinct values must not be uniform");
+        assert!(
+            r.all_constant,
+            "every profile is a Constant — must engage the PerEdgeConstant fast path"
+        );
+    }
+
+    #[test]
+    fn all_constant_flag_clears_for_any_variable_profile() {
+        // Mixed kinds — one Linear in the array clears `all_constant`
+        // so the endpoint falls through to the per-edge loop (which
+        // is the only path that can mix Constant/Linear/Variable).
+        let p = json!({
+            "radii": [
+                1.0,
+                { "kind": "linear", "start": 1.0, "end": 3.0 },
+                2.0
+            ]
+        });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        assert!(!r.uniform_constant);
+        assert!(
+            !r.all_constant,
+            "any non-Constant profile must clear all_constant"
+        );
+    }
+
+    #[test]
+    fn to_per_edge_constant_map_builds_full_map_for_distinct_radii() {
+        let p = json!({ "radii": [1.0, 1.5, 2.0] });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        // EdgeIds are arbitrary u32 values — the parser does not know
+        // them, so the endpoint passes them in.
+        let edges: Vec<EdgeId> = vec![7, 9, 12];
+        let map = r
+            .to_per_edge_constant_map(&edges)
+            .expect("all_constant → Some(map)");
+        assert_eq!(map.len(), 3);
+        assert!((map.get(&7).copied().unwrap_or(0.0) - 1.0).abs() < 1e-12);
+        assert!((map.get(&9).copied().unwrap_or(0.0) - 1.5).abs() < 1e-12);
+        assert!((map.get(&12).copied().unwrap_or(0.0) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn to_per_edge_constant_map_returns_none_for_mixed_kinds() {
+        let p = json!({
+            "radii": [
+                1.0,
+                { "kind": "linear", "start": 1.0, "end": 3.0 }
+            ]
+        });
+        let r = parse_fillet_radii(&p, 2).expect("parse");
+        let edges: Vec<EdgeId> = vec![3, 4];
+        assert!(
+            r.to_per_edge_constant_map(&edges).is_none(),
+            "mixed-kind profiles must yield None — caller falls through to per-edge loop"
+        );
+    }
+
+    #[test]
+    fn to_per_edge_constant_map_returns_none_for_length_mismatch() {
+        // Defensive: caller passes the wrong number of edges. The
+        // parser guarantees `profiles.len() == edge_count` at parse
+        // time, so this path triggers only on caller bugs — the
+        // map must still come back as `None` rather than silently
+        // truncating.
+        let p = json!({ "radii": [1.0, 2.0] });
+        let r = parse_fillet_radii(&p, 2).expect("parse");
+        let edges: Vec<EdgeId> = vec![3]; // length 1, profiles length 2
+        assert!(
+            r.to_per_edge_constant_map(&edges).is_none(),
+            "length mismatch must surface as None"
+        );
+    }
+
+    #[test]
+    fn uniform_radius_field_populates_all_constant() {
+        // The single-`radius`-field path must populate both flags
+        // consistently with the `radii` array path.
+        let p = json!({ "radius": 2.5 });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        assert!(r.uniform_constant);
+        assert!(r.all_constant);
+    }
+
+    #[test]
+    fn linear_radius_field_clears_all_constant() {
+        let p = json!({ "radius": { "kind": "linear", "start": 1.0, "end": 3.0 } });
+        let r = parse_fillet_radii(&p, 2).expect("parse");
+        assert!(!r.uniform_constant);
+        assert!(
+            !r.all_constant,
+            "Linear radius must clear all_constant in the single-radius shape"
+        );
     }
 }

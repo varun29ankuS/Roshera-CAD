@@ -1620,19 +1620,29 @@ async fn fillet_edges_endpoint(
     // tessellation runs under a read lock. Same pattern as boolean /
     // shell / mirror.
     //
-    // Two dispatch paths:
+    // Three dispatch paths:
     //   - All-equal `Constant(r)` across every edge → one atomic
     //     `fillet_edges` call across the whole edge set. Preserves the
     //     kernel's edge-chain grouping (matters for blend continuity
     //     when adjacent edges share a corner) and is byte-identical to
     //     the pre-F3-ε.2 single-radius path.
-    //   - Anything else (mixed constants, any Variable, any
-    //     VariableStations) → one `fillet_edges` call per edge with
-    //     `PropagationMode::None`. Propagation is suppressed so edge
-    //     K's chain cannot swallow edge K+1 and break the per-edge
-    //     profile invariant. A mid-loop kernel failure leaves the
-    //     solid partially filleted; atomic per-edge apply is queued
-    //     for a follow-up kernel slice.
+    //   - F5-β.5.3 — all `Constant(r_i)` but with distinct values →
+    //     one atomic `fillet_edges` call via
+    //     `FilletType::PerEdgeConstant(map)`. The BlendGraph sees the
+    //     shared corner as a single 3-edge vertex (rather than the
+    //     three independent vertices the per-edge loop produces),
+    //     unblocking the F5-β mixed-radii corner dispatcher from the
+    //     wire surface. Returns a typed `BlendFailed` when the cap
+    //     circles don't pairwise intersect (e.g. distinct radii on a
+    //     rectilinear box corner).
+    //   - Anything else (any Variable, any VariableStations, any
+    //     mixed-kind profile in `radii`) → one `fillet_edges` call
+    //     per edge with `PropagationMode::None`. Propagation is
+    //     suppressed so edge K's chain cannot swallow edge K+1 and
+    //     break the per-edge profile invariant. A mid-loop kernel
+    //     failure leaves the solid partially filleted; atomic
+    //     per-edge apply is queued for a follow-up kernel slice
+    //     (`FilletType::PerEdgeProfile`, F5-β.5.6).
     // The DTO → `FilletType` translation is performed inside this
     // model-lock scope via `radii_parsed.to_fillet_type(i)` rather than
     // up-front. Rationale: `FilletType::Function(Box<dyn Fn>)` is
@@ -1647,6 +1657,30 @@ async fn fillet_edges_endpoint(
         if radii_parsed.uniform_constant {
             let opts = FilletOptions {
                 fillet_type: radii_parsed.to_fillet_type(0),
+                propagation: PropagationMode::None,
+                ..FilletOptions::default()
+            };
+            kernel_fillet(&mut model, solid_id, edges.clone(), opts)
+                .map_err(ApiError::from)?;
+        } else if radii_parsed.all_constant {
+            // F5-β.5.3 — distinct per-edge constants in one atomic
+            // call. `to_per_edge_constant_map` returns `Some` iff
+            // every profile is `Constant`, which `all_constant`
+            // guarantees here; the `None` branch is defensive
+            // against future parser drift.
+            let map = radii_parsed
+                .to_per_edge_constant_map(&edges)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        "internal: all_constant flag set but per-edge map empty"
+                            .to_string(),
+                    )
+                })?;
+            let radius_repr = map.values().copied().fold(f64::INFINITY, f64::min);
+            let opts = FilletOptions {
+                fillet_type: FilletType::PerEdgeConstant(map),
+                radius: radius_repr,
                 propagation: PropagationMode::None,
                 ..FilletOptions::default()
             };
