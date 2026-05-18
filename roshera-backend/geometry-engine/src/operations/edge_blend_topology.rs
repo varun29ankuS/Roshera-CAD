@@ -101,6 +101,31 @@ pub(crate) struct BlendEdgeSurgery {
     pub v_t2_start: VertexId,
     /// New vertex on F2 near V1 (= end of trim2, end of cap_v1).
     pub v_t2_end: VertexId,
+    /// F5-α.2 — `original_v0` is shared with two other blend edges at
+    /// a `ConvexCorner { degree: 3 }` apex. When set, [`splice_blend_edge`]
+    /// skips the V0-side topology surgery — the pred/succ edge rewire
+    /// at V0, the third-face lookup at V0, the cap_v0 insertion, and
+    /// the V0 vertex removal — because:
+    /// 1. The pred/succ edges at V0 are *themselves* corner-fillet
+    ///    edges whose own splice will replace them in the F1/F2 loop;
+    ///    rewiring their V0-terminal pre-emptively would either be a
+    ///    no-op (the new vertex is already P_a/P_b/P_c thanks to
+    ///    `add_or_find`'s tolerance dedup) or it would break the next
+    ///    splice's `current_at_terminal == expected` check.
+    /// 2. No third face perpendicular at V0 exists in the live shell —
+    ///    every face incident to V0 is one of {face1, face2} for *some*
+    ///    edge in the corner; none survives as a non-blended cap host.
+    /// 3. The cap_v0 arc is shared between the fillet face and the
+    ///    apex sphere face (not a third face). The fillet-face loop
+    ///    already references it from one side; the sphere face's loop
+    ///    references it from the other side after
+    ///    `apply_apex_sphere_corner` runs.
+    /// 4. V0 itself is removed by `apply_apex_sphere_corner` once the
+    ///    sphere face's loop is committed, not here.
+    pub original_v0_corner_shared: bool,
+    /// F5-α.2 — symmetric flag for `original_v1`. See
+    /// [`Self::original_v0_corner_shared`].
+    pub original_v1_corner_shared: bool,
 }
 
 impl BlendEdgeSurgery {
@@ -253,18 +278,34 @@ pub(crate) fn splice_blend_edge(
 
     // Resolve F3 / F4 BEFORE touching F1/F2 — once we re-vertex the
     // shared edges, V0 and V1 stop being incidence keys.
-    let face3 = find_third_face_at_vertex(
-        model,
-        solid_id,
-        surgery.original_v0,
-        &[surgery.face1, surgery.face2],
-    )?;
-    let face4 = find_third_face_at_vertex(
-        model,
-        solid_id,
-        surgery.original_v1,
-        &[surgery.face1, surgery.face2],
-    )?;
+    //
+    // F5-α.2: at a `ConvexCorner { degree: 3 }` apex, no third face
+    // perpendicular to the blend exists — every face incident to the
+    // corner is one of {face1, face2} for some edge in the corner. The
+    // cap arc on that side belongs to the apex sphere face (built by
+    // `apply_apex_sphere_corner` after every per-edge splice runs),
+    // not to a third face here. Skip the F3/F4 lookup *and* the cap
+    // insertion when the corresponding vertex is corner-shared.
+    let face3 = if surgery.original_v0_corner_shared {
+        None
+    } else {
+        Some(find_third_face_at_vertex(
+            model,
+            solid_id,
+            surgery.original_v0,
+            &[surgery.face1, surgery.face2],
+        )?)
+    };
+    let face4 = if surgery.original_v1_corner_shared {
+        None
+    } else {
+        Some(find_third_face_at_vertex(
+            model,
+            solid_id,
+            surgery.original_v1,
+            &[surgery.face1, surgery.face2],
+        )?)
+    };
 
     // Splice F1: replace E with trim1, re-vertex the V0/V1 neighbours
     // to terminate at v_t1_start / v_t1_end.
@@ -277,6 +318,8 @@ pub(crate) fn splice_blend_edge(
         surgery.original_v1,
         surgery.v_t1_start,
         surgery.v_t1_end,
+        surgery.original_v0_corner_shared,
+        surgery.original_v1_corner_shared,
     )?;
 
     // Splice F2 with trim2, re-vertexing to v_t2_start / v_t2_end.
@@ -289,32 +332,46 @@ pub(crate) fn splice_blend_edge(
         surgery.original_v1,
         surgery.v_t2_start,
         surgery.v_t2_end,
+        surgery.original_v0_corner_shared,
+        surgery.original_v1_corner_shared,
     )?;
 
     // F3: bridge the gap that opened at V0 between the F1/F2
     // neighbours (now ending/starting at v_t1_start / v_t2_start).
-    insert_cap_into_face_loop(
-        model,
-        face3,
-        surgery.cap_v0_edge,
-        surgery.v_t1_start,
-        surgery.v_t2_start,
-    )?;
+    if let Some(face3) = face3 {
+        insert_cap_into_face_loop(
+            model,
+            face3,
+            surgery.cap_v0_edge,
+            surgery.v_t1_start,
+            surgery.v_t2_start,
+        )?;
+    }
 
     // F4: same bridge at V1, between v_t1_end / v_t2_end.
-    insert_cap_into_face_loop(
-        model,
-        face4,
-        surgery.cap_v1_edge,
-        surgery.v_t1_end,
-        surgery.v_t2_end,
-    )?;
+    if let Some(face4) = face4 {
+        insert_cap_into_face_loop(
+            model,
+            face4,
+            surgery.cap_v1_edge,
+            surgery.v_t1_end,
+            surgery.v_t2_end,
+        )?;
+    }
 
-    // Original edge no longer referenced by any face loop, original
-    // vertices no longer referenced by any edge — drop them.
+    // Original edge no longer referenced by any face loop — drop it.
+    // Original endpoints: corner-shared vertices stay alive for the
+    // apex-sphere step (`fillet::apply_apex_sphere_corner`) to remove
+    // once it has stitched the sphere face into the shell. Non-corner
+    // endpoints are unreferenced after the splice and drop here as
+    // before.
     model.edges.remove(surgery.original_edge);
-    model.vertices.remove(surgery.original_v0);
-    model.vertices.remove(surgery.original_v1);
+    if !surgery.original_v0_corner_shared {
+        model.vertices.remove(surgery.original_v0);
+    }
+    if !surgery.original_v1_corner_shared {
+        model.vertices.remove(surgery.original_v1);
+    }
 
     Ok(())
 }
@@ -406,6 +463,8 @@ fn splice_face_along_edge(
     old_v1: VertexId,
     new_v0: VertexId,
     new_v1: VertexId,
+    old_v0_corner_shared: bool,
+    old_v1_corner_shared: bool,
 ) -> OperationResult<()> {
     let loop_id = {
         let face = model
@@ -456,18 +515,46 @@ fn splice_face_along_edge(
     //   pred → (entry_vertex) → old_edge → (exit_vertex) → succ
     //   forward old_orient: entry = old_v0, exit = old_v1
     //   backward old_orient: entry = old_v1, exit = old_v0
-    let (entry_old, exit_old, entry_new, exit_new) = if old_orient {
-        (old_v0, old_v1, new_v0, new_v1)
-    } else {
-        (old_v1, old_v0, new_v1, new_v0)
-    };
+    let (entry_old, exit_old, entry_new, exit_new, entry_corner_shared, exit_corner_shared) =
+        if old_orient {
+            (
+                old_v0,
+                old_v1,
+                new_v0,
+                new_v1,
+                old_v0_corner_shared,
+                old_v1_corner_shared,
+            )
+        } else {
+            (
+                old_v1,
+                old_v0,
+                new_v1,
+                new_v0,
+                old_v1_corner_shared,
+                old_v0_corner_shared,
+            )
+        };
 
+    // F5-α.2: at a corner-shared terminal, `pred_edge` / `succ_edge`
+    // are themselves blend edges scheduled for splice in this pass.
+    // Rewiring them pre-emptively either no-ops (their corner endpoint
+    // has already been dedup-merged onto the cap-arc P_a/P_b/P_c by
+    // `VertexStore::add_or_find`) or actively breaks the next splice's
+    // `current_at_terminal == expected` guard. Skip the rewire on the
+    // corner-shared side; the sibling fillet's own splice will handle
+    // the trim curve's vertex contract from its own face's perspective.
+    //
     // Re-vertex pred_edge: its trailing endpoint (in pred_orient) was
-    // entry_old; rewrite it to entry_new.
-    rewire_edge_vertex(model, pred_edge, entry_old, entry_new, true, pred_orient)?;
+    // entry_old; rewrite it to entry_new (unless entry is corner-shared).
+    if !entry_corner_shared {
+        rewire_edge_vertex(model, pred_edge, entry_old, entry_new, true, pred_orient)?;
+    }
     // Re-vertex succ_edge: its leading endpoint (in succ_orient) was
-    // exit_old; rewrite it to exit_new.
-    rewire_edge_vertex(model, succ_edge, exit_old, exit_new, false, succ_orient)?;
+    // exit_old; rewrite it to exit_new (unless exit is corner-shared).
+    if !exit_corner_shared {
+        rewire_edge_vertex(model, succ_edge, exit_old, exit_new, false, succ_orient)?;
+    }
 
     // Replace old_edge with new_edge at the splice site, preserving
     // the orientation flag so loop traversal still goes
@@ -758,6 +845,8 @@ mod surgery_tests {
             v_t1_end: 4,
             v_t2_start: 5,
             v_t2_end: 6,
+            original_v0_corner_shared: false,
+            original_v1_corner_shared: false,
         }
     }
 
