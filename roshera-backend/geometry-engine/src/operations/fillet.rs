@@ -2532,6 +2532,369 @@ fn apply_triangular_nurbs_corner(
     )))
 }
 
+/// Trim `arc_edge_id` so its 3D extent runs from `p_start_new` to
+/// `p_end_new`, preserving the arc's center / normal / radius / x_axis
+/// frame.
+///
+/// F5-β.2 surgery primitive. The cap arc on a cylindrical fillet face
+/// is a sub-arc of the V-side cap circle (radius `r_i`, centred at
+/// `C_i`, in the plane perpendicular to the cylinder axis `u_i`).
+/// F5-α leaves the cap as a quarter-arc anchored at the apex; F5-β
+/// re-anchors it to the pairwise intersection points `P_{ij}`,
+/// `P_{ki}` computed by [`intersect_two_caps`].
+///
+/// Algorithm:
+///
+/// 1. Read the existing arc through `model.curves.get`. Use the stored
+///    frame `(center, normal, x_axis)` directly. The `y_axis` is
+///    `normal × x_axis` (matches `Arc::y_axis()` internally).
+/// 2. Project each endpoint onto the frame:
+///    `θ_P = atan2((P − C) · y_axis, (P − C) · x_axis)`.
+/// 3. Sweep direction disambiguation. Take the *short-way* sweep
+///    `Δθ = wrap_pi(θ_end − θ_start)`. Sample the midpoint of the
+///    candidate arc at parameter `t = 0.5`. If
+///    `(midpoint − vertex) · vertex_outward ≥ 0` the V-side test
+///    passes — keep the short sweep. Otherwise flip to the long way
+///    by adding `2π · sign(Δθ)` (so the midpoint lies on the opposite
+///    side of the chord, which by construction is the V-side).
+/// 4. Construct a fresh `Arc` *by direct struct literal* (not via
+///    `Arc::new`, which would canonicalise `x_axis` and invalidate
+///    the angle computations from step 2).
+/// 5. Insert the new arc into `model.curves`, rebind `edge.curve_id`,
+///    and replace `edge.start_vertex` / `edge.end_vertex` via
+///    `VertexStore::add_or_find(x, y, z, tolerance)` so any other
+///    consumer of the same intersection point shares the vertex id.
+///
+/// Returns `Err(OperationError::InvalidGeometry)` if either endpoint
+/// is more than `tolerance` off the existing cap circle — that
+/// indicates the upstream [`intersect_two_caps`] result was applied
+/// to the wrong cap arc.
+fn trim_cap_arc_in_place(
+    model: &mut BRepModel,
+    arc_edge_id: EdgeId,
+    p_start_new: Point3,
+    p_end_new: Point3,
+    vertex: Point3,
+    vertex_outward: Vector3,
+    tolerance: f64,
+) -> OperationResult<()> {
+    // 1 — read the existing arc.
+    let edge = model.edges.get(arc_edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "trim_cap_arc_in_place: edge {} not found",
+            arc_edge_id
+        ))
+    })?;
+    let curve_id = edge.curve_id;
+    let edge_tolerance = edge.tolerance;
+
+    let curve_box = model.curves.get(curve_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "trim_cap_arc_in_place: curve {} not found for edge {}",
+            curve_id, arc_edge_id
+        ))
+    })?;
+    let arc = curve_box.as_any().downcast_ref::<Arc>().ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "trim_cap_arc_in_place: edge {} does not back an Arc curve",
+            arc_edge_id
+        ))
+    })?;
+    let center = arc.center;
+    let normal = arc.normal;
+    let x_axis = arc.x_axis;
+    let radius = arc.radius;
+    let range = arc.range.clone();
+
+    // y_axis = normal × x_axis (matches Arc::y_axis()).
+    let y_axis = normal.cross(&x_axis);
+
+    // 2 — project both new endpoints onto the frame, verify on-circle.
+    let project = |p: Point3| -> OperationResult<(f64, f64, f64)> {
+        let d = Vector3::new(p.x - center.x, p.y - center.y, p.z - center.z);
+        let cx = d.x * x_axis.x + d.y * x_axis.y + d.z * x_axis.z;
+        let cy = d.x * y_axis.x + d.y * y_axis.y + d.z * y_axis.z;
+        let cz = d.x * normal.x + d.y * normal.y + d.z * normal.z;
+        // Tolerance gate: in-plane radial deviation + out-of-plane
+        // deviation. Both must fit within the caller-supplied
+        // `tolerance` (typed kernel tolerance, not a hard literal).
+        let radial = (cx * cx + cy * cy).sqrt();
+        if (radial - radius).abs() > tolerance || cz.abs() > tolerance {
+            return Err(OperationError::InvalidGeometry(format!(
+                "trim_cap_arc_in_place: endpoint deviates from cap circle by \
+                 radial = {:.3e}, axial = {:.3e} (tolerance = {:.3e})",
+                (radial - radius).abs(),
+                cz.abs(),
+                tolerance
+            )));
+        }
+        Ok((cx, cy, cz))
+    };
+    let (sx, sy, _) = project(p_start_new)?;
+    let (ex, ey, _) = project(p_end_new)?;
+
+    let theta_start = sy.atan2(sx);
+    let theta_end = ey.atan2(ex);
+
+    // 3 — sweep-direction disambiguation. Compute the two candidate
+    // sweeps (short way + long way) and pick whichever midpoint scores
+    // higher against `vertex_outward`. We do NOT gate on
+    // `score >= 0` — F5-α's cube-corner geometry yields both midpoints
+    // with negative outward scores (the cap circle radius is smaller
+    // than the corner-to-centre distance), but the *less negative*
+    // score still correctly identifies the V-side sub-arc. This
+    // matches the convention in [`intersect_two_caps`].
+    let mut sweep_short = theta_end - theta_start;
+    while sweep_short > std::f64::consts::PI {
+        sweep_short -= std::f64::consts::TAU;
+    }
+    while sweep_short <= -std::f64::consts::PI {
+        sweep_short += std::f64::consts::TAU;
+    }
+    let sweep_long = if sweep_short >= 0.0 {
+        sweep_short - std::f64::consts::TAU
+    } else {
+        sweep_short + std::f64::consts::TAU
+    };
+
+    let outward_score_for = |sweep: f64| -> f64 {
+        let mid_angle = theta_start + 0.5 * sweep;
+        let (sin_m, cos_m) = mid_angle.sin_cos();
+        let mid_offset_x = radius * cos_m;
+        let mid_offset_y = radius * sin_m;
+        let midpoint = Point3::new(
+            center.x + mid_offset_x * x_axis.x + mid_offset_y * y_axis.x,
+            center.y + mid_offset_x * x_axis.y + mid_offset_y * y_axis.y,
+            center.z + mid_offset_x * x_axis.z + mid_offset_y * y_axis.z,
+        );
+        (midpoint.x - vertex.x) * vertex_outward.x
+            + (midpoint.y - vertex.y) * vertex_outward.y
+            + (midpoint.z - vertex.z) * vertex_outward.z
+    };
+    let sweep = if outward_score_for(sweep_short) >= outward_score_for(sweep_long) {
+        sweep_short
+    } else {
+        sweep_long
+    };
+
+    // 4 — construct the trimmed arc by direct struct literal to
+    // preserve the existing x_axis frame (Arc::new canonicalises it).
+    let trimmed = Arc {
+        center,
+        normal,
+        x_axis,
+        radius,
+        start_angle: theta_start,
+        sweep_angle: sweep,
+        range,
+    };
+
+    // 5 — commit: insert curve, rebind, retarget vertices.
+    let new_curve_id = model.curves.add(Box::new(trimmed));
+    let new_start_vertex =
+        model
+            .vertices
+            .add_or_find(p_start_new.x, p_start_new.y, p_start_new.z, tolerance);
+    let new_end_vertex =
+        model
+            .vertices
+            .add_or_find(p_end_new.x, p_end_new.y, p_end_new.z, tolerance);
+
+    let edge_mut = model.edges.get_mut(arc_edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "trim_cap_arc_in_place: edge {} disappeared between read and write",
+            arc_edge_id
+        ))
+    })?;
+    edge_mut.curve_id = new_curve_id;
+    edge_mut.start_vertex = new_start_vertex;
+    edge_mut.end_vertex = new_end_vertex;
+    if edge_mut.tolerance < edge_tolerance {
+        edge_mut.tolerance = edge_tolerance;
+    }
+    Ok(())
+}
+
+/// Re-anchor every non-arc edge in `fillet_face_id`'s outer loop that
+/// terminated at `old_p_vertex` to terminate at `new_p_vertex` instead.
+///
+/// F5-β.2 sibling of [`trim_cap_arc_in_place`]. After a cap arc on a
+/// cylindrical fillet face is trimmed so its endpoint moves from the
+/// F5-α apex P-vertex to the F5-β intersection point `P_{ij}`, the
+/// two seam edges on the same fillet face that shared the old apex
+/// vertex must be retargeted so the face's outer loop stays closed.
+///
+/// Cylindrical fillet faces in the kernel use straight-line seam
+/// edges (cylinder generators along the axis direction). The
+/// re-anchor therefore preserves the far end of each seam and
+/// replaces the V-side end with the new `P_{ij}` position — a fresh
+/// `Line` curve with the same `(far, near)` orientation as the
+/// original.
+///
+/// No-op for edges in the loop whose endpoints don't reference
+/// `old_p_vertex`; safe to call once per cap-arc endpoint.
+fn reanchor_seam_edges_at_cap_arc_endpoint(
+    model: &mut BRepModel,
+    fillet_face_id: FaceId,
+    old_p_vertex: VertexId,
+    new_p_vertex: VertexId,
+) -> OperationResult<()> {
+    let face = model.faces.get(fillet_face_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "reanchor_seam_edges_at_cap_arc_endpoint: face {} not found",
+            fillet_face_id
+        ))
+    })?;
+    let outer_loop_id = face.outer_loop;
+    let loop_ref = model.loops.get(outer_loop_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "reanchor_seam_edges_at_cap_arc_endpoint: loop {} not found",
+            outer_loop_id
+        ))
+    })?;
+    let edge_ids: Vec<EdgeId> = loop_ref.edges.clone();
+
+    let new_pos = model.vertices.get_position(new_p_vertex).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "reanchor_seam_edges_at_cap_arc_endpoint: new vertex {} not found",
+            new_p_vertex
+        ))
+    })?;
+    let new_point = Point3::new(new_pos[0], new_pos[1], new_pos[2]);
+
+    for edge_id in edge_ids {
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e,
+            None => continue,
+        };
+        let curve = match model.curves.get(edge.curve_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        // Skip arc edges — those are the cap arcs themselves and are
+        // handled by `trim_cap_arc_in_place`. Only refresh straight
+        // seam edges (cylinder generators).
+        if curve.as_any().downcast_ref::<Line>().is_none() {
+            continue;
+        }
+        let replaces_start = edge.start_vertex == old_p_vertex;
+        let replaces_end = edge.end_vertex == old_p_vertex;
+        if !replaces_start && !replaces_end {
+            continue;
+        }
+        // Read the far-end position before we touch anything else.
+        let far_vertex = if replaces_start {
+            edge.end_vertex
+        } else {
+            edge.start_vertex
+        };
+        let far_pos = model.vertices.get_position(far_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "reanchor_seam_edges_at_cap_arc_endpoint: far vertex {} of edge \
+                 {} not found",
+                far_vertex, edge_id
+            ))
+        })?;
+        let far_point = Point3::new(far_pos[0], far_pos[1], far_pos[2]);
+
+        // Preserve start→end direction. If the old apex vertex was the
+        // edge's start, the new line goes new_point → far_point; if it
+        // was the end, far_point → new_point.
+        let (line_start, line_end) = if replaces_start {
+            (new_point, far_point)
+        } else {
+            (far_point, new_point)
+        };
+        let new_curve_id = model.curves.add(Box::new(Line::new(line_start, line_end)));
+
+        let edge_mut = model.edges.get_mut(edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "reanchor_seam_edges_at_cap_arc_endpoint: edge {} disappeared",
+                edge_id
+            ))
+        })?;
+        edge_mut.curve_id = new_curve_id;
+        if replaces_start {
+            edge_mut.start_vertex = new_p_vertex;
+        } else {
+            edge_mut.end_vertex = new_p_vertex;
+        }
+    }
+    Ok(())
+}
+
+/// Rational-quadratic Bezier control net + weights for the arc
+/// `arc`. Piegl-Tiller §7.5 eq. 7.31.
+///
+/// Returns `([P_start, T_mid, P_end], [1.0, cos(half_sweep), 1.0])`.
+/// `T_mid` is the intersection of the two end-tangents — placed at
+/// `C + (r / cos(half_sweep)) · (cos(α+θ/2) · x_axis + sin(α+θ/2) ·
+/// y_axis)`. The resulting rational quadratic reproduces the arc
+/// *exactly* on its parameter domain (not an approximation).
+///
+/// **Precondition**: `|arc.sweep_angle| < π`. For sweeps that meet or
+/// exceed a half-circle the weight `cos(θ/2)` vanishes and `T_mid`
+/// diverges; the arc must be split into multiple rational-quadratic
+/// segments first. F5-β cap arcs always satisfy this — they start as
+/// quarter-arcs (sweep ≤ π/2) and trim can only shrink them — so the
+/// helper guards instead of splitting. Callers see
+/// `Err(OperationError::InvalidGeometry)` when the precondition
+/// fails.
+fn arc_to_rational_quadratic_controls(
+    arc: &Arc,
+) -> OperationResult<([Point3; 3], [f64; 3])> {
+    let sweep = arc.sweep_angle;
+    if !sweep.is_finite() || sweep.abs() >= std::f64::consts::PI {
+        return Err(OperationError::InvalidGeometry(format!(
+            "arc_to_rational_quadratic_controls: sweep_angle = {:.6} rad must \
+             satisfy 0 < |sweep| < π for a single rational-quadratic segment",
+            sweep
+        )));
+    }
+    let half = 0.5 * sweep;
+    let w_mid = half.cos();
+    if w_mid <= 0.0 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "arc_to_rational_quadratic_controls: weight cos(sweep/2) = {:.3e} \
+             is non-positive — arc sweep crosses ±π singularity",
+            w_mid
+        )));
+    }
+
+    let center = arc.center;
+    let x_axis = arc.x_axis;
+    let y_axis = arc.normal.cross(&arc.x_axis);
+    let radius = arc.radius;
+
+    let alpha = arc.start_angle;
+    let beta = alpha + sweep;
+    let theta_mid = alpha + half;
+
+    let (sin_a, cos_a) = alpha.sin_cos();
+    let (sin_b, cos_b) = beta.sin_cos();
+    let (sin_m, cos_m) = theta_mid.sin_cos();
+
+    // P_start, P_end exactly on the circle.
+    let p_start = Point3::new(
+        center.x + radius * (cos_a * x_axis.x + sin_a * y_axis.x),
+        center.y + radius * (cos_a * x_axis.y + sin_a * y_axis.y),
+        center.z + radius * (cos_a * x_axis.z + sin_a * y_axis.z),
+    );
+    let p_end = Point3::new(
+        center.x + radius * (cos_b * x_axis.x + sin_b * y_axis.x),
+        center.y + radius * (cos_b * x_axis.y + sin_b * y_axis.y),
+        center.z + radius * (cos_b * x_axis.z + sin_b * y_axis.z),
+    );
+    // T_mid = C + (r / w_mid) · (cos(mid)·x + sin(mid)·y).
+    let r_over_w = radius / w_mid;
+    let t_mid = Point3::new(
+        center.x + r_over_w * (cos_m * x_axis.x + sin_m * y_axis.x),
+        center.y + r_over_w * (cos_m * x_axis.y + sin_m * y_axis.y),
+        center.z + r_over_w * (cos_m * x_axis.z + sin_m * y_axis.z),
+    );
+    Ok(([p_start, t_mid, p_end], [1.0, w_mid, 1.0]))
+}
+
 // `gather_vertex_blend_context` and `create_vertex_blend` were the
 // pre-F5-α scaffolding for the standalone `fillet_vertices` public
 // API. F5-α moves corner emission inline into `fillet_edges` via
@@ -6427,6 +6790,360 @@ mod tests {
             found.is_none(),
             "arc normal perpendicular to axis must not match"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // F5-β.2 (Task #89) — cap-arc trimming + arc → rational-quadratic
+    // Bezier control-net helpers.
+    //
+    // `trim_cap_arc_in_place` is exercised on a single-edge BRep that
+    // carries one Arc curve. Each test trims the arc to a new sub-
+    // range, then reads the result back from `model.edges` /
+    // `model.curves` and asserts: new endpoints land at the requested
+    // points, sweep direction obeys the V-side disambiguation rule,
+    // and the arc's stored `x_axis` frame is preserved (Arc::new
+    // would canonicalise it; direct struct construction must not).
+    //
+    // `arc_to_rational_quadratic_controls` is a pure-math primitive.
+    // Tests pin the closed-form Piegl-Tiller §7.5 eq. 7.31 control
+    // net for the quarter-arc, endpoint exactness, and the precondition
+    // gate at the ±π singularity.
+    // ------------------------------------------------------------------
+
+    /// Build a minimal BRep edge carrying `arc` as its curve. Returns
+    /// the new edge id. Vertices are placed at the arc's evaluated
+    /// start / end positions so the edge is geometrically consistent
+    /// from the outset.
+    fn build_single_arc_edge(model: &mut BRepModel, arc: Arc) -> EdgeId {
+        let start_pt = arc
+            .evaluate(0.0)
+            .expect("arc start evaluable")
+            .position;
+        let end_pt = arc
+            .evaluate(1.0)
+            .expect("arc end evaluable")
+            .position;
+        let v0 = model.vertices.add(start_pt.x, start_pt.y, start_pt.z);
+        let v1 = model.vertices.add(end_pt.x, end_pt.y, end_pt.z);
+        let curve_id = model.curves.add(Box::new(arc));
+        let edge = Edge::new_auto_range(0, v0, v1, curve_id, EdgeOrientation::Forward);
+        model.edges.add(edge)
+    }
+
+    #[test]
+    fn trim_cap_arc_in_place_quarter_to_eighth_short_way() {
+        // Quarter arc on the +z normal plane centred at origin,
+        // sweep 0 → π/2 (i.e. (1,0,0) → (0,1,0)). Trim to (1,0,0) →
+        // (cos π/4, sin π/4, 0). vertex at (1, 1, 0) outward (1,1,0)/√2
+        // — midpoint of the short-way sub-arc sits at angle π/8, well
+        // inside the +x/+y quadrant, so the V-side score is positive
+        // and the short sweep is kept.
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let mut model = BRepModel::new();
+        let edge_id = build_single_arc_edge(&mut model, arc);
+
+        let new_start = pt(1.0, 0.0, 0.0);
+        let new_end = pt(
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+        );
+        trim_cap_arc_in_place(
+            &mut model,
+            edge_id,
+            new_start,
+            new_end,
+            pt(1.0, 1.0, 0.0),
+            vec3(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            1.0e-9,
+        )
+        .expect("trim succeeds");
+
+        let edge = model.edges.get(edge_id).expect("edge");
+        let trimmed = model
+            .curves
+            .get(edge.curve_id)
+            .expect("curve")
+            .as_any()
+            .downcast_ref::<Arc>()
+            .expect("Arc")
+            .clone();
+        assert!(
+            (trimmed.start_angle - 0.0).abs() < 1.0e-12,
+            "start_angle expected 0, got {}",
+            trimmed.start_angle
+        );
+        assert!(
+            (trimmed.sweep_angle - std::f64::consts::FRAC_PI_4).abs() < 1.0e-12,
+            "sweep_angle expected π/4 (short way), got {}",
+            trimmed.sweep_angle
+        );
+    }
+
+    #[test]
+    fn trim_cap_arc_in_place_v_side_flip_picks_long_way() {
+        // Same quarter-arc as above, requested same endpoints, but
+        // vertex_outward points into −x − y so the +x/+y quadrant
+        // midpoint scores negative — algorithm must flip to the
+        // 2π − π/4 = 7π/4 sweep (long way around, signed negative).
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let mut model = BRepModel::new();
+        let edge_id = build_single_arc_edge(&mut model, arc);
+
+        let new_start = pt(1.0, 0.0, 0.0);
+        let new_end = pt(
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+        );
+        trim_cap_arc_in_place(
+            &mut model,
+            edge_id,
+            new_start,
+            new_end,
+            pt(-1.0, -1.0, 0.0),
+            vec3(
+                -std::f64::consts::FRAC_1_SQRT_2,
+                -std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            ),
+            1.0e-9,
+        )
+        .expect("trim succeeds");
+
+        let edge = model.edges.get(edge_id).expect("edge");
+        let trimmed = model
+            .curves
+            .get(edge.curve_id)
+            .expect("curve")
+            .as_any()
+            .downcast_ref::<Arc>()
+            .expect("Arc")
+            .clone();
+        // Long way: sweep should be π/4 − 2π = −7π/4.
+        let expected = std::f64::consts::FRAC_PI_4 - std::f64::consts::TAU;
+        assert!(
+            (trimmed.sweep_angle - expected).abs() < 1.0e-12,
+            "expected long-way sweep {}, got {}",
+            expected,
+            trimmed.sweep_angle
+        );
+    }
+
+    #[test]
+    fn trim_cap_arc_in_place_preserves_frame_after_replace() {
+        // Build an arc with a deliberately non-canonical x_axis (rotate
+        // the default +X by π/8). Arc::new canonicalises x_axis to +X
+        // for a +Z normal, so we hand-build the Arc via struct literal
+        // here to make the test meaningful — the helper must NOT call
+        // Arc::new during replace.
+        let half = std::f64::consts::FRAC_PI_4 / 2.0; // π/8
+        let (sin_h, cos_h) = half.sin_cos();
+        let custom_x = vec3(cos_h, sin_h, 0.0);
+        let original = Arc {
+            center: pt(0.0, 0.0, 0.0),
+            normal: vec3(0.0, 0.0, 1.0),
+            x_axis: custom_x,
+            radius: 1.0,
+            start_angle: 0.0,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
+            range: crate::primitives::curve::ParameterRange::unit(),
+        };
+
+        let mut model = BRepModel::new();
+        // We cannot use build_single_arc_edge because that path
+        // evaluates the arc directly and uses VertexStore::add — which
+        // is fine, but we hand-build here for explicit control over
+        // the start / end positions.
+        let start = original
+            .evaluate(0.0)
+            .expect("start eval")
+            .position;
+        let end = original
+            .evaluate(1.0)
+            .expect("end eval")
+            .position;
+        let v0 = model.vertices.add(start.x, start.y, start.z);
+        let v1 = model.vertices.add(end.x, end.y, end.z);
+        let curve_id = model.curves.add(Box::new(original));
+        let edge = Edge::new_auto_range(0, v0, v1, curve_id, EdgeOrientation::Forward);
+        let edge_id = model.edges.add(edge);
+
+        trim_cap_arc_in_place(
+            &mut model,
+            edge_id,
+            start,
+            end,
+            pt(1.0, 1.0, 0.0),
+            vec3(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            1.0e-9,
+        )
+        .expect("trim succeeds (same endpoints)");
+
+        let edge = model.edges.get(edge_id).expect("edge");
+        let trimmed = model
+            .curves
+            .get(edge.curve_id)
+            .expect("curve")
+            .as_any()
+            .downcast_ref::<Arc>()
+            .expect("Arc")
+            .clone();
+        // The custom x_axis must survive — Arc::new would have
+        // canonicalised it to +X for a +Z normal.
+        assert!(
+            (trimmed.x_axis.x - custom_x.x).abs() < 1.0e-12
+                && (trimmed.x_axis.y - custom_x.y).abs() < 1.0e-12,
+            "x_axis frame mutated: was {:?}, got {:?}",
+            custom_x,
+            trimmed.x_axis
+        );
+    }
+
+    #[test]
+    fn trim_cap_arc_in_place_rejects_off_circle_endpoint() {
+        // Endpoint half a unit off the unit circle → must trip the
+        // tolerance gate inside trim_cap_arc_in_place.
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let mut model = BRepModel::new();
+        let edge_id = build_single_arc_edge(&mut model, arc);
+
+        let result = trim_cap_arc_in_place(
+            &mut model,
+            edge_id,
+            pt(1.0, 0.0, 0.0),
+            pt(0.5, 0.5, 0.0), // |·| = √0.5 ≠ 1, off the circle
+            pt(1.0, 1.0, 0.0),
+            vec3(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            1.0e-9,
+        );
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(
+                    msg.contains("deviates from cap circle"),
+                    "expected diagnostic about off-circle endpoint, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected InvalidGeometry for off-circle endpoint, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn arc_to_rational_quadratic_controls_endpoints_lie_on_arc() {
+        // Quarter arc (0 → π/2) on unit circle: control net P_0, P_1, P_2
+        // — endpoints must coincide with the arc's geometric endpoints.
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let (pts, ws) = arc_to_rational_quadratic_controls(&arc).expect("controls");
+        assert!(approx_eq_pt(pts[0], pt(1.0, 0.0, 0.0), 1.0e-12));
+        assert!(approx_eq_pt(pts[2], pt(0.0, 1.0, 0.0), 1.0e-12));
+        // Weights for quarter-arc: cos(π/4) = √2/2.
+        assert!((ws[0] - 1.0).abs() < 1.0e-12);
+        assert!((ws[1] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1.0e-12);
+        assert!((ws[2] - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn arc_to_rational_quadratic_controls_quarter_arc_midpoint_reproduces_circle() {
+        // The rational-quadratic Bezier evaluated at u = 0.5 must land
+        // on the geometric mid-arc point (cos π/4, sin π/4, 0). Eval
+        // formula: R(u) = Σ w_i B_i^2(u) P_i / Σ w_i B_i^2(u), with
+        // Bernstein basis B_0^2 = (1-u)², B_1^2 = 2u(1-u), B_2^2 = u².
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc");
+        let (pts, ws) = arc_to_rational_quadratic_controls(&arc).expect("controls");
+
+        let u = 0.5;
+        let b = [(1.0 - u) * (1.0 - u), 2.0 * u * (1.0 - u), u * u];
+        let denom = ws[0] * b[0] + ws[1] * b[1] + ws[2] * b[2];
+        let num_x =
+            ws[0] * b[0] * pts[0].x + ws[1] * b[1] * pts[1].x + ws[2] * b[2] * pts[2].x;
+        let num_y =
+            ws[0] * b[0] * pts[0].y + ws[1] * b[1] * pts[1].y + ws[2] * b[2] * pts[2].y;
+        let num_z =
+            ws[0] * b[0] * pts[0].z + ws[1] * b[1] * pts[1].z + ws[2] * b[2] * pts[2].z;
+        let mid = pt(num_x / denom, num_y / denom, num_z / denom);
+        let expected = pt(
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+        );
+        assert!(
+            approx_eq_pt(mid, expected, 1.0e-12),
+            "rational-quadratic midpoint {:?} ≠ analytical {:?}",
+            mid,
+            expected
+        );
+    }
+
+    #[test]
+    fn arc_to_rational_quadratic_controls_rejects_half_circle_or_more() {
+        // Sweep = π (half-circle) hits the weight-zero singularity.
+        // A single rational-quadratic segment cannot represent it
+        // (T_mid → ∞); helper must return InvalidGeometry, not silently
+        // emit a control net with a degenerate weight or NaN point.
+        let arc = Arc::new(
+            pt(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            1.0,
+            0.0,
+            std::f64::consts::PI,
+        )
+        .expect("arc");
+        let result = arc_to_rational_quadratic_controls(&arc);
+        match result {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(
+                    msg.contains("rational-quadratic")
+                        || msg.contains("π")
+                        || msg.contains("PI")
+                        || msg.contains("sweep"),
+                    "diagnostic should reference sweep / π / rational-quadratic, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected InvalidGeometry for half-circle sweep, got {:?}",
+                other
+            ),
+        }
     }
 }
 
