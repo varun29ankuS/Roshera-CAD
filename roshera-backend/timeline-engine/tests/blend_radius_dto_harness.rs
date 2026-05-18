@@ -313,9 +313,17 @@ fn max_radius_variable_empty_returns_zero() {
 /// we destructure and compare component-wise.
 fn assert_fillet_matches(back: Operation, want_edges: &[EntityId], want_radius: &BlendRadiusDto) {
     match back {
-        Operation::Fillet { edges, radius } => {
+        Operation::Fillet {
+            edges,
+            radius,
+            per_edge_overrides,
+        } => {
             assert_eq!(edges, want_edges, "edges mismatch on round-trip");
             assert_eq!(&radius, want_radius, "radius mismatch on round-trip");
+            assert!(
+                per_edge_overrides.is_none(),
+                "legacy round-trip must not synthesise per_edge_overrides"
+            );
         }
         other => panic!("expected Operation::Fillet, got {other:?}"),
     }
@@ -328,6 +336,7 @@ fn operation_fillet_constant_round_trips() {
     let op = Operation::Fillet {
         edges: edges.clone(),
         radius: radius.clone(),
+        per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).expect("serialize Operation::Fillet/Constant");
     let back: Operation = serde_json::from_value(v).expect("deserialize Operation::Fillet/Constant");
@@ -341,6 +350,7 @@ fn operation_fillet_linear_round_trips() {
     let op = Operation::Fillet {
         edges: edges.clone(),
         radius: radius.clone(),
+        per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).expect("serialize Operation::Fillet/Linear");
     let back: Operation = serde_json::from_value(v).expect("deserialize Operation::Fillet/Linear");
@@ -354,6 +364,7 @@ fn operation_fillet_variable_round_trips() {
     let op = Operation::Fillet {
         edges: edges.clone(),
         radius: radius.clone(),
+        per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).expect("serialize Operation::Fillet/Variable");
     let back: Operation = serde_json::from_value(v).expect("deserialize Operation::Fillet/Variable");
@@ -374,12 +385,20 @@ fn operation_fillet_event_serialised_shape_is_flat_tagged() {
     let op = Operation::Fillet {
         edges: vec![edge_id],
         radius: BlendRadiusDto::Constant(0.5),
+        per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).unwrap();
     assert_eq!(v["type"], "Fillet", "Operation tag must be the variant name");
     assert_eq!(v["edges"][0], serde_json::to_value(edge_id).unwrap());
     assert_eq!(v["radius"]["kind"], "constant");
     assert_eq!(v["radius"]["value"], 0.5);
+    // F5-β.5.4 — `skip_serializing_if = "Option::is_none"` keeps
+    // the on-disk shape byte-identical to the pre-F5-β.5.4 form
+    // when no override is supplied. This pins that contract.
+    assert!(
+        v.get("per_edge_overrides").is_none(),
+        "absent per_edge_overrides must not appear in serialised event; got {v}"
+    );
 }
 
 #[test]
@@ -438,6 +457,7 @@ fn operation_fillet_event_array_round_trips() {
         .map(|r| Operation::Fillet {
             edges: vec![edge_id],
             radius: r.clone(),
+            per_edge_overrides: None,
         })
         .collect();
     let blob = serde_json::to_string(&ops).expect("serialize vec");

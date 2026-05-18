@@ -7,12 +7,15 @@ use crate::{
     entity_mapping::get_entity_mapping,
     execution::{ExecutionContext, OperationImpl, ResourceEstimate},
     types::BlendRadiusDto,
-    EntityType, Operation, OperationOutputs, TimelineError, TimelineResult,
+    EntityId, EntityType, Operation, OperationOutputs, TimelineError, TimelineResult,
 };
 use async_trait::async_trait;
 use geometry_engine::{
-    math::Tolerance, primitives::topology_builder::GeometryId as GeometryEngineId,
+    math::Tolerance,
+    operations::fillet::FilletType,
+    primitives::{edge::EdgeId, topology_builder::GeometryId as GeometryEngineId},
 };
+use std::collections::HashMap;
 
 /// Implementation of fillet operation
 pub struct FilletOp;
@@ -28,7 +31,12 @@ impl OperationImpl for FilletOp {
         operation: &Operation,
         context: &ExecutionContext,
     ) -> TimelineResult<()> {
-        if let Operation::Fillet { edges, radius } = operation {
+        if let Operation::Fillet {
+            edges,
+            radius,
+            per_edge_overrides,
+        } = operation
+        {
             // Check we have edges
             if edges.is_empty() {
                 return Err(TimelineError::ValidationError(
@@ -60,7 +68,27 @@ impl OperationImpl for FilletOp {
             // Validate edges belong to the same solid
             validate_edges_same_solid(edges, context)?;
 
-            // Fillet validation complete - Operation::Fillet has edges and radius fields
+            // F5-β.5.4 — per-edge overrides validation. Every key
+            // must be one of `edges` (extra entries are a wire-
+            // shape bug, not a silent ignore) and every override
+            // profile must be positive on its full domain.
+            if let Some(overrides) = per_edge_overrides {
+                for (edge_id, override_radius) in overrides {
+                    if !edges.contains(edge_id) {
+                        return Err(TimelineError::ValidationError(format!(
+                            "per_edge_overrides contains edge {:?} that is not in `edges`",
+                            edge_id
+                        )));
+                    }
+                    let min_override = override_radius.min_radius();
+                    if min_override <= 0.0 {
+                        return Err(TimelineError::ValidationError(format!(
+                            "per_edge_overrides[{:?}] radius must be positive everywhere (min={})",
+                            edge_id, min_override
+                        )));
+                    }
+                }
+            }
 
             Ok(())
         } else {
@@ -75,7 +103,12 @@ impl OperationImpl for FilletOp {
         operation: &Operation,
         context: &mut ExecutionContext,
     ) -> TimelineResult<OperationOutputs> {
-        if let Operation::Fillet { edges, radius } = operation {
+        if let Operation::Fillet {
+            edges,
+            radius,
+            per_edge_overrides,
+        } = operation
+        {
             // Find the solid that contains these edges
             let solid_entity_id = validate_edges_same_solid(edges, context)?;
 
@@ -83,28 +116,43 @@ impl OperationImpl for FilletOp {
             let solid_entity = context.get_entity(solid_entity_id)?;
             let mut brep = entity_state_to_brep(&solid_entity)?;
 
-            // Get edge IDs from entity mapping
+            // Get edge IDs from entity mapping. We also keep the
+            // parallel `entity → kernel` lookup so per-edge override
+            // dispatch can convert `EntityId` keys to `EdgeId`s.
             let mapping = get_entity_mapping();
             let mut edge_ids = Vec::new();
+            let mut entity_to_edge: HashMap<EntityId, EdgeId> = HashMap::new();
             for edge_entity_id in edges {
                 if let Some(geom_id) = mapping.get_geometry_id(*edge_entity_id) {
                     if let GeometryEngineId::Edge(edge_id) = geom_id {
                         edge_ids.push(edge_id);
+                        entity_to_edge.insert(*edge_entity_id, edge_id);
                     }
                 }
             }
 
             // Apply fillet operation using geometry-engine
             use geometry_engine::operations::fillet::{
-                fillet_edges, FilletOptions as GeomFilletOptions, FilletType,
+                fillet_edges, FilletOptions as GeomFilletOptions,
             };
 
-            // F3-ε.2: dispatch the BlendRadiusDto to the matching
-            // kernel FilletType variant. The `radius` scalar in
-            // GeomFilletOptions stays the conservative max — F6-α
-            // and downstream tessellation use it as a budget bound.
-            let fillet_type = blend_radius_dto_to_fillet_type(radius);
-            let conservative_radius = radius.max_radius();
+            // F5-β.5.4 — dispatch the (radius, per_edge_overrides)
+            // pair onto the kernel's `FilletType` shape.
+            //
+            // - No overrides           → legacy F3-ε.2 path
+            //   (`blend_radius_dto_to_fillet_type(radius)`).
+            // - All overrides Constant → `FilletType::PerEdgeConstant`
+            //   (every edge in `edges` must have an entry in the
+            //   merged map, either from `per_edge_overrides` or
+            //   from the default `radius` when it is itself
+            //   Constant; mixed-kind defaults+constants are not
+            //   expressible in `PerEdgeConstant` and are rejected
+            //   below as NotImplemented until F5-β.5.6/F5-β.5.8).
+            // - Mixed-kind             → typed `NotImplemented`,
+            //   gated to ship in F5-β.5.7 / F5-β.5.8.
+            let fillet_type =
+                build_fillet_type_from_overrides(radius, per_edge_overrides, &entity_to_edge)?;
+            let conservative_radius = max_radius_across(radius, per_edge_overrides);
 
             // Create fillet options
             let fillet_options = GeomFilletOptions {
@@ -173,6 +221,16 @@ impl OperationImpl for FilletOp {
                     "last_fillet_edges".to_string(),
                     serde_json::json!(edges.len()),
                 );
+                // F5-β.5.4 — surface the override map alongside
+                // the default radius so replay/diff tooling sees
+                // the full per-edge spec, not just the default.
+                if let Some(overrides) = per_edge_overrides {
+                    obj.insert(
+                        "last_fillet_per_edge_overrides".to_string(),
+                        serde_json::to_value(overrides)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                }
             }
 
             // Update context
@@ -236,5 +294,267 @@ pub fn blend_radius_dto_to_fillet_type(
         BlendRadiusDto::Constant(r) => FilletType::Constant(*r),
         BlendRadiusDto::Linear { start, end } => FilletType::Variable(*start, *end),
         BlendRadiusDto::Variable(samples) => FilletType::VariableStations(samples.clone()),
+    }
+}
+
+/// Build the kernel [`FilletType`] for a timeline `Fillet` event,
+/// folding in any `per_edge_overrides`.
+///
+/// Dispatch:
+///
+/// - `per_edge_overrides == None` → legacy single-profile path
+///   via [`blend_radius_dto_to_fillet_type`].
+/// - All overrides + default are `Constant` → `PerEdgeConstant`.
+///   Every `EntityId` in the selection is filled: explicit
+///   override wins, default `Constant` fills in the rest.
+/// - Any non-`Constant` profile present (override or default
+///   serving as fallback) → typed
+///   [`TimelineError::NotImplemented`]. Mixed-kind per-edge
+///   radii land in F5-β.5.6 (`FilletType::PerEdgeProfile`).
+pub(crate) fn build_fillet_type_from_overrides(
+    default_radius: &BlendRadiusDto,
+    per_edge_overrides: &Option<HashMap<EntityId, BlendRadiusDto>>,
+    entity_to_edge: &HashMap<EntityId, EdgeId>,
+) -> TimelineResult<FilletType> {
+    let overrides = match per_edge_overrides {
+        None => return Ok(blend_radius_dto_to_fillet_type(default_radius)),
+        Some(overrides) => overrides,
+    };
+
+    // Probe whether the merged spec is all-Constant. Required so
+    // the kernel `PerEdgeConstant(HashMap<EdgeId, f64>)` shape
+    // can carry every per-edge radius as a single `f64`.
+    let default_constant = match default_radius {
+        BlendRadiusDto::Constant(r) => Some(*r),
+        _ => None,
+    };
+
+    let mut per_edge: HashMap<EdgeId, f64> = HashMap::with_capacity(entity_to_edge.len());
+    for (entity_id, edge_id) in entity_to_edge {
+        let dto = overrides.get(entity_id).unwrap_or(default_radius);
+        match dto {
+            BlendRadiusDto::Constant(r) => {
+                per_edge.insert(*edge_id, *r);
+            }
+            BlendRadiusDto::Linear { .. } | BlendRadiusDto::Variable(_) => {
+                return Err(TimelineError::NotImplemented(format!(
+                    "per-edge variable radii not yet supported; \
+                     edge entity {:?} carries a non-Constant profile. \
+                     Mixed-kind per-edge dispatch lands in F5-β.5.6 \
+                     (FilletType::PerEdgeProfile).",
+                    entity_id
+                )));
+            }
+        }
+    }
+
+    // Defensive: if there were no entity→edge mappings (caller
+    // failed to resolve any edge from the mapping table) and
+    // `entity_to_edge` is empty, fall back to the default rather
+    // than ship an empty `PerEdgeConstant` map. The kernel
+    // rejects an empty selection upstream; this just keeps the
+    // dispatch error message at the kernel boundary.
+    if per_edge.is_empty() {
+        return Ok(blend_radius_dto_to_fillet_type(default_radius));
+    }
+
+    // The `default_constant` probe above is recorded for
+    // completeness — if the default is non-Constant it can only
+    // surface here when *every* edge has its own Constant
+    // override, in which case the default never fires. No error.
+    let _ = default_constant;
+
+    Ok(FilletType::PerEdgeConstant(per_edge))
+}
+
+/// Compute the conservative upper-bound radius across the
+/// default profile and every per-edge override. Used to seed
+/// `FilletOptions.radius` (the F6-α curvature budget bound).
+pub(crate) fn max_radius_across(
+    default_radius: &BlendRadiusDto,
+    per_edge_overrides: &Option<HashMap<EntityId, BlendRadiusDto>>,
+) -> f64 {
+    let mut max_r = default_radius.max_radius();
+    if let Some(overrides) = per_edge_overrides {
+        for dto in overrides.values() {
+            let r = dto.max_radius();
+            if r > max_r {
+                max_r = r;
+            }
+        }
+    }
+    max_r
+}
+
+#[cfg(test)]
+mod per_edge_overrides_tests {
+    //! F5-β.5.4 — unit coverage for the dispatch helpers
+    //! [`build_fillet_type_from_overrides`] and [`max_radius_across`].
+    //! End-to-end execute is exercised by the api-server router-
+    //! integration tests; these pin the pure dispatch shape.
+    use super::*;
+
+    fn make_entity_to_edge(edges: &[EntityId], edge_ids: &[EdgeId]) -> HashMap<EntityId, EdgeId> {
+        edges
+            .iter()
+            .zip(edge_ids.iter())
+            .map(|(e, k)| (*e, *k))
+            .collect()
+    }
+
+    #[test]
+    fn none_overrides_falls_through_to_legacy_path() {
+        let edges = vec![EntityId::new()];
+        let edge_ids: Vec<EdgeId> = vec![1];
+        let mapping = make_entity_to_edge(&edges, &edge_ids);
+        let ty = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Constant(0.5),
+            &None,
+            &mapping,
+        )
+        .expect("none-overrides must succeed");
+        match ty {
+            FilletType::Constant(r) => assert_eq!(r, 0.5),
+            other => panic!("expected Constant(0.5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_constant_overrides_yields_per_edge_constant() {
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![10, 11, 12];
+        let mapping = make_entity_to_edge(&[e0, e1, e2], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Constant(1.0));
+        overrides.insert(e1, BlendRadiusDto::Constant(1.5));
+        overrides.insert(e2, BlendRadiusDto::Constant(2.0));
+        let ty = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Constant(0.5),
+            &Some(overrides),
+            &mapping,
+        )
+        .expect("all-Constant overrides must succeed");
+        match ty {
+            FilletType::PerEdgeConstant(map) => {
+                assert_eq!(map.get(&10).copied(), Some(1.0));
+                assert_eq!(map.get(&11).copied(), Some(1.5));
+                assert_eq!(map.get(&12).copied(), Some(2.0));
+                assert_eq!(map.len(), 3);
+            }
+            other => panic!("expected PerEdgeConstant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_overrides_fall_back_to_constant_default_for_unspecified_edges() {
+        // Only e0 has an override; e1 and e2 should pick up the
+        // default Constant value of 0.5.
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![20, 21, 22];
+        let mapping = make_entity_to_edge(&[e0, e1, e2], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Constant(3.0));
+        let ty = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Constant(0.5),
+            &Some(overrides),
+            &mapping,
+        )
+        .expect("partial Constant overrides must succeed");
+        match ty {
+            FilletType::PerEdgeConstant(map) => {
+                assert_eq!(map.get(&20).copied(), Some(3.0));
+                assert_eq!(map.get(&21).copied(), Some(0.5));
+                assert_eq!(map.get(&22).copied(), Some(0.5));
+            }
+            other => panic!("expected PerEdgeConstant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linear_override_yields_not_implemented() {
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![30, 31];
+        let mapping = make_entity_to_edge(&[e0, e1], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Constant(1.0));
+        overrides.insert(
+            e1,
+            BlendRadiusDto::Linear {
+                start: 0.5,
+                end: 1.5,
+            },
+        );
+        let err = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Constant(0.5),
+            &Some(overrides),
+            &mapping,
+        )
+        .expect_err("Linear override must be rejected");
+        match err {
+            TimelineError::NotImplemented(msg) => {
+                assert!(
+                    msg.contains("non-Constant"),
+                    "error must mention non-Constant rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_default_with_constant_overrides_fills_every_edge() {
+        // Variable default — but every edge has its own Constant
+        // override. The default never fires, so the build succeeds.
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![40, 41];
+        let mapping = make_entity_to_edge(&[e0, e1], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Constant(0.8));
+        overrides.insert(e1, BlendRadiusDto::Constant(1.2));
+        let ty = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Linear {
+                start: 0.5,
+                end: 1.5,
+            },
+            &Some(overrides),
+            &mapping,
+        )
+        .expect("Variable default + full Constant overrides must succeed");
+        assert!(matches!(ty, FilletType::PerEdgeConstant(_)));
+    }
+
+    #[test]
+    fn max_radius_across_picks_largest_of_default_and_overrides() {
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Constant(1.0));
+        overrides.insert(
+            e1,
+            BlendRadiusDto::Linear {
+                start: 2.5,
+                end: 4.0,
+            },
+        );
+        let max = max_radius_across(&BlendRadiusDto::Constant(0.5), &Some(overrides));
+        assert_eq!(max, 4.0);
+    }
+
+    #[test]
+    fn max_radius_across_with_none_overrides_returns_default_max() {
+        let max = max_radius_across(
+            &BlendRadiusDto::Linear {
+                start: 0.3,
+                end: 0.9,
+            },
+            &None,
+        );
+        assert_eq!(max, 0.9);
     }
 }

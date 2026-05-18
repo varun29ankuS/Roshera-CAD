@@ -287,12 +287,27 @@ pub enum Operation {
     Fillet {
         /// Edges to fillet
         edges: Vec<EntityId>,
-        /// Fillet radius profile. Accepts the legacy bare-number
+        /// Default fillet radius profile applied to every edge in
+        /// `edges` that is **not** overridden by
+        /// `per_edge_overrides`. Accepts the legacy bare-number
         /// form (`"radius": 0.3`) and the F3-ε.2 tagged form
         /// (`{"kind": "linear", "start": 0.3, "end": 0.6}` etc.)
         /// transparently — see [`BlendRadiusDto`] for the full
         /// surface.
         radius: BlendRadiusDto,
+        /// F5-β.5.4 — optional per-edge radius overrides. When
+        /// present, each `(EntityId, BlendRadiusDto)` entry takes
+        /// precedence over `radius` for the matching edge. Every
+        /// key must be a member of `edges`; entries for edges not
+        /// in the selection are rejected by validation.
+        ///
+        /// Serialisation: absent in pre-F5-β.5.4 saved timelines,
+        /// `#[serde(default)]` keeps replay backward-compatible.
+        /// `skip_serializing_if = "Option::is_none"` keeps newly
+        /// written events with no overrides byte-identical to the
+        /// legacy shape so existing snapshot tests stay green.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        per_edge_overrides: Option<HashMap<EntityId, BlendRadiusDto>>,
     },
 
     /// Add chamfer

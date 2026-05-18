@@ -211,7 +211,11 @@ impl ValidationRule for OperationSpecificRule {
                 }
             }
 
-            Operation::Fillet { edges, radius } => {
+            Operation::Fillet {
+                edges,
+                radius,
+                per_edge_overrides,
+            } => {
                 // Validate radius — for variable / linear profiles we
                 // need EVERY sample positive, not just one; using the
                 // DTO's `min_radius` accessor catches profile-internal
@@ -238,6 +242,31 @@ impl ValidationRule for OperationSpecificRule {
                             "Entity {} is not an edge",
                             id
                         )));
+                    }
+                }
+
+                // F5-β.5.4 — per-edge override validation: every
+                // key must be a member of `edges`, and every
+                // override profile must be positive on its full
+                // domain. Catches malformed timeline events at
+                // replay time, not at kernel dispatch.
+                if let Some(overrides) = per_edge_overrides {
+                    for (edge_id, override_radius) in overrides {
+                        if !edges.contains(edge_id) {
+                            return Err(TimelineError::ValidationError(format!(
+                                "per_edge_overrides contains edge {} \
+                                 that is not in `edges`",
+                                edge_id
+                            )));
+                        }
+                        let min_r = override_radius.min_radius();
+                        if min_r <= 0.0 {
+                            return Err(TimelineError::ValidationError(format!(
+                                "per_edge_overrides[{}] must be positive \
+                                 everywhere on the edge (min={})",
+                                edge_id, min_r
+                            )));
+                        }
                     }
                 }
             }
