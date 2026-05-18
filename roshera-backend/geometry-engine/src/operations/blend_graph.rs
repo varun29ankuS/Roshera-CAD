@@ -700,13 +700,23 @@ pub fn compute_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> OperationR
 /// **Side effects.** On a corner that meets every precondition,
 /// overwrites `start_setback`/`end_setback` on each of the three
 /// incident `BlendEdge`s with the apex-aware value. Corners that do
-/// not meet the preconditions (any adjacent face non-planar; mixed
-/// radii across the three edges; rank-deficient axis system;
-/// numerically near-anti-parallel face normals) are silently left
-/// alone — the upstream Hoffmann setback survives. The lifecycle
-/// gate at `fillet.rs` is responsible for rejecting unsupported
-/// configurations before they reach the synthesis pass; this
-/// function never produces a diagnostic of its own.
+/// not meet the preconditions (any adjacent face non-planar;
+/// rank-deficient axis system; numerically near-anti-parallel face
+/// normals; non-finite or non-positive radius on any edge) are
+/// silently left alone — the upstream Hoffmann setback survives.
+/// The lifecycle gate at `fillet.rs` is responsible for rejecting
+/// unsupported configurations before they reach the synthesis pass;
+/// this function never produces a diagnostic of its own.
+///
+/// **Mixed-radii support (F5-β).** Each edge contributes its own
+/// `r_i` to the cylinder-axis base `q_i = V − (r_i/(1+c_i))·(n_a+n_b)`;
+/// the LS apex solve is radius-independent and converges on the
+/// concurrent-axes anchor `A`. The resulting per-edge setback
+/// `|(A − q_i)·u_i|` retracts each cylindrical fillet's V-end to
+/// `C_i = q_i + ((A − q_i)·u_i)·u_i`, the foot of `A` on axis `i`.
+/// For equal radii all three `C_i` collapse to a single point —
+/// the apex sphere centre — and the F5-α surgery recovers as a
+/// special case.
 ///
 /// **Idempotency.** Two consecutive calls produce the same final
 /// setback values (the second call reads the apex-aware values
@@ -753,7 +763,6 @@ pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> Opera
         const ANTI_PARALLEL_TOL: f64 = 1.0e-9;
 
         let mut predictions: Vec<EdgePrediction> = Vec::with_capacity(3);
-        let mut radius_ref: Option<f64> = None;
         let mut bail = false;
         for &eid in &blend_edges {
             let edge = match model.edges.get(eid) {
@@ -836,9 +845,15 @@ pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> Opera
                 Vector3::new(-t_end.x, -t_end.y, -t_end.z)
             };
 
-            // Radius — must agree across all three edges (the
-            // lifecycle gate already enforces this, but we re-check
-            // locally rather than trust an out-of-band invariant).
+            // Radius — per-edge constant arm of the BlendEdge. The
+            // F5-β setback formula `setback_i = |(A − q_i) · u_i|`
+            // is per-edge correct regardless of whether radii agree
+            // across the three incident edges: each `q_i` carries
+            // its own `r_i`, and the LS apex solve below is
+            // radius-independent. F5-α's equal-radius case is
+            // recovered when all three radii happen to coincide —
+            // `A` collapses to the apex sphere centre and each
+            // setback retracts the spine to that single point.
             let r = graph
                 .edges
                 .get(&eid)
@@ -847,14 +862,6 @@ pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> Opera
             if !(r > 0.0 && r.is_finite()) {
                 bail = true;
                 break;
-            }
-            if let Some(r_ref) = radius_ref {
-                if (r - r_ref).abs() > 1.0e-12 {
-                    bail = true;
-                    break;
-                }
-            } else {
-                radius_ref = Some(r);
             }
 
             // Cylinder axis origin: V − (r/(1+c))·(n_a + n_b).
