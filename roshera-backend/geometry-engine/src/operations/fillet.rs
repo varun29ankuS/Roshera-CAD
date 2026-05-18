@@ -2426,26 +2426,16 @@ fn apply_apex_sphere_corner(
     Ok(face_id)
 }
 
-/// F5-β triangular-NURBS corner emission skeleton — mixed-radii path.
+/// F5-β triangular-NURBS corner emission — mixed-radii path.
 ///
 /// Called from [`create_fillet_transitions`] for a degree-3 convex
 /// corner whose three incident fillet radii are not all equal. The
 /// equal-radius case still routes through [`apply_apex_sphere_corner`].
 ///
-/// # F5-β.1 status
-///
-/// This slice (Task #88) lands the underlying helpers
-/// ([`find_cap_arc_edge_by_cylinder_axis`], [`intersect_two_caps`])
-/// and the steps-1-3 skeleton. The public surface remains
-/// `BlendFailure::VertexBlendUnsupported { reason: MixedRadii }`
-/// because steps 4-8 (cap-arc trimming, seam re-anchoring,
-/// triangular NURBS surface emission, face registration, corner
-/// vertex drop) ship in F5-β.2 and F5-β.3.
-///
-/// # Steps implemented in F5-β.1
+/// # Steps
 ///
 /// 1. Locate the V-side cap-arc edge on each incident fillet face by
-///    cylinder-axis match (`find_cap_arc_edge_by_cylinder_axis`).
+///    cylinder-axis match ([`find_cap_arc_edge_by_cylinder_axis`]).
 ///    Failure → `NonManifoldNeighbourhood`.
 /// 2. Compute per-cylinder cap centre
 ///    `C_i = q_i + ((A − q_i) · u_i) · u_i` for each i. Pure
@@ -2454,13 +2444,42 @@ fn apply_apex_sphere_corner(
 ///    {(0, 1), (1, 2), (2, 0)}` via [`intersect_two_caps`]. Failure
 ///    (axes parallel, no intersection, or singular linear solve) →
 ///    `NonManifoldNeighbourhood`.
+/// 4. Trim each cap-arc edge in place so its endpoints sit at the
+///    two `P_{ij}` it owns. [`trim_cap_arc_in_place`] inserts a new
+///    `Arc` curve, rebinds the edge's `curve_id`, and replaces its
+///    start/end vertices with deduped `VertexStore::add_or_find`
+///    calls — so cap arcs `i` and `j` that share `P_{ij}` end up
+///    referencing the same `VertexId`.
+/// 5. Re-anchor every straight seam edge on each cylindrical fillet
+///    face whose endpoint was the cap arc's old apex-side vertex —
+///    rebuild that seam as a fresh `Line` from its unchanged far
+///    end to the freshly-deduped `P_{ij}` vertex.
+/// 6. Build a rational bi-quadratic NURBS surface with a degenerate
+///    `u = 1` column collapsed to `P_{12}`. Each of the three
+///    boundary cap arcs reproduces *exactly* on an isoparametric
+///    line via Piegl-Tiller §7.5 eq. 7.31; the interior control
+///    point and weight are the symmetric average of the three
+///    off-arc tangent-intersection controls.
+/// 7. Orient the new face via [`orient_face_for_outward`] sampled at
+///    a non-degenerate `(u, v)` (avoid the `u = 1` collapsed
+///    boundary). Build a 3-edge outer loop in the cycle order
+///    recovered by [`verify_cap_arcs_form_closed_triangle`]. Add
+///    the face to `model.faces` and register it on the solid's
+///    outer shell.
+/// 8. Drop the original sharp corner vertex if no edge in the live
+///    model still references it (defensive — the F5-α surgery
+///    pattern is preserved).
 ///
-/// After steps 1-3 the function emits the structured `MixedRadii`
-/// failure, preserving the public contract until F5-β.3 lifts it.
+/// Per-corner Euler delta: ΔV = 0 (three new `P_{ij}` vertices
+/// added during trim, three old apex-side vertices dropped when
+/// their last seam reference disappears), ΔE = 0 (three cap arcs
+/// re-parameterised, six seam edges re-anchored — no edges
+/// added/removed), ΔF = +1 (the corner patch). V − E + F goes
+/// from `2 − 1 = 1` (three-sided open hole) to `2`.
 #[allow(clippy::too_many_arguments)]
 fn apply_triangular_nurbs_corner(
     model: &mut BRepModel,
-    _solid_id: SolidId,
+    solid_id: SolidId,
     vertex_id: VertexId,
     vertex_pos: Point3,
     fillet_face_ids: &[FaceId; 3],
@@ -2468,6 +2487,10 @@ fn apply_triangular_nurbs_corner(
     corner_apex: Point3,
     vertex_outward: Vector3,
 ) -> OperationResult<FaceId> {
+    use crate::math::nurbs::NurbsSurface;
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::surface::GeneralNurbsSurface;
+
     // Step 1 — locate the three V-side cap-arc edges by cylinder axis.
     let mut cap_arc_edges: [EdgeId; 3] = [0; 3];
     for i in 0..3 {
@@ -2492,7 +2515,15 @@ fn apply_triangular_nurbs_corner(
         cap_centres[i] = Point3::new(q.x + t * u.x, q.y + t * u.y, q.z + t * u.z);
     }
 
-    // Step 3 — pairwise cap-circle intersection points P_{ij}.
+    // Step 3 — pairwise cap-circle intersection points.
+    //
+    // Convention: `p_ij[k]` is the intersection of caps `pairs[k].0`
+    // and `pairs[k].1`. After trim, cap-arc `i`'s two endpoints are
+    // the two `p_ij[k]` whose pair contains `i`:
+    //
+    //   * cap 0 owns P_{01} = p_ij[0] (pair 0-1) and P_{20} = p_ij[2] (pair 2-0)
+    //   * cap 1 owns P_{12} = p_ij[1] (pair 1-2) and P_{01} = p_ij[0] (pair 0-1)
+    //   * cap 2 owns P_{20} = p_ij[2] (pair 2-0) and P_{12} = p_ij[1] (pair 1-2)
     let pairs: [(usize, usize); 3] = [(0, 1), (1, 2), (2, 0)];
     let mut p_ij = [Point3::new(0.0, 0.0, 0.0); 3];
     for (k, &(i, j)) in pairs.iter().enumerate() {
@@ -2517,19 +2548,275 @@ fn apply_triangular_nurbs_corner(
         })?;
     }
 
-    // F5-β.1 skeleton: helpers wired, but surgery (steps 4-8) ships
-    // in F5-β.2 / F5-β.3. The public contract continues to emit a
-    // typed `MixedRadii` failure until that point so callers see no
-    // behavioural change relative to the F5-α dispatcher.
-    let _ = cap_arc_edges;
-    let _ = p_ij;
-    Err(OperationError::BlendFailed(Box::new(
-        BlendFailure::VertexBlendUnsupported {
-            vertex: vertex_id,
-            kind: BlendVertexKind::ConvexCorner { degree: 3 },
-            reason: VertexBlendUnsupportedReason::MixedRadii,
-        },
-    )))
+    // Step 4 — trim cap arcs in place. Each cap arc keeps its centre
+    // / axis / radius / x_axis frame; only `start_angle` /
+    // `sweep_angle` and the two endpoint vertex ids change.
+    //
+    // Convention: cap-arc-i is trimmed from `p_prev_pair` (the
+    // `P_{ki}` it shares with cap-arc-k where k = (i + 2) mod 3) to
+    // `p_next_pair` (the `P_{ij}` it shares with cap-arc-j where
+    // j = (i + 1) mod 3). This gives a consistent cycle:
+    //
+    //   cap 0: P_{20} → P_{01}
+    //   cap 1: P_{01} → P_{12}
+    //   cap 2: P_{12} → P_{20}    (intentionally reversed —
+    //                              keeps the cycle direction
+    //                              consistent so the new loop
+    //                              traversal is non-twisted)
+    //
+    // The actual orientation of each cap arc within the patch's
+    // loop is recovered by `verify_cap_arcs_form_closed_triangle`
+    // below, so the trim direction here only needs to keep both
+    // endpoints on the same circle — `trim_cap_arc_in_place` then
+    // picks the V-side short/long sweep by midpoint-outward score.
+    let endpoint_tolerance = Tolerance::default().distance();
+    let mut old_vertex_pairs: [(VertexId, VertexId); 3] = [(0, 0); 3];
+    let mut new_vertex_pairs: [(VertexId, VertexId); 3] = [(0, 0); 3];
+    for i in 0..3 {
+        let prev_pair_index = (i + 2) % 3; // P_{ki} pair
+        let next_pair_index = i; // P_{ij} pair: pairs[i] = (i, i+1)
+        let p_start_new = p_ij[prev_pair_index];
+        let p_end_new = p_ij[next_pair_index];
+
+        // Snapshot the cap arc's current endpoint vertex ids — the
+        // seam edges in the same fillet face still reference these
+        // and must be re-anchored to the new ids that
+        // `trim_cap_arc_in_place` is about to install.
+        let pre_trim_edge = model.edges.get(cap_arc_edges[i]).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "apply_triangular_nurbs_corner: cap arc edge {} missing before trim",
+                cap_arc_edges[i]
+            ))
+        })?;
+        old_vertex_pairs[i] = (pre_trim_edge.start_vertex, pre_trim_edge.end_vertex);
+
+        trim_cap_arc_in_place(
+            model,
+            cap_arc_edges[i],
+            p_start_new,
+            p_end_new,
+            vertex_pos,
+            vertex_outward,
+            endpoint_tolerance,
+        )?;
+
+        let post_trim_edge = model.edges.get(cap_arc_edges[i]).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "apply_triangular_nurbs_corner: cap arc edge {} missing after trim",
+                cap_arc_edges[i]
+            ))
+        })?;
+        new_vertex_pairs[i] = (post_trim_edge.start_vertex, post_trim_edge.end_vertex);
+    }
+
+    // Step 5 — re-anchor seam edges on each cylindrical fillet face.
+    //
+    // Cap arc i's old `(α_i, β_i)` are replaced by new `(γ_i, δ_i)`
+    // (via `add_or_find` inside trim). The seam edges on the same
+    // fillet face that referenced α_i or β_i must now reference
+    // the matching new vertex; otherwise the fillet face's outer
+    // loop is broken at the cap arc joints.
+    for i in 0..3 {
+        let (old_alpha, old_beta) = old_vertex_pairs[i];
+        let (new_alpha, new_beta) = new_vertex_pairs[i];
+        if old_alpha != new_alpha {
+            reanchor_seam_edges_at_cap_arc_endpoint(
+                model,
+                fillet_face_ids[i],
+                old_alpha,
+                new_alpha,
+            )?;
+        }
+        if old_beta != new_beta {
+            reanchor_seam_edges_at_cap_arc_endpoint(
+                model,
+                fillet_face_ids[i],
+                old_beta,
+                new_beta,
+            )?;
+        }
+    }
+
+    // Step 6 — build the rational bi-quadratic NURBS patch.
+    //
+    // Each trimmed cap arc gives a rational-quadratic Bezier triple
+    // (P_start, T_mid, P_end) with weights [1, cos(θ/2), 1]. The
+    // 3×3 control net layout:
+    //
+    //     P[0][0] = cap_0.start  P[0][1] = cap_0.T_mid  P[0][2] = cap_0.end
+    //     P[1][0] = cap_2.T_mid  P[1][1] = M_center     P[1][2] = cap_1.T_mid
+    //     P[2][0] = cap_2.end    P[2][1] = degen P_12   P[2][2] = degen P_12
+    //
+    // where the v=0 / v=1 / u=0 boundaries reproduce cap-arc-2 /
+    // cap-arc-1 / cap-arc-0 exactly, and the u=1 column collapses
+    // to a single point (the shared `P_{12}`). M_center is the
+    // simple average of the three T_mids, weighted by the simple
+    // average of the three rational weights — this gives a
+    // symmetric G0 corner patch with each cap arc on its assigned
+    // isoparametric boundary.
+    let mut cap_controls: [([Point3; 3], [f64; 3]); 3] =
+        [([Point3::new(0.0, 0.0, 0.0); 3], [1.0; 3]); 3];
+    for i in 0..3 {
+        let edge = model.edges.get(cap_arc_edges[i]).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "apply_triangular_nurbs_corner: cap arc edge {} missing for control extraction",
+                cap_arc_edges[i]
+            ))
+        })?;
+        let curve_box = model.curves.get(edge.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "apply_triangular_nurbs_corner: trimmed cap arc {}'s curve {} missing",
+                cap_arc_edges[i], edge.curve_id
+            ))
+        })?;
+        let arc = curve_box.as_any().downcast_ref::<Arc>().ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "apply_triangular_nurbs_corner: trimmed cap edge {} is no longer an Arc",
+                cap_arc_edges[i]
+            ))
+        })?;
+        cap_controls[i] = arc_to_rational_quadratic_controls(arc)?;
+    }
+
+    // cap-arc-0 was trimmed P_{20} → P_{01}; its rational-quad
+    // controls are (P_{20}, T_0, P_{01}). cap-arc-1 was P_{01} →
+    // P_{12}: (P_{01}, T_1, P_{12}). cap-arc-2 was P_{12} → P_{20}:
+    // (P_{12}, T_2, P_{20}). The patch wants (P_{20}, T_2, P_{12})
+    // along v=0, so we read cap-2's controls reversed.
+    let (cap0_ctrl, cap0_w) = cap_controls[0];
+    let (cap1_ctrl, cap1_w) = cap_controls[1];
+    let (cap2_ctrl, cap2_w) = cap_controls[2];
+
+    // p_20 / p_01 / p_12 are reproducible from the trimmed cap arcs
+    // for assertion purposes; the actual patch uses the cap-arc
+    // controls so any sub-tolerance drift between `p_ij[k]` and
+    // the trimmed arc endpoint stays on the arc.
+    let p_20 = cap0_ctrl[0];
+    let p_01 = cap0_ctrl[2];
+    let p_12 = cap1_ctrl[2];
+
+    let t_0 = cap0_ctrl[1];
+    let t_1 = cap1_ctrl[1];
+    let t_2 = cap2_ctrl[1];
+    let w_0 = cap0_w[1];
+    let w_1 = cap1_w[1];
+    let w_2 = cap2_w[1];
+
+    let m_center = Point3::new(
+        (t_0.x + t_1.x + t_2.x) / 3.0,
+        (t_0.y + t_1.y + t_2.y) / 3.0,
+        (t_0.z + t_1.z + t_2.z) / 3.0,
+    );
+    let w_center = (w_0 + w_1 + w_2) / 3.0;
+
+    let control_points: Vec<Vec<Point3>> = vec![
+        vec![p_20, t_0, p_01],
+        vec![t_2, m_center, t_1],
+        vec![p_12, p_12, p_12],
+    ];
+    let weights: Vec<Vec<f64>> = vec![
+        vec![1.0, w_0, 1.0],
+        vec![w_2, w_center, w_1],
+        vec![1.0, 1.0, 1.0],
+    ];
+    let knots_open = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let nurbs = NurbsSurface::new(
+        control_points,
+        weights,
+        knots_open.clone(),
+        knots_open,
+        2,
+        2,
+    )
+    .map_err(|e| {
+        OperationError::NumericalError(format!(
+            "F5-β triangular NURBS construction failed: {}",
+            e
+        ))
+    })?;
+    let corner_surface = GeneralNurbsSurface { nurbs };
+
+    // Step 7 — orient the patch and stitch it into the topology.
+    //
+    // The parametric midpoint (u=0.5, v=0.5) is well-defined for
+    // this patch (away from the u=1 degenerate column) and gives
+    // a reliable interior normal sample.
+    let orientation =
+        crate::operations::orientation::orient_face_for_outward_at(
+            &corner_surface,
+            vertex_outward,
+            0.5,
+            0.5,
+        )
+        .unwrap_or(FaceOrientation::Forward);
+
+    let (_corner_vertices, loop_forwards) =
+        verify_cap_arcs_form_closed_triangle(model, &cap_arc_edges)
+            .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
+
+    let surface_id = model.surfaces.add(Box::new(corner_surface));
+    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    for i in 0..3 {
+        blend_loop.add_edge(cap_arc_edges[i], loop_forwards[i]);
+    }
+    let loop_id = model.loops.add(blend_loop);
+
+    let mut face = Face::new(0, surface_id, loop_id, orientation);
+    face.outer_loop = loop_id;
+    let face_id = model.faces.add(face);
+
+    let shell_id = model
+        .solids
+        .get(solid_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Solid {} not found", solid_id)))?
+        .outer_shell;
+    let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Outer shell {} not found", shell_id))
+    })?;
+    shell.add_face(face_id);
+
+    // Step 8 — drop the original sharp corner vertex if no edge
+    // still references it. Same defensive pattern as
+    // `apply_apex_sphere_corner` (Step 8 there).
+    let still_referenced = model
+        .edges
+        .iter()
+        .any(|(_, e)| e.start_vertex == vertex_id || e.end_vertex == vertex_id);
+    if !still_referenced {
+        model.vertices.remove(vertex_id);
+    }
+
+    // Defensive: also drop any of the *old* cap-arc apex-side
+    // vertices that are now orphaned by the trim+reanchor pass.
+    // Each `old_vertex_pairs[i]` slot may have been replaced via
+    // `add_or_find` returning a new id; the originals are then
+    // orphaned unless a non-corner edge happens to share them.
+    let mut to_drop: HashSet<VertexId> = HashSet::new();
+    for (old_alpha, old_beta) in &old_vertex_pairs {
+        to_drop.insert(*old_alpha);
+        to_drop.insert(*old_beta);
+    }
+    // Don't drop the same vertex we just kept above.
+    to_drop.remove(&vertex_id);
+    for vid in to_drop {
+        // Only drop if no edge references it AND it wasn't reused
+        // by add_or_find for one of the new endpoints.
+        let reused = new_vertex_pairs
+            .iter()
+            .any(|(a, b)| *a == vid || *b == vid);
+        if reused {
+            continue;
+        }
+        let referenced = model
+            .edges
+            .iter()
+            .any(|(_, e)| e.start_vertex == vid || e.end_vertex == vid);
+        if !referenced {
+            model.vertices.remove(vid);
+        }
+    }
+
+    Ok(face_id)
 }
 
 /// Trim `arc_edge_id` so its 3D extent runs from `p_start_new` to
