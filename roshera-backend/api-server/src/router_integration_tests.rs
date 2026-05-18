@@ -267,6 +267,135 @@ fn find_top_rim_edge(model: &BRepModel, height: f64) -> Option<EdgeId> {
     })
 }
 
+/// Seed a `size × size × size` box centred at the origin into
+/// `state.model`, register a public UUID, and return
+/// `(uuid, solid_id, [edge0, edge1, edge2])` where the three edges
+/// are the ones meeting at corner `(size/2, size/2, size/2)`.
+///
+/// Mirrors `make_box` + `vertex_at` + `edges_at_vertex` from
+/// `tests/fillet_three_edge_corner_mixed_radii.rs`, the kernel
+/// fixture the F5-β.5.2 integration test pins. Using the same
+/// geometry here keeps the wire-layer assertions aligned with the
+/// kernel-level dispatcher contract (a box-corner with mixed
+/// constants → `NonManifoldNeighbourhood` rejection by design of
+/// the cap-cap intersection sanity gate).
+async fn seed_box(state: &AppState, size: f64) -> (Uuid, SolidId, [EdgeId; 3]) {
+    let solid_id;
+    let corner_edges;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+
+        solid_id = {
+            let mut builder = TopologyBuilder::new(model);
+            match builder
+                .create_box_3d(size, size, size)
+                .expect("box primitive must build for positive size")
+            {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {:?}", other),
+            }
+        };
+        let half = size / 2.0;
+        let corner_vertex = model
+            .vertices
+            .iter()
+            .find_map(|(id, v)| {
+                let p = v.position;
+                if (p[0] - half).abs() < 1e-9
+                    && (p[1] - half).abs() < 1e-9
+                    && (p[2] - half).abs() < 1e-9
+                {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .expect("box must expose a vertex at (size/2, size/2, size/2)");
+        let collected: Vec<EdgeId> = model
+            .edges
+            .iter()
+            .filter(|(_, edge)| {
+                edge.start_vertex == corner_vertex || edge.end_vertex == corner_vertex
+            })
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            collected.len(),
+            3,
+            "a box corner must have exactly 3 incident edges; got {}",
+            collected.len()
+        );
+        corner_edges = [collected[0], collected[1], collected[2]];
+    }
+
+    let uuid = Uuid::new_v4();
+    state.register_id_mapping(uuid, solid_id);
+    (uuid, solid_id, corner_edges)
+}
+
+/// Seed a `size × size × size` box and return three *mutually
+/// vertex-disjoint* edges from it (no two share an endpoint).
+///
+/// Why this matters: the per-edge fillet fallback loop iterates
+/// `edges` and calls `fillet_edges` once per edge. When the input
+/// edges meet at a shared vertex, each independent call installs
+/// its own cap topology at the corner but no call ever builds a
+/// corner-patch face — the resulting solid carries a missing face
+/// and fails `V − E + F = 2` validation (genus-1). Using
+/// vertex-disjoint edges side-steps the collision so the loop's
+/// happy path is observable.
+///
+/// Strategy: greedily walk edges, accept one iff neither endpoint
+/// is already claimed by a previously-accepted edge. A box's 12
+/// edges over 8 vertices guarantee at least 3 disjoint edges
+/// exist (a 4-matching is achievable on the cube edge graph).
+async fn seed_box_disjoint_edges(state: &AppState, size: f64) -> (Uuid, SolidId, [EdgeId; 3]) {
+    let solid_id;
+    let chosen;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+
+        solid_id = {
+            let mut builder = TopologyBuilder::new(model);
+            match builder
+                .create_box_3d(size, size, size)
+                .expect("box primitive must build for positive size")
+            {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {:?}", other),
+            }
+        };
+
+        let mut used_vertices = std::collections::HashSet::new();
+        let mut picked: Vec<EdgeId> = Vec::with_capacity(3);
+        for (eid, edge) in model.edges.iter() {
+            if picked.len() == 3 {
+                break;
+            }
+            let s = edge.start_vertex;
+            let t = edge.end_vertex;
+            if !used_vertices.contains(&s) && !used_vertices.contains(&t) {
+                used_vertices.insert(s);
+                used_vertices.insert(t);
+                picked.push(eid);
+            }
+        }
+        assert_eq!(
+            picked.len(),
+            3,
+            "box edge graph must yield a 3-matching; got {}",
+            picked.len()
+        );
+        chosen = [picked[0], picked[1], picked[2]];
+    }
+
+    let uuid = Uuid::new_v4();
+    state.register_id_mapping(uuid, solid_id);
+    (uuid, solid_id, chosen)
+}
+
 // =====================================================================
 // Request helpers
 // =====================================================================
@@ -534,6 +663,145 @@ async fn fillet_unknown_uuid_routes_to_solid_not_found() {
         body["error_code"], "solid_not_found",
         "wire payload must carry the solid_not_found error_code; body = {body}"
     );
+}
+
+// =====================================================================
+// Tests — F5-β.5.3 per-edge-radii dispatch through the router
+//
+// The three tests below pin the three dispatch arms in
+// `fillet_edges_endpoint` (`main.rs` around line 1665), one per
+// classification produced by `parse_fillet_radii`:
+//
+// 1. `uniform_constant == true`  → single atomic `fillet_edges`
+//    call carrying `FilletType::Constant(r)`. Box-corner equal-
+//    radii routes through F5-α (apex sphere) and succeeds.
+// 2. `all_constant == true && !uniform_constant` → single atomic
+//    `fillet_edges` call carrying `FilletType::PerEdgeConstant(map)`.
+//    Box-corner distinct-radii routes through F5-β's mixed-radii
+//    dispatcher, which rejects orthogonal-face caps with
+//    `BlendFailure::VertexBlendUnsupported { reason:
+//    NonManifoldNeighbourhood }`.
+// 3. `!all_constant` (any profile is `Linear`/`Variable`) → falls
+//    through to the per-edge fallback loop, one `fillet_edges`
+//    call per edge. No corner-blend is triggered (each call sees
+//    a single edge); succeeds for small radii.
+// =====================================================================
+
+/// Mixed-radii box-corner via the wire — three distinct constants
+/// in a single `radii: [...]` payload. This is the headline
+/// F5-β.5.3 test: the api-server must route through the new
+/// `FilletType::PerEdgeConstant` arm and the kernel's mixed-radii
+/// corner dispatcher must surface its typed
+/// `NonManifoldNeighbourhood` rejection all the way out as a
+/// `blend_failed` HTTP 400.
+///
+/// If the dispatcher silently fell back to the per-edge loop, each
+/// edge would fillet independently and the response would be 200;
+/// the assertion below fails loudly in that regression.
+#[tokio::test]
+async fn fillet_radii_distinct_constants_routes_through_per_edge_variant() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "radii":  [1.0, 1.5, 2.0],
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "mixed-radii box-corner must surface as 400 blend_failed; body = {body}"
+    );
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["error_code"], "blend_failed",
+        "wire payload must carry typed blend_failed; body = {body}"
+    );
+    assert_eq!(body["retryable"], false);
+
+    let failure = &body["details"]["failure"];
+    assert_eq!(
+        failure["type"], "VertexBlendUnsupported",
+        "details.failure.type must carry the internally-tagged discriminator; failure = {failure}"
+    );
+    assert_eq!(
+        failure["reason"], "NonManifoldNeighbourhood",
+        "kernel's cap-cap intersection sanity gate must surface as NonManifoldNeighbourhood; \
+         failure = {failure}"
+    );
+}
+
+/// Uniform-radii box-corner via the wire — three equal constants
+/// collapse to `uniform_constant = true` at parse time, then route
+/// through the legacy single-radius atomic path. F5-α handles the
+/// three-edge corner via apex-sphere blend and returns 200.
+///
+/// This pins the *negative* case for F5-β.5.3: equal constants must
+/// not detour through the new `PerEdgeConstant` arm (which would
+/// still work, but doesn't preserve the F5-α single-radius
+/// fast-path's blend-continuity invariants).
+#[tokio::test]
+async fn fillet_radii_uniform_constants_collapse_to_legacy_path() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "radii":  [0.5, 0.5, 0.5],
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "uniform-radii box-corner must succeed via F5-α apex-sphere; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// Mixed *kinds* (any profile is `Linear`/`Variable`) — falls
+/// through to the per-edge fallback loop in
+/// `fillet_edges_endpoint`. Each edge is filleted independently;
+/// no corner blend is triggered.
+///
+/// The wire shape here mixes `Constant(0.5)` with a small
+/// `Linear { 0.5 → 0.7 }`. The three input edges are **vertex-
+/// disjoint** by construction (see `seed_box_disjoint_edges`) so
+/// the per-edge loop's serial fillets don't collide at a shared
+/// corner — that collision is a separate kernel limitation
+/// observable from the box-corner fixture and is not what this
+/// test is pinning. With disjoint edges + in-range radii, the
+/// loop produces a watertight result and the wire surfaces as
+/// `200 OK`. Verifies that the `!all_constant` branch routes
+/// through the legacy per-edge loop rather than falling into the
+/// new `PerEdgeConstant` arm (which would refuse the mixed kinds
+/// at the `to_per_edge_constant_map` call).
+#[tokio::test]
+async fn fillet_radii_mixed_kinds_falls_through_to_per_edge_loop() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box_disjoint_edges(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "radii":  [
+            0.5,
+            { "kind": "linear", "start": 0.5, "end": 0.7 },
+            0.5,
+        ],
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "mixed-kinds per-edge loop must succeed for in-range disjoint edges; body = {body}"
+    );
+    assert_eq!(body["success"], true);
 }
 
 // =====================================================================
