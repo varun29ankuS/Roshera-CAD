@@ -67,9 +67,9 @@
 //!     dispatcher's pre/post-invariants hold across the whole
 //!     domain.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use geometry_engine::operations::diagnostics::VertexBlendUnsupportedReason;
+use geometry_engine::operations::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use geometry_engine::operations::fillet::{FilletType, PropagationMode};
 use geometry_engine::operations::{
     fillet_edges, CommonOptions, FilletOptions, OperationError,
@@ -230,6 +230,55 @@ fn drive_corner_fillet(
     };
 
     fillet_edges(&mut model, solid_id, corner_edges, opts).map(|face_ids| (model, solid_id, face_ids))
+}
+
+/// Drive `fillet_edges` at the (+x,+y,+z) corner with one radius per
+/// incident edge, using the F5-β.5.1
+/// [`FilletType::PerEdgeConstant`] variant. Maps `radii[i]` to the
+/// `i`-th edge in `edges_at_vertex`'s deterministic order so the
+/// dispatcher sees three distinct constant arms when the radii
+/// differ.
+///
+/// The returned tuple matches `drive_corner_fillet` so the mixed-
+/// radii integration tests can use the same downstream assertions.
+fn drive_corner_fillet_per_edge(
+    radii: [f64; 3],
+) -> Result<(BRepModel, SolidId, Vec<FaceId>), OperationError> {
+    let mut model = BRepModel::new();
+    let solid_id = make_box(&mut model, BOX_SIZE);
+    let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
+    let corner_edges = edges_at_vertex(&model, corner);
+    assert_eq!(
+        corner_edges.len(),
+        3,
+        "a box corner has exactly 3 incident edges; got {}",
+        corner_edges.len()
+    );
+
+    let mut per_edge: HashMap<EdgeId, f64> = HashMap::with_capacity(3);
+    for (idx, &eid) in corner_edges.iter().enumerate() {
+        per_edge.insert(eid, radii[idx]);
+    }
+
+    // `options.radius` is the legacy single-radius slot; the F6-α
+    // cap and `validate_fillet_inputs` collapse it from the
+    // per-edge map (minimum value, see `fillet.rs`). Keep it in
+    // sync so the F6-α gate doesn't see a stale 0.0.
+    let representative = radii.iter().copied().fold(f64::INFINITY, f64::min);
+
+    let opts = FilletOptions {
+        fillet_type: FilletType::PerEdgeConstant(per_edge),
+        radius: representative,
+        propagation: PropagationMode::None,
+        common: CommonOptions {
+            validate_result: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    fillet_edges(&mut model, solid_id, corner_edges, opts)
+        .map(|face_ids| (model, solid_id, face_ids))
 }
 
 /// Tessellate an entire solid and return the resulting triangle
@@ -512,40 +561,53 @@ mod property {
 }
 
 // ---------------------------------------------------------------
-// Forward-looking smoke for the mixed-radii NURBS path itself.
+// Mixed-radii path coverage.
 //
-// These tests are kept around as a manifest for F5-β.5 (per-edge
-// radii in `FilletOptions`) and F5-β.6 (synthetic-cylinder
-// mixed-radii integration fixture). They live as `#[ignore]`d
-// stubs so `cargo test --test fillet_three_edge_corner_mixed_radii
-// -- --ignored` lists them.
+// `mixed_radii_box_corner_rejects_with_typed_non_manifold` (F5-β.5.2,
+// active) pins the dispatcher's typed rejection on box-corner
+// mixed radii via the new `FilletType::PerEdgeConstant` variant.
+//
+// `mixed_radii_synthetic_corner_emits_general_nurbs_face` is still
+// `#[ignore]`d until F5-β.5.5 supplies the synthetic three-
+// cylinder fixture whose cap circles pairwise intersect — see the
+// module-level note on why box-corner geometry is geometrically
+// incompatible with a NURBS-emission success path.
 // ---------------------------------------------------------------
 
+/// F5-β.5.2 — with [`FilletType::PerEdgeConstant`] live, the
+/// mixed-radii dispatcher branch is now reachable from the public
+/// `fillet_edges` surface. At a rectilinear box corner the three
+/// orthogonal cap circles cannot pairwise intersect for distinct
+/// radii (see the module-level "Geometric reality" derivation), so
+/// `intersect_two_caps` inside `apply_triangular_nurbs_corner`
+/// returns `NoIntersection` and the dispatcher promotes it to
+/// `BlendFailure::VertexBlendUnsupported { reason:
+/// NonManifoldNeighbourhood }`. This test pins that typed wire
+/// shape.
 #[test]
-#[ignore = "Needs FilletOptions::PerEdgeRadii (F5-β.5). The mixed-radii \
-            dispatcher branch is unreachable via fillet_edges today \
-            because the public surface only carries a single \
-            Constant(r). Once F5-β.5 ships, this test feeds (1.0, 1.5, \
-            2.0), expects NonManifoldNeighbourhood from the cap-cap \
-            intersection sanity gate, and pins the typed wire shape."]
 fn mixed_radii_box_corner_rejects_with_typed_non_manifold() {
-    // Expected shape once F5-β.5 lands:
-    //
-    //   let err = drive_corner_fillet_per_edge([1.0, 1.5, 2.0])
-    //       .expect_err("mixed-radii box-corner caps cannot pairwise \
-    //                    intersect; dispatcher must reject");
-    //   match err {
-    //       OperationError::BlendFailed(failure) => match *failure {
-    //           BlendFailure::VertexBlendUnsupported { reason, .. } => {
-    //               assert_eq!(reason,
-    //                   VertexBlendUnsupportedReason::NonManifoldNeighbourhood);
-    //           }
-    //           other => panic!("expected NonManifoldNeighbourhood; got {:?}",
-    //                           other),
-    //       },
-    //       other => panic!("expected BlendFailed; got {:?}", other),
-    //   }
-    let _ = VertexBlendUnsupportedReason::NonManifoldNeighbourhood;
+    let err = drive_corner_fillet_per_edge([1.0, 1.5, 2.0]).expect_err(
+        "mixed-radii box-corner caps cannot pairwise intersect; \
+         dispatcher must reject",
+    );
+    match err {
+        OperationError::BlendFailed(failure) => match *failure {
+            BlendFailure::VertexBlendUnsupported { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    "mixed-radii box corner must reject with \
+                     NonManifoldNeighbourhood; got {:?}",
+                    reason
+                );
+            }
+            other => panic!(
+                "expected VertexBlendUnsupported; got BlendFailure::{:?}",
+                other
+            ),
+        },
+        other => panic!("expected OperationError::BlendFailed; got {:?}", other),
+    }
 }
 
 #[test]
