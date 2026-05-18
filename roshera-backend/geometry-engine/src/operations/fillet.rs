@@ -96,6 +96,24 @@ pub enum FilletType {
     /// - First station ≥ 0.0, last ≤ 1.0.
     /// - Every radius > 0.
     VariableStations(Vec<(f64, f64)>),
+    /// Per-edge constant radii. Each entry in the map binds a single
+    /// selected edge to its own constant radius. F5-β.5 lifts the
+    /// public-API restriction that forced every edge in a single
+    /// `fillet_edges` call to share the same radius; this is the
+    /// minimal variant — one constant value per edge.
+    ///
+    /// Invariants enforced by `validate_fillet_inputs`:
+    /// - Map contains exactly one entry per edge in the selection.
+    /// - No "extra" entries for edges not in the selection.
+    /// - Every radius is finite, strictly positive, and exceeds the
+    ///   caller-supplied `Tolerance::distance()`.
+    ///
+    /// Mixed-radii three-edge corners feed `apply_triangular_nurbs_
+    /// corner` via the existing F5-β.3 dispatch in
+    /// `create_fillet_transitions`; equal-radii corners still route
+    /// to `apply_apex_sphere_corner`. Variable / chord per-edge mixes
+    /// land in F5-β.5.6+.
+    PerEdgeConstant(HashMap<EdgeId, f64>),
     /// Radius function along edge parameter
     Function(Box<dyn Fn(f64) -> f64>),
     /// Chord length fillet
@@ -110,6 +128,16 @@ impl std::fmt::Debug for FilletType {
             FilletType::VariableStations(samples) => {
                 f.debug_tuple("VariableStations").field(samples).finish()
             }
+            FilletType::PerEdgeConstant(map) => {
+                // Iterate in sorted edge-id order so the Debug output
+                // is stable across runs (HashMap iteration order is
+                // randomised). The recorded-operation JSON uses this
+                // formatter, and timeline replay diffs are easier
+                // when the textual form is deterministic.
+                let mut entries: Vec<(&EdgeId, &f64)> = map.iter().collect();
+                entries.sort_by_key(|(eid, _)| **eid);
+                f.debug_tuple("PerEdgeConstant").field(&entries).finish()
+            }
             FilletType::Function(_) => f.debug_tuple("Function").field(&"<function>").finish(),
             FilletType::Chord(c) => f.debug_tuple("Chord").field(c).finish(),
         }
@@ -122,6 +150,7 @@ impl Clone for FilletType {
             FilletType::Constant(r) => FilletType::Constant(*r),
             FilletType::Variable(r1, r2) => FilletType::Variable(*r1, *r2),
             FilletType::VariableStations(samples) => FilletType::VariableStations(samples.clone()),
+            FilletType::PerEdgeConstant(map) => FilletType::PerEdgeConstant(map.clone()),
             FilletType::Function(_) => FilletType::Constant(5.0), // Fallback to constant
             FilletType::Chord(c) => FilletType::Chord(*c),
         }
@@ -196,6 +225,15 @@ pub fn fillet_edges(
                 .iter()
                 .map(|&(_, r)| r)
                 .fold(0.0_f64, f64::max),
+            // F5-β.5: per-edge map's largest constant radius. Empty
+            // / missing-edge cases are rejected by
+            // `validate_fillet_inputs`; treating the empty fold
+            // identity as 0.0 keeps F6-α a no-op and lets the input
+            // validator own the rejection.
+            FilletType::PerEdgeConstant(map) => map
+                .values()
+                .copied()
+                .fold(0.0_f64, f64::max),
             // `Function` and `Chord` paths don't have a closed-form
             // upper bound here; F6-α leaves them to the existing
             // downstream validation. Sampling them is F6-β.
@@ -240,6 +278,15 @@ pub fn fillet_edges(
                 FilletType::VariableStations(samples) => {
                     samples.iter().map(|&(_, r)| r).collect()
                 }
+                // F5-β.5: pick this edge's per-edge radius out of the
+                // map for half-edge-length bounds-checking. Missing
+                // keys are rejected by `validate_fillet_inputs`
+                // upstream; the fallback to the legacy
+                // `options.radius` here is purely defensive — if
+                // validation passes, the key is present.
+                FilletType::PerEdgeConstant(map) => {
+                    vec![map.get(&edge_id).copied().unwrap_or(options.radius)]
+                }
                 // Function radii are validated per-sample inside the
                 // surgery loop; the placeholder of 1.0 only exercises the
                 // structural bounds here (edge length non-zero, edge
@@ -265,6 +312,23 @@ pub fn fillet_edges(
                 .first()
                 .map(|&(_, r)| r)
                 .unwrap_or(0.0),
+            // F5-β.5: pick the smallest per-edge radius as the
+            // representative for the legacy `radius > 0.0` gate.
+            // Smallest, not largest, so a single zero / negative
+            // entry can't be masked by a larger sibling — every
+            // per-edge entry has already been individually
+            // bounds-checked above against the half-edge-length
+            // limit. Empty maps short-circuit to 0.0, which
+            // triggers the `radius <= 0.0` rejection two lines
+            // below; structurally the empty case is also rejected
+            // earlier by `validate_fillet_inputs`.
+            FilletType::PerEdgeConstant(map) => {
+                if map.is_empty() {
+                    0.0
+                } else {
+                    map.values().copied().fold(f64::INFINITY, f64::min)
+                }
+            }
             FilletType::Function(_) => 0.0, // Will validate per point
             FilletType::Chord(c) => *c,
         };
@@ -290,7 +354,7 @@ pub fn fillet_edges(
         // F4/F5 corner-blending will activate.
         let blend_selection: Vec<(EdgeId, BlendRadius)> = selected_edges
             .iter()
-            .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type)))
+            .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type, eid)))
             .collect();
         let mut blend_graph = blend_graph::build(model, &blend_selection)?;
         blend_graph::compute_setbacks(model, &mut blend_graph)?;
@@ -412,7 +476,7 @@ pub fn fillet_edges(
 /// classification (convexity / dihedral / manifold-kind) still
 /// covers every selected edge, even though the variable / function /
 /// chord paths don't yet consult the graph for setback retraction.
-fn fillet_type_to_blend_radius(fillet_type: &FilletType) -> BlendRadius {
+fn fillet_type_to_blend_radius(fillet_type: &FilletType, edge_id: EdgeId) -> BlendRadius {
     match fillet_type {
         FilletType::Constant(r) => BlendRadius::Constant(*r),
         FilletType::Variable(r1, r2) => BlendRadius::Linear {
@@ -425,6 +489,13 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType) -> BlendRadius {
         // structural invariants (non-empty, monotone, in [0,1])
         // were enforced upstream by `validate_variable_stations`.
         FilletType::VariableStations(samples) => BlendRadius::Variable(samples.clone()),
+        // F5-β.5: per-edge constant looked up by edge id. Missing
+        // keys are rejected by `validate_fillet_inputs` upstream;
+        // the fallback to `Constant(0.0)` here is defensive and
+        // would propagate as an `InvalidRadius(0.0)` downstream.
+        FilletType::PerEdgeConstant(map) => {
+            BlendRadius::Constant(map.get(&edge_id).copied().unwrap_or(0.0))
+        }
         // The Function and Chord paths don't expose a closed-form
         // sampling here; report Constant(1.0) as a placeholder so
         // the edge is still classified into the graph. F4 will
@@ -598,6 +669,29 @@ fn create_fillet_chain(
                     face1_id,
                     face2_id,
                     &evaluator,
+                    blend_graph,
+                )?
+            }
+            FilletType::PerEdgeConstant(map) => {
+                // F5-β.5: route each edge through the constant-radius
+                // path with its own per-edge value. Coverage is
+                // guaranteed by `validate_fillet_inputs` (every
+                // selected edge has a map entry); the missing-key
+                // path here surfaces as `InternalError` because by
+                // this point validation has already passed and any
+                // mismatch is a kernel-internal logic violation.
+                let r = map.get(&edge_id).copied().ok_or_else(|| {
+                    OperationError::InternalError(format!(
+                        "PerEdgeConstant: edge {} has no radius entry after validation",
+                        edge_id
+                    ))
+                })?;
+                create_constant_radius_fillet(
+                    model,
+                    edge_id,
+                    face1_id,
+                    face2_id,
+                    r,
                     blend_graph,
                 )?
             }
@@ -5375,6 +5469,58 @@ fn validate_fillet_inputs(
                 )));
             }
         }
+        FilletType::PerEdgeConstant(map) => {
+            // F5-β.5: structural validation for the per-edge variant.
+            // Surfaces as `InvalidInput` because every failure mode
+            // here is caller-side (wrong DTO shape, missing or extra
+            // edges, non-finite or non-positive radius).
+            if map.is_empty() {
+                return Err(OperationError::InvalidInput {
+                    parameter: "fillet_type.PerEdgeConstant".into(),
+                    expected: "non-empty per-edge radius map".into(),
+                    received: "empty map".into(),
+                });
+            }
+            // Coverage: every selected edge must have an entry.
+            let selection: HashSet<EdgeId> = edges.iter().copied().collect();
+            for &edge_id in edges {
+                if !map.contains_key(&edge_id) {
+                    return Err(OperationError::InvalidInput {
+                        parameter: "fillet_type.PerEdgeConstant".into(),
+                        expected: "radius entry for every selected edge".into(),
+                        received: format!("edge {} has no radius entry", edge_id),
+                    });
+                }
+            }
+            // No extras: every map key must correspond to a selected
+            // edge. Catches typos in caller-supplied edge ids and
+            // stale entries from interactive UIs that mutate the
+            // selection after the radius dictionary was built.
+            for &mapped_id in map.keys() {
+                if !selection.contains(&mapped_id) {
+                    return Err(OperationError::InvalidInput {
+                        parameter: "fillet_type.PerEdgeConstant".into(),
+                        expected: "no extra map entries beyond the selection".into(),
+                        received: format!(
+                            "edge {} has a radius entry but is not in the selection",
+                            mapped_id
+                        ),
+                    });
+                }
+            }
+            // Per-entry radius validity. Tolerance-aware so a
+            // sub-tolerance "round" can't slip past as 1e-15 and
+            // collapse into a numerical artifact downstream.
+            for (&edge_id, &r) in map.iter() {
+                if !r.is_finite() || r <= tol {
+                    return Err(OperationError::InvalidInput {
+                        parameter: format!("fillet_type.PerEdgeConstant[{}]", edge_id),
+                        expected: format!("finite radius > tolerance ({:.3e})", tol),
+                        received: format!("{r}"),
+                    });
+                }
+            }
+        }
         _ => {
             // Variant-specific validators handle their own radius checks.
         }
@@ -5688,7 +5834,7 @@ mod tests {
     fn fillet_type_to_blend_radius_maps_variable_stations_to_variable() {
         let samples = vec![(0.0, 1.0), (0.5, 2.0), (1.0, 1.5)];
         let ft = FilletType::VariableStations(samples.clone());
-        match fillet_type_to_blend_radius(&ft) {
+        match fillet_type_to_blend_radius(&ft, 0) {
             BlendRadius::Variable(out) => assert_eq!(out, samples),
             other => panic!("expected BlendRadius::Variable, got {other:?}"),
         }
@@ -5696,14 +5842,14 @@ mod tests {
 
     #[test]
     fn fillet_type_to_blend_radius_constant_still_maps_to_constant() {
-        // Regression pin: adding VariableStations must not alter
-        // the existing Constant → Constant / Variable(2) → Linear
-        // mappings used by every legacy fillet path.
-        match fillet_type_to_blend_radius(&FilletType::Constant(2.0)) {
+        // Regression pin: adding VariableStations / PerEdgeConstant
+        // must not alter the existing Constant → Constant / Variable(2)
+        // → Linear mappings used by every legacy fillet path.
+        match fillet_type_to_blend_radius(&FilletType::Constant(2.0), 0) {
             BlendRadius::Constant(r) => assert!((r - 2.0).abs() < 1e-12),
             other => panic!("expected BlendRadius::Constant, got {other:?}"),
         }
-        match fillet_type_to_blend_radius(&FilletType::Variable(1.0, 3.0)) {
+        match fillet_type_to_blend_radius(&FilletType::Variable(1.0, 3.0), 0) {
             BlendRadius::Linear { start, end } => {
                 assert!((start - 1.0).abs() < 1e-12);
                 assert!((end - 3.0).abs() < 1e-12);
@@ -7430,6 +7576,486 @@ mod tests {
                 "expected InvalidGeometry for half-circle sweep, got {:?}",
                 other
             ),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // F5-β.5.1 — FilletType::PerEdgeConstant
+    //
+    // Coverage:
+    //   - Clone / Debug invariants on the new variant.
+    //   - `validate_fillet_inputs` accepts a fully-covered, finite-and-
+    //     positive radius map and rejects every structural / numeric
+    //     mismatch (empty, missing entry, extra entry, non-finite,
+    //     zero, sub-tolerance).
+    //   - `fillet_type_to_blend_radius` looks up by edge id.
+    //   - Eight proptests stress the validator over randomised maps,
+    //     mutations, and permutations.
+    // -------------------------------------------------------------------
+
+    /// Helper: build a model with `n` distinct line edges and return
+    /// the solid id plus the list of edge ids. Each edge sits on its
+    /// own pair of unit-displaced vertices so half-edge-length bounds
+    /// always permit a radius of 0.1.
+    fn build_n_edge_model(n: usize) -> (BRepModel, SolidId, Vec<EdgeId>) {
+        let mut model = BRepModel::new();
+        let solid_id = build_unit_box(&mut model);
+        let mut edges = Vec::with_capacity(n);
+        for i in 0..n {
+            let from = Point3::new(i as f64 * 10.0, 0.0, 0.0);
+            let to = Point3::new(i as f64 * 10.0 + 4.0, 0.0, 0.0);
+            let (eid, _, _) = add_simple_edge(&mut model, from, to);
+            edges.push(eid);
+        }
+        (model, solid_id, edges)
+    }
+
+    fn per_edge_map(entries: &[(EdgeId, f64)]) -> HashMap<EdgeId, f64> {
+        entries.iter().copied().collect()
+    }
+
+    fn opts_with_per_edge(map: HashMap<EdgeId, f64>) -> FilletOptions {
+        FilletOptions {
+            radius: 1.0,
+            fillet_type: FilletType::PerEdgeConstant(map),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn per_edge_constant_clone_preserves_map() {
+        let mut m = HashMap::new();
+        m.insert(7_u32 as EdgeId, 1.25);
+        m.insert(11_u32 as EdgeId, 2.5);
+        let ft = FilletType::PerEdgeConstant(m.clone());
+        let cloned = ft.clone();
+        match cloned {
+            FilletType::PerEdgeConstant(c) => {
+                assert_eq!(c.len(), m.len());
+                for (k, v) in m.iter() {
+                    assert!((c.get(k).copied().unwrap_or(0.0) - v).abs() < 1e-12);
+                }
+            }
+            other => panic!("expected PerEdgeConstant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_edge_constant_debug_includes_entries_and_label() {
+        let mut m = HashMap::new();
+        m.insert(3_u32 as EdgeId, 0.75);
+        let ft = FilletType::PerEdgeConstant(m);
+        let s = format!("{:?}", ft);
+        assert!(s.contains("PerEdgeConstant"), "missing label: {s}");
+        assert!(s.contains("3"), "missing edge id: {s}");
+        assert!(s.contains("0.75"), "missing radius: {s}");
+    }
+
+    #[test]
+    fn per_edge_constant_debug_is_deterministic_across_insertion_order() {
+        // HashMap iteration order is randomised; the Debug impl
+        // must sort by edge id so timeline replay diffs are
+        // stable. We build two maps with the same logical entries
+        // inserted in opposite order and assert their Debug strings
+        // match exactly.
+        let mut a = HashMap::new();
+        a.insert(2_u32 as EdgeId, 1.0);
+        a.insert(5_u32 as EdgeId, 2.0);
+        a.insert(11_u32 as EdgeId, 3.0);
+
+        let mut b = HashMap::new();
+        b.insert(11_u32 as EdgeId, 3.0);
+        b.insert(2_u32 as EdgeId, 1.0);
+        b.insert(5_u32 as EdgeId, 2.0);
+
+        assert_eq!(
+            format!("{:?}", FilletType::PerEdgeConstant(a)),
+            format!("{:?}", FilletType::PerEdgeConstant(b)),
+        );
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_accepts_full_coverage() {
+        let (model, solid_id, edges) = build_n_edge_model(3);
+        let map = per_edge_map(&[(edges[0], 0.5), (edges[1], 0.75), (edges[2], 1.0)]);
+        let opts = opts_with_per_edge(map);
+        assert!(validate_fillet_inputs(&model, solid_id, &edges, &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_rejects_empty_map() {
+        let (model, solid_id, edges) = build_n_edge_model(1);
+        let opts = opts_with_per_edge(HashMap::new());
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeConstant"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_rejects_missing_edge() {
+        let (model, solid_id, edges) = build_n_edge_model(3);
+        // Two edges in the selection, only one in the map.
+        let map = per_edge_map(&[(edges[0], 1.0)]);
+        let opts = opts_with_per_edge(map);
+        let result = validate_fillet_inputs(&model, solid_id, &edges[..2], &opts);
+        match result {
+            Err(OperationError::InvalidInput { received, .. }) => {
+                assert!(received.contains("no radius entry"), "{received}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_rejects_extra_map_entry() {
+        let (model, solid_id, edges) = build_n_edge_model(3);
+        // Selection has 1 edge; map has 2 — one extra beyond the
+        // selection. Catches stale UI dictionary entries.
+        let map = per_edge_map(&[(edges[0], 1.0), (edges[1], 0.5)]);
+        let opts = opts_with_per_edge(map);
+        let result = validate_fillet_inputs(&model, solid_id, &edges[..1], &opts);
+        match result {
+            Err(OperationError::InvalidInput { received, .. }) => {
+                assert!(
+                    received.contains("not in the selection"),
+                    "{received}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_rejects_non_finite_radius() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_map(&[(edges[0], 1.0), (edges[1], f64::NAN)]);
+        let opts = opts_with_per_edge(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeConstant"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        let map = per_edge_map(&[(edges[0], 1.0), (edges[1], f64::INFINITY)]);
+        let opts = opts_with_per_edge(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { .. }) => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_rejects_zero_or_negative_radius() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+
+        let map = per_edge_map(&[(edges[0], 1.0), (edges[1], 0.0)]);
+        let opts = opts_with_per_edge(map);
+        assert!(matches!(
+            validate_fillet_inputs(&model, solid_id, &edges, &opts),
+            Err(OperationError::InvalidInput { .. })
+        ));
+
+        let map = per_edge_map(&[(edges[0], 1.0), (edges[1], -0.5)]);
+        let opts = opts_with_per_edge(map);
+        assert!(matches!(
+            validate_fillet_inputs(&model, solid_id, &edges, &opts),
+            Err(OperationError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_fillet_inputs_per_edge_constant_rejects_sub_tolerance_radius() {
+        let (model, solid_id, edges) = build_n_edge_model(1);
+        let tol = Tolerance::default().distance();
+        // Half of the default tolerance is definitely below the gate
+        // and well above the 0.0 short-circuit, exercising the
+        // `r <= tol` arm specifically.
+        let r_sub = tol * 0.5;
+        let map = per_edge_map(&[(edges[0], r_sub)]);
+        let opts = opts_with_per_edge(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeConstant"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_per_edge_constant_returns_edge_value() {
+        let mut m = HashMap::new();
+        m.insert(7_u32 as EdgeId, 2.0);
+        m.insert(13_u32 as EdgeId, 3.5);
+        let ft = FilletType::PerEdgeConstant(m);
+        match fillet_type_to_blend_radius(&ft, 13) {
+            BlendRadius::Constant(r) => assert!((r - 3.5).abs() < 1e-12),
+            other => panic!("expected BlendRadius::Constant(3.5), got {other:?}"),
+        }
+        match fillet_type_to_blend_radius(&ft, 7) {
+            BlendRadius::Constant(r) => assert!((r - 2.0).abs() < 1e-12),
+            other => panic!("expected BlendRadius::Constant(2.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_per_edge_constant_missing_key_falls_back_to_zero() {
+        // Defensive fallback only — by the time this is called,
+        // `validate_fillet_inputs` has already enforced coverage.
+        // The fallback exists so the kernel never panics on a logic
+        // violation and the downstream `InvalidRadius(0.0)` gate
+        // surfaces a typed error instead.
+        let mut m = HashMap::new();
+        m.insert(7_u32 as EdgeId, 2.0);
+        let ft = FilletType::PerEdgeConstant(m);
+        match fillet_type_to_blend_radius(&ft, 99) {
+            BlendRadius::Constant(r) => assert!(r == 0.0),
+            other => panic!("expected BlendRadius::Constant(0.0), got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Proptest harness for `validate_fillet_inputs` with PerEdgeConstant.
+    //
+    // Strategy:
+    //   - `arb_radius_finite_positive`: finite radius in (tol, 100).
+    //   - `arb_selection_size`: 1..=8 edges per case.
+    //   - For each case, build a model with N edges, derive a
+    //     correctly-shaped map, and run a focused mutation.
+    //
+    // Each property is *deterministic* given its random inputs: the
+    // validator's expected return value is computable from the
+    // mutation, not from a re-implementation of the validator. This
+    // catches drift between the validator's logic and its
+    // specification.
+    // -------------------------------------------------------------------
+
+    fn arb_radius_finite_positive() -> impl Strategy<Value = f64> {
+        // (tol, 100). Default tolerance is ~1e-6, so 1e-3 is a safe
+        // floor that always passes the `r > tol` gate without
+        // collapsing into the NumericalError regime.
+        (1e-3_f64..100.0_f64).prop_filter("must be finite", |r| r.is_finite())
+    }
+
+    fn arb_selection_size() -> impl Strategy<Value = usize> {
+        1usize..=8
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            max_global_rejects: 4096,
+            ..ProptestConfig::default()
+        })]
+
+        /// Any correctly-shaped per-edge map (every selected edge
+        /// has exactly one entry, every radius finite-positive)
+        /// must be accepted by `validate_fillet_inputs`.
+        #[test]
+        fn prop_validate_fillet_inputs_per_edge_constant_accepts_any_valid_coverage(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            // Derive deterministic radii from the seed so every
+            // edge gets a distinct, finite-positive value.
+            let mut map: HashMap<EdgeId, f64> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                // Map seed+index → (0.1, 5.1) deterministically.
+                let bits = seed.wrapping_add(i as u64);
+                let r = 0.1 + ((bits % 5000) as f64) / 1000.0;
+                map.insert(e, r);
+            }
+            let opts = opts_with_per_edge(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        /// Removing any single edge's entry from an otherwise-valid
+        /// map always trips the coverage check.
+        #[test]
+        fn prop_validate_fillet_inputs_rejects_any_missing_edge(
+            n in 2usize..=8,
+            drop_index in 0usize..8,
+            r in arb_radius_finite_positive(),
+        ) {
+            let drop_index = drop_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, f64> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == drop_index { continue; }
+                map.insert(e, r);
+            }
+            let opts = opts_with_per_edge(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(
+                matches!(result, Err(OperationError::InvalidInput { .. })),
+                "expected InvalidInput for missing edge, got {result:?}",
+            );
+        }
+
+        /// Adding an extra map key not in the selection always
+        /// trips the "no extras" check.
+        #[test]
+        fn prop_validate_fillet_inputs_rejects_any_extra_key(
+            n in arb_selection_size(),
+            r in arb_radius_finite_positive(),
+            extra_offset in 1u32..=1024,
+        ) {
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, f64> = edges
+                .iter()
+                .map(|&e| (e, r))
+                .collect();
+            // Inject an edge id guaranteed not in the selection.
+            let max_eid: EdgeId = *edges.iter().max().expect("non-empty by strategy");
+            let extra: EdgeId = max_eid + extra_offset;
+            // Re-verify it's not already in the map (only true if
+            // the model happened to allocate that id, which our
+            // helper doesn't — but be defensive).
+            prop_assume!(!map.contains_key(&extra));
+            map.insert(extra, r);
+            let opts = opts_with_per_edge(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(
+                matches!(result, Err(OperationError::InvalidInput { .. })),
+                "expected InvalidInput for extra key, got {result:?}",
+            );
+        }
+
+        /// Replacing any one edge's radius with zero or negative
+        /// must reject. Catches misses where the validator skips
+        /// per-entry numeric checks after coverage passes.
+        #[test]
+        fn prop_validate_fillet_inputs_rejects_any_non_positive_radius(
+            n in arb_selection_size(),
+            bad_index in 0usize..8,
+            good_r in arb_radius_finite_positive(),
+            bad_r in -50.0_f64..=0.0,
+        ) {
+            let bad_index = bad_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, f64> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let r = if i == bad_index { bad_r } else { good_r };
+                map.insert(e, r);
+            }
+            let opts = opts_with_per_edge(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(
+                matches!(result, Err(OperationError::InvalidInput { .. })),
+                "expected InvalidInput for non-positive radius, got {result:?}",
+            );
+        }
+
+        /// Non-finite radii (NaN, +∞) at any position are rejected.
+        #[test]
+        fn prop_validate_fillet_inputs_rejects_any_non_finite_radius(
+            n in arb_selection_size(),
+            bad_index in 0usize..8,
+            good_r in arb_radius_finite_positive(),
+            use_nan in any::<bool>(),
+        ) {
+            let bad_index = bad_index % n;
+            let bad_r = if use_nan { f64::NAN } else { f64::INFINITY };
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, f64> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let r = if i == bad_index { bad_r } else { good_r };
+                map.insert(e, r);
+            }
+            let opts = opts_with_per_edge(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(
+                matches!(result, Err(OperationError::InvalidInput { .. })),
+                "expected InvalidInput for non-finite radius, got {result:?}",
+            );
+        }
+
+        /// Lookup faithfulness: `fillet_type_to_blend_radius` must
+        /// return exactly the map's value (as `Constant(r)`) for
+        /// every present key.
+        #[test]
+        fn prop_fillet_type_to_blend_radius_returns_map_value_for_existing_key(
+            n in arb_selection_size(),
+            r in arb_radius_finite_positive(),
+        ) {
+            let (_, _, edges) = build_n_edge_model(n);
+            let map: HashMap<EdgeId, f64> = edges.iter().map(|&e| (e, r)).collect();
+            let ft = FilletType::PerEdgeConstant(map);
+            for &e in &edges {
+                match fillet_type_to_blend_radius(&ft, e) {
+                    BlendRadius::Constant(out) => prop_assert!(
+                        (out - r).abs() < 1e-12,
+                        "out={out} r={r}",
+                    ),
+                    other => prop_assert!(
+                        false,
+                        "expected Constant({r}), got {other:?}",
+                    ),
+                }
+            }
+        }
+
+        /// Clone round-trip: cloning a PerEdgeConstant variant
+        /// preserves every entry exactly.
+        #[test]
+        fn prop_per_edge_constant_clone_round_trip(
+            n in arb_selection_size(),
+            r in arb_radius_finite_positive(),
+        ) {
+            let (_, _, edges) = build_n_edge_model(n);
+            let original: HashMap<EdgeId, f64> =
+                edges.iter().map(|&e| (e, r)).collect();
+            let ft = FilletType::PerEdgeConstant(original.clone());
+            let cloned = ft.clone();
+            match cloned {
+                FilletType::PerEdgeConstant(c) => {
+                    prop_assert_eq!(c.len(), original.len());
+                    for (k, v) in &original {
+                        let got = c.get(k).copied().unwrap_or(f64::NAN);
+                        prop_assert!((got - v).abs() < 1e-12);
+                    }
+                }
+                other => prop_assert!(
+                    false,
+                    "expected PerEdgeConstant, got {other:?}",
+                ),
+            }
+        }
+
+        /// Debug output is permutation-invariant: two maps with the
+        /// same entries inserted in any order produce identical
+        /// Debug strings. The recorded-operation JSON depends on
+        /// this for stable timeline diffs.
+        #[test]
+        fn prop_per_edge_constant_debug_is_deterministic_under_permutations(
+            entries in proptest::collection::vec(
+                (0u32..1024, arb_radius_finite_positive()),
+                1..=8,
+            ),
+        ) {
+            // Dedupe by edge id — HashMap insertion would otherwise
+            // collapse duplicates non-deterministically depending on
+            // order.
+            let mut dedup: HashMap<EdgeId, f64> = HashMap::new();
+            for (e, r) in &entries {
+                dedup.insert(*e as EdgeId, *r);
+            }
+            let mut sorted: Vec<(EdgeId, f64)> = dedup.iter().map(|(&k, &v)| (k, v)).collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let mut reversed = sorted.clone();
+            reversed.reverse();
+
+            let map_a: HashMap<EdgeId, f64> = sorted.into_iter().collect();
+            let map_b: HashMap<EdgeId, f64> = reversed.into_iter().collect();
+            prop_assert_eq!(
+                format!("{:?}", FilletType::PerEdgeConstant(map_a)),
+                format!("{:?}", FilletType::PerEdgeConstant(map_b)),
+            );
         }
     }
 }
