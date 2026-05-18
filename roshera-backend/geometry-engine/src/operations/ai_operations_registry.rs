@@ -77,6 +77,13 @@ pub enum AIOperationParameter {
     Point { x: f64, y: f64, z: f64 },
     Enum { value: String, options: Vec<String> },
     EntityRef(EntityReference),
+    /// F5-β.5.4 — parallel-array slot used to feed per-edge
+    /// radii into `execute_fillet`. The element at index `i`
+    /// binds to `targets[i]`; lengths must match. JSON shape is
+    /// the bare `f64` array (e.g. `[1.0, 1.5, 2.0]`), which is
+    /// unambiguous under `#[serde(untagged)]` since none of the
+    /// other variants deserialise from a top-level JSON array.
+    NumberArray(Vec<f64>),
 }
 
 /// Operation execution result with rich metadata
@@ -585,15 +592,27 @@ impl OperationsRegistry {
         command: &AIOperationCommand,
         model: &mut BRepModel,
     ) -> OperationResult<Vec<EntityReference>> {
-        // Extract radius
-        let radius = if let Some(param) = command.parameters.get("radius") {
+        // F5-β.5.4 — accept either a scalar `radius` or a
+        // parallel `radii` array. `radii` wins when present.
+        // Length must equal the resolved edge count; the kernel
+        // dispatches on `FilletType::PerEdgeConstant` when the
+        // values disagree.
+        let radius_scalar = if let Some(param) = command.parameters.get("radius") {
             match param.value() {
                 AIOperationParameter::Number { value, .. } => *value,
-                _ => 1.0, // Default radius
+                _ => 1.0,
             }
         } else {
-            1.0 // Default radius
+            1.0
         };
+
+        let radii_vec: Option<Vec<f64>> = command
+            .parameters
+            .get("radii")
+            .and_then(|param| match param.value() {
+                AIOperationParameter::NumberArray(values) => Some(values.clone()),
+                _ => None,
+            });
 
         // Get target edges
         let mut edge_ids = Vec::new();
@@ -616,11 +635,57 @@ impl OperationsRegistry {
             ));
         }
 
+        // F5-β.5.4 — build `FilletType` from the parallel-array
+        // radii if supplied, otherwise fall back to the legacy
+        // scalar path. The conservative `radius` field on
+        // `FilletOptions` carries the max for F6-α curvature
+        // budgeting; the `fillet_type` field carries the actual
+        // dispatch shape.
+        let (fillet_type, conservative_radius) = if let Some(radii) = radii_vec.as_ref() {
+            if radii.len() != edge_ids.len() {
+                return Err(OperationError::InvalidInput {
+                    parameter: "radii".to_string(),
+                    expected: format!(
+                        "array of length {} matching the target edges",
+                        edge_ids.len()
+                    ),
+                    received: format!("array of length {}", radii.len()),
+                });
+            }
+            for (i, r) in radii.iter().enumerate() {
+                if !r.is_finite() || *r <= 0.0 {
+                    return Err(OperationError::InvalidInput {
+                        parameter: "radii".to_string(),
+                        expected: "finite positive radii".to_string(),
+                        received: format!("radii[{}] = {}", i, r),
+                    });
+                }
+            }
+            let mut map: std::collections::HashMap<crate::primitives::edge::EdgeId, f64> =
+                std::collections::HashMap::with_capacity(edge_ids.len());
+            for (edge_id, r) in edge_ids.iter().zip(radii.iter()) {
+                map.insert(*edge_id, *r);
+            }
+            let max_r = radii
+                .iter()
+                .copied()
+                .fold(0.0_f64, |acc, r| if r > acc { r } else { acc });
+            (
+                crate::operations::fillet::FilletType::PerEdgeConstant(map),
+                max_r,
+            )
+        } else {
+            (
+                crate::operations::fillet::FilletType::Constant(radius_scalar),
+                radius_scalar,
+            )
+        };
+
         // Execute fillet
         let options = FilletOptions {
-            radius,
+            radius: conservative_radius,
             common: crate::operations::CommonOptions::default(),
-            fillet_type: crate::operations::fillet::FilletType::Constant(radius),
+            fillet_type,
             propagation: crate::operations::fillet::PropagationMode::Tangent,
             preserve_edges: true,
             quality: crate::operations::fillet::FilletQuality::Standard,
@@ -1149,21 +1214,42 @@ impl OperationsRegistry {
     fn register_fillet_operation(&mut self) {
         let info = AIOperationInfo {
             name: "fillet".to_string(),
-            description: "Round edges with a constant radius".to_string(),
+            description: "Round edges with a constant radius, or with \
+                          per-edge constant radii via the `radii` array"
+                .to_string(),
             aliases: vec!["round".to_string(), "blend".to_string()],
             categories: vec!["edge".to_string(), "modification".to_string()],
             required_entities: vec!["edge".to_string()],
-            parameters: vec![OperationParameter {
-                name: "radius".to_string(),
-                description: "Fillet radius in millimeters".to_string(),
-                param_type: "number".to_string(),
-                required: true,
-                default_value: Some(serde_json::json!(1.0)),
-                constraints: Some(serde_json::json!({
-                    "min": 0.001,
-                    "max": 1000.0
-                })),
-            }],
+            parameters: vec![
+                OperationParameter {
+                    name: "radius".to_string(),
+                    description: "Fillet radius in millimeters. Used when \
+                                  `radii` is not supplied; otherwise ignored."
+                        .to_string(),
+                    param_type: "number".to_string(),
+                    required: false,
+                    default_value: Some(serde_json::json!(1.0)),
+                    constraints: Some(serde_json::json!({
+                        "min": 0.001,
+                        "max": 1000.0
+                    })),
+                },
+                OperationParameter {
+                    name: "radii".to_string(),
+                    description: "F5-β.5.4 — per-edge constant radii. \
+                                  Array length must match the resolved \
+                                  edge target count. Each entry binds \
+                                  positionally to the i-th edge target."
+                        .to_string(),
+                    param_type: "array<number>".to_string(),
+                    required: false,
+                    default_value: None,
+                    constraints: Some(serde_json::json!({
+                        "min_item": 0.001,
+                        "max_item": 1000.0
+                    })),
+                },
+            ],
             examples: vec![OperationExample {
                 input: "fillet all edges with radius 2mm".to_string(),
                 entities: vec!["all_edges".to_string()],
@@ -1623,5 +1709,98 @@ mod uuid {
         pub fn to_string(&self) -> String {
             format!("{:032x}", self.0)
         }
+    }
+}
+
+// =====================================================================
+// F5-β.5.4 — AI catalog unit tests for per-edge radii dispatch
+// =====================================================================
+#[cfg(test)]
+mod fillet_per_edge_radii_tests {
+    //! Two-test sweep validating the `radii` parameter slot on
+    //! `execute_fillet`:
+    //!
+    //! 1. `radii` parameter deserialises through the `serde(untagged)`
+    //!    `AIOperationParameter::NumberArray(Vec<f64>)` variant from
+    //!    a bare-array JSON payload, leaving the other variants
+    //!    untouched.
+    //! 2. `register_fillet_operation` exposes both `radius` and
+    //!    `radii` slots in the operation info catalogue so AI
+    //!    discovery can introspect them.
+    //!
+    //! End-to-end dispatch through a real `BRepModel` is covered by
+    //! the router-integration suite in api-server (F5-β.5.3) — these
+    //! catalogue tests pin the wire shape and discovery shape of the
+    //! new slot, not the kernel surgery.
+    use super::*;
+
+    #[test]
+    fn radii_parameter_deserialises_as_number_array_variant() {
+        // Wire shape: a bare JSON array. Under `serde(untagged)` it
+        // must resolve to `NumberArray(_)` and not to any other
+        // variant.
+        let json_blob = serde_json::json!([1.0, 1.5, 2.0]);
+        let param: AIOperationParameter =
+            serde_json::from_value(json_blob).expect("array → NumberArray");
+        match param {
+            AIOperationParameter::NumberArray(values) => {
+                assert_eq!(values, vec![1.0, 1.5, 2.0]);
+            }
+            other => panic!("expected NumberArray, got {other:?}"),
+        }
+
+        // Round-trip: serialised form is the bare array.
+        let back = serde_json::to_value(AIOperationParameter::NumberArray(vec![
+            0.5, 0.75, 1.0,
+        ]))
+        .expect("serialise NumberArray");
+        assert_eq!(back, serde_json::json!([0.5, 0.75, 1.0]));
+
+        // Negative: bare numbers and objects must still take the
+        // legacy variants, not collapse into NumberArray.
+        let scalar: AIOperationParameter =
+            serde_json::from_value(serde_json::json!({"value": 1.0, "unit": null}))
+                .expect("Number obj");
+        assert!(matches!(scalar, AIOperationParameter::Number { .. }));
+        let text: AIOperationParameter =
+            serde_json::from_value(serde_json::json!("hello")).expect("Text");
+        assert!(matches!(text, AIOperationParameter::Text(_)));
+    }
+
+    #[test]
+    fn fillet_registry_exposes_radius_and_radii_parameter_slots() {
+        // The natural-language discovery surface must advertise
+        // both the legacy `radius` slot (scalar) and the F5-β.5.4
+        // `radii` array slot. Catches accidental regression of the
+        // catalog registration.
+        let registry = OperationsRegistry::new();
+        let info = registry
+            .operations
+            .get("fillet")
+            .expect("fillet must be registered");
+        let names: Vec<&str> = info
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"radius"),
+            "fillet must advertise `radius`, got {names:?}"
+        );
+        assert!(
+            names.contains(&"radii"),
+            "fillet must advertise `radii`, got {names:?}"
+        );
+
+        let radii_param = info
+            .parameters
+            .iter()
+            .find(|p| p.name == "radii")
+            .expect("radii slot");
+        assert_eq!(radii_param.param_type, "array<number>");
+        assert!(
+            !radii_param.required,
+            "radii must be optional — caller may still pass scalar `radius`"
+        );
     }
 }
