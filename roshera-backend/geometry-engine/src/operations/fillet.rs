@@ -8343,6 +8343,27 @@ mod tests {
         1usize..=8
     }
 
+    /// Build one of the three `BlendRadius` variants with a non-
+    /// trivial, validation-passing shape from a `seed`. The variant
+    /// kind is picked by `kind % 3`. Radii are deterministically
+    /// derived from the seed so prop-test minimisation produces
+    /// reproducible cases. Variable stations are fixed monotone
+    /// `[0.0, 0.5, 1.0]`; radii vary by seed.
+    fn build_arb_blend_radius(seed: u64, kind: u8) -> BlendRadius {
+        let r0 = 0.1 + ((seed % 4000) as f64) / 1000.0;
+        let r1 = 0.1 + (((seed >> 7) % 4000) as f64) / 1000.0;
+        let r2 = 0.1 + (((seed >> 13) % 4000) as f64) / 1000.0;
+        match kind % 3 {
+            0 => BlendRadius::Constant(r0),
+            1 => BlendRadius::Linear { start: r0, end: r1 },
+            _ => BlendRadius::Variable(vec![
+                (0.0, r0),
+                (0.5, r1),
+                (1.0, r2),
+            ]),
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 96,
@@ -8554,6 +8575,289 @@ mod tests {
             prop_assert_eq!(
                 format!("{:?}", FilletType::PerEdgeConstant(map_a)),
                 format!("{:?}", FilletType::PerEdgeConstant(map_b)),
+            );
+        }
+
+        // -------------------------------------------------------------
+        // F5-β.5.6 — `PerEdgeProfile` prop tests
+        //
+        // Mirrors the `PerEdgeConstant` prop suite above but reaches
+        // one level deeper into the per-edge profile. Each prop pins
+        // an invariant of the new variant under randomised inputs.
+        // The `build_arb_blend_radius` helper lives outside the
+        // `proptest!` block (the macro doesn't admit free function
+        // definitions inside its body).
+        // -------------------------------------------------------------
+
+        /// Every valid per-edge profile map (one entry per selected
+        /// edge, finite-positive radii, valid Variable stations) is
+        /// accepted by `validate_fillet_inputs`.
+        #[test]
+        fn prop_validate_per_edge_profile_accepts_any_valid_coverage(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let s = seed.wrapping_add(i as u64);
+                map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+            }
+            let opts = FilletOptions {
+                radius: 1.0,
+                fillet_type: FilletType::PerEdgeProfile(map),
+                ..Default::default()
+            };
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        /// Removing any single edge's entry from an otherwise-valid
+        /// per-edge-profile map always trips the coverage check.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_any_missing_edge(
+            n in 2usize..=8,
+            drop_index in 0usize..8,
+            seed in any::<u64>(),
+        ) {
+            let drop_index = drop_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == drop_index { continue; }
+                let s = seed.wrapping_add(i as u64);
+                map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+            }
+            let opts = FilletOptions {
+                radius: 1.0,
+                fillet_type: FilletType::PerEdgeProfile(map),
+                ..Default::default()
+            };
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_err(), "expected Err, got {result:?}");
+        }
+
+        /// Adding any extra (non-selected) edge entry to an otherwise-
+        /// valid map trips the no-extras check.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_any_extra_key(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let s = seed.wrapping_add(i as u64);
+                map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+            }
+            // Inject a guaranteed-extra key. `build_n_edge_model`
+            // generates edge ids densely from EdgeStore allocation,
+            // so a u32 well above any plausibly-allocated id will
+            // not collide with the selection.
+            let extra: EdgeId = 999_999_u32 as EdgeId;
+            map.insert(extra, BlendRadius::Constant(0.5));
+            let opts = FilletOptions {
+                radius: 1.0,
+                fillet_type: FilletType::PerEdgeProfile(map),
+                ..Default::default()
+            };
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_err(), "expected Err, got {result:?}");
+        }
+
+        /// A negative `Constant` radius on any single edge is always
+        /// rejected.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_negative_constant_anywhere(
+            n in 1usize..=6,
+            bad_index in 0usize..8,
+            r_neg in -10.0f64..=-1e-6f64,
+            seed in any::<u64>(),
+        ) {
+            let bad_index = bad_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == bad_index {
+                    map.insert(e, BlendRadius::Constant(r_neg));
+                } else {
+                    let s = seed.wrapping_add(i as u64);
+                    map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                }
+            }
+            let opts = FilletOptions {
+                radius: 1.0,
+                fillet_type: FilletType::PerEdgeProfile(map),
+                ..Default::default()
+            };
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_err(), "expected Err, got {result:?}");
+        }
+
+        /// A `Linear { start, end }` with a non-finite or non-positive
+        /// endpoint on any single edge is always rejected.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_invalid_linear_endpoint(
+            n in 1usize..=6,
+            bad_index in 0usize..8,
+            // Cover the three failure modes deterministically.
+            mode in 0u8..3,
+            seed in any::<u64>(),
+        ) {
+            let bad_index = bad_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == bad_index {
+                    let bad = match mode {
+                        0 => BlendRadius::Linear { start: 0.0, end: 1.0 },
+                        1 => BlendRadius::Linear { start: 1.0, end: -0.5 },
+                        _ => BlendRadius::Linear {
+                            start: f64::NAN,
+                            end: 1.0,
+                        },
+                    };
+                    map.insert(e, bad);
+                } else {
+                    let s = seed.wrapping_add(i as u64);
+                    map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                }
+            }
+            let opts = FilletOptions {
+                radius: 1.0,
+                fillet_type: FilletType::PerEdgeProfile(map),
+                ..Default::default()
+            };
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_err(), "expected Err, got {result:?}");
+        }
+
+        /// A `Variable` profile with non-monotone stations on any
+        /// single edge is always rejected. We perturb a fixed
+        /// 3-sample template so the offending edge has stations
+        /// `[0.0, 0.5, p]` with `p ≤ 0.5`.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_non_monotone_variable(
+            n in 1usize..=6,
+            bad_index in 0usize..8,
+            p_third in 0.0f64..=0.5f64,
+            seed in any::<u64>(),
+        ) {
+            let bad_index = bad_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == bad_index {
+                    map.insert(
+                        e,
+                        BlendRadius::Variable(vec![
+                            (0.0, 0.4),
+                            (0.5, 0.6),
+                            (p_third, 0.4),
+                        ]),
+                    );
+                } else {
+                    let s = seed.wrapping_add(i as u64);
+                    map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                }
+            }
+            let opts = FilletOptions {
+                radius: 1.0,
+                fillet_type: FilletType::PerEdgeProfile(map),
+                ..Default::default()
+            };
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_err(), "expected Err, got {result:?}");
+        }
+
+        /// `fillet_type_to_blend_radius` returns the map's stored
+        /// profile *unchanged* for every present key. No variant
+        /// transmutation, no radius drift.
+        #[test]
+        fn prop_fillet_type_to_blend_radius_per_edge_profile_round_trip(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (_, _, edges) = build_n_edge_model(n);
+            let mut original: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let s = seed.wrapping_add(i as u64);
+                original.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+            }
+            let ft = FilletType::PerEdgeProfile(original.clone());
+            for &e in &edges {
+                let expected = original.get(&e).cloned();
+                let got = fillet_type_to_blend_radius(&ft, e);
+                prop_assert_eq!(
+                    expected.as_ref(),
+                    Some(&got),
+                    "edge {:?}: expected {:?}, got {:?}",
+                    e,
+                    expected,
+                    got,
+                );
+            }
+        }
+
+        /// Cloning a `PerEdgeProfile` variant preserves every entry
+        /// exactly — including the *kind* of each `BlendRadius`. We
+        /// build mixed-kind maps and assert per-entry equality via
+        /// `PartialEq` (already derived on `BlendRadius`).
+        #[test]
+        fn prop_per_edge_profile_clone_preserves_mixed_kinds(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (_, _, edges) = build_n_edge_model(n);
+            let mut original: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let s = seed.wrapping_add(i as u64);
+                original.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+            }
+            let ft = FilletType::PerEdgeProfile(original.clone());
+            let cloned = ft.clone();
+            match cloned {
+                FilletType::PerEdgeProfile(c) => {
+                    prop_assert_eq!(c.len(), original.len());
+                    for (k, v) in &original {
+                        prop_assert_eq!(c.get(k), Some(v));
+                    }
+                }
+                other => prop_assert!(
+                    false,
+                    "expected PerEdgeProfile, got {other:?}",
+                ),
+            }
+        }
+
+        /// Debug output is permutation-invariant: two maps with the
+        /// same entries inserted in any order produce identical
+        /// Debug strings. Required for stable timeline replay diffs.
+        #[test]
+        fn prop_per_edge_profile_debug_is_deterministic_under_permutations(
+            entries in proptest::collection::vec(
+                (0u32..1024, 0u8..3, any::<u64>()),
+                1..=6,
+            ),
+        ) {
+            // Dedupe by edge id so HashMap collisions don't make
+            // the two orderings disagree about which value survived.
+            let mut dedup: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            for (e, kind, seed) in &entries {
+                dedup.insert(*e as EdgeId, build_arb_blend_radius(*seed, *kind));
+            }
+            let mut sorted: Vec<(EdgeId, BlendRadius)> = dedup
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let mut reversed = sorted.clone();
+            reversed.reverse();
+            let map_a: HashMap<EdgeId, BlendRadius> = sorted.into_iter().collect();
+            let map_b: HashMap<EdgeId, BlendRadius> = reversed.into_iter().collect();
+            prop_assert_eq!(
+                format!("{:?}", FilletType::PerEdgeProfile(map_a)),
+                format!("{:?}", FilletType::PerEdgeProfile(map_b)),
             );
         }
     }
