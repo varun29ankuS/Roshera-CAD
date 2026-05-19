@@ -114,6 +114,30 @@ pub enum FilletType {
     /// to `apply_apex_sphere_corner`. Variable / chord per-edge mixes
     /// land in F5-β.5.6+.
     PerEdgeConstant(HashMap<EdgeId, f64>),
+    /// Per-edge variable profiles. Each edge can carry its own
+    /// [`BlendRadius`] profile — `Constant`, `Linear`, or `Variable`.
+    /// Used when a single fillet call mixes different *kinds* of
+    /// radii across edges (F5-β.5.6). The all-Constant case stays on
+    /// [`FilletType::PerEdgeConstant`] to keep the cheap single-`f64`
+    /// shape; this variant is reserved for selections that include
+    /// at least one non-Constant profile.
+    ///
+    /// Invariants enforced by `validate_fillet_inputs`:
+    /// - Map contains exactly one entry per edge in the selection.
+    /// - No extra entries for edges not in the selection.
+    /// - Each `Constant(r)` is finite, > 0, and > `Tolerance::distance`.
+    /// - Each `Linear { start, end }` has both endpoints finite,
+    ///   strictly positive, and > tolerance.
+    /// - Each `Variable(samples)` satisfies the same invariants as
+    ///   [`FilletType::VariableStations`] (delegated to
+    ///   `validate_variable_stations`).
+    ///
+    /// The dispatcher in `create_fillet_chain` fans each edge out
+    /// to the matching legacy creation function:
+    /// - `Constant` → `create_constant_radius_fillet`
+    /// - `Linear` → `create_variable_radius_fillet`
+    /// - `Variable` → `create_function_radius_fillet`
+    PerEdgeProfile(HashMap<EdgeId, BlendRadius>),
     /// Radius function along edge parameter
     Function(Box<dyn Fn(f64) -> f64>),
     /// Chord length fillet
@@ -138,6 +162,15 @@ impl std::fmt::Debug for FilletType {
                 entries.sort_by_key(|(eid, _)| **eid);
                 f.debug_tuple("PerEdgeConstant").field(&entries).finish()
             }
+            FilletType::PerEdgeProfile(map) => {
+                // Same determinism rationale as `PerEdgeConstant`:
+                // sort by edge id so recorded-operation JSON and
+                // timeline replay diffs are stable regardless of
+                // HashMap insertion order.
+                let mut entries: Vec<(&EdgeId, &BlendRadius)> = map.iter().collect();
+                entries.sort_by_key(|(eid, _)| **eid);
+                f.debug_tuple("PerEdgeProfile").field(&entries).finish()
+            }
             FilletType::Function(_) => f.debug_tuple("Function").field(&"<function>").finish(),
             FilletType::Chord(c) => f.debug_tuple("Chord").field(c).finish(),
         }
@@ -151,6 +184,7 @@ impl Clone for FilletType {
             FilletType::Variable(r1, r2) => FilletType::Variable(*r1, *r2),
             FilletType::VariableStations(samples) => FilletType::VariableStations(samples.clone()),
             FilletType::PerEdgeConstant(map) => FilletType::PerEdgeConstant(map.clone()),
+            FilletType::PerEdgeProfile(map) => FilletType::PerEdgeProfile(map.clone()),
             FilletType::Function(_) => FilletType::Constant(5.0), // Fallback to constant
             FilletType::Chord(c) => FilletType::Chord(*c),
         }
@@ -234,6 +268,16 @@ pub fn fillet_edges(
                 .values()
                 .copied()
                 .fold(0.0_f64, f64::max),
+            // F5-β.5.6: per-edge profile's largest *sample* radius
+            // across every profile shape. `BlendRadius::max_value`
+            // already normalises Constant / Linear / Variable to a
+            // single upper bound. Empty fold identity is 0.0 so an
+            // empty map degrades F6-α to a no-op and lets
+            // `validate_fillet_inputs` own the rejection.
+            FilletType::PerEdgeProfile(map) => map
+                .values()
+                .map(|b| b.max_value())
+                .fold(0.0_f64, f64::max),
             // `Function` and `Chord` paths don't have a closed-form
             // upper bound here; F6-α leaves them to the existing
             // downstream validation. Sampling them is F6-β.
@@ -287,6 +331,23 @@ pub fn fillet_edges(
                 FilletType::PerEdgeConstant(map) => {
                     vec![map.get(&edge_id).copied().unwrap_or(options.radius)]
                 }
+                // F5-β.5.6: per-edge profile — feed every sample of
+                // *this* edge's profile (not the global max) into
+                // the half-edge-length bounds check. `Constant` →
+                // one sample, `Linear` → two endpoints, `Variable`
+                // → every station radius. Missing keys are rejected
+                // by `validate_fillet_inputs` upstream; the
+                // fallback to `options.radius` here is purely
+                // defensive — if validation passes, the key is
+                // present.
+                FilletType::PerEdgeProfile(map) => match map.get(&edge_id) {
+                    Some(BlendRadius::Constant(r)) => vec![*r],
+                    Some(BlendRadius::Linear { start, end }) => vec![*start, *end],
+                    Some(BlendRadius::Variable(samples)) => {
+                        samples.iter().map(|&(_, r)| r).collect()
+                    }
+                    None => vec![options.radius],
+                },
                 // Function radii are validated per-sample inside the
                 // surgery loop; the placeholder of 1.0 only exercises the
                 // structural bounds here (edge length non-zero, edge
@@ -327,6 +388,23 @@ pub fn fillet_edges(
                     0.0
                 } else {
                     map.values().copied().fold(f64::INFINITY, f64::min)
+                }
+            }
+            // F5-β.5.6: smallest per-edge profile minimum. Folding
+            // `min_value()` (not `max_value()`) ensures a single
+            // zero / negative sample anywhere on any edge's profile
+            // can't be masked by a larger sibling — each profile
+            // has already been individually bounds-checked above.
+            // Empty maps short-circuit to 0.0, which trips the
+            // `radius <= 0.0` rejection below; the empty case is
+            // also rejected structurally by `validate_fillet_inputs`.
+            FilletType::PerEdgeProfile(map) => {
+                if map.is_empty() {
+                    0.0
+                } else {
+                    map.values()
+                        .map(|b| b.min_value())
+                        .fold(f64::INFINITY, f64::min)
                 }
             }
             FilletType::Function(_) => 0.0, // Will validate per point
@@ -496,6 +574,16 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType, edge_id: EdgeId) -> Ble
         FilletType::PerEdgeConstant(map) => {
             BlendRadius::Constant(map.get(&edge_id).copied().unwrap_or(0.0))
         }
+        // F5-β.5.6: per-edge profile maps directly — the kernel's
+        // `BlendRadius` enum already matches the variant set 1:1.
+        // Missing keys are rejected by `validate_fillet_inputs`
+        // upstream; the fallback to `Constant(0.0)` here is
+        // defensive and would propagate as an `InvalidRadius(0.0)`
+        // downstream.
+        FilletType::PerEdgeProfile(map) => map
+            .get(&edge_id)
+            .cloned()
+            .unwrap_or(BlendRadius::Constant(0.0)),
         // The Function and Chord paths don't expose a closed-form
         // sampling here; report Constant(1.0) as a placeholder so
         // the edge is still classified into the graph. F4 will
@@ -516,9 +604,26 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType, edge_id: EdgeId) -> Ble
 /// - First station ≥ 0.0, last ≤ 1.0.
 /// - Every radius > 0 and finite.
 fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
+    validate_variable_stations_labelled(samples, "fillet_type.VariableStations")
+}
+
+/// Same structural checks as [`validate_variable_stations`] but with
+/// a caller-supplied `label` so the `parameter` field on the
+/// resulting `InvalidInput` error reads
+/// `<label>[<i>].station` instead of
+/// `fillet_type.VariableStations[<i>].station`.
+///
+/// Used by `PerEdgeProfile` validation so the failing parameter
+/// names the offending edge (e.g.
+/// `fillet_type.PerEdgeProfile[42].Variable[3].station`) rather
+/// than the generic VariableStations label.
+fn validate_variable_stations_labelled(
+    samples: &[(f64, f64)],
+    label: &str,
+) -> OperationResult<()> {
     if samples.is_empty() {
         return Err(OperationError::InvalidInput {
-            parameter: "fillet_type.VariableStations".into(),
+            parameter: label.into(),
             expected: "non-empty list of (station, radius) samples".into(),
             received: "empty list".into(),
         });
@@ -526,14 +631,14 @@ fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
     for (i, &(s, r)) in samples.iter().enumerate() {
         if !s.is_finite() || !r.is_finite() {
             return Err(OperationError::InvalidInput {
-                parameter: format!("fillet_type.VariableStations[{i}]"),
+                parameter: format!("{label}[{i}]"),
                 expected: "finite station and radius".into(),
                 received: format!("station={s}, radius={r}"),
             });
         }
         if r <= 0.0 {
             return Err(OperationError::InvalidInput {
-                parameter: format!("fillet_type.VariableStations[{i}].radius"),
+                parameter: format!("{label}[{i}].radius"),
                 expected: "> 0".into(),
                 received: format!("{r}"),
             });
@@ -541,7 +646,7 @@ fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
     }
     if samples[0].0 < 0.0 {
         return Err(OperationError::InvalidInput {
-            parameter: "fillet_type.VariableStations[0].station".into(),
+            parameter: format!("{label}[0].station"),
             expected: "≥ 0.0".into(),
             received: format!("{}", samples[0].0),
         });
@@ -549,7 +654,7 @@ fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
     let last_station = samples[samples.len() - 1].0;
     if last_station > 1.0 {
         return Err(OperationError::InvalidInput {
-            parameter: "fillet_type.VariableStations[last].station".into(),
+            parameter: format!("{label}[last].station"),
             expected: "≤ 1.0".into(),
             received: format!("{last_station}"),
         });
@@ -557,7 +662,7 @@ fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
     for window in samples.windows(2) {
         if window[1].0 <= window[0].0 {
             return Err(OperationError::InvalidInput {
-                parameter: "fillet_type.VariableStations.station".into(),
+                parameter: format!("{label}.station"),
                 expected: "strictly increasing".into(),
                 received: format!("{} → {}", window[0].0, window[1].0),
             });
@@ -694,6 +799,55 @@ fn create_fillet_chain(
                     r,
                     blend_graph,
                 )?
+            }
+            FilletType::PerEdgeProfile(map) => {
+                // F5-β.5.6: per-edge profile fan-out. Each edge
+                // picks the surgery route that matches its profile
+                // shape — Constant → kpart constant path; Linear →
+                // legacy two-endpoint variable path; Variable →
+                // piecewise-linear function path (same builder the
+                // VariableStations arm above uses). Coverage is
+                // guaranteed by `validate_fillet_inputs`; the
+                // missing-key fallback surfaces as `InternalError`
+                // because at this point validation has passed.
+                let profile = map.get(&edge_id).ok_or_else(|| {
+                    OperationError::InternalError(format!(
+                        "PerEdgeProfile: edge {} has no profile entry after validation",
+                        edge_id
+                    ))
+                })?;
+                match profile {
+                    BlendRadius::Constant(r) => create_constant_radius_fillet(
+                        model,
+                        edge_id,
+                        face1_id,
+                        face2_id,
+                        *r,
+                        blend_graph,
+                    )?,
+                    BlendRadius::Linear { start, end } => create_variable_radius_fillet(
+                        model,
+                        edge_id,
+                        face1_id,
+                        face2_id,
+                        *start,
+                        *end,
+                        blend_graph,
+                    )?,
+                    BlendRadius::Variable(samples) => {
+                        let samples = samples.clone();
+                        let evaluator: Box<dyn Fn(f64) -> f64> =
+                            Box::new(move |u: f64| piecewise_linear_radius(&samples, u));
+                        create_function_radius_fillet(
+                            model,
+                            edge_id,
+                            face1_id,
+                            face2_id,
+                            &evaluator,
+                            blend_graph,
+                        )?
+                    }
+                }
             }
             FilletType::Function(f) => {
                 create_function_radius_fillet(model, edge_id, face1_id, face2_id, f, blend_graph)?
@@ -5521,6 +5675,103 @@ fn validate_fillet_inputs(
                 }
             }
         }
+        FilletType::PerEdgeProfile(map) => {
+            // F5-β.5.6: structural validation for the per-edge
+            // mixed-kind variant. Same coverage / no-extras
+            // contract as `PerEdgeConstant`, but each entry is
+            // a `BlendRadius` profile so the per-entry validity
+            // check needs to descend into the variant.
+            if map.is_empty() {
+                return Err(OperationError::InvalidInput {
+                    parameter: "fillet_type.PerEdgeProfile".into(),
+                    expected: "non-empty per-edge profile map".into(),
+                    received: "empty map".into(),
+                });
+            }
+            // Coverage: every selected edge must have an entry.
+            let selection: HashSet<EdgeId> = edges.iter().copied().collect();
+            for &edge_id in edges {
+                if !map.contains_key(&edge_id) {
+                    return Err(OperationError::InvalidInput {
+                        parameter: "fillet_type.PerEdgeProfile".into(),
+                        expected: "profile entry for every selected edge".into(),
+                        received: format!("edge {} has no profile entry", edge_id),
+                    });
+                }
+            }
+            // No extras: every map key must correspond to a
+            // selected edge.
+            for &mapped_id in map.keys() {
+                if !selection.contains(&mapped_id) {
+                    return Err(OperationError::InvalidInput {
+                        parameter: "fillet_type.PerEdgeProfile".into(),
+                        expected: "no extra map entries beyond the selection".into(),
+                        received: format!(
+                            "edge {} has a profile entry but is not in the selection",
+                            mapped_id
+                        ),
+                    });
+                }
+            }
+            // Per-entry profile validity. Constant + Linear share
+            // a finite/positive/tolerance check; Variable delegates
+            // to the per-station validator with a per-edge label so
+            // the failing parameter names the offending edge.
+            for (&edge_id, profile) in map.iter() {
+                match profile {
+                    BlendRadius::Constant(r) => {
+                        if !r.is_finite() || *r <= tol {
+                            return Err(OperationError::InvalidInput {
+                                parameter: format!(
+                                    "fillet_type.PerEdgeProfile[{}].Constant",
+                                    edge_id
+                                ),
+                                expected: format!(
+                                    "finite radius > tolerance ({:.3e})",
+                                    tol
+                                ),
+                                received: format!("{r}"),
+                            });
+                        }
+                    }
+                    BlendRadius::Linear { start, end } => {
+                        if !start.is_finite() || *start <= tol {
+                            return Err(OperationError::InvalidInput {
+                                parameter: format!(
+                                    "fillet_type.PerEdgeProfile[{}].Linear.start",
+                                    edge_id
+                                ),
+                                expected: format!(
+                                    "finite radius > tolerance ({:.3e})",
+                                    tol
+                                ),
+                                received: format!("{start}"),
+                            });
+                        }
+                        if !end.is_finite() || *end <= tol {
+                            return Err(OperationError::InvalidInput {
+                                parameter: format!(
+                                    "fillet_type.PerEdgeProfile[{}].Linear.end",
+                                    edge_id
+                                ),
+                                expected: format!(
+                                    "finite radius > tolerance ({:.3e})",
+                                    tol
+                                ),
+                                received: format!("{end}"),
+                            });
+                        }
+                    }
+                    BlendRadius::Variable(samples) => {
+                        let label = format!(
+                            "fillet_type.PerEdgeProfile[{}].Variable",
+                            edge_id
+                        );
+                        validate_variable_stations_labelled(samples, &label)?;
+                    }
+                }
+            }
+        }
         _ => {
             // Variant-specific validators handle their own radius checks.
         }
@@ -7815,6 +8066,254 @@ mod tests {
             BlendRadius::Constant(r) => assert!(r == 0.0),
             other => panic!("expected BlendRadius::Constant(0.0), got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // F5-β.5.6 — FilletType::PerEdgeProfile (mixed-kind per-edge radii)
+    //
+    // Coverage:
+    //   - Clone / Debug invariants on the mixed-kind variant
+    //     (sorted-by-edge-id Debug for replay determinism).
+    //   - `validate_fillet_inputs` accepts mixed-kind maps and
+    //     rejects every structural / per-profile failure.
+    //   - `fillet_type_to_blend_radius` returns the exact profile
+    //     shape for each edge.
+    // -------------------------------------------------------------------
+
+    fn per_edge_profile_map(
+        entries: &[(EdgeId, BlendRadius)],
+    ) -> HashMap<EdgeId, BlendRadius> {
+        entries.iter().cloned().collect()
+    }
+
+    fn opts_with_per_edge_profile(map: HashMap<EdgeId, BlendRadius>) -> FilletOptions {
+        FilletOptions {
+            radius: 1.0,
+            fillet_type: FilletType::PerEdgeProfile(map),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn per_edge_profile_debug_is_sorted() {
+        // Insert in shuffled order; the Debug output must list
+        // entries in ascending edge-id order so replay diffs of
+        // recorded-operation JSON are stable.
+        let mut a = HashMap::new();
+        a.insert(11_u32 as EdgeId, BlendRadius::Constant(3.0));
+        a.insert(2_u32 as EdgeId, BlendRadius::Constant(1.0));
+        a.insert(
+            5_u32 as EdgeId,
+            BlendRadius::Linear {
+                start: 0.5,
+                end: 2.0,
+            },
+        );
+
+        let mut b = HashMap::new();
+        b.insert(5_u32 as EdgeId, BlendRadius::Linear { start: 0.5, end: 2.0 });
+        b.insert(2_u32 as EdgeId, BlendRadius::Constant(1.0));
+        b.insert(11_u32 as EdgeId, BlendRadius::Constant(3.0));
+
+        assert_eq!(
+            format!("{:?}", FilletType::PerEdgeProfile(a)),
+            format!("{:?}", FilletType::PerEdgeProfile(b)),
+        );
+    }
+
+    #[test]
+    fn per_edge_profile_clone_preserves_map() {
+        let mut m = HashMap::new();
+        m.insert(7_u32 as EdgeId, BlendRadius::Constant(1.25));
+        m.insert(
+            11_u32 as EdgeId,
+            BlendRadius::Variable(vec![(0.0, 0.5), (1.0, 1.5)]),
+        );
+        let ft = FilletType::PerEdgeProfile(m.clone());
+        let cloned = ft.clone();
+        match cloned {
+            FilletType::PerEdgeProfile(c) => {
+                assert_eq!(c.len(), m.len());
+                assert_eq!(c.get(&7), Some(&BlendRadius::Constant(1.25)));
+                assert_eq!(
+                    c.get(&11),
+                    Some(&BlendRadius::Variable(vec![(0.0, 0.5), (1.0, 1.5)]))
+                );
+            }
+            other => panic!("expected PerEdgeProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_accepts_mixed_kinds() {
+        let (model, solid_id, edges) = build_n_edge_model(3);
+        let map = per_edge_profile_map(&[
+            (edges[0], BlendRadius::Constant(0.5)),
+            (
+                edges[1],
+                BlendRadius::Linear {
+                    start: 0.3,
+                    end: 0.8,
+                },
+            ),
+            (
+                edges[2],
+                BlendRadius::Variable(vec![(0.0, 0.4), (0.5, 0.6), (1.0, 0.4)]),
+            ),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        assert!(validate_fillet_inputs(&model, solid_id, &edges, &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_empty_map() {
+        let (model, solid_id, edges) = build_n_edge_model(1);
+        let opts = opts_with_per_edge_profile(HashMap::new());
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_missing_edge() {
+        let (model, solid_id, edges) = build_n_edge_model(3);
+        // Three edges selected, only two in the map.
+        let map = per_edge_profile_map(&[
+            (edges[0], BlendRadius::Constant(0.5)),
+            (edges[1], BlendRadius::Constant(0.75)),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { received, .. }) => {
+                assert!(received.contains("no profile entry"), "{received}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_extra_entry() {
+        let (model, solid_id, edges) = build_n_edge_model(3);
+        let map = per_edge_profile_map(&[
+            (edges[0], BlendRadius::Constant(0.5)),
+            (edges[1], BlendRadius::Constant(0.75)),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges[..1], &opts) {
+            Err(OperationError::InvalidInput { received, .. }) => {
+                assert!(received.contains("not in the selection"), "{received}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_negative_constant() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_profile_map(&[
+            (edges[0], BlendRadius::Constant(1.0)),
+            (edges[1], BlendRadius::Constant(-0.5)),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+                assert!(parameter.contains("Constant"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_zero_linear_endpoint() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_profile_map(&[
+            (edges[0], BlendRadius::Constant(1.0)),
+            (
+                edges[1],
+                BlendRadius::Linear {
+                    start: 0.0,
+                    end: 1.0,
+                },
+            ),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+                assert!(parameter.contains("Linear"), "{parameter}");
+                assert!(parameter.contains("start"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_non_monotone_variable_stations() {
+        let (model, solid_id, edges) = build_n_edge_model(1);
+        // Stations [0.0, 0.5, 0.3] — third station regresses.
+        let map = per_edge_profile_map(&[(
+            edges[0],
+            BlendRadius::Variable(vec![(0.0, 0.5), (0.5, 0.7), (0.3, 0.6)]),
+        )]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+                assert!(parameter.contains("Variable"), "{parameter}");
+                assert!(parameter.contains("station"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_per_edge_profile_picks_entry() {
+        let mut m = HashMap::new();
+        m.insert(7_u32 as EdgeId, BlendRadius::Constant(2.0));
+        m.insert(
+            13_u32 as EdgeId,
+            BlendRadius::Linear {
+                start: 0.5,
+                end: 1.5,
+            },
+        );
+        m.insert(
+            19_u32 as EdgeId,
+            BlendRadius::Variable(vec![(0.0, 0.3), (1.0, 0.8)]),
+        );
+        let ft = FilletType::PerEdgeProfile(m);
+        assert_eq!(
+            fillet_type_to_blend_radius(&ft, 7),
+            BlendRadius::Constant(2.0)
+        );
+        assert_eq!(
+            fillet_type_to_blend_radius(&ft, 13),
+            BlendRadius::Linear {
+                start: 0.5,
+                end: 1.5,
+            }
+        );
+        assert_eq!(
+            fillet_type_to_blend_radius(&ft, 19),
+            BlendRadius::Variable(vec![(0.0, 0.3), (1.0, 0.8)])
+        );
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_per_edge_profile_missing_key_falls_back_to_zero() {
+        // Defensive fallback only — by the time this is called,
+        // `validate_fillet_inputs` has already enforced coverage.
+        let mut m = HashMap::new();
+        m.insert(7_u32 as EdgeId, BlendRadius::Constant(2.0));
+        let ft = FilletType::PerEdgeProfile(m);
+        assert_eq!(
+            fillet_type_to_blend_radius(&ft, 99),
+            BlendRadius::Constant(0.0)
+        );
     }
 
     // -------------------------------------------------------------------
