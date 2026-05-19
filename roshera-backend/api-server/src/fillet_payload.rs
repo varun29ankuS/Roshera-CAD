@@ -61,6 +61,7 @@
 //! length.
 
 use crate::error_catalog::{ApiError, ErrorCode};
+use geometry_engine::operations::blend_graph::{BlendRadius, EdgeFilletProfile};
 use geometry_engine::operations::fillet::FilletType;
 use geometry_engine::primitives::edge::EdgeId;
 use serde_json::Value;
@@ -108,6 +109,18 @@ pub struct FilletRadii {
     /// and the mixed-radii corner dispatcher (F5-β.3) becomes
     /// reachable from the wire surface.
     pub all_constant: bool,
+    /// F5-β.5.9 — per-edge override map keyed by [`EdgeId`]. When
+    /// `Some`, the caller supplied the `radius + per_edge_overrides`
+    /// wire shape: every edge in the selection picks up its
+    /// override profile when present, falling back to the default
+    /// profile (broadcast into `profiles`) otherwise. The endpoint
+    /// expands this to the kernel's
+    /// [`FilletType::PerEdgeProfile`](FilletType::PerEdgeProfile)
+    /// shape via [`expand_to_per_edge_profile`](Self::expand_to_per_edge_profile).
+    ///
+    /// `None` for every legacy wire shape (bare `radius`, `radii`
+    /// array), preserving the existing three-arm dispatch.
+    pub per_edge_overrides: Option<HashMap<EdgeId, BlendRadiusDto>>,
 }
 
 impl FilletRadii {
@@ -153,6 +166,106 @@ impl FilletRadii {
         }
         Some(map)
     }
+
+    /// F5-β.5.9 — expand the (default `radius`, optional
+    /// `per_edge_overrides`) pair into a full per-edge
+    /// [`EdgeFilletProfile`] map covering every edge in `edges`.
+    /// Edges with an override pick it up; the rest fall back to the
+    /// default profile broadcast into `self.profiles[0]`.
+    ///
+    /// This is the wire-shape expansion documented under
+    /// `F5-β.5.9 — Mixed-default DTO ergonomic shape` in the F5-β.5
+    /// plan: the kernel always sees the full
+    /// [`FilletType::PerEdgeProfile`](FilletType::PerEdgeProfile)
+    /// map after expansion, so the per-edge surgery dispatcher
+    /// handles the "default + a few overrides" UX flow identically
+    /// to an explicit `{edge: profile}` map.
+    ///
+    /// Returns the expanded map; the caller wraps it in
+    /// `FilletType::PerEdgeProfile`. Edges in `self.per_edge_overrides`
+    /// that are *not* in `edges` are silently skipped — call
+    /// [`validate_overrides_against_edges`](Self::validate_overrides_against_edges)
+    /// up-front to reject those at the wire boundary.
+    pub fn expand_to_per_edge_profile(
+        &self,
+        edges: &[EdgeId],
+    ) -> HashMap<EdgeId, EdgeFilletProfile> {
+        let overrides = self.per_edge_overrides.as_ref();
+        // `self.profiles[0]` is the broadcast default (every slot
+        // holds the same DTO when the wire shipped a single
+        // `radius`). When `profiles` is empty (defensive: caller
+        // built `FilletRadii` directly without going through
+        // `parse_fillet_radii`), the fallback yields a Constant(0.0)
+        // that the kernel rejects at `validate_fillet_inputs`.
+        let default_dto = self.profiles.first();
+        let mut out: HashMap<EdgeId, EdgeFilletProfile> =
+            HashMap::with_capacity(edges.len());
+        for &eid in edges {
+            let dto = overrides
+                .and_then(|m| m.get(&eid))
+                .or(default_dto);
+            let profile = match dto {
+                Some(dto) => blend_radius_dto_to_edge_profile(dto),
+                None => EdgeFilletProfile::Radius(BlendRadius::Constant(0.0)),
+            };
+            out.insert(eid, profile);
+        }
+        out
+    }
+
+    /// F5-β.5.9 — reject `per_edge_overrides` keys that are not
+    /// members of the `edges` selection. The parser cannot do this
+    /// itself (it doesn't see the parsed `edges` array), so the
+    /// endpoint calls this after [`parse_fillet_radii`] and before
+    /// the kernel dispatch. Returns `Ok(())` when overrides are
+    /// `None` or every key is a member of `edges`.
+    pub fn validate_overrides_against_edges(
+        &self,
+        edges: &[EdgeId],
+    ) -> Result<(), ApiError> {
+        let overrides = match self.per_edge_overrides.as_ref() {
+            None => return Ok(()),
+            Some(m) => m,
+        };
+        for &override_eid in overrides.keys() {
+            if !edges.iter().any(|&e| e == override_eid) {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "'per_edge_overrides' contains edge {override_eid} \
+                         that is not in the 'edges' selection"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// F5-β.5.9 — translate a wire-level [`BlendRadiusDto`] into the
+/// kernel's [`EdgeFilletProfile`] shape used inside
+/// [`FilletType::PerEdgeProfile`](FilletType::PerEdgeProfile).
+///
+/// Mirrors timeline-engine's `blend_radius_dto_to_edge_profile`
+/// helper at `timeline-engine/src/operations/fillet.rs:404`: the
+/// three radius-schedule DTO variants wrap into
+/// `EdgeFilletProfile::Radius(BlendRadius::*)`; the `Chord` DTO
+/// maps to `EdgeFilletProfile::Chord` so the raw chord length
+/// survives intact to surgery time. Duplicated here to keep
+/// `fillet_payload` independent of timeline-engine internals —
+/// the function is a pure pattern match with no shared state.
+fn blend_radius_dto_to_edge_profile(dto: &BlendRadiusDto) -> EdgeFilletProfile {
+    match dto {
+        BlendRadiusDto::Constant(r) => EdgeFilletProfile::Radius(BlendRadius::Constant(*r)),
+        BlendRadiusDto::Linear { start, end } => EdgeFilletProfile::Radius(BlendRadius::Linear {
+            start: *start,
+            end: *end,
+        }),
+        BlendRadiusDto::Variable(samples) => {
+            EdgeFilletProfile::Radius(BlendRadius::Variable(samples.clone()))
+        }
+        BlendRadiusDto::Chord(c) => EdgeFilletProfile::Chord(*c),
+    }
 }
 
 /// Parse the `radius` / `radii` fields of a fillet payload into one
@@ -167,13 +280,53 @@ pub fn parse_fillet_radii(
 ) -> Result<FilletRadii, ApiError> {
     let radius_field = payload.get("radius");
     let radii_field = payload.get("radii");
+    let overrides_field = payload.get("per_edge_overrides");
 
-    match (radius_field, radii_field) {
-        (Some(_), Some(_)) => Err(ApiError::new(
+    // F5-β.5.9 — mutual-exclusion gate.
+    //
+    // Four allowed shapes:
+    //   1. `radius`                     → broadcast default
+    //   2. `radii`                      → explicit per-edge array
+    //   3. `radius + per_edge_overrides`→ default + sparse overrides
+    //   4. (nothing)                    → rejected, missing field
+    //
+    // `radii` + `per_edge_overrides` is rejected — the array shape
+    // is itself a full per-edge spec, so combining the two would
+    // duplicate the per-edge surface. `per_edge_overrides` without
+    // a `radius` default is rejected because there's no fallback
+    // profile for edges that don't carry an explicit override.
+    if radius_field.is_some() && radii_field.is_some() {
+        return Err(ApiError::new(
             ErrorCode::InvalidParameter,
             "cannot specify both 'radius' and 'radii' — pick one".to_string(),
-        )),
-        (None, None) => Err(ApiError::missing_field("radius")),
+        ));
+    }
+    if radii_field.is_some() && overrides_field.is_some() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "cannot specify both 'radii' and 'per_edge_overrides' — \
+             'per_edge_overrides' attaches to a single 'radius' default, \
+             not a 'radii' array"
+                .to_string(),
+        ));
+    }
+    if overrides_field.is_some() && radius_field.is_none() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'per_edge_overrides' requires a default 'radius' for \
+             edges without an explicit override"
+                .to_string(),
+        ));
+    }
+    if radius_field.is_none() && radii_field.is_none() && overrides_field.is_none() {
+        return Err(ApiError::missing_field("radius"));
+    }
+
+    let per_edge_overrides = parse_per_edge_overrides(overrides_field)?;
+
+    match (radius_field, radii_field) {
+        (Some(_), Some(_)) => unreachable!("mutex gate above rejects this case"),
+        (None, None) => unreachable!("missing-field gate above rejects this case"),
         (Some(r), None) => {
             let dto = parse_dto(r, "radius")?;
             let canonical = canonicalise(&dto);
@@ -187,6 +340,7 @@ pub fn parse_fillet_radii(
                 canonical_per_edge: vec![canonical; edge_count],
                 uniform_constant,
                 all_constant,
+                per_edge_overrides,
             })
         }
         (None, Some(rs)) => {
@@ -232,9 +386,69 @@ pub fn parse_fillet_radii(
                 canonical_per_edge,
                 uniform_constant,
                 all_constant,
+                per_edge_overrides,
             })
         }
     }
+}
+
+/// F5-β.5.9 — parse the optional `per_edge_overrides` map from the
+/// fillet payload. Returns `None` when the field is absent; returns
+/// a validated `HashMap<EdgeId, BlendRadiusDto>` when present.
+///
+/// Wire shape: `{"7": <BlendRadiusDto>, "12": <BlendRadiusDto>}`.
+/// JSON object keys are strings; we parse each key as `EdgeId`
+/// (a `u32`). Each value goes through the same `parse_dto` gate
+/// as the top-level `radius` field, so every override profile is
+/// range-checked at the wire boundary.
+///
+/// Membership of override keys in the `edges` array is *not*
+/// checked here — the parser doesn't see `edges`. The endpoint
+/// follows up with
+/// [`FilletRadii::validate_overrides_against_edges`].
+fn parse_per_edge_overrides(
+    field: Option<&Value>,
+) -> Result<Option<HashMap<EdgeId, BlendRadiusDto>>, ApiError> {
+    let value = match field {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    let obj = value.as_object().ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'per_edge_overrides' must be a JSON object \
+             keyed by stringified EdgeId (u32)"
+                .to_string(),
+        )
+    })?;
+    let mut map: HashMap<EdgeId, BlendRadiusDto> = HashMap::with_capacity(obj.len());
+    for (key, val) in obj.iter() {
+        let edge_id: EdgeId = key.parse().map_err(|_| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "'per_edge_overrides' key '{key}' is not a valid EdgeId \
+                     (expected non-negative integer ≤ u32::MAX)"
+                ),
+            )
+        })?;
+        let dto = parse_dto(val, &format!("per_edge_overrides[\"{key}\"]"))?;
+        if map.insert(edge_id, dto).is_some() {
+            // Two stringified keys collapsed to the same numeric
+            // EdgeId — JSON itself would reject duplicate string
+            // keys, but `"7"` and `"007"` both parse to `7`. Defend
+            // at the boundary so the kernel never sees a silent
+            // overwrite.
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "'per_edge_overrides' contains duplicate entries \
+                     for EdgeId {edge_id}"
+                ),
+            ));
+        }
+    }
+    Ok(Some(map))
 }
 
 /// Deserialise one radius value (bare number or tagged object) into a
@@ -825,5 +1039,234 @@ mod tests {
             !r.all_constant,
             "Linear radius must clear all_constant in the single-radius shape"
         );
+    }
+
+    // --- F5-β.5.9: per_edge_overrides + Mixed{default, overrides} -----
+    //
+    // Six unit pins matching the plan's test plan section. Each fires
+    // on a single, distinct dispatch path through `parse_fillet_radii`
+    // (mutex + happy paths) or through `expand_to_per_edge_profile`
+    // (expansion shape). End-to-end routing through the live router
+    // sits in `router_integration_tests.rs::fillet_default_with_*`.
+
+    #[test]
+    fn bare_radius_with_no_overrides_yields_none_overrides() {
+        // (1/6) Legacy path: bare `radius` and no overrides leaves
+        // `per_edge_overrides == None`, which the endpoint reads as
+        // "use the legacy single-profile dispatch". Pins the
+        // backward-compat guarantee: existing clients see no
+        // behavioural change.
+        let p = json!({ "radius": 1.5 });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        assert!(
+            r.per_edge_overrides.is_none(),
+            "absent overrides field must surface as None"
+        );
+    }
+
+    #[test]
+    fn radius_with_empty_overrides_is_legal_degenerate_shape() {
+        // (2/6) `per_edge_overrides: {}` is degenerate but legal —
+        // the endpoint expands to the full default for every edge,
+        // which is identical to a bare `radius` request. Validates
+        // the parser doesn't reject empty maps and that the
+        // expansion fills every edge with the default.
+        let p = json!({
+            "radius": 1.5,
+            "per_edge_overrides": {}
+        });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        let overrides = r
+            .per_edge_overrides
+            .as_ref()
+            .expect("empty overrides must surface as Some({})");
+        assert!(overrides.is_empty(), "empty object must yield empty map");
+
+        // Every edge falls back to the default Constant(1.5).
+        let edges: Vec<EdgeId> = vec![10, 20, 30];
+        let expanded = r.expand_to_per_edge_profile(&edges);
+        assert_eq!(expanded.len(), 3);
+        for &eid in &edges {
+            assert_eq!(
+                expanded.get(&eid),
+                Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(1.5))),
+                "edge {eid} must fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn radius_with_partial_overrides_expands_correctly() {
+        // (3/6) Headline F5-β.5.9 shape: default Constant + one
+        // explicit Linear override. The expansion picks the override
+        // for the named edge and the default for the rest.
+        let p = json!({
+            "radius": { "kind": "constant", "value": 2.0 },
+            "per_edge_overrides": {
+                "9": { "kind": "linear", "start": 0.5, "end": 1.5 }
+            }
+        });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        let overrides = r
+            .per_edge_overrides
+            .as_ref()
+            .expect("partial overrides must surface as Some(map)");
+        assert_eq!(overrides.len(), 1);
+
+        let edges: Vec<EdgeId> = vec![7, 9, 12];
+        let expanded = r.expand_to_per_edge_profile(&edges);
+        assert_eq!(
+            expanded.get(&7),
+            Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(2.0))),
+            "edge 7 must take the default"
+        );
+        assert_eq!(
+            expanded.get(&9),
+            Some(&EdgeFilletProfile::Radius(BlendRadius::Linear {
+                start: 0.5,
+                end: 1.5,
+            })),
+            "edge 9 must take the Linear override"
+        );
+        assert_eq!(
+            expanded.get(&12),
+            Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(2.0))),
+            "edge 12 must take the default"
+        );
+    }
+
+    #[test]
+    fn radius_with_full_overrides_uses_overrides_for_every_edge() {
+        // (4/6) Degenerate: every edge carries an override. The
+        // default never fires. The expanded map is the override map
+        // verbatim, regardless of the default's kind.
+        let p = json!({
+            "radius": { "kind": "constant", "value": 99.0 },
+            "per_edge_overrides": {
+                "5":  { "kind": "constant", "value": 0.3 },
+                "7":  { "kind": "linear", "start": 0.4, "end": 0.6 },
+                "12": { "kind": "chord", "value": 0.8 }
+            }
+        });
+        let r = parse_fillet_radii(&p, 3).expect("parse");
+        let edges: Vec<EdgeId> = vec![5, 7, 12];
+        let expanded = r.expand_to_per_edge_profile(&edges);
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(
+            expanded.get(&5),
+            Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(0.3)))
+        );
+        assert_eq!(
+            expanded.get(&7),
+            Some(&EdgeFilletProfile::Radius(BlendRadius::Linear {
+                start: 0.4,
+                end: 0.6
+            }))
+        );
+        assert_eq!(expanded.get(&12), Some(&EdgeFilletProfile::Chord(0.8)));
+        // Default never appears.
+        for profile in expanded.values() {
+            assert_ne!(
+                profile,
+                &EdgeFilletProfile::Radius(BlendRadius::Constant(99.0)),
+                "default must not appear when every edge is overridden"
+            );
+        }
+    }
+
+    #[test]
+    fn overrides_without_radius_rejected_at_parse() {
+        // (5/6) `per_edge_overrides` without a default `radius` is
+        // ambiguous — there's no fallback for unspecified edges.
+        // Reject at parse time so the endpoint never sees a half-
+        // built map.
+        let p = json!({
+            "per_edge_overrides": {
+                "7": { "kind": "constant", "value": 1.5 }
+            }
+        });
+        let err = parse_fillet_radii(&p, 1).expect_err("overrides-without-default");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn radii_with_overrides_rejected_at_parse() {
+        // (6/6) `radii` + `per_edge_overrides` doubles up the per-
+        // edge spec. Reject the combination so the wire shape is
+        // unambiguous: arrays carry their own per-edge profiles;
+        // maps attach to a single default.
+        let p = json!({
+            "radii": [1.0, 2.0, 3.0],
+            "per_edge_overrides": {
+                "7": { "kind": "constant", "value": 1.5 }
+            }
+        });
+        let err = parse_fillet_radii(&p, 3).expect_err("radii+overrides");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    // --- F5-β.5.9: defensive parser-shape pins -----------------------
+    //
+    // Cover edges of the new wire shape that the six headline tests
+    // don't pin: non-object overrides, non-integer keys, invalid
+    // override DTOs, stray-edge validation. These are not in the
+    // plan's six-test list but are required to keep the parser
+    // honest at the wire boundary.
+
+    #[test]
+    fn overrides_not_object_rejected() {
+        let p = json!({
+            "radius": 1.0,
+            "per_edge_overrides": [1, 2, 3]
+        });
+        let err = parse_fillet_radii(&p, 1).expect_err("array overrides");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn overrides_with_non_integer_key_rejected() {
+        let p = json!({
+            "radius": 1.0,
+            "per_edge_overrides": {
+                "not-a-number": { "kind": "constant", "value": 1.5 }
+            }
+        });
+        let err = parse_fillet_radii(&p, 1).expect_err("bad key");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn overrides_with_invalid_dto_rejected() {
+        let p = json!({
+            "radius": 1.0,
+            "per_edge_overrides": {
+                "7": { "kind": "constant", "value": -1.0 }
+            }
+        });
+        let err = parse_fillet_radii(&p, 1).expect_err("negative override");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn validate_overrides_against_edges_passes_when_none() {
+        let p = json!({ "radius": 1.0 });
+        let r = parse_fillet_radii(&p, 1).expect("parse");
+        r.validate_overrides_against_edges(&[7])
+            .expect("None overrides must pass");
+    }
+
+    #[test]
+    fn validate_overrides_against_edges_rejects_stray_key() {
+        let p = json!({
+            "radius": 1.0,
+            "per_edge_overrides": {
+                "99": { "kind": "constant", "value": 2.0 }
+            }
+        });
+        let r = parse_fillet_radii(&p, 2).expect("parse");
+        let err = r
+            .validate_overrides_against_edges(&[7, 8])
+            .expect_err("stray key 99 must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
     }
 }

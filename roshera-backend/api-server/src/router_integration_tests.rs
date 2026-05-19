@@ -834,3 +834,142 @@ async fn cors_preflight_succeeds_against_fillet_route() {
         response.status()
     );
 }
+
+// =====================================================================
+// Tests — F5-β.5.9 Mixed{default, overrides} wire-shape expansion
+// =====================================================================
+//
+// The api-server's `fillet_edges_endpoint` accepts a fourth dispatch
+// shape on top of the three F5-β.5.3 arms: a default `radius` together
+// with a sparse `per_edge_overrides` object keyed by `EdgeId`. The
+// payload parser (`fillet_payload::parse_fillet_radii`) lifts the
+// overrides into `FilletRadii::per_edge_overrides`; the endpoint then
+// calls `expand_to_per_edge_profile(&edges)` to materialise a full
+// `HashMap<EdgeId, EdgeFilletProfile>` and routes through
+// `FilletType::PerEdgeProfile`.
+//
+// These tests pin the wire-level surface through the live router:
+//   - happy paths: 200 OK on disjoint edges (avoids the corner-blend
+//     gap that's a separate F5-β concern).
+//   - error paths: the two new mutual-exclusion gates surface as
+//     400 `invalid_parameter`.
+// =====================================================================
+
+/// Default `radius` with a partial `per_edge_overrides` map. Edge 0
+/// is uncovered → expansion fills it from the default; edges 1+2 carry
+/// explicit overrides. Three vertex-disjoint edges keep the per-edge
+/// fan-out clear of the box-corner collision case.
+#[tokio::test]
+async fn fillet_default_with_partial_overrides_expands_correctly() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box_disjoint_edges(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "radius": 0.4,
+        "per_edge_overrides": {
+            edges[1].to_string(): 0.6,
+            edges[2].to_string(): { "kind": "linear", "start": 0.3, "end": 0.5 },
+        },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "partial overrides on disjoint edges must succeed; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// Default `radius` plus a `per_edge_overrides` map covering *every*
+/// edge in the selection. The default is then never consulted; the
+/// expansion is equivalent to passing the overrides as an explicit
+/// per-edge map. Pins that full-coverage overrides behave identically
+/// to the partial case from the dispatch's point of view.
+#[tokio::test]
+async fn fillet_default_with_full_overrides_equivalent_to_per_edge_map() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box_disjoint_edges(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "radius": 0.4,
+        "per_edge_overrides": {
+            edges[0].to_string(): 0.3,
+            edges[1].to_string(): 0.5,
+            edges[2].to_string(): 0.7,
+        },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "full overrides on disjoint edges must succeed; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// `per_edge_overrides` without a default `radius` must be rejected
+/// at parse time — the wire shape is well-formed JSON but
+/// semantically incomplete (edges without an override have no
+/// fallback profile). The parser surfaces this as 400
+/// `invalid_parameter`.
+#[tokio::test]
+async fn fillet_overrides_without_radius_returns_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box_disjoint_edges(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "per_edge_overrides": {
+            edges[0].to_string(): 0.5,
+        },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "overrides without default radius must reject as 400; body = {body}"
+    );
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["error_code"], "invalid_parameter",
+        "missing-default rejection must surface as invalid_parameter; body = {body}"
+    );
+}
+
+/// `radii` array combined with `per_edge_overrides` must be rejected
+/// at parse time — the array shape is itself a full per-edge spec,
+/// so combining the two would duplicate the per-edge surface.
+#[tokio::test]
+async fn fillet_radii_array_with_overrides_returns_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box_disjoint_edges(&state, 10.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0], edges[1], edges[2]],
+        "radii":  [0.3, 0.4, 0.5],
+        "per_edge_overrides": {
+            edges[0].to_string(): 0.6,
+        },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "radii + overrides must reject as 400; body = {body}"
+    );
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["error_code"], "invalid_parameter",
+        "double-spec rejection must surface as invalid_parameter; body = {body}"
+    );
+}

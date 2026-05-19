@@ -1605,9 +1605,17 @@ async fn fillet_edges_endpoint(
     // Parse radius/radii into one `FilletType` per edge. All wire-shape
     // validation (`radius` ↔ `radii` exclusivity, missing-field,
     // length-match, range checks on every numeric value, malformed-DTO
-    // rejection) is encapsulated in `fillet_payload::parse_fillet_radii`.
-    // See that module's `tests/` for the full shape harness.
+    // rejection, and F5-β.5.9 `radius + per_edge_overrides`
+    // mutual-exclusion) is encapsulated in
+    // `fillet_payload::parse_fillet_radii`. See that module's
+    // `tests/` for the full shape harness.
     let radii_parsed = fillet_payload::parse_fillet_radii(&payload, edges.len())?;
+
+    // F5-β.5.9 — reject `per_edge_overrides` keys that aren't in the
+    // `edges` selection. The parser can't do this itself (it doesn't
+    // see the parsed edges); the endpoint owns the cross-field
+    // check and surfaces it as `InvalidParameter` 400.
+    radii_parsed.validate_overrides_against_edges(&edges)?;
 
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
@@ -1620,7 +1628,18 @@ async fn fillet_edges_endpoint(
     // tessellation runs under a read lock. Same pattern as boolean /
     // shell / mirror.
     //
-    // Three dispatch paths:
+    // Four dispatch paths:
+    //   - F5-β.5.9 — `per_edge_overrides` present → expand the
+    //     (default `radius`, sparse overrides) pair into a full
+    //     per-edge profile map and route through
+    //     `FilletType::PerEdgeProfile`. Takes priority over the
+    //     legacy arms below: even when every override and the
+    //     default are `Constant`, the request's Mixed{default,
+    //     overrides} shape implies the caller wanted explicit
+    //     per-edge profiling, so we keep dispatch consistent and
+    //     let the kernel route each entry through the appropriate
+    //     surgery. The kernel collapses `Constant` entries to
+    //     `create_constant_radius_fillet` automatically.
     //   - All-equal `Constant(r)` across every edge → one atomic
     //     `fillet_edges` call across the whole edge set. Preserves the
     //     kernel's edge-chain grouping (matters for blend continuity
@@ -1640,9 +1659,7 @@ async fn fillet_edges_endpoint(
     //     per edge with `PropagationMode::None`. Propagation is
     //     suppressed so edge K's chain cannot swallow edge K+1 and
     //     break the per-edge profile invariant. A mid-loop kernel
-    //     failure leaves the solid partially filleted; atomic
-    //     per-edge apply is queued for a follow-up kernel slice
-    //     (`FilletType::PerEdgeProfile`, F5-β.5.6).
+    //     failure leaves the solid partially filleted.
     // The DTO → `FilletType` translation is performed inside this
     // model-lock scope via `radii_parsed.to_fillet_type(i)` rather than
     // up-front. Rationale: `FilletType::Function(Box<dyn Fn>)` is
@@ -1654,7 +1671,33 @@ async fn fillet_edges_endpoint(
     // call, never across a yield point.
     {
         let mut model = model_handle.write().await;
-        if radii_parsed.uniform_constant {
+        if radii_parsed.per_edge_overrides.is_some() {
+            // F5-β.5.9 — Mixed{default, overrides} → PerEdgeProfile.
+            // The expansion fills every edge in `edges` with either
+            // its explicit override profile or the broadcast
+            // default. The conservative radius seeded into
+            // `FilletOptions.radius` is the max across the default
+            // and every override; the kernel's F6-α curvature gate
+            // walks the map itself for per-edge bounds.
+            let expanded = radii_parsed.expand_to_per_edge_profile(&edges);
+            let conservative_radius = expanded
+                .values()
+                .map(|p| match p {
+                    geometry_engine::operations::blend_graph::EdgeFilletProfile::Radius(b) => {
+                        b.max_value()
+                    }
+                    geometry_engine::operations::blend_graph::EdgeFilletProfile::Chord(c) => *c,
+                })
+                .fold(0.0_f64, f64::max);
+            let opts = FilletOptions {
+                fillet_type: FilletType::PerEdgeProfile(expanded),
+                radius: conservative_radius,
+                propagation: PropagationMode::None,
+                ..FilletOptions::default()
+            };
+            kernel_fillet(&mut model, solid_id, edges.clone(), opts)
+                .map_err(ApiError::from)?;
+        } else if radii_parsed.uniform_constant {
             let opts = FilletOptions {
                 fillet_type: radii_parsed.to_fillet_type(0),
                 propagation: PropagationMode::None,
