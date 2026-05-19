@@ -13,7 +13,7 @@
 //! used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
-use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind};
+use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind, EdgeFilletProfile};
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::feasibility;
@@ -115,29 +115,35 @@ pub enum FilletType {
     /// land in F5-β.5.6+.
     PerEdgeConstant(HashMap<EdgeId, f64>),
     /// Per-edge variable profiles. Each edge can carry its own
-    /// [`BlendRadius`] profile — `Constant`, `Linear`, or `Variable`.
-    /// Used when a single fillet call mixes different *kinds* of
-    /// radii across edges (F5-β.5.6). The all-Constant case stays on
-    /// [`FilletType::PerEdgeConstant`] to keep the cheap single-`f64`
-    /// shape; this variant is reserved for selections that include
-    /// at least one non-Constant profile.
+    /// [`EdgeFilletProfile`] — wrapping a `BlendRadius`
+    /// (`Constant` / `Linear` / `Variable`) or a raw chord length
+    /// (`Chord`). Used when a single fillet call mixes different
+    /// *kinds* of radii across edges (F5-β.5.6) or mixes chord
+    /// profiles with radius profiles (F5-β.5.7). The all-Constant
+    /// case stays on [`FilletType::PerEdgeConstant`] to keep the
+    /// cheap single-`f64` shape; this variant is reserved for
+    /// selections that include at least one non-Constant or chord
+    /// profile.
     ///
     /// Invariants enforced by `validate_fillet_inputs`:
     /// - Map contains exactly one entry per edge in the selection.
     /// - No extra entries for edges not in the selection.
-    /// - Each `Constant(r)` is finite, > 0, and > `Tolerance::distance`.
-    /// - Each `Linear { start, end }` has both endpoints finite,
-    ///   strictly positive, and > tolerance.
-    /// - Each `Variable(samples)` satisfies the same invariants as
-    ///   [`FilletType::VariableStations`] (delegated to
-    ///   `validate_variable_stations`).
+    /// - Each `Radius(Constant(r))` is finite, > 0, and >
+    ///   `Tolerance::distance`.
+    /// - Each `Radius(Linear { start, end })` has both endpoints
+    ///   finite, strictly positive, and > tolerance.
+    /// - Each `Radius(Variable(samples))` satisfies the same
+    ///   invariants as [`FilletType::VariableStations`] (delegated
+    ///   to `validate_variable_stations`).
+    /// - Each `Chord(c)` is finite, > 0, and > `Tolerance::distance`.
     ///
     /// The dispatcher in `create_fillet_chain` fans each edge out
     /// to the matching legacy creation function:
-    /// - `Constant` → `create_constant_radius_fillet`
-    /// - `Linear` → `create_variable_radius_fillet`
-    /// - `Variable` → `create_function_radius_fillet`
-    PerEdgeProfile(HashMap<EdgeId, BlendRadius>),
+    /// - `Radius(Constant)` → `create_constant_radius_fillet`
+    /// - `Radius(Linear)` → `create_variable_radius_fillet`
+    /// - `Radius(Variable)` → `create_function_radius_fillet`
+    /// - `Chord` → `create_chord_fillet`
+    PerEdgeProfile(HashMap<EdgeId, EdgeFilletProfile>),
     /// Radius function along edge parameter
     Function(Box<dyn Fn(f64) -> f64>),
     /// Chord length fillet
@@ -167,7 +173,7 @@ impl std::fmt::Debug for FilletType {
                 // sort by edge id so recorded-operation JSON and
                 // timeline replay diffs are stable regardless of
                 // HashMap insertion order.
-                let mut entries: Vec<(&EdgeId, &BlendRadius)> = map.iter().collect();
+                let mut entries: Vec<(&EdgeId, &EdgeFilletProfile)> = map.iter().collect();
                 entries.sort_by_key(|(eid, _)| **eid);
                 f.debug_tuple("PerEdgeProfile").field(&entries).finish()
             }
@@ -268,15 +274,19 @@ pub fn fillet_edges(
                 .values()
                 .copied()
                 .fold(0.0_f64, f64::max),
-            // F5-β.5.6: per-edge profile's largest *sample* radius
-            // across every profile shape. `BlendRadius::max_value`
-            // already normalises Constant / Linear / Variable to a
-            // single upper bound. Empty fold identity is 0.0 so an
-            // empty map degrades F6-α to a no-op and lets
+            // F5-β.5.6/.7: per-edge profile's largest *sample* radius
+            // across every profile shape. `EdgeFilletProfile::
+            // max_radius_bound` normalises Radius(Constant/Linear/
+            // Variable) to its inner `BlendRadius::max_value` and
+            // reports 0.0 for `Chord` (chord can produce arbitrarily
+            // large radii at small dihedrals, so F6-α has no
+            // closed-form bound for it — same skip behaviour as
+            // top-level `FilletType::Chord`). Empty fold identity is
+            // 0.0 so an empty map degrades F6-α to a no-op and lets
             // `validate_fillet_inputs` own the rejection.
             FilletType::PerEdgeProfile(map) => map
                 .values()
-                .map(|b| b.max_value())
+                .map(|p| p.max_radius_bound())
                 .fold(0.0_f64, f64::max),
             // `Function` and `Chord` paths don't have a closed-form
             // upper bound here; F6-α leaves them to the existing
@@ -331,21 +341,28 @@ pub fn fillet_edges(
                 FilletType::PerEdgeConstant(map) => {
                     vec![map.get(&edge_id).copied().unwrap_or(options.radius)]
                 }
-                // F5-β.5.6: per-edge profile — feed every sample of
-                // *this* edge's profile (not the global max) into
-                // the half-edge-length bounds check. `Constant` →
-                // one sample, `Linear` → two endpoints, `Variable`
-                // → every station radius. Missing keys are rejected
-                // by `validate_fillet_inputs` upstream; the
-                // fallback to `options.radius` here is purely
-                // defensive — if validation passes, the key is
+                // F5-β.5.6/.7: per-edge profile — feed every sample
+                // of *this* edge's profile (not the global max) into
+                // the half-edge-length bounds check. `Radius(Constant)`
+                // → one sample, `Radius(Linear)` → two endpoints,
+                // `Radius(Variable)` → every station radius, `Chord`
+                // → the raw chord value itself (a chord of length `c`
+                // connects two cap points at distance `c` apart along
+                // the spine, so `c <= half_edge_length` is the same
+                // conservative guard the scalar-radius arms apply).
+                // Missing keys are rejected by `validate_fillet_inputs`
+                // upstream; the fallback to `options.radius` here is
+                // purely defensive — if validation passes, the key is
                 // present.
                 FilletType::PerEdgeProfile(map) => match map.get(&edge_id) {
-                    Some(BlendRadius::Constant(r)) => vec![*r],
-                    Some(BlendRadius::Linear { start, end }) => vec![*start, *end],
-                    Some(BlendRadius::Variable(samples)) => {
+                    Some(EdgeFilletProfile::Radius(BlendRadius::Constant(r))) => vec![*r],
+                    Some(EdgeFilletProfile::Radius(BlendRadius::Linear { start, end })) => {
+                        vec![*start, *end]
+                    }
+                    Some(EdgeFilletProfile::Radius(BlendRadius::Variable(samples))) => {
                         samples.iter().map(|&(_, r)| r).collect()
                     }
+                    Some(EdgeFilletProfile::Chord(c)) => vec![*c],
                     None => vec![options.radius],
                 },
                 // Function radii are validated per-sample inside the
@@ -403,7 +420,7 @@ pub fn fillet_edges(
                     0.0
                 } else {
                     map.values()
-                        .map(|b| b.min_value())
+                        .map(|b| b.min_radius_bound())
                         .fold(f64::INFINITY, f64::min)
                 }
             }
@@ -574,16 +591,23 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType, edge_id: EdgeId) -> Ble
         FilletType::PerEdgeConstant(map) => {
             BlendRadius::Constant(map.get(&edge_id).copied().unwrap_or(0.0))
         }
-        // F5-β.5.6: per-edge profile maps directly — the kernel's
-        // `BlendRadius` enum already matches the variant set 1:1.
+        // F5-β.5.6/.7: per-edge profile. For `Radius(_)` we forward
+        // the inner `BlendRadius` so the graph classifies the edge
+        // by its actual schedule. `Chord(c)` has no closed-form
+        // radius without the local dihedral (unavailable at graph-
+        // build time), so we report `Constant(c)` as a placeholder
+        // — matching the existing top-level `FilletType::Chord(c)`
+        // behaviour. The actual chord → radius conversion runs
+        // later at surgery time inside `create_chord_fillet`.
         // Missing keys are rejected by `validate_fillet_inputs`
         // upstream; the fallback to `Constant(0.0)` here is
         // defensive and would propagate as an `InvalidRadius(0.0)`
         // downstream.
-        FilletType::PerEdgeProfile(map) => map
-            .get(&edge_id)
-            .cloned()
-            .unwrap_or(BlendRadius::Constant(0.0)),
+        FilletType::PerEdgeProfile(map) => match map.get(&edge_id) {
+            Some(EdgeFilletProfile::Radius(b)) => b.clone(),
+            Some(EdgeFilletProfile::Chord(c)) => BlendRadius::Constant(*c),
+            None => BlendRadius::Constant(0.0),
+        },
         // The Function and Chord paths don't expose a closed-form
         // sampling here; report Constant(1.0) as a placeholder so
         // the edge is still classified into the graph. F4 will
@@ -801,15 +825,18 @@ fn create_fillet_chain(
                 )?
             }
             FilletType::PerEdgeProfile(map) => {
-                // F5-β.5.6: per-edge profile fan-out. Each edge
+                // F5-β.5.6/.7: per-edge profile fan-out. Each edge
                 // picks the surgery route that matches its profile
-                // shape — Constant → kpart constant path; Linear →
-                // legacy two-endpoint variable path; Variable →
-                // piecewise-linear function path (same builder the
-                // VariableStations arm above uses). Coverage is
-                // guaranteed by `validate_fillet_inputs`; the
-                // missing-key fallback surfaces as `InternalError`
-                // because at this point validation has passed.
+                // shape — Radius(Constant) → kpart constant path;
+                // Radius(Linear) → legacy two-endpoint variable
+                // path; Radius(Variable) → piecewise-linear function
+                // path (same builder the VariableStations arm above
+                // uses); Chord → `create_chord_fillet` (the chord →
+                // radius conversion lives there and runs with the
+                // local dihedral). Coverage is guaranteed by
+                // `validate_fillet_inputs`; the missing-key fallback
+                // surfaces as `InternalError` because at this point
+                // validation has passed.
                 let profile = map.get(&edge_id).ok_or_else(|| {
                     OperationError::InternalError(format!(
                         "PerEdgeProfile: edge {} has no profile entry after validation",
@@ -817,24 +844,28 @@ fn create_fillet_chain(
                     ))
                 })?;
                 match profile {
-                    BlendRadius::Constant(r) => create_constant_radius_fillet(
-                        model,
-                        edge_id,
-                        face1_id,
-                        face2_id,
-                        *r,
-                        blend_graph,
-                    )?,
-                    BlendRadius::Linear { start, end } => create_variable_radius_fillet(
-                        model,
-                        edge_id,
-                        face1_id,
-                        face2_id,
-                        *start,
-                        *end,
-                        blend_graph,
-                    )?,
-                    BlendRadius::Variable(samples) => {
+                    EdgeFilletProfile::Radius(BlendRadius::Constant(r)) => {
+                        create_constant_radius_fillet(
+                            model,
+                            edge_id,
+                            face1_id,
+                            face2_id,
+                            *r,
+                            blend_graph,
+                        )?
+                    }
+                    EdgeFilletProfile::Radius(BlendRadius::Linear { start, end }) => {
+                        create_variable_radius_fillet(
+                            model,
+                            edge_id,
+                            face1_id,
+                            face2_id,
+                            *start,
+                            *end,
+                            blend_graph,
+                        )?
+                    }
+                    EdgeFilletProfile::Radius(BlendRadius::Variable(samples)) => {
                         let samples = samples.clone();
                         let evaluator: Box<dyn Fn(f64) -> f64> =
                             Box::new(move |u: f64| piecewise_linear_radius(&samples, u));
@@ -847,6 +878,14 @@ fn create_fillet_chain(
                             blend_graph,
                         )?
                     }
+                    EdgeFilletProfile::Chord(c) => create_chord_fillet(
+                        model,
+                        edge_id,
+                        face1_id,
+                        face2_id,
+                        *c,
+                        blend_graph,
+                    )?,
                 }
             }
             FilletType::Function(f) => {
@@ -5713,13 +5752,18 @@ fn validate_fillet_inputs(
                     });
                 }
             }
-            // Per-entry profile validity. Constant + Linear share
-            // a finite/positive/tolerance check; Variable delegates
-            // to the per-station validator with a per-edge label so
-            // the failing parameter names the offending edge.
+            // Per-entry profile validity. Radius(Constant) +
+            // Radius(Linear) share a finite/positive/tolerance
+            // check; Radius(Variable) delegates to the per-station
+            // validator with a per-edge label so the failing
+            // parameter names the offending edge. F5-β.5.7: Chord
+            // gets its own finite/positive/tolerance gate using
+            // the raw chord length (the radius derivation happens
+            // later at surgery time inside `create_chord_fillet`,
+            // but a non-positive chord is meaningless on its face).
             for (&edge_id, profile) in map.iter() {
                 match profile {
-                    BlendRadius::Constant(r) => {
+                    EdgeFilletProfile::Radius(BlendRadius::Constant(r)) => {
                         if !r.is_finite() || *r <= tol {
                             return Err(OperationError::InvalidInput {
                                 parameter: format!(
@@ -5734,7 +5778,7 @@ fn validate_fillet_inputs(
                             });
                         }
                     }
-                    BlendRadius::Linear { start, end } => {
+                    EdgeFilletProfile::Radius(BlendRadius::Linear { start, end }) => {
                         if !start.is_finite() || *start <= tol {
                             return Err(OperationError::InvalidInput {
                                 parameter: format!(
@@ -5762,12 +5806,27 @@ fn validate_fillet_inputs(
                             });
                         }
                     }
-                    BlendRadius::Variable(samples) => {
+                    EdgeFilletProfile::Radius(BlendRadius::Variable(samples)) => {
                         let label = format!(
                             "fillet_type.PerEdgeProfile[{}].Variable",
                             edge_id
                         );
                         validate_variable_stations_labelled(samples, &label)?;
+                    }
+                    EdgeFilletProfile::Chord(c) => {
+                        if !c.is_finite() || *c <= tol {
+                            return Err(OperationError::InvalidInput {
+                                parameter: format!(
+                                    "fillet_type.PerEdgeProfile[{}].Chord",
+                                    edge_id
+                                ),
+                                expected: format!(
+                                    "finite chord length > tolerance ({:.3e})",
+                                    tol
+                                ),
+                                received: format!("{c}"),
+                            });
+                        }
                     }
                 }
             }
@@ -8081,12 +8140,12 @@ mod tests {
     // -------------------------------------------------------------------
 
     fn per_edge_profile_map(
-        entries: &[(EdgeId, BlendRadius)],
-    ) -> HashMap<EdgeId, BlendRadius> {
+        entries: &[(EdgeId, EdgeFilletProfile)],
+    ) -> HashMap<EdgeId, EdgeFilletProfile> {
         entries.iter().cloned().collect()
     }
 
-    fn opts_with_per_edge_profile(map: HashMap<EdgeId, BlendRadius>) -> FilletOptions {
+    fn opts_with_per_edge_profile(map: HashMap<EdgeId, EdgeFilletProfile>) -> FilletOptions {
         FilletOptions {
             radius: 1.0,
             fillet_type: FilletType::PerEdgeProfile(map),
@@ -8100,20 +8159,23 @@ mod tests {
         // entries in ascending edge-id order so replay diffs of
         // recorded-operation JSON are stable.
         let mut a = HashMap::new();
-        a.insert(11_u32 as EdgeId, BlendRadius::Constant(3.0));
-        a.insert(2_u32 as EdgeId, BlendRadius::Constant(1.0));
+        a.insert(11_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(3.0)));
+        a.insert(2_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)));
         a.insert(
             5_u32 as EdgeId,
-            BlendRadius::Linear {
+            EdgeFilletProfile::Radius(BlendRadius::Linear {
                 start: 0.5,
                 end: 2.0,
-            },
+            }),
         );
 
         let mut b = HashMap::new();
-        b.insert(5_u32 as EdgeId, BlendRadius::Linear { start: 0.5, end: 2.0 });
-        b.insert(2_u32 as EdgeId, BlendRadius::Constant(1.0));
-        b.insert(11_u32 as EdgeId, BlendRadius::Constant(3.0));
+        b.insert(
+            5_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Linear { start: 0.5, end: 2.0 }),
+        );
+        b.insert(2_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)));
+        b.insert(11_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(3.0)));
 
         assert_eq!(
             format!("{:?}", FilletType::PerEdgeProfile(a)),
@@ -8124,20 +8186,29 @@ mod tests {
     #[test]
     fn per_edge_profile_clone_preserves_map() {
         let mut m = HashMap::new();
-        m.insert(7_u32 as EdgeId, BlendRadius::Constant(1.25));
+        m.insert(
+            7_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(1.25)),
+        );
         m.insert(
             11_u32 as EdgeId,
-            BlendRadius::Variable(vec![(0.0, 0.5), (1.0, 1.5)]),
+            EdgeFilletProfile::Radius(BlendRadius::Variable(vec![(0.0, 0.5), (1.0, 1.5)])),
         );
         let ft = FilletType::PerEdgeProfile(m.clone());
         let cloned = ft.clone();
         match cloned {
             FilletType::PerEdgeProfile(c) => {
                 assert_eq!(c.len(), m.len());
-                assert_eq!(c.get(&7), Some(&BlendRadius::Constant(1.25)));
+                assert_eq!(
+                    c.get(&7),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(1.25)))
+                );
                 assert_eq!(
                     c.get(&11),
-                    Some(&BlendRadius::Variable(vec![(0.0, 0.5), (1.0, 1.5)]))
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
+                        (0.0, 0.5),
+                        (1.0, 1.5)
+                    ])))
                 );
             }
             other => panic!("expected PerEdgeProfile, got {other:?}"),
@@ -8148,17 +8219,21 @@ mod tests {
     fn validate_per_edge_profile_accepts_mixed_kinds() {
         let (model, solid_id, edges) = build_n_edge_model(3);
         let map = per_edge_profile_map(&[
-            (edges[0], BlendRadius::Constant(0.5)),
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(0.5))),
             (
                 edges[1],
-                BlendRadius::Linear {
+                EdgeFilletProfile::Radius(BlendRadius::Linear {
                     start: 0.3,
                     end: 0.8,
-                },
+                }),
             ),
             (
                 edges[2],
-                BlendRadius::Variable(vec![(0.0, 0.4), (0.5, 0.6), (1.0, 0.4)]),
+                EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
+                    (0.0, 0.4),
+                    (0.5, 0.6),
+                    (1.0, 0.4),
+                ])),
             ),
         ]);
         let opts = opts_with_per_edge_profile(map);
@@ -8182,8 +8257,8 @@ mod tests {
         let (model, solid_id, edges) = build_n_edge_model(3);
         // Three edges selected, only two in the map.
         let map = per_edge_profile_map(&[
-            (edges[0], BlendRadius::Constant(0.5)),
-            (edges[1], BlendRadius::Constant(0.75)),
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(0.5))),
+            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(0.75))),
         ]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
@@ -8198,8 +8273,8 @@ mod tests {
     fn validate_per_edge_profile_rejects_extra_entry() {
         let (model, solid_id, edges) = build_n_edge_model(3);
         let map = per_edge_profile_map(&[
-            (edges[0], BlendRadius::Constant(0.5)),
-            (edges[1], BlendRadius::Constant(0.75)),
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(0.5))),
+            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(0.75))),
         ]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges[..1], &opts) {
@@ -8214,8 +8289,8 @@ mod tests {
     fn validate_per_edge_profile_rejects_negative_constant() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], BlendRadius::Constant(1.0)),
-            (edges[1], BlendRadius::Constant(-0.5)),
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(-0.5))),
         ]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
@@ -8231,13 +8306,13 @@ mod tests {
     fn validate_per_edge_profile_rejects_zero_linear_endpoint() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], BlendRadius::Constant(1.0)),
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
             (
                 edges[1],
-                BlendRadius::Linear {
+                EdgeFilletProfile::Radius(BlendRadius::Linear {
                     start: 0.0,
                     end: 1.0,
-                },
+                }),
             ),
         ]);
         let opts = opts_with_per_edge_profile(map);
@@ -8257,7 +8332,11 @@ mod tests {
         // Stations [0.0, 0.5, 0.3] — third station regresses.
         let map = per_edge_profile_map(&[(
             edges[0],
-            BlendRadius::Variable(vec![(0.0, 0.5), (0.5, 0.7), (0.3, 0.6)]),
+            EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
+                (0.0, 0.5),
+                (0.5, 0.7),
+                (0.3, 0.6),
+            ])),
         )]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
@@ -8273,17 +8352,20 @@ mod tests {
     #[test]
     fn fillet_type_to_blend_radius_per_edge_profile_picks_entry() {
         let mut m = HashMap::new();
-        m.insert(7_u32 as EdgeId, BlendRadius::Constant(2.0));
+        m.insert(
+            7_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(2.0)),
+        );
         m.insert(
             13_u32 as EdgeId,
-            BlendRadius::Linear {
+            EdgeFilletProfile::Radius(BlendRadius::Linear {
                 start: 0.5,
                 end: 1.5,
-            },
+            }),
         );
         m.insert(
             19_u32 as EdgeId,
-            BlendRadius::Variable(vec![(0.0, 0.3), (1.0, 0.8)]),
+            EdgeFilletProfile::Radius(BlendRadius::Variable(vec![(0.0, 0.3), (1.0, 0.8)])),
         );
         let ft = FilletType::PerEdgeProfile(m);
         assert_eq!(
@@ -8308,12 +8390,166 @@ mod tests {
         // Defensive fallback only — by the time this is called,
         // `validate_fillet_inputs` has already enforced coverage.
         let mut m = HashMap::new();
-        m.insert(7_u32 as EdgeId, BlendRadius::Constant(2.0));
+        m.insert(
+            7_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(2.0)),
+        );
         let ft = FilletType::PerEdgeProfile(m);
         assert_eq!(
             fillet_type_to_blend_radius(&ft, 99),
             BlendRadius::Constant(0.0)
         );
+    }
+
+    // -------------------------------------------------------------------
+    // F5-β.5.7 — chord-in-per-edge-profile coverage
+    //
+    // Each new test pins one invariant of the new
+    // `EdgeFilletProfile::Chord(_)` variant inside the
+    // `FilletType::PerEdgeProfile` map shape:
+    //   - Clone / Debug behave the same way as for radius entries.
+    //   - `validate_fillet_inputs` rejects non-positive / non-finite
+    //     chords with a parameter name that includes `Chord`.
+    //   - A chord-and-radius mix is accepted (the variant is
+    //     designed exactly for this).
+    //   - `fillet_type_to_blend_radius` reports `Constant(c)` for
+    //     a Chord entry (placeholder for the graph; the surgery
+    //     time conversion uses the local dihedral).
+    //   - `EdgeFilletProfile::max_radius_bound` / `min_radius_bound`
+    //     report 0.0 / c/2 for Chord and delegate to the inner
+    //     `BlendRadius` for `Radius(_)`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn per_edge_profile_chord_clone_is_deep() {
+        let mut m = HashMap::new();
+        m.insert(3_u32 as EdgeId, EdgeFilletProfile::Chord(0.5));
+        m.insert(
+            5_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(0.25)),
+        );
+        let ft = FilletType::PerEdgeProfile(m.clone());
+        let cloned = ft.clone();
+        if let FilletType::PerEdgeProfile(c) = cloned {
+            assert_eq!(c, m);
+        } else {
+            panic!("expected PerEdgeProfile");
+        }
+    }
+
+    #[test]
+    fn per_edge_profile_chord_debug_is_sorted() {
+        let mut m = HashMap::new();
+        m.insert(11_u32 as EdgeId, EdgeFilletProfile::Chord(0.7));
+        m.insert(
+            2_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(0.25)),
+        );
+        m.insert(7_u32 as EdgeId, EdgeFilletProfile::Chord(0.4));
+        let ft = FilletType::PerEdgeProfile(m);
+        let s = format!("{:?}", ft);
+        // edges 2, 7, 11 must appear in that order in the Debug output.
+        let p2 = s.find("2").expect("edge 2 in debug");
+        let p7 = s.find("7").expect("edge 7 in debug");
+        let p11 = s.find("11").expect("edge 11 in debug");
+        assert!(p2 < p7 && p7 < p11, "Debug output not sorted: {}", s);
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_negative_chord() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_profile_map(&[
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (edges[1], EdgeFilletProfile::Chord(-0.5)),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+                assert!(parameter.contains("Chord"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_zero_chord() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_profile_map(&[
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (edges[1], EdgeFilletProfile::Chord(0.0)),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+                assert!(parameter.contains("Chord"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_rejects_non_finite_chord() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_profile_map(&[
+            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (edges[1], EdgeFilletProfile::Chord(f64::NAN)),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
+            Err(OperationError::InvalidInput { parameter, .. }) => {
+                assert!(parameter.contains("PerEdgeProfile"), "{parameter}");
+                assert!(parameter.contains("Chord"), "{parameter}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_per_edge_profile_accepts_chord_and_radius_mix() {
+        let (model, solid_id, edges) = build_n_edge_model(2);
+        let map = per_edge_profile_map(&[
+            (edges[0], EdgeFilletProfile::Chord(0.4)),
+            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(0.3))),
+        ]);
+        let opts = opts_with_per_edge_profile(map);
+        assert!(validate_fillet_inputs(&model, solid_id, &edges, &opts).is_ok());
+    }
+
+    #[test]
+    fn fillet_type_to_blend_radius_per_edge_profile_chord_returns_constant() {
+        let mut m = HashMap::new();
+        let chord_edge = 7_u32 as EdgeId;
+        m.insert(chord_edge, EdgeFilletProfile::Chord(0.6));
+        let ft = FilletType::PerEdgeProfile(m);
+        assert_eq!(
+            fillet_type_to_blend_radius(&ft, chord_edge),
+            BlendRadius::Constant(0.6)
+        );
+    }
+
+    #[test]
+    fn edge_fillet_profile_max_radius_bound_chord_is_zero() {
+        // Conservative: chord can produce arbitrarily large radii at
+        // small dihedrals, so F6-α gate must be skipped.
+        assert_eq!(EdgeFilletProfile::Chord(0.5).max_radius_bound(), 0.0);
+    }
+
+    #[test]
+    fn edge_fillet_profile_min_radius_bound_chord_is_half() {
+        let v = EdgeFilletProfile::Chord(0.6).min_radius_bound();
+        assert!((v - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn edge_fillet_profile_radius_bounds_delegate_to_inner() {
+        let p = EdgeFilletProfile::Radius(BlendRadius::Linear {
+            start: 0.1,
+            end: 0.5,
+        });
+        assert!((p.max_radius_bound() - 0.5).abs() < 1e-12);
+        assert!((p.min_radius_bound() - 0.1).abs() < 1e-12);
     }
 
     // -------------------------------------------------------------------
@@ -8598,10 +8834,13 @@ mod tests {
             seed in any::<u64>(),
         ) {
             let (model, solid_id, edges) = build_n_edge_model(n);
-            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 let s = seed.wrapping_add(i as u64);
-                map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                map.insert(
+                    e,
+                    EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                );
             }
             let opts = FilletOptions {
                 radius: 1.0,
@@ -8622,11 +8861,14 @@ mod tests {
         ) {
             let drop_index = drop_index % n;
             let (model, solid_id, edges) = build_n_edge_model(n);
-            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 if i == drop_index { continue; }
                 let s = seed.wrapping_add(i as u64);
-                map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                map.insert(
+                    e,
+                    EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                );
             }
             let opts = FilletOptions {
                 radius: 1.0,
@@ -8645,17 +8887,20 @@ mod tests {
             seed in any::<u64>(),
         ) {
             let (model, solid_id, edges) = build_n_edge_model(n);
-            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 let s = seed.wrapping_add(i as u64);
-                map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                map.insert(
+                    e,
+                    EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                );
             }
             // Inject a guaranteed-extra key. `build_n_edge_model`
             // generates edge ids densely from EdgeStore allocation,
             // so a u32 well above any plausibly-allocated id will
             // not collide with the selection.
             let extra: EdgeId = 999_999_u32 as EdgeId;
-            map.insert(extra, BlendRadius::Constant(0.5));
+            map.insert(extra, EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)));
             let opts = FilletOptions {
                 radius: 1.0,
                 fillet_type: FilletType::PerEdgeProfile(map),
@@ -8676,13 +8921,16 @@ mod tests {
         ) {
             let bad_index = bad_index % n;
             let (model, solid_id, edges) = build_n_edge_model(n);
-            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 if i == bad_index {
-                    map.insert(e, BlendRadius::Constant(r_neg));
+                    map.insert(e, EdgeFilletProfile::Radius(BlendRadius::Constant(r_neg)));
                 } else {
                     let s = seed.wrapping_add(i as u64);
-                    map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                    map.insert(
+                        e,
+                        EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                    );
                 }
             }
             let opts = FilletOptions {
@@ -8706,7 +8954,7 @@ mod tests {
         ) {
             let bad_index = bad_index % n;
             let (model, solid_id, edges) = build_n_edge_model(n);
-            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 if i == bad_index {
                     let bad = match mode {
@@ -8717,10 +8965,13 @@ mod tests {
                             end: 1.0,
                         },
                     };
-                    map.insert(e, bad);
+                    map.insert(e, EdgeFilletProfile::Radius(bad));
                 } else {
                     let s = seed.wrapping_add(i as u64);
-                    map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                    map.insert(
+                        e,
+                        EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                    );
                 }
             }
             let opts = FilletOptions {
@@ -8745,20 +8996,23 @@ mod tests {
         ) {
             let bad_index = bad_index % n;
             let (model, solid_id, edges) = build_n_edge_model(n);
-            let mut map: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 if i == bad_index {
                     map.insert(
                         e,
-                        BlendRadius::Variable(vec![
+                        EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
                             (0.0, 0.4),
                             (0.5, 0.6),
                             (p_third, 0.4),
-                        ]),
+                        ])),
                     );
                 } else {
                     let s = seed.wrapping_add(i as u64);
-                    map.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                    map.insert(
+                        e,
+                        EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                    );
                 }
             }
             let opts = FilletOptions {
@@ -8779,12 +9033,20 @@ mod tests {
             seed in any::<u64>(),
         ) {
             let (_, _, edges) = build_n_edge_model(n);
+            // Keep the inner `BlendRadius` map for round-trip
+            // comparison against `fillet_type_to_blend_radius`, and
+            // build the matching `EdgeFilletProfile` map by wrapping
+            // each entry in `Radius(_)` for the `FilletType` value.
             let mut original: HashMap<EdgeId, BlendRadius> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 let s = seed.wrapping_add(i as u64);
                 original.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
             }
-            let ft = FilletType::PerEdgeProfile(original.clone());
+            let profile_map: HashMap<EdgeId, EdgeFilletProfile> = original
+                .iter()
+                .map(|(&k, v)| (k, EdgeFilletProfile::Radius(v.clone())))
+                .collect();
+            let ft = FilletType::PerEdgeProfile(profile_map);
             for &e in &edges {
                 let expected = original.get(&e).cloned();
                 let got = fillet_type_to_blend_radius(&ft, e);
@@ -8809,10 +9071,13 @@ mod tests {
             seed in any::<u64>(),
         ) {
             let (_, _, edges) = build_n_edge_model(n);
-            let mut original: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut original: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (i, &e) in edges.iter().enumerate() {
                 let s = seed.wrapping_add(i as u64);
-                original.insert(e, build_arb_blend_radius(s, (s & 0xff) as u8));
+                original.insert(
+                    e,
+                    EdgeFilletProfile::Radius(build_arb_blend_radius(s, (s & 0xff) as u8)),
+                );
             }
             let ft = FilletType::PerEdgeProfile(original.clone());
             let cloned = ft.clone();
@@ -8842,23 +9107,279 @@ mod tests {
         ) {
             // Dedupe by edge id so HashMap collisions don't make
             // the two orderings disagree about which value survived.
-            let mut dedup: HashMap<EdgeId, BlendRadius> = HashMap::new();
+            let mut dedup: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
             for (e, kind, seed) in &entries {
-                dedup.insert(*e as EdgeId, build_arb_blend_radius(*seed, *kind));
+                dedup.insert(
+                    *e as EdgeId,
+                    EdgeFilletProfile::Radius(build_arb_blend_radius(*seed, *kind)),
+                );
             }
-            let mut sorted: Vec<(EdgeId, BlendRadius)> = dedup
+            let mut sorted: Vec<(EdgeId, EdgeFilletProfile)> = dedup
                 .iter()
                 .map(|(&k, v)| (k, v.clone()))
                 .collect();
             sorted.sort_by_key(|(k, _)| *k);
             let mut reversed = sorted.clone();
             reversed.reverse();
-            let map_a: HashMap<EdgeId, BlendRadius> = sorted.into_iter().collect();
-            let map_b: HashMap<EdgeId, BlendRadius> = reversed.into_iter().collect();
+            let map_a: HashMap<EdgeId, EdgeFilletProfile> = sorted.into_iter().collect();
+            let map_b: HashMap<EdgeId, EdgeFilletProfile> = reversed.into_iter().collect();
             prop_assert_eq!(
                 format!("{:?}", FilletType::PerEdgeProfile(map_a)),
                 format!("{:?}", FilletType::PerEdgeProfile(map_b)),
             );
+        }
+
+        // ----- F5-β.5.7 chord-focused property tests -----
+
+        /// `EdgeFilletProfile::Chord(c).min_radius_bound()` is `c/2`
+        /// for every positive finite chord — this is the worst-case
+        /// (flat dihedral, θ=π) radius derived from a chord, and the
+        /// representative-radius > 0 gate relies on it being a
+        /// closed-form lower bound. Verified for any `c > 0`.
+        #[test]
+        fn prop_edge_fillet_profile_chord_min_bound_is_half_for_any_positive_chord(
+            c in 1e-9_f64..1e6_f64,
+        ) {
+            let bound = EdgeFilletProfile::Chord(c).min_radius_bound();
+            prop_assert!(
+                (bound - c / 2.0).abs() < 1e-12,
+                "Chord({c}).min_radius_bound() = {bound}, expected {expected}",
+                expected = c / 2.0,
+            );
+        }
+
+        /// `EdgeFilletProfile::Chord(c).max_radius_bound()` is `0.0`
+        /// for any chord, matching the existing top-level
+        /// `FilletType::Chord(_) => 0.0` F6-α opt-out. The actual
+        /// radius produced by a chord at dihedral θ is
+        /// `c / (2 sin(θ/2))`, which is unbounded as θ → 0, so the
+        /// curvature gate cannot pre-screen chord requests and must
+        /// no-op them.
+        #[test]
+        fn prop_edge_fillet_profile_chord_max_bound_is_zero_for_any_chord(
+            c in 1e-9_f64..1e6_f64,
+        ) {
+            let bound = EdgeFilletProfile::Chord(c).max_radius_bound();
+            prop_assert_eq!(bound, 0.0);
+        }
+
+        /// Wrapping any `BlendRadius` profile in
+        /// `EdgeFilletProfile::Radius(...)` preserves both
+        /// `min_radius_bound` and `max_radius_bound` — they delegate
+        /// to the inner schedule's `min_value` / `max_value`. The
+        /// chord arm is the only asymmetric path; everything else
+        /// must be pass-through.
+        #[test]
+        fn prop_edge_fillet_profile_radius_bounds_delegate_to_inner_for_any_kind(
+            seed in any::<u64>(),
+            kind in 0u8..3u8,
+        ) {
+            let inner = build_arb_blend_radius(seed, kind);
+            let wrapped = EdgeFilletProfile::Radius(inner.clone());
+            prop_assert!(
+                (wrapped.max_radius_bound() - inner.max_value()).abs() < 1e-12,
+                "max_radius_bound mismatch: wrapped={}, inner={}",
+                wrapped.max_radius_bound(),
+                inner.max_value(),
+            );
+            prop_assert!(
+                (wrapped.min_radius_bound() - inner.min_value()).abs() < 1e-12,
+                "min_radius_bound mismatch: wrapped={}, inner={}",
+                wrapped.min_radius_bound(),
+                inner.min_value(),
+            );
+        }
+
+        /// Random per-edge map where every entry is `Chord(c_i)` with
+        /// `c_i` finite-positive must validate clean. Pins the
+        /// chord-only fast path through the validator.
+        #[test]
+        fn prop_validate_per_edge_profile_accepts_any_valid_chord_only_coverage(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let bits = seed.wrapping_add(i as u64);
+                let c = 0.1 + ((bits % 5000) as f64) / 1000.0;
+                map.insert(e, EdgeFilletProfile::Chord(c));
+            }
+            let opts = opts_with_per_edge_profile(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        /// Random per-edge map where every entry is *either* a valid
+        /// chord *or* a valid radius profile must validate clean.
+        /// Pins the mixed chord+radius path — the variant that F5-β.5.7
+        /// exists to enable.
+        #[test]
+        fn prop_validate_per_edge_profile_accepts_any_valid_chord_radius_mix(
+            n in arb_selection_size(),
+            seed in any::<u64>(),
+        ) {
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                let bits = seed.wrapping_add(i as u64);
+                // Cycle the kind: chord on every 4th edge, otherwise
+                // a deterministic radius profile.
+                if i % 4 == 0 {
+                    let c = 0.1 + ((bits % 5000) as f64) / 1000.0;
+                    map.insert(e, EdgeFilletProfile::Chord(c));
+                } else {
+                    let r = build_arb_blend_radius(bits, (i % 3) as u8);
+                    map.insert(e, EdgeFilletProfile::Radius(r));
+                }
+            }
+            let opts = opts_with_per_edge_profile(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            prop_assert!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        /// Injecting a non-positive chord at any single position of an
+        /// otherwise-valid mixed map must trip the per-edge chord
+        /// positivity check. The failing parameter must mention
+        /// `Chord` so callers can localise the bad entry.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_non_positive_chord_anywhere(
+            n in 1usize..=8,
+            bad_index in 0usize..8,
+            bad_value in proptest::sample::select(vec![0.0_f64, -1e-6, -0.5, -42.0]),
+        ) {
+            prop_assume!(n >= 1);
+            let bad_index = bad_index % n;
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == bad_index {
+                    map.insert(e, EdgeFilletProfile::Chord(bad_value));
+                } else {
+                    map.insert(e, EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)));
+                }
+            }
+            let opts = opts_with_per_edge_profile(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            match result {
+                Err(OperationError::InvalidInput { parameter, .. }) => {
+                    prop_assert!(
+                        parameter.contains("Chord"),
+                        "expected parameter to mention Chord, got {parameter}",
+                    );
+                }
+                other => prop_assert!(
+                    false,
+                    "expected InvalidInput citing Chord, got {other:?}",
+                ),
+            }
+        }
+
+        /// Injecting a non-finite chord (NaN / +∞ / -∞) at any single
+        /// position must trip the finite check. Mirrors the
+        /// `..._non_finite_constant_anywhere` test for the chord arm.
+        #[test]
+        fn prop_validate_per_edge_profile_rejects_non_finite_chord_anywhere(
+            n in 1usize..=8,
+            bad_index in 0usize..8,
+            mode in 0u8..3u8,
+        ) {
+            let bad_index = bad_index % n;
+            let bad_value = match mode {
+                0 => f64::NAN,
+                1 => f64::INFINITY,
+                _ => f64::NEG_INFINITY,
+            };
+            let (model, solid_id, edges) = build_n_edge_model(n);
+            let mut map: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
+            for (i, &e) in edges.iter().enumerate() {
+                if i == bad_index {
+                    map.insert(e, EdgeFilletProfile::Chord(bad_value));
+                } else {
+                    map.insert(e, EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)));
+                }
+            }
+            let opts = opts_with_per_edge_profile(map);
+            let result = validate_fillet_inputs(&model, solid_id, &edges, &opts);
+            match result {
+                Err(OperationError::InvalidInput { parameter, .. }) => {
+                    prop_assert!(
+                        parameter.contains("Chord"),
+                        "expected parameter to mention Chord, got {parameter}",
+                    );
+                }
+                other => prop_assert!(
+                    false,
+                    "expected InvalidInput citing Chord, got {other:?}",
+                ),
+            }
+        }
+
+        /// For any per-edge chord entry, `fillet_type_to_blend_radius`
+        /// returns `BlendRadius::Constant(c)` — the placeholder used
+        /// to feed `blend_graph::build`'s edge classification when no
+        /// closed-form radius is available without dihedral context.
+        /// Required so chord edges still appear in the blend graph
+        /// (and therefore in the surgery pipeline) on equal footing
+        /// with constant-radius edges.
+        #[test]
+        fn prop_fillet_type_to_blend_radius_chord_per_edge_returns_constant(
+            c in 1e-9_f64..1e6_f64,
+            eid in 0u32..1024,
+        ) {
+            let mut m = HashMap::new();
+            m.insert(eid as EdgeId, EdgeFilletProfile::Chord(c));
+            let ft = FilletType::PerEdgeProfile(m);
+            match fillet_type_to_blend_radius(&ft, eid as EdgeId) {
+                BlendRadius::Constant(out) => prop_assert!(
+                    (out - c).abs() < 1e-12,
+                    "expected Constant({c}), got Constant({out})",
+                ),
+                other => prop_assert!(
+                    false,
+                    "expected Constant({c}), got {other:?}",
+                ),
+            }
+        }
+
+        /// Cloning a `PerEdgeProfile` map that mixes chord + radius
+        /// entries preserves every value (deep clone semantics). The
+        /// pre-F5-β.5.7 prop test only covered radius profiles; this
+        /// extends it to the new chord arm.
+        #[test]
+        fn prop_per_edge_profile_chord_clone_preserves_mixed_kinds(
+            entries in proptest::collection::vec(
+                (0u32..1024, 0u8..4, any::<u64>()),
+                1..=8,
+            ),
+        ) {
+            let mut original: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
+            for (e, kind, seed) in &entries {
+                let profile = if *kind == 3 {
+                    // Map kind=3 to chord; the other three kinds go
+                    // through the existing arbitrary BlendRadius
+                    // builder.
+                    let c = 0.1 + ((seed % 5000) as f64) / 1000.0;
+                    EdgeFilletProfile::Chord(c)
+                } else {
+                    EdgeFilletProfile::Radius(build_arb_blend_radius(*seed, *kind))
+                };
+                original.insert(*e as EdgeId, profile);
+            }
+            let ft = FilletType::PerEdgeProfile(original.clone());
+            let cloned = ft.clone();
+            match cloned {
+                FilletType::PerEdgeProfile(c) => {
+                    prop_assert_eq!(c.len(), original.len());
+                    for (k, v) in &original {
+                        prop_assert_eq!(c.get(k), Some(v));
+                    }
+                }
+                other => prop_assert!(
+                    false,
+                    "expected PerEdgeProfile, got {other:?}",
+                ),
+            }
         }
     }
 

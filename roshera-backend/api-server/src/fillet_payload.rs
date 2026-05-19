@@ -296,6 +296,19 @@ fn validate_dto(dto: &BlendRadiusDto, field_path: &str) -> Result<(), ApiError> 
                 }
             }
         }
+        // F5-β.5.7: the `Chord` DTO carries the raw chord length;
+        // positivity / finiteness is the same gate the `Constant`
+        // arm applies. End-to-end routing of chord profiles through
+        // the per-edge `all_simple` payload path is deferred to a
+        // follow-up slice; this arm exists so the validator remains
+        // exhaustive after the DTO grew a fourth variant.
+        BlendRadiusDto::Chord(c) => {
+            if !c.is_finite() || *c <= 0.0 {
+                return Err(invalid(format!(
+                    "'{field_path}' chord must be a positive finite number, got {c}"
+                )));
+            }
+        }
     }
     Ok(())
 }

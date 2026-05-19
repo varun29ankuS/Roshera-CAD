@@ -46,7 +46,7 @@
 //! memo can integrate it today.
 
 use geometry_engine::math::Tolerance;
-use geometry_engine::operations::blend_graph::BlendRadius;
+use geometry_engine::operations::blend_graph::{BlendRadius, EdgeFilletProfile};
 use geometry_engine::operations::fillet::{FilletType, PropagationMode};
 use geometry_engine::operations::{fillet_edges, FilletOptions};
 use geometry_engine::primitives::edge::EdgeId;
@@ -131,18 +131,25 @@ fn per_edge_profile_mixed_kinds_dispatch_through_fillet_edges() {
 
     // All three radii ≪ HALF / 2 so the F6-α curvature gate is
     // satisfied trivially for every profile sample.
-    let mut profile: HashMap<EdgeId, BlendRadius> = HashMap::new();
-    profile.insert(edge_a, BlendRadius::Constant(0.3));
+    let mut profile: HashMap<EdgeId, EdgeFilletProfile> = HashMap::new();
+    profile.insert(
+        edge_a,
+        EdgeFilletProfile::Radius(BlendRadius::Constant(0.3)),
+    );
     profile.insert(
         edge_b,
-        BlendRadius::Linear {
+        EdgeFilletProfile::Radius(BlendRadius::Linear {
             start: 0.2,
             end: 0.5,
-        },
+        }),
     );
     profile.insert(
         edge_c,
-        BlendRadius::Variable(vec![(0.0, 0.25), (0.5, 0.4), (1.0, 0.25)]),
+        EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
+            (0.0, 0.25),
+            (0.5, 0.4),
+            (1.0, 0.25),
+        ])),
     );
 
     let opts = FilletOptions {

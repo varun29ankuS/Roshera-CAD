@@ -12,7 +12,10 @@ use crate::{
 use async_trait::async_trait;
 use geometry_engine::{
     math::Tolerance,
-    operations::{blend_graph::BlendRadius, fillet::FilletType},
+    operations::{
+        blend_graph::{BlendRadius, EdgeFilletProfile},
+        fillet::FilletType,
+    },
     primitives::{edge::EdgeId, topology_builder::GeometryId as GeometryEngineId},
 };
 use std::collections::HashMap;
@@ -294,6 +297,13 @@ pub fn blend_radius_dto_to_fillet_type(
         BlendRadiusDto::Constant(r) => FilletType::Constant(*r),
         BlendRadiusDto::Linear { start, end } => FilletType::Variable(*start, *end),
         BlendRadiusDto::Variable(samples) => FilletType::VariableStations(samples.clone()),
+        // F5-β.5.7: a default-only `Chord` DTO maps to the top-
+        // level chord path (`FilletType::Chord`). When chord
+        // appears inside `per_edge_overrides` the dispatch
+        // happens one level up in `build_fillet_type_from_
+        // overrides`, which builds `FilletType::PerEdgeProfile`
+        // with `EdgeFilletProfile::Chord` entries.
+        BlendRadiusDto::Chord(c) => FilletType::Chord(*c),
     }
 }
 
@@ -303,14 +313,20 @@ pub fn blend_radius_dto_to_fillet_type(
 /// Dispatch:
 ///
 /// - `per_edge_overrides == None` → legacy single-profile path
-///   via [`blend_radius_dto_to_fillet_type`].
+///   via [`blend_radius_dto_to_fillet_type`]. A `Chord` default
+///   takes the top-level `FilletType::Chord` path through this
+///   helper.
 /// - All overrides + default are `Constant` → `PerEdgeConstant`.
-///   Cheap single-`f64` shape; the all-Constant fast path.
+///   Cheap single-`f64` shape; the all-Constant fast path. A
+///   `Chord` entry never matches this predicate, so any chord
+///   in the override map falls through to `PerEdgeProfile`.
 /// - Any non-`Constant` profile present (override or default
-///   serving as fallback) → `PerEdgeProfile`. Every selected
-///   edge is filled with its explicit override (when present)
-///   or the default profile (when not). F5-β.5.6 lifted the
-///   prior `NotImplemented` gate here.
+///   serving as fallback), or any `Chord` profile → `PerEdge
+///   Profile`. Every selected edge is filled with its explicit
+///   override (when present) or the default profile (when not).
+///   F5-β.5.6 lifted the prior `NotImplemented` gate here;
+///   F5-β.5.7 extended the variant to carry chord entries
+///   alongside radius schedules.
 pub(crate) fn build_fillet_type_from_overrides(
     default_radius: &BlendRadiusDto,
     per_edge_overrides: &Option<HashMap<EntityId, BlendRadiusDto>>,
@@ -356,15 +372,17 @@ pub(crate) fn build_fillet_type_from_overrides(
         return Ok(FilletType::PerEdgeConstant(per_edge));
     }
 
-    // Mixed-kind path: at least one profile is non-Constant.
-    // Pack as `PerEdgeProfile(HashMap<EdgeId, BlendRadius>)`.
+    // Mixed-kind path: at least one profile is non-Constant
+    // (or any profile is `Chord`, which never collapses into
+    // `PerEdgeConstant` regardless of its value). Pack as
+    // `PerEdgeProfile(HashMap<EdgeId, EdgeFilletProfile>)`.
     // Every selected edge gets its own profile entry; missing
     // entity ids fall back to the default profile.
-    let mut per_edge: HashMap<EdgeId, BlendRadius> =
+    let mut per_edge: HashMap<EdgeId, EdgeFilletProfile> =
         HashMap::with_capacity(entity_to_edge.len());
     for (entity_id, edge_id) in entity_to_edge {
         let dto = overrides.get(entity_id).unwrap_or(default_radius);
-        per_edge.insert(*edge_id, blend_radius_dto_to_blend_radius(dto));
+        per_edge.insert(*edge_id, blend_radius_dto_to_edge_profile(dto));
     }
     if per_edge.is_empty() {
         // Defensive: empty entity→edge mapping degrades to the
@@ -376,18 +394,24 @@ pub(crate) fn build_fillet_type_from_overrides(
 }
 
 /// Convert a wire-level [`BlendRadiusDto`] to the kernel
-/// [`BlendRadius`] shape. Each DTO variant maps 1:1 — the kernel
-/// `BlendRadius` enum was designed to match this DTO so per-edge
-/// profile dispatch (F5-β.5.6) doesn't have to invent a parallel
-/// type.
-fn blend_radius_dto_to_blend_radius(dto: &BlendRadiusDto) -> BlendRadius {
+/// [`EdgeFilletProfile`] shape used inside `PerEdgeProfile`. The
+/// three radius-schedule DTO variants wrap into
+/// `EdgeFilletProfile::Radius(BlendRadius::*)`; the F5-β.5.7
+/// `Chord` DTO maps to `EdgeFilletProfile::Chord` so the raw
+/// chord length survives intact to surgery time, where
+/// `create_chord_fillet` converts it to a per-edge radius with
+/// the local dihedral.
+fn blend_radius_dto_to_edge_profile(dto: &BlendRadiusDto) -> EdgeFilletProfile {
     match dto {
-        BlendRadiusDto::Constant(r) => BlendRadius::Constant(*r),
-        BlendRadiusDto::Linear { start, end } => BlendRadius::Linear {
+        BlendRadiusDto::Constant(r) => EdgeFilletProfile::Radius(BlendRadius::Constant(*r)),
+        BlendRadiusDto::Linear { start, end } => EdgeFilletProfile::Radius(BlendRadius::Linear {
             start: *start,
             end: *end,
-        },
-        BlendRadiusDto::Variable(samples) => BlendRadius::Variable(samples.clone()),
+        }),
+        BlendRadiusDto::Variable(samples) => {
+            EdgeFilletProfile::Radius(BlendRadius::Variable(samples.clone()))
+        }
+        BlendRadiusDto::Chord(c) => EdgeFilletProfile::Chord(*c),
     }
 }
 
@@ -525,13 +549,16 @@ mod per_edge_overrides_tests {
         .expect("mixed-kind overrides must now build PerEdgeProfile");
         match ty {
             FilletType::PerEdgeProfile(map) => {
-                assert_eq!(map.get(&30), Some(&BlendRadius::Constant(1.0)));
+                assert_eq!(
+                    map.get(&30),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)))
+                );
                 assert_eq!(
                     map.get(&31),
-                    Some(&BlendRadius::Linear {
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Linear {
                         start: 0.5,
                         end: 1.5,
-                    })
+                    }))
                 );
                 assert_eq!(map.len(), 2);
             }
@@ -571,21 +598,24 @@ mod per_edge_overrides_tests {
         .expect("mixed-kind overrides with Constant default must build");
         match ty {
             FilletType::PerEdgeProfile(map) => {
-                assert_eq!(map.get(&50), Some(&BlendRadius::Constant(0.3)));
+                assert_eq!(
+                    map.get(&50),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(0.3)))
+                );
                 assert_eq!(
                     map.get(&51),
-                    Some(&BlendRadius::Linear {
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Linear {
                         start: 0.2,
                         end: 0.5,
-                    })
+                    }))
                 );
                 assert_eq!(
                     map.get(&52),
-                    Some(&BlendRadius::Variable(vec![
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
                         (0.0, 0.25),
                         (0.5, 0.4),
                         (1.0, 0.25),
-                    ]))
+                    ])))
                 );
                 assert_eq!(map.len(), 3);
             }
@@ -626,15 +656,21 @@ mod per_edge_overrides_tests {
             FilletType::PerEdgeProfile(map) => {
                 assert_eq!(
                     map.get(&60),
-                    Some(&BlendRadius::Linear {
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Linear {
                         start: 0.2,
                         end: 0.4,
-                    })
+                    }))
                 );
-                assert_eq!(map.get(&61), Some(&BlendRadius::Constant(0.6)));
+                assert_eq!(
+                    map.get(&61),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(0.6)))
+                );
                 assert_eq!(
                     map.get(&62),
-                    Some(&BlendRadius::Variable(vec![(0.0, 0.5), (1.0, 0.7)]))
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Variable(vec![
+                        (0.0, 0.5),
+                        (1.0, 0.7)
+                    ])))
                 );
                 assert_eq!(map.len(), 3);
             }
@@ -692,5 +728,150 @@ mod per_edge_overrides_tests {
             &None,
         );
         assert_eq!(max, 0.9);
+    }
+
+    // ------------------------------------------------------------------
+    // F5-β.5.7 — chord-in-per-edge-overrides coverage.
+    //
+    // Each test pins one dispatch path for the new
+    // `BlendRadiusDto::Chord(_)` DTO variant inside the override map:
+    //   - Default-only Chord (no overrides) → top-level
+    //     `FilletType::Chord`.
+    //   - Chord override mixed with Constant default + Constant
+    //     overrides → `PerEdgeProfile` (Chord never collapses into
+    //     `PerEdgeConstant`).
+    //   - All-Chord overrides → `PerEdgeProfile`.
+    //   - Mixed Linear default + Chord / Constant overrides → all
+    //     three EdgeFilletProfile shapes accounted for.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn chord_default_with_no_overrides_yields_fillet_type_chord() {
+        let result = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Chord(0.5),
+            &None,
+            &HashMap::new(),
+        )
+        .expect("Chord default with no overrides must succeed");
+        match result {
+            FilletType::Chord(c) => assert!((c - 0.5).abs() < 1e-12),
+            other => panic!("expected FilletType::Chord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chord_override_with_constant_default_builds_per_edge_profile() {
+        // Three edges, default Constant, one edge overridden with
+        // Chord. The Chord entry blocks the all-Constant fast path,
+        // so the dispatch lands on PerEdgeProfile with two
+        // Radius(Constant) entries (e0 explicit override, e2
+        // default fallback) and one Chord (e1).
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![70, 71, 72];
+        let mapping = make_entity_to_edge(&[e0, e1, e2], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Constant(0.4));
+        overrides.insert(e1, BlendRadiusDto::Chord(0.6));
+        let ty = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Constant(0.5),
+            &Some(overrides),
+            &mapping,
+        )
+        .expect("Chord override with Constant default must build");
+        match ty {
+            FilletType::PerEdgeProfile(map) => {
+                assert_eq!(map.len(), 3);
+                assert_eq!(
+                    map.get(&70),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(0.4)))
+                );
+                assert_eq!(map.get(&71), Some(&EdgeFilletProfile::Chord(0.6)));
+                assert_eq!(
+                    map.get(&72),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)))
+                );
+                let chord_count = map
+                    .values()
+                    .filter(|p| matches!(p, EdgeFilletProfile::Chord(_)))
+                    .count();
+                assert_eq!(chord_count, 1, "exactly one Chord entry expected");
+            }
+            other => panic!("expected PerEdgeProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_chord_overrides_build_per_edge_profile() {
+        // Three edges, default Constant, every edge overridden with
+        // Chord. Chord never collapses to PerEdgeConstant — even
+        // though every entry is "constant" in shape, the radius
+        // derivation requires the local dihedral, so PerEdgeProfile
+        // is the correct dispatch.
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![80, 81, 82];
+        let mapping = make_entity_to_edge(&[e0, e1, e2], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Chord(0.3));
+        overrides.insert(e1, BlendRadiusDto::Chord(0.4));
+        overrides.insert(e2, BlendRadiusDto::Chord(0.5));
+        let ty = build_fillet_type_from_overrides(
+            &BlendRadiusDto::Constant(0.5),
+            &Some(overrides),
+            &mapping,
+        )
+        .expect("all-Chord overrides must build");
+        match ty {
+            FilletType::PerEdgeProfile(map) => {
+                assert_eq!(map.len(), 3);
+                assert_eq!(map.get(&80), Some(&EdgeFilletProfile::Chord(0.3)));
+                assert_eq!(map.get(&81), Some(&EdgeFilletProfile::Chord(0.4)));
+                assert_eq!(map.get(&82), Some(&EdgeFilletProfile::Chord(0.5)));
+            }
+            other => panic!("expected PerEdgeProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_radius_and_chord_overrides_build_per_edge_profile() {
+        // Three edges, default Linear, overrides: e0 Chord, e1
+        // Constant, e2 nothing (picks up Linear default). Asserts
+        // PerEdgeProfile with one Chord, one Radius(Constant), one
+        // Radius(Linear).
+        let e0 = EntityId::new();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let edge_ids: Vec<EdgeId> = vec![90, 91, 92];
+        let mapping = make_entity_to_edge(&[e0, e1, e2], &edge_ids);
+        let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+        overrides.insert(e0, BlendRadiusDto::Chord(0.7));
+        overrides.insert(e1, BlendRadiusDto::Constant(0.45));
+        let default = BlendRadiusDto::Linear {
+            start: 0.2,
+            end: 0.6,
+        };
+        let ty = build_fillet_type_from_overrides(&default, &Some(overrides), &mapping)
+            .expect("mixed radius and chord overrides must build");
+        match ty {
+            FilletType::PerEdgeProfile(map) => {
+                assert_eq!(map.len(), 3);
+                assert_eq!(map.get(&90), Some(&EdgeFilletProfile::Chord(0.7)));
+                assert_eq!(
+                    map.get(&91),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Constant(0.45)))
+                );
+                assert_eq!(
+                    map.get(&92),
+                    Some(&EdgeFilletProfile::Radius(BlendRadius::Linear {
+                        start: 0.2,
+                        end: 0.6,
+                    }))
+                );
+            }
+            other => panic!("expected PerEdgeProfile, got {other:?}"),
+        }
     }
 }
