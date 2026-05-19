@@ -124,10 +124,12 @@ fn fillet_with_constant_overrides_round_trips_losslessly() {
 
 #[test]
 fn fillet_with_mixed_kind_overrides_round_trips_losslessly() {
-    // Even though the dispatch path rejects mixed-kind overrides as
-    // NotImplemented (F5-β.5.6+ unlocks the kernel side), the wire
-    // shape must still serialise and load losslessly so the
-    // timeline can be saved + agent-reviewed before manual revision.
+    // F5-β.5.6+ lifted the kernel-side `NotImplemented` gate, but
+    // the wire-shape round-trip contract is independent of dispatch
+    // status: regardless of whether the executor accepts the
+    // event, the on-disk JSON must serialise and load losslessly
+    // so the timeline can be saved + agent-reviewed before manual
+    // revision.
     let e0 = EntityId::new();
     let e1 = EntityId::new();
     let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
@@ -222,4 +224,163 @@ fn fillet_with_overrides_event_tag_is_unchanged() {
     assert_eq!(v["type"], "Fillet");
     assert_eq!(v["radius"]["kind"], "constant");
     assert!(v["per_edge_overrides"].is_object());
+}
+
+// ---------------------------------------------------------------------------
+// 5. F5-β.5.8 — replay-determinism for mixed-kind + chord overrides
+//
+// F5-β.5.6 lifted the kernel-side `NotImplemented` gate on mixed-kind
+// `per_edge_overrides`; F5-β.5.7 added the `Chord` DTO variant. These
+// two tests pin the wire-shape determinism contract for both cases:
+// the executor now successfully consumes any combination of profile
+// kinds, so the on-disk shape must round-trip byte-identically across
+// two save/load cycles. Without this pin, a future refactor that
+// leaks `HashMap` ordering into the JSON form would silently corrupt
+// the replay output for any timeline carrying mixed-kind overrides.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replay_fillet_per_edge_overrides_mixed_kinds_is_deterministic() {
+    // Three edges, default Constant, every shape represented in
+    // the override map: Constant on e0, Linear on e1, Variable on
+    // e2. The dispatch path now routes this through
+    // `FilletType::PerEdgeProfile` (no more `NotImplemented`), so
+    // the wire-shape determinism is the stronger of the two
+    // contracts that need pinning.
+    let e0 = EntityId::new();
+    let e1 = EntityId::new();
+    let e2 = EntityId::new();
+    let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+    overrides.insert(e0, BlendRadiusDto::Constant(0.3));
+    overrides.insert(
+        e1,
+        BlendRadiusDto::Linear {
+            start: 0.2,
+            end: 0.5,
+        },
+    );
+    overrides.insert(
+        e2,
+        BlendRadiusDto::Variable(vec![(0.0, 0.25), (0.5, 0.4), (1.0, 0.25)]),
+    );
+    let op = Operation::Fillet {
+        edges: vec![e0, e1, e2],
+        radius: BlendRadiusDto::Constant(0.5),
+        per_edge_overrides: Some(overrides),
+    };
+    // Two independent save → load → save cycles must produce
+    // identical canonical JSON. The contract is pinned through
+    // `serde_json::to_value` (the path the storage layer uses):
+    // `Value::Object` is backed by a `BTreeMap`, which gives a
+    // stable string-keyed ordering regardless of the source
+    // `HashMap`'s iteration order. This is the exact form a
+    // saved timeline persists.
+    let v1 = serde_json::to_value(&op).expect("first serialise");
+    let back1: Operation = serde_json::from_value(v1.clone()).expect("first load");
+    let v1_round = serde_json::to_value(&back1).expect("first re-serialise");
+    let back2: Operation = serde_json::from_value(v1_round.clone()).expect("second load");
+    let v2_round = serde_json::to_value(&back2).expect("second re-serialise");
+    assert_eq!(
+        v1_round, v2_round,
+        "mixed-kind overrides must replay byte-identically across two cycles"
+    );
+    // Sanity: the round-tripped event must equal the original
+    // structurally (HashMap equality is order-independent).
+    match back2 {
+        Operation::Fillet {
+            per_edge_overrides: Some(map),
+            ..
+        } => {
+            assert_eq!(map.len(), 3, "all three overrides must survive replay");
+            assert_eq!(map.get(&e0), Some(&BlendRadiusDto::Constant(0.3)));
+            assert_eq!(
+                map.get(&e1),
+                Some(&BlendRadiusDto::Linear {
+                    start: 0.2,
+                    end: 0.5,
+                })
+            );
+            assert_eq!(
+                map.get(&e2),
+                Some(&BlendRadiusDto::Variable(vec![
+                    (0.0, 0.25),
+                    (0.5, 0.4),
+                    (1.0, 0.25),
+                ]))
+            );
+        }
+        other => panic!("expected Fillet with overrides, got {other:?}"),
+    }
+}
+
+#[test]
+fn replay_fillet_per_edge_overrides_chord_kind_works() {
+    // F5-β.5.7 added `BlendRadiusDto::Chord(c)`. The kernel-side
+    // dispatch packs chord entries into `EdgeFilletProfile::Chord`
+    // inside `FilletType::PerEdgeProfile`; the wire shape carries
+    // them with `{ "kind": "chord", "value": c }`. This test pins
+    // both halves:
+    //
+    //   1. A chord-bearing override map survives a save/load
+    //      cycle losslessly.
+    //   2. Two re-serialisation cycles produce byte-identical
+    //      JSON (replay determinism, as in the mixed-kind test).
+    //   3. The wire form uses the `chord` tag, not `constant` or
+    //      `variable` — guards against accidental kind aliasing
+    //      in the serde derive.
+    let e0 = EntityId::new();
+    let e1 = EntityId::new();
+    let e2 = EntityId::new();
+    let mut overrides: HashMap<EntityId, BlendRadiusDto> = HashMap::new();
+    overrides.insert(e0, BlendRadiusDto::Chord(0.3));
+    overrides.insert(e1, BlendRadiusDto::Chord(0.4));
+    overrides.insert(e2, BlendRadiusDto::Constant(0.5));
+    let op = Operation::Fillet {
+        edges: vec![e0, e1, e2],
+        radius: BlendRadiusDto::Constant(0.5),
+        per_edge_overrides: Some(overrides.clone()),
+    };
+    // Determinism contract goes through `to_value` (the storage
+    // layer's canonical form) — see `replay_fillet_per_edge_
+    // overrides_mixed_kinds_is_deterministic` for the rationale.
+    let v1 = serde_json::to_value(&op).expect("first serialise");
+    let back1: Operation = serde_json::from_value(v1.clone()).expect("first load");
+    let v1_round = serde_json::to_value(&back1).expect("first re-serialise");
+    let back2: Operation = serde_json::from_value(v1_round.clone()).expect("second load");
+    let v2_round = serde_json::to_value(&back2).expect("second re-serialise");
+    assert_eq!(
+        v1_round, v2_round,
+        "chord-bearing overrides must replay byte-identically across two cycles"
+    );
+    // Sanity: chord entries survive load.
+    match back2 {
+        Operation::Fillet {
+            per_edge_overrides: Some(map),
+            ..
+        } => {
+            assert_eq!(map, overrides, "chord overrides must round-trip exactly");
+            let chord_count = map
+                .values()
+                .filter(|d| matches!(d, BlendRadiusDto::Chord(_)))
+                .count();
+            assert_eq!(chord_count, 2, "two Chord entries expected after replay");
+        }
+        other => panic!("expected Fillet with overrides, got {other:?}"),
+    }
+    // Wire-shape pinning: the chord override must serialise with
+    // `kind: "chord"`, not aliased to another tag.
+    let v = serde_json::to_value(&op).expect("serialise to value");
+    let overrides_obj = v["per_edge_overrides"]
+        .as_object()
+        .expect("per_edge_overrides must be an object");
+    let chord_tags: Vec<&str> = overrides_obj
+        .values()
+        .filter_map(|val| val["kind"].as_str())
+        .filter(|k| *k == "chord")
+        .collect();
+    assert_eq!(
+        chord_tags.len(),
+        2,
+        "exactly two `kind: chord` entries expected on the wire; got object {overrides_obj:?}"
+    );
 }
