@@ -87,6 +87,53 @@ impl BlendRadius {
     }
 }
 
+/// Per-edge fillet profile shape. Wraps a radius schedule
+/// ([`BlendRadius`]) or a chord length, since chord requires
+/// dihedral context for radius derivation and isn't naturally
+/// expressible as a radius value. F5-β.5.7 introduces this wrapper
+/// so per-edge fillet selections can mix radius-schedule profiles
+/// (Constant / Linear / Variable) with chord profiles on a
+/// single `fillet_edges` call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgeFilletProfile {
+    /// Radius schedule along the edge (Constant / Linear / Variable).
+    Radius(BlendRadius),
+    /// Chord length. Local dihedral converts chord → radius at
+    /// surgery time inside `create_chord_fillet`; this variant
+    /// stays raw so the conversion is applied per-edge with the
+    /// actual edge geometry, not the global selection.
+    Chord(f64),
+}
+
+impl EdgeFilletProfile {
+    /// Conservative *upper bound* on radius produced by this
+    /// profile. Used by the F6-α curvature gate. For `Chord`
+    /// we cannot bound the resulting radius without the local
+    /// dihedral (radius → ∞ as dihedral → 0), so we return 0.0
+    /// which makes the F6-α gate a no-op for chord profiles —
+    /// matching the existing top-level `FilletType::Chord(_)`
+    /// behaviour.
+    pub fn max_radius_bound(&self) -> f64 {
+        match self {
+            EdgeFilletProfile::Radius(b) => b.max_value(),
+            EdgeFilletProfile::Chord(_) => 0.0,
+        }
+    }
+
+    /// Conservative *lower bound* on radius produced by this
+    /// profile. For chord `c` at any convex dihedral `θ ∈ (0, π]`,
+    /// the resulting radius is `c / (2 sin(θ/2)) ≥ c/2`, so
+    /// `c/2` is a safe lower bound. Used by the representative
+    /// > 0 gate; the actual positivity check on the raw chord
+    /// value is owned by `validate_fillet_inputs`.
+    pub fn min_radius_bound(&self) -> f64 {
+        match self {
+            EdgeFilletProfile::Radius(b) => b.min_value(),
+            EdgeFilletProfile::Chord(c) => *c / 2.0,
+        }
+    }
+}
+
 /// A single edge selected for blending. Convexity and dihedral are
 /// reflected here directly so consumers don't have to round-trip
 /// back to `model.edges`.

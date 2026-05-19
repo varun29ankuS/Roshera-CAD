@@ -437,6 +437,13 @@ pub enum BlendRadiusDto {
     },
     /// Explicit `(station, radius)` control points along `u ∈ [0, 1]`.
     Variable(Vec<(f64, f64)>),
+    /// Chord-length fillet. The cap-to-cap chord distance `c` is
+    /// converted to a per-edge radius at surgery time using the local
+    /// dihedral; this DTO holds the raw `c` value. F5-β.5.7 adds this
+    /// variant so per-edge profile overrides can mix radius-schedule
+    /// entries (`Constant` / `Linear` / `Variable`) with chord
+    /// entries on a single fillet operation.
+    Chord(f64),
 }
 
 impl BlendRadiusDto {
@@ -451,6 +458,14 @@ impl BlendRadiusDto {
             BlendRadiusDto::Variable(samples) => {
                 samples.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max)
             }
+            // Chord's resulting radius depends on the local dihedral
+            // and cannot be bounded here without that context. Report
+            // the chord value itself as a placeholder — same shape as
+            // the kernel's `FilletType::Chord(c) => BlendRadius::
+            // Constant(*c)` mapping. Upstream gates that need a true
+            // radius bound (e.g. F6-α curvature check) skip chord
+            // entries; the chord positivity gate lives in `validate`.
+            BlendRadiusDto::Chord(c) => *c,
         }
     }
 
@@ -472,6 +487,8 @@ impl BlendRadiusDto {
                         .fold(f64::INFINITY, f64::min)
                 }
             }
+            // Same placeholder as `max_radius` — see note above.
+            BlendRadiusDto::Chord(c) => *c,
         }
     }
 }
@@ -499,6 +516,12 @@ impl Serialize for BlendRadiusDto {
                 m.serialize_entry("samples", samples)?;
                 m.end()
             }
+            BlendRadiusDto::Chord(c) => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("kind", "chord")?;
+                m.serialize_entry("value", c)?;
+                m.end()
+            }
         }
     }
 }
@@ -523,7 +546,7 @@ impl<'de> Deserialize<'de> for BlendRadiusDto {
                     .ok_or_else(|| {
                         serde::de::Error::custom(
                             "BlendRadiusDto: tagged form requires a 'kind' string field \
-                             (one of: constant, linear, variable)",
+                             (one of: constant, linear, variable, chord)",
                         )
                     })?;
                 match kind {
@@ -571,8 +594,19 @@ impl<'de> Deserialize<'de> for BlendRadiusDto {
                             })?;
                         Ok(BlendRadiusDto::Variable(samples))
                     }
+                    "chord" => {
+                        let value = map
+                            .get("value")
+                            .and_then(|v| v.as_f64())
+                            .ok_or_else(|| {
+                                serde::de::Error::custom(
+                                    "BlendRadiusDto::Chord: 'value' must be a number",
+                                )
+                            })?;
+                        Ok(BlendRadiusDto::Chord(value))
+                    }
                     other => Err(serde::de::Error::custom(format!(
-                        "BlendRadiusDto: unknown kind '{other}' (expected: constant, linear, variable)"
+                        "BlendRadiusDto: unknown kind '{other}' (expected: constant, linear, variable, chord)"
                     ))),
                 }
             }
