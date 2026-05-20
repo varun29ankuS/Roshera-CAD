@@ -124,6 +124,15 @@ pub mod spine_solver;
 // Dispatch table is pinned by `tests/fillet_analytic_surface_contract.rs`.
 pub mod blend_surface_carrier;
 
+// CF-β.3 — eager-cap synthesizer for mixed-kind corners. A vertex
+// whose incident edges carry a mix of fillet and chamfer blends is
+// closed by a single planar cap face emitted by the *second* of two
+// kind-mismatched calls. See the module-level doc comment for the
+// algorithm. Dispatch wiring (the chamfer.rs / fillet.rs entry hooks)
+// lands in CF-β.3.4 alongside the surgery-flag extension that
+// preserves the corner vertex during the first call.
+pub mod mixed_kind_corner_cap;
+
 // AI integration
 pub mod ai_operations_registry;
 
