@@ -476,6 +476,22 @@ pub struct Solid {
     /// helpers [`Self::chamfer_faces_at_vertex`] /
     /// [`Self::fillet_faces_at_vertex`].
     pub(crate) blend_faces_by_kind: HashMap<FaceId, BlendKind>,
+    /// CF-β.4 — vertices left with a deliberate, partially-blended open
+    /// boundary by the *first* of two kind-mismatched calls at the same
+    /// corner. The second call's dispatch hook
+    /// (`mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`) closes
+    /// the boundary and removes the vertex from this set; the
+    /// post-operation `validate_result` gate consults the set to
+    /// short-circuit non-manifold-edge and Euler-characteristic checks
+    /// at edges incident to a pending corner, so the intermediate state
+    /// passes validation without weakening the gate for everything else.
+    ///
+    /// Mutated by [`Self::mark_pending_mixed_kind_corner`] (first call,
+    /// after surgery) and [`Self::clear_pending_mixed_kind_corner`]
+    /// (second call, after cap synthesis). Idempotent on both sides.
+    /// Survives [`Self::deep_copy`] so timeline replay preserves the
+    /// intermediate-state expectation across snapshots.
+    pub(crate) pending_mixed_kind_corners: HashSet<VertexId>,
 }
 
 /// Top-level AABB used as a conservative collision proxy. The detailed
@@ -508,6 +524,7 @@ impl Solid {
             blended_edges: HashMap::new(),
             blended_vertices: HashMap::new(),
             blend_faces_by_kind: HashMap::new(),
+            pending_mixed_kind_corners: HashSet::new(),
         }
     }
 
@@ -555,6 +572,7 @@ impl Solid {
             blended_edges: self.blended_edges.clone(),
             blended_vertices: self.blended_vertices.clone(),
             blend_faces_by_kind: self.blend_faces_by_kind.clone(),
+            pending_mixed_kind_corners: self.pending_mixed_kind_corners.clone(),
         }
     }
 
@@ -636,6 +654,47 @@ impl Solid {
     /// from surface geometry.
     pub fn blend_kind_at_face(&self, face: FaceId) -> Option<BlendKind> {
         self.blend_faces_by_kind.get(&face).copied()
+    }
+
+    /// CF-β.4 — mark `vertex` as carrying a deliberate, partially-
+    /// blended open boundary contributed by the first of two kind-
+    /// mismatched blend calls. Called by `chamfer::chamfer_edges` /
+    /// `fillet::fillet_edges` after surgery, before `record_operation`,
+    /// for every corner vertex that was preserved by the
+    /// `original_v*_corner_shared` flag *and* whose
+    /// [`VertexBlendKindSet`] is single-kind after the call (i.e. the
+    /// matching opposite-kind call has not yet fired). Idempotent.
+    pub(crate) fn mark_pending_mixed_kind_corner(&mut self, vertex: VertexId) {
+        self.pending_mixed_kind_corners.insert(vertex);
+    }
+
+    /// CF-β.4 — clear `vertex` from the pending set once the matching
+    /// opposite-kind call has fired
+    /// [`super::super::operations::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`]
+    /// and the open boundary is closed by a stitched cap face.
+    /// Idempotent — clearing a vertex that was never pending is a
+    /// no-op (returns `false`).
+    pub(crate) fn clear_pending_mixed_kind_corner(&mut self, vertex: VertexId) -> bool {
+        self.pending_mixed_kind_corners.remove(&vertex)
+    }
+
+    /// CF-β.4 — query whether `vertex` currently carries a partially-
+    /// blended open boundary that the `validate_result` gate should
+    /// tolerate. The post-operation validator
+    /// (`chamfer::validate_chamfered_solid` /
+    /// `fillet::validate_filleted_solid`) consults this to short-
+    /// circuit non-manifold-edge and Euler-characteristic checks at
+    /// edges incident to a pending corner.
+    pub fn is_mixed_kind_corner_pending(&self, vertex: VertexId) -> bool {
+        self.pending_mixed_kind_corners.contains(&vertex)
+    }
+
+    /// CF-β.4 — read-only borrow of the full pending-corners set.
+    /// Used by `record_operation` to serialise the intermediate-state
+    /// expectation into the timeline event payload, so a replay can
+    /// reproduce the same partially-blended boundary.
+    pub fn pending_mixed_kind_corners(&self) -> &HashSet<VertexId> {
+        &self.pending_mixed_kind_corners
     }
 
     /// Add inner shell (void)
@@ -1860,5 +1919,81 @@ mod blend_faces_by_kind_tests {
             Some(BlendKind::Chamfer),
             "snapshot must own its blend_faces_by_kind clone"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_mixed_kind_corners_tests {
+    //! CF-β.4 — pin the per-solid pending-mixed-kind-corner registry
+    //! that lets the post-operation `validate_result` gate tolerate the
+    //! deliberate open boundary left by the first of two kind-
+    //! mismatched blend calls at the same corner. The second call's
+    //! synthesizer (`mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`)
+    //! is responsible for clearing the entry once the cap is stitched.
+
+    use super::{ShellId, Solid, SolidId};
+
+    fn empty_solid() -> Solid {
+        Solid::new(0 as SolidId, 0 as ShellId)
+    }
+
+    #[test]
+    fn mark_then_query_round_trips() {
+        let mut s = empty_solid();
+        assert!(!s.is_mixed_kind_corner_pending(17));
+        s.mark_pending_mixed_kind_corner(17);
+        assert!(s.is_mixed_kind_corner_pending(17));
+        assert!(!s.is_mixed_kind_corner_pending(18));
+    }
+
+    #[test]
+    fn mark_is_idempotent() {
+        let mut s = empty_solid();
+        s.mark_pending_mixed_kind_corner(3);
+        s.mark_pending_mixed_kind_corner(3);
+        assert_eq!(s.pending_mixed_kind_corners().len(), 1);
+    }
+
+    #[test]
+    fn clear_returns_true_only_when_present() {
+        let mut s = empty_solid();
+        s.mark_pending_mixed_kind_corner(5);
+        assert!(s.clear_pending_mixed_kind_corner(5));
+        assert!(!s.is_mixed_kind_corner_pending(5));
+        // Second clear is a no-op.
+        assert!(!s.clear_pending_mixed_kind_corner(5));
+        // Clearing a never-marked vertex is also a no-op.
+        assert!(!s.clear_pending_mixed_kind_corner(99));
+    }
+
+    #[test]
+    fn deep_copy_preserves_pending_set() {
+        let mut s = empty_solid();
+        s.mark_pending_mixed_kind_corner(11);
+        s.mark_pending_mixed_kind_corner(13);
+        let snap = s.deep_copy();
+        assert!(snap.is_mixed_kind_corner_pending(11));
+        assert!(snap.is_mixed_kind_corner_pending(13));
+        // Mutating the original after the snapshot must not leak in.
+        s.clear_pending_mixed_kind_corner(11);
+        assert!(
+            snap.is_mixed_kind_corner_pending(11),
+            "snapshot must own its pending_mixed_kind_corners clone"
+        );
+    }
+
+    #[test]
+    fn pending_corners_getter_reflects_current_state() {
+        let mut s = empty_solid();
+        assert!(s.pending_mixed_kind_corners().is_empty());
+        s.mark_pending_mixed_kind_corner(1);
+        s.mark_pending_mixed_kind_corner(2);
+        s.mark_pending_mixed_kind_corner(3);
+        assert_eq!(s.pending_mixed_kind_corners().len(), 3);
+        s.clear_pending_mixed_kind_corner(2);
+        assert_eq!(s.pending_mixed_kind_corners().len(), 2);
+        assert!(s.pending_mixed_kind_corners().contains(&1));
+        assert!(s.pending_mixed_kind_corners().contains(&3));
+        assert!(!s.pending_mixed_kind_corners().contains(&2));
     }
 }
