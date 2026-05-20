@@ -349,7 +349,18 @@ fn validate_blend_conflict(
             continue;
         };
         for &vid in &[edge.start_vertex, edge.end_vertex] {
-            if let Some(existing_kind) = solid.blend_kind_at_vertex(vid) {
+            // CF-β.1 uses `blend_kind_at_vertex_single` so the gate
+            // continues to model the CF-α contract: it reads exactly
+            // one kind when the corner has been touched by one kind,
+            // and `None` when either nothing has touched it *or* both
+            // kinds have already touched it. The mixed-kind branch is
+            // handled by `vertex_blend_set` in CF-β.2's gate rewrite;
+            // until that lands, an already-mixed corner short-circuits
+            // through `None` here, which is intentionally permissive —
+            // CF-α never produced a mixed entry, so the only way to
+            // reach `is_mixed()` today is to bypass the gate entirely
+            // (impossible from supported call paths).
+            if let Some(existing_kind) = solid.blend_kind_at_vertex_single(vid) {
                 if existing_kind != requested_kind {
                     return Err(OperationError::from(
                         BlendFailure::ConflictingBlendKind {
