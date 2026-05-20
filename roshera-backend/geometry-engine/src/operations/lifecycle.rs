@@ -715,11 +715,24 @@ mod tests {
         assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
-    /// A shared-corner fillet selection now surfaces a *specific*
-    /// rejection naming the setback feasibility. This is the F2-γ.1
-    /// behaviour — historical callers got a generic `NotImplemented`.
+    /// A degree-3 convex equal-radius box-corner fillet now clears
+    /// the pre-flight gate. Pre-F5-α this case was rejected
+    /// (`validate_no_shared_corners` blanket reject, later upgraded
+    /// to a setback-aware specific diagnostic by F2-γ.1). F5-α
+    /// implements the apex-sphere corner patch for exactly this
+    /// vertex kind, so `validate_corner_compatibility` opens the
+    /// gate for `ConvexCorner { degree: 3 }` with equal radii — the
+    /// downstream `create_fillet_transitions` dispatcher and
+    /// `apply_apex_sphere_corner` handle the surgery.
+    ///
+    /// The historical behaviour (specific-reason rejection for
+    /// corner kinds outside the F5-α scope — `ConvexCorner` with
+    /// `degree >= 4`, `Mixed`, `Cliff`, mixed radii) is exercised by
+    /// the F5-α / F5-β unit tests on `validate_corner_compatibility`
+    /// and the typed `BlendFailure::VertexBlendUnsupported`
+    /// dispatch in `operations::fillet`.
     #[test]
-    fn corner_compatibility_emits_specific_diagnostic_for_box_corner() {
+    fn corner_compatibility_admits_degree_three_convex_box_corner_post_f5_alpha() {
         let model = build_unit_box();
         // Pick 3 edges sharing a single vertex on the box (degree-3
         // corner). Walk the edges to find one.
@@ -747,18 +760,12 @@ mod tests {
                 edges: &corner_edges,
             },
         );
-        let msg = match result {
-            Err(OperationError::NotImplemented(m)) => m,
-            Err(OperationError::InvalidGeometry(m)) => m,
-            other => panic!(
-                "expected setback-aware diagnostic for shared corner, got {:?}",
-                other
-            ),
-        };
         assert!(
-            msg.contains("corner vertex"),
-            "diagnostic should name the corner vertex (got: {})",
-            msg
+            result.is_ok(),
+            "degree-3 convex equal-radius box-corner fillet must clear \
+             pre-flight under F5-α (apex-sphere corner patch is supported); \
+             got {:?}",
+            result
         );
     }
 
