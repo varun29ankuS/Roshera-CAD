@@ -1866,21 +1866,37 @@ fn identify_chamfer_corners(
     let mut corner_ids: HashSet<VertexId> = HashSet::new();
 
     for (vertex_id, edge_indices) in &vertex_incidence {
-        // Chamfer-β: admit N ≥ 3. Vertices with 1 or 2 incident
-        // selected edges never need V-retention —
-        // `splice_blend_edge` handles them correctly via the default
-        // `corner_shared = false` path (the second splice's V lookup
-        // still succeeds because the first splice's opposite
-        // endpoint is untouched).
-        if edge_indices.len() < 3 {
+        // CF-β.4 — partial-mixed admission gate. The default Chamfer-β
+        // gate requires N ≥ 3 chamfered edges at V before treating V
+        // as a corner. CF-β extends that: if V is already recorded in
+        // `blended_vertices` with the opposite kind (fillet), the
+        // dispatch hook in `handle_chamfer_vertices` routes to
+        // `mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`
+        // which assembles a heterogeneous cap (current chamfer rims
+        // + prior fillet rims). The synthesizer needs only ≥ 1
+        // chamfer edge at V from the current call; the prior fillet
+        // call contributed the remaining cap edges.
+        let has_prior_fillet = model
+            .solids
+            .get(solid_id)
+            .and_then(|s| s.vertex_blend_set(*vertex_id))
+            .map(|set| set.contains(crate::primitives::solid::BlendKind::Fillet))
+            .unwrap_or(false);
+
+        // Vertices with 1 or 2 incident selected edges *and* no prior
+        // opposite-kind blend never need V-retention — `splice_blend_edge`
+        // handles them correctly via the default `corner_shared = false`
+        // path.
+        if edge_indices.len() < 3 && !has_prior_fillet {
             continue;
         }
 
-        // V-retention gate fires for every degree-≥3 vertex, even
-        // when we won't emit a cap. The splice ordering means the
-        // second of N splices crashes if it can't find V; flagging V
-        // as corner-shared on all N surgeries keeps it alive across
-        // the entire splice pass.
+        // V-retention gate fires for every degree-≥3 vertex AND every
+        // partial-mixed V. The splice ordering means the second of N
+        // splices crashes if it can't find V; flagging V as corner-
+        // shared on all incident surgeries keeps it alive across the
+        // entire splice pass — even at partial-mixed corners where
+        // the current chamfer call only selects 1 or 2 of V's edges.
         corner_ids.insert(*vertex_id);
 
         // Cap-emit gates from here on. Non-uniform / non-planar /
@@ -1888,6 +1904,49 @@ fn identify_chamfer_corners(
         // but skip cap synthesis — the shell carries a deliberate
         // N-sided hole until the matching later slice fills it.
         if !cap_synthesis_enabled {
+            continue;
+        }
+
+        // CF-β.4 partial-mixed corner — bypass the same-kind
+        // adjacent-face-count, planarity, and convexity gates: those
+        // checks duplicate (and are stricter than) the synthesizer's
+        // own coplanarity/orientation logic in
+        // `synthesize_mixed_kind_corner_cap`. Push a `ChamferCorner`
+        // with the current chamfer edges only; the dispatch hook in
+        // `handle_chamfer_vertices` (CF-β.3.4) detects
+        // `has_prior_fillet` and routes the heterogeneous cap loop
+        // assembly to the synthesizer.
+        if has_prior_fillet {
+            let vertex = match model.vertices.get(*vertex_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            let position = Point3::new(
+                vertex.position[0],
+                vertex.position[1],
+                vertex.position[2],
+            );
+            // Outward normal from the V-incident adjacent original
+            // faces (subset of the full corner umbrella; for a convex
+            // manifold corner the subset normals point consistently
+            // outward).
+            let mut adjacent_set: HashSet<FaceId> = HashSet::new();
+            for &eidx in edge_indices {
+                let (f1, f2) = get_adjacent_faces(model, solid_id, selected_edges[eidx])?;
+                adjacent_set.insert(f1);
+                adjacent_set.insert(f2);
+            }
+            let adjacent_face_ids: Vec<FaceId> = adjacent_set.into_iter().collect();
+            let outward = match compute_corner_outward_normal(model, position, &adjacent_face_ids) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            corners.push(ChamferCorner {
+                vertex_id: *vertex_id,
+                position,
+                edge_indices: edge_indices.clone(),
+                outward,
+            });
             continue;
         }
 

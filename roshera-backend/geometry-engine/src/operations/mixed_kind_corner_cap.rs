@@ -329,10 +329,16 @@ pub fn synthesize_mixed_kind_corner_cap(
     // Step 8 — record the synthesized cap on the per-solid registries.
     // `record_blended_vertex` inserts `requested_kind` into the
     // `VertexBlendKindSet` at this vertex, so a subsequent CF-α query
-    // observes both kinds at the corner.
+    // observes both kinds at the corner. `clear_pending_mixed_kind_corner`
+    // (CF-β.4) removes the deliberate-open-boundary mark left by the
+    // first kind-call so the next `validate_result` gate at the
+    // newly-watertight corner re-applies the full validator (no carve-
+    // out for this vertex anymore). Idempotent — a no-op if the first
+    // call never marked the corner pending.
     if let Some(solid) = model.solids.get_mut(solid_id) {
         solid.record_blend_face(face_id, requested_kind);
         solid.record_blended_vertex(vertex_id, requested_kind);
+        solid.clear_pending_mixed_kind_corner(vertex_id);
     }
 
     Ok(face_id)
