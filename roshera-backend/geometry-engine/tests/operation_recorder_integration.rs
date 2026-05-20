@@ -177,6 +177,108 @@ fn parameter_payload_contains_primitive_dimensions() {
     );
 }
 
+/// CF-β.4.3 — recorded `chamfer_edges` / `fillet_edges` events must
+/// carry the post-call `pending_mixed_kind_corners` snapshot so that
+/// timeline replay can reconstruct the intermediate-state expectation
+/// for the `validate_result` carve-out. For a standalone non-mixed
+/// call the snapshot is the empty list; the field must still be
+/// present (omitting it would force replay to guess the empty case).
+#[test]
+fn chamfer_event_payload_carries_pending_mixed_kind_corners_field() {
+    use geometry_engine::operations::chamfer::{chamfer_edges, ChamferOptions, ChamferType};
+    use geometry_engine::primitives::edge::EdgeId;
+    use geometry_engine::primitives::topology_builder::GeometryId;
+
+    let mut model = BRepModel::new();
+    let capture = Arc::new(CaptureRecorder::default());
+    model.attach_recorder(Some(capture.clone() as Arc<dyn OperationRecorder>));
+
+    let solid_id = {
+        let mut builder = TopologyBuilder::new(&mut model);
+        match builder.create_box_3d(10.0, 10.0, 10.0).expect("box") {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {:?}", other),
+        }
+    };
+
+    let edges: Vec<EdgeId> = model.edges.iter().map(|(id, _)| id).take(1).collect();
+    let opts = ChamferOptions {
+        chamfer_type: ChamferType::EqualDistance(1.0),
+        ..Default::default()
+    };
+    let _faces = chamfer_edges(&mut model, solid_id, edges, opts).expect("chamfer succeeds");
+
+    let events = capture.snapshot();
+    // create_box_3d + chamfer_edges = 2 events. Find the chamfer one.
+    let chamfer_event = events
+        .iter()
+        .find(|e| e.kind == "chamfer_edges")
+        .expect("chamfer_edges event recorded");
+    let params = &chamfer_event.parameters;
+    assert!(
+        params.get("pending_mixed_kind_corners").is_some(),
+        "chamfer_edges params must carry pending_mixed_kind_corners field, got {}",
+        params
+    );
+    let pending = params
+        .get("pending_mixed_kind_corners")
+        .and_then(|v| v.as_array())
+        .expect("pending_mixed_kind_corners is a JSON array");
+    assert!(
+        pending.is_empty(),
+        "standalone non-mixed chamfer call should record empty pending set, got {:?}",
+        pending
+    );
+}
+
+#[test]
+fn fillet_event_payload_carries_pending_mixed_kind_corners_field() {
+    use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
+    use geometry_engine::primitives::edge::EdgeId;
+    use geometry_engine::primitives::topology_builder::GeometryId;
+
+    let mut model = BRepModel::new();
+    let capture = Arc::new(CaptureRecorder::default());
+    model.attach_recorder(Some(capture.clone() as Arc<dyn OperationRecorder>));
+
+    let solid_id = {
+        let mut builder = TopologyBuilder::new(&mut model);
+        match builder.create_box_3d(10.0, 10.0, 10.0).expect("box") {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {:?}", other),
+        }
+    };
+
+    let edges: Vec<EdgeId> = model.edges.iter().map(|(id, _)| id).take(1).collect();
+    let opts = FilletOptions {
+        fillet_type: FilletType::Constant(1.0),
+        radius: 1.0,
+        ..Default::default()
+    };
+    let _faces = fillet_edges(&mut model, solid_id, edges, opts).expect("fillet succeeds");
+
+    let events = capture.snapshot();
+    let fillet_event = events
+        .iter()
+        .find(|e| e.kind == "fillet_edges")
+        .expect("fillet_edges event recorded");
+    let params = &fillet_event.parameters;
+    assert!(
+        params.get("pending_mixed_kind_corners").is_some(),
+        "fillet_edges params must carry pending_mixed_kind_corners field, got {}",
+        params
+    );
+    let pending = params
+        .get("pending_mixed_kind_corners")
+        .and_then(|v| v.as_array())
+        .expect("pending_mixed_kind_corners is a JSON array");
+    assert!(
+        pending.is_empty(),
+        "standalone non-mixed fillet call should record empty pending set, got {:?}",
+        pending
+    );
+}
+
 #[test]
 fn detaching_recorder_stops_event_capture() {
     let mut model = BRepModel::new();
