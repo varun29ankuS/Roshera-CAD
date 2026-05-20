@@ -5009,7 +5009,72 @@ fn create_fillet_transitions(
             }))
         })?;
 
-        if radii_equal {
+        // CF-β.3.4 — mixed-kind dispatch. If `corner.id` already
+        // carries a recorded *chamfer* blend on this solid (fillet-
+        // second ordering), the corner's boundary is the heterogeneous
+        // loop fillet-arc-rims ∪ chamfer-linear-rims. Route to the
+        // eager-cap synthesizer rather than the apex-sphere or
+        // triangular-NURBS path so a single mixed cap closes both
+        // sides. Same-kind corners (the typical F5-α / F5-β paths)
+        // fall through unchanged. Only the equal-radius arm of the
+        // dispatcher routes through the synthesizer today; mixed
+        // radii × mixed kinds is CF-β follow-up work.
+        let has_prior_chamfer = model
+            .solids
+            .get(solid_id)
+            .and_then(|s| s.vertex_blend_set(corner.id))
+            .map(|set| set.contains(BlendKind::Chamfer))
+            .unwrap_or(false);
+
+        if radii_equal && has_prior_chamfer {
+            // Collect the per-fillet-face V-side cap arcs of this
+            // call. For equal radii the sphere centre coincides with
+            // `corner_apex`, so `find_cap_arc_edge_at_vertex` matches
+            // by centre-coincidence and picks exactly the V-side cap.
+            let mut fillet_rim_arcs: Vec<EdgeId> = Vec::with_capacity(face_ids.len());
+            for fid in face_ids.iter() {
+                let arc = find_cap_arc_edge_at_vertex(model, *fid, corner_apex).ok_or_else(
+                    || {
+                        OperationError::BlendFailed(Box::new(
+                            BlendFailure::VertexBlendUnsupported {
+                                vertex: corner.id,
+                                kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                            },
+                        ))
+                    },
+                )?;
+                fillet_rim_arcs.push(arc);
+            }
+            let chamfer_rim_lines =
+                super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
+                    model,
+                    solid_id,
+                    corner.id,
+                    BlendKind::Chamfer,
+                );
+            let mut cap_edges_with_kind: Vec<(
+                EdgeId,
+                super::mixed_kind_corner_cap::RimKind,
+            )> = fillet_rim_arcs
+                .iter()
+                .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::ArcRim))
+                .collect();
+            for line_eid in &chamfer_rim_lines {
+                cap_edges_with_kind
+                    .push((*line_eid, super::mixed_kind_corner_cap::RimKind::LinearRim));
+            }
+            let cap_face = super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                model,
+                solid_id,
+                corner.id,
+                &cap_edges_with_kind,
+                vertex_outward,
+                Tolerance::default().distance(),
+                BlendKind::Fillet,
+            )?;
+            new_faces.push(cap_face);
+        } else if radii_equal {
             let face_id = apply_apex_sphere_corner(
                 model,
                 solid_id,
