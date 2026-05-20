@@ -2943,11 +2943,31 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
             solid_id
         )));
     }
-    let result = crate::primitives::validation::validate_model_enhanced(
+    let mut result = crate::primitives::validation::validate_model_enhanced(
         model,
         Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );
+
+    // CF-β.4 — partially-blended corners left open by the first of two
+    // kind-mismatched calls produce expected non-manifold-edge and
+    // Euler-deficit errors at the corner's local neighbourhood. Drop
+    // those before re-evaluating validity; every other defect still
+    // surfaces.
+    let pending = model
+        .solids
+        .get(solid_id)
+        .map(|s| s.pending_mixed_kind_corners().clone())
+        .unwrap_or_default();
+    if !pending.is_empty() {
+        result.errors = super::mixed_kind_corner_cap::filter_pending_corner_errors(
+            model,
+            &pending,
+            std::mem::take(&mut result.errors),
+        );
+        result.is_valid = result.errors.is_empty();
+    }
+
     if !result.is_valid {
         let summary = result
             .errors
