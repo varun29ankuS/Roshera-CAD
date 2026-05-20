@@ -979,8 +979,34 @@ fn create_fillet_chain(
             // cap insertion (via the sphere face's loop) and the
             // corner-vertex removal once the per-edge splices have all
             // run.
-            s.original_v0_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v0);
-            s.original_v1_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v1);
+            //
+            // CF-β.4.4 — also retain V when the current call only
+            // selects 1 or 2 of V's incident edges *and* V is already
+            // recorded in `blended_vertices` with the opposite kind
+            // (chamfer). Without this, the partial-mixed first call
+            // (e.g. `fillet(B)` then `chamfer(A,C)` at the same
+            // corner) would remove V during the splice and the
+            // chamfer-second call's synthesizer would find no
+            // anchor. The flag preserves V across the splice pass;
+            // the later opposite-kind call's dispatch hook routes to
+            // `synthesize_mixed_kind_corner_cap` which closes the
+            // heterogeneous loop and removes V then.
+            let v0_prior_chamfer = model
+                .solids
+                .get(solid_id)
+                .and_then(|sol| sol.vertex_blend_set(s.original_v0))
+                .map(|set| set.contains(BlendKind::Chamfer))
+                .unwrap_or(false);
+            let v1_prior_chamfer = model
+                .solids
+                .get(solid_id)
+                .and_then(|sol| sol.vertex_blend_set(s.original_v1))
+                .map(|set| set.contains(BlendKind::Chamfer))
+                .unwrap_or(false);
+            s.original_v0_corner_shared =
+                is_three_edge_convex_corner(blend_graph, s.original_v0) || v0_prior_chamfer;
+            s.original_v1_corner_shared =
+                is_three_edge_convex_corner(blend_graph, s.original_v1) || v1_prior_chamfer;
             surgeries.push(s);
         }
     }
