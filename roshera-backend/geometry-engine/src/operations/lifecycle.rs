@@ -43,11 +43,12 @@
 //! operations.
 
 use crate::operations::blend_graph::{self, BlendRadius, BlendVertexKind};
+use crate::operations::diagnostics::BlendFailure;
 use crate::operations::{OperationError, OperationResult};
 use crate::primitives::edge::EdgeId;
 use crate::primitives::face::FaceId;
 use crate::primitives::snapshot::ModelSnapshot;
-use crate::primitives::solid::SolidId;
+use crate::primitives::solid::{BlendKind, SolidId};
 use crate::primitives::topology_builder::BRepModel;
 
 /// Which blend operation is invoking the shared corner-compatibility
@@ -137,6 +138,12 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
         OpSpec::Generic => Ok(()),
         OpSpec::FilletEdges { solid_id, edges } => {
             check_solid_exists(model, solid_id)?;
+            // CF-α: typed cross-kind conflict gate. Runs BEFORE
+            // `check_edges_exist` so a request against an
+            // already-blended (and thus destroyed) edge surfaces as
+            // `ConflictingBlendKind` instead of the generic
+            // "edge not found" string.
+            validate_blend_conflict(model, solid_id, edges, BlendKind::Fillet)?;
             check_edges_exist(model, edges)?;
             // F2-γ.1: setback-aware corner compatibility. Replaces
             // the historical `validate_no_shared_corners` blanket
@@ -145,6 +152,9 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
         }
         OpSpec::ChamferEdges { solid_id, edges } => {
             check_solid_exists(model, solid_id)?;
+            // CF-α: typed cross-kind conflict gate — see FilletEdges
+            // arm above for the ordering rationale.
+            validate_blend_conflict(model, solid_id, edges, BlendKind::Chamfer)?;
             check_edges_exist(model, edges)?;
             validate_corner_compatibility(model, edges, BlendOpKind::Chamfer)
         }
@@ -277,6 +287,82 @@ fn check_edges_exist(model: &BRepModel, edges: &[EdgeId]) -> OperationResult<()>
             });
         }
     }
+    Ok(())
+}
+
+/// CF-α — pre-flight gate that rejects a blend request when it would
+/// clash with a blend already recorded on the host [`Solid`].
+///
+/// Two failure cases share the single
+/// [`BlendFailure::ConflictingBlendKind`] payload:
+///
+/// 1. **Same-edge re-blend.** The caller passed an `EdgeId` that the
+///    solid's `blended_edges` registry recognises. In practice the
+///    edge is *gone* (destroyed by `splice_blend_edge`), so without
+///    this gate the caller would get the legacy
+///    `"edge {} not found in model"` `InvalidInput` from
+///    [`check_edges_exist`]. CF-α replaces that with a typed signal
+///    carrying both the existing and requested kinds so an agent can
+///    branch on remediation.
+///
+/// 2. **Shared-vertex cross-kind.** The requested edge still exists,
+///    but at least one of its endpoint vertices was previously
+///    consumed by a blend of the *opposite* kind (recorded in
+///    `blended_vertices`). The kernel doesn't yet synthesize a
+///    mixed-kind corner (fillet setback fan stitched to a chamfer
+///    cap — that's CF-β), so we surface the conflict pre-flight.
+///
+/// `requested_kind == existing_kind` at a shared vertex is **not** a
+/// conflict — same-kind multi-blend at a corner is the F5-α /
+/// Chamfer-α/β path and is exercised by the existing corner
+/// compatibility check downstream.
+fn validate_blend_conflict(
+    model: &BRepModel,
+    solid_id: SolidId,
+    edges: &[EdgeId],
+    requested_kind: BlendKind,
+) -> OperationResult<()> {
+    // `check_solid_exists` is called by the caller before us; this is
+    // a defensive re-fetch, not a redundant validation.
+    let solid = match model.solids.get(solid_id) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    for &eid in edges {
+        // Case 1: same edge has already been blended.
+        if let Some(existing_kind) = solid.blend_kind_at_edge(eid) {
+            return Err(OperationError::from(BlendFailure::ConflictingBlendKind {
+                edge: eid,
+                existing_kind,
+                requested_kind,
+            }));
+        }
+
+        // Case 2: a corner of this edge survives from a previous
+        // opposite-kind blend. Only inspect endpoints when the edge
+        // resolves — a missing edge will be caught (with a legacy
+        // shape) by `check_edges_exist` immediately after this gate,
+        // and we don't want to mask a missing-edge bug with a
+        // shared-vertex one.
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        for &vid in &[edge.start_vertex, edge.end_vertex] {
+            if let Some(existing_kind) = solid.blend_kind_at_vertex(vid) {
+                if existing_kind != requested_kind {
+                    return Err(OperationError::from(
+                        BlendFailure::ConflictingBlendKind {
+                            edge: eid,
+                            existing_kind,
+                            requested_kind,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

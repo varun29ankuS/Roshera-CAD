@@ -17,12 +17,12 @@
 use crate::math::{consts, MathResult, Matrix4, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
-    edge::EdgeStore,
+    edge::{EdgeId, EdgeStore},
     face::{FaceId, FaceStore},
     r#loop::LoopStore,
     shell::{MassProperties, ShellId, ShellStore},
     surface::SurfaceStore,
-    vertex::VertexStore,
+    vertex::{VertexId, VertexStore},
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -275,6 +275,41 @@ impl SolidAnchor {
     }
 }
 
+/// CF-α — which blend operation kind a [`Solid`] has already accepted
+/// at a given edge or vertex. Stored on [`Solid::blended_edges`] and
+/// [`Solid::blended_vertices`], consumed by the lifecycle pre-flight
+/// gate `operations::lifecycle::validate_blend_conflict` to surface a
+/// typed [`BlendFailure::ConflictingBlendKind`] when a caller asks for
+/// a fillet on an edge that already carried a chamfer (or vice versa).
+///
+/// The enum lives here — at the storage layer where the registry
+/// physically resides — rather than in `operations::diagnostics`, to
+/// avoid a `primitives → operations → primitives` cycle. The
+/// diagnostics module re-exports it so call-site imports stay
+/// single-source: `use crate::operations::diagnostics::BlendKind;`.
+///
+/// [`BlendFailure::ConflictingBlendKind`]: crate::operations::diagnostics::BlendFailure::ConflictingBlendKind
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendKind {
+    /// Smooth (G1) rolling-ball / spine-marched blend.
+    Fillet,
+    /// Flat n-gon cap (planar for N=2/3, miter-pre-pass + planar
+    /// cap for N≥4 convex corners — Chamfer-β).
+    Chamfer,
+}
+
+impl std::fmt::Display for BlendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlendKind::Fillet => write!(f, "fillet"),
+            BlendKind::Chamfer => write!(f, "chamfer"),
+        }
+    }
+}
+
 /// Solid representation
 #[derive(Debug, Clone)]
 pub struct Solid {
@@ -307,6 +342,32 @@ pub struct Solid {
     history: Arc<RwLock<Vec<HistoryNode>>>,
     /// Collision acceleration structure (e.g., OBB tree)
     collision_tree: Option<Arc<CollisionTree>>,
+    /// CF-α — per-edge blend registry. Each entry records the
+    /// [`BlendKind`] applied to the edge ID *as it was at the moment
+    /// of the blend call*, so the `validate_blend_conflict` pre-flight
+    /// gate in `operations::lifecycle` can reject a subsequent blend
+    /// request on the same (now-destroyed) edge with a typed
+    /// [`BlendFailure::ConflictingBlendKind`] instead of the legacy
+    /// `edge not found in model` string surface.
+    ///
+    /// Populated by `fillet::fillet_edges` and
+    /// `chamfer::chamfer_edges` on successful completion, before
+    /// `record_operation`. Cleared / re-populated never — entries
+    /// accumulate across the solid's life; the registry survives
+    /// `deep_copy` for snapshot fidelity.
+    ///
+    /// [`BlendFailure::ConflictingBlendKind`]: crate::operations::diagnostics::BlendFailure::ConflictingBlendKind
+    pub(crate) blended_edges: HashMap<EdgeId, BlendKind>,
+    /// CF-α — per-vertex blend registry. Mirrors `blended_edges` for
+    /// the corners that participate in a vertex blend (F5-α three-edge
+    /// convex apex sphere, Chamfer-α planar cap, Chamfer-β n-gon cap)
+    /// and survive into the post-surgery topology (only when the
+    /// `original_v*_corner_shared` flag fires — otherwise the vertex
+    /// is removed by `splice_blend_edge` and never lands here).
+    ///
+    /// Used to detect cross-kind conflict at a corner shared between
+    /// a previously-blended edge and the edge currently being requested.
+    pub(crate) blended_vertices: HashMap<VertexId, BlendKind>,
 }
 
 /// Top-level AABB used as a conservative collision proxy. The detailed
@@ -336,6 +397,8 @@ impl Solid {
             parent_assembly: None,
             history: Arc::new(RwLock::new(Vec::new())),
             collision_tree: None,
+            blended_edges: HashMap::new(),
+            blended_vertices: HashMap::new(),
         }
     }
 
@@ -380,7 +443,45 @@ impl Solid {
             parent_assembly: self.parent_assembly,
             history: Arc::new(RwLock::new(history_snapshot)),
             collision_tree: self.collision_tree.clone(),
+            blended_edges: self.blended_edges.clone(),
+            blended_vertices: self.blended_vertices.clone(),
         }
+    }
+
+    /// CF-α — record that `edge` carried a successful blend of `kind`
+    /// on this solid. Called by `operations::fillet::fillet_edges` and
+    /// `operations::chamfer::chamfer_edges` after surgery succeeds,
+    /// before `record_operation`. Idempotent on `(edge, kind)`; a
+    /// later call with the same kind overwrites silently. A later
+    /// call with a different kind also overwrites — the conflict gate
+    /// runs *pre-flight* in `lifecycle::validate_blend_conflict`, so
+    /// by the time we reach this writer the kernel has already
+    /// validated the absence of a cross-kind clash.
+    pub(crate) fn record_blended_edge(&mut self, edge: EdgeId, kind: BlendKind) {
+        self.blended_edges.insert(edge, kind);
+    }
+
+    /// CF-α — record that `vertex` participates in a successful blend
+    /// of `kind` on this solid. Only called for vertices that survive
+    /// `splice_blend_edge` (the `original_v*_corner_shared` flag is
+    /// set), since others are destroyed and would never be looked up.
+    pub(crate) fn record_blended_vertex(&mut self, vertex: VertexId, kind: BlendKind) {
+        self.blended_vertices.insert(vertex, kind);
+    }
+
+    /// CF-α — look up the previously-applied blend kind at `edge`, if
+    /// any. Used by `lifecycle::validate_blend_conflict` to test
+    /// whether the requested kind clashes with what the registry
+    /// already holds.
+    pub fn blend_kind_at_edge(&self, edge: EdgeId) -> Option<BlendKind> {
+        self.blended_edges.get(&edge).copied()
+    }
+
+    /// CF-α — look up the previously-applied blend kind at `vertex`,
+    /// if any. Returns `None` when the vertex has never participated
+    /// in a blend on this solid.
+    pub fn blend_kind_at_vertex(&self, vertex: VertexId) -> Option<BlendKind> {
+        self.blended_vertices.get(&vertex).copied()
     }
 
     /// Add inner shell (void)

@@ -20,7 +20,7 @@ use crate::primitives::{
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId, FaceOrientation},
     r#loop::{Loop, LoopType},
-    solid::SolidId,
+    solid::{BlendKind, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
     vertex::VertexId,
@@ -120,6 +120,18 @@ pub fn chamfer_edges(
         // Capture input edges before the Vec is consumed by propagation.
         let input_edges_for_record: Vec<u32> = edges.clone();
 
+        // CF-α: snapshot endpoint vertex IDs of every requested edge
+        // *before* `splice_blend_edge` destroys the edge. After
+        // surgery we record only surviving vertices on
+        // `Solid::blended_vertices`, so the pre-flight conflict gate
+        // (`lifecycle::validate_blend_conflict`) can detect shared-
+        // corner cross-kind clashes in subsequent blend calls.
+        let input_edge_endpoints: Vec<VertexId> = edges
+            .iter()
+            .filter_map(|&eid| model.edges.get(eid))
+            .flat_map(|e| [e.start_vertex, e.end_vertex])
+            .collect();
+
         // Propagate edge selection if requested
         let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
@@ -207,6 +219,28 @@ pub fn chamfer_edges(
         // Validate result if requested
         if options.common.validate_result {
             validate_chamfered_solid(model, solid_id)?;
+        }
+
+        // CF-α: populate the per-solid blend registry. Mirrors the
+        // fillet writer — edges keyed by their pre-surgery IDs, only
+        // surviving endpoint vertices recorded. See
+        // `fillet::fillet_edges` for the full rationale.
+        let surviving_endpoints: Vec<VertexId> = {
+            let mut seen: HashSet<VertexId> = HashSet::new();
+            input_edge_endpoints
+                .iter()
+                .copied()
+                .filter(|vid| seen.insert(*vid))
+                .filter(|vid| model.vertices.get(*vid).is_some())
+                .collect()
+        };
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            for &eid in &input_edges_for_record {
+                solid.record_blended_edge(eid, BlendKind::Chamfer);
+            }
+            for vid in surviving_endpoints {
+                solid.record_blended_vertex(vid, BlendKind::Chamfer);
+            }
         }
 
         // Record the operation for timeline / event-sourcing consumers.

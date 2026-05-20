@@ -223,6 +223,30 @@ pub enum BlendFailure {
         /// Specific reason within `kind`.
         reason: VertexBlendUnsupportedReason,
     },
+    /// CF-α — the requested blend kind conflicts with a previously
+    /// applied blend on the same edge (or on a vertex shared with a
+    /// previously-blended edge). Surfaced pre-flight so the caller
+    /// gets a typed, actionable signal instead of the legacy
+    /// `edge not found in model` shape that results from the
+    /// original edge having been destroyed by `splice_blend_edge`.
+    ///
+    /// `existing_kind == requested_kind` is also a conflict — the
+    /// edge no longer exists in the model topology even for a
+    /// same-kind retry — but carries a different remediation hint
+    /// (the requested edge was already processed) than the
+    /// cross-kind case (fillet ↔ chamfer mix at a shared corner is
+    /// not supported by the kernel at this slice).
+    ConflictingBlendKind {
+        /// The edge the caller requested (by ID). Either this edge
+        /// has been removed by a previous blend, or it is incident
+        /// to a vertex that survives from a previous blend of the
+        /// opposite kind.
+        edge: EdgeId,
+        /// Kind already applied (recorded on the host `Solid`).
+        existing_kind: BlendKind,
+        /// Kind requested by the current call site.
+        requested_kind: BlendKind,
+    },
     /// Catch-all for irreducible failures not yet classified. The
     /// `detail` string is freeform; treat occurrences as a TODO to
     /// replace with a structured variant once the failure mode is
@@ -232,6 +256,13 @@ pub enum BlendFailure {
         detail: String,
     },
 }
+
+// `BlendKind` is defined alongside the per-`Solid` blend registry in
+// `primitives::solid` (the kernel layer that physically stores it),
+// then re-exported here so callers using the diagnostics surface
+// have a single import site for `BlendFailure::ConflictingBlendKind`
+// and the kind tag it carries.
+pub use crate::primitives::solid::BlendKind;
 
 impl std::fmt::Display for BlendFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -291,6 +322,15 @@ impl std::fmt::Display for BlendFailure {
                 "vertex {} blend unsupported (kind {:?}): {}",
                 vertex, kind, reason
             ),
+            BlendFailure::ConflictingBlendKind {
+                edge,
+                existing_kind,
+                requested_kind,
+            } => write!(
+                f,
+                "conflicting blend on edge {}: existing kind {} cannot accept a {} on the same edge or shared corner",
+                edge, existing_kind, requested_kind
+            ),
             BlendFailure::TopologyViolation { detail } => {
                 write!(f, "topology violation: {}", detail)
             }
@@ -322,7 +362,8 @@ impl From<BlendFailure> for OperationError {
         match failure {
             BlendFailure::RadiusExceedsCurvature { .. }
             | BlendFailure::SetbackTooLong { .. }
-            | BlendFailure::VertexBlendUnsupported { .. } => {
+            | BlendFailure::VertexBlendUnsupported { .. }
+            | BlendFailure::ConflictingBlendKind { .. } => {
                 OperationError::InvalidInput {
                     parameter: "blend".to_string(),
                     expected: "geometrically feasible blend parameters".to_string(),

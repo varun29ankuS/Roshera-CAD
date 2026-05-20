@@ -27,7 +27,7 @@ use crate::primitives::{
     face::{Face, FaceId},
     fillet_surfaces::{CylindricalFillet, ToroidalFillet, VariableRadiusFillet},
     r#loop::{Loop, LoopType},
-    solid::SolidId,
+    solid::{BlendKind, SolidId},
     surface::{Cylinder, Sphere, Surface},
     topology_builder::BRepModel,
     vertex::VertexId,
@@ -309,6 +309,20 @@ pub fn fillet_edges(
         // propagation step below — needed for the recorder payload.
         let input_edges_for_record: Vec<u32> = edges.clone();
 
+        // CF-α: snapshot endpoint vertex IDs of every requested edge
+        // *before* `splice_blend_edge` destroys the edge (and, when
+        // `corner_shared` is not set, the vertex too). After surgery
+        // we test each ID against `model.vertices` to record only the
+        // vertices that survived, populating
+        // `Solid::blended_vertices` so the CF-α pre-flight gate can
+        // detect shared-corner cross-kind conflicts in subsequent
+        // blend calls.
+        let input_edge_endpoints: Vec<VertexId> = edges
+            .iter()
+            .filter_map(|&eid| model.edges.get(eid))
+            .flat_map(|e| [e.start_vertex, e.end_vertex])
+            .collect();
+
         // Additional robust validation. For variable-radius fillets we
         // must check both endpoint radii — the linear interpolant means
         // either end can independently violate the half-edge-length bound,
@@ -518,6 +532,35 @@ pub fn fillet_edges(
         // Validate result if requested
         if options.common.validate_result {
             validate_filleted_solid(model, solid_id)?;
+        }
+
+        // CF-α: populate the per-solid blend registry. Edges are
+        // recorded by their pre-surgery IDs (they no longer exist in
+        // `model.edges` — `splice_blend_edge` destroyed them — but
+        // the registry uses the ID as a stable key for the
+        // `validate_blend_conflict` gate, which fires *before*
+        // `check_edges_exist`). Endpoint vertices are recorded only
+        // when they survived surgery (the F5-α `corner_shared` path);
+        // others were also destroyed and would never be re-queried.
+        // Pre-collect the surviving vertex set under an immutable
+        // borrow so the subsequent `solids.get_mut` doesn't fight
+        // the borrow checker.
+        let surviving_endpoints: Vec<VertexId> = {
+            let mut seen: HashSet<VertexId> = HashSet::new();
+            input_edge_endpoints
+                .iter()
+                .copied()
+                .filter(|vid| seen.insert(*vid))
+                .filter(|vid| model.vertices.get(*vid).is_some())
+                .collect()
+        };
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            for &eid in &input_edges_for_record {
+                solid.record_blended_edge(eid, BlendKind::Fillet);
+            }
+            for vid in surviving_endpoints {
+                solid.record_blended_vertex(vid, BlendKind::Fillet);
+            }
         }
 
         // Record for attached recorders. `inputs` lists the user-supplied
