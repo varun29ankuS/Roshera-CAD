@@ -806,4 +806,174 @@ mod tests {
             result
         );
     }
+
+    // -----------------------------------------------------------------
+    // CF-α.2 — shared-vertex arm of `validate_blend_conflict`.
+    //
+    // CF-α's integration suite (`blend_conflict_detection.rs`) covers
+    // the same-edge re-blend case end-to-end. The shared-vertex arm is
+    // not reachable from any single-edge production path: only the
+    // multi-edge corner-patch callers (F5-α 3-edge apex sphere,
+    // Chamfer-α 3-edge cap, Chamfer-β N≥4 cap) raise the
+    // `corner_shared` flag that keeps a corner vertex alive in
+    // `splice_blend_edge` and thereby admits an entry into
+    // `Solid::blended_vertices`. These unit tests populate the
+    // registry directly so the vertex-arm branch is exercised
+    // independently of CF-β's mixed-kind corner work.
+    // -----------------------------------------------------------------
+
+    /// Pick an edge incident to `vertex` (start or end).
+    fn edge_incident_to(model: &BRepModel, vertex: u32) -> EdgeId {
+        model
+            .edges
+            .iter()
+            .find_map(|(id, e)| {
+                if e.start_vertex == vertex || e.end_vertex == vertex {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .expect("at least one edge incident to vertex")
+    }
+
+    /// Cross-kind at a shared corner — chamfer recorded at vertex,
+    /// fillet requested on an edge incident to that vertex — must
+    /// surface as `BlendFailure::ConflictingBlendKind` carrying the
+    /// existing (chamfer) and requested (fillet) kinds.
+    #[test]
+    fn validate_blend_conflict_rejects_cross_kind_at_shared_vertex() {
+        let mut model = build_unit_box();
+        let solid_id: SolidId = model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box solid");
+        let corner_vertex = model
+            .vertices
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has vertices");
+        let edge = edge_incident_to(&model, corner_vertex);
+
+        // Seed the registry as a previous chamfer would have.
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.record_blended_vertex(corner_vertex, BlendKind::Chamfer);
+        }
+
+        let err = validate_can_apply(
+            &model,
+            OpSpec::FilletEdges {
+                solid_id,
+                edges: &[edge],
+            },
+        )
+        .expect_err("cross-kind at shared corner must be rejected");
+
+        match err {
+            OperationError::InvalidInput {
+                parameter,
+                received,
+                ..
+            } => {
+                assert_eq!(parameter, "blend");
+                assert!(
+                    received.contains(&format!("edge {}", edge)),
+                    "received must name the conflicting edge id; got: {}",
+                    received
+                );
+                assert!(
+                    received.contains("existing kind chamfer"),
+                    "received must name the existing kind 'chamfer'; got: {}",
+                    received
+                );
+                assert!(
+                    received.contains("a fillet"),
+                    "received must name the requested kind 'fillet'; got: {}",
+                    received
+                );
+            }
+            other => panic!(
+                "expected InvalidInput carrying ConflictingBlendKind, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Same-kind at a shared corner is NOT a conflict — the vertex
+    /// arm is a *cross-kind* gate (the same-edge arm catches
+    /// already-blended edges separately). This pins the
+    /// false-positive boundary: a fillet at a corner previously
+    /// touched by a fillet on a different edge proceeds to the next
+    /// validation layer.
+    #[test]
+    fn validate_blend_conflict_allows_same_kind_at_shared_vertex() {
+        let mut model = build_unit_box();
+        let solid_id: SolidId = model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box solid");
+        let corner_vertex = model
+            .vertices
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has vertices");
+        let edge = edge_incident_to(&model, corner_vertex);
+
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.record_blended_vertex(corner_vertex, BlendKind::Fillet);
+        }
+
+        // Call the gate directly so the result is independent of the
+        // downstream `validate_corner_compatibility` rules — the CF-α
+        // contract under test is "same-kind at a shared vertex
+        // clears the conflict gate". Downstream validators may still
+        // reject for unrelated reasons; that's not what's being
+        // tested here.
+        let result =
+            validate_blend_conflict(&model, solid_id, &[edge], BlendKind::Fillet);
+        assert!(
+            result.is_ok(),
+            "same-kind shared-vertex must clear validate_blend_conflict; \
+             got {:?}",
+            result
+        );
+    }
+
+    /// Conflict at the *end* vertex (not just the start) is also
+    /// caught — `validate_blend_conflict` walks both endpoints of
+    /// each requested edge.
+    #[test]
+    fn validate_blend_conflict_inspects_both_endpoints() {
+        let mut model = build_unit_box();
+        let solid_id: SolidId = model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box solid");
+        // Pick any edge and seed the registry at its END vertex.
+        let (edge_id, end_vertex) = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, e)| (id, e.end_vertex))
+            .expect("box edges exist");
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.record_blended_vertex(end_vertex, BlendKind::Fillet);
+        }
+
+        let result =
+            validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Chamfer);
+        assert!(
+            matches!(result, Err(OperationError::InvalidInput { .. })),
+            "end-vertex conflict must surface as InvalidInput; got {:?}",
+            result
+        );
+    }
 }
