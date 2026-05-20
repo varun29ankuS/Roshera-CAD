@@ -241,6 +241,14 @@ pub fn chamfer_edges(
             for vid in surviving_endpoints {
                 solid.record_blended_vertex(vid, BlendKind::Chamfer);
             }
+            // CF-β.3 — tag every emitted chamfer face (trim + cap)
+            // with `BlendKind::Chamfer` so the mixed-kind corner cap
+            // synthesizer can locate the surviving chamfer faces at
+            // a shared corner without re-deriving the classification
+            // from surface geometry.
+            for &fid in &chamfer_faces {
+                solid.record_blend_face(fid, BlendKind::Chamfer);
+            }
         }
 
         // Record the operation for timeline / event-sourcing consumers.

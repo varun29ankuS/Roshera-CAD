@@ -561,6 +561,14 @@ pub fn fillet_edges(
             for vid in surviving_endpoints {
                 solid.record_blended_vertex(vid, BlendKind::Fillet);
             }
+            // CF-β.3 — tag every emitted fillet face (transition +
+            // corner patch) with `BlendKind::Fillet` so the
+            // mixed-kind corner cap synthesizer can locate the
+            // surviving fillet faces at a shared corner without
+            // re-deriving the classification from surface geometry.
+            for &fid in &fillet_faces {
+                solid.record_blend_face(fid, BlendKind::Fillet);
+            }
         }
 
         // Record for attached recorders. `inputs` lists the user-supplied

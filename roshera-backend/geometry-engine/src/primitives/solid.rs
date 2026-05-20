@@ -462,6 +462,20 @@ pub struct Solid {
     /// feasibility pre-flight (CF-β)", and "blanket reject (CF-α
     /// fallback)".
     pub(crate) blended_vertices: HashMap<VertexId, VertexBlendKindSet>,
+    /// CF-β.3 — per-face blend registry. Records the [`BlendKind`]
+    /// every blend face was emitted by, so the mixed-kind corner cap
+    /// synthesizer can locate the surviving chamfer face(s) and
+    /// fillet face(s) incident to a shared corner without re-deriving
+    /// the classification from surface geometry.
+    ///
+    /// Populated by `chamfer::chamfer_edges` (entries tagged
+    /// [`BlendKind::Chamfer`]) and `fillet::fillet_edges` (entries
+    /// tagged [`BlendKind::Fillet`]) once the surgery has emitted the
+    /// blend face IDs and before `record_operation`. Look-ups go
+    /// through [`Self::blend_kind_at_face`] and the per-vertex
+    /// helpers [`Self::chamfer_faces_at_vertex`] /
+    /// [`Self::fillet_faces_at_vertex`].
+    pub(crate) blend_faces_by_kind: HashMap<FaceId, BlendKind>,
 }
 
 /// Top-level AABB used as a conservative collision proxy. The detailed
@@ -493,6 +507,7 @@ impl Solid {
             collision_tree: None,
             blended_edges: HashMap::new(),
             blended_vertices: HashMap::new(),
+            blend_faces_by_kind: HashMap::new(),
         }
     }
 
@@ -539,6 +554,7 @@ impl Solid {
             collision_tree: self.collision_tree.clone(),
             blended_edges: self.blended_edges.clone(),
             blended_vertices: self.blended_vertices.clone(),
+            blend_faces_by_kind: self.blend_faces_by_kind.clone(),
         }
     }
 
@@ -597,6 +613,29 @@ impl Solid {
     /// kind (single-kind CF-α corner) or both (CF-β mixed corner).
     pub fn vertex_blend_set(&self, vertex: VertexId) -> Option<VertexBlendKindSet> {
         self.blended_vertices.get(&vertex).copied()
+    }
+
+    /// CF-β.3 — record that the newly-emitted blend face `face` is of
+    /// kind `kind`. Called by `chamfer::chamfer_edges` once per
+    /// chamfer trim face (and once per planar cap face) and by
+    /// `fillet::fillet_edges` once per fillet transition face on
+    /// successful completion, before `record_operation`. Idempotent;
+    /// a re-emission with the same kind overwrites silently. A re-
+    /// emission with a different kind would be a kernel defect (a
+    /// face cannot belong to two distinct blends) and overwrites the
+    /// last writer; the gate against that is upstream in the
+    /// per-edge / per-vertex registries.
+    pub(crate) fn record_blend_face(&mut self, face: FaceId, kind: BlendKind) {
+        self.blend_faces_by_kind.insert(face, kind);
+    }
+
+    /// CF-β.3 — look up the [`BlendKind`] that produced `face`, if
+    /// any. Used by the mixed-kind corner cap synthesizer to filter
+    /// the faces incident to a shared corner into chamfer-rim and
+    /// fillet-rim subsets without re-deriving the classification
+    /// from surface geometry.
+    pub fn blend_kind_at_face(&self, face: FaceId) -> Option<BlendKind> {
+        self.blend_faces_by_kind.get(&face).copied()
     }
 
     /// Add inner shell (void)
@@ -1771,5 +1810,55 @@ mod vertex_blend_kind_set_tests {
                 .expect("VertexBlendKindSet deserialises");
             assert_eq!(set, back, "round-trip mismatch for {set}");
         }
+    }
+}
+
+#[cfg(test)]
+mod blend_faces_by_kind_tests {
+    //! CF-β.3 — pin the per-face blend registry that lets the
+    //! mixed-kind corner cap synthesizer filter the faces incident
+    //! to a shared corner into chamfer-rim and fillet-rim subsets
+    //! without re-deriving the classification from surface geometry.
+
+    use super::{BlendKind, ShellId, Solid, SolidId};
+
+    fn empty_solid() -> Solid {
+        Solid::new(0 as SolidId, 0 as ShellId)
+    }
+
+    #[test]
+    fn record_blend_face_round_trips_through_lookup() {
+        let mut s = empty_solid();
+        s.record_blend_face(7, BlendKind::Chamfer);
+        s.record_blend_face(11, BlendKind::Fillet);
+        assert_eq!(s.blend_kind_at_face(7), Some(BlendKind::Chamfer));
+        assert_eq!(s.blend_kind_at_face(11), Some(BlendKind::Fillet));
+        assert_eq!(s.blend_kind_at_face(99), None);
+    }
+
+    #[test]
+    fn record_blend_face_idempotent_on_same_kind() {
+        let mut s = empty_solid();
+        s.record_blend_face(3, BlendKind::Fillet);
+        s.record_blend_face(3, BlendKind::Fillet);
+        assert_eq!(s.blend_kind_at_face(3), Some(BlendKind::Fillet));
+        assert_eq!(s.blend_faces_by_kind.len(), 1);
+    }
+
+    #[test]
+    fn deep_copy_preserves_blend_faces_by_kind() {
+        let mut s = empty_solid();
+        s.record_blend_face(5, BlendKind::Chamfer);
+        s.record_blend_face(9, BlendKind::Fillet);
+        let snap = s.deep_copy();
+        assert_eq!(snap.blend_kind_at_face(5), Some(BlendKind::Chamfer));
+        assert_eq!(snap.blend_kind_at_face(9), Some(BlendKind::Fillet));
+        // Mutating the original after the snapshot must not leak in.
+        s.record_blend_face(5, BlendKind::Fillet);
+        assert_eq!(
+            snap.blend_kind_at_face(5),
+            Some(BlendKind::Chamfer),
+            "snapshot must own its blend_faces_by_kind clone"
+        );
     }
 }
