@@ -93,6 +93,12 @@ pub enum VertexBlendUnsupportedReason {
     /// assumes one ball radius across all incident edges; mixed-
     /// radius corners need an n-rail / Gregory patch (F5-β).
     MixedRadii,
+    /// At least one face adjacent to the corner is curved, so the
+    /// N cap-edge endpoints do not lie within `tolerance` of a
+    /// single plane. The Chamfer-β planar n-gon cap requires
+    /// coplanar corner vertices; curved-adjacent corners need a
+    /// curved cap (Chamfer-γ, future).
+    CurvedAdjacent,
 }
 
 impl std::fmt::Display for VertexBlendUnsupportedReason {
@@ -114,6 +120,12 @@ impl std::fmt::Display for VertexBlendUnsupportedReason {
             }
             VertexBlendUnsupportedReason::MixedRadii => {
                 write!(f, "incident blend radii disagree — apex sphere undefined")
+            }
+            VertexBlendUnsupportedReason::CurvedAdjacent => {
+                write!(
+                    f,
+                    "adjacent face is curved — cap corner vertices not coplanar"
+                )
             }
         }
     }
