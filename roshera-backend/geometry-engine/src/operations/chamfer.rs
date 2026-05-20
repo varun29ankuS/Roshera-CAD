@@ -2169,7 +2169,7 @@ fn compute_corner_miter_overrides(
 /// Returns `(vertices_in_traversal_order, forwards_in_input_order)`.
 /// The caller assembles the cap loop by iterating `cap_edges` in
 /// input order and applying `forwards_in_input_order[i]` to each.
-fn verify_cap_edges_form_closed_polygon(
+pub(crate) fn verify_cap_edges_form_closed_polygon(
     model: &BRepModel,
     cap_edges: &[EdgeId],
 ) -> Result<(Vec<VertexId>, Vec<bool>), BlendFailure> {
@@ -2278,7 +2278,7 @@ fn verify_cap_edges_form_closed_polygon(
 /// Returns `false` if the first three points are collinear (zero
 /// cross-product) — that case is geometrically degenerate and
 /// surfaces as a `BlendFailure` at the caller.
-fn cap_vertices_coplanar(positions: &[Point3], tol: f64) -> bool {
+pub(crate) fn cap_vertices_coplanar(positions: &[Point3], tol: f64) -> bool {
     if positions.len() <= 3 {
         return true;
     }
