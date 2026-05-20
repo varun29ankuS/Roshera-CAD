@@ -464,6 +464,93 @@ pub(crate) fn find_blend_cap_edges_at_vertex(
     out.into_iter().collect()
 }
 
+/// CF-β.4 — filter `errors` down to the subset that *cannot* be
+/// explained by a deliberate partially-blended open boundary at a
+/// pending mixed-kind corner.
+///
+/// The intermediate state between the first and second of two kind-
+/// mismatched blend calls leaves a single corner with a non-manifold
+/// edge fringe and a corresponding `V − E + F = 2` deficit. Both are
+/// reported by [`crate::primitives::validation::validate_model_enhanced`]
+/// as `TopologyError` / `ConnectivityError` entries whose
+/// [`crate::primitives::validation::EntityLocation`] references either
+/// (a) the pending vertex directly, or (b) an edge incident to the
+/// pending vertex. This helper drops exactly those errors and returns
+/// the rest, letting the post-operation `validate_result` gate ship
+/// the intermediate state while still catching every error elsewhere.
+///
+/// Inputs:
+/// * `model` — the current B-Rep (used to expand the pending-vertex
+///   set into the set of edges incident to any pending vertex).
+/// * `pending` — the per-`Solid` `pending_mixed_kind_corners` snapshot
+///   (callers should clone the registry before validation to avoid
+///   holding the `&Solid` borrow across the validator call).
+/// * `errors` — the unfiltered error list from `validate_model_enhanced`.
+///
+/// When `pending` is empty the function returns `errors` unchanged
+/// (zero-cost fast path). Errors whose variant has no
+/// `EntityLocation` (`MissingEntity`, `ManufacturingError`,
+/// `ToleranceError`, `FeatureError`, `AssemblyError`) are passed
+/// through unfiltered — they describe defects orthogonal to the
+/// corner's local topology and must surface even at a pending corner.
+pub(crate) fn filter_pending_corner_errors(
+    model: &BRepModel,
+    pending: &HashSet<VertexId>,
+    errors: Vec<crate::primitives::validation::ValidationError>,
+) -> Vec<crate::primitives::validation::ValidationError> {
+    if pending.is_empty() {
+        return errors;
+    }
+
+    // Edges incident to any pending vertex. Single pass over the edge
+    // store; safe to materialise into a HashSet because the pending
+    // set is tiny (typically 1, never more than a handful) and the
+    // filter is run once per validate_result call.
+    let pending_incident_edges: HashSet<EdgeId> = model
+        .edges
+        .iter()
+        .filter_map(|(eid, edge)| {
+            if pending.contains(&edge.start_vertex) || pending.contains(&edge.end_vertex) {
+                Some(eid)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    use crate::primitives::validation::ValidationError;
+    errors
+        .into_iter()
+        .filter(|err| {
+            // Only errors whose variant carries an `EntityLocation`
+            // are candidates for the filter; the rest pass through.
+            let location = match err {
+                ValidationError::TopologyError { location, .. }
+                | ValidationError::GeometryError { location, .. }
+                | ValidationError::OrientationError { location, .. }
+                | ValidationError::ConnectivityError { location, .. } => location,
+                _ => return true,
+            };
+            // Drop iff the error is at a pending vertex OR at an
+            // edge incident to a pending vertex. Other locations
+            // (face / loop / shell / solid only) pass through —
+            // the deliberate open boundary is a vertex/edge-local
+            // phenomenon.
+            if let Some(vid) = location.vertex_id {
+                if pending.contains(&vid) {
+                    return false;
+                }
+            }
+            if let Some(eid) = location.edge_id {
+                if pending_incident_edges.contains(&eid) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,5 +863,167 @@ mod tests {
     fn rim_kind_from_blend_kind_round_trip() {
         assert_eq!(RimKind::from(BlendKind::Chamfer), RimKind::LinearRim);
         assert_eq!(RimKind::from(BlendKind::Fillet), RimKind::ArcRim);
+    }
+
+    /// CF-β.4 — pin the pending-corner error-filter contract used by
+    /// `chamfer::validate_chamfered_solid` and
+    /// `fillet::validate_filleted_solid`.
+    mod filter_pending_corner_errors_tests {
+        use super::super::filter_pending_corner_errors;
+        use crate::primitives::curve::Line as LineCurve;
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use crate::primitives::topology_builder::BRepModel;
+        use crate::primitives::validation::{EntityLocation, ValidationError};
+        use std::collections::HashSet;
+
+        fn loc_with_vertex(vid: u32) -> EntityLocation {
+            EntityLocation {
+                solid_id: None,
+                shell_id: None,
+                face_id: None,
+                loop_id: None,
+                edge_id: None,
+                vertex_id: Some(vid),
+            }
+        }
+
+        fn loc_with_edge(eid: u32) -> EntityLocation {
+            EntityLocation {
+                solid_id: None,
+                shell_id: None,
+                face_id: None,
+                loop_id: None,
+                edge_id: Some(eid),
+                vertex_id: None,
+            }
+        }
+
+        fn loc_with_face(fid: u32) -> EntityLocation {
+            EntityLocation {
+                solid_id: None,
+                shell_id: None,
+                face_id: Some(fid),
+                loop_id: None,
+                edge_id: None,
+                vertex_id: None,
+            }
+        }
+
+        #[test]
+        fn empty_pending_passes_errors_unchanged() {
+            let model = BRepModel::new();
+            let pending: HashSet<u32> = HashSet::new();
+            let errors = vec![
+                ValidationError::TopologyError {
+                    message: "x".into(),
+                    location: loc_with_vertex(7),
+                },
+                ValidationError::MissingEntity {
+                    entity_type: "edge".into(),
+                    id: 99,
+                },
+            ];
+            let kept = filter_pending_corner_errors(&model, &pending, errors);
+            assert_eq!(kept.len(), 2);
+        }
+
+        #[test]
+        fn drops_errors_at_pending_vertex() {
+            let model = BRepModel::new();
+            let pending: HashSet<u32> = [7u32].into_iter().collect();
+            let errors = vec![
+                ValidationError::TopologyError {
+                    message: "at pending V".into(),
+                    location: loc_with_vertex(7),
+                },
+                ValidationError::TopologyError {
+                    message: "elsewhere".into(),
+                    location: loc_with_vertex(8),
+                },
+            ];
+            let kept = filter_pending_corner_errors(&model, &pending, errors);
+            assert_eq!(kept.len(), 1);
+            match &kept[0] {
+                ValidationError::TopologyError { message, .. } => {
+                    assert_eq!(message, "elsewhere");
+                }
+                _ => panic!("unexpected variant"),
+            }
+        }
+
+        #[test]
+        fn drops_errors_at_edge_incident_to_pending_vertex() {
+            // Build a minimal model with two vertices and one edge
+            // between them. Pending the start vertex must drop a
+            // TopologyError whose location references the edge.
+            let mut model = BRepModel::new();
+            let v0 = model.vertices.add(0.0, 0.0, 0.0);
+            let v1 = model.vertices.add(1.0, 0.0, 0.0);
+            let line = LineCurve::new(
+                crate::math::Point3::new(0.0, 0.0, 0.0),
+                crate::math::Point3::new(1.0, 0.0, 0.0),
+            );
+            let cid = model.curves.add(Box::new(line));
+            let eid = model
+                .edges
+                .add(Edge::new_auto_range(0, v0, v1, cid, EdgeOrientation::Forward));
+
+            let pending: HashSet<u32> = [v0].into_iter().collect();
+            let errors = vec![
+                ValidationError::ConnectivityError {
+                    message: "non-manifold rim".into(),
+                    location: loc_with_edge(eid),
+                },
+                ValidationError::TopologyError {
+                    message: "unrelated face".into(),
+                    location: loc_with_face(42),
+                },
+            ];
+            let kept = filter_pending_corner_errors(&model, &pending, errors);
+            assert_eq!(kept.len(), 1);
+            match &kept[0] {
+                ValidationError::TopologyError { message, .. } => {
+                    assert_eq!(message, "unrelated face");
+                }
+                _ => panic!("unexpected variant"),
+            }
+        }
+
+        #[test]
+        fn keeps_location_less_errors_even_with_pending() {
+            let model = BRepModel::new();
+            let pending: HashSet<u32> = [7u32].into_iter().collect();
+            let errors = vec![
+                ValidationError::MissingEntity {
+                    entity_type: "face".into(),
+                    id: 42,
+                },
+                ValidationError::FeatureError {
+                    message: "x".into(),
+                    feature_id: 1,
+                },
+            ];
+            let kept = filter_pending_corner_errors(&model, &pending, errors);
+            assert_eq!(
+                kept.len(),
+                2,
+                "errors without EntityLocation must pass through"
+            );
+        }
+
+        #[test]
+        fn keeps_face_only_errors_even_at_pending_corner() {
+            // An error whose only location field is `face_id` must
+            // survive even if a corner is pending — the face-level
+            // defect is orthogonal to the corner's local boundary.
+            let model = BRepModel::new();
+            let pending: HashSet<u32> = [7u32].into_iter().collect();
+            let errors = vec![ValidationError::OrientationError {
+                message: "face normal flipped".into(),
+                location: loc_with_face(99),
+            }];
+            let kept = filter_pending_corner_errors(&model, &pending, errors);
+            assert_eq!(kept.len(), 1);
+        }
     }
 }
