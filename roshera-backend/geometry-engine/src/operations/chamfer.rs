@@ -137,13 +137,40 @@ pub fn chamfer_edges(
         //      [`handle_chamfer_vertices`].
         let corner_set = identify_chamfer_corners(model, solid_id, &selected_edges, &options)?;
 
+        // Chamfer-β — pre-compute per-(edge, corner vertex, shared
+        // face) miter overrides for every degree-≥4 convex corner.
+        // For degree-3 corners and for non-corner edges the override
+        // map is empty (or `None` is passed downstream), preserving
+        // legacy behaviour exactly. The miter pass only fires for
+        // uniform-offset chamfers (`identify_chamfer_corners` gates
+        // `corner_set.corners` on that), and the canonical offset is
+        // `options.distance1` (equal to `distance2` within tolerance
+        // by the same gate).
+        let miter_map = if corner_set.corners.is_empty() {
+            MiterOverrideMap::new()
+        } else {
+            compute_corner_miter_overrides(
+                model,
+                solid_id,
+                &corner_set,
+                &selected_edges,
+                options.distance1,
+            )?
+        };
+        let miter_overrides: Option<&MiterOverrideMap> = if miter_map.is_empty() {
+            None
+        } else {
+            Some(&miter_map)
+        };
+
         // Create chamfer faces for each edge. Closed-edge (rim) chamfers
         // perform their topology surgery inline and return `None`; open
         // edges return `Some(surgery)` for the 4-face splice below.
         let mut chamfer_faces = Vec::new();
         let mut surgeries: Vec<BlendEdgeSurgery> = Vec::new();
         for &edge_id in &selected_edges {
-            let (face_id, surgery) = create_edge_chamfer(model, solid_id, edge_id, &options)?;
+            let (face_id, surgery) =
+                create_edge_chamfer(model, solid_id, edge_id, &options, miter_overrides)?;
             chamfer_faces.push(face_id);
             if let Some(mut s) = surgery {
                 // Chamfer-α — stamp corner-shared flags. With the flag
@@ -171,8 +198,8 @@ pub fn chamfer_edges(
                 model,
                 solid_id,
                 &corner_set,
-                &chamfer_faces,
-                &options,
+                &selected_edges,
+                &surgeries,
             )?;
             chamfer_faces.extend(cap_faces);
         }
@@ -230,6 +257,7 @@ fn create_edge_chamfer(
     solid_id: SolidId,
     edge_id: EdgeId,
     options: &ChamferOptions,
+    miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get adjacent faces
     let (face1_id, face2_id) = get_adjacent_faces(model, solid_id, edge_id)?;
@@ -268,19 +296,38 @@ fn create_edge_chamfer(
     // shape that closed-edge dispatch above uses.
     match &options.chamfer_type {
         ChamferType::EqualDistance(dist) => {
-            create_equal_distance_chamfer(model, edge_id, face1_id, face2_id, *dist)
-                .map(|(f, s)| (f, Some(s)))
+            create_equal_distance_chamfer(
+                model,
+                edge_id,
+                face1_id,
+                face2_id,
+                *dist,
+                miter_overrides,
+            )
+            .map(|(f, s)| (f, Some(s)))
         }
-        ChamferType::TwoDistances(dist1, dist2) => {
-            create_two_distance_chamfer(model, edge_id, face1_id, face2_id, *dist1, *dist2)
-                .map(|(f, s)| (f, Some(s)))
-        }
-        ChamferType::DistanceAngle(dist, angle) => {
-            create_distance_angle_chamfer(model, edge_id, face1_id, face2_id, *dist, *angle)
-                .map(|(f, s)| (f, Some(s)))
-        }
+        ChamferType::TwoDistances(dist1, dist2) => create_two_distance_chamfer(
+            model,
+            edge_id,
+            face1_id,
+            face2_id,
+            *dist1,
+            *dist2,
+            miter_overrides,
+        )
+        .map(|(f, s)| (f, Some(s))),
+        ChamferType::DistanceAngle(dist, angle) => create_distance_angle_chamfer(
+            model,
+            edge_id,
+            face1_id,
+            face2_id,
+            *dist,
+            *angle,
+            miter_overrides,
+        )
+        .map(|(f, s)| (f, Some(s))),
         ChamferType::Angle(angle) => {
-            create_angle_chamfer(model, edge_id, face1_id, face2_id, *angle)
+            create_angle_chamfer(model, edge_id, face1_id, face2_id, *angle, miter_overrides)
                 .map(|(f, s)| (f, Some(s)))
         }
     }
@@ -293,6 +340,7 @@ fn create_equal_distance_chamfer(
     face1_id: FaceId,
     face2_id: FaceId,
     distance: f64,
+    miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Get edge geometry
     let edge = model
@@ -302,8 +350,16 @@ fn create_equal_distance_chamfer(
         .clone();
 
     // Compute chamfer offsets along edge
-    let chamfer_data =
-        compute_chamfer_offsets(model, &edge, edge_id, face1_id, face2_id, distance, distance)?;
+    let chamfer_data = compute_chamfer_offsets(
+        model,
+        &edge,
+        edge_id,
+        face1_id,
+        face2_id,
+        distance,
+        distance,
+        miter_overrides,
+    )?;
 
     // Create chamfer surface (ruled surface between offset curves)
     let chamfer_surface = create_ruled_chamfer_surface(model, &chamfer_data)?;
@@ -321,6 +377,7 @@ fn create_two_distance_chamfer(
     face2_id: FaceId,
     distance1: f64,
     distance2: f64,
+    miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Similar to equal distance but with different offsets
     let edge = model
@@ -329,8 +386,16 @@ fn create_two_distance_chamfer(
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
         .clone();
 
-    let chamfer_data =
-        compute_chamfer_offsets(model, &edge, edge_id, face1_id, face2_id, distance1, distance2)?;
+    let chamfer_data = compute_chamfer_offsets(
+        model,
+        &edge,
+        edge_id,
+        face1_id,
+        face2_id,
+        distance1,
+        distance2,
+        miter_overrides,
+    )?;
 
     let chamfer_surface = create_ruled_chamfer_surface(model, &chamfer_data)?;
     let surface_id = model.surfaces.add(chamfer_surface);
@@ -346,12 +411,21 @@ fn create_distance_angle_chamfer(
     face2_id: FaceId,
     distance: f64,
     angle: f64,
+    miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Compute second distance from angle
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     let distance2 = distance * (angle.sin() / (face_angle - angle).sin());
 
-    create_two_distance_chamfer(model, edge_id, face1_id, face2_id, distance, distance2)
+    create_two_distance_chamfer(
+        model,
+        edge_id,
+        face1_id,
+        face2_id,
+        distance,
+        distance2,
+        miter_overrides,
+    )
 }
 
 /// Create angle-based chamfer.
@@ -371,6 +445,7 @@ fn create_angle_chamfer(
     face1_id: FaceId,
     face2_id: FaceId,
     angle: f64,
+    miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     if angle <= 0.0 || angle >= face_angle {
@@ -404,7 +479,15 @@ fn create_angle_chamfer(
     }
     let distance2 = distance1 * angle.sin() / denom;
 
-    create_two_distance_chamfer(model, edge_id, face1_id, face2_id, distance1, distance2)
+    create_two_distance_chamfer(
+        model,
+        edge_id,
+        face1_id,
+        face2_id,
+        distance1,
+        distance2,
+        miter_overrides,
+    )
 }
 
 /// Resolve `(d_lat, d_cap)` distances for a closed-rim chamfer, where
@@ -1006,6 +1089,7 @@ fn compute_chamfer_offsets(
     face2_id: FaceId,
     distance1: f64,
     distance2: f64,
+    miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<ChamferData> {
     let num_samples = 10;
     let mut data = ChamferData {
@@ -1099,6 +1183,94 @@ fn compute_chamfer_offsets(
             .push(edge_point + offset_dir2 * distance2);
         data.normals1.push(face_normal1);
         data.normals2.push(face_normal2);
+    }
+
+    // Chamfer-β — apply corner-miter overrides on the cap-side offset
+    // endpoints (V0 end at index 0 and V1 end at the last index), then
+    // re-interpolate intermediate samples linearly between the
+    // possibly-overridden endpoints. The pre-override interior samples
+    // already lie on a straight line (planar adjacent face × straight
+    // edge × constant offset direction), so replacing a single endpoint
+    // would leave the trim curve off the planar chamfer surface. Linear
+    // re-interp keeps the trim curve flush with the surface.
+    if let Some(map) = miter_overrides {
+        // Curve parameter ↦ vertex mapping respects Edge::orientation,
+        // mirroring `unit_dir_from_vertex` above.
+        let v_at_t0 = if edge.orientation.is_forward() {
+            edge.start_vertex
+        } else {
+            edge.end_vertex
+        };
+        let v_at_t1 = if edge.orientation.is_forward() {
+            edge.end_vertex
+        } else {
+            edge.start_vertex
+        };
+
+        let mut face1_overridden = false;
+        let mut face2_overridden = false;
+
+        if let Some(p) = map.get(&MiterKey {
+            edge: edge_id,
+            vertex: v_at_t0,
+            face: face1_id,
+        }) {
+            data.offset_points1[0] = *p;
+            face1_overridden = true;
+        }
+        if let Some(p) = map.get(&MiterKey {
+            edge: edge_id,
+            vertex: v_at_t1,
+            face: face1_id,
+        }) {
+            let last = data.offset_points1.len() - 1;
+            data.offset_points1[last] = *p;
+            face1_overridden = true;
+        }
+        if let Some(p) = map.get(&MiterKey {
+            edge: edge_id,
+            vertex: v_at_t0,
+            face: face2_id,
+        }) {
+            data.offset_points2[0] = *p;
+            face2_overridden = true;
+        }
+        if let Some(p) = map.get(&MiterKey {
+            edge: edge_id,
+            vertex: v_at_t1,
+            face: face2_id,
+        }) {
+            let last = data.offset_points2.len() - 1;
+            data.offset_points2[last] = *p;
+            face2_overridden = true;
+        }
+
+        // Re-interpolate interior samples linearly between the
+        // (possibly-overridden) endpoints. Only touches the sequences
+        // that had at least one endpoint overridden; unaffected edges
+        // keep their raw perpendicular-offset polyline.
+        if face1_overridden {
+            let last = data.offset_points1.len() - 1;
+            if last >= 2 {
+                let p0 = data.offset_points1[0];
+                let pn = data.offset_points1[last];
+                for i in 1..last {
+                    let t = i as f64 / last as f64;
+                    data.offset_points1[i] = p0 + (pn - p0) * t;
+                }
+            }
+        }
+        if face2_overridden {
+            let last = data.offset_points2.len() - 1;
+            if last >= 2 {
+                let p0 = data.offset_points2[0];
+                let pn = data.offset_points2[last];
+                for i in 1..last {
+                    let t = i as f64 / last as f64;
+                    data.offset_points2[i] = p0 + (pn - p0) * t;
+                }
+            }
+        }
     }
 
     Ok(data)
@@ -1462,8 +1634,10 @@ struct ChamferCorner {
     /// edge on each chamfer face by endpoint proximity.
     position: Point3,
     /// Indices into the caller's `selected_edges` / `chamfer_faces`
-    /// slices — the three chamfer faces incident to this corner.
-    edge_indices: [usize; 3],
+    /// slices — the N chamfer faces incident to this corner. N ≥ 3,
+    /// with N=3 the degree-3 box-corner case (Chamfer-α) and N ≥ 4
+    /// the polyhedral apex case (Chamfer-β).
+    edge_indices: Vec<usize>,
     /// Outward direction at the corner (sum of the three adjacent
     /// original face normals, normalised). Drives the planar-cap
     /// orientation via [`orient_face_for_outward`].
@@ -1497,10 +1671,11 @@ fn chamfer_offsets_uniform(options: &ChamferOptions) -> bool {
             <= Tolerance::default().distance()
 }
 
-/// Chamfer-α — true iff every adjacent original face around `vertex_id`
-/// (gathered via [`get_adjacent_faces`] for each of the three incident
-/// chamfered edges) carries a `Plane` surface. Cylinder / sphere /
-/// NURBS-adjacent corners are deferred to Chamfer-δ.
+/// Chamfer-α/β — true iff every adjacent original face around the
+/// corner vertex (gathered via [`get_adjacent_faces`] for each of the
+/// N ≥ 3 incident chamfered edges) carries a `Plane` surface.
+/// Cylinder / sphere / NURBS-adjacent corners are deferred to
+/// Chamfer-δ.
 fn corner_adjacent_faces_planar(
     model: &BRepModel,
     adjacent_face_ids: &[FaceId],
@@ -1569,33 +1744,34 @@ fn is_convex_corner(
     Ok(true)
 }
 
-/// Chamfer-α — pre-surgery corner detection.
+/// Chamfer-β — pre-surgery corner detection.
 ///
 /// Walks every vertex incident to two or more selected chamfer edges
-/// and admits the degree-3 convex planar uniform-offset subset. Builds
-/// a [`ChamferCornerSet`] consumed in two places:
+/// and admits the degree-N (N ≥ 3) convex planar uniform-offset
+/// subset. Builds a [`ChamferCornerSet`] consumed in two places:
 ///
 /// 1. By [`chamfer_edges`] immediately after each `create_edge_chamfer`
 ///    call to stamp `original_v*_corner_shared = true` on the matching
 ///    `BlendEdgeSurgery` — this suppresses the legacy V-side cap
 ///    insertion + corner-vertex removal in `splice_blend_edge`.
 /// 2. By [`handle_chamfer_vertices`] post-splice to emit a planar
-///    triangular cap face per qualifying corner.
+///    N-gon cap face per qualifying corner.
 ///
 /// Two distinct gates are applied:
 ///
 /// 1. **`corner_ids` (V-retention gate)** — populated for *every*
-///    degree-3 vertex where three selected chamfer edges meet,
-///    regardless of offset uniformity or face planarity. This drives
-///    `original_v*_corner_shared` stamping on the `BlendEdgeSurgery`
-///    so `splice_blend_edge` leaves V alive: at a 3-edge corner the
-///    second and third splices would otherwise look up V (already
-///    removed by the first splice) and fail with
-///    `BlendEdgeSurgery original_v0 N missing from model`.
+///    degree-≥3 vertex where three or more selected chamfer edges
+///    meet, regardless of offset uniformity or face planarity. This
+///    drives `original_v*_corner_shared` stamping on the
+///    `BlendEdgeSurgery` so `splice_blend_edge` leaves V alive: at
+///    an N-edge corner the second through Nth splices would
+///    otherwise look up V (already removed by the first splice) and
+///    fail with `BlendEdgeSurgery original_v0 N missing from model`.
 /// 2. **`corners` (cap-emit gate)** — additionally requires uniform
 ///    offsets (`EqualDistance(d)` with `distance1 == distance2`),
-///    three planar adjacent faces, and a convex corner. Non-α modes
-///    leave V alive but skip cap synthesis (Chamfer-β / γ / δ / β.5).
+///    N planar adjacent faces, and a convex corner. Non-cap-emit
+///    modes leave V alive but skip cap synthesis (Chamfer-β.5 /
+///    γ / δ).
 fn identify_chamfer_corners(
     model: &BRepModel,
     solid_id: SolidId,
@@ -1627,42 +1803,45 @@ fn identify_chamfer_corners(
     let mut corner_ids: HashSet<VertexId> = HashSet::new();
 
     for (vertex_id, edge_indices) in &vertex_incidence {
-        // Chamfer-β handles degree ≠ 3; α is the strict degree-3 case.
-        // Vertices with 1 or 2 incident selected edges never need
-        // V-retention — `splice_blend_edge` handles them correctly via
-        // the default `corner_shared=false` path.
-        if edge_indices.len() != 3 {
+        // Chamfer-β: admit N ≥ 3. Vertices with 1 or 2 incident
+        // selected edges never need V-retention —
+        // `splice_blend_edge` handles them correctly via the default
+        // `corner_shared = false` path (the second splice's V lookup
+        // still succeeds because the first splice's opposite
+        // endpoint is untouched).
+        if edge_indices.len() < 3 {
             continue;
         }
 
-        // V-retention gate fires for every degree-3 vertex, even when
-        // we won't emit a cap. The splice ordering means the second of
-        // three splices crashes if it can't find V; flagging V as
-        // corner-shared on all three surgeries keeps it alive across
+        // V-retention gate fires for every degree-≥3 vertex, even
+        // when we won't emit a cap. The splice ordering means the
+        // second of N splices crashes if it can't find V; flagging V
+        // as corner-shared on all N surgeries keeps it alive across
         // the entire splice pass.
         corner_ids.insert(*vertex_id);
 
         // Cap-emit gates from here on. Non-uniform / non-planar /
-        // non-convex corners leave V alive (above) but skip cap
-        // synthesis — the shell carries a deliberate triangular hole
-        // until the matching later slice fills it.
+        // non-convex / non-coplanar corners leave V alive (above)
+        // but skip cap synthesis — the shell carries a deliberate
+        // N-sided hole until the matching later slice fills it.
         if !cap_synthesis_enabled {
             continue;
         }
 
-        // Collect the three unique adjacent original faces around V.
-        // Each of the three chamfered edges borders two faces; the
-        // three faces appear with multiplicity 2 in the multiset (each
-        // pair of corner edges shares exactly one adjacent face on a
-        // generic convex 3-edge corner).
+        // Collect the unique adjacent original faces around V. For a
+        // convex degree-N manifold corner each pair of consecutive
+        // incident edges shares exactly one adjacent face, so the
+        // adjacent face count equals the edge count. Mismatch
+        // indicates a non-manifold neighbourhood (e.g. two of the
+        // chamfered edges share both their adjacent faces — a
+        // degenerate fold) — defer.
         let mut adjacent_set: HashSet<FaceId> = HashSet::new();
         for &eidx in edge_indices {
             let (f1, f2) = get_adjacent_faces(model, solid_id, selected_edges[eidx])?;
             adjacent_set.insert(f1);
             adjacent_set.insert(f2);
         }
-        // Non-manifold or degenerate corner — defer.
-        if adjacent_set.len() != 3 {
+        if adjacent_set.len() != edge_indices.len() {
             continue;
         }
         let adjacent_face_ids: Vec<FaceId> = adjacent_set.into_iter().collect();
@@ -1692,12 +1871,12 @@ fn identify_chamfer_corners(
             continue;
         }
 
-        // edge_indices is exactly 3 long (gated above).
-        let ei = [edge_indices[0], edge_indices[1], edge_indices[2]];
+        // edge_indices is the vertex's chamfered-edge incidence list
+        // (length N ≥ 3, gated above).
         corners.push(ChamferCorner {
             vertex_id: *vertex_id,
             position,
-            edge_indices: ei,
+            edge_indices: edge_indices.clone(),
             outward,
         });
     }
@@ -1708,68 +1887,262 @@ fn identify_chamfer_corners(
     })
 }
 
-/// Chamfer-α — locate the V-side cap edge on a chamfer face.
+/// Chamfer-β — keyed override for a single chamfer offset endpoint.
 ///
-/// The chamfer face's outer loop is exactly four edges in the order
-/// produced by [`create_chamfer_face`] (trim1 forward → cap_v1 forward
-/// → trim2 reversed → cap_v0 forward). The V-side cap edge is the one
-/// whose *both* endpoints lie within `d · √2 + tol` of the corner
-/// position: a planar-adjacent chamfer with offset `d` places both
-/// cap-edge endpoints at distance exactly `d` from V, so the diagonal
-/// between them is bounded by `d · √2`. Trim edges have one endpoint
-/// at the V-side offset (distance `d`) and the other at the
-/// V-opposite-side offset (distance ≈ `edge_length − d`); for the
-/// usual `d < edge_length / 2 − tol` regime the trim edges fail the
-/// "both endpoints near V" predicate.
-fn find_cap_edge_at_vertex_for_chamfer(
-    model: &BRepModel,
-    chamfer_face_id: FaceId,
-    corner_position: Point3,
-    offset_distance: f64,
-    tolerance: f64,
-) -> Option<EdgeId> {
-    let face = model.faces.get(chamfer_face_id)?;
-    let outer_loop = model.loops.get(face.outer_loop)?;
-    let bound_sq = {
-        let r = offset_distance * std::f64::consts::SQRT_2 + tolerance;
-        r * r
-    };
-    for &edge_id in &outer_loop.edges {
-        let edge = model.edges.get(edge_id)?;
-        let v_start = model.vertices.get(edge.start_vertex)?;
-        let v_end = model.vertices.get(edge.end_vertex)?;
-        let d0 = {
-            let dx = v_start.position[0] - corner_position.x;
-            let dy = v_start.position[1] - corner_position.y;
-            let dz = v_start.position[2] - corner_position.z;
-            dx * dx + dy * dy + dz * dz
-        };
-        let d1 = {
-            let dx = v_end.position[0] - corner_position.x;
-            let dy = v_end.position[1] - corner_position.y;
-            let dz = v_end.position[2] - corner_position.z;
-            dx * dx + dy * dy + dz * dz
-        };
-        if d0 <= bound_sq && d1 <= bound_sq {
-            return Some(edge_id);
-        }
-    }
-    None
+/// One entry per `(chamfered edge, shared corner vertex, shared adjacent
+/// face)` triple where N ≥ 4 corner mitering needs to replace the raw
+/// perpendicular-in-face offset with the mitered position. After the
+/// override fires, adjacent chamfer faces' cap endpoints on the shared
+/// face are coincident → the `add_or_find` dedup in [`create_chamfer_face`]
+/// unifies them into a single `VertexId` → the N cap edges form a closed
+/// polygon → the planar n-gon cap synthesis runs to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MiterKey {
+    edge: EdgeId,
+    vertex: VertexId,
+    face: FaceId,
 }
 
-/// Chamfer-α — verify three cap edges close a triangle and recover
+/// Chamfer-β — table of per-(edge, vertex, face) miter overrides.
+///
+/// Empty for degree-3 corners (the legacy box-corner path relies on
+/// natural perpendicular-offset coincidence by cube symmetry and is
+/// left untouched to keep `chamfer_three_edge_corner_box_emits_planar_cap`
+/// green). Empty for every non-corner chamfer call as well.
+type MiterOverrideMap = HashMap<MiterKey, Point3>;
+
+/// Chamfer-β — walk an N-edge convex corner in cyclic order around V.
+///
+/// Returns a `Vec<(edge_id, shared_face_with_next)>` of length N in
+/// face-umbrella traversal order, where `shared_face_with_next[i]` is
+/// the face that `edge[i]` and `edge[(i+1) % N]` both bound at V.
+///
+/// Returns `None` if the umbrella fails to close after N steps (non-
+/// manifold neighbourhood). The caller leaves miter overrides empty
+/// for that corner and the downstream cap-polygon walker surfaces a
+/// typed [`BlendFailure::TopologyViolation`].
+fn cyclic_order_at_corner(
+    model: &BRepModel,
+    solid_id: SolidId,
+    corner: &ChamferCorner,
+    selected_edges: &[EdgeId],
+) -> Option<Vec<(EdgeId, FaceId)>> {
+    let n = corner.edge_indices.len();
+    if n < 3 {
+        return None;
+    }
+
+    // Build edge_id -> (face_a, face_b) lookup for every chamfered
+    // edge incident to V. Both faces are guaranteed distinct on a
+    // manifold solid; `identify_chamfer_corners` already enforced
+    // `adjacent_set.len() == edge_indices.len()` so each shared face
+    // appears exactly twice across the N edge entries.
+    let mut edge_faces: HashMap<EdgeId, (FaceId, FaceId)> = HashMap::with_capacity(n);
+    for &eidx in &corner.edge_indices {
+        let eid = selected_edges[eidx];
+        let (f1, f2) = get_adjacent_faces(model, solid_id, eid).ok()?;
+        edge_faces.insert(eid, (f1, f2));
+    }
+
+    // Seed the walk with the first incident edge; advance along its
+    // face2 arbitrarily (either choice produces a cyclic permutation
+    // of the same N-tuple).
+    let start_eid = selected_edges[corner.edge_indices[0]];
+    let (_f_back, mut f_forward) = *edge_faces.get(&start_eid)?;
+
+    let mut order: Vec<(EdgeId, FaceId)> = Vec::with_capacity(n);
+    let mut current = start_eid;
+
+    for _step in 0..n {
+        order.push((current, f_forward));
+
+        // Find the unique other chamfered edge at V that shares
+        // f_forward as one of its adjacent faces.
+        let advance = corner.edge_indices.iter().find_map(|&eidx| {
+            let eid = selected_edges[eidx];
+            if eid == current {
+                return None;
+            }
+            let (a, b) = *edge_faces.get(&eid)?;
+            if a == f_forward {
+                Some((eid, b))
+            } else if b == f_forward {
+                Some((eid, a))
+            } else {
+                None
+            }
+        });
+        let (next_eid, next_forward) = advance?;
+        current = next_eid;
+        f_forward = next_forward;
+    }
+
+    // Walk must return to the start; otherwise the umbrella does
+    // not close (non-manifold).
+    if current != start_eid {
+        return None;
+    }
+    Some(order)
+}
+
+/// Chamfer-β — unit direction from `v_id` along `edge_id`.
+///
+/// Probes the curve tangent at the matching parameter endpoint
+/// (`0` if `v_id` sits at the curve's parameter origin, `1` otherwise)
+/// and flips its sign so the resulting vector points AWAY from V into
+/// the edge interior. Curve parameter mapping accounts for
+/// `Edge::orientation`.
+fn unit_dir_from_vertex(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    v_id: VertexId,
+) -> OperationResult<Vector3> {
+    let edge = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {edge_id} missing")))?;
+    let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("Curve for edge {edge_id} missing"))
+    })?;
+
+    // With Forward orientation curve.point_at(0) is at start_vertex;
+    // with Backward at end_vertex.
+    let v_at_curve_t0 = if edge.orientation.is_forward() {
+        edge.start_vertex
+    } else {
+        edge.end_vertex
+    };
+    let (t_at_v, into_edge_sign) = if v_id == v_at_curve_t0 {
+        (0.0_f64, 1.0_f64)
+    } else {
+        (1.0_f64, -1.0_f64)
+    };
+
+    let tangent = curve
+        .tangent_at(t_at_v)
+        .map_err(|e| OperationError::NumericalError(format!("Tangent at vertex failed: {:?}", e)))?;
+    let dir = tangent * into_edge_sign;
+    dir.normalize().map_err(|e| {
+        OperationError::NumericalError(format!("Edge direction degenerate: {:?}", e))
+    })
+}
+
+/// Chamfer-β — compute miter overrides for every convex degree-≥4
+/// corner in `corner_set`.
+///
+/// For each consecutive pair (e_i, e_{i+1}) of chamfered edges in
+/// cyclic order at V sharing face F:
+///
+/// ```text
+///     M = V + (d / sin(θ/2)) · normalize(v_i + v_{i+1})
+/// ```
+///
+/// where `d` is the uniform chamfer offset, `θ` is the angle at V
+/// measured between the two edges on F, and `v_*` are unit directions
+/// from V along each edge. Both `v_i` and `v_{i+1}` lie in F (each
+/// edge bounds F at V), so the bisector lies in F and M is a point on
+/// F at the standard 2D street-corner miter offset from V.
+///
+/// Both edges' cap-side offset endpoint on F is set to the same M.
+/// The dedup at [`create_chamfer_face`] then unifies them into one
+/// `VertexId`, so the N cap edges share N corner vertices and the
+/// cap-polygon walker closes the loop.
+///
+/// Degree-3 corners are deliberately skipped — the legacy box-corner
+/// path is pinned by `chamfer_three_edge_corner_box_emits_planar_cap`
+/// and depends on perpendicular-offset coincidence by cube symmetry.
+fn compute_corner_miter_overrides(
+    model: &BRepModel,
+    solid_id: SolidId,
+    corner_set: &ChamferCornerSet,
+    selected_edges: &[EdgeId],
+    distance: f64,
+) -> OperationResult<MiterOverrideMap> {
+    let mut overrides: MiterOverrideMap = HashMap::new();
+
+    for corner in &corner_set.corners {
+        if corner.edge_indices.len() < 4 {
+            continue;
+        }
+        let cyclic = match cyclic_order_at_corner(model, solid_id, corner, selected_edges) {
+            Some(c) => c,
+            None => continue,
+        };
+        let n = cyclic.len();
+        for i in 0..n {
+            let (e_i, f_shared) = cyclic[i];
+            let (e_next, _) = cyclic[(i + 1) % n];
+
+            let v_dir_i = unit_dir_from_vertex(model, e_i, corner.vertex_id)?;
+            let v_dir_next = unit_dir_from_vertex(model, e_next, corner.vertex_id)?;
+
+            let cos_theta = v_dir_i.dot(&v_dir_next).clamp(-1.0, 1.0);
+            let theta = cos_theta.acos();
+            let half = theta * 0.5;
+            let s = half.sin();
+            // Near-collinear adjacent edges → miter blows up. Skip;
+            // downstream coplanarity / cap-walker surfaces the issue
+            // as a typed BlendFailure.
+            if s.abs() < 1e-9 {
+                continue;
+            }
+
+            let bisector = match (v_dir_i + v_dir_next).normalize() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let miter_dist = distance / s;
+            let m_pt: Point3 = corner.position + bisector * miter_dist;
+
+            overrides.insert(
+                MiterKey {
+                    edge: e_i,
+                    vertex: corner.vertex_id,
+                    face: f_shared,
+                },
+                m_pt,
+            );
+            overrides.insert(
+                MiterKey {
+                    edge: e_next,
+                    vertex: corner.vertex_id,
+                    face: f_shared,
+                },
+                m_pt,
+            );
+        }
+    }
+    Ok(overrides)
+}
+
+/// Chamfer-β — verify N cap edges close a polygon and recover
 /// per-edge loop-forward flags.
 ///
-/// Endpoint-only logic — identical to fillet's
-/// `verify_cap_arcs_form_closed_triangle` (fillet.rs:2423-2488) with
-/// the `Arc` vs `Line` underlying curve distinction invisible at this
+/// Endpoint-only greedy chain walk over N edges. Generalises the
+/// degree-3 triangle verifier (Chamfer-α) to arbitrary N ≥ 3. The
+/// `Arc` vs `Line` underlying curve distinction is invisible at this
 /// layer.
-fn verify_cap_edges_form_closed_triangle(
+///
+/// Returns `(vertices_in_traversal_order, forwards_in_input_order)`.
+/// The caller assembles the cap loop by iterating `cap_edges` in
+/// input order and applying `forwards_in_input_order[i]` to each.
+fn verify_cap_edges_form_closed_polygon(
     model: &BRepModel,
-    cap_edges: &[EdgeId; 3],
-) -> Result<([VertexId; 3], [bool; 3]), BlendFailure> {
-    let mut endpoints = [(0u32, 0u32); 3];
-    for (i, &edge_id) in cap_edges.iter().enumerate() {
+    cap_edges: &[EdgeId],
+) -> Result<(Vec<VertexId>, Vec<bool>), BlendFailure> {
+    let n = cap_edges.len();
+    if n < 3 {
+        return Err(BlendFailure::TopologyViolation {
+            detail: format!(
+                "chamfer cap loop has {} edges; need ≥ 3 to form a closed polygon",
+                n
+            ),
+        });
+    }
+
+    let mut endpoints: Vec<(VertexId, VertexId)> = Vec::with_capacity(n);
+    for &edge_id in cap_edges {
         let edge = model
             .edges
             .get(edge_id)
@@ -1779,140 +2152,175 @@ fn verify_cap_edges_form_closed_triangle(
                     edge_id
                 ),
             })?;
-        endpoints[i] = (edge.start_vertex, edge.end_vertex);
+        endpoints.push((edge.start_vertex, edge.end_vertex));
     }
 
-    let a = endpoints[0].0;
-    let b = endpoints[0].1;
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut forwards_walk: Vec<bool> = Vec::with_capacity(n);
+    let mut used = vec![false; n];
+    let mut verts: Vec<VertexId> = Vec::with_capacity(n);
 
-    let pick_middle = |i: usize| -> Option<(bool, VertexId)> {
-        if endpoints[i].0 == b {
-            Some((true, endpoints[i].1))
-        } else if endpoints[i].1 == b {
-            Some((false, endpoints[i].0))
-        } else {
-            None
+    // Seed the walk with edge 0 in forward orientation.
+    order.push(0);
+    forwards_walk.push(true);
+    used[0] = true;
+    verts.push(endpoints[0].0);
+    let mut running = endpoints[0].1;
+
+    for _ in 1..n {
+        let mut found = false;
+        for j in 0..n {
+            if used[j] {
+                continue;
+            }
+            if endpoints[j].0 == running {
+                order.push(j);
+                forwards_walk.push(true);
+                used[j] = true;
+                verts.push(running);
+                running = endpoints[j].1;
+                found = true;
+                break;
+            }
+            if endpoints[j].1 == running {
+                order.push(j);
+                forwards_walk.push(false);
+                used[j] = true;
+                verts.push(running);
+                running = endpoints[j].0;
+                found = true;
+                break;
+            }
         }
-    };
-    let (next_idx, last_idx, next_forward, c) = if let Some((fwd, c)) = pick_middle(1) {
-        (1usize, 2usize, fwd, c)
-    } else if let Some((fwd, c)) = pick_middle(2) {
-        (2usize, 1usize, fwd, c)
-    } else {
+        if !found {
+            return Err(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "chamfer cap loop does not close: walked {} of {} edges, \
+                     stuck at vertex {:?} with no unused incident cap edge",
+                    verts.len(),
+                    n,
+                    running
+                ),
+            });
+        }
+    }
+
+    // The cycle must return to the starting vertex of edge 0.
+    if running != verts[0] {
         return Err(BlendFailure::TopologyViolation {
             detail: format!(
-                "chamfer cap edges do not form a closed triangle: edge 0 ends at \
-                 vertex {:?} but neither of the other two cap edges is incident to it",
-                b
+                "chamfer cap loop does not close: ended at vertex {:?}, expected {:?}",
+                running, verts[0]
             ),
         });
-    };
+    }
 
-    let last_forward = if endpoints[last_idx].0 == c && endpoints[last_idx].1 == a {
-        true
-    } else if endpoints[last_idx].1 == c && endpoints[last_idx].0 == a {
-        false
-    } else {
-        return Err(BlendFailure::TopologyViolation {
-            detail: format!(
-                "chamfer cap edges do not form a closed triangle: a={:?}, b={:?}, \
-                 c={:?}, but the remaining cap edge has endpoints {:?} — does not \
-                 close the cycle",
-                a, b, c, endpoints[last_idx]
-            ),
-        });
-    };
+    // Permute forwards back into input edge order.
+    let mut forwards_in_input_order = vec![true; n];
+    for (k, &orig_idx) in order.iter().enumerate() {
+        forwards_in_input_order[orig_idx] = forwards_walk[k];
+    }
 
-    let mut forwards = [true; 3];
-    forwards[0] = true;
-    forwards[next_idx] = next_forward;
-    forwards[last_idx] = last_forward;
-
-    Ok(([a, b, c], forwards))
+    Ok((verts, forwards_in_input_order))
 }
 
-/// Chamfer-α — emit one planar triangular cap face at a qualifying
-/// corner.
+/// Chamfer-β — verify N cap-loop corner positions are coplanar within
+/// `tol` of the plane defined by the first three.
+///
+/// N ≤ 3 is vacuously coplanar (three points always lie on a plane).
+/// For N ≥ 4 we build a unit normal from `(p1 − p0) × (p2 − p0)` and
+/// project each remaining point's offset from `p0` onto it; the
+/// absolute value of that projection is the signed distance to the
+/// candidate plane.
+///
+/// Returns `false` if the first three points are collinear (zero
+/// cross-product) — that case is geometrically degenerate and
+/// surfaces as a `BlendFailure` at the caller.
+fn cap_vertices_coplanar(positions: &[Point3], tol: f64) -> bool {
+    if positions.len() <= 3 {
+        return true;
+    }
+    let ab = positions[1] - positions[0];
+    let ac = positions[2] - positions[0];
+    let normal = match ab.cross(&ac).normalize() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    for p in &positions[3..] {
+        let offset = *p - positions[0];
+        if offset.dot(&normal).abs() > tol {
+            return false;
+        }
+    }
+    true
+}
+
+/// Chamfer-β — emit one planar N-gon cap face at a qualifying corner.
 ///
 /// Mirrors `apply_apex_sphere_corner` (fillet.rs:2626-2714) with
-/// `Sphere` substituted for `Plane`. The three V-side cap edges
-/// already exist (created per-edge by [`create_chamfer_face`]); this
-/// function:
+/// `Sphere` substituted for `Plane` and the degree-3 special case
+/// generalised to arbitrary N ≥ 3. The N V-side cap edges already
+/// exist (created per-edge by [`create_chamfer_face`]) and are
+/// resolved deterministically by the caller via
+/// `BlendEdgeSurgery::cap_v{0,1}_edge`; this function:
 ///
-/// 1. Locates each via [`find_cap_edge_at_vertex_for_chamfer`].
-/// 2. Verifies they close a triangle and recovers loop-forward flags
-///    via [`verify_cap_edges_form_closed_triangle`].
-/// 3. Builds a `Plane` from the three corner vertex positions.
-/// 4. Orients the plane outward via [`orient_face_for_outward`].
-/// 5. Registers the new face on the outer shell.
-/// 6. Drops the original sharp corner vertex if no edge still
+/// 1. Verifies the supplied cap edges close a polygon and recovers
+///    loop-forward flags via [`verify_cap_edges_form_closed_polygon`].
+/// 2. Verifies all N corner positions are coplanar within tolerance
+///    via [`cap_vertices_coplanar`]; non-coplanar caps surface as
+///    `BlendFailure::VertexBlendUnsupported` (curved-adjacent path,
+///    deferred to Chamfer-γ).
+/// 3. Builds a `Plane` from the first three corner positions.
+/// 4. Orients the plane outward via [`orient_face_for_outward`] and
+///    registers the new face on the outer shell.
+/// 5. Drops the original sharp corner vertex if no edge still
 ///    references it (same defensive scan as F5-α).
 fn apply_planar_chamfer_cap(
     model: &mut BRepModel,
     solid_id: SolidId,
     vertex_id: VertexId,
-    corner_position: Point3,
-    chamfer_face_ids: &[FaceId; 3],
+    cap_edges: &[EdgeId],
     vertex_outward: Vector3,
-    offset_distance: f64,
     tolerance: f64,
 ) -> OperationResult<FaceId> {
-    // Step 1 — locate the three V-side cap edges.
-    let mut cap_edges: [EdgeId; 3] = [0; 3];
-    for (i, &face_id) in chamfer_face_ids.iter().enumerate() {
-        cap_edges[i] = find_cap_edge_at_vertex_for_chamfer(
-            model,
-            face_id,
-            corner_position,
-            offset_distance,
-            tolerance,
-        )
-        .ok_or_else(|| {
-            OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
-                vertex: vertex_id,
-                kind: BlendVertexKind::ConvexCorner { degree: 3 },
-                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
-            }))
-        })?;
-    }
+    let degree = cap_edges.len();
 
-    // Step 2 — verify the cap edges close a triangle and recover the
-    // per-edge loop-forward flag.
+    // Step 1 — verify the cap edges close a polygon and recover the
+    // per-edge loop-forward flag. The caller resolves cap edge ids via
+    // `BlendEdgeSurgery::cap_v{0,1}_edge` so no geometric search is
+    // performed here; mitered (Chamfer-β) and raw-perpendicular
+    // (Chamfer-α) endpoints flow through the same path.
     let (corner_vertices, loop_forwards) =
-        verify_cap_edges_form_closed_triangle(model, &cap_edges)
+        verify_cap_edges_form_closed_polygon(model, cap_edges)
             .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
 
-    // Step 3 — read the three corner vertex positions and build the
-    // plane. Two of `(B - A)` and `(C - A)` span the plane; their cross
-    // product gives an admissible normal (sign resolved by
+    // Step 2 — read the N corner vertex positions in traversal order
+    // and verify coplanarity. The first three positions define the
+    // candidate plane; the remaining N-3 must lie within `tolerance`
+    // of it (vacuous when N == 3).
+    let mut positions: Vec<Point3> = Vec::with_capacity(corner_vertices.len());
+    for &vid in &corner_vertices {
+        let v = model.vertices.get(vid).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("Chamfer cap corner vertex {} missing", vid))
+        })?;
+        positions.push(Point3::new(v.position[0], v.position[1], v.position[2]));
+    }
+    if !cap_vertices_coplanar(&positions, tolerance) {
+        return Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::VertexBlendUnsupported {
+                vertex: vertex_id,
+                kind: BlendVertexKind::ConvexCorner { degree },
+                reason: VertexBlendUnsupportedReason::CurvedAdjacent,
+            },
+        )));
+    }
+
+    // Step 3 — build the plane from the first three corner positions.
+    // `(B - A) × (C - A)` gives an admissible normal (sign resolved by
     // `orient_face_for_outward` below).
-    let p_a = {
-        let v = model.vertices.get(corner_vertices[0]).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!(
-                "Chamfer cap corner vertex {} missing",
-                corner_vertices[0]
-            ))
-        })?;
-        Point3::new(v.position[0], v.position[1], v.position[2])
-    };
-    let p_b = {
-        let v = model.vertices.get(corner_vertices[1]).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!(
-                "Chamfer cap corner vertex {} missing",
-                corner_vertices[1]
-            ))
-        })?;
-        Point3::new(v.position[0], v.position[1], v.position[2])
-    };
-    let p_c = {
-        let v = model.vertices.get(corner_vertices[2]).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!(
-                "Chamfer cap corner vertex {} missing",
-                corner_vertices[2]
-            ))
-        })?;
-        Point3::new(v.position[0], v.position[1], v.position[2])
-    };
+    let p_a = positions[0];
+    let p_b = positions[1];
+    let p_c = positions[2];
 
     let ab = p_b - p_a;
     let ac = p_c - p_a;
@@ -1941,8 +2349,8 @@ fn apply_planar_chamfer_cap(
     let surface_id = model.surfaces.add(Box::new(plane));
 
     let mut cap_loop = Loop::new(0, LoopType::Outer);
-    for i in 0..3 {
-        cap_loop.add_edge(cap_edges[i], loop_forwards[i]);
+    for (i, &cap_edge) in cap_edges.iter().enumerate() {
+        cap_loop.add_edge(cap_edge, loop_forwards[i]);
     }
     let loop_id = model.loops.add(cap_loop);
 
@@ -1962,14 +2370,14 @@ fn apply_planar_chamfer_cap(
 
     // Step 5 — drop the original sharp corner vertex if unreferenced.
     //
-    // Each per-edge `splice_blend_edge` for the three corner edges
-    // left `vertex_id` alive (its `original_v*_corner_shared` flag was
+    // Each per-edge `splice_blend_edge` for the N corner edges left
+    // `vertex_id` alive (its `original_v*_corner_shared` flag was
     // set by `chamfer_edges`). After every chamfer face's trim edges
     // have been spliced in and this cap has been added to the outer
     // shell, no edge in the model should still reference `vertex_id`:
     //
-    // * The three corner edges themselves are removed during their
-    //   own `splice_blend_edge` calls.
+    // * The N corner edges themselves are removed during their own
+    //   `splice_blend_edge` calls.
     // * Each adjacent face's loop now references the V-side cap
     //   endpoints (deduplicated via `VertexStore::add_or_find` in
     //   `create_chamfer_face`). The sharp corner is geometrically
@@ -1989,44 +2397,81 @@ fn apply_planar_chamfer_cap(
     Ok(face_id)
 }
 
-/// Handle vertices where chamfered edges meet — Chamfer-α planar cap
-/// synthesis.
+/// Handle vertices where chamfered edges meet — Chamfer-β planar
+/// N-gon cap synthesis.
 ///
 /// Iterates the `corner_set` built pre-surgery by
-/// [`identify_chamfer_corners`] and emits one planar triangular face
-/// per admissible corner via [`apply_planar_chamfer_cap`]. Non-α
-/// corners (degree ≠ 3, non-planar adjacent, non-convex, non-uniform
-/// offset) never enter the set — those branches landed in later
-/// slices (Chamfer-β / γ / δ / β.5).
+/// [`identify_chamfer_corners`] and emits one planar N-gon cap face
+/// per admissible corner via [`apply_planar_chamfer_cap`]. The
+/// degree-3 case (Chamfer-α, triangular cap) and the degree-≥4 case
+/// (Chamfer-β, N-gon cap) flow through the same path; only the cap
+/// loop length differs. Non-admissible corners (degree < 3,
+/// non-planar adjacent, non-convex, non-uniform offset,
+/// non-coplanar cap vertices) never enter the set — those branches
+/// land in later slices (Chamfer-β.2 / β.5 / γ / δ).
 fn handle_chamfer_vertices(
     model: &mut BRepModel,
     solid_id: SolidId,
     corner_set: &ChamferCornerSet,
-    chamfer_faces: &[FaceId],
-    options: &ChamferOptions,
+    selected_edges: &[EdgeId],
+    surgeries: &[BlendEdgeSurgery],
 ) -> OperationResult<Vec<FaceId>> {
     let mut cap_faces: Vec<FaceId> = Vec::new();
     if corner_set.corners.is_empty() {
         return Ok(cap_faces);
     }
 
-    let offset_distance = options.distance1;
     let tolerance = Tolerance::default().distance();
 
     for corner in &corner_set.corners {
-        let chamfer_face_ids: [FaceId; 3] = [
-            chamfer_faces[corner.edge_indices[0]],
-            chamfer_faces[corner.edge_indices[1]],
-            chamfer_faces[corner.edge_indices[2]],
-        ];
+        let degree = corner.edge_indices.len();
+        // Resolve the N V-side cap edges by surgery lookup rather than
+        // by geometric proximity search. Each chamfered edge produced a
+        // `BlendEdgeSurgery` carrying both V0 and V1 cap edge ids; the
+        // one we want at this corner is `cap_v0_edge` if the corner
+        // vertex matches `surgery.original_v0`, else `cap_v1_edge`.
+        // The proximity-based fallback was retired because mitered
+        // cap endpoints (Chamfer-β) sit at distance `d / sin(θ/2)`
+        // from V — substantially larger than the legacy `d·√2` search
+        // bound for sharp corners. The surgery already stores the
+        // exact `EdgeId` so no geometric search is required.
+        let mut cap_edges_at_vertex: Vec<EdgeId> = Vec::with_capacity(degree);
+        for &ei in &corner.edge_indices {
+            let eid = selected_edges[ei];
+            let surgery =
+                surgeries
+                    .iter()
+                    .find(|s| s.original_edge == eid)
+                    .ok_or_else(|| {
+                        OperationError::BlendFailed(Box::new(
+                            BlendFailure::VertexBlendUnsupported {
+                                vertex: corner.vertex_id,
+                                kind: BlendVertexKind::ConvexCorner { degree },
+                                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                            },
+                        ))
+                    })?;
+            let cap_edge = if surgery.original_v0 == corner.vertex_id {
+                surgery.cap_v0_edge
+            } else if surgery.original_v1 == corner.vertex_id {
+                surgery.cap_v1_edge
+            } else {
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::VertexBlendUnsupported {
+                        vertex: corner.vertex_id,
+                        kind: BlendVertexKind::ConvexCorner { degree },
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    },
+                )));
+            };
+            cap_edges_at_vertex.push(cap_edge);
+        }
         let cap_face_id = apply_planar_chamfer_cap(
             model,
             solid_id,
             corner.vertex_id,
-            corner.position,
-            &chamfer_face_ids,
+            &cap_edges_at_vertex,
             corner.outward,
-            offset_distance,
             tolerance,
         )?;
         cap_faces.push(cap_face_id);

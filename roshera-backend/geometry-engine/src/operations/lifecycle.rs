@@ -50,6 +50,19 @@ use crate::primitives::snapshot::ModelSnapshot;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 
+/// Which blend operation is invoking the shared corner-compatibility
+/// pre-flight. Distinguishes the two callers so the gate can open the
+/// degree>=4 ConvexCorner hole for chamfer (Chamfer-β planar n-gon cap
+/// is the corner-patch synthesis at that degree) while keeping it shut
+/// for fillet (no degree>=4 equal-radius corner sphere yet — F5-γ).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendOpKind {
+    /// Caller is `fillet_edges`.
+    Fillet,
+    /// Caller is `chamfer_edges`.
+    Chamfer,
+}
+
 /// What an operation is about to do, in just enough detail to run a
 /// cheap pre-flight check.
 ///
@@ -128,12 +141,12 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // F2-γ.1: setback-aware corner compatibility. Replaces
             // the historical `validate_no_shared_corners` blanket
             // reject with a specific-reason failure mode.
-            validate_corner_compatibility(model, edges)
+            validate_corner_compatibility(model, edges, BlendOpKind::Fillet)
         }
         OpSpec::ChamferEdges { solid_id, edges } => {
             check_solid_exists(model, solid_id)?;
             check_edges_exist(model, edges)?;
-            validate_corner_compatibility(model, edges)
+            validate_corner_compatibility(model, edges, BlendOpKind::Chamfer)
         }
         OpSpec::Boolean { solid_a, solid_b } => {
             check_solid_exists(model, solid_a)?;
@@ -301,6 +314,7 @@ fn check_edges_exist(model: &BRepModel, edges: &[EdgeId]) -> OperationResult<()>
 fn validate_corner_compatibility(
     model: &BRepModel,
     edges: &[EdgeId],
+    op_kind: BlendOpKind,
 ) -> OperationResult<()> {
     if edges.len() < 2 {
         return Ok(());
@@ -385,10 +399,25 @@ fn validate_corner_compatibility(
     // surfaces inside the transitions dispatcher, where a non-
     // concurrent (skewed / non-rectilinear) input surfaces as a typed
     // `BlendFailure::VertexBlendUnsupported`. Higher-degree convex
-    // corners (F5-γ) and concave / mixed corners (F5-δ) continue to
-    // be rejected through the existing arms below.
-    if let Some(BlendVertexKind::ConvexCorner { degree: 3 }) = vertex_kind {
-        return Ok(());
+    // corners on the fillet path (F5-γ) and concave / mixed corners
+    // (F5-δ) continue to be rejected through the existing arms below.
+    //
+    // Chamfer-β (Task #82 successor): degree-3 *and* degree>=4 convex
+    // corners are handled by `chamfer::try_build_planar_corner_cap`,
+    // which emits an n-gon planar cap when the corner vertices land
+    // within tolerance of a single plane. Topologies that the planar
+    // cap cannot synthesise (non-coplanar / curved-adjacent) surface
+    // as `BlendFailure::VertexBlendUnsupported { reason:
+    // CurvedAdjacent, .. }` from inside the cap builder — that's the
+    // correct rejection layer, not this pre-flight.
+    match (op_kind, vertex_kind) {
+        (_, Some(BlendVertexKind::ConvexCorner { degree: 3 })) => return Ok(()),
+        (BlendOpKind::Chamfer, Some(BlendVertexKind::ConvexCorner { degree }))
+            if degree >= 4 =>
+        {
+            return Ok(());
+        }
+        _ => {}
     }
 
     match blend_graph::compute_setbacks(&probe_model, &mut graph) {
