@@ -2196,7 +2196,7 @@ fn classify_blend_for_edge(
 /// Returns `None` if the face is missing, its outer loop is missing,
 /// no edge of the loop carries an `Arc`, or no Arc centre is within
 /// tolerance of `sphere_center`.
-fn find_cap_arc_edge_at_vertex(
+pub(crate) fn find_cap_arc_edge_at_vertex(
     model: &BRepModel,
     fillet_face_id: FaceId,
     sphere_center: Point3,
@@ -2471,7 +2471,7 @@ fn intersect_two_caps(
 /// `forwards[i]` is the flag for `cap_arc_edges[i]` in the input
 /// order — the caller adds edges to the new sphere-face loop in that
 /// same order.
-fn verify_cap_arcs_form_closed_triangle(
+pub(crate) fn verify_cap_arcs_form_closed_triangle(
     model: &BRepModel,
     cap_arc_edges: &[EdgeId; 3],
 ) -> Result<([VertexId; 3], [bool; 3]), BlendFailure> {
