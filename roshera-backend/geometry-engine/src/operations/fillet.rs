@@ -579,6 +579,26 @@ pub fn fillet_edges(
         // this event instead of jumping past it back to the primitive. The
         // generated fillet faces follow so the recorded op still names the
         // topology it introduced.
+        //
+        // CF-β.4 — snapshot the post-call `pending_mixed_kind_corners`
+        // set into the event payload. Timeline replay reconstructs the
+        // intermediate-state expectation from this so the
+        // `validate_result` gate at the replayed call's boundary
+        // applies the same carve-out. Sorted for stable serialisation.
+        let pending_after_call: Vec<u64> = {
+            let mut v: Vec<u64> = model
+                .solids
+                .get(solid_id)
+                .map(|s| {
+                    s.pending_mixed_kind_corners()
+                        .iter()
+                        .map(|&vid| vid as u64)
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort_unstable();
+            v
+        };
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("fillet_edges")
                 .with_parameters(serde_json::json!({
@@ -588,6 +608,7 @@ pub fn fillet_edges(
                     "propagation": format!("{:?}", options.propagation),
                     "preserve_edges": options.preserve_edges,
                     "quality": format!("{:?}", options.quality),
+                    "pending_mixed_kind_corners": pending_after_call,
                 }))
                 .with_input_solids([solid_id as u64])
                 .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
