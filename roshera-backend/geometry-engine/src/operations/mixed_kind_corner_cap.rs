@@ -77,6 +77,7 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::VertexId,
 };
+use std::collections::HashSet;
 
 /// Underlying curve shape of a single cap-loop edge.
 ///
@@ -384,6 +385,83 @@ fn existing_kind_set_or_default(
 /// `validate_mixed_kind_corner_feasibility`).
 fn corner_kind_for_degree(degree: usize) -> super::blend_graph::BlendVertexKind {
     super::blend_graph::BlendVertexKind::ConvexCorner { degree }
+}
+
+/// CF-β.3.4 — locate the cap-rim edges of `kind` incident at
+/// `vertex_id` on `solid_id`.
+///
+/// Walks every face registered under `kind` in `solid.blend_faces_by_kind`
+/// (the per-solid CF-β.3.1 side-registry), inspects each face's outer
+/// loop, and returns every edge that (a) terminates at `vertex_id` and
+/// (b) carries the rim curve primitive matching `kind`'s `RimKind`
+/// projection (chamfer → `Line`, fillet → `Arc`). The result is
+/// de-duplicated because a single edge can be shared between two
+/// adjacent kind-tagged faces (e.g. two abutting chamfer faces share
+/// the "third-face cap" edge across their common boundary).
+///
+/// Returned order is unspecified — the dispatch sites stitch this list
+/// into the heterogeneous cap loop alongside the current call's own
+/// rim edges and pass the union to [`synthesize_mixed_kind_corner_cap`],
+/// which delegates ordering to [`verify_mixed_cap_loop`]'s endpoint
+/// chain walker. So the caller-side ordering does not need to be
+/// cyclic.
+pub(crate) fn find_blend_cap_edges_at_vertex(
+    model: &BRepModel,
+    solid_id: SolidId,
+    vertex_id: VertexId,
+    kind: BlendKind,
+) -> Vec<EdgeId> {
+    let mut out: HashSet<EdgeId> = HashSet::new();
+
+    // Snapshot the face-id list of the requested kind before we walk
+    // their loops — keeps the borrow checker happy (no live `&Solid`
+    // borrow held across the per-face lookups below) and avoids
+    // re-querying `blend_kind_at_face` for every face in the model.
+    let kinded_face_ids: Vec<FaceId> = {
+        let Some(solid) = model.solids.get(solid_id) else {
+            return Vec::new();
+        };
+        model
+            .faces
+            .iter()
+            .filter_map(|(fid, _)| {
+                if solid.blend_kind_at_face(fid) == Some(kind) {
+                    Some(fid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    for fid in kinded_face_ids {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(outer) = model.loops.get(face.outer_loop) else {
+            continue;
+        };
+        for &eid in &outer.edges {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            if edge.start_vertex != vertex_id && edge.end_vertex != vertex_id {
+                continue;
+            }
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let matches_rim = match kind {
+                BlendKind::Chamfer => curve.as_any().downcast_ref::<Line>().is_some(),
+                BlendKind::Fillet => curve.as_any().downcast_ref::<Arc>().is_some(),
+            };
+            if matches_rim {
+                out.insert(eid);
+            }
+        }
+    }
+
+    out.into_iter().collect()
 }
 
 #[cfg(test)]

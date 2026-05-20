@@ -2508,14 +2508,58 @@ fn handle_chamfer_vertices(
             };
             cap_edges_at_vertex.push(cap_edge);
         }
-        let cap_face_id = apply_planar_chamfer_cap(
-            model,
-            solid_id,
-            corner.vertex_id,
-            &cap_edges_at_vertex,
-            corner.outward,
-            tolerance,
-        )?;
+        // CF-β.3.4 — mixed-kind dispatch. If `corner.vertex_id`
+        // already carries a recorded *fillet* blend on this solid
+        // (chamfer-second ordering), the corner's boundary is the
+        // heterogeneous loop chamfer-linear-rims ∪ fillet-arc-rims.
+        // Route to the eager-cap synthesizer instead of the chamfer-
+        // only planar N-gon path so a single mixed cap closes both
+        // sides. Same-kind corners (the typical chamfer-only path)
+        // fall through to `apply_planar_chamfer_cap` unchanged.
+        let has_prior_fillet = model
+            .solids
+            .get(solid_id)
+            .and_then(|s| s.vertex_blend_set(corner.vertex_id))
+            .map(|set| set.contains(BlendKind::Fillet))
+            .unwrap_or(false);
+
+        let cap_face_id = if has_prior_fillet {
+            let fillet_rim_arcs = super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
+                model,
+                solid_id,
+                corner.vertex_id,
+                BlendKind::Fillet,
+            );
+            let mut cap_edges_with_kind: Vec<(
+                EdgeId,
+                super::mixed_kind_corner_cap::RimKind,
+            )> = cap_edges_at_vertex
+                .iter()
+                .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::LinearRim))
+                .collect();
+            for arc_eid in &fillet_rim_arcs {
+                cap_edges_with_kind
+                    .push((*arc_eid, super::mixed_kind_corner_cap::RimKind::ArcRim));
+            }
+            super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                model,
+                solid_id,
+                corner.vertex_id,
+                &cap_edges_with_kind,
+                corner.outward,
+                tolerance,
+                BlendKind::Chamfer,
+            )?
+        } else {
+            apply_planar_chamfer_cap(
+                model,
+                solid_id,
+                corner.vertex_id,
+                &cap_edges_at_vertex,
+                corner.outward,
+                tolerance,
+            )?
+        };
         cap_faces.push(cap_face_id);
     }
     Ok(cap_faces)
