@@ -50,6 +50,7 @@ use crate::primitives::face::FaceId;
 use crate::primitives::snapshot::ModelSnapshot;
 use crate::primitives::solid::{BlendKind, SolidId};
 use crate::primitives::topology_builder::BRepModel;
+use crate::primitives::vertex::VertexId;
 
 /// Which blend operation is invoking the shared corner-compatibility
 /// pre-flight. Distinguishes the two callers so the gate can open the
@@ -290,32 +291,30 @@ fn check_edges_exist(model: &BRepModel, edges: &[EdgeId]) -> OperationResult<()>
     Ok(())
 }
 
-/// CF-α — pre-flight gate that rejects a blend request when it would
-/// clash with a blend already recorded on the host [`Solid`].
+/// CF-α / CF-β — pre-flight gate that decides whether a blend request
+/// clashes with state already recorded on the host [`Solid`].
 ///
-/// Two failure cases share the single
-/// [`BlendFailure::ConflictingBlendKind`] payload:
+/// Three outcomes:
 ///
-/// 1. **Same-edge re-blend.** The caller passed an `EdgeId` that the
-///    solid's `blended_edges` registry recognises. In practice the
-///    edge is *gone* (destroyed by `splice_blend_edge`), so without
-///    this gate the caller would get the legacy
-///    `"edge {} not found in model"` `InvalidInput` from
-///    [`check_edges_exist`]. CF-α replaces that with a typed signal
-///    carrying both the existing and requested kinds so an agent can
-///    branch on remediation.
+/// 1. **Same-edge re-blend** (any kind): hard reject with
+///    [`BlendFailure::ConflictingBlendKind`]. The edge is gone
+///    (destroyed by `splice_blend_edge`) so without this gate the
+///    caller would get the legacy `"edge {} not found in model"`
+///    `InvalidInput` from [`check_edges_exist`]. Same-edge same-kind
+///    is also a conflict (the edge doesn't exist for a retry); both
+///    sub-cases share one variant.
 ///
-/// 2. **Shared-vertex cross-kind.** The requested edge still exists,
-///    but at least one of its endpoint vertices was previously
-///    consumed by a blend of the *opposite* kind (recorded in
-///    `blended_vertices`). The kernel doesn't yet synthesize a
-///    mixed-kind corner (fillet setback fan stitched to a chamfer
-///    cap — that's CF-β), so we surface the conflict pre-flight.
+/// 2. **Shared-vertex same-kind**: clear — this is the F5-α / Chamfer-α
+///    multi-edge corner path. Same-kind multi-blend at a corner is
+///    handled downstream by `validate_corner_compatibility`.
 ///
-/// `requested_kind == existing_kind` at a shared vertex is **not** a
-/// conflict — same-kind multi-blend at a corner is the F5-α /
-/// Chamfer-α/β path and is exercised by the existing corner
-/// compatibility check downstream.
+/// 3. **Shared-vertex cross-kind** (CF-β): delegate to
+///    [`validate_mixed_kind_corner_feasibility`]. β.2 returns a typed
+///    `MixedKindUnsupported { detail: DegreeUnsupported { degree: 3 } }`
+///    for every mixed case (interim "not yet implemented" surface);
+///    β.3 flips the degree-3 equal-displacement case to `Ok(())` and
+///    the dispatcher in `fillet_edges` / `chamfer_edges` routes it
+///    into `synthesize_mixed_kind_corner_cap`.
 fn validate_blend_conflict(
     model: &BRepModel,
     solid_id: SolidId,
@@ -330,7 +329,7 @@ fn validate_blend_conflict(
     };
 
     for &eid in edges {
-        // Case 1: same edge has already been blended.
+        // Case 1: same edge has already been blended (any kind).
         if let Some(existing_kind) = solid.blend_kind_at_edge(eid) {
             return Err(OperationError::from(BlendFailure::ConflictingBlendKind {
                 edge: eid,
@@ -339,42 +338,87 @@ fn validate_blend_conflict(
             }));
         }
 
-        // Case 2: a corner of this edge survives from a previous
-        // opposite-kind blend. Only inspect endpoints when the edge
-        // resolves — a missing edge will be caught (with a legacy
-        // shape) by `check_edges_exist` immediately after this gate,
-        // and we don't want to mask a missing-edge bug with a
-        // shared-vertex one.
+        // Cases 2 + 3: inspect the surviving corner vertices. Only
+        // inspect endpoints when the edge resolves — a missing edge
+        // is caught (with a legacy shape) by `check_edges_exist`
+        // immediately after this gate, and we don't want to mask a
+        // missing-edge bug with a shared-vertex one.
         let Some(edge) = model.edges.get(eid) else {
             continue;
         };
         for &vid in &[edge.start_vertex, edge.end_vertex] {
-            // CF-β.1 uses `blend_kind_at_vertex_single` so the gate
-            // continues to model the CF-α contract: it reads exactly
-            // one kind when the corner has been touched by one kind,
-            // and `None` when either nothing has touched it *or* both
-            // kinds have already touched it. The mixed-kind branch is
-            // handled by `vertex_blend_set` in CF-β.2's gate rewrite;
-            // until that lands, an already-mixed corner short-circuits
-            // through `None` here, which is intentionally permissive —
-            // CF-α never produced a mixed entry, so the only way to
-            // reach `is_mixed()` today is to bypass the gate entirely
-            // (impossible from supported call paths).
-            if let Some(existing_kind) = solid.blend_kind_at_vertex_single(vid) {
-                if existing_kind != requested_kind {
-                    return Err(OperationError::from(
-                        BlendFailure::ConflictingBlendKind {
-                            edge: eid,
-                            existing_kind,
-                            requested_kind,
-                        },
-                    ));
-                }
+            let Some(existing_set) = solid.vertex_blend_set(vid) else {
+                continue; // vertex never blended
+            };
+            if existing_set.contains(requested_kind) {
+                // Case 2: same-kind reuse at a shared corner. Clear.
+                continue;
             }
+            // Case 3: cross-kind at a shared corner. Delegate to the
+            // CF-β feasibility pre-flight, which returns Ok(()) when
+            // the mixed-kind cap synthesizer can handle this corner
+            // and a typed `MixedKindUnsupported` otherwise.
+            validate_mixed_kind_corner_feasibility(
+                model,
+                solid_id,
+                vid,
+                eid,
+                existing_set,
+                requested_kind,
+            )?;
         }
     }
 
     Ok(())
+}
+
+/// CF-β — decide whether the mixed-kind cap synthesizer can stitch the
+/// corner at `vertex` once the current call adds `requested_kind` on
+/// top of the previously-recorded `existing` set.
+///
+/// β.2 ships the *typed-reject surface* before any geometry. The
+/// implementation currently returns
+/// `MixedKindUnsupported { detail: DegreeUnsupported { degree } }` for
+/// every mixed-kind corner, where `degree` is the number of incident
+/// edges at the vertex (so the payload is informative even though the
+/// kernel rejects). β.3 will replace this body with the real
+/// dispatch: degree-3 convex equal-displacement → `Ok(())`, every
+/// other sub-case → a *specific* `MixedKindRejectDetail`.
+///
+/// Production-grade: the function never panics, threads every Option
+/// through `?`, and emits an actionable typed payload on every reject.
+fn validate_mixed_kind_corner_feasibility(
+    model: &BRepModel,
+    _solid_id: SolidId,
+    vertex: VertexId,
+    _trigger_edge: EdgeId,
+    existing: crate::primitives::solid::VertexBlendKindSet,
+    requested: BlendKind,
+) -> OperationResult<()> {
+    // Count incident edges at the vertex (used as `degree` payload).
+    // We walk the model's edge store rather than rely on a vertex
+    // adjacency cache because the gate runs pre-flight: the topology
+    // may have just been mutated by `splice_blend_edge` upstream and
+    // any cache would risk staleness.
+    let mut degree: usize = 0;
+    for (_id, edge) in model.edges.iter() {
+        if edge.start_vertex == vertex || edge.end_vertex == vertex {
+            degree += 1;
+        }
+    }
+    Err(OperationError::from(
+        BlendFailure::VertexBlendUnsupported {
+            vertex,
+            kind: crate::operations::blend_graph::BlendVertexKind::ConvexCorner { degree },
+            reason: crate::operations::diagnostics::VertexBlendUnsupportedReason::MixedKindUnsupported {
+                existing,
+                requested,
+                detail: crate::operations::diagnostics::MixedKindRejectDetail::DegreeUnsupported {
+                    degree,
+                },
+            },
+        },
+    ))
 }
 
 /// F2-γ.1: setback-aware multi-edge corner compatibility check.
@@ -848,12 +892,14 @@ mod tests {
             .expect("at least one edge incident to vertex")
     }
 
-    /// Cross-kind at a shared corner — chamfer recorded at vertex,
-    /// fillet requested on an edge incident to that vertex — must
-    /// surface as `BlendFailure::ConflictingBlendKind` carrying the
-    /// existing (chamfer) and requested (fillet) kinds.
+    /// CF-β.2 — cross-kind at a shared corner is delegated to
+    /// `validate_mixed_kind_corner_feasibility`, which (in β.2) emits
+    /// a typed `MixedKindUnsupported { detail: DegreeUnsupported{..} }`
+    /// for every mixed case. β.3 will flip the degree-3 equal-
+    /// displacement convex case to `Ok(())`; until then, the typed
+    /// not-yet-supported surface is the contract.
     #[test]
-    fn validate_blend_conflict_rejects_cross_kind_at_shared_vertex() {
+    fn validate_blend_conflict_routes_cross_kind_shared_vertex_to_mixed_kind_unsupported() {
         let mut model = build_unit_box();
         let solid_id: SolidId = model
             .solids
@@ -881,7 +927,7 @@ mod tests {
                 edges: &[edge],
             },
         )
-        .expect_err("cross-kind at shared corner must be rejected");
+        .expect_err("cross-kind at shared corner must be rejected (β.2 stub)");
 
         match err {
             OperationError::InvalidInput {
@@ -891,23 +937,33 @@ mod tests {
             } => {
                 assert_eq!(parameter, "blend");
                 assert!(
-                    received.contains(&format!("edge {}", edge)),
-                    "received must name the conflicting edge id; got: {}",
+                    received.contains(&format!("vertex {}", corner_vertex)),
+                    "received must name the offending vertex id; got: {}",
                     received
                 );
                 assert!(
-                    received.contains("existing kind chamfer"),
-                    "received must name the existing kind 'chamfer'; got: {}",
+                    received.contains("mixed-kind corner"),
+                    "received must carry the MixedKindUnsupported wording; got: {}",
                     received
                 );
                 assert!(
-                    received.contains("a fillet"),
-                    "received must name the requested kind 'fillet'; got: {}",
+                    received.contains("existing {chamfer}"),
+                    "received must echo the existing kind set; got: {}",
+                    received
+                );
+                assert!(
+                    received.contains("requested fillet"),
+                    "received must name the requested kind; got: {}",
+                    received
+                );
+                assert!(
+                    received.contains("degree"),
+                    "β.2 stub must carry the DegreeUnsupported detail; got: {}",
                     received
                 );
             }
             other => panic!(
-                "expected InvalidInput carrying ConflictingBlendKind, got {:?}",
+                "expected InvalidInput carrying MixedKindUnsupported, got {:?}",
                 other
             ),
         }
@@ -986,5 +1042,199 @@ mod tests {
             "end-vertex conflict must surface as InvalidInput; got {:?}",
             result
         );
+    }
+
+    // -----------------------------------------------------------------
+    // CF-β.2 — gate relaxation + typed-reject pre-flight tests.
+    // -----------------------------------------------------------------
+
+    /// CF-β.2 sends every cross-kind shared-vertex case through
+    /// `validate_mixed_kind_corner_feasibility`. The pre-flight is
+    /// *typed*: the payload variant must be `VertexBlendUnsupported`
+    /// with reason `MixedKindUnsupported`, not the legacy CF-α
+    /// `ConflictingBlendKind` shape. β.3 will flip the degree-3
+    /// equal-displacement convex case to Ok; this test pins the β.2
+    /// contract — *delegation* — independent of which sub-cases the
+    /// feasibility pre-flight currently accepts.
+    #[test]
+    fn validate_blend_conflict_routes_mixed_vertex_to_feasibility_pre_flight() {
+        use crate::operations::diagnostics::{
+            BlendFailure, MixedKindRejectDetail, VertexBlendUnsupportedReason,
+        };
+
+        let mut model = build_unit_box();
+        let solid_id: SolidId = model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box solid");
+        let corner_vertex = model
+            .vertices
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has vertices");
+        let edge = edge_incident_to(&model, corner_vertex);
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.record_blended_vertex(corner_vertex, BlendKind::Fillet);
+        }
+
+        // Drive the BlendFailed-typed surface directly so we can
+        // pattern-match the variant — `OperationError::from` collapses
+        // to `InvalidInput`, but the kernel also retains the typed
+        // `BlendFailed(Box<BlendFailure>)` variant which the api-
+        // server layer prefers. We reconstruct the failure by
+        // round-tripping through `BlendFailure::VertexBlendUnsupported`.
+        let err = validate_blend_conflict(
+            &model,
+            solid_id,
+            &[edge],
+            BlendKind::Chamfer,
+        )
+        .expect_err("cross-kind must reject");
+        let received = match err {
+            OperationError::InvalidInput { received, .. } => received,
+            other => panic!("expected InvalidInput, got {:?}", other),
+        };
+
+        // Reconstruct the expected wording via a parallel
+        // construction; pinning the string keeps the contract stable.
+        let expected = BlendFailure::VertexBlendUnsupported {
+            vertex: corner_vertex,
+            kind: crate::operations::blend_graph::BlendVertexKind::ConvexCorner {
+                degree: model
+                    .edges
+                    .iter()
+                    .filter(|(_, e)| {
+                        e.start_vertex == corner_vertex || e.end_vertex == corner_vertex
+                    })
+                    .count(),
+            },
+            reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
+                existing: crate::primitives::solid::VertexBlendKindSet::single(
+                    BlendKind::Fillet,
+                ),
+                requested: BlendKind::Chamfer,
+                detail: MixedKindRejectDetail::DegreeUnsupported {
+                    degree: model
+                        .edges
+                        .iter()
+                        .filter(|(_, e)| {
+                            e.start_vertex == corner_vertex
+                                || e.end_vertex == corner_vertex
+                        })
+                        .count(),
+                },
+            },
+        }
+        .to_string();
+        assert_eq!(received, expected);
+    }
+
+    /// CF-α's same-edge contract is unchanged by β.2 — the same-edge
+    /// arm runs *before* the vertex arm and always emits
+    /// `ConflictingBlendKind`. Pin this so a future refactor doesn't
+    /// accidentally route same-edge through the mixed-kind pre-flight.
+    #[test]
+    fn validate_blend_conflict_still_rejects_same_edge_cross_kind() {
+        let mut model = build_unit_box();
+        let solid_id: SolidId = model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box solid");
+        let edge_id = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has edges");
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.record_blended_edge(edge_id, BlendKind::Chamfer);
+        }
+        let err =
+            validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Fillet)
+                .expect_err("same-edge cross-kind must still reject");
+        match err {
+            OperationError::InvalidInput { received, .. } => {
+                // Same-edge keeps the CF-α wording verbatim — "existing
+                // kind chamfer cannot accept a fillet on the same
+                // edge or shared corner" — distinct from the β.2
+                // shared-vertex "mixed-kind corner" wording.
+                assert!(
+                    received.contains("existing kind chamfer"),
+                    "same-edge arm must keep CF-α wording; got: {}",
+                    received
+                );
+                assert!(
+                    !received.contains("mixed-kind corner"),
+                    "same-edge arm must NOT route through MixedKindUnsupported; got: {}",
+                    received
+                );
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    /// `validate_mixed_kind_corner_feasibility` is the β.2 stub that
+    /// always rejects with a typed `MixedKindUnsupported{detail:
+    /// DegreeUnsupported{degree}}`. β.3 will flip degree-3 equal-d
+    /// to Ok; this test pins β.2's interim contract and the degree
+    /// reporting (the pre-flight walks the edge store to count
+    /// incident edges, threading the actual `degree` payload).
+    #[test]
+    fn validate_mixed_kind_corner_feasibility_emits_typed_degree_unsupported_for_now() {
+        let mut model = build_unit_box();
+        let solid_id: SolidId = model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box solid");
+        // Pick a box corner vertex (degree 3).
+        let corner_vertex = model
+            .vertices
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("box has vertices");
+        let degree_at_corner = model
+            .edges
+            .iter()
+            .filter(|(_, e)| {
+                e.start_vertex == corner_vertex || e.end_vertex == corner_vertex
+            })
+            .count();
+        assert_eq!(
+            degree_at_corner, 3,
+            "box corner is degree 3 by construction"
+        );
+        let trigger_edge = edge_incident_to(&model, corner_vertex);
+        let existing =
+            crate::primitives::solid::VertexBlendKindSet::single(BlendKind::Chamfer);
+
+        let err = validate_mixed_kind_corner_feasibility(
+            &model,
+            solid_id,
+            corner_vertex,
+            trigger_edge,
+            existing,
+            BlendKind::Fillet,
+        )
+        .expect_err("β.2 stub must reject every mixed-kind case");
+        match err {
+            OperationError::InvalidInput { received, .. } => {
+                assert!(received.contains("mixed-kind corner"));
+                assert!(received.contains(&format!("vertex {}", corner_vertex)));
+                assert!(
+                    received.contains(&format!("degree {}", degree_at_corner)),
+                    "stub must carry the actual incident-edge degree; got: {}",
+                    received
+                );
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
     }
 }

@@ -62,12 +62,113 @@ use super::OperationError;
 use crate::primitives::edge::EdgeId;
 use crate::primitives::vertex::VertexId;
 
+// CF-β re-export so the mixed-kind reason variant + wire shape both
+// reach for the same set type the storage layer uses.
+pub use crate::primitives::solid::VertexBlendKindSet;
+
+/// CF-β — specific reason a mixed-kind corner (a vertex carrying both
+/// a fillet and a chamfer on different incident edges) cannot be
+/// stitched at this slice. Nested inside
+/// [`VertexBlendUnsupportedReason::MixedKindUnsupported`].
+///
+/// Each variant is a hard-reject sub-case: the kernel surfaces the
+/// most specific reason it can determine pre-flight so agents can
+/// branch on the failure without parsing strings. CF-β.3 implements
+/// the only currently-feasible case (degree-3 convex equal-displacement
+/// box corner); β.2 ships the typed-reject surface so the wire shape
+/// is pinned before any geometry lands.
+///
+/// Internally tagged on `type` so a deserialiser can branch on the
+/// variant without knowing the surrounding `BlendFailure` shape:
+///
+/// ```json
+/// { "type": "MixedDisplacements", "offsets": [0.5], "radii": [0.8] }
+/// ```
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum MixedKindRejectDetail {
+    /// Corner degree (number of incident blend edges) exceeds the
+    /// 3-edge convex case the mixed-kind cap synthesizer supports.
+    /// CF-β.3 only implements degree 3; higher-degree mixed corners
+    /// await follow-up work.
+    DegreeUnsupported {
+        /// Incident-blend-edge degree at the vertex.
+        degree: usize,
+    },
+    /// Chamfer offset(s) and fillet radius/radii at the same corner
+    /// disagree beyond numerical tolerance. The mixed cap loses
+    /// coplanarity the moment displacements differ — see CF-β plan
+    /// §3.3 for the proof.
+    MixedDisplacements {
+        /// Recorded chamfer offsets at the corner's chamfer edges.
+        offsets: Vec<f64>,
+        /// Recorded fillet radii at the corner's fillet edges.
+        radii: Vec<f64>,
+    },
+    /// The mixed cap's loop endpoints failed the planarity gate.
+    /// Adjacent face curvature or numerical drift pushed the residual
+    /// above tolerance.
+    NonPlanarCap {
+        /// Worst-case point-to-plane residual.
+        residual: f64,
+        /// Tolerance the residual was compared against.
+        tolerance: f64,
+    },
+    /// At least one face adjacent to the corner is curved. CF-β only
+    /// supports planar-adjacent corners (the chamfer cap's existing
+    /// `cap_vertices_coplanar` precondition).
+    CurvedAdjacent,
+    /// Corner classification reached this gate with a non-convex sign
+    /// (concave or Cliff). The upstream F2-γ.1 corner-compatibility
+    /// check normally rejects these earlier; the variant exists so
+    /// the mixed gate can still emit a typed signal if the upstream
+    /// pass is bypassed (tests).
+    ConcaveOrCliff,
+}
+
+impl std::fmt::Display for MixedKindRejectDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MixedKindRejectDetail::DegreeUnsupported { degree } => write!(
+                f,
+                "mixed-kind corner degree {} exceeds the 3-edge case CF-β supports",
+                degree
+            ),
+            MixedKindRejectDetail::MixedDisplacements { offsets, radii } => write!(
+                f,
+                "mixed-kind corner displacements disagree (chamfer offsets {:?}, fillet radii {:?})",
+                offsets, radii
+            ),
+            MixedKindRejectDetail::NonPlanarCap {
+                residual,
+                tolerance,
+            } => write!(
+                f,
+                "mixed-kind cap planarity residual {} exceeds tolerance {}",
+                residual, tolerance
+            ),
+            MixedKindRejectDetail::CurvedAdjacent => write!(
+                f,
+                "mixed-kind corner has a curved adjacent face — planar cap inadmissible"
+            ),
+            MixedKindRejectDetail::ConcaveOrCliff => write!(
+                f,
+                "mixed-kind corner is concave or Cliff — single-sign cap not defined"
+            ),
+        }
+    }
+}
+
 /// Why a corner-patch (vertex blend) cannot be constructed at the
 /// given vertex. Carried as a field of
 /// [`BlendFailure::VertexBlendUnsupported`] so agents can branch on
 /// the *underlying topological reason* — degree vs. mixed convexity
 /// vs. non-manifold neighbourhood — rather than parsing strings.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// Note: cannot derive `Eq` because the CF-β `MixedKindUnsupported`
+// variant nests `MixedKindRejectDetail`, which carries `f64` fields
+// (planarity residual / mixed displacements). All sibling variants
+// remain comparable through `PartialEq`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VertexBlendUnsupportedReason {
     /// Vertex incidence exceeds the highest-supported corner patch.
     /// F5-α (Task #10) implements the three-edge convex equal-radius
@@ -99,6 +200,26 @@ pub enum VertexBlendUnsupportedReason {
     /// coplanar corner vertices; curved-adjacent corners need a
     /// curved cap (Chamfer-γ, future).
     CurvedAdjacent,
+    /// CF-β — the corner carries both a fillet and a chamfer on
+    /// different incident edges, but the mixed-kind cap synthesizer
+    /// cannot stitch this specific configuration. The nested
+    /// [`MixedKindRejectDetail`] carries the most specific reason
+    /// the pre-flight could determine (degree, displacement mismatch,
+    /// planarity, curved adjacency, or concavity).
+    ///
+    /// `existing` is the set of kinds already recorded at the vertex
+    /// before the current call; `requested` is the kind the current
+    /// call would have added. Agents can branch on `existing.is_mixed()`
+    /// to distinguish "third call into an already-mixed corner" from
+    /// "second call upgrading a single-kind corner to mixed".
+    MixedKindUnsupported {
+        /// Set of kinds already recorded at the vertex.
+        existing: VertexBlendKindSet,
+        /// Kind the current call would have added.
+        requested: crate::primitives::solid::BlendKind,
+        /// Specific obstruction within the mixed-kind cap synthesizer.
+        detail: MixedKindRejectDetail,
+    },
 }
 
 impl std::fmt::Display for VertexBlendUnsupportedReason {
@@ -127,6 +248,15 @@ impl std::fmt::Display for VertexBlendUnsupportedReason {
                     "adjacent face is curved — cap corner vertices not coplanar"
                 )
             }
+            VertexBlendUnsupportedReason::MixedKindUnsupported {
+                existing,
+                requested,
+                detail,
+            } => write!(
+                f,
+                "mixed-kind corner (existing {}, requested {}): {}",
+                existing, requested, detail
+            ),
         }
     }
 }
@@ -652,5 +782,131 @@ mod tests {
             }
             other => panic!("expected InvalidGeometry, got {:?}", other),
         }
+    }
+
+    // ----------------------------------------------------------------
+    // CF-β.2 — pin the new `MixedKindUnsupported` reason and its
+    // nested `MixedKindRejectDetail`. Each sub-case maps onto the
+    // typed `InvalidInput("blend", …)` surface via the existing
+    // `From<BlendFailure>` impl and serialises to its own internally-
+    // tagged JSON shape so agents can branch on `reason.type` ==
+    // "MixedKindUnsupported" *and* on `reason.detail.type`.
+    // ----------------------------------------------------------------
+
+    fn mixed_kind_failure_with(detail: MixedKindRejectDetail) -> BlendFailure {
+        BlendFailure::VertexBlendUnsupported {
+            vertex: 42,
+            kind: BlendVertexKind::ConvexCorner { degree: 3 },
+            reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
+                existing: VertexBlendKindSet::single(crate::primitives::solid::BlendKind::Chamfer),
+                requested: crate::primitives::solid::BlendKind::Fillet,
+                detail,
+            },
+        }
+    }
+
+    #[test]
+    fn mixed_kind_unsupported_maps_to_invalid_input_and_embeds_detail() {
+        let failure = mixed_kind_failure_with(MixedKindRejectDetail::DegreeUnsupported {
+            degree: 4,
+        });
+        let rendered = failure.to_string();
+        let err: OperationError = failure.into();
+        match err {
+            OperationError::InvalidInput {
+                parameter,
+                received,
+                ..
+            } => {
+                assert_eq!(parameter, "blend");
+                assert_eq!(received, rendered);
+                assert!(received.contains("vertex 42"));
+                assert!(received.contains("mixed-kind corner"));
+                assert!(received.contains("degree 4"));
+                assert!(received.contains("existing {chamfer}"));
+                assert!(received.contains("requested fillet"));
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mixed_kind_reject_detail_display_distinguishes_all_variants() {
+        let degree = MixedKindRejectDetail::DegreeUnsupported { degree: 4 }.to_string();
+        let displ = MixedKindRejectDetail::MixedDisplacements {
+            offsets: vec![0.5],
+            radii: vec![0.8],
+        }
+        .to_string();
+        let planar = MixedKindRejectDetail::NonPlanarCap {
+            residual: 0.01,
+            tolerance: 1e-6,
+        }
+        .to_string();
+        let curved = MixedKindRejectDetail::CurvedAdjacent.to_string();
+        let cliff = MixedKindRejectDetail::ConcaveOrCliff.to_string();
+        for s in [&degree, &displ, &planar, &curved, &cliff] {
+            assert!(!s.is_empty());
+        }
+        let distinct: std::collections::HashSet<&str> =
+            [&degree, &displ, &planar, &curved, &cliff].iter().map(|s| s.as_str()).collect();
+        assert_eq!(distinct.len(), 5, "every MixedKindRejectDetail variant must Display distinctly");
+        assert!(degree.contains("degree 4"));
+        assert!(displ.contains("[0.5]") && displ.contains("[0.8]"));
+        assert!(planar.contains("0.01") && planar.contains("1e-6") || planar.contains("0.000001"));
+    }
+
+    #[test]
+    fn mixed_kind_reject_detail_serde_round_trip_internally_tagged() {
+        // Every variant must round-trip and surface its discriminant
+        // on the `type` key. Agents reading the typed REST surface
+        // branch on this; changing the tag layout breaks the contract.
+        let samples = [
+            MixedKindRejectDetail::DegreeUnsupported { degree: 4 },
+            MixedKindRejectDetail::MixedDisplacements {
+                offsets: vec![0.5, 0.5],
+                radii: vec![0.8],
+            },
+            MixedKindRejectDetail::NonPlanarCap {
+                residual: 1e-3,
+                tolerance: 1e-6,
+            },
+            MixedKindRejectDetail::CurvedAdjacent,
+            MixedKindRejectDetail::ConcaveOrCliff,
+        ];
+        for sample in &samples {
+            let json = serde_json::to_value(sample).expect("MixedKindRejectDetail serialises");
+            let type_tag = json["type"].as_str().expect("type tag is a string");
+            assert!(
+                !type_tag.is_empty(),
+                "internally-tagged enum must surface its tag on `type`"
+            );
+            let back: MixedKindRejectDetail =
+                serde_json::from_value(json).expect("round-trip");
+            assert_eq!(*sample, back);
+        }
+    }
+
+    #[test]
+    fn mixed_kind_unsupported_nested_serde_round_trip() {
+        // The full BlendFailure round-trip: the outer variant is
+        // `VertexBlendUnsupported`, the nested reason is
+        // `MixedKindUnsupported`, and the nested-nested detail is
+        // (say) `MixedDisplacements`. Pin the whole shape so a
+        // future flattening doesn't silently break agent parsers.
+        let failure = mixed_kind_failure_with(MixedKindRejectDetail::MixedDisplacements {
+            offsets: vec![0.5],
+            radii: vec![0.8, 0.8],
+        });
+        let json = serde_json::to_value(&failure).expect("BlendFailure serialises");
+        assert_eq!(json["type"], "VertexBlendUnsupported");
+        assert_eq!(json["vertex"], 42);
+        assert_eq!(json["reason"]["MixedKindUnsupported"]["requested"], "fillet");
+        assert_eq!(
+            json["reason"]["MixedKindUnsupported"]["detail"]["type"],
+            "MixedDisplacements"
+        );
+        let back: BlendFailure = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(failure, back);
     }
 }

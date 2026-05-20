@@ -829,6 +829,103 @@ mod tests {
         assert_eq!(payload["detail"], "non-manifold edge after splice");
     }
 
+    /// CF-β.2: a `BlendFailure::VertexBlendUnsupported` carrying the
+    /// new `MixedKindUnsupported` reason variant survives the
+    /// `OperationError → ApiError → JSON` chain with the existing /
+    /// requested kind tags + the nested `MixedKindRejectDetail`
+    /// discriminator intact. Agents pattern-match
+    /// `details.failure.reason.MixedKindUnsupported.detail.type`
+    /// to decide whether to retry with matched displacements, drop
+    /// the conflict, or surface the unsupported degree to the user.
+    #[test]
+    fn blend_failed_wire_shape_carries_mixed_kind_unsupported_payload() {
+        use geometry_engine::operations::blend_graph::BlendVertexKind;
+        use geometry_engine::operations::diagnostics::{
+            BlendFailure, MixedKindRejectDetail, VertexBlendKindSet,
+            VertexBlendUnsupportedReason,
+        };
+        use geometry_engine::operations::OperationError;
+        use geometry_engine::primitives::solid::BlendKind;
+
+        let mut existing = VertexBlendKindSet::default();
+        existing.insert(BlendKind::Chamfer);
+
+        let failure = BlendFailure::VertexBlendUnsupported {
+            vertex: 19,
+            kind: BlendVertexKind::ConvexCorner { degree: 3 },
+            reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
+                existing,
+                requested: BlendKind::Fillet,
+                detail: MixedKindRejectDetail::DegreeUnsupported { degree: 3 },
+            },
+        };
+
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        assert_eq!(api_err.code, ErrorCode::BlendFailed);
+        assert_eq!(api_err.code.status(), StatusCode::BAD_REQUEST);
+        assert!(!api_err.retryable);
+
+        let v = serde_json::to_value(&api_err).unwrap();
+        let payload = &v["details"]["failure"];
+        assert_eq!(payload["type"], "VertexBlendUnsupported");
+        assert_eq!(payload["vertex"], 19);
+        assert_eq!(payload["kind"]["ConvexCorner"]["degree"], 3);
+        // Outer reason discriminator is externally tagged.
+        let mixed = &payload["reason"]["MixedKindUnsupported"];
+        assert_eq!(mixed["existing"]["has_chamfer"], true);
+        assert_eq!(mixed["existing"]["has_fillet"], false);
+        assert_eq!(mixed["requested"], "fillet");
+        // Nested detail is internally tagged on `type`.
+        assert_eq!(mixed["detail"]["type"], "DegreeUnsupported");
+        assert_eq!(mixed["detail"]["degree"], 3);
+    }
+
+    /// CF-β.2: the `MixedDisplacements` arm of
+    /// `MixedKindRejectDetail` round-trips the per-edge offsets and
+    /// radii vectors verbatim. Agents use these to decide whether
+    /// the displacements are close enough to nudge with a tolerance
+    /// retry, or whether they're orders apart and must be re-
+    /// authored by the operator.
+    #[test]
+    fn blend_failed_wire_shape_carries_nested_mixed_displacements_detail() {
+        use geometry_engine::operations::blend_graph::BlendVertexKind;
+        use geometry_engine::operations::diagnostics::{
+            BlendFailure, MixedKindRejectDetail, VertexBlendKindSet,
+            VertexBlendUnsupportedReason,
+        };
+        use geometry_engine::operations::OperationError;
+        use geometry_engine::primitives::solid::BlendKind;
+
+        let mut existing = VertexBlendKindSet::default();
+        existing.insert(BlendKind::Fillet);
+        existing.insert(BlendKind::Chamfer);
+
+        let failure = BlendFailure::VertexBlendUnsupported {
+            vertex: 23,
+            kind: BlendVertexKind::ConvexCorner { degree: 3 },
+            reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
+                existing,
+                requested: BlendKind::Chamfer,
+                detail: MixedKindRejectDetail::MixedDisplacements {
+                    offsets: vec![0.5, 0.5],
+                    radii: vec![0.8],
+                },
+            },
+        };
+
+        let api_err: ApiError = OperationError::BlendFailed(Box::new(failure)).into();
+        let v = serde_json::to_value(&api_err).unwrap();
+        let mixed = &v["details"]["failure"]["reason"]["MixedKindUnsupported"];
+        assert_eq!(mixed["existing"]["has_fillet"], true);
+        assert_eq!(mixed["existing"]["has_chamfer"], true);
+        assert_eq!(mixed["requested"], "chamfer");
+        let detail = &mixed["detail"];
+        assert_eq!(detail["type"], "MixedDisplacements");
+        assert_eq!(detail["offsets"][0], 0.5);
+        assert_eq!(detail["offsets"][1], 0.5);
+        assert_eq!(detail["radii"][0], 0.8);
+    }
+
     /// Every `BlendFailure` variant must map to HTTP 400 (caller-
     /// recoverable bad request, not a server fault). This is the
     /// status-side counterpart to the per-variant wire-shape pins;
