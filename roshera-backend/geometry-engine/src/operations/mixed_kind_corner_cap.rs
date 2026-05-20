@@ -68,7 +68,7 @@ use super::orientation::orient_face_for_outward;
 use super::{OperationError, OperationResult};
 use crate::math::{Point3, Vector3};
 use crate::primitives::{
-    curve::{Arc, Curve, Line},
+    curve::{Arc, Line},
     edge::EdgeId,
     face::{Face, FaceId},
     r#loop::{Loop, LoopType},
