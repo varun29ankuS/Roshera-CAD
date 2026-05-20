@@ -310,6 +310,92 @@ impl std::fmt::Display for BlendKind {
     }
 }
 
+/// CF-β — the set of blend kinds applied at a single vertex. The
+/// CF-α registry stored exactly one [`BlendKind`] per vertex, which
+/// modelled "this corner has been blended" but could not represent
+/// the mixed case "this corner has been chamfered on edge A and
+/// filleted on edge B". CF-β unlocks degree-3 convex equal-displacement
+/// mixed-kind corners (chamfer on one edge, fillet on the other two,
+/// stitched by a planar hexagonal cap); the registry shape lifts to
+/// this newtype so the lifecycle gate and the corner-cap dispatch can
+/// distinguish "single-kind so far" from "already mixed".
+///
+/// Stored as `(bool, bool)` rather than `EnumSet<BlendKind>` to avoid
+/// pulling a new dependency for a two-element domain. `Copy` so the
+/// existing `Solid::deep_copy` clones it for free; serde-derived so
+/// the field round-trips through any serialiser that touches `Solid`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize,
+)]
+pub struct VertexBlendKindSet {
+    /// Whether a fillet has been applied at this vertex.
+    pub has_fillet: bool,
+    /// Whether a chamfer has been applied at this vertex.
+    pub has_chamfer: bool,
+}
+
+impl VertexBlendKindSet {
+    /// A set carrying exactly `kind`.
+    pub fn single(kind: BlendKind) -> Self {
+        let mut s = Self::default();
+        s.insert(kind);
+        s
+    }
+
+    /// Insert `kind`; idempotent.
+    pub fn insert(&mut self, kind: BlendKind) {
+        match kind {
+            BlendKind::Fillet => self.has_fillet = true,
+            BlendKind::Chamfer => self.has_chamfer = true,
+        }
+    }
+
+    /// Whether `kind` is in the set.
+    pub fn contains(&self, kind: BlendKind) -> bool {
+        match kind {
+            BlendKind::Fillet => self.has_fillet,
+            BlendKind::Chamfer => self.has_chamfer,
+        }
+    }
+
+    /// Both kinds present.
+    pub fn is_mixed(&self) -> bool {
+        self.has_fillet && self.has_chamfer
+    }
+
+    /// Number of distinct kinds in the set (0, 1, or 2).
+    pub fn len(&self) -> usize {
+        usize::from(self.has_fillet) + usize::from(self.has_chamfer)
+    }
+
+    /// True iff no kind has been recorded.
+    pub fn is_empty(&self) -> bool {
+        !self.has_fillet && !self.has_chamfer
+    }
+
+    /// If exactly one kind is present, return it; otherwise `None`.
+    /// Used by callers (e.g. CF-α legacy paths) that only support a
+    /// single-kind vertex and want to reject the mixed case upstream.
+    pub fn as_single(&self) -> Option<BlendKind> {
+        match (self.has_fillet, self.has_chamfer) {
+            (true, false) => Some(BlendKind::Fillet),
+            (false, true) => Some(BlendKind::Chamfer),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for VertexBlendKindSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.has_fillet, self.has_chamfer) {
+            (false, false) => write!(f, "∅"),
+            (true, false) => write!(f, "{{fillet}}"),
+            (false, true) => write!(f, "{{chamfer}}"),
+            (true, true) => write!(f, "{{chamfer, fillet}}"),
+        }
+    }
+}
+
 /// Solid representation
 #[derive(Debug, Clone)]
 pub struct Solid {
@@ -367,7 +453,15 @@ pub struct Solid {
     ///
     /// Used to detect cross-kind conflict at a corner shared between
     /// a previously-blended edge and the edge currently being requested.
-    pub(crate) blended_vertices: HashMap<VertexId, BlendKind>,
+    ///
+    /// **CF-β** lifts the value type from `BlendKind` to
+    /// [`VertexBlendKindSet`]: a single corner can carry both a fillet
+    /// (on one edge) and a chamfer (on another) simultaneously. The
+    /// lifecycle gate consults [`VertexBlendKindSet::contains`] to
+    /// decide between "same-kind reuse (allowed)", "cross-kind
+    /// feasibility pre-flight (CF-β)", and "blanket reject (CF-α
+    /// fallback)".
+    pub(crate) blended_vertices: HashMap<VertexId, VertexBlendKindSet>,
 }
 
 /// Top-level AABB used as a conservative collision proxy. The detailed
@@ -461,12 +555,18 @@ impl Solid {
         self.blended_edges.insert(edge, kind);
     }
 
-    /// CF-α — record that `vertex` participates in a successful blend
-    /// of `kind` on this solid. Only called for vertices that survive
-    /// `splice_blend_edge` (the `original_v*_corner_shared` flag is
-    /// set), since others are destroyed and would never be looked up.
+    /// CF-α / CF-β — record that `vertex` participates in a successful
+    /// blend of `kind` on this solid. Only called for vertices that
+    /// survive `splice_blend_edge` (the `original_v*_corner_shared`
+    /// flag is set), since others are destroyed and would never be
+    /// looked up.
+    ///
+    /// Idempotent and order-independent: under CF-β the same vertex
+    /// can be visited by a fillet call and a chamfer call (in either
+    /// order); each call inserts its kind into the per-vertex
+    /// [`VertexBlendKindSet`], leaving the other slot untouched.
     pub(crate) fn record_blended_vertex(&mut self, vertex: VertexId, kind: BlendKind) {
-        self.blended_vertices.insert(vertex, kind);
+        self.blended_vertices.entry(vertex).or_default().insert(kind);
     }
 
     /// CF-α — look up the previously-applied blend kind at `edge`, if
@@ -477,10 +577,25 @@ impl Solid {
         self.blended_edges.get(&edge).copied()
     }
 
-    /// CF-α — look up the previously-applied blend kind at `vertex`,
-    /// if any. Returns `None` when the vertex has never participated
-    /// in a blend on this solid.
-    pub fn blend_kind_at_vertex(&self, vertex: VertexId) -> Option<BlendKind> {
+    /// CF-α — look up the previously-applied blend kind at `vertex`
+    /// when *exactly one* kind has been recorded there. Returns
+    /// `None` when the vertex has never participated in a blend on
+    /// this solid **or** when both fillet and chamfer have been
+    /// recorded (the CF-β mixed case).
+    ///
+    /// Callers that need to handle the mixed case must use
+    /// [`Self::vertex_blend_set`] instead.
+    pub fn blend_kind_at_vertex_single(&self, vertex: VertexId) -> Option<BlendKind> {
+        self.blended_vertices
+            .get(&vertex)
+            .and_then(VertexBlendKindSet::as_single)
+    }
+
+    /// CF-β — look up the full set of blend kinds recorded at `vertex`.
+    /// Returns `None` when the vertex has never participated in a
+    /// blend, `Some(set)` otherwise. The returned set may carry one
+    /// kind (single-kind CF-α corner) or both (CF-β mixed corner).
+    pub fn vertex_blend_set(&self, vertex: VertexId) -> Option<VertexBlendKindSet> {
         self.blended_vertices.get(&vertex).copied()
     }
 
@@ -1579,6 +1694,82 @@ mod inertia_tests {
                     i_com[i][j]
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod vertex_blend_kind_set_tests {
+    //! CF-β.1 — pin the [`VertexBlendKindSet`] contract that lifts the
+    //! CF-α single-kind registry to a two-element set so a single
+    //! corner vertex can carry both a fillet (on one edge) and a
+    //! chamfer (on another) simultaneously.
+
+    use super::{BlendKind, VertexBlendKindSet};
+
+    #[test]
+    fn insert_idempotent_and_order_independent() {
+        let mut a = VertexBlendKindSet::default();
+        a.insert(BlendKind::Fillet);
+        a.insert(BlendKind::Fillet); // idempotent
+        assert!(a.contains(BlendKind::Fillet));
+        assert!(!a.contains(BlendKind::Chamfer));
+        assert_eq!(a.len(), 1);
+        assert!(!a.is_mixed());
+
+        let mut b = VertexBlendKindSet::default();
+        b.insert(BlendKind::Chamfer);
+        b.insert(BlendKind::Fillet);
+        let mut c = VertexBlendKindSet::default();
+        c.insert(BlendKind::Fillet);
+        c.insert(BlendKind::Chamfer);
+        assert_eq!(b, c, "set membership must be order-independent");
+    }
+
+    #[test]
+    fn is_mixed_only_when_both_set() {
+        let empty = VertexBlendKindSet::default();
+        assert!(!empty.is_mixed());
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.as_single(), None);
+
+        let single_fillet = VertexBlendKindSet::single(BlendKind::Fillet);
+        assert!(!single_fillet.is_mixed());
+        assert_eq!(single_fillet.len(), 1);
+        assert_eq!(single_fillet.as_single(), Some(BlendKind::Fillet));
+
+        let single_chamfer = VertexBlendKindSet::single(BlendKind::Chamfer);
+        assert!(!single_chamfer.is_mixed());
+        assert_eq!(single_chamfer.as_single(), Some(BlendKind::Chamfer));
+
+        let mut mixed = single_fillet;
+        mixed.insert(BlendKind::Chamfer);
+        assert!(mixed.is_mixed());
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(
+            mixed.as_single(),
+            None,
+            "as_single must collapse to None for the CF-β mixed case"
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_all_four_states() {
+        for set in [
+            VertexBlendKindSet::default(),
+            VertexBlendKindSet::single(BlendKind::Fillet),
+            VertexBlendKindSet::single(BlendKind::Chamfer),
+            VertexBlendKindSet {
+                has_fillet: true,
+                has_chamfer: true,
+            },
+        ] {
+            let json = serde_json::to_string(&set)
+                .expect("VertexBlendKindSet serialises");
+            let back: VertexBlendKindSet = serde_json::from_str(&json)
+                .expect("VertexBlendKindSet deserialises");
+            assert_eq!(set, back, "round-trip mismatch for {set}");
         }
     }
 }
