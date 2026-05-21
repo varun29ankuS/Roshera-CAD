@@ -50,6 +50,14 @@ pub struct ChamferOptions {
 
     /// Whether to preserve original edges in special cases
     pub preserve_edges: bool,
+
+    /// CF-β.5.2-A — opt-in: convex corner vertices at which the caller
+    /// intends to leave a *partial-mixed* selection, knowing that a
+    /// follow-up `fillet_edges` call will close the corner. See
+    /// [`crate::operations::fillet::FilletOptions::partial_corner_vertices`]
+    /// for the full contract; the chamfer side carries identical
+    /// semantics.
+    pub partial_corner_vertices: Vec<VertexId>,
 }
 
 impl Default for ChamferOptions {
@@ -62,6 +70,7 @@ impl Default for ChamferOptions {
             symmetric: true,
             propagation: PropagationMode::None,
             preserve_edges: false,
+            partial_corner_vertices: Vec::new(),
         }
     }
 }
@@ -107,6 +116,7 @@ pub fn chamfer_edges(
             OpSpec::ChamferEdges {
                 solid_id,
                 edges: &edges,
+                partial_corner_vertices: &options.partial_corner_vertices,
             },
         )?;
     }
@@ -190,8 +200,22 @@ pub fn chamfer_edges(
                 // alive and skips third-face cap insertion at that
                 // endpoint; `apply_planar_chamfer_cap` takes over both
                 // responsibilities post-splice.
-                s.original_v0_corner_shared = corner_set.is_corner(s.original_v0);
-                s.original_v1_corner_shared = corner_set.is_corner(s.original_v1);
+                //
+                // CF-β.5.2-A — OR with the opt-in partial-mixed
+                // corner set so V is also preserved when the caller
+                // declares this corner will be closed later by the
+                // opposite blend kind. Mirrors the fillet-side stamp
+                // in fillet.rs::create_fillet_chain.
+                let v0_partial_opt_in = options
+                    .partial_corner_vertices
+                    .contains(&s.original_v0);
+                let v1_partial_opt_in = options
+                    .partial_corner_vertices
+                    .contains(&s.original_v1);
+                s.original_v0_corner_shared =
+                    corner_set.is_corner(s.original_v0) || v0_partial_opt_in;
+                s.original_v1_corner_shared =
+                    corner_set.is_corner(s.original_v1) || v1_partial_opt_in;
                 surgeries.push(s);
             }
         }
@@ -214,6 +238,30 @@ pub fn chamfer_edges(
                 &surgeries,
             )?;
             chamfer_faces.extend(cap_faces);
+        }
+
+        // CF-β.5.2-A — register every opt-in partial-mixed corner
+        // vertex in the host solid's `pending_mixed_kind_corners`
+        // set BEFORE the `validate_result` gate runs. The β.4.2
+        // carve-out inside `validate_chamfered_solid` consults this
+        // set via `filter_pending_corner_errors` to drop the
+        // non-manifold-edge errors at intentionally-open corners.
+        // Vertices that no longer exist (e.g. surgery removed them
+        // because the opt-in was redundant with a fully-closed
+        // 3-corner) are filtered out — pending is a vertex-id
+        // index, the membership API requires a live id.
+        if !options.partial_corner_vertices.is_empty() {
+            let alive_partial: Vec<VertexId> = options
+                .partial_corner_vertices
+                .iter()
+                .copied()
+                .filter(|&vid| model.vertices.get(vid).is_some())
+                .collect();
+            if let Some(solid) = model.solids.get_mut(solid_id) {
+                for vid in alive_partial {
+                    solid.mark_pending_mixed_kind_corner(vid);
+                }
+            }
         }
 
         // Validate result if requested
@@ -278,6 +326,20 @@ pub fn chamfer_edges(
             v.sort_unstable();
             v
         };
+        // CF-β.5.2-A — caller's opt-in partial-mixed corner
+        // declaration. Sorted for stable replay-determinism
+        // (matching the `pending_mixed_kind_corners` shape).
+        // Computed outside the `json!` macro because the macro
+        // cannot parse the `Vec<u64>` turbofish.
+        let partial_corner_vertices_payload: Vec<u64> = {
+            let mut v: Vec<u64> = options
+                .partial_corner_vertices
+                .iter()
+                .map(|&vid| vid as u64)
+                .collect();
+            v.sort_unstable();
+            v
+        };
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("chamfer_edges")
                 .with_parameters(serde_json::json!({
@@ -289,6 +351,7 @@ pub fn chamfer_edges(
                     "propagation": format!("{:?}", options.propagation),
                     "preserve_edges": options.preserve_edges,
                     "pending_mixed_kind_corners": pending_after_call,
+                    "partial_corner_vertices": partial_corner_vertices_payload,
                 }))
                 .with_input_solids([solid_id as u64])
                 .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
@@ -3440,6 +3503,7 @@ mod tests {
                 symmetric: true,
                 propagation: PropagationMode::None,
                 preserve_edges: false,
+                partial_corner_vertices: Vec::new(),
             };
 
             let result = chamfer_edges(&mut model, solid_id, vec![*edge_id], opts);

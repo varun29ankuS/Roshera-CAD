@@ -171,6 +171,7 @@ impl OperationImpl for FilletOp {
                 propagation: geometry_engine::operations::fillet::PropagationMode::Tangent,
                 preserve_edges: true,
                 quality: geometry_engine::operations::fillet::FilletQuality::Standard,
+                partial_corner_vertices: Vec::new(),
             };
 
             // Get the solid ID from the BRep (there should be one solid)

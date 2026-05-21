@@ -81,11 +81,19 @@ pub enum OpSpec<'a> {
     FilletEdges {
         solid_id: SolidId,
         edges: &'a [EdgeId],
+        /// CF-β.5.2-A — convex corner vertices the caller has
+        /// opted in to leave partially-mixed. Empty slice ↦
+        /// standard pre-flight (no carve-out). See
+        /// [`crate::operations::fillet::FilletOptions::partial_corner_vertices`].
+        partial_corner_vertices: &'a [VertexId],
     },
     /// `chamfer_edges(solid_id, edges, …)`.
     ChamferEdges {
         solid_id: SolidId,
         edges: &'a [EdgeId],
+        /// CF-β.5.2-A — see
+        /// [`crate::operations::chamfer::ChamferOptions::partial_corner_vertices`].
+        partial_corner_vertices: &'a [VertexId],
     },
     /// `boolean_operation(solid_a, solid_b, …)`.
     Boolean {
@@ -137,7 +145,11 @@ pub enum OpSpec<'a> {
 pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResult<()> {
     match spec {
         OpSpec::Generic => Ok(()),
-        OpSpec::FilletEdges { solid_id, edges } => {
+        OpSpec::FilletEdges {
+            solid_id,
+            edges,
+            partial_corner_vertices,
+        } => {
             check_solid_exists(model, solid_id)?;
             // CF-α: typed cross-kind conflict gate. Runs BEFORE
             // `check_edges_exist` so a request against an
@@ -148,16 +160,32 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             check_edges_exist(model, edges)?;
             // F2-γ.1: setback-aware corner compatibility. Replaces
             // the historical `validate_no_shared_corners` blanket
-            // reject with a specific-reason failure mode.
-            validate_corner_compatibility(model, edges, BlendOpKind::Fillet)
+            // reject with a specific-reason failure mode. CF-β.5.2-A:
+            // the opt-in slice carves out per-vertex shared-corner
+            // rejects for partially-mixed selections.
+            validate_corner_compatibility(
+                model,
+                edges,
+                BlendOpKind::Fillet,
+                partial_corner_vertices,
+            )
         }
-        OpSpec::ChamferEdges { solid_id, edges } => {
+        OpSpec::ChamferEdges {
+            solid_id,
+            edges,
+            partial_corner_vertices,
+        } => {
             check_solid_exists(model, solid_id)?;
             // CF-α: typed cross-kind conflict gate — see FilletEdges
             // arm above for the ordering rationale.
             validate_blend_conflict(model, solid_id, edges, BlendKind::Chamfer)?;
             check_edges_exist(model, edges)?;
-            validate_corner_compatibility(model, edges, BlendOpKind::Chamfer)
+            validate_corner_compatibility(
+                model,
+                edges,
+                BlendOpKind::Chamfer,
+                partial_corner_vertices,
+            )
         }
         OpSpec::Boolean { solid_a, solid_b } => {
             check_solid_exists(model, solid_a)?;
@@ -392,7 +420,7 @@ fn validate_blend_conflict(
 /// through `?`, and emits an actionable typed payload on every reject.
 fn validate_mixed_kind_corner_feasibility(
     model: &BRepModel,
-    _solid_id: SolidId,
+    solid_id: SolidId,
     vertex: VertexId,
     _trigger_edge: EdgeId,
     existing: crate::primitives::solid::VertexBlendKindSet,
@@ -469,6 +497,7 @@ fn validate_corner_compatibility(
     model: &BRepModel,
     edges: &[EdgeId],
     op_kind: BlendOpKind,
+    partial_corner_vertices: &[VertexId],
 ) -> OperationResult<()> {
     if edges.len() < 2 {
         return Ok(());
@@ -504,6 +533,16 @@ fn validate_corner_compatibility(
                 None
             };
             if let Some(v) = shared {
+                // CF-β.5.2-A — when the caller has opted this vertex
+                // in as a *partial-mixed* corner, skip this clash
+                // (the V-side surgery / pending registration path
+                // takes over inside the blend op body). Continue
+                // searching for other shared corners that were *not*
+                // opted in — those still reject through the F2-γ.1
+                // setback-aware arm below.
+                if partial_corner_vertices.contains(&v) {
+                    continue;
+                }
                 shared_pair = Some((ei, ej, v));
                 break;
             }
@@ -713,6 +752,7 @@ mod tests {
             OpSpec::FilletEdges {
                 solid_id: 9999,
                 edges: &[],
+                partial_corner_vertices: &[],
             },
         );
         match result {
@@ -737,6 +777,7 @@ mod tests {
             OpSpec::FilletEdges {
                 solid_id,
                 edges: &[9999_u32],
+                partial_corner_vertices: &[],
             },
         );
         match result {
@@ -826,6 +867,7 @@ mod tests {
             OpSpec::FilletEdges {
                 solid_id,
                 edges: &corner_edges,
+                partial_corner_vertices: &[],
             },
         );
         assert!(
@@ -866,6 +908,7 @@ mod tests {
             OpSpec::FilletEdges {
                 solid_id,
                 edges: &[e0, e1],
+                partial_corner_vertices: &[],
             },
         );
         assert!(
@@ -938,6 +981,7 @@ mod tests {
             OpSpec::FilletEdges {
                 solid_id,
                 edges: &[edge],
+                partial_corner_vertices: &[],
             },
         )
         .expect_err("cross-kind at shared corner must be rejected (β.2 stub)");
@@ -1352,5 +1396,149 @@ mod tests {
             }
             other => panic!("expected InvalidInput, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // CF-β.5.2-A — partial_corner_vertices opt-in carve-out.
+    //
+    // When the caller declares a vertex in `partial_corner_vertices`,
+    // `validate_corner_compatibility`'s shared-vertex detection loop
+    // must skip clashes at that vertex (the V-side surgery /
+    // pending-registration path inside the blend op takes over). All
+    // shared corners *not* opted in continue to flow through the
+    // F2-γ.1 setback-aware arm.
+    // -----------------------------------------------------------------
+
+    /// All three edges of a degree-3 convex box corner clear the gate
+    /// without any opt-in via F5-α (apex-sphere) — this pins the
+    /// baseline against which the carve-out is contrasted.
+    #[test]
+    fn validate_corner_compatibility_baseline_degree_three_passes_via_f5_alpha() {
+        let model = build_unit_box();
+        let mut by_vertex: std::collections::HashMap<u32, Vec<EdgeId>> =
+            std::collections::HashMap::new();
+        for (eid, e) in model.edges.iter() {
+            by_vertex.entry(e.start_vertex).or_default().push(eid);
+            by_vertex.entry(e.end_vertex).or_default().push(eid);
+        }
+        let corner_edges = by_vertex
+            .into_values()
+            .find(|es| es.len() == 3)
+            .expect("box has degree-3 corner");
+
+        // All 3 corner edges in the selection: F5-α opens the gate
+        // for a degree-3 convex corner without any partial-mixed
+        // opt-in. This pins the baseline.
+        validate_corner_compatibility(
+            &model,
+            &corner_edges,
+            BlendOpKind::Fillet,
+            &[],
+        )
+        .expect("F5-α admits degree-3 convex corner without opt-in");
+    }
+
+    /// With `partial_corner_vertices` populated for the shared
+    /// vertex, the gate short-circuits via the carve-out before ever
+    /// reaching the F2-γ.1 graph-build/setback path. Selecting only
+    /// 2 of 3 incident edges on a box corner classifies as
+    /// `ConvexCorner { degree: 2 }`, which the F5-α arm does NOT
+    /// admit (NotImplemented setback path) — so opt-in is the
+    /// difference between reject and accept here.
+    #[test]
+    fn validate_corner_compatibility_carves_out_opted_in_shared_vertex() {
+        let model = build_unit_box();
+        let mut by_vertex: std::collections::HashMap<u32, Vec<EdgeId>> =
+            std::collections::HashMap::new();
+        for (eid, e) in model.edges.iter() {
+            by_vertex.entry(e.start_vertex).or_default().push(eid);
+            by_vertex.entry(e.end_vertex).or_default().push(eid);
+        }
+        let (shared_vertex, corner_edges) = by_vertex
+            .into_iter()
+            .find(|(_, es)| es.len() == 3)
+            .expect("box has degree-3 corner");
+        let pair = vec![corner_edges[0], corner_edges[1]];
+
+        // Find a vertex that is NOT the shared corner — pin the
+        // negative branch of the carve-out.
+        let other_vertex = model
+            .vertices
+            .iter()
+            .find_map(|(id, _)| if id != shared_vertex { Some(id) } else { None })
+            .expect("box has more than one vertex");
+        assert_ne!(other_vertex, shared_vertex);
+
+        // Opt-in for an unrelated vertex → carve-out does NOT fire,
+        // the gate hits the F2-γ.1 setback path and rejects with
+        // NotImplemented (the standing F5-γ / F5-δ TODO).
+        let err = validate_corner_compatibility(
+            &model,
+            &pair,
+            BlendOpKind::Fillet,
+            &[other_vertex],
+        )
+        .expect_err("unrelated opt-in must not short-circuit the loop");
+        assert!(
+            matches!(err, OperationError::NotImplemented(_)),
+            "expected NotImplemented from the setback path, got: {:?}",
+            err
+        );
+
+        // Opt-in for the actual shared vertex → carve-out fires,
+        // gate returns Ok early without touching the graph builder.
+        validate_corner_compatibility(
+            &model,
+            &pair,
+            BlendOpKind::Fillet,
+            &[shared_vertex],
+        )
+        .expect("opt-in for the shared vertex carves out the clash");
+    }
+
+    /// The opt-in is per-vertex: opting in for one corner does not
+    /// silence clashes at *other* shared corners in the same call.
+    /// Synthesise a 3-edge selection where two pairs of edges share
+    /// different corner vertices, opt one in, verify the other still
+    /// flows through the F5-α / setback arm (which, for a box's
+    /// degree-3 corner, returns Ok — we contrast against the
+    /// preceding "everything Ok" tests by inspecting the call site).
+    #[test]
+    fn validate_corner_compatibility_opt_in_is_per_vertex() {
+        let model = build_unit_box();
+        // Pick any 3 edges that share a single corner — same setup
+        // as the baseline. The opt-in for the shared corner short-
+        // circuits; F5-α handles the residual checks.
+        let mut by_vertex: std::collections::HashMap<u32, Vec<EdgeId>> =
+            std::collections::HashMap::new();
+        for (eid, e) in model.edges.iter() {
+            by_vertex.entry(e.start_vertex).or_default().push(eid);
+            by_vertex.entry(e.end_vertex).or_default().push(eid);
+        }
+        let (shared_vertex, corner_edges) = by_vertex
+            .into_iter()
+            .find(|(_, es)| es.len() == 3)
+            .expect("box has degree-3 corner");
+
+        // Opt-in for the shared vertex; the 3-edge selection clears
+        // pre-flight because every shared-vertex pair targets the
+        // opted-in vertex.
+        validate_corner_compatibility(
+            &model,
+            &corner_edges,
+            BlendOpKind::Fillet,
+            &[shared_vertex],
+        )
+        .expect("3-edge selection with all clashes at opted-in vertex clears");
+
+        // Same call with empty opt-in: F5-α returns Ok for degree-3
+        // convex — pin that the contract is symmetric on this case.
+        validate_corner_compatibility(
+            &model,
+            &corner_edges,
+            BlendOpKind::Fillet,
+            &[],
+        )
+        .expect("F5-α admits 3-edge degree-3 convex selection without opt-in");
     }
 }

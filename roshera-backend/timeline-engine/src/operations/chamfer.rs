@@ -133,6 +133,7 @@ impl OperationImpl for ChamferOp {
                 symmetric: true,
                 propagation: PropagationMode::Tangent,
                 preserve_edges: true,
+                partial_corner_vertices: Vec::new(),
             };
 
             // Get the solid ID from the BRep (there should be one solid)
