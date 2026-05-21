@@ -162,12 +162,20 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // the historical `validate_no_shared_corners` blanket
             // reject with a specific-reason failure mode. CF-β.5.2-A:
             // the opt-in slice carves out per-vertex shared-corner
-            // rejects for partially-mixed selections.
+            // rejects for partially-mixed selections. CF-β.5.2-B:
+            // auto-detect the second-call side by unioning any
+            // vertices already registered in
+            // `solid.pending_mixed_kind_corners` (left there by the
+            // opposite-kind first call) so the gate carves out the
+            // same corner without the caller having to repeat the
+            // explicit opt-in.
+            let effective_partial =
+                effective_partial_corner_vertices(model, solid_id, partial_corner_vertices);
             validate_corner_compatibility(
                 model,
                 edges,
                 BlendOpKind::Fillet,
-                partial_corner_vertices,
+                &effective_partial,
             )
         }
         OpSpec::ChamferEdges {
@@ -180,11 +188,15 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // arm above for the ordering rationale.
             validate_blend_conflict(model, solid_id, edges, BlendKind::Chamfer)?;
             check_edges_exist(model, edges)?;
+            // CF-β.5.2-B — auto-detect via pending_mixed_kind_corners,
+            // see the FilletEdges arm for the rationale.
+            let effective_partial =
+                effective_partial_corner_vertices(model, solid_id, partial_corner_vertices);
             validate_corner_compatibility(
                 model,
                 edges,
                 BlendOpKind::Chamfer,
-                partial_corner_vertices,
+                &effective_partial,
             )
         }
         OpSpec::Boolean { solid_a, solid_b } => {
@@ -472,6 +484,33 @@ fn validate_mixed_kind_corner_feasibility(
             },
         },
     ))
+}
+
+/// CF-β.5.2-B — union the caller's explicit
+/// `partial_corner_vertices` opt-in with vertices already registered
+/// in `solid.pending_mixed_kind_corners`. The pending registry is
+/// populated by the *first* of two kind-mismatched blend calls and
+/// outlives the call boundary, so the *second* call's pre-flight
+/// gate can discover the partial-mixed corner without the caller
+/// having to repeat the opt-in. Both signals point to the same
+/// geometric fact at V: the V-end of this blend terminates against
+/// an opposite-kind blend face placed by the prior call, and the
+/// shared-vertex setback gate must carve out V to let the surgery
+/// run through to the synthesizer's dispatch hook.
+fn effective_partial_corner_vertices(
+    model: &BRepModel,
+    solid_id: SolidId,
+    explicit: &[VertexId],
+) -> Vec<VertexId> {
+    let mut out: Vec<VertexId> = explicit.to_vec();
+    if let Some(solid) = model.solids.get(solid_id) {
+        for &vid in solid.pending_mixed_kind_corners().keys() {
+            if !out.contains(&vid) {
+                out.push(vid);
+            }
+        }
+    }
+    out
 }
 
 /// F2-γ.1: setback-aware multi-edge corner compatibility check.
@@ -968,6 +1007,8 @@ mod tests {
     /// not-yet-supported surface is the contract.
     #[test]
     fn validate_blend_conflict_routes_cross_kind_shared_vertex_to_mixed_kind_unsupported() {
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
         let mut model = build_unit_box();
         let solid_id: SolidId = model
             .solids
@@ -975,13 +1016,32 @@ mod tests {
             .next()
             .map(|(id, _)| id)
             .expect("box solid");
-        let corner_vertex = model
-            .vertices
-            .iter()
-            .next()
-            .map(|(id, _)| id)
-            .expect("box has vertices");
-        let edge = edge_incident_to(&model, corner_vertex);
+
+        // CF-β.3.4 admitted the degree-3 convex box corner, so the
+        // typed-reject contract is pinned via a synthesised degree-4
+        // apex (the count-only feasibility walker does not need the
+        // edges to participate in a real shell).
+        let corner_vertex = model.vertices.add(0.5, 0.5, 5.0);
+        let l_a = model.vertices.add(0.0, 0.0, 6.0);
+        let l_b = model.vertices.add(1.0, 0.0, 6.0);
+        let l_c = model.vertices.add(1.0, 1.0, 6.0);
+        let l_d = model.vertices.add(0.0, 1.0, 6.0);
+        let edge = model.edges.add(Edge::new_auto_range(
+            0,
+            corner_vertex,
+            l_a,
+            0,
+            EdgeOrientation::Forward,
+        ));
+        for leaf in [l_b, l_c, l_d] {
+            let _ = model.edges.add(Edge::new_auto_range(
+                0,
+                corner_vertex,
+                leaf,
+                0,
+                EdgeOrientation::Forward,
+            ));
+        }
 
         // Seed the registry as a previous chamfer would have.
         if let Some(solid) = model.solids.get_mut(solid_id) {
@@ -998,41 +1058,45 @@ mod tests {
         )
         .expect_err("cross-kind at shared corner must be rejected (β.2 stub)");
 
+        // CF-β.5.2-B — typed payload via `BlendFailed`. Verify the
+        // boxed `MixedKindUnsupported` carries the right discriminator
+        // fields (existing kind set, requested kind, vertex, degree
+        // detail). The Display fallback that the legacy `InvalidInput`
+        // path emitted is no longer the contract surface — REST
+        // consumers branch on the typed payload.
+        use crate::operations::diagnostics::{
+            BlendFailure, MixedKindRejectDetail, VertexBlendUnsupportedReason,
+        };
         match err {
-            OperationError::InvalidInput {
-                parameter,
-                received,
-                ..
-            } => {
-                assert_eq!(parameter, "blend");
-                assert!(
-                    received.contains(&format!("vertex {}", corner_vertex)),
-                    "received must name the offending vertex id; got: {}",
-                    received
-                );
-                assert!(
-                    received.contains("mixed-kind corner"),
-                    "received must carry the MixedKindUnsupported wording; got: {}",
-                    received
-                );
-                assert!(
-                    received.contains("existing {chamfer}"),
-                    "received must echo the existing kind set; got: {}",
-                    received
-                );
-                assert!(
-                    received.contains("requested fillet"),
-                    "received must name the requested kind; got: {}",
-                    received
-                );
-                assert!(
-                    received.contains("degree"),
-                    "β.2 stub must carry the DegreeUnsupported detail; got: {}",
-                    received
-                );
-            }
+            OperationError::BlendFailed(boxed) => match *boxed {
+                BlendFailure::VertexBlendUnsupported {
+                    vertex,
+                    reason:
+                        VertexBlendUnsupportedReason::MixedKindUnsupported {
+                            existing,
+                            requested,
+                            detail,
+                        },
+                    ..
+                } => {
+                    assert_eq!(vertex, corner_vertex);
+                    assert!(existing.contains(BlendKind::Chamfer));
+                    assert_eq!(requested, BlendKind::Fillet);
+                    match detail {
+                        MixedKindRejectDetail::DegreeUnsupported { .. } => {}
+                        other => panic!(
+                            "β.2 stub must carry DegreeUnsupported, got {:?}",
+                            other
+                        ),
+                    }
+                }
+                other => panic!(
+                    "expected MixedKindUnsupported reason, got {:?}",
+                    other
+                ),
+            },
             other => panic!(
-                "expected InvalidInput carrying MixedKindUnsupported, got {:?}",
+                "expected BlendFailed carrying MixedKindUnsupported, got {:?}",
                 other
             ),
         }
@@ -1086,6 +1150,8 @@ mod tests {
     /// each requested edge.
     #[test]
     fn validate_blend_conflict_inspects_both_endpoints() {
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
         let mut model = build_unit_box();
         let solid_id: SolidId = model
             .solids
@@ -1093,22 +1159,43 @@ mod tests {
             .next()
             .map(|(id, _)| id)
             .expect("box solid");
-        // Pick any edge and seed the registry at its END vertex.
-        let (edge_id, end_vertex) = model
-            .edges
-            .iter()
-            .next()
-            .map(|(id, e)| (id, e.end_vertex))
-            .expect("box edges exist");
+
+        // Build a degree-4 synthetic vertex so the end-vertex clash
+        // still rejects after CF-β.3.4 (which admitted degree-3
+        // convex corners). The trigger edge points at the apex via
+        // its `end_vertex`, exercising the end-endpoint arm of
+        // `validate_blend_conflict`.
+        let apex = model.vertices.add(0.5, 0.5, 5.0);
+        let leaf_start = model.vertices.add(0.0, 0.0, 6.0);
+        let l_b = model.vertices.add(1.0, 0.0, 6.0);
+        let l_c = model.vertices.add(1.0, 1.0, 6.0);
+        let l_d = model.vertices.add(0.0, 1.0, 6.0);
+        let edge_id = model.edges.add(Edge::new_auto_range(
+            0,
+            leaf_start,
+            apex,
+            0,
+            EdgeOrientation::Forward,
+        ));
+        for leaf in [l_b, l_c, l_d] {
+            let _ = model.edges.add(Edge::new_auto_range(
+                0,
+                apex,
+                leaf,
+                0,
+                EdgeOrientation::Forward,
+            ));
+        }
+
         if let Some(solid) = model.solids.get_mut(solid_id) {
-            solid.record_blended_vertex(end_vertex, BlendKind::Fillet);
+            solid.record_blended_vertex(apex, BlendKind::Fillet);
         }
 
         let result =
             validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Chamfer);
         assert!(
-            matches!(result, Err(OperationError::InvalidInput { .. })),
-            "end-vertex conflict must surface as InvalidInput; got {:?}",
+            matches!(result, Err(OperationError::BlendFailed(_))),
+            "end-vertex conflict must surface as BlendFailed; got {:?}",
             result
         );
     }
@@ -1176,10 +1263,6 @@ mod tests {
             BlendKind::Chamfer,
         )
         .expect_err("cross-kind at degree-4 corner must reject");
-        let received = match err {
-            OperationError::InvalidInput { received, .. } => received,
-            other => panic!("expected InvalidInput, got {:?}", other),
-        };
 
         let degree_at_apex = model
             .edges
@@ -1187,25 +1270,47 @@ mod tests {
             .filter(|(_, e)| e.start_vertex == apex || e.end_vertex == apex)
             .count();
 
-        // Reconstruct the expected wording via a parallel
-        // construction; pinning the string keeps the contract stable.
-        let expected = BlendFailure::VertexBlendUnsupported {
-            vertex: apex,
-            kind: crate::operations::blend_graph::BlendVertexKind::ConvexCorner {
-                degree: degree_at_apex,
-            },
-            reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
-                existing: crate::primitives::solid::VertexBlendKindSet::single(
-                    BlendKind::Fillet,
+        // CF-β.5.2-B — `MixedKindUnsupported` now routes through
+        // `OperationError::BlendFailed(Box<BlendFailure>)` to preserve
+        // the typed `MixedKindRejectDetail` payload for the
+        // api-server's `ApiError::blend_failed` wire shape. Match the
+        // boxed failure structurally rather than the legacy
+        // `InvalidInput { received }` string surface.
+        match err {
+            OperationError::BlendFailed(boxed) => match *boxed {
+                BlendFailure::VertexBlendUnsupported {
+                    vertex,
+                    kind,
+                    reason:
+                        VertexBlendUnsupportedReason::MixedKindUnsupported {
+                            existing,
+                            requested,
+                            detail,
+                        },
+                } => {
+                    assert_eq!(vertex, apex);
+                    match kind {
+                        crate::operations::blend_graph::BlendVertexKind::ConvexCorner {
+                            degree,
+                        } => assert_eq!(degree, degree_at_apex),
+                        other => panic!("expected ConvexCorner kind, got {:?}", other),
+                    }
+                    assert!(existing.contains(BlendKind::Fillet));
+                    assert_eq!(requested, BlendKind::Chamfer);
+                    match detail {
+                        MixedKindRejectDetail::DegreeUnsupported { degree } => {
+                            assert_eq!(degree, degree_at_apex);
+                        }
+                        other => panic!("expected DegreeUnsupported, got {:?}", other),
+                    }
+                }
+                other => panic!(
+                    "expected VertexBlendUnsupported{{MixedKindUnsupported}}, got {:?}",
+                    other
                 ),
-                requested: BlendKind::Chamfer,
-                detail: MixedKindRejectDetail::DegreeUnsupported {
-                    degree: degree_at_apex,
-                },
             },
+            other => panic!("expected BlendFailed, got {:?}", other),
         }
-        .to_string();
-        assert_eq!(received, expected);
     }
 
     /// CF-β.3.4 — the degree-3 carve-out short-circuits the
@@ -1397,16 +1502,31 @@ mod tests {
         )
         .expect_err("degree-4 mixed-kind corner must still reject");
         match err {
-            OperationError::InvalidInput { received, .. } => {
-                assert!(received.contains("mixed-kind corner"));
-                assert!(received.contains(&format!("vertex {}", apex)));
-                assert!(
-                    received.contains(&format!("degree {}", degree_at_apex)),
-                    "reject must carry the actual incident-edge degree; got: {}",
-                    received
-                );
-            }
-            other => panic!("expected InvalidInput, got {:?}", other),
+            OperationError::BlendFailed(ref boxed) => match boxed.as_ref() {
+                crate::operations::diagnostics::BlendFailure::VertexBlendUnsupported {
+                    vertex,
+                    reason:
+                        crate::operations::diagnostics::VertexBlendUnsupportedReason::MixedKindUnsupported {
+                            detail:
+                                crate::operations::diagnostics::MixedKindRejectDetail::DegreeUnsupported {
+                                    degree,
+                                },
+                            ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(*vertex, apex, "rejected vertex id must match the apex");
+                    assert_eq!(
+                        *degree, degree_at_apex,
+                        "reject must carry the actual incident-edge degree"
+                    );
+                }
+                other => panic!(
+                    "expected MixedKindUnsupported{{DegreeUnsupported}}, got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected BlendFailed, got {:?}", other),
         }
     }
 

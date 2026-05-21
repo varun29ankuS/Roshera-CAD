@@ -132,7 +132,6 @@ fn fixture_box_baseline_topology() {
 /// and routes the corner to `synthesize_mixed_kind_corner_cap`.
 /// Final shell must be watertight.
 #[test]
-#[ignore = "blocked on CF-β.5.2-B: finalize-pass synthesizer dispatch for partial-mixed corners (#17)"]
 fn box_corner_one_chamfer_two_fillets_chamfer_first_then_fillet() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
@@ -188,7 +187,6 @@ fn box_corner_one_chamfer_two_fillets_chamfer_first_then_fillet() {
 /// The chamfer second call sees V already recorded with Fillet kind
 /// and routes through the chamfer-side dispatch hook.
 #[test]
-#[ignore = "blocked on CF-β.5.2-B: fillet-arc-rim discovery via find_blend_cap_edges_at_vertex returns 0 — needs investigation of fillet face cap-edge survival across surgery (#17)"]
 fn box_corner_two_fillets_then_chamfer_synthesises_mixed_cap() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
@@ -273,7 +271,6 @@ fn box_corner_mixed_kind_intermediate_state_skips_watertight_validation() {
 /// `MixedKindUnsupported { detail: DegreeUnsupported { degree: 4 } }`
 /// reject because the cap walker has not been validated for N > 3.
 #[test]
-#[ignore = "blocked on CF-β.5.2-B: degree-4 partial-mixed apex requires synthesizer scaffold to reach second call (#17)"]
 fn box_corner_mixed_kind_degree_4_pyramid_rejected_typed_degree_unsupported() {
     let mut model = BRepModel::new();
     let solid_id = make_square_pyramid_solid(&mut model, 10.0, 10.0);
@@ -358,7 +355,6 @@ fn box_corner_mixed_kind_degree_4_pyramid_rejected_typed_degree_unsupported() {
 /// so it ignores per-store ID ordering — only structural
 /// differences surface as a mismatch.
 #[test]
-#[ignore = "blocked on CF-β.5.2-B: requires synthesizer dispatch to compute final-state hash (#17)"]
 fn box_corner_mixed_kind_topology_hash_order_invariant() {
     // Order A: chamfer first then fillet. First call opts in the
     // apex corner; second call auto-detects via the pending
