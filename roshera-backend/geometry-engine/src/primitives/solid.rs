@@ -480,18 +480,26 @@ pub struct Solid {
     /// boundary by the *first* of two kind-mismatched calls at the same
     /// corner. The second call's dispatch hook
     /// (`mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`) closes
-    /// the boundary and removes the vertex from this set; the
-    /// post-operation `validate_result` gate consults the set to
+    /// the boundary and removes the vertex from this map; the
+    /// post-operation `validate_result` gate consults the keys to
     /// short-circuit non-manifold-edge and Euler-characteristic checks
     /// at edges incident to a pending corner, so the intermediate state
     /// passes validation without weakening the gate for everything else.
+    ///
+    /// CF-β.5.2-B: the *value* is the corner vertex's incident-edge
+    /// degree captured at opt-in time, **before** the first call's
+    /// surgery destroyed any of those edges. The feasibility pre-flight
+    /// (`lifecycle::validate_mixed_kind_corner_feasibility`) consults
+    /// this stored degree on the *second* call so it can reach the
+    /// degree-3 carve-out even after the first call's splice reduced
+    /// the per-edge incident count.
     ///
     /// Mutated by [`Self::mark_pending_mixed_kind_corner`] (first call,
     /// after surgery) and [`Self::clear_pending_mixed_kind_corner`]
     /// (second call, after cap synthesis). Idempotent on both sides.
     /// Survives [`Self::deep_copy`] so timeline replay preserves the
     /// intermediate-state expectation across snapshots.
-    pub(crate) pending_mixed_kind_corners: HashSet<VertexId>,
+    pub(crate) pending_mixed_kind_corners: HashMap<VertexId, usize>,
 }
 
 /// Top-level AABB used as a conservative collision proxy. The detailed
@@ -524,7 +532,7 @@ impl Solid {
             blended_edges: HashMap::new(),
             blended_vertices: HashMap::new(),
             blend_faces_by_kind: HashMap::new(),
-            pending_mixed_kind_corners: HashSet::new(),
+            pending_mixed_kind_corners: HashMap::new(),
         }
     }
 
@@ -663,19 +671,31 @@ impl Solid {
     /// for every corner vertex that was preserved by the
     /// `original_v*_corner_shared` flag *and* whose
     /// [`VertexBlendKindSet`] is single-kind after the call (i.e. the
-    /// matching opposite-kind call has not yet fired). Idempotent.
-    pub(crate) fn mark_pending_mixed_kind_corner(&mut self, vertex: VertexId) {
-        self.pending_mixed_kind_corners.insert(vertex);
+    /// matching opposite-kind call has not yet fired).
+    ///
+    /// CF-β.5.2-B: `original_degree` is the corner's incident-edge
+    /// count captured *before* surgery destroyed any of those edges.
+    /// The feasibility pre-flight uses it to reach the degree-3 carve-
+    /// out on the second call. Idempotent: a second call with the same
+    /// `(vertex, degree)` overwrites silently. A call with a different
+    /// `degree` for the same vertex also overwrites — kernel internals
+    /// invariably re-capture from the same pre-surgery model.
+    pub(crate) fn mark_pending_mixed_kind_corner(
+        &mut self,
+        vertex: VertexId,
+        original_degree: usize,
+    ) {
+        self.pending_mixed_kind_corners.insert(vertex, original_degree);
     }
 
-    /// CF-β.4 — clear `vertex` from the pending set once the matching
+    /// CF-β.4 — clear `vertex` from the pending map once the matching
     /// opposite-kind call has fired
     /// [`super::super::operations::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`]
     /// and the open boundary is closed by a stitched cap face.
     /// Idempotent — clearing a vertex that was never pending is a
     /// no-op (returns `false`).
     pub(crate) fn clear_pending_mixed_kind_corner(&mut self, vertex: VertexId) -> bool {
-        self.pending_mixed_kind_corners.remove(&vertex)
+        self.pending_mixed_kind_corners.remove(&vertex).is_some()
     }
 
     /// CF-β.4 — query whether `vertex` currently carries a partially-
@@ -686,14 +706,29 @@ impl Solid {
     /// circuit non-manifold-edge and Euler-characteristic checks at
     /// edges incident to a pending corner.
     pub fn is_mixed_kind_corner_pending(&self, vertex: VertexId) -> bool {
-        self.pending_mixed_kind_corners.contains(&vertex)
+        self.pending_mixed_kind_corners.contains_key(&vertex)
     }
 
-    /// CF-β.4 — read-only borrow of the full pending-corners set.
+    /// CF-β.5.2-B — read the original incident-edge degree captured
+    /// for `vertex` at the *first* of two kind-mismatched calls (the
+    /// one that opted V in via `partial_corner_vertices`). Returns
+    /// `None` when `vertex` is not pending. Used by
+    /// [`lifecycle::validate_mixed_kind_corner_feasibility`] to bypass
+    /// the per-current-edge degree count (which is meaningless on the
+    /// second call because surgery has already destroyed half the
+    /// corner's edges) and apply the degree-3 carve-out using the
+    /// pre-surgery topology.
+    pub fn pending_corner_original_degree(&self, vertex: VertexId) -> Option<usize> {
+        self.pending_mixed_kind_corners.get(&vertex).copied()
+    }
+
+    /// CF-β.4 — read-only borrow of the full pending-corners map.
     /// Used by `record_operation` to serialise the intermediate-state
     /// expectation into the timeline event payload, so a replay can
-    /// reproduce the same partially-blended boundary.
-    pub fn pending_mixed_kind_corners(&self) -> &HashSet<VertexId> {
+    /// reproduce the same partially-blended boundary. Callers that
+    /// only need the vertex keys (without the captured degrees)
+    /// iterate `.keys()`.
+    pub fn pending_mixed_kind_corners(&self) -> &HashMap<VertexId, usize> {
         &self.pending_mixed_kind_corners
     }
 
@@ -1941,23 +1976,25 @@ mod pending_mixed_kind_corners_tests {
     fn mark_then_query_round_trips() {
         let mut s = empty_solid();
         assert!(!s.is_mixed_kind_corner_pending(17));
-        s.mark_pending_mixed_kind_corner(17);
+        s.mark_pending_mixed_kind_corner(17, 3);
         assert!(s.is_mixed_kind_corner_pending(17));
         assert!(!s.is_mixed_kind_corner_pending(18));
+        assert_eq!(s.pending_corner_original_degree(17), Some(3));
+        assert_eq!(s.pending_corner_original_degree(18), None);
     }
 
     #[test]
     fn mark_is_idempotent() {
         let mut s = empty_solid();
-        s.mark_pending_mixed_kind_corner(3);
-        s.mark_pending_mixed_kind_corner(3);
+        s.mark_pending_mixed_kind_corner(3, 3);
+        s.mark_pending_mixed_kind_corner(3, 3);
         assert_eq!(s.pending_mixed_kind_corners().len(), 1);
     }
 
     #[test]
     fn clear_returns_true_only_when_present() {
         let mut s = empty_solid();
-        s.mark_pending_mixed_kind_corner(5);
+        s.mark_pending_mixed_kind_corner(5, 3);
         assert!(s.clear_pending_mixed_kind_corner(5));
         assert!(!s.is_mixed_kind_corner_pending(5));
         // Second clear is a no-op.
@@ -1969,11 +2006,12 @@ mod pending_mixed_kind_corners_tests {
     #[test]
     fn deep_copy_preserves_pending_set() {
         let mut s = empty_solid();
-        s.mark_pending_mixed_kind_corner(11);
-        s.mark_pending_mixed_kind_corner(13);
+        s.mark_pending_mixed_kind_corner(11, 3);
+        s.mark_pending_mixed_kind_corner(13, 4);
         let snap = s.deep_copy();
         assert!(snap.is_mixed_kind_corner_pending(11));
         assert!(snap.is_mixed_kind_corner_pending(13));
+        assert_eq!(snap.pending_corner_original_degree(13), Some(4));
         // Mutating the original after the snapshot must not leak in.
         s.clear_pending_mixed_kind_corner(11);
         assert!(
@@ -1986,14 +2024,15 @@ mod pending_mixed_kind_corners_tests {
     fn pending_corners_getter_reflects_current_state() {
         let mut s = empty_solid();
         assert!(s.pending_mixed_kind_corners().is_empty());
-        s.mark_pending_mixed_kind_corner(1);
-        s.mark_pending_mixed_kind_corner(2);
-        s.mark_pending_mixed_kind_corner(3);
+        s.mark_pending_mixed_kind_corner(1, 3);
+        s.mark_pending_mixed_kind_corner(2, 3);
+        s.mark_pending_mixed_kind_corner(3, 4);
         assert_eq!(s.pending_mixed_kind_corners().len(), 3);
         s.clear_pending_mixed_kind_corner(2);
         assert_eq!(s.pending_mixed_kind_corners().len(), 2);
-        assert!(s.pending_mixed_kind_corners().contains(&1));
-        assert!(s.pending_mixed_kind_corners().contains(&3));
-        assert!(!s.pending_mixed_kind_corners().contains(&2));
+        assert!(s.pending_mixed_kind_corners().contains_key(&1));
+        assert!(s.pending_mixed_kind_corners().contains_key(&3));
+        assert!(!s.pending_mixed_kind_corners().contains_key(&2));
+        assert_eq!(s.pending_corner_original_degree(3), Some(4));
     }
 }

@@ -353,6 +353,30 @@ pub fn fillet_edges(
             .flat_map(|e| [e.start_vertex, e.end_vertex])
             .collect();
 
+        // CF-β.5.2-B — capture each opt-in partial-mixed corner's
+        // incident-edge degree on the *pre-surgery* model. The
+        // `splice_blend_edge` loop downstream destroys some of those
+        // edges, so a post-surgery count would underflow the typed
+        // `MixedKindUnsupported { DegreeUnsupported { degree } }`
+        // payload that the second call's feasibility pre-flight emits.
+        // Mirrors chamfer.rs:153-168.
+        let partial_corner_original_degrees: HashMap<VertexId, usize> = {
+            let mut out: HashMap<VertexId, usize> = HashMap::new();
+            for &vid in &options.partial_corner_vertices {
+                if model.vertices.get(vid).is_none() {
+                    continue;
+                }
+                let mut degree: usize = 0;
+                for (_eid, edge) in model.edges.iter() {
+                    if edge.start_vertex == vid || edge.end_vertex == vid {
+                        degree += 1;
+                    }
+                }
+                out.insert(vid, degree);
+            }
+            out
+        };
+
         // Additional robust validation. For variable-radius fillets we
         // must check both endpoint radii — the linear interpolant means
         // either end can independently violate the half-edge-length bound,
@@ -578,7 +602,15 @@ pub fn fillet_edges(
                 .collect();
             if let Some(solid) = model.solids.get_mut(solid_id) {
                 for vid in alive_partial {
-                    solid.mark_pending_mixed_kind_corner(vid);
+                    // CF-β.5.2-B — original degree captured pre-surgery
+                    // (see `partial_corner_original_degrees` above);
+                    // 0 fallback is defensive — the alive_partial
+                    // filter above already excludes missing vertices.
+                    let original_degree = partial_corner_original_degrees
+                        .get(&vid)
+                        .copied()
+                        .unwrap_or(0);
+                    solid.mark_pending_mixed_kind_corner(vid, original_degree);
                 }
             }
         }
@@ -645,7 +677,7 @@ pub fn fillet_edges(
                 .get(solid_id)
                 .map(|s| {
                     s.pending_mixed_kind_corners()
-                        .iter()
+                        .keys()
                         .map(|&vid| vid as u64)
                         .collect()
                 })
@@ -6110,10 +6142,10 @@ fn validate_filleted_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
     // Euler-deficit errors at the corner's local neighbourhood. Drop
     // those before re-evaluating validity; every other defect still
     // surfaces.
-    let pending = model
+    let pending: HashSet<VertexId> = model
         .solids
         .get(solid_id)
-        .map(|s| s.pending_mixed_kind_corners().clone())
+        .map(|s| s.pending_mixed_kind_corners().keys().copied().collect())
         .unwrap_or_default();
     if !pending.is_empty() {
         result.errors = super::mixed_kind_corner_cap::filter_pending_corner_errors(

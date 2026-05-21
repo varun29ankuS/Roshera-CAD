@@ -188,7 +188,7 @@ fn box_corner_one_chamfer_two_fillets_chamfer_first_then_fillet() {
 /// The chamfer second call sees V already recorded with Fillet kind
 /// and routes through the chamfer-side dispatch hook.
 #[test]
-#[ignore = "blocked on CF-β.5.2-B: finalize-pass synthesizer dispatch for partial-mixed corners (#17)"]
+#[ignore = "blocked on CF-β.5.2-B: fillet-arc-rim discovery via find_blend_cap_edges_at_vertex returns 0 — needs investigation of fillet face cap-edge survival across surgery (#17)"]
 fn box_corner_two_fillets_then_chamfer_synthesises_mixed_cap() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);

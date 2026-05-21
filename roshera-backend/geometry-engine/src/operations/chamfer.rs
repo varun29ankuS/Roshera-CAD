@@ -142,6 +142,31 @@ pub fn chamfer_edges(
             .flat_map(|e| [e.start_vertex, e.end_vertex])
             .collect();
 
+        // CF-β.5.2-B — capture each opt-in partial-mixed corner's
+        // incident-edge degree on the *pre-surgery* model. The
+        // `splice_blend_edge` loop downstream destroys some of those
+        // edges, so a post-surgery count would underflow the typed
+        // `MixedKindUnsupported { DegreeUnsupported { degree } }`
+        // payload that the second call's feasibility pre-flight emits.
+        // Recorded into `Solid::pending_mixed_kind_corners` below
+        // alongside `mark_pending_mixed_kind_corner`.
+        let partial_corner_original_degrees: HashMap<VertexId, usize> = {
+            let mut out: HashMap<VertexId, usize> = HashMap::new();
+            for &vid in &options.partial_corner_vertices {
+                if model.vertices.get(vid).is_none() {
+                    continue;
+                }
+                let mut degree: usize = 0;
+                for (_eid, edge) in model.edges.iter() {
+                    if edge.start_vertex == vid || edge.end_vertex == vid {
+                        degree += 1;
+                    }
+                }
+                out.insert(vid, degree);
+            }
+            out
+        };
+
         // Propagate edge selection if requested
         let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
@@ -259,7 +284,16 @@ pub fn chamfer_edges(
                 .collect();
             if let Some(solid) = model.solids.get_mut(solid_id) {
                 for vid in alive_partial {
-                    solid.mark_pending_mixed_kind_corner(vid);
+                    // CF-β.5.2-B — original degree captured
+                    // pre-surgery (see `partial_corner_original_degrees`
+                    // above). Falls back to 0 only if the vertex was
+                    // already gone at function entry (defensive — the
+                    // alive_partial filter above already excludes that).
+                    let original_degree = partial_corner_original_degrees
+                        .get(&vid)
+                        .copied()
+                        .unwrap_or(0);
+                    solid.mark_pending_mixed_kind_corner(vid, original_degree);
                 }
             }
         }
@@ -318,7 +352,7 @@ pub fn chamfer_edges(
                 .get(solid_id)
                 .map(|s| {
                     s.pending_mixed_kind_corners()
-                        .iter()
+                        .keys()
                         .map(|&vid| vid as u64)
                         .collect()
                 })
@@ -3097,10 +3131,10 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
     // Euler-deficit errors at the corner's local neighbourhood. Drop
     // those before re-evaluating validity; every other defect still
     // surfaces.
-    let pending = model
+    let pending: HashSet<VertexId> = model
         .solids
         .get(solid_id)
-        .map(|s| s.pending_mixed_kind_corners().clone())
+        .map(|s| s.pending_mixed_kind_corners().keys().copied().collect())
         .unwrap_or_default();
     if !pending.is_empty() {
         result.errors = super::mixed_kind_corner_cap::filter_pending_corner_errors(
