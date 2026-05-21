@@ -426,17 +426,29 @@ fn validate_mixed_kind_corner_feasibility(
     existing: crate::primitives::solid::VertexBlendKindSet,
     requested: BlendKind,
 ) -> OperationResult<()> {
-    // Count incident edges at the vertex (used as `degree` payload).
-    // We walk the model's edge store rather than rely on a vertex
-    // adjacency cache because the gate runs pre-flight: the topology
-    // may have just been mutated by `splice_blend_edge` upstream and
-    // any cache would risk staleness.
-    let mut degree: usize = 0;
-    for (_id, edge) in model.edges.iter() {
-        if edge.start_vertex == vertex || edge.end_vertex == vertex {
-            degree += 1;
-        }
-    }
+    // CF-β.5.2-B — when the vertex was already opted-in by an earlier
+    // partial-mixed call, the first call's `splice_blend_edge` loop
+    // has destroyed the rim edges that originally landed at V, so a
+    // straight current-edge count under-reports the topological
+    // degree (a 3-edge box corner now shows as 1 after the chamfer
+    // pass destroyed 2). The pre-surgery degree captured at the
+    // first call's entry is the authoritative value for the typed
+    // `DegreeUnsupported` payload and the degree-3 carve-out below.
+    // Non-pending vertices (first call's pre-flight) fall through
+    // to the live edge-store count.
+    let degree: usize = model
+        .solids
+        .get(solid_id)
+        .and_then(|s| s.pending_corner_original_degree(vertex))
+        .unwrap_or_else(|| {
+            let mut d: usize = 0;
+            for (_id, edge) in model.edges.iter() {
+                if edge.start_vertex == vertex || edge.end_vertex == vertex {
+                    d += 1;
+                }
+            }
+            d
+        });
 
     // β.3.4 degree-3 carve-out — the cap synthesizer's headline case
     // (3-edge equal-displacement convex box corner). Higher degrees
