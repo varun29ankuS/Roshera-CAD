@@ -973,3 +973,127 @@ async fn fillet_radii_array_with_overrides_returns_400() {
         "double-spec rejection must surface as invalid_parameter; body = {body}"
     );
 }
+
+// =====================================================================
+// CF-β.5.2-C — partial_corner_vertices wire-shape through the router
+// =====================================================================
+
+/// Build a POST `/api/geometry/chamfer` request with the given JSON
+/// payload — sibling of [`fillet_post`].
+fn chamfer_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/chamfer")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static chamfer request must build")
+}
+
+/// Non-array `partial_corner_vertices` (here: a bare integer) must be
+/// rejected at the parser boundary with the typed
+/// `invalid_parameter` wire shape, before the kernel ever sees the
+/// payload. Pins the contract that the field is an array of u32 ids,
+/// nothing else.
+#[tokio::test]
+async fn fillet_partial_corner_vertices_non_array_returns_invalid_parameter_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [0_u64],
+        "radius": 0.1,
+        "partial_corner_vertices": 7,
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "scalar partial_corner_vertices must reject as 400; body = {body}"
+    );
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("partial_corner_vertices"),
+        "error must name the offending field; got {error_str:?}"
+    );
+}
+
+/// Negative `partial_corner_vertices` entry — same parser arm as the
+/// non-array case but exercises the per-entry u32-range check.
+#[tokio::test]
+async fn fillet_partial_corner_vertices_negative_entry_returns_invalid_parameter_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [0_u64],
+        "radius": 0.1,
+        "partial_corner_vertices": [1, -2, 3],
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("partial_corner_vertices[1]"),
+        "error must name the offending index; got {error_str:?}"
+    );
+}
+
+/// Identical parser contract for the chamfer endpoint — pins that
+/// both blend endpoints expose the same opt-in wire shape.
+#[tokio::test]
+async fn chamfer_partial_corner_vertices_non_array_returns_invalid_parameter_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = chamfer_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [0_u64],
+        "distance": 0.1,
+        "partial_corner_vertices": "not-an-array",
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "scalar partial_corner_vertices must reject as 400 on chamfer too; body = {body}"
+    );
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("partial_corner_vertices"),
+        "error must name the offending field; got {error_str:?}"
+    );
+}
+
+/// Empty `partial_corner_vertices` array is accepted as a no-op: the
+/// happy path must succeed and return 200 with the standard
+/// mesh-bearing wire shape. Pins that the opt-in surface is
+/// genuinely optional and does not regress the legacy CF-α
+/// contract for callers that don't use the feature.
+#[tokio::test]
+async fn fillet_empty_partial_corner_vertices_is_noop_returns_200() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [rim],
+        "radius": 0.1,
+        "partial_corner_vertices": [],
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "empty partial_corner_vertices must be a no-op; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
