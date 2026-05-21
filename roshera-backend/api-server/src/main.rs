@@ -1535,6 +1535,59 @@ async fn mirror_solid(
 /// Frontends receive a single `ObjectUpdated` frame with the new
 /// tessellation; the feature tree nests `Fillet-N` as a child of
 /// the body event, matching SolidWorks / Fusion behaviour.
+///
+/// CF-β.5.2-C — optional `partial_corner_vertices` (an array of
+/// `VertexId` integers). Each entry opts the named vertex out of the
+/// F2-γ.1 setback-aware corner gate for the current call. The kernel
+/// V-side surgery preserves the vertex and registers it in
+/// `Solid::pending_mixed_kind_corners`; the *next* blend call of the
+/// opposite kind at that corner synthesises a mixed-kind cap and
+/// closes the shell. See the CF-β plan for the order-independence
+/// contract. Absent / empty field → CF-α / CF-β.3.4 baseline.
+///
+/// Parse the optional `partial_corner_vertices` JSON field common to
+/// the `/api/geometry/fillet` and `/api/geometry/chamfer` endpoints.
+/// Missing or `null` → empty `Vec`. Non-array, non-integer, or
+/// out-of-`u32` entries surface as `InvalidParameter` 400. Duplicates
+/// are accepted (the kernel dedups internally via `HashSet`).
+fn parse_partial_corner_vertices(
+    payload: &serde_json::Value,
+) -> Result<Vec<geometry_engine::primitives::vertex::VertexId>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::primitives::vertex::VertexId;
+
+    let value = match payload.get("partial_corner_vertices") {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(Vec::new()),
+    };
+    let array = value.as_array().ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            "'partial_corner_vertices' must be an array of vertex ids (u32 integers)"
+                .to_string(),
+        )
+    })?;
+    let mut out: Vec<VertexId> = Vec::with_capacity(array.len());
+    for (i, item) in array.iter().enumerate() {
+        let n = item.as_u64().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "'partial_corner_vertices[{i}]' must be a non-negative integer, got {item}"
+                ),
+            )
+        })?;
+        if n > u32::MAX as u64 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("'partial_corner_vertices[{i}]'={n} exceeds u32::MAX"),
+            ));
+        }
+        out.push(n as VertexId);
+    }
+    Ok(out)
+}
+
 async fn fillet_edges_endpoint(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -1617,6 +1670,13 @@ async fn fillet_edges_endpoint(
     // check and surfaces it as `InvalidParameter` 400.
     radii_parsed.validate_overrides_against_edges(&edges)?;
 
+    // CF-β.5.2-C — optional opt-in for partial-mixed corners. Threaded
+    // unchanged into every kernel dispatch arm below; the kernel's
+    // `validate_corner_compatibility` carves these out of the F2-γ.1
+    // setback gate so the cross-kind first call can deliberately
+    // leave a planar boundary at the corner.
+    let partial_corner_vertices = parse_partial_corner_vertices(&payload)?;
+
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -1693,6 +1753,7 @@ async fn fillet_edges_endpoint(
                 fillet_type: FilletType::PerEdgeProfile(expanded),
                 radius: conservative_radius,
                 propagation: PropagationMode::None,
+                partial_corner_vertices: partial_corner_vertices.clone(),
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
@@ -1701,6 +1762,7 @@ async fn fillet_edges_endpoint(
             let opts = FilletOptions {
                 fillet_type: radii_parsed.to_fillet_type(0),
                 propagation: PropagationMode::None,
+                partial_corner_vertices: partial_corner_vertices.clone(),
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
@@ -1725,15 +1787,22 @@ async fn fillet_edges_endpoint(
                 fillet_type: FilletType::PerEdgeConstant(map),
                 radius: radius_repr,
                 propagation: PropagationMode::None,
+                partial_corner_vertices: partial_corner_vertices.clone(),
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
                 .map_err(ApiError::from)?;
         } else {
+            // Per-edge variable-profile loop. The opt-in vector is
+            // cloned per iteration: at each kernel call the same
+            // pending-corner set carves out the same corner from
+            // F2-γ.1, and the surgery-side dedup is idempotent for
+            // already-pending vertices.
             for (i, &edge_id) in edges.iter().enumerate() {
                 let opts = FilletOptions {
                     fillet_type: radii_parsed.to_fillet_type(i),
                     propagation: PropagationMode::None,
+                    partial_corner_vertices: partial_corner_vertices.clone(),
                     ..FilletOptions::default()
                 };
                 kernel_fillet(&mut model, solid_id, vec![edge_id], opts)
@@ -1778,7 +1847,7 @@ async fn fillet_edges_endpoint(
     // field for back-compat with the pre-F3-ε.2 broadcast contract;
     // anything else fans out as `radii: [...]` (one tagged DTO per
     // edge, parallel to `edges`).
-    let parameters = if uniform_constant {
+    let mut parameters = if uniform_constant {
         serde_json::json!({
             "radius": canonical_per_edge[0].clone(),
             "source": object_uuid.to_string(),
@@ -1789,6 +1858,19 @@ async fn fillet_edges_endpoint(
             "source": object_uuid.to_string(),
         })
     };
+    // CF-β.5.2-C — echo the opt-in vector so timeline replay /
+    // chat subscribers can reproduce the exact partial-mixed contract.
+    // Omitted when empty to keep the legacy CF-α broadcast shape
+    // byte-identical for callers that don't opt in.
+    if !partial_corner_vertices.is_empty() {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.insert(
+                "partial_corner_vertices".to_string(),
+                serde_json::to_value(&partial_corner_vertices)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
     let result_id_str = object_uuid.to_string();
 
     broadcast_object_updated(
@@ -1898,6 +1980,10 @@ async fn chamfer_edges_endpoint(
         edges.push(n as EdgeId);
     }
 
+    // CF-β.5.2-C — same opt-in surface as fillet. See
+    // `parse_partial_corner_vertices` doc-comment for the contract.
+    let partial_corner_vertices = parse_partial_corner_vertices(&payload)?;
+
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -1913,6 +1999,7 @@ async fn chamfer_edges_endpoint(
             distance2: distance,
             symmetric: true,
             propagation: PropagationMode::None,
+            partial_corner_vertices: partial_corner_vertices.clone(),
             ..ChamferOptions::default()
         };
         kernel_chamfer(&mut model, solid_id, edges, opts).map_err(ApiError::from)?;
@@ -1949,10 +2036,20 @@ async fn chamfer_edges_endpoint(
     // discards it in favour of the existing name (see
     // `ws-bridge.ts::case 'ObjectUpdated'`).
     let display_name = format!("Chamfer {}", solid_id);
-    let parameters = serde_json::json!({
+    let mut parameters = serde_json::json!({
         "distance": distance,
         "source": object_uuid.to_string(),
     });
+    // CF-β.5.2-C — echo opt-in. Omitted when empty for back-compat.
+    if !partial_corner_vertices.is_empty() {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.insert(
+                "partial_corner_vertices".to_string(),
+                serde_json::to_value(&partial_corner_vertices)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
     let result_id_str = object_uuid.to_string();
 
     broadcast_object_updated(
@@ -5181,6 +5278,76 @@ mod tests {
     #[tokio::test]
     async fn test_root_endpoint() {
         // Test root endpoint
+    }
+
+    // -----------------------------------------------------------------
+    // CF-β.5.2-C — `partial_corner_vertices` wire-shape parser tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_partial_corner_vertices_missing_field_returns_empty() {
+        let payload = serde_json::json!({ "object": "x", "edges": [1] });
+        let parsed = parse_partial_corner_vertices(&payload)
+            .expect("missing field must default to empty vec");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_null_field_returns_empty() {
+        let payload = serde_json::json!({
+            "object": "x",
+            "edges": [1],
+            "partial_corner_vertices": serde_json::Value::Null,
+        });
+        let parsed = parse_partial_corner_vertices(&payload)
+            .expect("null field must default to empty vec");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_valid_u32_array_round_trips() {
+        let payload = serde_json::json!({
+            "partial_corner_vertices": [0_u64, 1, 42, u32::MAX as u64],
+        });
+        let parsed = parse_partial_corner_vertices(&payload)
+            .expect("valid u32 array must parse");
+        assert_eq!(parsed, vec![0_u32, 1, 42, u32::MAX]);
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_rejects_non_array() {
+        let payload = serde_json::json!({ "partial_corner_vertices": 7 });
+        let err = parse_partial_corner_vertices(&payload)
+            .expect_err("scalar must reject as InvalidParameter");
+        assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_rejects_non_integer_entry() {
+        let payload =
+            serde_json::json!({ "partial_corner_vertices": [1, "two", 3] });
+        let err = parse_partial_corner_vertices(&payload)
+            .expect_err("string entry must reject");
+        assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_rejects_negative_entry() {
+        let payload =
+            serde_json::json!({ "partial_corner_vertices": [1, -2, 3] });
+        let err = parse_partial_corner_vertices(&payload)
+            .expect_err("negative entry must reject");
+        assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_rejects_overflow_entry() {
+        let overflow = (u32::MAX as u64) + 1;
+        let payload =
+            serde_json::json!({ "partial_corner_vertices": [overflow] });
+        let err = parse_partial_corner_vertices(&payload)
+            .expect_err("u32 overflow must reject");
+        assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
     }
 }
 
