@@ -57,6 +57,34 @@ pub struct FilletOptions {
 
     /// Quality level (affects tessellation)
     pub quality: FilletQuality,
+
+    /// CF-β.5.2-A — opt-in: convex corner vertices at which the caller
+    /// intends to leave a *partial-mixed* selection — i.e. fewer
+    /// edges of this call's blend kind than the vertex's incident
+    /// degree, knowing that a follow-up call of the opposite kind
+    /// will close the corner. Listing a vertex here:
+    ///
+    /// 1. Carves the vertex out of the F2-γ.1 setback-aware corner
+    ///    compatibility gate (otherwise the gate would reject this
+    ///    selection as a same-corner multi-edge clash).
+    /// 2. Stamps `original_v?_corner_shared = true` on every
+    ///    `BlendEdgeSurgery` whose surgery endpoint matches an
+    ///    opt-in vertex, so `splice_blend_edge` skips the V-side
+    ///    cap insertion + corner-vertex removal at that endpoint
+    ///    (V is preserved for the follow-up call to reference).
+    /// 3. Registers the vertex into `Solid::pending_mixed_kind_corners`
+    ///    on success so the post-flight `validate_result` carve-out
+    ///    filters non-manifold-edge errors at these intentionally-
+    ///    open intermediate corners (CF-β.4.2).
+    ///
+    /// Empty by default; standard single-edge / fully-selected
+    /// multi-edge selections continue to operate exactly as
+    /// before. The second of the two kind-mismatched calls
+    /// auto-detects the partial-mixed corner via the
+    /// `pending_mixed_kind_corners` set + the opposite-kind
+    /// records on `Solid::blended_vertices`, so the caller does
+    /// not need to repeat the opt-in there.
+    pub partial_corner_vertices: Vec<VertexId>,
 }
 
 impl Default for FilletOptions {
@@ -68,6 +96,7 @@ impl Default for FilletOptions {
             propagation: PropagationMode::Tangent,
             preserve_edges: true,
             quality: FilletQuality::Standard,
+            partial_corner_vertices: Vec::new(),
         }
     }
 }
@@ -238,6 +267,7 @@ pub fn fillet_edges(
             OpSpec::FilletEdges {
                 solid_id,
                 edges: &edges,
+                partial_corner_vertices: &options.partial_corner_vertices,
             },
         )?;
 
@@ -529,6 +559,30 @@ pub fn fillet_edges(
             create_fillet_transitions(model, solid_id, &blend_graph, &edge_to_face, &corner_positions)?;
         fillet_faces.extend(corner_faces);
 
+        // CF-β.5.2-A — register every opt-in partial-mixed corner
+        // vertex in the host solid's `pending_mixed_kind_corners`
+        // set BEFORE the `validate_result` gate runs. Mirrors the
+        // chamfer-side registration in `chamfer::chamfer_edges`;
+        // the β.4.2 carve-out inside `validate_filleted_solid`
+        // consults this set via `filter_pending_corner_errors` to
+        // drop non-manifold-edge errors at intentionally-open
+        // corners. Vertices that no longer survive surgery (e.g.
+        // the corner closed through one of the homogeneous paths
+        // and V was removed) are filtered out.
+        if !options.partial_corner_vertices.is_empty() {
+            let alive_partial: Vec<VertexId> = options
+                .partial_corner_vertices
+                .iter()
+                .copied()
+                .filter(|&vid| model.vertices.get(vid).is_some())
+                .collect();
+            if let Some(solid) = model.solids.get_mut(solid_id) {
+                for vid in alive_partial {
+                    solid.mark_pending_mixed_kind_corner(vid);
+                }
+            }
+        }
+
         // Validate result if requested
         if options.common.validate_result {
             validate_filleted_solid(model, solid_id)?;
@@ -599,6 +653,18 @@ pub fn fillet_edges(
             v.sort_unstable();
             v
         };
+        // CF-β.5.2-A — caller's opt-in partial-mixed corner
+        // declaration. Computed outside the `json!` macro because
+        // the macro cannot parse the `Vec<u64>` turbofish.
+        let partial_corner_vertices_payload: Vec<u64> = {
+            let mut v: Vec<u64> = options
+                .partial_corner_vertices
+                .iter()
+                .map(|&vid| vid as u64)
+                .collect();
+            v.sort_unstable();
+            v
+        };
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("fillet_edges")
                 .with_parameters(serde_json::json!({
@@ -609,6 +675,7 @@ pub fn fillet_edges(
                     "preserve_edges": options.preserve_edges,
                     "quality": format!("{:?}", options.quality),
                     "pending_mixed_kind_corners": pending_after_call,
+                    "partial_corner_vertices": partial_corner_vertices_payload,
                 }))
                 .with_input_solids([solid_id as u64])
                 .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
@@ -1003,10 +1070,25 @@ fn create_fillet_chain(
                 .and_then(|sol| sol.vertex_blend_set(s.original_v1))
                 .map(|set| set.contains(BlendKind::Chamfer))
                 .unwrap_or(false);
-            s.original_v0_corner_shared =
-                is_three_edge_convex_corner(blend_graph, s.original_v0) || v0_prior_chamfer;
-            s.original_v1_corner_shared =
-                is_three_edge_convex_corner(blend_graph, s.original_v1) || v1_prior_chamfer;
+            // CF-β.5.2-A — opt-in partial-mixed: caller explicitly
+            // listed this corner vertex, declaring intent to leave
+            // the corner open for a follow-up opposite-kind call.
+            // OR'd alongside the BlendGraph 3-corner classifier and
+            // the prior-chamfer auto-detect so the stamp fires
+            // whether the partial-mixed corner is opt-in (first
+            // call of two) or auto-detected on the closing call.
+            let v0_partial_opt_in = options
+                .partial_corner_vertices
+                .contains(&s.original_v0);
+            let v1_partial_opt_in = options
+                .partial_corner_vertices
+                .contains(&s.original_v1);
+            s.original_v0_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v0)
+                || v0_prior_chamfer
+                || v0_partial_opt_in;
+            s.original_v1_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v1)
+                || v1_prior_chamfer
+                || v1_partial_opt_in;
             surgeries.push(s);
         }
     }

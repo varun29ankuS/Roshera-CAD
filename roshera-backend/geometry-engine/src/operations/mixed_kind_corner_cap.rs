@@ -524,24 +524,90 @@ pub(crate) fn filter_pending_corner_errors(
         })
         .collect();
 
+    // CF-β.5.2-A — faces in the local neighbourhood of a pending
+    // corner. The cap rim edges of a partial blend (with
+    // `corner_shared=true`) sit on a *newly-created* blend face that
+    // does NOT contain V in its loop; V remains in the adjacent
+    // host face's loop instead. The new blend face touches those
+    // host faces via shared (trim) edges. So the neighbourhood is:
+    //
+    //   1. **V-faces**: faces whose loops visit any pending V
+    //      (the host faces that kept V after `corner_shared` splice).
+    //   2. **V-adjacent faces**: faces sharing at least one edge
+    //      with a V-face — these include the new blend face whose
+    //      rim is the dangling boundary.
+    //
+    // Boundary-edge connectivity errors at edges lying in any
+    // V-adjacent face are part of the deliberate open boundary and
+    // must drop. Errors at faces outside this neighbourhood still
+    // surface — the filter stays local.
+    let v_faces: HashSet<u32> = model
+        .loops
+        .iter()
+        .filter_map(|(lid, lp)| {
+            let touches_v = lp.edges.iter().any(|&eid| {
+                model
+                    .edges
+                    .get(eid)
+                    .map(|e| pending.contains(&e.start_vertex) || pending.contains(&e.end_vertex))
+                    .unwrap_or(false)
+            });
+            if !touches_v {
+                return None;
+            }
+            // Locate the face that owns this loop.
+            model
+                .faces
+                .iter()
+                .find(|(_, f)| f.outer_loop == lid || f.inner_loops.contains(&lid))
+                .map(|(fid, _)| fid)
+        })
+        .collect();
+
+    // Edges that appear in a V-face's loop — used to find V-adjacent
+    // faces via the inverse-incidence.
+    let v_face_edges: HashSet<EdgeId> = model
+        .loops
+        .iter()
+        .filter(|(lid, _)| {
+            model.faces.iter().any(|(fid, f)| {
+                v_faces.contains(&fid)
+                    && (f.outer_loop == *lid || f.inner_loops.contains(lid))
+            })
+        })
+        .flat_map(|(_, lp)| lp.edges.iter().copied())
+        .collect();
+
+    let mut v_adjacent_faces: HashSet<u32> = v_faces.clone();
+    for (fid, face) in model.faces.iter() {
+        let touches_v_face_edge = std::iter::once(face.outer_loop)
+            .chain(face.inner_loops.iter().copied())
+            .filter_map(|lid| model.loops.get(lid))
+            .flat_map(|lp| lp.edges.iter().copied())
+            .any(|eid| v_face_edges.contains(&eid));
+        if touches_v_face_edge {
+            v_adjacent_faces.insert(fid);
+        }
+    }
+
     use crate::primitives::validation::ValidationError;
     errors
         .into_iter()
         .filter(|err| {
             // Only errors whose variant carries an `EntityLocation`
             // are candidates for the filter; the rest pass through.
-            let location = match err {
-                ValidationError::TopologyError { location, .. }
-                | ValidationError::GeometryError { location, .. }
-                | ValidationError::OrientationError { location, .. }
-                | ValidationError::ConnectivityError { location, .. } => location,
+            let (message, location) = match err {
+                ValidationError::TopologyError { message, location }
+                | ValidationError::GeometryError { message, location }
+                | ValidationError::OrientationError { message, location }
+                | ValidationError::ConnectivityError { message, location } => {
+                    (message.as_str(), location)
+                }
                 _ => return true,
             };
             // Drop iff the error is at a pending vertex OR at an
-            // edge incident to a pending vertex. Other locations
-            // (face / loop / shell / solid only) pass through —
-            // the deliberate open boundary is a vertex/edge-local
-            // phenomenon.
+            // edge incident to a pending vertex. The deliberate
+            // open boundary is a vertex/edge-local phenomenon.
             if let Some(vid) = location.vertex_id {
                 if pending.contains(&vid) {
                     return false;
@@ -549,6 +615,34 @@ pub(crate) fn filter_pending_corner_errors(
             }
             if let Some(eid) = location.edge_id {
                 if pending_incident_edges.contains(&eid) {
+                    return false;
+                }
+            }
+            // CF-β.5.2-A — shell- or solid-scoped errors with no
+            // edge/vertex location, caused by the deliberate open
+            // boundary, must also be dropped while a corner is
+            // pending. Primarily the Euler-characteristic deficit:
+            // V−E+F ≠ 2 when one corner loop is intentionally open.
+            // Anchor on the message prefix (matches
+            // `validate_model_enhanced`'s wording) to keep the
+            // filter narrow — every other shell-scoped defect still
+            // surfaces.
+            let is_shell_scoped = location.vertex_id.is_none()
+                && location.edge_id.is_none()
+                && location.face_id.is_none()
+                && location.loop_id.is_none();
+            if is_shell_scoped && message.starts_with("Invalid Euler characteristic") {
+                return false;
+            }
+            // CF-β.5.2-A — boundary-edge connectivity errors on
+            // faces within the V-adjacent neighbourhood are part of
+            // the deliberate open boundary at the partial-mixed
+            // corner. Match the validator's wording ("Boundary edge
+            // {} detected") to keep the predicate narrow.
+            if let Some(fid) = location.face_id {
+                if v_adjacent_faces.contains(&fid)
+                    && message.starts_with("Boundary edge")
+                {
                     return false;
                 }
             }

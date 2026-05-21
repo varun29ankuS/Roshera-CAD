@@ -164,6 +164,7 @@ fn build_corner_chamfer(chamfer_type: ChamferType) -> (BRepModel, SolidId, Vec<F
         symmetric: (d1 - d2).abs() < 1.0e-12,
         propagation: PropagationMode::None,
         preserve_edges: false,
+        partial_corner_vertices: Vec::new(),
         common: CommonOptions {
             validate_result: false,
             ..Default::default()

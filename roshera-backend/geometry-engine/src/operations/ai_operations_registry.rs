@@ -689,6 +689,7 @@ impl OperationsRegistry {
             propagation: crate::operations::fillet::PropagationMode::Tangent,
             preserve_edges: true,
             quality: crate::operations::fillet::FilletQuality::Standard,
+            partial_corner_vertices: Vec::new(),
         };
         // Get the solid_id from the first edge's parent face
         let solid_id = if !edge_ids.is_empty() {
@@ -785,6 +786,7 @@ impl OperationsRegistry {
             chamfer_type: crate::operations::chamfer::ChamferType::EqualDistance(distance),
             propagation: crate::operations::chamfer::PropagationMode::None,
             preserve_edges: false,
+            partial_corner_vertices: Vec::new(),
         };
 
         // Get the solid_id from the first edge's parent face

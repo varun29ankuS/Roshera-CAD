@@ -357,6 +357,7 @@ fn chamfer_pyramid_apex_emits_planar_quad_cap() {
         symmetric: true,
         propagation: PropagationMode::None,
         preserve_edges: false,
+        partial_corner_vertices: Vec::new(),
         common: CommonOptions {
             validate_result: false,
             ..Default::default()
@@ -465,6 +466,7 @@ fn chamfer_pyramid_apex_three_of_four_edges_subset() {
         symmetric: true,
         propagation: PropagationMode::None,
         preserve_edges: false,
+        partial_corner_vertices: Vec::new(),
         common: CommonOptions {
             validate_result: false,
             ..Default::default()
