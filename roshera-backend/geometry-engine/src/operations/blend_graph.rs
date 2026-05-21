@@ -1022,6 +1022,59 @@ pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> Opera
     Ok(())
 }
 
+/// Zero out the Hoffmann / apex setbacks at the listed vertices on
+/// every incident [`BlendEdge`] in `graph`. Used by the CF-β.5.2-B
+/// partial-mixed corner path: at a 3-edge corner where one incident
+/// edge is closed by a planar chamfer face (rather than a rolling
+/// ball or apex sphere), the fillet arc on each of the remaining
+/// two incident edges must terminate where the chamfer face begins
+/// — i.e. at the simple offset point `V + r·u_face_edge` along the
+/// non-filleted adjacent edge — *not* at the Hoffmann smooth-closure
+/// retraction `r·cos(θ/2)` that [`compute_setbacks`] writes. Setting
+/// the V-end setback to `None` (treated as `0.0` by
+/// [`crate::operations::spine_solver::compute_setback_trim`]) makes
+/// the fillet trim collapse to `ParamTrim::FULL` at V, so the arc
+/// endpoint lands at the face-boundary tangent points that match
+/// the chamfer's offset convention.
+///
+/// **Side effects.** For each `(vid, eid)` pair where `eid` is in
+/// `graph.vertices[vid].incident_blend_edges`: sets
+/// `start_setback = None` if `vid == edge.start_vertex`, sets
+/// `end_setback = None` if `vid == edge.end_vertex`. Vertices not in
+/// `graph.vertices` are silently skipped (the caller's
+/// `partial_corner_vertices` list may include vertices that no
+/// incident blend edge in this graph touches).
+///
+/// **Idempotency.** Multiple calls produce the same final state
+/// (subsequent calls re-set already-`None` slots to `None`).
+///
+/// Must be called *after* both [`compute_setbacks`] and
+/// [`compute_apex_setbacks`] — otherwise those passes would
+/// re-stamp the Hoffmann / apex values back over the cleared
+/// slots.
+pub fn clear_setbacks_at(graph: &mut BlendGraph, model: &BRepModel, vertex_ids: &[VertexId]) {
+    for &vid in vertex_ids {
+        let incident: Vec<EdgeId> = match graph.vertices.get(&vid) {
+            Some(v) => v.incident_blend_edges.clone(),
+            None => continue,
+        };
+        for eid in incident {
+            let (is_start, is_end) = match model.edges.get(eid) {
+                Some(e) => (e.start_vertex == vid, e.end_vertex == vid),
+                None => continue,
+            };
+            if let Some(be) = graph.edges.get_mut(&eid) {
+                if is_start {
+                    be.start_setback = None;
+                }
+                if is_end {
+                    be.end_setback = None;
+                }
+            }
+        }
+    }
+}
+
 /// True if a vertex of the given kind should receive a setback
 /// computation. Pulled out for testability.
 #[inline]

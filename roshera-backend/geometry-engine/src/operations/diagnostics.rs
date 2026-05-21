@@ -489,7 +489,18 @@ impl std::fmt::Display for BlendFailure {
 impl From<BlendFailure> for OperationError {
     fn from(failure: BlendFailure) -> Self {
         let detail = failure.to_string();
-        match failure {
+        match &failure {
+            // CF-β.2: MixedKindUnsupported carries a typed
+            // `MixedKindRejectDetail` payload that agents (and the
+            // api-server wire shape) need to branch on, so it routes
+            // to the typed `BlendFailed` variant rather than the
+            // legacy stringly-typed `InvalidInput`. Other
+            // `VertexBlendUnsupported` reasons keep the historical
+            // `InvalidInput` mapping for source compatibility.
+            BlendFailure::VertexBlendUnsupported {
+                reason: VertexBlendUnsupportedReason::MixedKindUnsupported { .. },
+                ..
+            } => OperationError::BlendFailed(Box::new(failure)),
             BlendFailure::RadiusExceedsCurvature { .. }
             | BlendFailure::SetbackTooLong { .. }
             | BlendFailure::VertexBlendUnsupported { .. }
@@ -806,27 +817,53 @@ mod tests {
     }
 
     #[test]
-    fn mixed_kind_unsupported_maps_to_invalid_input_and_embeds_detail() {
+    fn mixed_kind_unsupported_maps_to_blend_failed_and_preserves_typed_detail() {
+        // CF-β.5.2-B: `MixedKindUnsupported` routes through
+        // `OperationError::BlendFailed` (typed wire shape) rather than
+        // the generic `InvalidInput` bucket. The api-server's
+        // `ApiError::blend_failed(&BlendFailure)` constructor consumes
+        // the boxed failure and emits the structured `details.failure`
+        // JSON payload that downstream agents branch on; collapsing to
+        // `InvalidInput` would lose the embedded `MixedKindRejectDetail`.
         let failure = mixed_kind_failure_with(MixedKindRejectDetail::DegreeUnsupported {
             degree: 4,
         });
         let rendered = failure.to_string();
         let err: OperationError = failure.into();
         match err {
-            OperationError::InvalidInput {
-                parameter,
-                received,
-                ..
-            } => {
-                assert_eq!(parameter, "blend");
-                assert_eq!(received, rendered);
-                assert!(received.contains("vertex 42"));
-                assert!(received.contains("mixed-kind corner"));
-                assert!(received.contains("degree 4"));
-                assert!(received.contains("existing {chamfer}"));
-                assert!(received.contains("requested fillet"));
-            }
-            other => panic!("expected InvalidInput, got {:?}", other),
+            OperationError::BlendFailed(boxed) => match *boxed {
+                BlendFailure::VertexBlendUnsupported {
+                    vertex,
+                    reason:
+                        VertexBlendUnsupportedReason::MixedKindUnsupported {
+                            existing,
+                            requested,
+                            detail,
+                        },
+                    ..
+                } => {
+                    assert_eq!(vertex, 42);
+                    assert!(existing.contains(crate::primitives::solid::BlendKind::Chamfer));
+                    assert_eq!(requested, crate::primitives::solid::BlendKind::Fillet);
+                    match detail {
+                        MixedKindRejectDetail::DegreeUnsupported { degree } => {
+                            assert_eq!(degree, 4);
+                        }
+                        other => panic!("expected DegreeUnsupported, got {:?}", other),
+                    }
+                    // The Display surface is what `received` would carry
+                    // through the legacy InvalidInput path; verify it
+                    // still renders the discriminator strings so REST
+                    // log lines stay searchable.
+                    assert!(rendered.contains("vertex 42"));
+                    assert!(rendered.contains("mixed-kind corner"));
+                    assert!(rendered.contains("degree 4"));
+                    assert!(rendered.contains("existing {chamfer}"));
+                    assert!(rendered.contains("requested fillet"));
+                }
+                other => panic!("expected VertexBlendUnsupported{{MixedKindUnsupported}}, got {:?}", other),
+            },
+            other => panic!("expected BlendFailed, got {:?}", other),
         }
     }
 

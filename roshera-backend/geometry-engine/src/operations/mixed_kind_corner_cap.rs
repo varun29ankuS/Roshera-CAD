@@ -221,7 +221,48 @@ pub fn synthesize_mixed_kind_corner_cap(
 
     // Step 1 — verify rim-kind annotations + topological cycle.
     let (corner_vertices, loop_forwards) = verify_mixed_cap_loop(model, cap_edges_with_kind)
-        .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
+        .map_err(|e| {
+            // CF-β.5.2-B diagnostic: when the chain walk fails, the
+            // bare error message names a vertex id but not its position
+            // — so it is hard to tell whether two endpoints failed to
+            // dedup at `add_or_find` boundary, or whether the
+            // topological neighbourhood is genuinely malformed. Inflate
+            // the detail with each cap edge's (id, kind, start_pos,
+            // end_pos) tuple so the test failure is self-diagnosing.
+            if let BlendFailure::TopologyViolation { detail } = &e {
+                let mut dump = String::from(detail.as_str());
+                dump.push_str("\n  cap edges:");
+                for &(eid, kind) in cap_edges_with_kind {
+                    if let Some(edge) = model.edges.get(eid) {
+                        let sp = model
+                            .vertices
+                            .get(edge.start_vertex)
+                            .map(|v| v.position)
+                            .unwrap_or([f64::NAN; 3]);
+                        let ep = model
+                            .vertices
+                            .get(edge.end_vertex)
+                            .map(|v| v.position)
+                            .unwrap_or([f64::NAN; 3]);
+                        dump.push_str(&format!(
+                            "\n    edge {:?} ({:?}): start v{:?}={:?}, end v{:?}={:?}",
+                            eid,
+                            kind,
+                            edge.start_vertex,
+                            sp,
+                            edge.end_vertex,
+                            ep,
+                        ));
+                    } else {
+                        dump.push_str(&format!("\n    edge {:?} ({:?}): MISSING", eid, kind));
+                    }
+                }
+                return OperationError::BlendFailed(Box::new(
+                    BlendFailure::TopologyViolation { detail: dump },
+                ));
+            }
+            OperationError::BlendFailed(Box::new(e))
+        })?;
 
     // Step 2 — read corner positions in traversal order and check
     // coplanarity within `tolerance`.
@@ -339,6 +380,15 @@ pub fn synthesize_mixed_kind_corner_cap(
         solid.record_blend_face(face_id, requested_kind);
         solid.record_blended_vertex(vertex_id, requested_kind);
         solid.clear_pending_mixed_kind_corner(vertex_id);
+        // CF-β.5.2-B — drop the per-corner cap-rim registry entries
+        // now that the heterogeneous cap is closed. The cap-rim edges
+        // remain in the model (they're part of the synthesized loop),
+        // but the registry no longer needs to point to them: the
+        // corner is no longer mixed-open and any future synthesizer
+        // call at this vertex would be a different mixed event with
+        // its own freshly-registered cap edges. Idempotent — returns
+        // false if no entry existed for this vertex.
+        let _ = solid.clear_corner_cap_edges(vertex_id);
     }
 
     Ok(face_id)
@@ -393,17 +443,25 @@ fn corner_kind_for_degree(degree: usize) -> super::blend_graph::BlendVertexKind 
     super::blend_graph::BlendVertexKind::ConvexCorner { degree }
 }
 
-/// CF-β.3.4 — locate the cap-rim edges of `kind` incident at
+/// CF-β.3.4 — locate the cap-rim edges of `kind` registered at
 /// `vertex_id` on `solid_id`.
 ///
-/// Walks every face registered under `kind` in `solid.blend_faces_by_kind`
-/// (the per-solid CF-β.3.1 side-registry), inspects each face's outer
-/// loop, and returns every edge that (a) terminates at `vertex_id` and
-/// (b) carries the rim curve primitive matching `kind`'s `RimKind`
-/// projection (chamfer → `Line`, fillet → `Arc`). The result is
-/// de-duplicated because a single edge can be shared between two
-/// adjacent kind-tagged faces (e.g. two abutting chamfer faces share
-/// the "third-face cap" edge across their common boundary).
+/// Reads `Solid::corner_cap_rim_edges` (the CF-β.5.2-B per-corner
+/// side-registry populated by `chamfer_edges` / `fillet_edges`
+/// immediately after `update_adjacent_faces*`) and returns every
+/// `(EdgeId, BlendKind)` entry whose kind matches `kind`. Filters out
+/// any edge ID that no longer survives in `model.edges` — defensive
+/// against partial timeline-replay where an entry was recorded but
+/// the underlying edge was later destroyed by a downstream op.
+///
+/// The registry is authoritative because cap-rim edges are constructed
+/// between *offset* vertices (`v_t{1,2}_{start,end}` at displacement
+/// `d`/`r` from the original corner V), not V itself. The earlier
+/// face-loop walk relied on `edge.start_vertex == V || edge.end_vertex
+/// == V`, which is never true for a fillet/chamfer cap rim at a
+/// preserved corner — so the old discovery path silently returned an
+/// empty vector and blocked the synthesizer at "≥ 3 cap edges" even
+/// when the geometry was sound.
 ///
 /// Returned order is unspecified — the dispatch sites stitch this list
 /// into the heterogeneous cap loop alongside the current call's own
@@ -417,56 +475,23 @@ pub(crate) fn find_blend_cap_edges_at_vertex(
     vertex_id: VertexId,
     kind: BlendKind,
 ) -> Vec<EdgeId> {
-    let mut out: HashSet<EdgeId> = HashSet::new();
-
-    // Snapshot the face-id list of the requested kind before we walk
-    // their loops — keeps the borrow checker happy (no live `&Solid`
-    // borrow held across the per-face lookups below) and avoids
-    // re-querying `blend_kind_at_face` for every face in the model.
-    let kinded_face_ids: Vec<FaceId> = {
-        let Some(solid) = model.solids.get(solid_id) else {
-            return Vec::new();
-        };
-        model
-            .faces
-            .iter()
-            .filter_map(|(fid, _)| {
-                if solid.blend_kind_at_face(fid) == Some(kind) {
-                    Some(fid)
-                } else {
-                    None
-                }
-            })
-            .collect()
+    let Some(solid) = model.solids.get(solid_id) else {
+        return Vec::new();
+    };
+    let Some(entries) = solid.corner_cap_edges(vertex_id) else {
+        return Vec::new();
     };
 
-    for fid in kinded_face_ids {
-        let Some(face) = model.faces.get(fid) else {
+    let mut out: HashSet<EdgeId> = HashSet::new();
+    for &(eid, k) in entries {
+        if k != kind {
             continue;
-        };
-        let Some(outer) = model.loops.get(face.outer_loop) else {
-            continue;
-        };
-        for &eid in &outer.edges {
-            let Some(edge) = model.edges.get(eid) else {
-                continue;
-            };
-            if edge.start_vertex != vertex_id && edge.end_vertex != vertex_id {
-                continue;
-            }
-            let Some(curve) = model.curves.get(edge.curve_id) else {
-                continue;
-            };
-            let matches_rim = match kind {
-                BlendKind::Chamfer => curve.as_any().downcast_ref::<Line>().is_some(),
-                BlendKind::Fillet => curve.as_any().downcast_ref::<Arc>().is_some(),
-            };
-            if matches_rim {
-                out.insert(eid);
-            }
         }
+        if model.edges.get(eid).is_none() {
+            continue;
+        }
+        out.insert(eid);
     }
-
     out.into_iter().collect()
 }
 

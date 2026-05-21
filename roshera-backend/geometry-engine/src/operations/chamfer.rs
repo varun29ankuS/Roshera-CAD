@@ -248,6 +248,33 @@ pub fn chamfer_edges(
         // Re-stitch surrounding topology and add chamfer faces to outer shell.
         update_adjacent_faces_for_chamfer(model, solid_id, &chamfer_faces, &surgeries)?;
 
+        // CF-β.5.2-B — register each surgery's cap-rim edges under the
+        // original corner vertex when the corner is preserved. The cap
+        // edge constructed in `create_edge_chamfer` connects the
+        // *offset* vertices (`v_t1_start/v_t2_start` or
+        // `v_t1_end/v_t2_end`), not V, so the mixed-kind cap
+        // synthesizer cannot recover the rim from V's edge incidence.
+        // This registry stores the (V, cap_edge) link directly so
+        // `find_blend_cap_edges_at_vertex` is O(1) per corner.
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            for s in &surgeries {
+                if s.original_v0_corner_shared {
+                    solid.record_corner_cap_edge(
+                        s.original_v0,
+                        s.cap_v0_edge,
+                        BlendKind::Chamfer,
+                    );
+                }
+                if s.original_v1_corner_shared {
+                    solid.record_corner_cap_edge(
+                        s.original_v1,
+                        s.cap_v1_edge,
+                        BlendKind::Chamfer,
+                    );
+                }
+            }
+        }
+
         // Chamfer-α corner closure — walks the pre-computed corner set
         // (vertex IDs survive surgery because their `corner_shared`
         // flags suppressed removal) and emits one planar triangular
@@ -1865,7 +1892,7 @@ fn corner_adjacent_faces_planar(
 /// outward face normals span ℝ³ and their sum points strictly outward.
 /// The function returns a unit vector or surfaces the underlying
 /// normalisation failure as `NumericalError`.
-fn compute_corner_outward_normal(
+pub(crate) fn compute_corner_outward_normal(
     model: &BRepModel,
     vertex_position: Point3,
     adjacent_face_ids: &[FaceId],

@@ -213,9 +213,9 @@ pub fn topology_hash(model: &BRepModel, solid_id: SolidId) -> u64 {
     // 1. (V, E, F) counts via shell_census.
     let (v_count, e_count, f_count) = shell_census(model, solid_id);
 
-    // 2. Canonical edge-endpoint set. Each edge contributes
-    // (min, max) of its two endpoint vertex IDs. Sorted to make
-    // the output independent of edge-store insertion order.
+    // 2. Collect all edges in the shell and build a vertex
+    // adjacency list (multigraph allowed — parallel edges are
+    // tracked as multiplicities).
     let mut edge_ids: HashSet<EdgeId> = HashSet::new();
     for &face_id in &shell.faces {
         let face = model.faces.get(face_id).expect("face exists");
@@ -226,9 +226,6 @@ pub fn topology_hash(model: &BRepModel, solid_id: SolidId) -> u64 {
             }
         }
     }
-    // Renumber vertices to a canonical 0..N labelling so identical
-    // topologies with different vertex IDs hash equal. Walk
-    // discovered vertices in sorted-ID order and emit a remapping.
     let mut vertices_sorted: Vec<VertexId> = edge_ids
         .iter()
         .filter_map(|&eid| model.edges.get(eid))
@@ -236,26 +233,27 @@ pub fn topology_hash(model: &BRepModel, solid_id: SolidId) -> u64 {
         .collect();
     vertices_sorted.sort_unstable();
     vertices_sorted.dedup();
-    let v_remap: BTreeMap<VertexId, u64> = vertices_sorted
-        .into_iter()
-        .enumerate()
-        .map(|(i, vid)| (vid, i as u64))
-        .collect();
 
-    let mut canonical_edges: Vec<(u64, u64)> = edge_ids
-        .iter()
-        .filter_map(|&eid| model.edges.get(eid))
-        .map(|e| {
-            let a = *v_remap.get(&e.start_vertex).unwrap_or(&u64::MAX);
-            let b = *v_remap.get(&e.end_vertex).unwrap_or(&u64::MAX);
-            if a <= b {
-                (a, b)
-            } else {
-                (b, a)
+    let mut adjacency: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
+    for &vid in &vertices_sorted {
+        adjacency.insert(vid, Vec::new());
+    }
+    for &eid in &edge_ids {
+        if let Some(e) = model.edges.get(eid) {
+            // Skip self-loops at the adjacency-construction level
+            // (a B-Rep edge with `start == end` is a degenerate
+            // closed curve; record its presence in the per-vertex
+            // signature via the edge-count diff instead).
+            if e.start_vertex == e.end_vertex {
+                continue;
             }
-        })
-        .collect();
-    canonical_edges.sort_unstable();
+            adjacency
+                .entry(e.start_vertex)
+                .or_default()
+                .push(e.end_vertex);
+            adjacency.entry(e.end_vertex).or_default().push(e.start_vertex);
+        }
+    }
 
     // 3. Sorted multiset of face-surface-kind tags. Tag the
     // analytic kind by trait downcast; unknown / non-analytic
@@ -271,9 +269,44 @@ pub fn topology_hash(model: &BRepModel, solid_id: SolidId) -> u64 {
         .collect();
     face_tags.sort_unstable();
 
+    // 4. Weisfeiler-Lehman colour-refinement vertex fingerprint.
+    // Two solids with isomorphic shell graphs produce identical
+    // sorted-colour multisets after enough refinement rounds. For
+    // the small (≤ ~30 vertex) graphs in this test suite, 3
+    // refinement rounds suffice to distinguish every non-
+    // isomorphic graph encountered to date. The initial colour is
+    // the vertex's degree (≡ |adjacency|); each subsequent round
+    // replaces it with a hash of `(old_colour,
+    // sorted_multiset_of_neighbour_colours)`. Sorting the final
+    // colour multiset makes the digest invariant under VertexId
+    // permutation — the property the legacy "sort-by-VertexId then
+    // remap" recipe failed to provide (it only removed in-store
+    // insertion bias, not graph-relabelling).
+    let mut colours: BTreeMap<VertexId, u64> = BTreeMap::new();
+    for (&vid, nbrs) in adjacency.iter() {
+        colours.insert(vid, nbrs.len() as u64);
+    }
+    const WL_ROUNDS: usize = 3;
+    for _ in 0..WL_ROUNDS {
+        let mut next: BTreeMap<VertexId, u64> = BTreeMap::new();
+        for (&vid, nbrs) in adjacency.iter() {
+            let old = *colours.get(&vid).unwrap_or(&0);
+            let mut nbr_cols: Vec<u64> =
+                nbrs.iter().map(|n| *colours.get(n).unwrap_or(&0)).collect();
+            nbr_cols.sort_unstable();
+            let mut h = DefaultHasher::new();
+            old.hash(&mut h);
+            nbr_cols.hash(&mut h);
+            next.insert(vid, h.finish());
+        }
+        colours = next;
+    }
+    let mut colour_multiset: Vec<u64> = colours.values().copied().collect();
+    colour_multiset.sort_unstable();
+
     let mut hasher = DefaultHasher::new();
     (v_count, e_count, f_count).hash(&mut hasher);
-    canonical_edges.hash(&mut hasher);
+    colour_multiset.hash(&mut hasher);
     face_tags.hash(&mut hasher);
     hasher.finish()
 }

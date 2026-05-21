@@ -500,6 +500,30 @@ pub struct Solid {
     /// Survives [`Self::deep_copy`] so timeline replay preserves the
     /// intermediate-state expectation across snapshots.
     pub(crate) pending_mixed_kind_corners: HashMap<VertexId, usize>,
+    /// CF-β.5.2-B — cap rim edges of every blend whose surgery preserved
+    /// a corner vertex (`corner_shared = true`). Indexed by the
+    /// *original* corner vertex, the value lists each `(cap_edge_id,
+    /// kind)` produced by the surgery loop's `cap_v?_edge` slots at
+    /// that vertex.
+    ///
+    /// Necessary because the cap rim edge constructed by both blend
+    /// kinds (`fillet::create_trimmed_fillet_face` and
+    /// `chamfer::create_edge_chamfer`) terminates at the *offset*
+    /// vertices (`v_t1_start/v_t2_start` or `v_t1_end/v_t2_end`), never
+    /// at the original V. So the mixed-kind cap synthesizer's
+    /// `find_blend_cap_edges_at_vertex` cannot recover the cap rim
+    /// from V's incidence — V is not on the cap-edge endpoint list,
+    /// only the offset vertices are. This registry stores the
+    /// (V, cap_edge) association directly so the synthesizer reaches
+    /// the rim in O(1) per corner.
+    ///
+    /// Populated by `chamfer::chamfer_edges` and `fillet::fillet_edges`
+    /// after their respective per-edge splice loops, alongside the
+    /// existing `record_blended_edge` / `record_blend_face` writes.
+    /// Cleared per-vertex by the cap synthesizer when it consumes the
+    /// rim into the heterogeneous loop (the rim edges merge into the
+    /// new cap face's outer loop and lose their "rim" role).
+    pub(crate) corner_cap_rim_edges: HashMap<VertexId, Vec<(EdgeId, BlendKind)>>,
 }
 
 /// Top-level AABB used as a conservative collision proxy. The detailed
@@ -533,6 +557,7 @@ impl Solid {
             blended_vertices: HashMap::new(),
             blend_faces_by_kind: HashMap::new(),
             pending_mixed_kind_corners: HashMap::new(),
+            corner_cap_rim_edges: HashMap::new(),
         }
     }
 
@@ -581,6 +606,7 @@ impl Solid {
             blended_vertices: self.blended_vertices.clone(),
             blend_faces_by_kind: self.blend_faces_by_kind.clone(),
             pending_mixed_kind_corners: self.pending_mixed_kind_corners.clone(),
+            corner_cap_rim_edges: self.corner_cap_rim_edges.clone(),
         }
     }
 
@@ -662,6 +688,52 @@ impl Solid {
     /// from surface geometry.
     pub fn blend_kind_at_face(&self, face: FaceId) -> Option<BlendKind> {
         self.blend_faces_by_kind.get(&face).copied()
+    }
+
+    /// CF-β.5.2-B — record that `cap_edge` is the cap-rim edge produced
+    /// by a blend of `kind` at the original corner vertex `vertex`.
+    /// Used at partial-mixed corners (where `original_v*_corner_shared`
+    /// preserved V) so the second of two kind-mismatched calls can
+    /// locate the first call's cap rim without walking face loops —
+    /// the cap rim's endpoints are the *offset* vertices, never V.
+    ///
+    /// Called by `chamfer::chamfer_edges` and `fillet::fillet_edges`
+    /// after the per-edge splice loop, for every surgery where
+    /// `original_v?_corner_shared` is set. Multiple cap edges may
+    /// land at the same V (one per surviving incident blend edge);
+    /// the function appends, idempotent only at the `(edge, kind)`
+    /// pair level (a duplicate insert is deduplicated).
+    pub(crate) fn record_corner_cap_edge(
+        &mut self,
+        vertex: VertexId,
+        cap_edge: EdgeId,
+        kind: BlendKind,
+    ) {
+        let entry = self.corner_cap_rim_edges.entry(vertex).or_default();
+        if !entry.iter().any(|&(e, k)| e == cap_edge && k == kind) {
+            entry.push((cap_edge, kind));
+        }
+    }
+
+    /// CF-β.5.2-B — look up the cap-rim edges previously recorded at
+    /// the original corner vertex `vertex`. Returns the full slice
+    /// (every kind together) so callers can partition by kind in a
+    /// single pass. `None` when the vertex has never carried a
+    /// partial-mixed cap rim.
+    pub fn corner_cap_edges(
+        &self,
+        vertex: VertexId,
+    ) -> Option<&[(EdgeId, BlendKind)]> {
+        self.corner_cap_rim_edges.get(&vertex).map(|v| v.as_slice())
+    }
+
+    /// CF-β.5.2-B — drop every cap-rim edge recorded at `vertex`. Called
+    /// by the mixed-kind cap synthesizer when the heterogeneous cap
+    /// loop has consumed the rim edges into the new cap face's outer
+    /// loop. Idempotent — clearing a vertex that was never recorded
+    /// is a no-op (returns `false`).
+    pub(crate) fn clear_corner_cap_edges(&mut self, vertex: VertexId) -> bool {
+        self.corner_cap_rim_edges.remove(&vertex).is_some()
     }
 
     /// CF-β.4 — mark `vertex` as carrying a deliberate, partially-
@@ -2034,5 +2106,84 @@ mod pending_mixed_kind_corners_tests {
         assert!(s.pending_mixed_kind_corners().contains_key(&3));
         assert!(!s.pending_mixed_kind_corners().contains_key(&2));
         assert_eq!(s.pending_corner_original_degree(3), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod corner_cap_rim_edges_tests {
+    //! CF-β.5.2-B — pin the per-solid cap-rim registry that lets the
+    //! mixed-kind corner cap synthesizer locate the first call's cap
+    //! rim edges at a shared corner. Necessary because the cap rim
+    //! edge's endpoints are the *offset* vertices, never the original
+    //! V, so a face-loop walk indexed by V's incidence returns zero.
+
+    use super::{BlendKind, ShellId, Solid, SolidId};
+
+    fn empty_solid() -> Solid {
+        Solid::new(0 as SolidId, 0 as ShellId)
+    }
+
+    #[test]
+    fn record_then_lookup_round_trips_per_vertex() {
+        let mut s = empty_solid();
+        assert!(s.corner_cap_edges(7).is_none());
+        s.record_corner_cap_edge(7, 42, BlendKind::Fillet);
+        s.record_corner_cap_edge(7, 43, BlendKind::Fillet);
+        s.record_corner_cap_edge(7, 51, BlendKind::Chamfer);
+        let entries = s.corner_cap_edges(7).expect("vertex 7 should have entries");
+        assert_eq!(entries.len(), 3);
+        assert!(entries.contains(&(42, BlendKind::Fillet)));
+        assert!(entries.contains(&(43, BlendKind::Fillet)));
+        assert!(entries.contains(&(51, BlendKind::Chamfer)));
+        // Other vertices remain untouched.
+        assert!(s.corner_cap_edges(8).is_none());
+    }
+
+    #[test]
+    fn record_is_idempotent_on_same_edge_kind_pair() {
+        let mut s = empty_solid();
+        s.record_corner_cap_edge(3, 100, BlendKind::Fillet);
+        s.record_corner_cap_edge(3, 100, BlendKind::Fillet);
+        let entries = s.corner_cap_edges(3).expect("vertex 3 should have entries");
+        assert_eq!(entries.len(), 1, "duplicate (edge,kind) must dedup");
+        // Same edge id under a different kind is a legitimately distinct
+        // slot — both register.
+        s.record_corner_cap_edge(3, 100, BlendKind::Chamfer);
+        let entries = s.corner_cap_edges(3).expect("vertex 3 should have entries");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn clear_removes_all_entries_for_vertex() {
+        let mut s = empty_solid();
+        s.record_corner_cap_edge(5, 60, BlendKind::Fillet);
+        s.record_corner_cap_edge(5, 61, BlendKind::Chamfer);
+        s.record_corner_cap_edge(6, 70, BlendKind::Fillet);
+        assert!(s.clear_corner_cap_edges(5));
+        assert!(s.corner_cap_edges(5).is_none());
+        // Other vertex's entries untouched.
+        assert!(s.corner_cap_edges(6).is_some());
+        // Second clear is a no-op.
+        assert!(!s.clear_corner_cap_edges(5));
+        // Clearing a never-recorded vertex is also a no-op.
+        assert!(!s.clear_corner_cap_edges(99));
+    }
+
+    #[test]
+    fn deep_copy_preserves_corner_cap_registry() {
+        let mut s = empty_solid();
+        s.record_corner_cap_edge(11, 200, BlendKind::Fillet);
+        s.record_corner_cap_edge(11, 201, BlendKind::Chamfer);
+        let snap = s.deep_copy();
+        let snap_entries = snap
+            .corner_cap_edges(11)
+            .expect("snapshot must preserve entries");
+        assert_eq!(snap_entries.len(), 2);
+        // Mutating the original after the snapshot must not leak in.
+        s.clear_corner_cap_edges(11);
+        assert!(
+            snap.corner_cap_edges(11).is_some(),
+            "snapshot must own its corner_cap_rim_edges clone"
+        );
     }
 }

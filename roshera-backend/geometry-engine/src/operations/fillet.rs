@@ -534,6 +534,40 @@ pub fn fillet_edges(
         // baseline.
         blend_graph::compute_apex_setbacks(model, &mut blend_graph)?;
 
+        // CF-β.5.2-B — clear Hoffmann / apex setbacks at partial-mixed
+        // corners so each fillet arc's V-end trims to the simple
+        // offset point `V + r·u` along the face-boundary tangent
+        // direction, matching the chamfer's `offset == r` convention.
+        // Without this, the 3-edge partial-mixed cap loop fails to
+        // close because the fillet arc endpoints sit at the Hoffmann
+        // retraction `r·cos(θ/2)` (≈ 0.71·r for orthogonal corners)
+        // while the chamfer cap-edge endpoints sit at `r` along the
+        // non-chamfered adjacent edges — the two conventions produce
+        // genuinely different points and the cap-walker cannot dedup
+        // them. Two sources of partial-mixed vertices are unioned:
+        //   1. Explicit opt-in via `options.partial_corner_vertices`
+        //      (first call of a kind-mismatched pair).
+        //   2. Auto-detected via `solid.is_mixed_kind_corner_pending`
+        //      (second call after an opposite-kind first call left V
+        //      registered in `pending_mixed_kind_corners`).
+        // Both signals point to the same geometric fact: the V-end of
+        // this fillet arc terminates at a chamfer face, not at a
+        // smooth-closure tangent / apex-sphere.
+        {
+            let mut partial_corners: Vec<VertexId> =
+                options.partial_corner_vertices.clone();
+            if let Some(solid) = model.solids.get(solid_id) {
+                for vid in blend_graph.vertices.keys() {
+                    if solid.is_mixed_kind_corner_pending(*vid)
+                        && !partial_corners.contains(vid)
+                    {
+                        partial_corners.push(*vid);
+                    }
+                }
+            }
+            blend_graph::clear_setbacks_at(&mut blend_graph, model, &partial_corners);
+        }
+
         // F5-α: snapshot the original sharp-vertex position for every
         // BlendGraph corner *before* per-edge fillets retract their
         // spines and `update_adjacent_faces` splices the neighbourhood.
@@ -571,6 +605,33 @@ pub fn fillet_edges(
         // Re-stitch the surrounding topology and add fillet faces to the
         // outer shell so the resulting B-Rep is watertight.
         update_adjacent_faces(model, solid_id, &fillet_faces, &surgeries)?;
+
+        // CF-β.5.2-B — register each surgery's cap-arc edges under the
+        // original corner vertex when the corner is preserved. Mirrors
+        // the chamfer-side block in `chamfer_edges`. The cap arc edge
+        // constructed in `create_fillet_chain` connects the *offset*
+        // vertices (`v_t1_start/v_t2_start` at radius `r` from V), not
+        // V itself, so the mixed-kind cap synthesizer cannot recover
+        // the rim from V's edge incidence. The registry provides an
+        // O(1) lookup from V to its surviving cap arcs.
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            for s in &surgeries {
+                if s.original_v0_corner_shared {
+                    solid.record_corner_cap_edge(
+                        s.original_v0,
+                        s.cap_v0_edge,
+                        BlendKind::Fillet,
+                    );
+                }
+                if s.original_v1_corner_shared {
+                    solid.record_corner_cap_edge(
+                        s.original_v1,
+                        s.cap_v1_edge,
+                        BlendKind::Fillet,
+                    );
+                }
+            }
+        }
 
         // F5-α: corner-blend dispatch. After per-edge fillets have been
         // spliced in (so their cap arcs are committed to the shell),
@@ -5019,6 +5080,179 @@ fn create_fillet_transitions(
             // do.
             _ => continue,
         };
+
+        // CF-β.5.2-B — partial-mixed corner dispatch (degree ≠ 3).
+        //
+        // When V is registered in `pending_mixed_kind_corners` and
+        // carries a prior `Chamfer` blend, the current fillet call
+        // selects only the remaining (un-chamfered) edges. The
+        // BlendGraph reports `degree == N - k` (N = original corner
+        // degree, k = chamfered edges) — typically `degree == 2` for
+        // a 3-edge box corner with one chamfered edge. The corner
+        // boundary is the heterogeneous loop:
+        //   `chamfer_linear_rims (from corner_cap_rim_edges registry)
+        //    ∪ fillet_arc_rims (V-side cap arcs of this call)`.
+        // Route to the eager-cap synthesizer so a single mixed cap
+        // closes the corner watertight; the same-kind degree-3 path
+        // below is unchanged for non-partial-mixed corners.
+        let is_partial_mixed = model
+            .solids
+            .get(solid_id)
+            .map(|s| {
+                s.is_mixed_kind_corner_pending(corner.id)
+                    && s.vertex_blend_set(corner.id)
+                        .map(|set| set.contains(BlendKind::Chamfer))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        if is_partial_mixed && degree != 3 {
+            // Resolve the fillet face per incident blend edge.
+            let mut partial_face_ids: Vec<FaceId> = Vec::with_capacity(degree);
+            let mut all_present = true;
+            for eid in &corner.incident_blend_edges {
+                match edge_to_face.get(eid) {
+                    Some(f) => partial_face_ids.push(*f),
+                    None => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if !all_present {
+                continue;
+            }
+
+            // V is preserved at the original corner position (β.5.2-A
+            // V-retention via partial_corner_vertices opt-in or via
+            // `or v?_prior_chamfer` extension). Snapshot lookup is
+            // robust even if surgery orphaned V.
+            let vertex_pos = corner_positions.get(&corner.id).copied().ok_or_else(|| {
+                OperationError::InternalError(format!(
+                    "partial-mixed corner vertex {} missing from snapshot",
+                    corner.id
+                ))
+            })?;
+
+            // V-side cap arcs of each fillet face. Pull cylinder
+            // descriptors per incident edge — the by-axis lookup
+            // identifies the V-side cap without requiring an apex
+            // sphere centre (which is rank-deficient at degree-2).
+            // The corner_apex hint disambiguates V-side vs far-side
+            // for each cap; V_pos itself is the obvious hint (V-side
+            // cap centre sits a half-radius offset from V along the
+            // cylinder axis).
+            let mut fillet_rim_arcs: Vec<EdgeId> = Vec::with_capacity(degree);
+            for fid in partial_face_ids.iter() {
+                let descriptor =
+                    extract_fillet_cylinder_descriptor(model, *fid).ok_or_else(|| {
+                        OperationError::BlendFailed(Box::new(
+                            BlendFailure::VertexBlendUnsupported {
+                                vertex: corner.id,
+                                kind: BlendVertexKind::ConvexCorner { degree },
+                                reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                            },
+                        ))
+                    })?;
+                let arc = find_cap_arc_edge_by_cylinder_axis(
+                    model,
+                    *fid,
+                    descriptor.axis_origin,
+                    descriptor.axis,
+                    vertex_pos,
+                )
+                .ok_or_else(|| {
+                    OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
+                        vertex: corner.id,
+                        kind: BlendVertexKind::ConvexCorner { degree },
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    }))
+                })?;
+                fillet_rim_arcs.push(arc);
+            }
+
+            // Chamfer linear rims at V come from the
+            // `corner_cap_rim_edges` registry written by the prior
+            // chamfer surgery — chamfer cap edges connect *offset*
+            // vertices and are not reachable via V's incidence.
+            let chamfer_rim_lines = super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
+                model,
+                solid_id,
+                corner.id,
+                BlendKind::Chamfer,
+            );
+
+            let mut cap_edges_with_kind: Vec<(
+                EdgeId,
+                super::mixed_kind_corner_cap::RimKind,
+            )> = fillet_rim_arcs
+                .iter()
+                .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::ArcRim))
+                .collect();
+            for line_eid in &chamfer_rim_lines {
+                cap_edges_with_kind
+                    .push((*line_eid, super::mixed_kind_corner_cap::RimKind::LinearRim));
+            }
+
+            // Outward direction at V — derive from the cap-endpoint
+            // centroid. The cap face will sit roughly under V (cap
+            // edges connect to vertices offset inward from V by the
+            // chamfer + fillet displacements), so the vector from
+            // cap centroid to V points outward. This recipe is
+            // robust without needing pre-surgery face adjacency
+            // (the spine edge ids are gone after splice, so
+            // `get_adjacent_faces` would fail) and without needing
+            // a degree-3 apex (rank-deficient at degree 2).
+            let mut centroid_acc = Vector3::new(0.0, 0.0, 0.0);
+            let mut centroid_count: usize = 0;
+            for &(eid, _) in &cap_edges_with_kind {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if let Some(v) = model.vertices.get(vid) {
+                            centroid_acc.x += v.position[0];
+                            centroid_acc.y += v.position[1];
+                            centroid_acc.z += v.position[2];
+                            centroid_count += 1;
+                        }
+                    }
+                }
+            }
+            if centroid_count == 0 {
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::VertexBlendUnsupported {
+                        vertex: corner.id,
+                        kind: BlendVertexKind::ConvexCorner { degree },
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    },
+                )));
+            }
+            let inv = 1.0 / (centroid_count as f64);
+            let centroid = Point3::new(
+                centroid_acc.x * inv,
+                centroid_acc.y * inv,
+                centroid_acc.z * inv,
+            );
+            let outward_raw = vertex_pos - centroid;
+            let vertex_outward = outward_raw.normalize().map_err(|_| {
+                OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
+                    vertex: corner.id,
+                    kind: BlendVertexKind::ConvexCorner { degree },
+                    reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                }))
+            })?;
+
+            let cap_face = super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                model,
+                solid_id,
+                corner.id,
+                &cap_edges_with_kind,
+                vertex_outward,
+                Tolerance::default().distance(),
+                BlendKind::Fillet,
+            )?;
+            new_faces.push(cap_face);
+            continue;
+        }
 
         if degree != 3 {
             // Non-degree-3 ConvexCorner vertices reach this iterator
