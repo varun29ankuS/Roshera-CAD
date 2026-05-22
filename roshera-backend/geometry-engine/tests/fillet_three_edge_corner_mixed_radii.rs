@@ -76,7 +76,12 @@
 //! on a non-rectilinear-solid fixture in `TopologyBuilder` and is
 //! tracked separately.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+#[path = "blend_fixtures/mod.rs"]
+mod blend_fixtures;
+
+use blend_fixtures::{edges_at_vertex, make_cube, shell_census, vertex_at};
 
 use geometry_engine::operations::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use geometry_engine::operations::fillet::{FilletType, PropagationMode};
@@ -87,68 +92,11 @@ use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::{GeneralNurbsSurface, Sphere};
-use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
-use geometry_engine::primitives::vertex::VertexId;
+use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 
 const BOX_SIZE: f64 = 10.0;
 const HALF_BOX: f64 = BOX_SIZE / 2.0;
-
-// ---------------------------------------------------------------
-// Helpers — mirror `fillet_three_edge_corner.rs` so the F5-α and
-// F5-β suites use the same fixture vocabulary.
-// ---------------------------------------------------------------
-
-fn make_box(model: &mut BRepModel, size: f64) -> SolidId {
-    let mut builder = TopologyBuilder::new(model);
-    match builder
-        .create_box_3d(size, size, size)
-        .expect("box creation succeeds")
-    {
-        GeometryId::Solid(id) => id,
-        other => panic!("expected solid, got {:?}", other),
-    }
-}
-
-fn vertex_at(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
-    for (id, vertex) in model.vertices.iter() {
-        let p = vertex.position;
-        if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
-            return id;
-        }
-    }
-    panic!("no vertex at ({}, {}, {})", x, y, z);
-}
-
-fn edges_at_vertex(model: &BRepModel, vertex: VertexId) -> Vec<EdgeId> {
-    model
-        .edges
-        .iter()
-        .filter(|(_, edge)| edge.start_vertex == vertex || edge.end_vertex == vertex)
-        .map(|(id, _)| id)
-        .collect()
-}
-
-fn shell_census(model: &BRepModel, solid_id: SolidId) -> (usize, usize, usize) {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut vertices: HashSet<VertexId> = HashSet::new();
-    let mut edges: HashSet<EdgeId> = HashSet::new();
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            for &edge_id in &lp.edges {
-                edges.insert(edge_id);
-                if let Some(edge) = model.edges.get(edge_id) {
-                    vertices.insert(edge.start_vertex);
-                    vertices.insert(edge.end_vertex);
-                }
-            }
-        }
-    }
-    (vertices.len(), edges.len(), shell.faces.len())
-}
 
 fn find_sphere_face(model: &BRepModel, face_ids: &[FaceId]) -> Option<FaceId> {
     for &fid in face_ids {
@@ -185,7 +133,7 @@ fn drive_corner_fillet(
     radii: [f64; 3],
 ) -> Result<(BRepModel, SolidId, Vec<FaceId>), OperationError> {
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let corner_edges = edges_at_vertex(&model, corner);
     assert_eq!(
@@ -254,7 +202,7 @@ fn drive_corner_fillet_per_edge(
     radii: [f64; 3],
 ) -> Result<(BRepModel, SolidId, Vec<FaceId>), OperationError> {
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let corner_edges = edges_at_vertex(&model, corner);
     assert_eq!(
