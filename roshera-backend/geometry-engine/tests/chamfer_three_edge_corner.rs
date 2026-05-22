@@ -24,123 +24,32 @@
 //!     deliberately non-watertight (V − E + F = 1) — flips back to
 //!     2 once Chamfer-β.5 lands.
 
-use std::collections::HashSet;
+#[path = "blend_fixtures/mod.rs"]
+mod blend_fixtures;
+
+use blend_fixtures::{
+    edges_at_vertex, faces_referencing_edge, find_planar_cap_face, make_cube,
+    non_manifold_edge_count, shell_census, vertex_at,
+};
 
 use geometry_engine::operations::chamfer::{ChamferOptions, ChamferType, PropagationMode};
 use geometry_engine::operations::{chamfer_edges, CommonOptions};
 use geometry_engine::primitives::curve::Line;
-use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::Plane;
-use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
-use geometry_engine::primitives::vertex::VertexId;
+use geometry_engine::primitives::topology_builder::BRepModel;
 
 const BOX_SIZE: f64 = 10.0;
 const HALF_BOX: f64 = BOX_SIZE / 2.0;
 const CHAMFER_OFFSET: f64 = 1.0;
-
-/// Build a `size×size×size` box centred on the origin.
-fn make_box(model: &mut BRepModel, size: f64) -> SolidId {
-    let mut builder = TopologyBuilder::new(model);
-    match builder
-        .create_box_3d(size, size, size)
-        .expect("box creation succeeds")
-    {
-        GeometryId::Solid(id) => id,
-        other => panic!("expected solid, got {:?}", other),
-    }
-}
-
-fn vertex_at(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
-    for (id, vertex) in model.vertices.iter() {
-        let p = vertex.position;
-        if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
-            return id;
-        }
-    }
-    panic!("no vertex at ({}, {}, {})", x, y, z);
-}
-
-fn edges_at_vertex(model: &BRepModel, vertex: VertexId) -> Vec<EdgeId> {
-    model
-        .edges
-        .iter()
-        .filter(|(_, edge)| edge.start_vertex == vertex || edge.end_vertex == vertex)
-        .map(|(id, _)| id)
-        .collect()
-}
-
-/// Topology census of `solid_id`'s outer shell as `(V, E, F)`. The
-/// Euler-Poincaré relation V − E + F = 2 is the genus-zero
-/// closed-surface invariant.
-fn shell_census(model: &BRepModel, solid_id: SolidId) -> (usize, usize, usize) {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut vertices: HashSet<VertexId> = HashSet::new();
-    let mut edges: HashSet<EdgeId> = HashSet::new();
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            for &edge_id in &lp.edges {
-                edges.insert(edge_id);
-                if let Some(edge) = model.edges.get(edge_id) {
-                    vertices.insert(edge.start_vertex);
-                    vertices.insert(edge.end_vertex);
-                }
-            }
-        }
-    }
-    (vertices.len(), edges.len(), shell.faces.len())
-}
-
-/// How many faces of `solid_id`'s outer shell reference `edge_id` in
-/// any loop. 2 for every interior edge on a watertight manifold.
-fn faces_referencing_edge(model: &BRepModel, solid_id: SolidId, edge_id: EdgeId) -> usize {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut count = 0;
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            if lp.edges.iter().any(|&e| e == edge_id) {
-                count += 1;
-                break;
-            }
-        }
-    }
-    count
-}
-
-/// Locate the unique planar cap face among `face_ids`. Panics if
-/// there isn't exactly one with a triangular outer loop.
-fn find_planar_cap_face(model: &BRepModel, face_ids: &[FaceId]) -> FaceId {
-    let mut found: Option<FaceId> = None;
-    for &fid in face_ids {
-        let face = model.faces.get(fid).expect("face exists");
-        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
-        if surface.as_any().downcast_ref::<Plane>().is_some() {
-            let outer = model
-                .loops
-                .get(face.outer_loop)
-                .expect("planar face outer loop");
-            if outer.edges.len() == 3 {
-                assert!(found.is_none(), "more than one triangular planar face produced");
-                found = Some(fid);
-            }
-        }
-    }
-    found.expect("no triangular planar cap face among returned chamfer faces")
-}
 
 /// Drive a Chamfer-α call: build the box, chamfer the three edges
 /// of the (+x, +y, +z) corner at offset `CHAMFER_OFFSET`. Returns
 /// `(model, solid_id, returned_face_ids)`.
 fn build_corner_chamfer(chamfer_type: ChamferType) -> (BRepModel, SolidId, Vec<FaceId>) {
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let corner_edges = edges_at_vertex(&model, corner);
     assert_eq!(
@@ -181,7 +90,7 @@ fn chamfer_three_edge_corner_box_pre_chamfer_baseline() {
     // Pin the harness math: a freshly-built 10×10×10 box outer shell
     // has 8 vertices, 12 edges, 6 faces, V − E + F = 2.
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let (v, e, f) = shell_census(&model, solid_id);
     assert_eq!(v, 8, "box has 8 vertices");
     assert_eq!(e, 12, "box has 12 edges");
@@ -202,7 +111,7 @@ fn chamfer_three_edge_corner_box_emits_planar_cap() {
         face_ids.len()
     );
 
-    let cap_face_id = find_planar_cap_face(&model, &face_ids);
+    let cap_face_id = find_planar_cap_face(&model, &face_ids, Some(3));
     let cap_face = model.faces.get(cap_face_id).expect("cap face exists");
 
     // The cap surface must downcast to Plane.
@@ -259,28 +168,6 @@ fn chamfer_three_edge_corner_box_emits_planar_cap() {
          corner closure; got V={}, E={}, F={}, V−E+F={}",
         v, e, f, euler
     );
-}
-
-/// Count edges of `solid_id`'s outer shell whose reference count
-/// across face loops is not exactly 2. A watertight closed manifold
-/// has zero such edges; every "hole" boundary contributes one.
-fn non_manifold_edge_count(model: &BRepModel, solid_id: SolidId) -> usize {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut all_edges: HashSet<EdgeId> = HashSet::new();
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            for &edge_id in &lp.edges {
-                all_edges.insert(edge_id);
-            }
-        }
-    }
-    all_edges
-        .into_iter()
-        .filter(|&edge_id| faces_referencing_edge(model, solid_id, edge_id) != 2)
-        .count()
 }
 
 #[test]

@@ -65,99 +65,23 @@
 //! interim and `cargo test -- --ignored fillet_three_edge_corner`
 //! re-arms the contract for the next slice.
 
-use std::collections::HashSet;
+#[path = "blend_fixtures/mod.rs"]
+mod blend_fixtures;
+
+use blend_fixtures::{
+    edges_at_vertex, faces_referencing_edge, make_cube, shell_census, vertex_at,
+};
 
 use geometry_engine::operations::fillet::{FilletType, PropagationMode};
 use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};
-use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::Sphere;
-use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
-use geometry_engine::primitives::vertex::VertexId;
+use geometry_engine::primitives::topology_builder::BRepModel;
 
 const BOX_SIZE: f64 = 10.0;
 const HALF_BOX: f64 = BOX_SIZE / 2.0;
 const FILLET_RADIUS: f64 = 1.0;
-
-/// Build a `size×size×size` box centred on the origin (corners at
-/// `(±size/2, ±size/2, ±size/2)`).
-fn make_box(model: &mut BRepModel, size: f64) -> SolidId {
-    let mut builder = TopologyBuilder::new(model);
-    match builder
-        .create_box_3d(size, size, size)
-        .expect("box creation succeeds")
-    {
-        GeometryId::Solid(id) => id,
-        other => panic!("expected solid, got {:?}", other),
-    }
-}
-
-/// Find the vertex whose world position matches `(x, y, z)` within
-/// `1e-9`.
-fn vertex_at(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
-    for (id, vertex) in model.vertices.iter() {
-        let p = vertex.position;
-        if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
-            return id;
-        }
-    }
-    panic!("no vertex at ({}, {}, {})", x, y, z);
-}
-
-/// Edges currently incident to `vertex` (start or end).
-fn edges_at_vertex(model: &BRepModel, vertex: VertexId) -> Vec<EdgeId> {
-    model
-        .edges
-        .iter()
-        .filter(|(_, edge)| edge.start_vertex == vertex || edge.end_vertex == vertex)
-        .map(|(id, _)| id)
-        .collect()
-}
-
-/// Topology census of `solid_id`'s outer shell as `(V, E, F)`. The
-/// Euler-Poincaré relation V − E + F = 2 is the genus-zero
-/// closed-surface invariant — the F5-α watertightness pin.
-fn shell_census(model: &BRepModel, solid_id: SolidId) -> (usize, usize, usize) {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut vertices: HashSet<VertexId> = HashSet::new();
-    let mut edges: HashSet<EdgeId> = HashSet::new();
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            for &edge_id in &lp.edges {
-                edges.insert(edge_id);
-                if let Some(edge) = model.edges.get(edge_id) {
-                    vertices.insert(edge.start_vertex);
-                    vertices.insert(edge.end_vertex);
-                }
-            }
-        }
-    }
-    (vertices.len(), edges.len(), shell.faces.len())
-}
-
-/// How many faces of `solid_id`'s outer shell reference `edge_id`
-/// in any of their loops. For a watertight closed manifold this is
-/// 2 for every interior edge.
-fn faces_referencing_edge(model: &BRepModel, solid_id: SolidId, edge_id: EdgeId) -> usize {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut count = 0;
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            if lp.edges.iter().any(|&e| e == edge_id) {
-                count += 1;
-                break;
-            }
-        }
-    }
-    count
-}
 
 /// Find the unique sphere face among `face_ids`. Panics if there
 /// isn't exactly one — F5-α emits one spherical patch per
@@ -181,7 +105,7 @@ fn find_sphere_face(model: &BRepModel, face_ids: &[FaceId]) -> FaceId {
 /// `(model, solid_id, returned_face_ids)`.
 fn build_corner_blend() -> (BRepModel, SolidId, Vec<FaceId>) {
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let corner_edges = edges_at_vertex(&model, corner);
     assert_eq!(

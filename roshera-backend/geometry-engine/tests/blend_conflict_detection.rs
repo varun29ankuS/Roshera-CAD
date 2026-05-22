@@ -27,41 +27,25 @@
 //!    previously-blended edge proceeds without a false-positive
 //!    rejection.
 
+#[path = "blend_fixtures/mod.rs"]
+mod blend_fixtures;
+
+use blend_fixtures::{make_cube, vertex_at};
+
 use geometry_engine::operations::chamfer::{
     chamfer_edges, ChamferOptions, ChamferType, PropagationMode as ChamferProp,
 };
 use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
 use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions, OperationError};
 use geometry_engine::primitives::edge::EdgeId;
-use geometry_engine::primitives::solid::{BlendKind, SolidId};
-use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+use geometry_engine::primitives::solid::BlendKind;
+use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::primitives::vertex::VertexId;
 
 const BOX_SIZE: f64 = 10.0;
 const HALF_BOX: f64 = BOX_SIZE / 2.0;
 const RADIUS: f64 = 0.5;
 const OFFSET: f64 = 0.5;
-
-fn make_box(model: &mut BRepModel, size: f64) -> SolidId {
-    let mut builder = TopologyBuilder::new(model);
-    match builder
-        .create_box_3d(size, size, size)
-        .expect("box creation succeeds")
-    {
-        GeometryId::Solid(id) => id,
-        other => panic!("expected solid, got {:?}", other),
-    }
-}
-
-fn vertex_at(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
-    for (id, vertex) in model.vertices.iter() {
-        let p = vertex.position;
-        if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
-            return id;
-        }
-    }
-    panic!("no vertex at ({}, {}, {})", x, y, z);
-}
 
 /// Pick one edge incident to `vertex`. Used to grab a single edge to
 /// chamfer/fillet without grabbing the whole 3-edge corner — the
@@ -164,7 +148,7 @@ fn assert_conflict(
 #[test]
 fn chamfer_then_fillet_same_edge_returns_typed_conflict() {
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let edge = pick_one_edge_at_vertex(&model, corner);
 
@@ -184,7 +168,7 @@ fn chamfer_then_fillet_same_edge_returns_typed_conflict() {
 #[test]
 fn fillet_then_chamfer_same_edge_returns_typed_conflict() {
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let edge = pick_one_edge_at_vertex(&model, corner);
 
@@ -204,7 +188,7 @@ fn chamfer_then_chamfer_same_edge_returns_typed_conflict() {
     // through the typed signal too (rather than falling back to the
     // legacy `edge not found` shape).
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let edge = pick_one_edge_at_vertex(&model, corner);
 
@@ -225,7 +209,7 @@ fn chamfer_disjoint_edges_does_not_falsely_trigger_conflict() {
     // false-positive boundary: the gate fires on the registry hits
     // only, not on every subsequent blend.
     let mut model = BRepModel::new();
-    let solid_id = make_box(&mut model, BOX_SIZE);
+    let solid_id = make_cube(&mut model, BOX_SIZE);
 
     let corner_a = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
     let edge_a = pick_one_edge_at_vertex(&model, corner_a);

@@ -31,266 +31,24 @@
 //! N=3, which is the identity case of `verify_cap_edges_form_closed_polygon`'s
 //! chain walk.
 
-use std::collections::HashSet;
+#[path = "blend_fixtures/mod.rs"]
+mod blend_fixtures;
 
-use geometry_engine::math::{Point3, Tolerance, Vector3};
+use blend_fixtures::{
+    faces_referencing_edge, find_planar_cap_face, make_square_pyramid_solid,
+    non_manifold_edge_count, shell_census, vertex_at,
+};
+
 use geometry_engine::operations::chamfer::{ChamferOptions, ChamferType, PropagationMode};
 use geometry_engine::operations::{chamfer_edges, CommonOptions};
-use geometry_engine::primitives::curve::{Line, ParameterRange};
-use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
-use geometry_engine::primitives::face::{Face, FaceId, FaceOrientation};
-use geometry_engine::primitives::r#loop::{Loop, LoopType};
-use geometry_engine::primitives::shell::{Shell, ShellType};
-use geometry_engine::primitives::solid::{Solid, SolidId};
+use geometry_engine::primitives::curve::Line;
+use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::surface::Plane;
 use geometry_engine::primitives::topology_builder::BRepModel;
-use geometry_engine::primitives::vertex::VertexId;
 
 const PYRAMID_BASE: f64 = 10.0;
 const PYRAMID_HEIGHT: f64 = 10.0;
 const CHAMFER_OFFSET: f64 = 0.5;
-
-/// Build a symmetric square-base pyramid centred on the z-axis with
-/// the base on z=0 and the apex at (0, 0, height).
-///
-/// Vertex layout (`hb = base / 2`):
-///   v0=(-hb,-hb,0) v1=(hb,-hb,0) v2=(hb,hb,0) v3=(-hb,hb,0)   base
-///   v4=(0,0,h)                                                 apex
-///
-/// Edge layout (all stored start→end):
-///   e0:v0→v1   e1:v1→v2   e2:v2→v3   e3:v3→v0   (base, CCW)
-///   e4:v0→v4   e5:v1→v4   e6:v2→v4   e7:v3→v4   (sloped to apex)
-///
-/// Face layout (outward normals point away from the solid centroid):
-///   f_base:  base square at z=0, outward −Z, loop v0→v3→v2→v1
-///   f_front: triangle v0,v1,v4 — outward (0,−h,hb) direction
-///   f_right: triangle v1,v2,v4 — outward (h,0,hb) direction
-///   f_back:  triangle v2,v3,v4 — outward (0,h,hb) direction
-///   f_left:  triangle v3,v0,v4 — outward (−h,0,hb) direction
-fn make_square_pyramid_solid(model: &mut BRepModel, base: f64, height: f64) -> SolidId {
-    let tol = Tolerance::default().distance();
-    let hb = base / 2.0;
-
-    // 5 vertices
-    let v0 = model.vertices.add_or_find(-hb, -hb, 0.0, tol);
-    let v1 = model.vertices.add_or_find(hb, -hb, 0.0, tol);
-    let v2 = model.vertices.add_or_find(hb, hb, 0.0, tol);
-    let v3 = model.vertices.add_or_find(-hb, hb, 0.0, tol);
-    let v4 = model.vertices.add_or_find(0.0, 0.0, height, tol);
-
-    let p0 = Point3::new(-hb, -hb, 0.0);
-    let p1 = Point3::new(hb, -hb, 0.0);
-    let p2 = Point3::new(hb, hb, 0.0);
-    let p3 = Point3::new(-hb, hb, 0.0);
-    let p4 = Point3::new(0.0, 0.0, height);
-
-    // 8 edges
-    let edges = [
-        // Base CCW square at z=0
-        (v0, v1, p0, p1),
-        (v1, v2, p1, p2),
-        (v2, v3, p2, p3),
-        (v3, v0, p3, p0),
-        // Sloped edges base→apex
-        (v0, v4, p0, p4),
-        (v1, v4, p1, p4),
-        (v2, v4, p2, p4),
-        (v3, v4, p3, p4),
-    ];
-    let mut edge_ids: [EdgeId; 8] = [0; 8];
-    for (i, &(sv, ev, sp, ep)) in edges.iter().enumerate() {
-        let curve_id = model.curves.add(Box::new(Line::new(sp, ep)));
-        let edge = Edge::new(
-            0,
-            sv,
-            ev,
-            curve_id,
-            EdgeOrientation::Forward,
-            ParameterRange::new(0.0, 1.0),
-        );
-        edge_ids[i] = model.edges.add(edge);
-    }
-
-    // Face data: (loop edge indices, per-edge forward flags, plane
-    // origin, plane outward normal).
-    //
-    // Base (z=0, outward −Z): traversal v0→v3→v2→v1→v0
-    //   v0→v3 = e3 reversed, v3→v2 = e2 reversed,
-    //   v2→v1 = e1 reversed, v1→v0 = e0 reversed.
-    //
-    // Each sloped face's traversal is CCW when viewed from outside
-    // (away from the solid centroid at z≈h/4), so the right-hand-rule
-    // normal of the loop matches the analytical outward normal
-    // supplied below.
-    let face_data: [(Vec<usize>, Vec<bool>, Point3, Vector3); 5] = [
-        // Base
-        (
-            vec![3, 2, 1, 0],
-            vec![false, false, false, false],
-            Point3::new(0.0, 0.0, 0.0),
-            Vector3::new(0.0, 0.0, -1.0),
-        ),
-        // Front (-Y side): v0→v1→v4
-        (
-            vec![0, 5, 4],
-            vec![true, true, false],
-            p0,
-            Vector3::new(0.0, -height, hb),
-        ),
-        // Right (+X side): v1→v2→v4
-        (
-            vec![1, 6, 5],
-            vec![true, true, false],
-            p1,
-            Vector3::new(height, 0.0, hb),
-        ),
-        // Back (+Y side): v2→v3→v4
-        (
-            vec![2, 7, 6],
-            vec![true, true, false],
-            p2,
-            Vector3::new(0.0, height, hb),
-        ),
-        // Left (-X side): v3→v0→v4
-        (
-            vec![3, 4, 7],
-            vec![true, true, false],
-            p3,
-            Vector3::new(-height, 0.0, hb),
-        ),
-    ];
-
-    let mut face_ids: [FaceId; 5] = [0; 5];
-    for (face_idx, (edge_indices, orientations, point, normal)) in face_data.iter().enumerate() {
-        let plane = Plane::from_point_normal(*point, *normal).expect("pyramid plane construction");
-        let surface_id = model.surfaces.add(Box::new(plane));
-
-        let mut loop_obj = Loop::new(0, LoopType::Outer);
-        for (i, &edge_idx) in edge_indices.iter().enumerate() {
-            loop_obj.add_edge(edge_ids[edge_idx], orientations[i]);
-        }
-        let loop_id = model.loops.add(loop_obj);
-
-        let mut face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
-        face.outer_loop = loop_id;
-        face_ids[face_idx] = model.faces.add(face);
-    }
-
-    let mut shell = Shell::new(0, ShellType::Closed);
-    for &fid in &face_ids {
-        shell.add_face(fid);
-    }
-    let shell_id = model.shells.add(shell);
-    model.solids.add(Solid::new(0, shell_id))
-}
-
-fn vertex_at(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
-    for (id, vertex) in model.vertices.iter() {
-        let p = vertex.position;
-        if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
-            return id;
-        }
-    }
-    panic!("no vertex at ({}, {}, {})", x, y, z);
-}
-
-/// Topology census of `solid_id`'s outer shell as `(V, E, F)`. The
-/// Euler-Poincaré relation V − E + F = 2 is the genus-zero
-/// closed-surface invariant.
-fn shell_census(model: &BRepModel, solid_id: SolidId) -> (usize, usize, usize) {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut vertices: HashSet<VertexId> = HashSet::new();
-    let mut edges: HashSet<EdgeId> = HashSet::new();
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            for &edge_id in &lp.edges {
-                edges.insert(edge_id);
-                if let Some(edge) = model.edges.get(edge_id) {
-                    vertices.insert(edge.start_vertex);
-                    vertices.insert(edge.end_vertex);
-                }
-            }
-        }
-    }
-    (vertices.len(), edges.len(), shell.faces.len())
-}
-
-fn faces_referencing_edge(model: &BRepModel, solid_id: SolidId, edge_id: EdgeId) -> usize {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut count = 0;
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            if lp.edges.iter().any(|&e| e == edge_id) {
-                count += 1;
-                break;
-            }
-        }
-    }
-    count
-}
-
-/// Count edges of `solid_id`'s outer shell whose reference count
-/// across face loops is not exactly 2. A watertight closed manifold
-/// has zero such edges.
-fn non_manifold_edge_count(model: &BRepModel, solid_id: SolidId) -> usize {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut all_edges: HashSet<EdgeId> = HashSet::new();
-    for &face_id in &shell.faces {
-        let face = model.faces.get(face_id).expect("face exists");
-        for loop_id in face.all_loops() {
-            let lp = model.loops.get(loop_id).expect("loop exists");
-            for &edge_id in &lp.edges {
-                all_edges.insert(edge_id);
-            }
-        }
-    }
-    all_edges
-        .into_iter()
-        .filter(|&edge_id| faces_referencing_edge(model, solid_id, edge_id) != 2)
-        .count()
-}
-
-/// Locate the unique planar cap face among `face_ids` whose outer
-/// loop has exactly `expected_edge_count` edges. Panics if there
-/// isn't exactly one.
-fn find_planar_cap_face(
-    model: &BRepModel,
-    face_ids: &[FaceId],
-    expected_edge_count: usize,
-) -> FaceId {
-    let mut found: Option<FaceId> = None;
-    for &fid in face_ids {
-        let face = model.faces.get(fid).expect("face exists");
-        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
-        if surface.as_any().downcast_ref::<Plane>().is_some() {
-            let outer = model
-                .loops
-                .get(face.outer_loop)
-                .expect("planar face outer loop");
-            if outer.edges.len() == expected_edge_count {
-                assert!(
-                    found.is_none(),
-                    "more than one planar face with {} outer-loop edges produced",
-                    expected_edge_count
-                );
-                found = Some(fid);
-            }
-        }
-    }
-    found.unwrap_or_else(|| {
-        panic!(
-            "no planar cap face with {} outer-loop edges among returned chamfer faces",
-            expected_edge_count
-        )
-    })
-}
 
 /// Collect the four sloped edges (base→apex) on the fixture pyramid.
 fn sloped_edges(model: &BRepModel, base: f64, height: f64) -> Vec<EdgeId> {
@@ -374,7 +132,7 @@ fn chamfer_pyramid_apex_emits_planar_quad_cap() {
         face_ids.len()
     );
 
-    let cap_face_id = find_planar_cap_face(&model, &face_ids, 4);
+    let cap_face_id = find_planar_cap_face(&model, &face_ids, Some(4));
     let cap_face = model.faces.get(cap_face_id).expect("cap face exists");
 
     let cap_surface = model
