@@ -15,6 +15,7 @@
 
 use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind, EdgeFilletProfile};
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
+use super::mixed_kind_corner_cap::SeamContinuity;
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::feasibility;
 use super::lifecycle::{self, OpSpec};
@@ -85,6 +86,18 @@ pub struct FilletOptions {
     /// records on `Solid::blended_vertices`, so the caller does
     /// not need to repeat the opt-in there.
     pub partial_corner_vertices: Vec<VertexId>,
+
+    /// CF-γ.1 — caller-selectable seam continuity at the mixed-kind
+    /// cap's rim. Defaults to
+    /// [`SeamContinuity::C0`] (planar N-gon cap — CF-β behaviour).
+    /// Selecting [`SeamContinuity::G1`] opts into the CF-γ
+    /// degenerate-bicubic NURBS cap whose tangent plane matches each
+    /// neighbour at every rim sample. The flag is consulted at the
+    /// mixed-kind dispatch site in `create_fillet_transitions`; on
+    /// non-mixed-kind corners (homogeneous all-fillet corners that
+    /// flow through `apply_apex_sphere_corner` /
+    /// `apply_triangular_nurbs_corner`) it has no effect.
+    pub seam_continuity: SeamContinuity,
 }
 
 impl Default for FilletOptions {
@@ -97,6 +110,7 @@ impl Default for FilletOptions {
             preserve_edges: true,
             quality: FilletQuality::Standard,
             partial_corner_vertices: Vec::new(),
+            seam_continuity: SeamContinuity::default(),
         }
     }
 }
@@ -641,7 +655,7 @@ pub fn fillet_edges(
         // through; supported kinds outside today's MVP surface as
         // typed BlendFailure::VertexBlendUnsupported.
         let corner_faces =
-            create_fillet_transitions(model, solid_id, &blend_graph, &edge_to_face, &corner_positions)?;
+            create_fillet_transitions(model, solid_id, &blend_graph, &edge_to_face, &corner_positions, options.seam_continuity)?;
         fillet_faces.extend(corner_faces);
 
         // CF-β.5.2-A — register every opt-in partial-mixed corner
@@ -5065,6 +5079,7 @@ fn create_fillet_transitions(
     blend_graph: &BlendGraph,
     edge_to_face: &HashMap<EdgeId, FaceId>,
     corner_positions: &HashMap<VertexId, Point3>,
+    seam_continuity: SeamContinuity,
 ) -> OperationResult<Vec<FaceId>> {
     const RADIUS_TOL: f64 = 1.0e-9;
     const AXES_RESIDUAL_TOL: f64 = 1.0e-6;
@@ -5241,15 +5256,31 @@ fn create_fillet_transitions(
                 }))
             })?;
 
-            let cap_face = super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                model,
-                solid_id,
-                corner.id,
-                &cap_edges_with_kind,
-                vertex_outward,
-                Tolerance::default().distance(),
-                BlendKind::Fillet,
-            )?;
+            // CF-γ.1 dispatcher (partial-mixed arm). `C0` keeps CF-β
+            // planar cap synthesis; `G1` is a sentinel until CF-γ.2
+            // lands the degenerate-bicubic NURBS synthesizer.
+            let cap_face = match seam_continuity {
+                SeamContinuity::C0 => super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                    model,
+                    solid_id,
+                    corner.id,
+                    &cap_edges_with_kind,
+                    vertex_outward,
+                    Tolerance::default().distance(),
+                    BlendKind::Fillet,
+                )?,
+                SeamContinuity::G1 => {
+                    let rim_edge = cap_edges_with_kind[0].0;
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SeamContinuityUnreachable {
+                            residual: f64::INFINITY,
+                            tolerance: 0.0,
+                            station: 0,
+                            rim_edge,
+                        },
+                    )));
+                }
+            };
             new_faces.push(cap_face);
             continue;
         }
@@ -5459,15 +5490,32 @@ fn create_fillet_transitions(
                 cap_edges_with_kind
                     .push((*line_eid, super::mixed_kind_corner_cap::RimKind::LinearRim));
             }
-            let cap_face = super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                model,
-                solid_id,
-                corner.id,
-                &cap_edges_with_kind,
-                vertex_outward,
-                Tolerance::default().distance(),
-                BlendKind::Fillet,
-            )?;
+            // CF-γ.1 dispatcher (degree-3 mixed arm — fillet
+            // closing a corner with a prior chamfer). `C0` keeps
+            // CF-β planar cap synthesis; `G1` is a sentinel until
+            // CF-γ.2 lands the degenerate-bicubic NURBS synthesizer.
+            let cap_face = match seam_continuity {
+                SeamContinuity::C0 => super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                    model,
+                    solid_id,
+                    corner.id,
+                    &cap_edges_with_kind,
+                    vertex_outward,
+                    Tolerance::default().distance(),
+                    BlendKind::Fillet,
+                )?,
+                SeamContinuity::G1 => {
+                    let rim_edge = cap_edges_with_kind[0].0;
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SeamContinuityUnreachable {
+                            residual: f64::INFINITY,
+                            tolerance: 0.0,
+                            station: 0,
+                            rim_edge,
+                        },
+                    )));
+                }
+            };
             new_faces.push(cap_face);
         } else if radii_equal {
             let face_id = apply_apex_sphere_corner(

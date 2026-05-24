@@ -9,6 +9,7 @@
 
 use super::blend_graph::BlendVertexKind;
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
+use super::mixed_kind_corner_cap::SeamContinuity;
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::fillet::edge_orientation_in_face;
 use super::lifecycle::{self, OpSpec};
@@ -58,6 +59,16 @@ pub struct ChamferOptions {
     /// for the full contract; the chamfer side carries identical
     /// semantics.
     pub partial_corner_vertices: Vec<VertexId>,
+
+    /// CF-γ.1 — caller-selectable seam continuity at the mixed-kind
+    /// cap's rim. Defaults to
+    /// [`SeamContinuity::C0`] (planar N-gon cap — CF-β behaviour).
+    /// Selecting [`SeamContinuity::G1`] opts into the CF-γ
+    /// degenerate-bicubic NURBS cap whose tangent plane matches each
+    /// neighbour at every rim sample. The flag is consulted at the
+    /// mixed-kind dispatch site in `handle_chamfer_vertices`; on
+    /// non-mixed-kind corners it has no effect.
+    pub seam_continuity: SeamContinuity,
 }
 
 impl Default for ChamferOptions {
@@ -71,6 +82,7 @@ impl Default for ChamferOptions {
             propagation: PropagationMode::None,
             preserve_edges: false,
             partial_corner_vertices: Vec::new(),
+            seam_continuity: SeamContinuity::default(),
         }
     }
 }
@@ -288,6 +300,7 @@ pub fn chamfer_edges(
                 &corner_set,
                 &selected_edges,
                 &surgeries,
+                options.seam_continuity,
             )?;
             chamfer_faces.extend(cap_faces);
         }
@@ -2661,6 +2674,7 @@ fn handle_chamfer_vertices(
     corner_set: &ChamferCornerSet,
     selected_edges: &[EdgeId],
     surgeries: &[BlendEdgeSurgery],
+    seam_continuity: SeamContinuity,
 ) -> OperationResult<Vec<FaceId>> {
     let mut cap_faces: Vec<FaceId> = Vec::new();
     if corner_set.corners.is_empty() {
@@ -2745,15 +2759,41 @@ fn handle_chamfer_vertices(
                 cap_edges_with_kind
                     .push((*arc_eid, super::mixed_kind_corner_cap::RimKind::ArcRim));
             }
-            super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                model,
-                solid_id,
-                corner.vertex_id,
-                &cap_edges_with_kind,
-                corner.outward,
-                tolerance,
-                BlendKind::Chamfer,
-            )?
+            // CF-γ.1 dispatcher: branch on caller-selected seam
+            // continuity. `C0` keeps CF-β planar cap synthesis
+            // byte-identical (the historical path). `G1` is a sentinel
+            // until CF-γ.2 lands the degenerate-bicubic NURBS
+            // synthesizer — the kernel surfaces a typed
+            // `SeamContinuityUnreachable` reject so the api-server
+            // round-trips a structured `BlendFailed` HTTP-400 carrying
+            // the contract surface. CF-γ.2 flips this arm to the real
+            // `synthesize_mixed_kind_corner_cap_g1` call.
+            match seam_continuity {
+                SeamContinuity::C0 => super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                    model,
+                    solid_id,
+                    corner.vertex_id,
+                    &cap_edges_with_kind,
+                    corner.outward,
+                    tolerance,
+                    BlendKind::Chamfer,
+                )?,
+                SeamContinuity::G1 => {
+                    // cap_edges_with_kind is non-empty by the
+                    // `degree ≥ 3` corner-set invariant; indexing
+                    // through the file-wide
+                    // `#![allow(clippy::indexing_slicing)]`.
+                    let rim_edge = cap_edges_with_kind[0].0;
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SeamContinuityUnreachable {
+                            residual: f64::INFINITY,
+                            tolerance: 0.0,
+                            station: 0,
+                            rim_edge,
+                        },
+                    )));
+                }
+            }
         } else {
             apply_planar_chamfer_cap(
                 model,
@@ -3565,6 +3605,7 @@ mod tests {
                 propagation: PropagationMode::None,
                 preserve_edges: false,
                 partial_corner_vertices: Vec::new(),
+                seam_continuity: SeamContinuity::C0,
             };
 
             let result = chamfer_edges(&mut model, solid_id, vec![*edge_id], opts);

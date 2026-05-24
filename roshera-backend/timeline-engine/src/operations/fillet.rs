@@ -172,6 +172,8 @@ impl OperationImpl for FilletOp {
                 preserve_edges: true,
                 quality: geometry_engine::operations::fillet::FilletQuality::Standard,
                 partial_corner_vertices: Vec::new(),
+                seam_continuity:
+                    geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity::C0,
             };
 
             // Get the solid ID from the BRep (there should be one solid)

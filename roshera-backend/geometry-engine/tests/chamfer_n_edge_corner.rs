@@ -120,6 +120,7 @@ fn chamfer_pyramid_apex_emits_planar_quad_cap() {
             validate_result: false,
             ..Default::default()
         },
+        ..ChamferOptions::default()
     };
     let face_ids = chamfer_edges(&mut model, solid_id, edges, opts)
         .expect("Chamfer-β four-edge apex chamfer on a square pyramid succeeds");
@@ -229,6 +230,7 @@ fn chamfer_pyramid_apex_three_of_four_edges_subset() {
             validate_result: false,
             ..Default::default()
         },
+        ..ChamferOptions::default()
     };
     let face_ids = chamfer_edges(&mut model, solid_id, edges, opts)
         .expect("Chamfer-β three-of-four-edge apex chamfer on a square pyramid succeeds");

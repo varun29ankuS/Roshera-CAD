@@ -377,6 +377,32 @@ pub enum BlendFailure {
         /// Kind requested by the current call site.
         requested_kind: BlendKind,
     },
+    /// CF-γ — the requested
+    /// [`crate::operations::mixed_kind_corner_cap::SeamContinuity::G1`]
+    /// cap could not satisfy the per-rim tangent-plane constraints
+    /// within the kernel-fixed angular tolerance. `residual` is the
+    /// worst-case angular residual the G1 solver produced (radians);
+    /// `tolerance` is the bar it was compared against. `station` is
+    /// the integer index ∈ `[0, K)` of the sample station that
+    /// exceeded `tolerance` (K = the kernel's per-rim sample count).
+    /// `rim_edge` is the cap-rim edge whose tangent-plane match
+    /// failed.
+    ///
+    /// Agents recover by retrying with
+    /// `seam_continuity: C0` (which always succeeds for the same
+    /// fixture by definition — CF-β planar cap is the C0 fallback)
+    /// or by adjusting the displacement parameters so the
+    /// neighbouring tangent ribbons admit a G1 solution.
+    SeamContinuityUnreachable {
+        /// Worst-case angular residual the G1 solver produced (radians).
+        residual: f64,
+        /// Angular tolerance the residual was compared against (radians).
+        tolerance: f64,
+        /// Sample-station index ∈ `[0, K)` at which `residual` was measured.
+        station: u32,
+        /// Cap-rim edge whose tangent-plane match failed.
+        rim_edge: EdgeId,
+    },
     /// Catch-all for irreducible failures not yet classified. The
     /// `detail` string is freeform; treat occurrences as a TODO to
     /// replace with a structured variant once the failure mode is
@@ -461,6 +487,16 @@ impl std::fmt::Display for BlendFailure {
                 "conflicting blend on edge {}: existing kind {} cannot accept a {} on the same edge or shared corner",
                 edge, existing_kind, requested_kind
             ),
+            BlendFailure::SeamContinuityUnreachable {
+                residual,
+                tolerance,
+                station,
+                rim_edge,
+            } => write!(
+                f,
+                "G1 seam-continuity unreachable at rim edge {} station {} (angular residual {} > tolerance {})",
+                rim_edge, station, residual, tolerance
+            ),
             BlendFailure::TopologyViolation { detail } => {
                 write!(f, "topology violation: {}", detail)
             }
@@ -501,6 +537,15 @@ impl From<BlendFailure> for OperationError {
                 reason: VertexBlendUnsupportedReason::MixedKindUnsupported { .. },
                 ..
             } => OperationError::BlendFailed(Box::new(failure)),
+            // CF-γ: SeamContinuityUnreachable carries the structured
+            // angular-residual payload that callers (frontend
+            // diagnostics, agents) need to branch on (retry-with-C0
+            // vs. adjust-displacement). Route to the typed
+            // `BlendFailed` variant rather than the legacy
+            // stringly-typed `InvalidGeometry` bucket.
+            BlendFailure::SeamContinuityUnreachable { .. } => {
+                OperationError::BlendFailed(Box::new(failure))
+            }
             BlendFailure::RadiusExceedsCurvature { .. }
             | BlendFailure::SetbackTooLong { .. }
             | BlendFailure::VertexBlendUnsupported { .. }
@@ -922,6 +967,74 @@ mod tests {
                 serde_json::from_value(json).expect("round-trip");
             assert_eq!(*sample, back);
         }
+    }
+
+    // ----------------------------------------------------------------
+    // CF-γ.1 — pin the new `SeamContinuityUnreachable` variant. The
+    // variant routes through `OperationError::BlendFailed` so agents
+    // (frontend diagnostics, MCP tools) can branch on the typed
+    // angular-residual payload rather than parsing the Display string.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn seam_continuity_unreachable_maps_to_blend_failed_and_preserves_payload() {
+        let failure = BlendFailure::SeamContinuityUnreachable {
+            residual: 0.005,
+            tolerance: 1.0e-4,
+            station: 3,
+            rim_edge: 17,
+        };
+        let err: OperationError = failure.clone().into();
+        match err {
+            OperationError::BlendFailed(boxed) => match *boxed {
+                BlendFailure::SeamContinuityUnreachable {
+                    residual,
+                    tolerance,
+                    station,
+                    rim_edge,
+                } => {
+                    assert_eq!(residual, 0.005);
+                    assert_eq!(tolerance, 1.0e-4);
+                    assert_eq!(station, 3);
+                    assert_eq!(rim_edge, 17);
+                }
+                other => panic!("expected SeamContinuityUnreachable, got {:?}", other),
+            },
+            other => panic!("expected BlendFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn seam_continuity_unreachable_display_carries_rim_and_station() {
+        let rendered = BlendFailure::SeamContinuityUnreachable {
+            residual: 0.005,
+            tolerance: 1.0e-4,
+            station: 3,
+            rim_edge: 17,
+        }
+        .to_string();
+        assert!(rendered.contains("rim edge 17"));
+        assert!(rendered.contains("station 3"));
+        assert!(rendered.contains("G1 seam-continuity unreachable"));
+    }
+
+    #[test]
+    fn seam_continuity_unreachable_serde_round_trip_internally_tagged() {
+        let failure = BlendFailure::SeamContinuityUnreachable {
+            residual: 0.005,
+            tolerance: 1.0e-4,
+            station: 3,
+            rim_edge: 17,
+        };
+        let json = serde_json::to_value(&failure).expect("serialize");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("SeamContinuityUnreachable")
+        );
+        assert_eq!(json.get("station").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(json.get("rim_edge").and_then(|v| v.as_u64()), Some(17));
+        let back: BlendFailure = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(failure, back);
     }
 
     #[test]
