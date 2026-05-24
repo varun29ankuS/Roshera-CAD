@@ -78,6 +78,7 @@ fn build_corner_chamfer(chamfer_type: ChamferType) -> (BRepModel, SolidId, Vec<F
             validate_result: false,
             ..Default::default()
         },
+        ..ChamferOptions::default()
     };
     let face_ids = chamfer_edges(&mut model, solid_id, corner_edges, opts)
         .expect("Chamfer-α three-edge corner chamfer on a box succeeds");

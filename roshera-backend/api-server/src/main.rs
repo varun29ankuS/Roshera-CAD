@@ -1588,6 +1588,47 @@ fn parse_partial_corner_vertices(
     Ok(out)
 }
 
+/// CF-γ.1 — optional `seam_continuity` field (string: "c0" or "g1").
+/// Selects the kernel's mixed-kind cap surface continuity at the
+/// rim. Defaults to `c0` (planar N-gon cap — CF-β behaviour).
+/// Missing / null / case-insensitive match → `SeamContinuity::C0`;
+/// `"g1"` → `SeamContinuity::G1`; any other string is a 400.
+///
+/// The wire shape is fixed at this slice: changing it is a breaking
+/// change to the `/api/geometry/{fillet,chamfer}` endpoint contract.
+fn parse_seam_continuity(
+    payload: &serde_json::Value,
+) -> Result<
+    geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity,
+    error_catalog::ApiError,
+> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity;
+
+    let value = match payload.get("seam_continuity") {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(SeamContinuity::default()),
+    };
+    let s = value.as_str().ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'seam_continuity' must be a string (\"c0\" or \"g1\"), got {value}"
+            ),
+        )
+    })?;
+    match s.to_ascii_lowercase().as_str() {
+        "c0" => Ok(SeamContinuity::C0),
+        "g1" => Ok(SeamContinuity::G1),
+        other => Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'seam_continuity' must be \"c0\" or \"g1\", got \"{other}\""
+            ),
+        )),
+    }
+}
+
 async fn fillet_edges_endpoint(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -1677,6 +1718,13 @@ async fn fillet_edges_endpoint(
     // leave a planar boundary at the corner.
     let partial_corner_vertices = parse_partial_corner_vertices(&payload)?;
 
+    // CF-γ.1 — optional seam-continuity flag at the mixed-kind cap
+    // rim. Threaded unchanged into every kernel dispatch arm below;
+    // the kernel's `create_fillet_transitions` branches on this at
+    // the eager-cap synthesis site. Defaults to `C0` (CF-β planar
+    // cap behaviour) when absent.
+    let seam_continuity = parse_seam_continuity(&payload)?;
+
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -1754,6 +1802,7 @@ async fn fillet_edges_endpoint(
                 radius: conservative_radius,
                 propagation: PropagationMode::None,
                 partial_corner_vertices: partial_corner_vertices.clone(),
+                seam_continuity,
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
@@ -1763,6 +1812,7 @@ async fn fillet_edges_endpoint(
                 fillet_type: radii_parsed.to_fillet_type(0),
                 propagation: PropagationMode::None,
                 partial_corner_vertices: partial_corner_vertices.clone(),
+                seam_continuity,
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
@@ -1788,6 +1838,7 @@ async fn fillet_edges_endpoint(
                 radius: radius_repr,
                 propagation: PropagationMode::None,
                 partial_corner_vertices: partial_corner_vertices.clone(),
+                seam_continuity,
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts)
@@ -1803,6 +1854,7 @@ async fn fillet_edges_endpoint(
                     fillet_type: radii_parsed.to_fillet_type(i),
                     propagation: PropagationMode::None,
                     partial_corner_vertices: partial_corner_vertices.clone(),
+                    seam_continuity,
                     ..FilletOptions::default()
                 };
                 kernel_fillet(&mut model, solid_id, vec![edge_id], opts)
@@ -1867,6 +1919,22 @@ async fn fillet_edges_endpoint(
             obj.insert(
                 "partial_corner_vertices".to_string(),
                 serde_json::to_value(&partial_corner_vertices)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    // CF-γ.1 — echo the opt-in seam-continuity flag so timeline replay
+    // reproduces the exact G1/C0 dispatch. Omitted on the default C0
+    // path to keep the pre-CF-γ broadcast shape byte-identical for
+    // callers that don't opt in to G1.
+    if !matches!(
+        seam_continuity,
+        geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity::C0
+    ) {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.insert(
+                "seam_continuity".to_string(),
+                serde_json::to_value(seam_continuity)
                     .unwrap_or(serde_json::Value::Null),
             );
         }
@@ -1983,6 +2051,10 @@ async fn chamfer_edges_endpoint(
     // CF-β.5.2-C — same opt-in surface as fillet. See
     // `parse_partial_corner_vertices` doc-comment for the contract.
     let partial_corner_vertices = parse_partial_corner_vertices(&payload)?;
+    // CF-γ.1 — opt-in seam-continuity flag. Default C0 preserves
+    // the pre-CF-γ planar mixed-kind cap; G1 routes to the
+    // (γ.2-landing) NURBS synthesizer.
+    let seam_continuity = parse_seam_continuity(&payload)?;
 
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
@@ -2000,6 +2072,7 @@ async fn chamfer_edges_endpoint(
             symmetric: true,
             propagation: PropagationMode::None,
             partial_corner_vertices: partial_corner_vertices.clone(),
+            seam_continuity,
             ..ChamferOptions::default()
         };
         kernel_chamfer(&mut model, solid_id, edges, opts).map_err(ApiError::from)?;
@@ -2046,6 +2119,21 @@ async fn chamfer_edges_endpoint(
             obj.insert(
                 "partial_corner_vertices".to_string(),
                 serde_json::to_value(&partial_corner_vertices)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    // CF-γ.1 — echo seam-continuity flag. Omitted on default C0 so
+    // the pre-CF-γ broadcast shape stays byte-identical for callers
+    // that don't opt in to G1.
+    if !matches!(
+        seam_continuity,
+        geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity::C0
+    ) {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.insert(
+                "seam_continuity".to_string(),
+                serde_json::to_value(seam_continuity)
                     .unwrap_or(serde_json::Value::Null),
             );
         }

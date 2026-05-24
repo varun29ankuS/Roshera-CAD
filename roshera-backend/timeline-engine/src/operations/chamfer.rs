@@ -134,6 +134,8 @@ impl OperationImpl for ChamferOp {
                 propagation: PropagationMode::Tangent,
                 preserve_edges: true,
                 partial_corner_vertices: Vec::new(),
+                seam_continuity:
+                    geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity::C0,
             };
 
             // Get the solid ID from the BRep (there should be one solid)

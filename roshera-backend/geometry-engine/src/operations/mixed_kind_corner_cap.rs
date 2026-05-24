@@ -97,6 +97,42 @@ pub enum RimKind {
     ArcRim,
 }
 
+/// CF-γ — caller-selectable seam continuity at the mixed-kind cap's
+/// rim. The default `C0` keeps the CF-β behaviour byte-identical: the
+/// cap is a planar N-gon whose underlying [`Plane`] meets each
+/// neighbour (chamfer [`crate::primitives::surface::RuledSurface`] or
+/// fillet [`crate::primitives::surface::Cylinder`]) at a dihedral
+/// kink. Selecting `G1` opts into the CF-γ degenerate-bicubic NURBS
+/// cap whose tangent plane matches each neighbour's tangent plane at
+/// every sample station along the corresponding rim — visually
+/// smooth across the seam under Gouraud / Phong shading.
+///
+/// Internally tagged on `type` (snake_case) so the api-server wire
+/// shape stays uniform with the rest of the blend-options surface:
+///
+/// ```json
+/// "seam_continuity": "c0"  // or "g1"
+/// ```
+///
+/// Stored as a single byte on [`crate::operations::chamfer::ChamferOptions`]
+/// and [`crate::operations::fillet::FilletOptions`]; threaded
+/// unchanged through every dispatch arm so the kernel can branch on
+/// it at the eager-cap synthesis site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeamContinuity {
+    /// Default — planar N-gon cap (CF-β behaviour). C0 with both
+    /// chamfer and fillet neighbours.
+    #[default]
+    C0,
+    /// CF-γ — degenerate-bicubic NURBS cap whose tangent plane matches
+    /// each neighbour at every rim sample station. Falls back to a
+    /// typed [`super::diagnostics::BlendFailure::SeamContinuityUnreachable`]
+    /// reject when the G1 least-squares solver cannot satisfy the
+    /// per-rim tangent constraints within the kernel-fixed tolerance.
+    G1,
+}
+
 impl From<BlendKind> for RimKind {
     fn from(kind: BlendKind) -> Self {
         match kind {
@@ -683,6 +719,57 @@ mod tests {
     use crate::primitives::curve::{Arc as ArcCurve, Line as LineCurve, NurbsCurve};
     use crate::primitives::edge::{Edge, EdgeOrientation};
     use crate::primitives::topology_builder::BRepModel;
+
+    // ----------------------------------------------------------------
+    // CF-γ.1 — `SeamContinuity` enum pin.
+    //
+    // The default must stay `C0` so every existing CF-β caller (and
+    // the `..Default::default()` initialiser pattern used throughout
+    // the test surface and api-server) keeps the planar cap path
+    // active without a code change. The serde round-trip pins the
+    // wire shape the api-server's `parse_seam_continuity` and
+    // `recorded_operation_extras` echo rely on.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn seam_continuity_default_is_c0() {
+        assert_eq!(SeamContinuity::default(), SeamContinuity::C0);
+    }
+
+    #[test]
+    fn seam_continuity_serde_round_trip_snake_case_tags() {
+        // Pin both directions of every variant: serialize → snake_case
+        // string; deserialize the same string back. The wire shape
+        // is fixed at this slice — changing it is a breaking change
+        // to the api-server `seam_continuity` field contract.
+        let c0_json = serde_json::to_value(SeamContinuity::C0).expect("serialize C0");
+        let g1_json = serde_json::to_value(SeamContinuity::G1).expect("serialize G1");
+        assert_eq!(c0_json.as_str(), Some("c0"));
+        assert_eq!(g1_json.as_str(), Some("g1"));
+
+        let c0_back: SeamContinuity = serde_json::from_value(c0_json).expect("deserialize c0");
+        let g1_back: SeamContinuity = serde_json::from_value(g1_json).expect("deserialize g1");
+        assert_eq!(c0_back, SeamContinuity::C0);
+        assert_eq!(g1_back, SeamContinuity::G1);
+    }
+
+    #[test]
+    fn chamfer_options_seam_continuity_defaults_to_c0() {
+        // ChamferOptions::default() must populate `seam_continuity`
+        // with `C0` — every existing caller that constructs the
+        // options via `..Default::default()` keeps the planar cap
+        // path without an explicit assignment.
+        use crate::operations::chamfer::ChamferOptions;
+        let opts = ChamferOptions::default();
+        assert_eq!(opts.seam_continuity, SeamContinuity::C0);
+    }
+
+    #[test]
+    fn fillet_options_seam_continuity_defaults_to_c0() {
+        use crate::operations::FilletOptions;
+        let opts = FilletOptions::default();
+        assert_eq!(opts.seam_continuity, SeamContinuity::C0);
+    }
 
     /// Lightweight model + N synthetic cap edges helper.
     ///
