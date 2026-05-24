@@ -70,10 +70,10 @@ use crate::math::{Point3, Vector3};
 use crate::primitives::{
     curve::{Arc, Line},
     edge::EdgeId,
-    face::{Face, FaceId},
+    face::{Face, FaceId, FaceOrientation},
     r#loop::{Loop, LoopType},
     solid::{BlendKind, SolidId, VertexBlendKindSet},
-    surface::Plane,
+    surface::{Plane, SurfaceId},
     topology_builder::BRepModel,
     vertex::VertexId,
 };
@@ -361,6 +361,83 @@ pub fn synthesize_mixed_kind_corner_cap(
     let orientation = orient_face_for_outward(&plane, vertex_outward)?;
     let surface_id = model.surfaces.add(Box::new(plane));
 
+    // Steps 5–8 (loop assembly, face creation, shell registration,
+    // orphan-vertex cleanup, per-solid registry updates) are shared
+    // verbatim between the CF-β planar cap synthesizer and the CF-γ
+    // G1 NURBS cap synthesizer in
+    // [`crate::operations::mixed_kind_corner_cap_g1`]. They live in
+    // [`finalize_mixed_kind_cap_face`] so the only behaviour
+    // distinguishing the two synthesizers is the surface
+    // construction in Steps 1–4 above; everything that touches the
+    // topology / registries / orphan-vertex defence is identical.
+    finalize_mixed_kind_cap_face(
+        model,
+        solid_id,
+        vertex_id,
+        cap_edges_with_kind,
+        &loop_forwards,
+        surface_id,
+        orientation,
+        requested_kind,
+    )
+}
+
+/// Shared finalize tail for mixed-kind corner caps (CF-β planar and
+/// CF-γ G1 NURBS).
+///
+/// Given a fully-constructed cap surface already added to
+/// `model.surfaces` (with `surface_id`) and the caller-chosen
+/// `orientation`, this routine performs the topology / shell
+/// registration / orphan-cleanup / per-solid registry mutations
+/// that are byte-identical between the planar and NURBS cap
+/// synthesizers:
+///
+/// 5. Assemble the cap loop in `cap_edges_with_kind` input order,
+///    using the recovered `loop_forwards` flags from
+///    [`verify_mixed_cap_loop`].
+/// 6. Create the cap [`Face`] and register it on the host solid's
+///    outer shell.
+/// 7. Drop the original sharp corner vertex if no edge in the live
+///    model still references it (defensive — every per-edge
+///    `splice_blend_edge` already rewired the V-side to the offset
+///    rim endpoints, but a stray reference is theoretically possible
+///    in a partial-replay).
+/// 8. Update per-solid registries:
+///    - `Solid::record_blend_face(face_id, requested_kind)`
+///    - `Solid::record_blended_vertex(vertex_id, requested_kind)`
+///      (inserts into the `VertexBlendKindSet`)
+///    - `Solid::clear_pending_mixed_kind_corner(vertex_id)`
+///      (CF-β.4 — the deliberate-open-boundary mark left by the
+///      first kind-call is cleared so the next `validate_result`
+///      gate at this now-watertight corner re-applies the full
+///      validator)
+///    - `Solid::clear_corner_cap_edges(vertex_id)` (CF-β.5.2-B —
+///      drop the per-corner cap-rim side-registry; idempotent)
+///
+/// Errors propagate the existing CF-β shape:
+/// `InvalidGeometry` if the solid or its outer shell is missing
+/// from the model.
+///
+/// # CF-γ.2 invariant
+///
+/// `finalize_mixed_kind_cap_face` is the **only** place that mutates
+/// `Loop` / `Face` / `Shell` / `Solid` state for a mixed-kind cap.
+/// Both [`synthesize_mixed_kind_corner_cap`] (planar) and the CF-γ
+/// G1 synthesizer end with a single call to this routine; the
+/// `finalize_mixed_kind_cap_face_registry_state_matches_legacy_for_planar_input`
+/// unit test in
+/// [`crate::operations::mixed_kind_corner_cap_g1`] pins this
+/// behaviour as byte-identical to the CF-β pre-refactor tail.
+pub(crate) fn finalize_mixed_kind_cap_face(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    vertex_id: VertexId,
+    cap_edges_with_kind: &[(EdgeId, RimKind)],
+    loop_forwards: &[bool],
+    surface_id: SurfaceId,
+    orientation: FaceOrientation,
+    requested_kind: BlendKind,
+) -> OperationResult<FaceId> {
     // Step 5 — assemble cap loop in input order using recovered
     // forward flags.
     let mut cap_loop = Loop::new(0, LoopType::Outer);
