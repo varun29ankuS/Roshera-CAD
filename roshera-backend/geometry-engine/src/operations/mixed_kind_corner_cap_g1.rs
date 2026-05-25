@@ -100,7 +100,7 @@ use super::diagnostics::{
     BlendFailure, MixedKindRejectDetail, VertexBlendUnsupportedReason,
 };
 use super::mixed_kind_corner_cap::{
-    finalize_mixed_kind_cap_face, verify_mixed_cap_loop, RimKind,
+    finalize_mixed_kind_cap_face, verify_mixed_cap_loop, CapSubFace, RimKind,
 };
 use super::{OperationError, OperationResult};
 use crate::math::linear_solver::solve_least_squares;
@@ -538,16 +538,36 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
     .unwrap_or(FaceOrientation::Forward);
 
     let surface_id = model.surfaces.add(Box::new(cap_surface));
-    finalize_mixed_kind_cap_face(
+    // CF-γ.6.1 — wrap the single G1 patch into one `CapSubFace`
+    // and unwrap the first face id back to the legacy `FaceId`
+    // return type. γ.6.2 replaces this with a 3-sub-patch vector
+    // construction. The synthesizer is currently unreachable from
+    // production code (chamfer.rs / fillet.rs dispatcher arms
+    // short-circuit `SeamContinuity::G1` to the typed sentinel
+    // under the γ.3 backout); γ.6.2 lifts that short-circuit.
+    let sub_face = CapSubFace {
+        surface_id,
+        orientation,
+        loop_edges: cap_edges_with_kind
+            .iter()
+            .zip(loop_forwards.iter())
+            .map(|(&(edge, _), &fwd)| (edge, fwd))
+            .collect(),
+    };
+    let face_ids = finalize_mixed_kind_cap_face(
         model,
         solid_id,
         vertex_id,
-        cap_edges_with_kind,
-        &loop_forwards,
-        surface_id,
-        orientation,
+        std::slice::from_ref(&sub_face),
         requested_kind,
-    )
+    )?;
+    face_ids.into_iter().next().ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "finalize_mixed_kind_cap_face returned an empty face list \
+             for the CF-γ single-patch G1 path"
+                .to_string(),
+        )
+    })
 }
 
 /// Lift a rim curve to a 4-control-point cubic Bezier

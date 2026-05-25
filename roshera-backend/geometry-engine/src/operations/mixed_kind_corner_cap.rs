@@ -142,6 +142,26 @@ impl From<BlendKind> for RimKind {
     }
 }
 
+/// CF-γ.6.1 — one sub-face of a mixed-kind cap.
+///
+/// The CF-β planar cap is always one sub-face (the planar N-gon). The
+/// CF-γ.6 three-sub-patch G1 cap is three sub-faces sharing a central
+/// apex vertex. [`finalize_mixed_kind_cap_face`] takes a slice of these
+/// and creates one [`Face`] + one [`Loop`] per entry, registers each on
+/// the host solid's outer shell, then runs the shared step-7 (orphan
+/// vertex cleanup) and step-8 (per-solid registry updates) tail once.
+///
+/// `loop_edges` is the full sub-face loop in cap-loop traversal order,
+/// each edge paired with its `forward` flag. For the CF-β single-face
+/// case this is the cap-rim ring; for a 3-sub-patch G1 case this is one
+/// rim edge + two spoke edges per sub-face.
+#[derive(Debug, Clone)]
+pub(crate) struct CapSubFace {
+    pub surface_id: SurfaceId,
+    pub orientation: FaceOrientation,
+    pub loop_edges: Vec<(EdgeId, bool)>,
+}
+
 /// Verify a heterogeneous cap loop's rim-kind annotations match each
 /// edge's underlying curve type, then delegate the topological cycle
 /// check to [`verify_cap_edges_form_closed_polygon`].
@@ -370,16 +390,38 @@ pub fn synthesize_mixed_kind_corner_cap(
     // distinguishing the two synthesizers is the surface
     // construction in Steps 1–4 above; everything that touches the
     // topology / registries / orphan-vertex defence is identical.
-    finalize_mixed_kind_cap_face(
+    // CF-γ.6.1 — wrap the single planar cap face into one
+    // [`CapSubFace`]. `finalize_mixed_kind_cap_face` returns a
+    // `Vec<FaceId>` so the 3-sub-patch G1 path can carry all three
+    // face ids; the CF-β planar path stays single-face and unwraps
+    // back to the legacy `FaceId` return at the callers above.
+    let sub_face = CapSubFace {
+        surface_id,
+        orientation,
+        loop_edges: cap_edges_with_kind
+            .iter()
+            .zip(loop_forwards.iter())
+            .map(|(&(edge, _), &fwd)| (edge, fwd))
+            .collect(),
+    };
+    let face_ids = finalize_mixed_kind_cap_face(
         model,
         solid_id,
         vertex_id,
-        cap_edges_with_kind,
-        &loop_forwards,
-        surface_id,
-        orientation,
+        std::slice::from_ref(&sub_face),
         requested_kind,
-    )
+    )?;
+    // CF-β single-face cap — finalize pushes one FaceId per
+    // sub-face and rejects an empty slice up-front, so the Vec is
+    // guaranteed non-empty here. `next()` keeps the contract
+    // `unwrap_used = "deny"` policy-clean.
+    face_ids.into_iter().next().ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "finalize_mixed_kind_cap_face returned an empty face list \
+             for the CF-β single-cap path"
+                .to_string(),
+        )
+    })
 }
 
 /// Shared finalize tail for mixed-kind corner caps (CF-β planar and
@@ -418,39 +460,32 @@ pub fn synthesize_mixed_kind_corner_cap(
 /// `InvalidGeometry` if the solid or its outer shell is missing
 /// from the model.
 ///
-/// # CF-γ.2 invariant
+/// # CF-γ.6.1 invariant
 ///
 /// `finalize_mixed_kind_cap_face` is the **only** place that mutates
 /// `Loop` / `Face` / `Shell` / `Solid` state for a mixed-kind cap.
-/// Both [`synthesize_mixed_kind_corner_cap`] (planar) and the CF-γ
-/// G1 synthesizer end with a single call to this routine; the
-/// `finalize_mixed_kind_cap_face_registry_state_matches_legacy_for_planar_input`
-/// unit test in
-/// [`crate::operations::mixed_kind_corner_cap_g1`] pins this
-/// behaviour as byte-identical to the CF-β pre-refactor tail.
+/// The CF-β planar synthesizer wraps its single planar cap into
+/// one [`CapSubFace`] and unwraps the returned `Vec<FaceId>` back
+/// to a single `FaceId`; the CF-γ.6 three-sub-patch G1 synthesizer
+/// (γ.6.2) hands in three [`CapSubFace`]s and forwards the full
+/// vec to its callers. The
+/// `finalize_with_single_subface_byte_identical_to_legacy_planar_tail`
+/// unit test below pins the CF-β path as byte-identical to the
+/// pre-γ.6.1 tail.
 pub(crate) fn finalize_mixed_kind_cap_face(
     model: &mut BRepModel,
     solid_id: SolidId,
     vertex_id: VertexId,
-    cap_edges_with_kind: &[(EdgeId, RimKind)],
-    loop_forwards: &[bool],
-    surface_id: SurfaceId,
-    orientation: FaceOrientation,
+    sub_faces: &[CapSubFace],
     requested_kind: BlendKind,
-) -> OperationResult<FaceId> {
-    // Step 5 — assemble cap loop in input order using recovered
-    // forward flags.
-    let mut cap_loop = Loop::new(0, LoopType::Outer);
-    for (i, &(cap_edge, _)) in cap_edges_with_kind.iter().enumerate() {
-        cap_loop.add_edge(cap_edge, loop_forwards[i]);
+) -> OperationResult<Vec<FaceId>> {
+    if sub_faces.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "finalize_mixed_kind_cap_face: at least one sub-face required".to_string(),
+        ));
     }
-    let loop_id = model.loops.add(cap_loop);
 
-    let mut face = Face::new(0, surface_id, loop_id, orientation);
-    face.outer_loop = loop_id;
-    let face_id = model.faces.add(face);
-
-    // Step 6 — register the cap face on the outer shell.
+    // Resolve the outer shell once; every sub-face attaches to it.
     let shell_id = model
         .solids
         .get(solid_id)
@@ -461,17 +496,39 @@ pub(crate) fn finalize_mixed_kind_cap_face(
             ))
         })?
         .outer_shell;
-    let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Outer shell {} not found while registering mixed-kind cap",
-            shell_id
-        ))
-    })?;
-    shell.add_face(face_id);
+
+    let mut face_ids: Vec<FaceId> = Vec::with_capacity(sub_faces.len());
+
+    for sub in sub_faces {
+        // Step 5 — assemble this sub-face's loop in caller-supplied
+        // traversal order.
+        let mut cap_loop = Loop::new(0, LoopType::Outer);
+        for &(edge_id, forward) in &sub.loop_edges {
+            cap_loop.add_edge(edge_id, forward);
+        }
+        let loop_id = model.loops.add(cap_loop);
+
+        let mut face = Face::new(0, sub.surface_id, loop_id, sub.orientation);
+        face.outer_loop = loop_id;
+        let face_id = model.faces.add(face);
+
+        // Step 6 — register this sub-face on the outer shell.
+        let shell = model.shells.get_mut(shell_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "Outer shell {} not found while registering mixed-kind cap",
+                shell_id
+            ))
+        })?;
+        shell.add_face(face_id);
+
+        face_ids.push(face_id);
+    }
 
     // Step 7 — drop the original sharp corner vertex if unreferenced.
     // Mirrors the defensive guard in `apply_planar_chamfer_cap` and
-    // `apply_apex_sphere_corner`.
+    // `apply_apex_sphere_corner`. Runs once across all sub-faces — the
+    // CF-γ.6 3-sub-patch cap introduces a fresh apex vertex but the
+    // original corner is still the one being torn down here.
     let still_referenced = model
         .edges
         .iter()
@@ -489,8 +546,14 @@ pub(crate) fn finalize_mixed_kind_cap_face(
     // newly-watertight corner re-applies the full validator (no carve-
     // out for this vertex anymore). Idempotent — a no-op if the first
     // call never marked the corner pending.
+    //
+    // `record_blend_face` runs once per sub-face so a CF-γ.6 cap
+    // shows all 3 sub-patches in `Solid::blend_faces_by_kind`. The
+    // other three registry calls are per-vertex and run exactly once.
     if let Some(solid) = model.solids.get_mut(solid_id) {
-        solid.record_blend_face(face_id, requested_kind);
+        for &face_id in &face_ids {
+            solid.record_blend_face(face_id, requested_kind);
+        }
         solid.record_blended_vertex(vertex_id, requested_kind);
         solid.clear_pending_mixed_kind_corner(vertex_id);
         // CF-β.5.2-B — drop the per-corner cap-rim registry entries
@@ -504,7 +567,7 @@ pub(crate) fn finalize_mixed_kind_cap_face(
         let _ = solid.clear_corner_cap_edges(vertex_id);
     }
 
-    Ok(face_id)
+    Ok(face_ids)
 }
 
 /// Best-effort planar residual: max signed distance from the plane
@@ -1314,5 +1377,242 @@ mod tests {
             let kept = filter_pending_corner_errors(&model, &pending, errors);
             assert_eq!(kept.len(), 1);
         }
+    }
+
+    // ----------------------------------------------------------------
+    // CF-γ.6.1 — `finalize_mixed_kind_cap_face` N-sub-face refactor.
+    //
+    // These tests drive `finalize_mixed_kind_cap_face` directly with
+    // hand-built `CapSubFace` values, pinning the shape change:
+    //
+    // * 1 sub-face → 1 face / 1 loop / 1 shell entry / 1
+    //   `record_blend_face` registry mutation. This is the CF-β
+    //   planar path's invariant — must remain byte-identical to the
+    //   pre-γ.6.1 tail.
+    // * 3 sub-faces → 3 faces / 3 loops / 3 shell entries / 3
+    //   `record_blend_face` mutations + 1 `record_blended_vertex`
+    //   mutation. This is the CF-γ.6.2 3-sub-patch G1 path's
+    //   topology contract.
+    // * 0 sub-faces → typed `InvalidGeometry` reject.
+    // ----------------------------------------------------------------
+
+    use crate::primitives::shell::{Shell, ShellType};
+    use crate::primitives::solid::Solid;
+
+    /// Build a fresh `(model, solid_id, shell_id)` with a default
+    /// outer shell. The shell starts empty — every `finalize_*` test
+    /// can assert on the shell-face delta directly.
+    fn fresh_solid_with_outer_shell() -> (BRepModel, SolidId, crate::primitives::shell::ShellId) {
+        let mut model = BRepModel::new();
+        let shell = Shell::new(0, ShellType::Closed);
+        let shell_id = model.shells.add(shell);
+        let solid = Solid::new(0, shell_id);
+        let solid_id = model.solids.add(solid);
+        (model, solid_id, shell_id)
+    }
+
+    /// Register a planar cap surface at z = 0, normal +Z, u-axis +X.
+    /// One surface per sub-face is wasteful in the planar case but
+    /// keeps the test's invariant assertions independent across
+    /// sub-faces (no aliasing of `surface_id`).
+    fn add_planar_cap_surface(model: &mut BRepModel) -> SurfaceId {
+        let plane = Plane::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        )
+        .expect("synthetic cap plane constructs");
+        model.surfaces.add(Box::new(plane))
+    }
+
+    #[test]
+    fn finalize_with_single_subface_byte_identical_to_legacy_planar_tail() {
+        // 3-edge planar triangle cap — the CF-β single-face contract.
+        let (mut model, solid_id, shell_id) = fresh_solid_with_outer_shell();
+        let cap_edges = build_synthetic_cap_loop(
+            &mut model,
+            3,
+            1.0,
+            &[RimKind::LinearRim, RimKind::ArcRim, RimKind::LinearRim],
+        );
+        let (_verts, forwards) = verify_mixed_cap_loop(&model, &cap_edges)
+            .expect("triangle synthetic cap closes");
+
+        // Take a free vertex (no edges referencing it) as the "corner"
+        // — finalize's Step-7 orphan-cleanup must drop it.
+        let corner = model.vertices.add(0.0, 0.0, 5.0);
+
+        let surface_id = add_planar_cap_surface(&mut model);
+        let sub_face = CapSubFace {
+            surface_id,
+            orientation: FaceOrientation::Forward,
+            loop_edges: cap_edges
+                .iter()
+                .zip(forwards.iter())
+                .map(|(&(edge, _), &fwd)| (edge, fwd))
+                .collect(),
+        };
+
+        let faces_before = model.faces.len();
+        let loops_before = model.loops.len();
+
+        let face_ids = finalize_mixed_kind_cap_face(
+            &mut model,
+            solid_id,
+            corner,
+            std::slice::from_ref(&sub_face),
+            BlendKind::Chamfer,
+        )
+        .expect("single-sub-face finalize succeeds");
+
+        // ΔF = 1, ΔL = 1 — byte-identical to the pre-γ.6.1 planar tail.
+        assert_eq!(face_ids.len(), 1, "single sub-face yields one face id");
+        assert_eq!(model.faces.len(), faces_before + 1);
+        assert_eq!(model.loops.len(), loops_before + 1);
+
+        // Shell grew by exactly the one face.
+        let shell = model.shells.get(shell_id).expect("outer shell present");
+        assert_eq!(shell.faces, vec![face_ids[0]]);
+
+        // Registry mutations.
+        let solid = model.solids.get(solid_id).expect("solid present");
+        assert_eq!(
+            solid.blend_faces_by_kind.get(&face_ids[0]),
+            Some(&BlendKind::Chamfer),
+            "blend_faces_by_kind records the new face under the requested kind",
+        );
+        assert!(
+            solid.blended_vertices.contains_key(&corner),
+            "record_blended_vertex inserts the corner",
+        );
+
+        // Step-7 orphan cleanup — the unreferenced corner is gone.
+        assert!(
+            model.vertices.get(corner).is_none(),
+            "unreferenced corner vertex must be dropped by Step 7",
+        );
+    }
+
+    #[test]
+    fn finalize_with_three_subfaces_creates_three_faces_three_loops_one_registry_entry_per_face() {
+        // CF-γ.6 3-sub-patch contract: 3 sub-faces share the same
+        // (degenerate) cap loop topology in this unit test (the real
+        // synthesizer lands in γ.6.2). The point is the bookkeeping:
+        // 3 faces, 3 loops, 3 shell entries, 3 `record_blend_face`
+        // calls — and exactly one `record_blended_vertex` /
+        // `clear_pending_mixed_kind_corner` call regardless of N.
+        let (mut model, solid_id, shell_id) = fresh_solid_with_outer_shell();
+        let cap_edges = build_synthetic_cap_loop(
+            &mut model,
+            3,
+            1.0,
+            &[RimKind::LinearRim, RimKind::ArcRim, RimKind::LinearRim],
+        );
+        let (_verts, forwards) = verify_mixed_cap_loop(&model, &cap_edges)
+            .expect("triangle synthetic cap closes");
+
+        let corner = model.vertices.add(0.0, 0.0, 5.0);
+
+        // Build 3 sub-faces. Each carries its own surface and the
+        // same triangle loop — sufficient to exercise the finalize
+        // bookkeeping without depending on γ.6.2's apex / spoke
+        // topology being in place yet.
+        let loop_edges: Vec<(EdgeId, bool)> = cap_edges
+            .iter()
+            .zip(forwards.iter())
+            .map(|(&(edge, _), &fwd)| (edge, fwd))
+            .collect();
+        let sub_faces: Vec<CapSubFace> = (0..3)
+            .map(|_| CapSubFace {
+                surface_id: add_planar_cap_surface(&mut model),
+                orientation: FaceOrientation::Forward,
+                loop_edges: loop_edges.clone(),
+            })
+            .collect();
+
+        let faces_before = model.faces.len();
+        let loops_before = model.loops.len();
+
+        let face_ids = finalize_mixed_kind_cap_face(
+            &mut model,
+            solid_id,
+            corner,
+            &sub_faces,
+            BlendKind::Fillet,
+        )
+        .expect("three-sub-face finalize succeeds");
+
+        assert_eq!(face_ids.len(), 3, "three sub-faces yield three face ids");
+        assert_eq!(model.faces.len(), faces_before + 3);
+        assert_eq!(model.loops.len(), loops_before + 3);
+
+        let shell = model.shells.get(shell_id).expect("outer shell present");
+        assert_eq!(
+            shell.faces, face_ids,
+            "shell carries all three sub-face ids in finalize order",
+        );
+
+        // `record_blend_face` ran once per sub-face — all three
+        // entries present under the requested kind.
+        let solid = model.solids.get(solid_id).expect("solid present");
+        for &face_id in &face_ids {
+            assert_eq!(
+                solid.blend_faces_by_kind.get(&face_id),
+                Some(&BlendKind::Fillet),
+                "blend_faces_by_kind missing face {:?}",
+                face_id,
+            );
+        }
+        assert_eq!(
+            solid.blend_faces_by_kind.len(),
+            3,
+            "exactly three blend-face registry entries created",
+        );
+
+        // `record_blended_vertex` ran once regardless of N.
+        assert_eq!(
+            solid.blended_vertices.len(),
+            1,
+            "blended_vertices has exactly one entry for the corner",
+        );
+
+        // Orphan cleanup unaffected by N.
+        assert!(
+            model.vertices.get(corner).is_none(),
+            "unreferenced corner vertex must be dropped by Step 7",
+        );
+    }
+
+    #[test]
+    fn finalize_with_zero_subfaces_returns_invalid_geometry() {
+        let (mut model, solid_id, _shell_id) = fresh_solid_with_outer_shell();
+        let corner = model.vertices.add(0.0, 0.0, 0.0);
+
+        let err = finalize_mixed_kind_cap_face(
+            &mut model,
+            solid_id,
+            corner,
+            &[],
+            BlendKind::Chamfer,
+        )
+        .expect_err("zero sub-faces must reject");
+
+        match err {
+            OperationError::InvalidGeometry(msg) => {
+                assert!(
+                    msg.contains("at least one sub-face required"),
+                    "InvalidGeometry message must explain the empty-slice reject: {}",
+                    msg,
+                );
+            }
+            other => panic!("expected InvalidGeometry, got {:?}", other),
+        }
+
+        // The corner vertex must survive — empty-slice rejection runs
+        // before Step 7's orphan cleanup.
+        assert!(
+            model.vertices.get(corner).is_some(),
+            "rejection must short-circuit before orphan-vertex cleanup",
+        );
     }
 }
