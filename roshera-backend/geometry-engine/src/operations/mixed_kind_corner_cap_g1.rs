@@ -525,16 +525,22 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         &stations,
         endpoint_tol,
     )?;
-    let (sub_grids, sub_weights, worst_residual, worst_rim_idx, worst_station_idx) =
-        solve_coupled_g1(
-            &rim_lifts,
-            &rim_walk_vids,
-            &distinct_corner_vids,
-            &spoke_cps_for_vid_idx,
-            apex,
-            &neighbour_normals,
-            &stations,
-        )?;
+    let (
+        sub_grids,
+        sub_weights,
+        polished_spoke_cps,
+        worst_residual,
+        worst_rim_idx,
+        worst_station_idx,
+    ) = solve_coupled_g1(
+        &rim_lifts,
+        &rim_walk_vids,
+        &distinct_corner_vids,
+        &spoke_cps_for_vid_idx,
+        apex,
+        &neighbour_normals,
+        &stations,
+    )?;
 
     if worst_residual > G1_TOLERANCE {
         return Err(OperationError::BlendFailed(Box::new(
@@ -546,6 +552,20 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
             },
         )));
     }
+
+    // CF-γ.6.3 follow-up — upgrade each spoke edge's curve from a
+    // `Line(corner, apex)` to a degree-3 NURBS built from the four
+    // *polished* spoke CPs (`polished_spoke_cps[k]`). The cap sub-
+    // patches use the polished interior CPs for their `v = 0` (and
+    // `v = 1`) columns; if the spoke edge stays linear, the cap
+    // face's wire boundary curve and the cap surface restricted to
+    // that boundary diverge by `O(displacement · 1e-7)` — a latent
+    // C0 mismatch that the vertex-pair DCEL gate cannot detect.
+    // Replacing the curve at the same `curve_id` keeps every edge
+    // reference intact; `ParameterRange::unit()` from
+    // `Edge::new_auto_range` still matches the NURBS clamped domain
+    // `[knots[degree], knots[n]] = [0, 1]`.
+    upgrade_spoke_edges_to_nurbs(model, &spoke_edges, &polished_spoke_cps)?;
 
     let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
     let mut sub_faces: Vec<CapSubFace> = Vec::with_capacity(3);
@@ -693,6 +713,73 @@ fn build_spoke_edges(
         spokes[i] = model.edges.add(edge);
     }
     Ok(spokes)
+}
+
+/// CF-γ.6.3 follow-up — replace each spoke edge's `Line(corner, apex)`
+/// curve with a degree-3 NURBS built from the polished 4-CP spoke
+/// returned by [`solve_coupled_g1`].
+///
+/// Why this is needed: both the linear LS and the Newton polish
+/// optimise over the two interior CPs of every spoke (`spoke_cps[k][1]`
+/// and `spoke_cps[k][2]`). Those interior CPs *are* the cap sub-
+/// patches' `v = 0` (and shared `v = 1`) interior boundary samples
+/// after `apply_global_solution` re-syncs the columns. If the spoke
+/// edge curve stays linear while the cap face's wire boundary picks
+/// up the polished interior CPs, the two diverge by
+/// `O(displacement · 1e-7)` — a latent C0 mismatch invisible to the
+/// vertex-pair DCEL gate but real geometrically.
+///
+/// The replacement reuses the existing `curve_id` (in-place via
+/// `CurveStore::get_mut`), so every edge / loop / face reference in
+/// the DCEL stays intact. The cubic NURBS with knot vector
+/// `[0,0,0,0,1,1,1,1]` has clamped domain `[0, 1]` — matching the
+/// `ParameterRange::unit()` that [`Edge::new_auto_range`] stamped on
+/// each spoke. Endpoints are pinned at `corner` (CP[0]) and `apex`
+/// (CP[3]), so vertex-vs-curve evaluation at the endpoints is
+/// byte-identical to the previous `Line` representation.
+///
+/// Weights are uniform (`1.0`) — the spoke is non-rational; only the
+/// rim Bezier carries the rational arc weights.
+fn upgrade_spoke_edges_to_nurbs(
+    model: &mut BRepModel,
+    spoke_edges: &[EdgeId; 3],
+    polished_spoke_cps: &[[Point3; 4]; 3],
+) -> OperationResult<()> {
+    let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    for k in 0..3 {
+        let cps: Vec<Point3> = polished_spoke_cps[k].to_vec();
+        let weights = vec![1.0_f64; 4];
+        let nurbs =
+            crate::primitives::curve::NurbsCurve::new(3, cps, weights, knots.clone())
+                .map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "CF-γ.6.3 spoke-NURBS upgrade: NurbsCurve::new failed \
+                         on spoke {}: {}",
+                        k, e
+                    ))
+                })?;
+        let edge = model.edges.get(spoke_edges[k]).ok_or_else(|| {
+            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6.3 spoke-NURBS upgrade: spoke edge {} missing from \
+                     EdgeStore",
+                    spoke_edges[k]
+                ),
+            }))
+        })?;
+        let curve_id = edge.curve_id;
+        let slot = model.curves.get_mut(curve_id).ok_or_else(|| {
+            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6.3 spoke-NURBS upgrade: curve {} for spoke edge \
+                     {} missing from CurveStore",
+                    curve_id, spoke_edges[k]
+                ),
+            }))
+        })?;
+        *slot = Box::new(nurbs);
+    }
+    Ok(())
 }
 
 /// CF-γ.6.2 — Lift each rim curve to a 4-CP cubic Bezier oriented
@@ -2174,6 +2261,7 @@ fn solve_coupled_g1(
 ) -> OperationResult<(
     [Vec<Vec<Point3>>; 3],
     [Vec<Vec<f64>>; 3],
+    [[Point3; 4]; 3],
     f64,
     usize,
     usize,
@@ -2273,7 +2361,7 @@ fn solve_coupled_g1(
         stations,
     )?;
 
-    Ok((sub_grids, sub_weights, worst, worst_rim, worst_station))
+    Ok((sub_grids, sub_weights, spoke_cps, worst, worst_rim, worst_station))
 }
 
 #[cfg(test)]
