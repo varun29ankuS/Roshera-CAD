@@ -1318,22 +1318,21 @@ async fn chamfer_seam_continuity_unknown_string_returns_invalid_parameter_400() 
     );
 }
 
-// ---- Mixed-corner G1 cap dispatch → typed reject end-to-end ---------
+// ---- Mixed-corner G1 cap dispatch → 3-sub-patch success end-to-end --
 
-/// (4) — End-to-end CF-γ backout sentinel through the HTTP stack.
-/// Driver: seed a box, chamfer one corner-incident edge with
+/// (4) — End-to-end CF-γ.6.2 3-sub-patch success through the HTTP
+/// stack. Driver: seed a box, chamfer one corner-incident edge with
 /// `seam_continuity: "g1"` AND `partial_corner_vertices: [corner]`
 /// (the opt-in that keeps the corner open without synthesizing a
 /// cap), then fillet the remaining two corner-incident edges with
 /// `seam_continuity: "g1"`. The fillet call reaches the mixed-kind
-/// dispatcher's G1 arm and surfaces the typed
-/// `BlendFailure::SeamContinuityUnreachable` reject. The full chain
-/// — kernel `OperationError::BlendFailed` → `ApiError::blend_failed`
-/// → `Json` serialization → HTTP 400 — must preserve the structured
-/// payload at `details.failure.type`, with all four fields
-/// (`residual`, `tolerance`, `station`, `rim_edge`) intact.
+/// dispatcher's G1 arm and routes through
+/// `synthesize_mixed_kind_corner_cap_g1`, emitting three bicubic
+/// NURBS sub-patches sharing a central apex vertex. The HTTP stack
+/// must surface 200 OK (success) — the post-γ.6.2 contract; the
+/// pre-γ.6.2 sentinel 400 reject is no longer the expected shape.
 #[tokio::test]
-async fn fillet_g1_mixed_corner_surfaces_seam_continuity_unreachable_400() {
+async fn fillet_g1_mixed_corner_returns_200_with_three_subpatch_cap() {
     let state = make_test_state().await;
     let (uuid, _solid_id, edges) = seed_box(&state, 4.0).await;
 
@@ -1380,7 +1379,7 @@ async fn fillet_g1_mixed_corner_surfaces_seam_continuity_unreachable_400() {
     );
 
     // Second call: fillet edge[1] + edge[2] with G1. Reaches the
-    // mixed-kind dispatcher → typed reject.
+    // mixed-kind dispatcher → 3-sub-patch G1 cap synthesizer.
     let second_request = fillet_post(json!({
         "object": uuid.to_string(),
         "edges":  [edges[1], edges[2]],
@@ -1391,35 +1390,11 @@ async fn fillet_g1_mixed_corner_surfaces_seam_continuity_unreachable_400() {
 
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "G1 mixed-corner fillet must surface 400 blend_failed; body = {body}"
+        StatusCode::OK,
+        "γ.6.2 G1 mixed-corner fillet must surface 200 OK with 3-sub-patch cap; body = {body}"
     );
-    assert_eq!(body["error_code"], "blend_failed");
-
-    let payload = &body["details"]["failure"];
     assert_eq!(
-        payload["type"], "SeamContinuityUnreachable",
-        "typed payload must carry the SeamContinuityUnreachable discriminator; payload = {payload}"
-    );
-    // Sentinel field contract from chamfer.rs/fillet.rs G1 arms.
-    // `residual = f64::INFINITY` serialises to JSON `null` (IEEE
-    // ±inf has no JSON representation under serde_json's default
-    // policy); accept either `null` or a numeric infinity sentinel
-    // so the test is robust to a future serde-json policy change
-    // that adopts `"+Infinity"` / `Infinity` literals.
-    let residual = &payload["residual"];
-    assert!(
-        residual.is_null()
-            || residual.as_f64().map(|x| x.is_infinite()).unwrap_or(false)
-            || residual.as_str() == Some("inf")
-            || residual.as_str() == Some("+inf"),
-        "residual must surface as null / inf sentinel; got {residual}"
-    );
-    assert_eq!(payload["tolerance"], 0.0);
-    assert_eq!(payload["station"], 0);
-    assert!(
-        payload["rim_edge"].is_number(),
-        "rim_edge must be a numeric EdgeId; got {}",
-        payload["rim_edge"]
+        body["success"], true,
+        "γ.6.2 G1 mixed-corner fillet response must report success; body = {body}"
     );
 }

@@ -5256,39 +5256,36 @@ fn create_fillet_transitions(
                 }))
             })?;
 
-            // CF-γ.1 dispatcher (partial-mixed arm). `C0` keeps CF-β
-            // planar cap synthesis; `G1` is a sentinel until CF-γ.2
-            // lands the degenerate-bicubic NURBS synthesizer.
-            let cap_face = match seam_continuity {
-                SeamContinuity::C0 => super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                    model,
-                    solid_id,
-                    corner.id,
-                    &cap_edges_with_kind,
-                    vertex_outward,
-                    Tolerance::default().distance(),
-                    BlendKind::Fillet,
-                )?,
+            // CF-γ.6.2 dispatcher (partial-mixed arm). `C0` keeps
+            // CF-β planar cap synthesis (single FaceId wrapped in a
+            // 1-element Vec). `G1` routes through the 3-sub-patch C0
+            // synthesizer in `synthesize_mixed_kind_corner_cap_g1`;
+            // CF-γ.6.3 lifts the seed CPs to the coupled solver.
+            let cap_face_ids: Vec<FaceId> = match seam_continuity {
+                SeamContinuity::C0 => vec![
+                    super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                        model,
+                        solid_id,
+                        corner.id,
+                        &cap_edges_with_kind,
+                        vertex_outward,
+                        Tolerance::default().distance(),
+                        BlendKind::Fillet,
+                    )?,
+                ],
                 SeamContinuity::G1 => {
-                    // CF-γ backout (plan §"Backout plan"): see the
-                    // matching arm in chamfer.rs::handle_chamfer_vertices
-                    // for the full rationale. The G1 synthesizer
-                    // module stays in tree for a follow-up
-                    // reformulation; until then, every G1 request
-                    // surfaces the typed `SeamContinuityUnreachable`
-                    // reject.
-                    let rim_edge = cap_edges_with_kind[0].0;
-                    return Err(OperationError::BlendFailed(Box::new(
-                        BlendFailure::SeamContinuityUnreachable {
-                            residual: f64::INFINITY,
-                            tolerance: 0.0,
-                            station: 0,
-                            rim_edge,
-                        },
-                    )));
+                    super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                        model,
+                        solid_id,
+                        corner.id,
+                        &cap_edges_with_kind,
+                        vertex_outward,
+                        Tolerance::default().distance(),
+                        BlendKind::Fillet,
+                    )?
                 }
             };
-            new_faces.push(cap_face);
+            new_faces.extend(cap_face_ids);
             continue;
         }
 
@@ -5497,40 +5494,37 @@ fn create_fillet_transitions(
                 cap_edges_with_kind
                     .push((*line_eid, super::mixed_kind_corner_cap::RimKind::LinearRim));
             }
-            // CF-γ.1 dispatcher (degree-3 mixed arm — fillet
+            // CF-γ.6.2 dispatcher (degree-3 mixed arm — fillet
             // closing a corner with a prior chamfer). `C0` keeps
-            // CF-β planar cap synthesis; `G1` is a sentinel until
-            // CF-γ.2 lands the degenerate-bicubic NURBS synthesizer.
-            let cap_face = match seam_continuity {
-                SeamContinuity::C0 => super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                    model,
-                    solid_id,
-                    corner.id,
-                    &cap_edges_with_kind,
-                    vertex_outward,
-                    Tolerance::default().distance(),
-                    BlendKind::Fillet,
-                )?,
+            // CF-β planar cap synthesis (single FaceId wrapped in a
+            // 1-element Vec). `G1` routes through the 3-sub-patch C0
+            // synthesizer; CF-γ.6.3 lifts the seed CPs to the
+            // coupled solver.
+            let cap_face_ids: Vec<FaceId> = match seam_continuity {
+                SeamContinuity::C0 => vec![
+                    super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                        model,
+                        solid_id,
+                        corner.id,
+                        &cap_edges_with_kind,
+                        vertex_outward,
+                        Tolerance::default().distance(),
+                        BlendKind::Fillet,
+                    )?,
+                ],
                 SeamContinuity::G1 => {
-                    // CF-γ backout (plan §"Backout plan"): see the
-                    // matching arm in chamfer.rs::handle_chamfer_vertices
-                    // for the full rationale. The G1 synthesizer
-                    // module stays in tree for a follow-up
-                    // reformulation; until then, every G1 request
-                    // surfaces the typed `SeamContinuityUnreachable`
-                    // reject.
-                    let rim_edge = cap_edges_with_kind[0].0;
-                    return Err(OperationError::BlendFailed(Box::new(
-                        BlendFailure::SeamContinuityUnreachable {
-                            residual: f64::INFINITY,
-                            tolerance: 0.0,
-                            station: 0,
-                            rim_edge,
-                        },
-                    )));
+                    super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                        model,
+                        solid_id,
+                        corner.id,
+                        &cap_edges_with_kind,
+                        vertex_outward,
+                        Tolerance::default().distance(),
+                        BlendKind::Fillet,
+                    )?
                 }
             };
-            new_faces.push(cap_face);
+            new_faces.extend(cap_face_ids);
         } else if radii_equal {
             let face_id = apply_apex_sphere_corner(
                 model,

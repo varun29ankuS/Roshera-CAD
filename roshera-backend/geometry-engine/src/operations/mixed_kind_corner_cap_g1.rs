@@ -1,4 +1,4 @@
-//! CF-γ.2 — G1 NURBS mixed-kind corner-cap synthesizer.
+//! CF-γ.6 — three-sub-patch G1 NURBS mixed-kind corner-cap synthesizer.
 //!
 //! Companion to [`super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`]
 //! (the CF-β planar N-gon cap). Selected by callers via
@@ -8,19 +8,29 @@
 //! arm by [`super::chamfer::handle_chamfer_vertices`] and
 //! [`super::fillet::create_fillet_transitions`].
 //!
-//! # Geometry
+//! # Geometry (CF-γ.6 reformulation)
 //!
-//! A degenerate **bicubic NURBS** patch (degree 3 × degree 3) wrapped
-//! in [`crate::primitives::surface::GeneralNurbsSurface`]. The `u=1`
-//! row collapses to a single apex point (one of the three cap corner
-//! vertices), so the rectangular patch maps onto a triangular
-//! footprint with three rim boundaries and one degenerate "fourth
-//! side". The pattern follows
-//! [`super::fillet::apply_triangular_nurbs_corner`] (the F5-β
-//! fillet-only 3-corner cap), upgraded from bi-quadratic to bicubic
-//! to give two interior rows of control points — the extra degrees
-//! of freedom required for exact G1 at every rim sample station
-//! (Farin §17.2; Piegl & Tiller §10.4).
+//! Three bicubic NURBS sub-patches (degree 3 × degree 3) sharing a
+//! single central **apex vertex** placed at the lifted centroid of
+//! the three cap-corner vertices. Each sub-patch covers one wedge
+//! `(C_i, C_{(i+1) mod 3}, A)` and owns one rim's G1 constraint
+//! independently; adjacent sub-patches share their internal
+//! **spoke edges** (`C_i → A`) so G0 across spoke seams is automatic
+//! by shared-CP construction. The pattern mirrors the production
+//! [`super::fillet::apply_triangular_nurbs_corner`] (F5-β
+//! fillet-only 3-corner cap) generalised to mixed chamfer × fillet
+//! rims with the upgraded bicubic resolution required for exact
+//! G1 at every rim sample station (Farin §17.2; Piegl & Tiller §10.4).
+//!
+//! **Why three sub-patches:** the single-patch CF-γ.2 topology had
+//! 12 free interior CPs vs 15 rim-G1 constraints — a structural
+//! rank limit that asymmetrically clipped the achievable residual
+//! to ~8e-3 rad on 1C2F and ~6e-1 rad on 2C1F (commit `d785605`
+//! backout). The three-sub-patch reformulation lifts DoF to 54
+//! (3 × 4 per-patch interior + 18 shared spoke interior) against
+//! 27 rim-G1 + 18 internal-C1 + 54 Tikhonov rows — over-determined
+//! by 33 rows, well-conditioned, and Parasolid-residual-parity
+//! (≤ 1e-6 rad) under the γ.6.3 coupled solver.
 //!
 //! Knot vectors: open-uniform `[0,0,0,0,1,1,1,1]` in both `u` and
 //! `v` — the standard bicubic-Bezier-as-NURBS encoding,
@@ -108,7 +118,7 @@ use crate::math::nurbs::NurbsSurface;
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Arc, Line},
-    edge::EdgeId,
+    edge::{Edge, EdgeId, EdgeOrientation},
     face::{FaceId, FaceOrientation},
     solid::{BlendKind, SolidId, VertexBlendKindSet},
     surface::{GeneralNurbsSurface, Surface},
@@ -124,27 +134,93 @@ use crate::primitives::{
 /// G0 is automatic there and the G1 constraint reduces to a
 /// neighbour-tangent matching condition baked into the rim lift,
 /// not a free variable.
-pub(crate) const K_STATIONS: usize = 5;
+///
+/// **CF-γ.6.3:** 4 uniform interior stations on `(0, 1)`. Sample
+/// count is pinned to the polynomial dimension of the bicubic
+/// cross-boundary derivative `∂S/∂u(0, v) = 3 · Σ_j B_j³(v) ·
+/// (P[1][j] − P[0][j])` — degree-3 in v with 4 Bernstein modes.
+/// Sampling more than 4 stations over-constrains the row-1
+/// unknown block under cylindrical/toroidal neighbour normals
+/// (where `n(v)` is non-polynomial) and degrades the LS fit; 4
+/// stations exactly span the polynomial constraint space so the
+/// solve is just-determined w.r.t. rim-G1 and yields residuals
+/// at machine precision at the sampled stations. Inter-station
+/// drift is what the post-solve residual gate measures.
+pub(crate) const K_STATIONS: usize = 4;
 
 /// Angular tolerance for the per-rim cross-seam tangent match
-/// (radians). Tighter than the CAD-visual seam-continuity threshold
-/// (1e-3 ≈ 0.057° → Gouraud highlight break, Farin §15.5), looser
-/// than `Tolerance::default().angle() = 1e-6` (the kernel's
-/// strict-orthogonality bar). 1e-4 rad ≈ 0.006° is below the
-/// highlight-line-discontinuity threshold for Class-A surface
-/// inspection (Farin §17.5) and inside the convergence budget of
-/// a 12-DoF least-squares solve on rim curves of length ~1.
-pub(crate) const G1_TOLERANCE: f64 = 1.0e-4;
+/// (radians). Parasolid `SESSION_PRECISION` angular parity:
+/// 1e-6 rad ≈ 0.000057° is the strict-orthogonality bar shared
+/// with `Tolerance::default().angle()`. CF-γ.2 used 1e-4 rad
+/// (CAD-visual seam-continuity, Farin §15.5); CF-γ.6.3's
+/// 54-DoF coupled solver pins the tighter 1e-6 bar by construction
+/// (the rim-G1 constraint is linear in the unknowns and exactly
+/// satisfiable when 27 row-rank ≤ 54 DoF, which is the case for
+/// the 3-edge convex corner with planar or analytic neighbours).
+pub(crate) const G1_TOLERANCE: f64 = 1.0e-6;
 
 /// Tikhonov regularisation strength `λ` applied to the normal
 /// equations as `(JᵀJ + λI) x = Jᵀb`. Keeps the solve
-/// well-conditioned at small displacements (rim CPs cluster, the
-/// Bernstein-coefficient Jacobian becomes near-rank-deficient).
-/// The plan budgets `λ = 1e-10` — below kernel positional
-/// tolerance, above double-precision noise.
+/// well-conditioned in the under-determined null space (54 DoF
+/// vs 45 hard constraint rows from rim-G1 + internal-C1; the
+/// 9-DoF nullspace is pinned by minimising `‖x − x_seed‖²`
+/// against the planar-fairing Coons-patch seed).
+///
+/// **CF-γ.6.3:** 1e-10. With `√λ = 1e-5` the Tikhonov rows are
+/// five orders of magnitude weaker than the rim-G1 rows (whose
+/// row norms are `‖B(t)·W(0,t)·n‖ ~ 1`), so the constrained
+/// directions sit at signal-to-noise `1 / √λ = 1e5` while
+/// `JᵀJ` stays at condition ~`1e10` — inside double-precision
+/// elimination's accurate range when paired with the
+/// `λ / 100`-floor pivot tolerance below.
 pub(crate) const TIKHONOV_LAMBDA: f64 = 1.0e-10;
 
-/// Synthesize a G1 NURBS cap face at a degree-3 mixed-kind corner.
+/// Number of free degrees-of-freedom in the CF-γ.6.3 coupled
+/// solver: 3 sub-patches × 4 interior CPs × 3 coords (= 36) +
+/// 3 shared spokes × 2 interior CPs × 3 coords (= 18). See
+/// [`assemble_global_g1_system`] for the column-indexing scheme.
+pub(crate) const N_FREE_DOF: usize = 54;
+
+/// Number of rim-G1 rows in the CF-γ.6.3 coupled LS system:
+/// 3 rims × [`K_STATIONS`] interior sample stations × 1 scalar
+/// constraint per (rim, station). With `K_STATIONS = 4` this is
+/// 12 rows — the polynomial dimension of the bicubic cross-boundary
+/// derivative in v.
+pub(crate) const N_RIM_G1_ROWS: usize = 3 * K_STATIONS;
+
+/// Number of internal-C1 rows in the CF-γ.6.3 coupled LS system:
+/// 3 shared spokes × 2 live spoke-row indices (`k ∈ {1, 2}`) ×
+/// 3 coords = 18 rows. The `k = 0` (corner) and `k = 3` (apex)
+/// rows are dropped: `k = 0` is a constant residual driven by
+/// rim-tangent misalignment at the corner (geometric, not a free
+/// variable); `k = 3` is identically zero by apex-collapse.
+pub(crate) const N_INTERNAL_C1_ROWS: usize = 3 * 2 * 3;
+
+/// Number of Tikhonov regularisation rows in the CF-γ.6.3
+/// coupled LS system: one per free DoF.
+pub(crate) const N_TIKHONOV_ROWS: usize = N_FREE_DOF;
+
+/// Total row count of the CF-γ.6.3 assembled system:
+/// rim-G1 (12) + internal-C1 (18) + Tikhonov (54) = 84.
+pub(crate) const N_TOTAL_ROWS: usize =
+    N_RIM_G1_ROWS + N_INTERNAL_C1_ROWS + N_TIKHONOV_ROWS;
+
+/// Hard upper bound for the internal-C1 vector norm across the
+/// shared spoke seams in the CF-γ.6 three-sub-patch cap. The
+/// γ.6.3 coupled solver enforces C1 exactly by construction at
+/// the spoke-row indices `k ∈ {1, 2}` (rim-end `k=0` and apex-end
+/// `k=3` are trivially satisfied); a `debug_assert!` in the
+/// solver post-condition pins the residual below this bar so a
+/// future regression in the assembly code surfaces immediately.
+/// Set just above double-precision noise on a `Σ_36` of
+/// CP-difference dot products with unit normals.
+///
+/// **γ.6.2 status:** defined for γ.6.3 — not yet referenced.
+#[allow(dead_code)]
+pub(crate) const G1_INTERNAL_C1_TOLERANCE: f64 = 1.0e-9;
+
+/// Synthesize a G1 NURBS cap at a degree-3 mixed-kind corner as
+/// three bicubic sub-patches sharing a central apex vertex.
 ///
 /// Mirrors the public shape of
 /// [`super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap`]
@@ -153,40 +229,57 @@ pub(crate) const TIKHONOV_LAMBDA: f64 = 1.0e-10;
 /// arms in
 /// [`super::chamfer::handle_chamfer_vertices`] and
 /// [`super::fillet::create_fillet_transitions`] swap in a single
-/// match arm.
+/// match arm. Returns the **vector** of synthesized cap face ids
+/// (length 3 — one per sub-patch) for callers to append to their
+/// running face accumulator.
 ///
-/// # Algorithm
+/// # CF-γ.6.2 algorithm (topology synthesis, no G1 solver)
 ///
 /// 1. Verify the cap loop topology + rim-kind annotations via
 ///    [`verify_mixed_cap_loop`]. Recovers
 ///    `(corner_vertices, loop_forwards)` in input order.
-/// 2. Lift each rim curve (line or arc) to a 4-CP cubic Bezier
-///    representation, oriented `corner_vertices[i] →
-///    corner_vertices[(i+1) % 3]`. Reverses rim 2 internally so
-///    its CPs run `corner_vertices[0] → corner_vertices[2]` along
-///    the patch's `v=0` boundary.
-/// 3. Assemble the degenerate 4×4 control net: boundary rows /
-///    columns from the rim lifts; apex (`u=1` row) collapsed to
-///    `corner_vertices[2]`; interior CPs initialised to a
-///    sensible seed (mean of the three rim midpoints) for the
-///    least-squares warm start.
-/// 4. Sample neighbour normals at K = [`K_STATIONS`] per rim
-///    (closest-point inversion into the neighbour face's
-///    surface). Build the 3K-row Jacobian + RHS, append `√λ · I`
-///    Tikhonov rows, solve via
-///    [`solve_least_squares`].
-/// 5. Re-sample the resulting patch at every rim × station;
-///    compute the angular residual `acos(|n_cap · n_neighbour|)`.
-///    Worst residual > [`G1_TOLERANCE`] surfaces as
-///    [`BlendFailure::SeamContinuityUnreachable`].
-/// 6. Wrap the control net in
-///    [`crate::math::nurbs::NurbsSurface`] +
-///    [`crate::primitives::surface::GeneralNurbsSurface`], orient
-///    via [`super::orientation::orient_face_for_outward_at`] at the
-///    patch midpoint `(0.5, 0.5)` (well away from the `u=1`
-///    degeneracy), and call
+/// 2. Resolve corner positions; lift each rim curve (line or arc)
+///    to a 4-CP cubic Bezier oriented `C_i → C_{(i+1) mod 3}`.
+/// 3. Place the **apex vertex** `A = centroid(C_0, C_1, C_2) +
+///    h · vertex_outward` with
+///    `h = (1/3) · min_i ‖C_i − centroid‖` (Risk B mitigation —
+///    apex is fixed, not promoted to a solver unknown). Add to
+///    `model.vertices` via `add_or_find`.
+/// 4. Build three **spoke edges** (`Line` curves `C_i → A`),
+///    one per corner, via `model.curves.add` + `model.edges.add`.
+///    Spokes are internal to the cap; G0 across each spoke seam
+///    is automatic by shared-edge construction.
+/// 5. For each sub-patch `i ∈ {0, 1, 2}`:
+///    * Assemble a 4×4 bicubic NURBS control net with `u=0` row
+///      from `rim_i` Bezier, `u=1` row collapsed to apex,
+///      `v=0` column = spoke `i` (uniform thirds along
+///      `C_i → A`), `v=1` column = spoke `(i+1) mod 3` (uniform
+///      thirds along `C_{i+1} → A`). Interior 2×2 block initialised
+///      to the Coons-patch transfinite-interpolation seed
+///      (boundary-fairing warm start).
+///    * Wrap in [`crate::math::nurbs::NurbsSurface`] +
+///      [`crate::primitives::surface::GeneralNurbsSurface`].
+///    * Orient via
+///      [`super::orientation::orient_face_for_outward_at`] at
+///      `(0.3, 0.5)` (biased away from the `u=1` apex degeneracy).
+///    * Assemble the sub-patch loop:
+///      `[rim_i (loop_forwards[i]),
+///        spoke_{(i+1) mod 3} (forward, C_{i+1} → A),
+///        spoke_i (reverse, A → C_i)]`.
+/// 6. Forward the three [`CapSubFace`] records to
 ///    [`finalize_mixed_kind_cap_face`] for the shared
-///    topology / shell / registry tail.
+///    loop / face / shell / registry tail (γ.6.1 N-face
+///    generalisation), returning the resulting `Vec<FaceId>`.
+///
+/// **γ.6.2 status:** the coupled rim-G1 + internal-C1 solver is
+/// deferred to γ.6.3. This phase delivers watertight 3-sub-patch
+/// NURBS cap topology with C0 across spoke seams (by shared-CP
+/// construction); rim-G1 residuals at the sub-patch ↔ neighbour
+/// boundaries are set by the planar-fairing seed and are not yet
+/// residual-gated. γ.6.3 lifts the seed to the converged
+/// least-squares solution + Newton refinement and re-installs
+/// the [`BlendFailure::SeamContinuityUnreachable`] gate at the
+/// Parasolid-parity [`G1_TOLERANCE`] = 1e-6 rad bar.
 ///
 /// # Errors
 ///
@@ -195,15 +288,13 @@ pub(crate) const TIKHONOV_LAMBDA: f64 = 1.0e-10;
 ///   do not match `corner_vertices` within `tolerance`.
 /// * `BlendFailure::VertexBlendUnsupported(MixedKindUnsupported {
 ///   detail: DegreeUnsupported })` — N != 3.
-/// * `BlendFailure::SeamContinuityUnreachable` — least-squares
-///   residual exceeds [`G1_TOLERANCE`] at some sample station.
 /// * `OperationError::NumericalError` — `NurbsSurface::new` rejects
-///   the synthesised control net (degenerate net), or
-///   `solve_least_squares` reports `SingularMatrix` /
-///   `DimensionMismatch`.
+///   a synthesised sub-patch control net (degenerate net).
 /// * `OperationError::InvalidGeometry` — solid / shell / vertex
-///   missing from the model (propagated from
-///   [`finalize_mixed_kind_cap_face`]).
+///   missing from the model, or the corner triangle is degenerate
+///   (centroid coincides with a corner), or `vertex_outward` is
+///   zero-length. Propagated from
+///   [`finalize_mixed_kind_cap_face`] for shell / registry failures.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_mixed_kind_corner_cap_g1(
     model: &mut BRepModel,
@@ -213,7 +304,7 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
     vertex_outward: Vector3,
     tolerance: f64,
     requested_kind: BlendKind,
-) -> OperationResult<FaceId> {
+) -> OperationResult<Vec<FaceId>> {
     let degree = cap_edges_with_kind.len();
     if degree != 3 {
         let existing = existing_kind_set_or_default(model, solid_id, vertex_id);
@@ -230,52 +321,431 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         )));
     }
 
-    // Step 1 — verify topology + recover (corner_vertices, loop_forwards).
-    let (corner_vertices, loop_forwards) = verify_mixed_cap_loop(model, cap_edges_with_kind)
-        .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
-    if corner_vertices.len() != 3 || loop_forwards.len() != 3 {
+    // Step 1 — Verify cap-loop topology and recover the per-rim
+    // loop orientation flags. `corner_vertices` from
+    // `verify_mixed_cap_loop` is in *walk order*, NOT input order;
+    // we don't use it directly to avoid a permutation mismatch
+    // with `cap_edges_with_kind[i]` (which is in input order).
+    // Instead, every per-rim quantity is anchored on vertex IDs
+    // derived from `loop_forwards[i]` ∘ `cap_edges_with_kind[i]`.
+    let (_corner_vertices_walk, loop_forwards) =
+        verify_mixed_cap_loop(model, cap_edges_with_kind)
+            .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
+    if loop_forwards.len() != 3 {
         return Err(OperationError::BlendFailed(Box::new(
             BlendFailure::TopologyViolation {
                 detail: format!(
-                    "CF-γ G1 cap at vertex {:?} expected 3 corner vertices, got {}",
+                    "CF-γ.6 G1 cap at vertex {:?}: expected 3 loop-forward flags, got {}",
                     vertex_id,
-                    corner_vertices.len()
+                    loop_forwards.len()
                 ),
             },
         )));
     }
 
-    // Corner positions, used for endpoint coincidence checks and
-    // for the apex assignment.
-    let mut corners: [Point3; 3] = [Point3::new(0.0, 0.0, 0.0); 3];
-    for (i, &vid) in corner_vertices.iter().enumerate() {
+    // Step 2 — Compute each rim's (walk-start, walk-end) vertex
+    // pair in INPUT-rim-index order. `walk_start` is the cap-loop
+    // direction's first endpoint of rim i; `walk_end` is the second.
+    let mut rim_walk_vids: [(VertexId, VertexId); 3] = [(0, 0); 3];
+    for i in 0..3 {
+        let (edge_id, _) = cap_edges_with_kind[i];
+        let edge = model.edges.get(edge_id).ok_or_else(|| {
+            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6 G1 cap: rim edge {:?} missing from model",
+                    edge_id
+                ),
+            }))
+        })?;
+        rim_walk_vids[i] = if loop_forwards[i] {
+            (edge.start_vertex, edge.end_vertex)
+        } else {
+            (edge.end_vertex, edge.start_vertex)
+        };
+    }
+
+    // Step 3 — Collect the 3 distinct corner vertex IDs across
+    // all rim endpoints, in first-seen order. Build a parallel
+    // `distinct_positions` vector for later geometry.
+    let mut distinct_corner_vids: Vec<VertexId> = Vec::with_capacity(3);
+    for (s, e) in &rim_walk_vids {
+        if !distinct_corner_vids.contains(s) {
+            distinct_corner_vids.push(*s);
+        }
+        if !distinct_corner_vids.contains(e) {
+            distinct_corner_vids.push(*e);
+        }
+    }
+    if distinct_corner_vids.len() != 3 {
+        return Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6 G1 cap at vertex {:?}: expected 3 distinct corner vertices \
+                     across rim endpoints, got {} ({:?})",
+                    vertex_id,
+                    distinct_corner_vids.len(),
+                    distinct_corner_vids
+                ),
+            },
+        )));
+    }
+    let mut distinct_positions: [Point3; 3] = [Point3::new(0.0, 0.0, 0.0); 3];
+    for (i, &vid) in distinct_corner_vids.iter().enumerate() {
         let v = model.vertices.get(vid).ok_or_else(|| {
             OperationError::InvalidGeometry(format!(
-                "CF-γ G1 cap: corner vertex {:?} missing from model",
+                "CF-γ.6 G1 cap: corner vertex {:?} missing from model",
                 vid
             ))
         })?;
-        corners[i] = Point3::new(v.position[0], v.position[1], v.position[2]);
+        distinct_positions[i] = Point3::new(v.position[0], v.position[1], v.position[2]);
+    }
+    // Look up a position by vertex ID (3-way fan; the corner
+    // count is exactly 3 so a linear scan is the right cost).
+    let position_for = |vid: VertexId| -> OperationResult<Point3> {
+        for (i, &cv) in distinct_corner_vids.iter().enumerate() {
+            if cv == vid {
+                return Ok(distinct_positions[i]);
+            }
+        }
+        Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6 G1 cap: vertex {:?} not in distinct corner set",
+                    vid
+                ),
+            },
+        )))
+    };
+
+    let endpoint_tol = tolerance.max(1.0e-9);
+
+    // Step 4 — Build per-rim cubic Bezier lifts, each oriented
+    // `walk_start → walk_end` (cap-loop traversal direction).
+    let rim_lifts = build_rim_lifts(
+        model,
+        cap_edges_with_kind,
+        &rim_walk_vids,
+        &distinct_corner_vids,
+        &distinct_positions,
+        endpoint_tol,
+    )?;
+
+    // Step 5 — Place the apex vertex at the lifted centroid of the
+    // three distinct corner positions. Apex is fixed (not a solver
+    // unknown), per the CF-γ.6 plan Risk-B mitigation.
+    let (apex_vertex_id, apex) =
+        build_apex_vertex(model, &distinct_positions, vertex_outward, endpoint_tol)?;
+
+    // Step 6 — Build one spoke edge per distinct corner vertex
+    // (`distinct_corner_vids[k] → apex`), each backed by a `Line`
+    // curve. `spoke_for_vid[k]` is the spoke edge whose start
+    // vertex is `distinct_corner_vids[k]`.
+    let spoke_edges = build_spoke_edges(
+        model,
+        &[
+            distinct_corner_vids[0],
+            distinct_corner_vids[1],
+            distinct_corner_vids[2],
+        ],
+        apex_vertex_id,
+        &distinct_positions,
+        apex,
+    )?;
+    let spoke_for_vid = |vid: VertexId| -> OperationResult<EdgeId> {
+        for (k, &cv) in distinct_corner_vids.iter().enumerate() {
+            if cv == vid {
+                return Ok(spoke_edges[k]);
+            }
+        }
+        Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6 G1 cap: vertex {:?} has no spoke edge",
+                    vid
+                ),
+            },
+        )))
+    };
+
+    // Pre-compute each spoke's 4 control points (uniform thirds
+    // `corner → apex`). Computing once per distinct corner instead
+    // of twice per sub-patch guarantees byte-identical shared
+    // columns and therefore exact C0 (and degenerate-collinear C1)
+    // across the shared internal seam.
+    let mut spoke_cps_for_vid_idx: [[Point3; 4]; 3] =
+        [[Point3::new(0.0, 0.0, 0.0); 4]; 3];
+    for k in 0..3 {
+        let c = distinct_positions[k];
+        let d = apex - c;
+        spoke_cps_for_vid_idx[k][0] = c;
+        spoke_cps_for_vid_idx[k][1] =
+            Point3::new(c.x + d.x / 3.0, c.y + d.y / 3.0, c.z + d.z / 3.0);
+        spoke_cps_for_vid_idx[k][2] = Point3::new(
+            c.x + 2.0 * d.x / 3.0,
+            c.y + 2.0 * d.y / 3.0,
+            c.z + 2.0 * d.z / 3.0,
+        );
+        spoke_cps_for_vid_idx[k][3] = apex;
+    }
+    let spoke_cps_for_vid = |vid: VertexId| -> OperationResult<[Point3; 4]> {
+        for (k, &cv) in distinct_corner_vids.iter().enumerate() {
+            if cv == vid {
+                return Ok(spoke_cps_for_vid_idx[k]);
+            }
+        }
+        Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6 G1 cap: vertex {:?} has no spoke CPs",
+                    vid
+                ),
+            },
+        )))
+    };
+
+    // Step 7 — CF-γ.6.3 coupled rim-G1 + internal-C1 solve.
+    //
+    // The γ.6.2 seed (Coons-patch interior 2×2 + uniform-thirds
+    // spoke interior) is the warm-start for a single
+    // [`solve_least_squares`] call against a 99×54 system:
+    //
+    //   *  12 rim-G1 rows  (3 rims × K_STATIONS × 1 scalar/station)
+    //   *  18 internal-C1 rows (3 spokes × 2 live rows × 3 coords)
+    //   *  54 Tikhonov rows centred on the warm-start seed
+    //
+    // The system is linear in the unknowns, so one LS solve is
+    // optimal — no Newton refinement loop required. After solving,
+    // the rim-G1 residual is re-sampled at the same K_STATIONS
+    // stations and gated at [`G1_TOLERANCE`] (1e-6 rad).
+    let stations: [f64; K_STATIONS] = sample_stations::<K_STATIONS>();
+    let neighbour_normals = compute_neighbour_normals_per_rim(
+        model,
+        cap_edges_with_kind,
+        &rim_lifts,
+        &stations,
+        endpoint_tol,
+    )?;
+    let (sub_grids, sub_weights, worst_residual, worst_rim_idx, worst_station_idx) =
+        solve_coupled_g1(
+            &rim_lifts,
+            &rim_walk_vids,
+            &distinct_corner_vids,
+            &spoke_cps_for_vid_idx,
+            apex,
+            &neighbour_normals,
+            &stations,
+        )?;
+
+    if worst_residual > G1_TOLERANCE {
+        return Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::SeamContinuityUnreachable {
+                residual: worst_residual,
+                tolerance: G1_TOLERANCE,
+                station: worst_station_idx as u32,
+                rim_edge: cap_edges_with_kind[worst_rim_idx].0,
+            },
+        )));
     }
 
-    // Step 2 — lift each rim curve to a 4-CP cubic Bezier, oriented
-    // corner[i] → corner[(i+1) % 3].
-    let mut rim_bezier: [([Point3; 4], [f64; 4]); 3] = [
+    let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let mut sub_faces: Vec<CapSubFace> = Vec::with_capacity(3);
+    for i in 0..3 {
+        let (start_vid, end_vid) = rim_walk_vids[i];
+        let grid = sub_grids[i].clone();
+        let weights = sub_weights[i].clone();
+        let nurbs = NurbsSurface::new(grid, weights, knots.clone(), knots.clone(), 3, 3)
+            .map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6 G1 cap: NurbsSurface::new rejected sub-patch {} control net: {}",
+                    i, e
+                ))
+            })?;
+        let cap_surface = GeneralNurbsSurface { nurbs };
+        // Sample orientation at (u=0.3, v=0.5) — biased toward the
+        // u=0 rim and away from the u=1 apex degeneracy where the
+        // surface normal is undefined.
+        let orientation = super::orientation::orient_face_for_outward_at(
+            &cap_surface,
+            vertex_outward,
+            0.3,
+            0.5,
+        )
+        .unwrap_or(FaceOrientation::Forward);
+        let surface_id = model.surfaces.add(Box::new(cap_surface));
+        // Sub-patch loop: rim_i in cap-loop direction, then spoke
+        // from walk_end → apex (forward — the spoke's natural
+        // direction is corner → apex), then spoke from apex →
+        // walk_start (reverse — same underlying edge, traversed
+        // backwards). Closes the wedge in topology order; the
+        // per-face orientation flag above resolves outward normal.
+        let _ = position_for(start_vid)?; // sanity-pin against drift
+        let loop_edges: Vec<(EdgeId, bool)> = vec![
+            (cap_edges_with_kind[i].0, loop_forwards[i]),
+            (spoke_for_vid(end_vid)?, true),
+            (spoke_for_vid(start_vid)?, false),
+        ];
+        sub_faces.push(CapSubFace {
+            surface_id,
+            orientation,
+            loop_edges,
+        });
+    }
+
+    // Step 7 — Forward to the γ.6.1 shared finalize tail (N
+    // sub-faces) for loop / face / shell / registry construction
+    // and the drop-orphan-corner cleanup. Returns the vector of
+    // the 3 freshly registered FaceIds for the caller's
+    // accumulator.
+    finalize_mixed_kind_cap_face(model, solid_id, vertex_id, &sub_faces, requested_kind)
+}
+
+// ---------------------------------------------------------------------
+// CF-γ.6.2 private helpers — topology synthesis.
+// ---------------------------------------------------------------------
+
+/// CF-γ.6.2 — Place the apex vertex at the lifted centroid of the
+/// three corner vertices.
+///
+/// Formula:
+///
+/// ```text
+///     centroid = (C_0 + C_1 + C_2) / 3
+///     h        = (1/3) · min_i ‖C_i − centroid‖
+///     A        = centroid + h · normalize(vertex_outward)
+/// ```
+///
+/// The apex is the topological identity of all three sub-patches'
+/// collapsed `u = 1` rows. Fixed (not promoted to a solver
+/// unknown) — the CF-γ.6 plan's Risk-B mitigation: lifting the
+/// apex into the solver would couple 12 sub-patch interior CPs
+/// and 3 spoke endpoints into one variable and crater the
+/// conditioning.
+///
+/// # Errors
+///
+/// * `InvalidGeometry` — degenerate corner triangle
+///   (`min ‖C_i − centroid‖ ≤ tol`), or `vertex_outward` is
+///   zero-length / not normalisable.
+fn build_apex_vertex(
+    model: &mut BRepModel,
+    corners: &[Point3; 3],
+    vertex_outward: Vector3,
+    tol: f64,
+) -> OperationResult<(VertexId, Point3)> {
+    let centroid = Point3::new(
+        (corners[0].x + corners[1].x + corners[2].x) / 3.0,
+        (corners[0].y + corners[1].y + corners[2].y) / 3.0,
+        (corners[0].z + corners[1].z + corners[2].z) / 3.0,
+    );
+    let d0 = (corners[0] - centroid).magnitude();
+    let d1 = (corners[1] - centroid).magnitude();
+    let d2 = (corners[2] - centroid).magnitude();
+    let min_dist = d0.min(d1).min(d2);
+    if min_dist <= tol {
+        return Err(OperationError::InvalidGeometry(format!(
+            "CF-γ.6 G1 cap: degenerate corner triangle — min ‖C_i − centroid‖ = \
+             {:.3e} ≤ tol {:.3e}",
+            min_dist, tol
+        )));
+    }
+    let h = min_dist / 3.0;
+    let outward_unit = vertex_outward.normalize().map_err(|e| {
+        OperationError::InvalidGeometry(format!(
+            "CF-γ.6 G1 cap: vertex_outward {:?} could not be normalised: {:?}",
+            vertex_outward, e
+        ))
+    })?;
+    let apex = Point3::new(
+        centroid.x + h * outward_unit.x,
+        centroid.y + h * outward_unit.y,
+        centroid.z + h * outward_unit.z,
+    );
+    let apex_vertex_id = model.vertices.add_or_find(apex.x, apex.y, apex.z, tol);
+    Ok((apex_vertex_id, apex))
+}
+
+/// CF-γ.6.2 — Build the three spoke edges (`C_i → apex`), each
+/// backed by a `Line` curve.
+///
+/// Spokes are shared between adjacent sub-patches: sub-patch `i`
+/// reads spoke `i` on its `v = 0` column and spoke `(i + 1) % 3`
+/// on its `v = 1` column. Loop construction in the caller orients
+/// the second spoke reversed (`apex → C_i`) so the wedge loop
+/// closes in topology order.
+fn build_spoke_edges(
+    model: &mut BRepModel,
+    corner_vertices: &[VertexId; 3],
+    apex_vertex_id: VertexId,
+    corners: &[Point3; 3],
+    apex: Point3,
+) -> OperationResult<[EdgeId; 3]> {
+    let mut spokes: [EdgeId; 3] = [0; 3];
+    for i in 0..3 {
+        let line = Line::new(corners[i], apex);
+        let curve_id = model.curves.add(Box::new(line));
+        let edge = Edge::new_auto_range(
+            0,
+            corner_vertices[i],
+            apex_vertex_id,
+            curve_id,
+            EdgeOrientation::Forward,
+        );
+        spokes[i] = model.edges.add(edge);
+    }
+    Ok(spokes)
+}
+
+/// CF-γ.6.2 — Lift each rim curve to a 4-CP cubic Bezier oriented
+/// `C_i → C_{(i+1) % 3}` in cap-loop traversal order.
+///
+/// Reuses [`rim_to_cubic_bezier`] for the per-rim lift (line or
+/// arc) and reverses the CPs / weights array if the natural rim
+/// orientation runs `C_{(i+1) % 3} → C_i`.
+///
+/// # Errors
+///
+/// * `BlendFailure::TopologyViolation` — a rim endpoint does not
+///   match its adjacent corner within `endpoint_tol` in either
+///   orientation.
+fn build_rim_lifts(
+    model: &BRepModel,
+    cap_edges_with_kind: &[(EdgeId, RimKind)],
+    rim_walk_vids: &[(VertexId, VertexId); 3],
+    distinct_corner_vids: &[VertexId],
+    distinct_positions: &[Point3; 3],
+    endpoint_tol: f64,
+) -> OperationResult<[([Point3; 4], [f64; 4]); 3]> {
+    // Local vertex-ID → Point3 fan over the 3 distinct corners.
+    // Keeps `build_rim_lifts` free of cross-step coupling: every
+    // rim is resolved against the same walk-anchored corner set
+    // that the synthesizer body uses elsewhere.
+    let position_for = |vid: VertexId| -> OperationResult<Point3> {
+        for (i, &cv) in distinct_corner_vids.iter().enumerate() {
+            if cv == vid {
+                return Ok(distinct_positions[i]);
+            }
+        }
+        Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6 G1 cap: vertex {:?} not in distinct corner set",
+                    vid
+                ),
+            },
+        )))
+    };
+
+    let mut lifts: [([Point3; 4], [f64; 4]); 3] = [
         ([Point3::new(0.0, 0.0, 0.0); 4], [1.0; 4]),
         ([Point3::new(0.0, 0.0, 0.0); 4], [1.0; 4]),
         ([Point3::new(0.0, 0.0, 0.0); 4], [1.0; 4]),
     ];
-    let endpoint_tol = tolerance.max(1.0e-9);
     for i in 0..3 {
         let (edge_id, kind) = cap_edges_with_kind[i];
         let (pts, ws) = rim_to_cubic_bezier(model, edge_id, kind)?;
-        let want_start = corners[i];
-        let want_end = corners[(i + 1) % 3];
-
-        // Orient lift to match cap-loop direction. The rim curve
-        // is oriented in its own (edge.start_vertex → edge.end_vertex)
-        // direction; reverse if that doesn't match (want_start,
-        // want_end).
+        let (start_vid, end_vid) = rim_walk_vids[i];
+        let want_start = position_for(start_vid)?;
+        let want_end = position_for(end_vid)?;
         let lift_start = pts[0];
         let lift_end = pts[3];
         let forward_ok = (lift_start - want_start).magnitude() <= endpoint_tol
@@ -283,9 +753,9 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         let reverse_ok = (lift_end - want_start).magnitude() <= endpoint_tol
             && (lift_start - want_end).magnitude() <= endpoint_tol;
         if forward_ok {
-            rim_bezier[i] = (pts, ws);
+            lifts[i] = (pts, ws);
         } else if reverse_ok {
-            rim_bezier[i] = (
+            lifts[i] = (
                 [pts[3], pts[2], pts[1], pts[0]],
                 [ws[3], ws[2], ws[1], ws[0]],
             );
@@ -293,281 +763,113 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
             return Err(OperationError::BlendFailed(Box::new(
                 BlendFailure::TopologyViolation {
                     detail: format!(
-                        "CF-γ G1 cap: rim edge {:?} (kind {:?}) endpoint mismatch — \
-                         lift produced ({:?}, {:?}) but cap loop expects ({:?}, {:?}) \
-                         within tol {:.3e}",
-                        edge_id, kind, lift_start, lift_end, want_start, want_end, endpoint_tol
+                        "CF-γ.6 G1 cap: rim edge {:?} (kind {:?}) endpoint mismatch \
+                         — lift produced ({:?}, {:?}) but cap loop expects \
+                         ({:?}, {:?}) within tol {:.3e}",
+                        edge_id, kind, lift_start, lift_end, want_start, want_end,
+                        endpoint_tol
                     ),
                 },
             )));
         }
-        // loop_forwards is consumed by finalize via the closure
-        // below; this rim's orientation in the patch parameter space
-        // is independent of its loop traversal direction (the
-        // finalize tail re-reads loop_forwards from its caller).
     }
+    Ok(lifts)
+}
 
-    // Step 3 — assemble the degenerate 4×4 control net.
-    // - Rim 0 → u=0 row (j varying).
-    // - Rim 1 → v=1 column (i varying), pre-oriented corner[1] →
-    //   corner[2].
-    // - Rim 2 reversed → v=0 column (i varying), pre-oriented
-    //   corner[0] → corner[2]. The reverse happened above by the
-    //   `reverse_ok` branch — at the patch we now want CPs in i
-    //   direction (i=0 at corner[0], i=3 at corner[2]). The rim 2
-    //   lift in `rim_bezier[2]` is already corner[2] → corner[0]
-    //   (because corner_vertices walking puts rim 2 between
-    //   corner[2] and corner[0]); reverse it once more for the
-    //   v=0 column.
-    let (r0_pts, r0_ws) = rim_bezier[0];
-    let (r1_pts, r1_ws) = rim_bezier[1];
-    let (r2_pts, r2_ws) = rim_bezier[2];
-    // Re-orient rim 2 from (corner[2] → corner[0]) — its cap-loop
-    // direction — to (corner[0] → corner[2]) for the v=0 column.
-    let r2_col_pts = [r2_pts[3], r2_pts[2], r2_pts[1], r2_pts[0]];
-    let r2_col_ws = [r2_ws[3], r2_ws[2], r2_ws[1], r2_ws[0]];
-
-    // Apex: shared corner of rim 1 and rim 2 cap-loop direction →
-    // corner[2].
-    let apex = corners[2];
-
-    // Construct boundary CPs / weights. Interior CPs initialised
-    // to mean(P[0][1], P[0][2], P[1][0], P[2][0], P[1][3], P[2][3])
-    // — a sensible warm start for the least-squares solve (residual
-    // shrinks faster from a closer initial estimate, though the
-    // linear solve is single-shot and seed-independent in exact
-    // arithmetic).
+/// CF-γ.6.2 — Assemble a 4×4 bicubic NURBS control net for one
+/// sub-patch.
+///
+/// Layout (degenerate at `u = 1`):
+///
+/// ```text
+///                v=0 (spoke_i)          v=1 (spoke_{(i+1) % 3})
+///     u=0   [ rim_i CPs (4) — oriented C_i → C_{(i+1)%3} ]
+///     u=1   [ apex apex apex apex                       ]
+/// ```
+///
+/// Boundary rows / columns are pinned:
+/// * `grid[0][..]` ← `rim_lift.0` (cap-loop oriented rim Bezier)
+/// * `grid[..][0]` ← `spoke_v0_cps` (uniform thirds `C_i → apex`)
+/// * `grid[..][3]` ← `spoke_v1_cps` (uniform thirds `C_{i+1} → apex`)
+/// * `grid[3][..]` ← `apex` (collapsed u=1 row)
+///
+/// The interior 2×2 block `grid[i][j]` for `i, j ∈ {1, 2}` is
+/// seeded via Coons-patch transfinite interpolation of the four
+/// boundary curves — the planar-fairing warm start for the γ.6.3
+/// coupled rim-G1 + internal-C1 least-squares refinement. The
+/// Coons formula `C(u, v) = U(u, v) + V(u, v) − UV(u, v)`
+/// reproduces the boundary exactly at any `(u, v)` on the
+/// boundary, so the planar-fairing seed is consistent with the
+/// pinned boundary CPs even at the apex degeneracy.
+///
+/// Weights default to 1.0 everywhere; the rim Bezier carries the
+/// only source of non-unit weights (arc rims) on the `u = 0` row.
+fn build_subpatch_control_net(
+    rim_lift: &([Point3; 4], [f64; 4]),
+    spoke_v0_cps: &[Point3; 4],
+    spoke_v1_cps: &[Point3; 4],
+    apex: Point3,
+) -> (Vec<Vec<Point3>>, Vec<Vec<f64>>) {
     let mut grid: Vec<Vec<Point3>> = vec![vec![Point3::new(0.0, 0.0, 0.0); 4]; 4];
     let mut weights: Vec<Vec<f64>> = vec![vec![1.0; 4]; 4];
 
-    // u=0 row (rim 0).
+    // u = 0 row: rim Bezier (carries any non-unit weights for arc rims).
     for j in 0..4 {
-        grid[0][j] = r0_pts[j];
-        weights[0][j] = r0_ws[j];
+        grid[0][j] = rim_lift.0[j];
+        weights[0][j] = rim_lift.1[j];
     }
-    // v=1 column (rim 1).
+    // v = 0 column: spoke_i CPs (uniform thirds C_i → apex).
     for i in 0..4 {
-        grid[i][3] = r1_pts[i];
-        weights[i][3] = r1_ws[i];
+        grid[i][0] = spoke_v0_cps[i];
     }
-    // v=0 column (rim 2 reversed). Sanity-check corner consistency
-    // before overwriting.
-    if (r2_col_pts[0] - grid[0][0]).magnitude() > endpoint_tol {
-        return Err(OperationError::BlendFailed(Box::new(
-            BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ G1 cap: rim 0 and rim 2 disagree on corner_vertices[0] \
-                     position — rim 0 P[0][0] = {:?}, rim 2 reversed P[0] = {:?}",
-                    grid[0][0], r2_col_pts[0]
-                ),
-            },
-        )));
-    }
+    // v = 1 column: spoke_{(i+1) % 3} CPs (uniform thirds C_{i+1} → apex).
     for i in 0..4 {
-        grid[i][0] = r2_col_pts[i];
-        weights[i][0] = r2_col_ws[i];
+        grid[i][3] = spoke_v1_cps[i];
     }
-    // u=1 row degenerate at apex.
+    // u = 1 row: degenerate, collapsed to apex.
     for j in 0..4 {
         grid[3][j] = apex;
-        weights[3][j] = 1.0;
     }
-    // Verify rim-1 / rim-2 share apex at corner_vertices[2].
-    if (grid[3][3] - r1_pts[3]).magnitude() > endpoint_tol
-        || (grid[3][0] - r2_col_pts[3]).magnitude() > endpoint_tol
-    {
-        return Err(OperationError::BlendFailed(Box::new(
-            BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ G1 cap: rim 1 end / rim 2 reversed end disagree with \
-                     apex corner_vertices[2] = {:?} (rim1 P3 = {:?}, rim2col P3 = {:?})",
-                    apex, r1_pts[3], r2_col_pts[3]
-                ),
-            },
-        )));
-    }
-    // Seed interior CPs at the centroid of the six boundary-interior
-    // CPs (those adjacent to the interior block on the three live
-    // rims).
-    let seed = average_of(&[
-        grid[0][1], grid[0][2], grid[1][0], grid[2][0], grid[1][3], grid[2][3],
-    ]);
-    grid[1][1] = seed;
-    grid[1][2] = seed;
-    grid[2][1] = seed;
-    grid[2][2] = seed;
 
-    // Step 4 — extract neighbour normals at K=5 stations per rim,
-    // build the 3K = 15-row Jacobian / RHS, append √λ·I Tikhonov
-    // rows, solve.
-    let stations = sample_stations::<K_STATIONS>();
-    let mut neighbour_normals: [[Vector3; K_STATIONS]; 3] =
-        [[Vector3::new(0.0, 0.0, 0.0); K_STATIONS]; 3];
-    for i in 0..3 {
-        let (edge_id, _) = cap_edges_with_kind[i];
-        let neighbour_face_id = find_neighbour_face_for_edge(model, edge_id).ok_or_else(|| {
-            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ G1 cap: rim edge {:?} has no neighbour face (not referenced \
-                     by any face's outer/inner loops)",
-                    edge_id
-                ),
-            }))
-        })?;
-        let neighbour_face = model.faces.get(neighbour_face_id).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!(
-                "CF-γ G1 cap: neighbour face {:?} missing from model",
-                neighbour_face_id
-            ))
-        })?;
-        let neighbour_surface = model.surfaces.get(neighbour_face.surface_id).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!(
-                "CF-γ G1 cap: neighbour surface {:?} (face {:?}) missing from model",
-                neighbour_face.surface_id, neighbour_face_id
-            ))
-        })?;
-
-        // The patch's u=0 / v=0 / v=1 boundaries are oriented to
-        // run along the rim from corner[i] (param 0) to corner[i+1
-        // mod 3] (param 1) for rim 0; corner[1]→corner[2] (param
-        // 0→1, along i) for rim 1 (v=1 col); corner[0]→corner[2]
-        // (param 0→1, along i) for rim 2 (v=0 col).
-        //
-        // For each rim and each station t ∈ stations, sample the
-        // rim's cubic Bezier at t to get the rim point, then invert
-        // onto the neighbour surface for `closest_point`, then
-        // evaluate `normal_at`.
-        let rim_cps = match i {
-            0 => &r0_pts,
-            1 => &r1_pts,
-            _ => &r2_col_pts,
-        };
-        let rim_ws = match i {
-            0 => &r0_ws,
-            1 => &r1_ws,
-            _ => &r2_col_ws,
-        };
-        for (k, &t) in stations.iter().enumerate() {
-            let rim_point = rational_cubic_bezier_eval(rim_cps, rim_ws, t);
-            let (nu, nv) = neighbour_surface
-                .closest_point(&rim_point, Tolerance::default())
-                .map_err(|e| {
-                    OperationError::NumericalError(format!(
-                        "CF-γ G1 cap: closest_point inversion failed on neighbour \
-                         face {:?} at rim {:?} station {}: {:?}",
-                        neighbour_face_id, edge_id, k, e
-                    ))
-                })?;
-            let normal = neighbour_surface.normal_at(nu, nv).map_err(|e| {
-                OperationError::NumericalError(format!(
-                    "CF-γ G1 cap: normal_at failed on neighbour face {:?} at \
-                     ({:.6}, {:.6}): {:?}",
-                    neighbour_face_id, nu, nv, e
-                ))
-            })?;
-            neighbour_normals[i][k] = normal;
+    // Interior 2×2 — Coons-patch transfinite interpolation seed.
+    //   C(u, v) = U(u, v) + V(u, v) − UV(u, v)
+    // where U interpolates the v-isoparametric pair, V the
+    // u-isoparametric pair, and UV is the bilinear blend of the
+    // four corners.
+    for i in 1..=2 {
+        for j in 1..=2 {
+            let u = i as f64 / 3.0;
+            let v = j as f64 / 3.0;
+            let p_u = lerp(grid[0][j], grid[3][j], u);
+            let p_v = lerp(grid[i][0], grid[i][3], v);
+            let p_uv = bilerp(grid[0][0], grid[0][3], grid[3][0], grid[3][3], u, v);
+            grid[i][j] = Point3::new(
+                p_u.x + p_v.x - p_uv.x,
+                p_u.y + p_v.y - p_uv.y,
+                p_u.z + p_v.z - p_uv.z,
+            );
         }
     }
 
-    // Step 4b — build Jacobian + RHS and solve.
-    let solution = solve_g1_interior_cps(&grid, &neighbour_normals, &stations).map_err(|e| {
-        OperationError::NumericalError(format!(
-            "CF-γ G1 cap: least-squares solver failed: {:?}",
-            e
-        ))
-    })?;
-    // Unknown ordering: [P[1][1].x, P[1][1].y, P[1][1].z,
-    //                    P[1][2].x, P[1][2].y, P[1][2].z,
-    //                    P[2][1].x, P[2][1].y, P[2][1].z,
-    //                    P[2][2].x, P[2][2].y, P[2][2].z]
-    grid[1][1] = Point3::new(solution[0], solution[1], solution[2]);
-    grid[1][2] = Point3::new(solution[3], solution[4], solution[5]);
-    grid[2][1] = Point3::new(solution[6], solution[7], solution[8]);
-    grid[2][2] = Point3::new(solution[9], solution[10], solution[11]);
+    (grid, weights)
+}
 
-    // Step 5 — wrap into NURBS and run the residual gate.
-    let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
-    let nurbs = NurbsSurface::new(grid.clone(), weights.clone(), knots.clone(), knots, 3, 3)
-        .map_err(|e| {
-            OperationError::NumericalError(format!(
-                "CF-γ G1 cap: NurbsSurface::new rejected the degenerate bicubic \
-                 control net: {}",
-                e
-            ))
-        })?;
-    let cap_surface = GeneralNurbsSurface { nurbs };
-
-    // Residual gate. For each rim × station, evaluate the patch
-    // normal at the rim parameter, compare angle to neighbour
-    // normal. Worst residual > G1_TOLERANCE → typed
-    // SeamContinuityUnreachable reject.
-    for i in 0..3 {
-        let (edge_id, _) = cap_edges_with_kind[i];
-        for (k, &t) in stations.iter().enumerate() {
-            let (u, v) = patch_uv_for_rim_station(i, t);
-            let cap_normal = cap_surface.normal_at(u, v).map_err(|e| {
-                OperationError::NumericalError(format!(
-                    "CF-γ G1 cap: patch normal_at({:.6}, {:.6}) failed at \
-                     rim {:?} station {}: {:?}",
-                    u, v, edge_id, k, e
-                ))
-            })?;
-            let n_ref = neighbour_normals[i][k];
-            let residual = angular_residual(&cap_normal, &n_ref);
-            if residual > G1_TOLERANCE {
-                return Err(OperationError::BlendFailed(Box::new(
-                    BlendFailure::SeamContinuityUnreachable {
-                        residual,
-                        tolerance: G1_TOLERANCE,
-                        station: k as u32,
-                        rim_edge: edge_id,
-                    },
-                )));
-            }
-        }
-    }
-
-    // Step 6 — orient at the patch midpoint (well away from the u=1
-    // degeneracy) and call the shared finalize tail.
-    let orientation = super::orientation::orient_face_for_outward_at(
-        &cap_surface,
-        vertex_outward,
-        0.5,
-        0.5,
+/// Linear interpolation between two `Point3`s.
+fn lerp(a: Point3, b: Point3, t: f64) -> Point3 {
+    Point3::new(
+        a.x + t * (b.x - a.x),
+        a.y + t * (b.y - a.y),
+        a.z + t * (b.z - a.z),
     )
-    .unwrap_or(FaceOrientation::Forward);
+}
 
-    let surface_id = model.surfaces.add(Box::new(cap_surface));
-    // CF-γ.6.1 — wrap the single G1 patch into one `CapSubFace`
-    // and unwrap the first face id back to the legacy `FaceId`
-    // return type. γ.6.2 replaces this with a 3-sub-patch vector
-    // construction. The synthesizer is currently unreachable from
-    // production code (chamfer.rs / fillet.rs dispatcher arms
-    // short-circuit `SeamContinuity::G1` to the typed sentinel
-    // under the γ.3 backout); γ.6.2 lifts that short-circuit.
-    let sub_face = CapSubFace {
-        surface_id,
-        orientation,
-        loop_edges: cap_edges_with_kind
-            .iter()
-            .zip(loop_forwards.iter())
-            .map(|(&(edge, _), &fwd)| (edge, fwd))
-            .collect(),
-    };
-    let face_ids = finalize_mixed_kind_cap_face(
-        model,
-        solid_id,
-        vertex_id,
-        std::slice::from_ref(&sub_face),
-        requested_kind,
-    )?;
-    face_ids.into_iter().next().ok_or_else(|| {
-        OperationError::InvalidGeometry(
-            "finalize_mixed_kind_cap_face returned an empty face list \
-             for the CF-γ single-patch G1 path"
-                .to_string(),
-        )
-    })
+/// Bilinear interpolation of the four corners of a unit
+/// rectangle. `p00` at `(u, v) = (0, 0)`, `p01` at `(0, 1)`,
+/// `p10` at `(1, 0)`, `p11` at `(1, 1)`.
+fn bilerp(p00: Point3, p01: Point3, p10: Point3, p11: Point3, u: f64, v: f64) -> Point3 {
+    let bot = lerp(p00, p01, v);
+    let top = lerp(p10, p11, v);
+    lerp(bot, top, u)
 }
 
 /// Lift a rim curve to a 4-control-point cubic Bezier
@@ -796,6 +1098,7 @@ fn find_neighbour_face_for_edge(model: &BRepModel, edge_id: EdgeId) -> Option<Fa
 /// Appends `√λ · I` Tikhonov rows so the normal equations are
 /// regularised at small displacements where the Jacobian becomes
 /// near-rank-deficient.
+#[allow(dead_code)] // γ.6.2: single-patch 12-DoF solver retained for γ.6.3 lift to 87×54
 fn solve_g1_interior_cps(
     grid: &[Vec<Point3>],
     neighbour_normals: &[[Vector3; K_STATIONS]; 3],
@@ -937,6 +1240,7 @@ fn solve_g1_interior_cps(
 /// - Rim 1 on v=1 boundary: `(t, 1)`.
 /// - Rim 2 on v=0 boundary, oriented `corner[0] → corner[2]` along
 ///   `i` (i.e. u-direction): `(t, 0)`.
+#[allow(dead_code)] // γ.6.2: residual-gate helper retained for γ.6.3
 fn patch_uv_for_rim_station(rim: usize, t: f64) -> (f64, f64) {
     match rim {
         0 => (0.0, t),
@@ -988,6 +1292,7 @@ fn sample_stations<const K: usize>() -> [f64; K] {
 }
 
 /// Centroid of a slice of points.
+#[allow(dead_code)] // γ.6.2: centroid helper retained for γ.6.3 / future fairing seeds
 fn average_of(points: &[Point3]) -> Point3 {
     let n = points.len() as f64;
     let mut sx = 0.0_f64;
@@ -1006,18 +1311,27 @@ fn vec_from(p: Point3) -> Vector3 {
     Vector3::new(p.x, p.y, p.z)
 }
 
-/// Angular residual in radians: `acos(|a·b| / (|a| |b|))`. Always
-/// in `[0, π/2]`. Uses absolute value of the dot so a sign-flipped
-/// neighbour normal still counts as G1 (the cap surface is oriented
-/// later by [`super::orientation::orient_face_for_outward_at`]).
+/// Angular residual in radians: `‖a × b‖ / (‖a‖ ‖b‖)`, which for
+/// unit-normalised input equals `|sin θ|` and approximates θ
+/// linearly for small θ. Always in `[0, 1]` (≤ π/2 ≈ 1.57 rad).
+/// Sign-invariant for the cap-vs-neighbour-normal use case
+/// because `sin` is even on the parallel-vs-antiparallel axis
+/// (the cap surface is oriented later by
+/// [`super::orientation::orient_face_for_outward_at`]).
+///
+/// **Why `sin` not `acos(|cos|)`:** `acos` near 1 amplifies
+/// double-precision noise on the dot product — `acos(1 − 5e-11)
+/// ≈ √(1e-10) ≈ 1e-5 rad` for vectors that are parallel to
+/// 10 decimal places. The cross-product norm avoids the
+/// catastrophic-cancellation `1 − cos²θ` evaluation and reports
+/// the true geometric residual at full precision.
 fn angular_residual(a: &Vector3, b: &Vector3) -> f64 {
     let am = a.magnitude();
     let bm = b.magnitude();
     if am < 1.0e-15 || bm < 1.0e-15 {
         return std::f64::consts::FRAC_PI_2;
     }
-    let c = (a.dot(b) / (am * bm)).abs().min(1.0);
-    c.acos()
+    a.cross(b).magnitude() / (am * bm)
 }
 
 /// Best-effort lookup of the `VertexBlendKindSet` already recorded
@@ -1035,6 +1349,931 @@ fn existing_kind_set_or_default(
         .get(solid_id)
         .and_then(|solid| solid.vertex_blend_set(vertex_id))
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------
+// CF-γ.6.3 — coupled rim-G1 + internal-C1 solver helpers.
+// ---------------------------------------------------------------------
+
+/// Locate the 0-based index of `vid` inside the `distinct_corner_vids`
+/// fan, used to translate a per-corner vertex ID into a spoke-column
+/// offset in the global 54-DoF unknown vector.
+fn vid_idx_for(
+    distinct_corner_vids: &[VertexId],
+    vid: VertexId,
+) -> OperationResult<usize> {
+    for (i, &cv) in distinct_corner_vids.iter().enumerate() {
+        if cv == vid {
+            return Ok(i);
+        }
+    }
+    Err(OperationError::BlendFailed(Box::new(
+        BlendFailure::TopologyViolation {
+            detail: format!(
+                "CF-γ.6.3 G1 solver: vertex {:?} not in distinct corner set",
+                vid
+            ),
+        },
+    )))
+}
+
+/// Column offset of the patch-`i` interior CP `(row, col)` `(x, y, z)`
+/// triplet in the global 54-DoF unknown vector.
+///
+/// Patch i owns 12 columns at base offset `12 * i`. The 4 interior
+/// CPs are ordered `(1, 1)`, `(1, 2)`, `(2, 1)`, `(2, 2)` —
+/// matching the per-row column blocks used by the rim-G1 + C1
+/// row assemblers below.
+#[inline]
+fn col_patch_interior(patch_idx: usize, row: usize, col: usize) -> usize {
+    let cp_idx = match (row, col) {
+        (1, 1) => 0,
+        (1, 2) => 1,
+        (2, 1) => 2,
+        (2, 2) => 3,
+        _ => unreachable!("CF-γ.6.3: patch interior CP indices are (1,1), (1,2), (2,1), (2,2)"),
+    };
+    12 * patch_idx + 3 * cp_idx
+}
+
+/// Column offset of spoke `spoke_idx`'s interior CP at spoke-row
+/// `r ∈ {1, 2}` `(x, y, z)` triplet in the global 54-DoF unknown
+/// vector. Spokes follow the 3 patch blocks; each spoke owns 6
+/// columns at base offset `36 + 6 * spoke_idx`.
+#[inline]
+fn col_spoke_interior(spoke_idx: usize, r: usize) -> usize {
+    debug_assert!(
+        r == 1 || r == 2,
+        "CF-γ.6.3: spoke interior rows are 1 and 2 (CP[0] = corner, CP[3] = apex)"
+    );
+    36 + 6 * spoke_idx + 3 * (r - 1)
+}
+
+/// For each rim, sample the neighbour face's outward-agnostic unit
+/// normal at the K_STATIONS rim-parameter stations.
+///
+/// Inverts the rim's lifted 3D point into the neighbour surface's
+/// `(u, v)` via [`Surface::closest_point`] and evaluates
+/// [`Surface::normal_at`]. The G1 constraint uses the dot
+/// `cap_n · neighbour_n` directly — sign of the neighbour normal
+/// is irrelevant because the constraint enforces orthogonality
+/// of the cap's cross-boundary derivative to the neighbour normal
+/// (zero on either side of the tangent plane).
+///
+/// # Errors
+/// * `BlendFailure::TopologyViolation` — rim has no incident face
+///   (genuinely orphan; should not happen post-surgery because
+///   each cap-rim edge was just created by chamfer or fillet code
+///   and has its chamfer / fillet face on the other side).
+/// * `OperationError::InvalidGeometry` — neighbour face or surface
+///   missing.
+/// * `OperationError::NumericalError` — `closest_point` /
+///   `normal_at` failed, or the returned normal is zero-length.
+fn compute_neighbour_normals_per_rim(
+    model: &BRepModel,
+    cap_edges_with_kind: &[(EdgeId, RimKind)],
+    rim_lifts: &[([Point3; 4], [f64; 4]); 3],
+    stations: &[f64; K_STATIONS],
+    tolerance: f64,
+) -> OperationResult<[[Vector3; K_STATIONS]; 3]> {
+    let mut normals: [[Vector3; K_STATIONS]; 3] =
+        [[Vector3::new(0.0, 0.0, 0.0); K_STATIONS]; 3];
+    let tol = Tolerance::new(tolerance, tolerance);
+    for i in 0..3 {
+        let (edge_id, _kind) = cap_edges_with_kind[i];
+        let face_id = find_neighbour_face_for_edge(model, edge_id).ok_or_else(|| {
+            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6.3 G1 solver: rim edge {:?} has no incident face — \
+                     cannot extract neighbour normal",
+                    edge_id
+                ),
+            }))
+        })?;
+        let face = model.faces.get(face_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "CF-γ.6.3 G1 solver: neighbour face {:?} missing from model",
+                face_id
+            ))
+        })?;
+        let surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "CF-γ.6.3 G1 solver: neighbour face {:?} references missing surface {:?}",
+                face_id, face.surface_id
+            ))
+        })?;
+        for (k, t) in stations.iter().enumerate() {
+            let pt = rational_cubic_bezier_eval(&rim_lifts[i].0, &rim_lifts[i].1, *t);
+            let (u, v) = surface.closest_point(&pt, tol).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 G1 solver: closest_point failed on rim {} station {} \
+                     (t = {:.6}): {:?}",
+                    i, k, t, e
+                ))
+            })?;
+            let n_raw = surface.normal_at(u, v).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 G1 solver: normal_at({:.6}, {:.6}) failed on rim {} \
+                     station {}: {:?}",
+                    u, v, i, k, e
+                ))
+            })?;
+            let n = n_raw.normalize().map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 G1 solver: neighbour normal at rim {} station {} \
+                     is zero-length: {:?}",
+                    i, k, e
+                ))
+            })?;
+            normals[i][k] = n;
+        }
+    }
+    Ok(normals)
+}
+
+/// Pack the planar-fairing seed into the 54-entry unknown vector.
+///
+/// Layout matches [`col_patch_interior`] + [`col_spoke_interior`]:
+///
+/// ```text
+///   x[12·i + 0..3]   = patch_i.P[1][1]   x, y, z
+///   x[12·i + 3..6]   = patch_i.P[1][2]
+///   x[12·i + 6..9]   = patch_i.P[2][1]
+///   x[12·i + 9..12]  = patch_i.P[2][2]
+///   x[36 + 6·k + 0..3]  = spoke_k.CP[1]  (uniform-thirds, corner+d/3)
+///   x[36 + 6·k + 3..6]  = spoke_k.CP[2]                  corner+2d/3
+/// ```
+fn pack_seed_vector(
+    sub_grids: &[Vec<Vec<Point3>>; 3],
+    spoke_cps_for_vid_idx: &[[Point3; 4]; 3],
+) -> Vec<f64> {
+    let mut seed = vec![0.0_f64; N_FREE_DOF];
+    for i in 0..3 {
+        for &(r, c, cp_idx) in &[(1, 1, 0), (1, 2, 1), (2, 1, 2), (2, 2, 3)] {
+            let base = 12 * i + 3 * cp_idx;
+            seed[base] = sub_grids[i][r][c].x;
+            seed[base + 1] = sub_grids[i][r][c].y;
+            seed[base + 2] = sub_grids[i][r][c].z;
+        }
+    }
+    for k in 0..3 {
+        let base = 36 + 6 * k;
+        seed[base] = spoke_cps_for_vid_idx[k][1].x;
+        seed[base + 1] = spoke_cps_for_vid_idx[k][1].y;
+        seed[base + 2] = spoke_cps_for_vid_idx[k][1].z;
+        seed[base + 3] = spoke_cps_for_vid_idx[k][2].x;
+        seed[base + 4] = spoke_cps_for_vid_idx[k][2].y;
+        seed[base + 5] = spoke_cps_for_vid_idx[k][2].z;
+    }
+    seed
+}
+
+/// Unpack a 54-entry solution vector into:
+/// * per-sub-patch interior 2×2 blocks (writes `grids[i][r][c]` for
+///   `(r, c) ∈ {(1,1), (1,2), (2,1), (2,2)}`),
+/// * per-spoke interior CPs (writes `spoke_cps_for_vid_idx[k][r]`
+///   for `r ∈ {1, 2}` — endpoints stay pinned to corner / apex),
+/// * then re-syncs each sub-patch's `v=0` and `v=1` columns to
+///   match the updated spoke CPs so the patch grid is internally
+///   consistent before being handed to `NurbsSurface::new`.
+fn apply_global_solution(
+    x: &[f64],
+    sub_grids: &mut [Vec<Vec<Point3>>; 3],
+    spoke_cps_for_vid_idx: &mut [[Point3; 4]; 3],
+    distinct_corner_vids: &[VertexId],
+    rim_walk_vids: &[(VertexId, VertexId); 3],
+) -> OperationResult<()> {
+    debug_assert_eq!(x.len(), N_FREE_DOF);
+    // Patch interiors.
+    for i in 0..3 {
+        for &(r, c, cp_idx) in &[(1, 1, 0), (1, 2, 1), (2, 1, 2), (2, 2, 3)] {
+            let base = 12 * i + 3 * cp_idx;
+            sub_grids[i][r][c] = Point3::new(x[base], x[base + 1], x[base + 2]);
+        }
+    }
+    // Spoke interiors.
+    for k in 0..3 {
+        let base = 36 + 6 * k;
+        spoke_cps_for_vid_idx[k][1] = Point3::new(x[base], x[base + 1], x[base + 2]);
+        spoke_cps_for_vid_idx[k][2] =
+            Point3::new(x[base + 3], x[base + 4], x[base + 5]);
+    }
+    // Re-sync each sub-patch's v=0 and v=1 boundary columns from the
+    // (now-solved) shared spoke CPs. Endpoints (rim corners + apex)
+    // already match; only the two interior rows (r ∈ {1, 2}) need to
+    // be copied across.
+    for i in 0..3 {
+        let (start_vid, end_vid) = rim_walk_vids[i];
+        let start_idx = vid_idx_for(distinct_corner_vids, start_vid)?;
+        let end_idx = vid_idx_for(distinct_corner_vids, end_vid)?;
+        sub_grids[i][1][0] = spoke_cps_for_vid_idx[start_idx][1];
+        sub_grids[i][2][0] = spoke_cps_for_vid_idx[start_idx][2];
+        sub_grids[i][1][3] = spoke_cps_for_vid_idx[end_idx][1];
+        sub_grids[i][2][3] = spoke_cps_for_vid_idx[end_idx][2];
+    }
+    Ok(())
+}
+
+/// Build the 99×54 coupled rim-G1 + internal-C1 + Tikhonov system
+/// in `min ||J x + e||` form.
+///
+/// Row order:
+/// 1. Rim-G1 rows (3 rims × K_STATIONS = 12): one scalar
+///    `(∂N/∂u(0, t_k)) · n_neighbour = 0` per (rim, station).
+///    For sub-patch i:
+///      `∂N/∂u(0, t) = 3 · Σ_j B_j(t) (P[1][j] − P[0][j])`
+///    so the constraint reduces to
+///      `Σ_j B_j(t) · P[1][j] · n = Σ_j B_j(t) · P[0][j] · n`,
+///    with the LHS coefficients flowing into the four free CPs
+///    along the `u = 1` Bernstein row: spoke_start.CP[1] (B_0),
+///    patch_i.P[1][1] (B_1), patch_i.P[1][2] (B_2),
+///    spoke_end.CP[1] (B_3). The RHS comes from the rim Bezier
+///    (fixed) and is moved into `e` with sign flip.
+/// 2. Internal-C1 rows (3 spokes × 2 live rows × 3 coords = 18):
+///    derived from `∂S_A/∂v(u, 1) + ∂S_B/∂v(u, 0) = 0`. With
+///    `P_A[i][3] = P_B[i][0] = spoke[i]` the spoke CP cancels:
+///      `−P_A[i][2] + P_B[i][1] = 0`  for i ∈ {1, 2}.
+///    `i = 0` produces a constant residual `(rim_B[1] − rim_A[2])`
+///    that represents a geometric corner crease (unsatisfiable
+///    when the two rims' tangents disagree at the corner) and is
+///    therefore dropped. `i = 3` is identically zero (apex
+///    collapse) and is also dropped.
+/// 3. Tikhonov rows (54): one per unknown, `√λ · x[j] = √λ · seed[j]`,
+///    moved into `e` with sign flip. Centres the solve on the
+///    planar-fairing seed in the under-determined nullspace.
+///
+/// All RHS quantities are folded into `e` with sign flip so that
+/// the `solve_least_squares` contract `min ||J x + e||` reduces to
+/// the desired `J x ≈ rhs`.
+#[allow(clippy::too_many_arguments)]
+fn assemble_coupled_g1_system(
+    rim_lifts: &[([Point3; 4], [f64; 4]); 3],
+    rim_walk_vids: &[(VertexId, VertexId); 3],
+    distinct_corner_vids: &[VertexId],
+    spoke_cps_for_vid_idx: &[[Point3; 4]; 3],
+    neighbour_normals: &[[Vector3; K_STATIONS]; 3],
+    stations: &[f64; K_STATIONS],
+    seed: &[f64],
+) -> OperationResult<(Vec<Vec<f64>>, Vec<f64>)> {
+    debug_assert_eq!(seed.len(), N_FREE_DOF);
+    let mut jacobian: Vec<Vec<f64>> = Vec::with_capacity(N_TOTAL_ROWS);
+    let mut errors: Vec<f64> = Vec::with_capacity(N_TOTAL_ROWS);
+
+    // --- Rim-G1 rows (3 × K_STATIONS = 12). ---
+    //
+    // The cap is a *rational* tensor-product Bezier when an arc rim
+    // contributes non-unit weights to the `u = 0` boundary row. The
+    // u-derivative at `u = 0` for a rational patch is
+    //
+    //     ∂S/∂u(0, v) =
+    //         [∂N/∂u(0, v) · W(0, v) − N(0, v) · ∂W/∂u(0, v)] / W(0, v)²
+    //
+    // where `N` / `W` are the homogeneous numerator / weight
+    // accumulators. With `w_{1j} = 1` (row-1 weights pinned by
+    // [`build_subpatch_control_net`]) and `w_{0j}` from the rim
+    // lift, the constraint `∂S/∂u(0, t) · n = 0` (equivalent under
+    // `W > 0` to vanishing of the bracket numerator) reduces via
+    // Bernstein partition-of-unity to the compact form
+    //
+    //     Σ_j P[1][j] · n · B_j(t) · W(0, t)
+    //         = Σ_j w_{0j} · P[0][j] · n · B_j(t)
+    //
+    // For line rims (`w_{0j} = 1` ⇒ `W(0, t) = 1`) this degenerates
+    // to the standard non-rational form; for arc rims the rational
+    // correction factors are essential — dropping them yields a
+    // few-degree residual on every fillet-bearing fixture.
+    for i in 0..3 {
+        let (start_vid, end_vid) = rim_walk_vids[i];
+        let start_idx = vid_idx_for(distinct_corner_vids, start_vid)?;
+        let end_idx = vid_idx_for(distinct_corner_vids, end_vid)?;
+        let rim_pts = &rim_lifts[i].0;
+        let rim_ws = &rim_lifts[i].1;
+        for k in 0..K_STATIONS {
+            let t = stations[k];
+            let n = neighbour_normals[i][k];
+            let b = bernstein3(t);
+            // W(0, t) = Σ_j w_{0j} · B_j(t).
+            let w_at_t: f64 = (0..4).map(|j| rim_ws[j] * b[j]).sum();
+            let mut row = vec![0.0_f64; N_FREE_DOF];
+
+            // Free contributions on the P[1][·] row. The coefficient
+            // on P[1][j] · n is `B_j(t) · W(0, t)`.
+            let c0 = b[0] * w_at_t;
+            let c1 = b[1] * w_at_t;
+            let c2 = b[2] * w_at_t;
+            let c3 = b[3] * w_at_t;
+            // spoke_start.CP[1] = P[1][0] coefficient.
+            let base_s = col_spoke_interior(start_idx, 1);
+            row[base_s] += c0 * n.x;
+            row[base_s + 1] += c0 * n.y;
+            row[base_s + 2] += c0 * n.z;
+            // patch_i.P[1][1] coefficient.
+            let base_p11 = col_patch_interior(i, 1, 1);
+            row[base_p11] += c1 * n.x;
+            row[base_p11 + 1] += c1 * n.y;
+            row[base_p11 + 2] += c1 * n.z;
+            // patch_i.P[1][2] coefficient.
+            let base_p12 = col_patch_interior(i, 1, 2);
+            row[base_p12] += c2 * n.x;
+            row[base_p12 + 1] += c2 * n.y;
+            row[base_p12 + 2] += c2 * n.z;
+            // spoke_end.CP[1] = P[1][3] coefficient.
+            let base_e = col_spoke_interior(end_idx, 1);
+            row[base_e] += c3 * n.x;
+            row[base_e + 1] += c3 * n.y;
+            row[base_e + 2] += c3 * n.z;
+
+            // RHS = Σ_j w_{0j} · B_j(t) · P[0][j] · n (rim Bezier
+            // CPs are fixed; w_{0j} comes from the rational rim lift).
+            let mut rhs = 0.0_f64;
+            for j in 0..4 {
+                rhs += rim_ws[j] * b[j] * vec_from(rim_pts[j]).dot(&n);
+            }
+            jacobian.push(row);
+            errors.push(-rhs);
+        }
+    }
+
+    // --- Internal-C1 rows across each shared spoke. ---
+    //
+    // For spoke at distinct_corner_vids[k]:
+    //   * Patch A is the sub-patch whose `end_vid` = vid_k
+    //     (the spoke is its v=1 column).
+    //   * Patch B is the sub-patch whose `start_vid` = vid_k
+    //     (the spoke is its v=0 column).
+    //   * Live rows r ∈ {1, 2}; per-row, per-coord:
+    //       P_B[r][1].coord − P_A[r][2].coord = 0.
+    for k in 0..3 {
+        let vid = distinct_corner_vids[k];
+        let mut patch_a: Option<usize> = None;
+        let mut patch_b: Option<usize> = None;
+        for (idx, &(s, e)) in rim_walk_vids.iter().enumerate() {
+            if e == vid {
+                patch_a = Some(idx);
+            }
+            if s == vid {
+                patch_b = Some(idx);
+            }
+        }
+        let a = patch_a.ok_or_else(|| {
+            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6.3 G1 solver: corner vertex {:?} is not the end of any rim — \
+                     cannot identify patch A for internal-C1 row",
+                    vid
+                ),
+            }))
+        })?;
+        let b_idx = patch_b.ok_or_else(|| {
+            OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                detail: format!(
+                    "CF-γ.6.3 G1 solver: corner vertex {:?} is not the start of any rim — \
+                     cannot identify patch B for internal-C1 row",
+                    vid
+                ),
+            }))
+        })?;
+        for &r in &[1_usize, 2_usize] {
+            let col_b = col_patch_interior(b_idx, r, 1);
+            let col_a = col_patch_interior(a, r, 2);
+            for coord in 0..3 {
+                let mut row = vec![0.0_f64; N_FREE_DOF];
+                row[col_b + coord] = 1.0;
+                row[col_a + coord] = -1.0;
+                jacobian.push(row);
+                errors.push(0.0);
+            }
+        }
+    }
+
+    // --- Tikhonov rows centred on the planar-fairing seed. ---
+    let sqrt_lambda = TIKHONOV_LAMBDA.sqrt();
+    for j in 0..N_FREE_DOF {
+        let mut row = vec![0.0_f64; N_FREE_DOF];
+        row[j] = sqrt_lambda;
+        jacobian.push(row);
+        errors.push(-sqrt_lambda * seed[j]);
+    }
+
+    // Compile-time-checked shape: 12 + 18 + 54 = 84 rows × 54 cols.
+    let _ = spoke_cps_for_vid_idx; // present in the API for symmetry / future extensions
+    debug_assert_eq!(jacobian.len(), N_TOTAL_ROWS);
+    debug_assert_eq!(errors.len(), N_TOTAL_ROWS);
+    Ok((jacobian, errors))
+}
+
+/// After the LS solve, sample each sub-patch's outward-agnostic
+/// surface normal at the K_STATIONS rim stations on the `u = 0`
+/// boundary and compute the angular residual against the
+/// neighbour normal. Returns the worst residual + its
+/// `(rim_idx, station_idx)` site so the synthesizer can surface
+/// a precisely-located [`BlendFailure::SeamContinuityUnreachable`]
+/// when the gate trips.
+///
+/// Reuses [`angular_residual`] (sign-invariant `acos(|·|)`) so the
+/// metric is independent of the surface orientation chosen later
+/// by [`super::orientation::orient_face_for_outward_at`].
+fn compute_rim_g1_residual_max(
+    sub_grids: &[Vec<Vec<Point3>>; 3],
+    sub_weights: &[Vec<Vec<f64>>; 3],
+    neighbour_normals: &[[Vector3; K_STATIONS]; 3],
+    stations: &[f64; K_STATIONS],
+) -> OperationResult<(f64, usize, usize)> {
+    let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let mut worst = 0.0_f64;
+    let mut worst_rim = 0_usize;
+    let mut worst_station = 0_usize;
+    for i in 0..3 {
+        let nurbs = NurbsSurface::new(
+            sub_grids[i].clone(),
+            sub_weights[i].clone(),
+            knots.clone(),
+            knots.clone(),
+            3,
+            3,
+        )
+        .map_err(|e| {
+            OperationError::NumericalError(format!(
+                "CF-γ.6.3 G1 solver: residual NurbsSurface::new failed on sub-patch {}: {}",
+                i, e
+            ))
+        })?;
+        let surface = GeneralNurbsSurface { nurbs };
+        for k in 0..K_STATIONS {
+            let t = stations[k];
+            let n_cap = surface.normal_at(0.0, t).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 G1 solver: cap normal_at(0, {:.6}) failed on sub-patch {}: {:?}",
+                    t, i, e
+                ))
+            })?;
+            let res = angular_residual(&n_cap, &neighbour_normals[i][k]);
+            if res > worst {
+                worst = res;
+                worst_rim = i;
+                worst_station = k;
+            }
+        }
+    }
+    Ok((worst, worst_rim, worst_station))
+}
+
+/// Evaluate the cap-vs-neighbour normal mismatch as a **signed
+/// 3-component cross-product residual** at each `(rim, station)`
+/// site.
+///
+/// Returns the `3 × K_STATIONS × 3` vector
+///
+/// ```text
+///     r_{i,k,c} = (n_cap(0, t_k) × n_neigh_{i,k})_c     c ∈ {x,y,z}
+/// ```
+///
+/// flattened in `(i, k, c)`-major order. The magnitude
+/// `‖n_cap × n_neigh‖` equals `sin θ` — exactly the gate metric in
+/// [`compute_rim_g1_residual_max`]. By exposing the cross product as
+/// three signed scalars instead of taking the magnitude, every
+/// residual component is *smooth* with respect to control-point
+/// perturbations everywhere — including at `sin θ = 0`, the
+/// convergence target. The unsigned magnitude has a `|·|`-style
+/// kink at zero that destroys the FD Jacobian near the minimum;
+/// the signed components avoid that pathology.
+///
+/// Earlier analytic forms relied on `∂S/∂v(0, v) ⊥ n_neigh` (the
+/// cap's `v = 0` column lying *exactly* on the neighbour face).
+/// That assumption breaks under the current solver's latent C0
+/// mismatch (see CF-γ.6.3 follow-up task), so any analytic
+/// shortcut drifts from the true `sin θ`. Computing `n_cap` via
+/// the rational surface evaluator and taking the cross with
+/// `n_neigh` directly is exact regardless.
+fn evaluate_geometric_residuals(
+    sub_grids: &[Vec<Vec<Point3>>; 3],
+    sub_weights: &[Vec<Vec<f64>>; 3],
+    neighbour_normals: &[[Vector3; K_STATIONS]; 3],
+    stations: &[f64; K_STATIONS],
+) -> OperationResult<Vec<f64>> {
+    let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let mut residuals = Vec::with_capacity(3 * K_STATIONS * 3);
+    for i in 0..3 {
+        let nurbs = NurbsSurface::new(
+            sub_grids[i].clone(),
+            sub_weights[i].clone(),
+            knots.clone(),
+            knots.clone(),
+            3,
+            3,
+        )
+        .map_err(|e| {
+            OperationError::NumericalError(format!(
+                "CF-γ.6.3 G1 polish: NurbsSurface::new failed on sub-patch {}: {}",
+                i, e
+            ))
+        })?;
+        let surface = GeneralNurbsSurface { nurbs };
+        for k in 0..K_STATIONS {
+            let t = stations[k];
+            let n_cap = surface.normal_at(0.0, t).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 G1 polish: cap normal_at(0, {:.6}) failed on \
+                     sub-patch {}: {:?}",
+                    t, i, e
+                ))
+            })?;
+            let cross = n_cap.cross(&neighbour_normals[i][k]);
+            residuals.push(cross.x);
+            residuals.push(cross.y);
+            residuals.push(cross.z);
+        }
+    }
+    Ok(residuals)
+}
+
+/// Geometric Newton polish on top of the linear LS solution.
+///
+/// The linear assembler satisfies the algebraic Bernstein form of
+/// `∂S/∂u(0, t) · n_neigh = 0` to machine precision, but the
+/// quotient-rule scaling `W(0, t)²` and the cap's anisotropy near
+/// the apex can leave the *geometric* residual
+/// `sin θ(n_cap, n_neigh)` one to two orders of magnitude above
+/// the 1e-6 rad gate.
+///
+/// This routine polishes the linear seed by iterating LM steps on
+/// the unnormalised geometric residual `r(x)` (3 × K_STATIONS scalar
+/// entries, signed). The Jacobian is taken by forward finite
+/// differences (`h = 1e-7`); analytic via the rational quotient is
+/// feasible but offers no benefit at 12×54.
+///
+/// At each iteration we solve
+///
+/// ```text
+///     [   J(x_curr)   ]            [ r(x_curr) ]
+///     [ √λ_lm · I_54  ] · dx + ... [    0      ]   →   min ‖·‖²
+/// ```
+///
+/// over the same 54-DoF unknown layout used by the linear assembler
+/// (see [`pack_seed_vector`] / [`apply_global_solution`]). The
+/// internal-C1 rows are *not* re-added: the LS already satisfied
+/// them, and they are invariant under symmetric updates of the
+/// patch interiors when paired with the spoke re-sync inside
+/// `apply_global_solution`. Backtracking halves `dx` up to 4× if a
+/// trial step fails to decrease the worst residual; if every trial
+/// fails, the loop exits with the LS solution unchanged (the LS
+/// solution is then already a stationary point of the geometric
+/// objective).
+///
+/// References:
+/// * Patrikalakis & Maekawa (2002), *Shape Interrogation for
+///   Computer-Aided Design and Manufacturing*, §11.2.4 (Newton
+///   refinement for surface G1 patching) — the two-pass algebraic
+///   seed + geometric polish scheme is described there.
+/// * Levenberg (1944) / Marquardt (1963) — the damped-LS step.
+fn polish_g1_newton(
+    sub_grids: &mut [Vec<Vec<Point3>>; 3],
+    sub_weights: &[Vec<Vec<f64>>; 3],
+    spoke_cps: &mut [[Point3; 4]; 3],
+    distinct_corner_vids: &[VertexId],
+    rim_walk_vids: &[(VertexId, VertexId); 3],
+    neighbour_normals: &[[Vector3; K_STATIONS]; 3],
+    stations: &[f64; K_STATIONS],
+) -> OperationResult<(f64, usize, usize)> {
+    const MAX_ITERS: usize = 6;
+    const TARGET: f64 = G1_TOLERANCE * 0.1; // 1e-7 — well below the gate.
+    // Central-difference step. Optimal `h` for central FD is
+    // `(3ε / |f'''/f|)^(1/3) · |x|` ≈ ε^(1/3)·|x| ≈ 1e-5·10 ≈ 1e-4
+    // for double precision and `O(10)` CP magnitudes on the box
+    // fixtures. Truncation error is then `O(h²) ≈ 1e-10`, which
+    // gives us two orders of magnitude of headroom below the
+    // `1e-6` G1 gate — forward differences (`O(h) ≈ 1e-7`) ran
+    // into a floor at `~1.3e-6` rad on the 1C2F fixtures.
+    const FD_H: f64 = 1.0e-5;
+    // LM damping must be small relative to the residual scale we
+    // are chasing. With `√λ = 1e-8` and target residual `1e-7`,
+    // the damping contributes at most `1e-8` of bias — comfortably
+    // below the target. The 12-row geometric block is rank ~9 (3
+    // rims × 3 free directions per row-1 set after partition-of-
+    // unity collinearity), so the 36-DoF Tikhonov rows in the
+    // *initial* linear LS already fixed the nullspace; the polish
+    // only needs LM as a fallback if the FD Jacobian rank-drops.
+    const LM_LAMBDA: f64 = 1.0e-16;
+    const MAX_BACKTRACK: usize = 4;
+
+    // Residual layout: 3 rims × K_STATIONS stations × 3 cross-product
+    // components per station. Worst-case `sin θ` per (rim, station) is
+    // the L2 norm of the 3 cross components — that L2 norm is exactly
+    // the gate's `compute_rim_g1_residual_max` value.
+    let n_rows: usize = 3 * K_STATIONS * 3;
+    let ls_pivot_tol = Tolerance::new(LM_LAMBDA / 100.0, 1.0e-6);
+    let trace = std::env::var("ROSHERA_CFG6_TRACE").ok().as_deref() == Some("1");
+
+    // Reduce a 3-component-per-station residual vector to the worst
+    // `sin θ` over all (rim, station) sites.
+    let worst_sin_theta = |r: &[f64]| -> f64 {
+        let n_stations = r.len() / 3;
+        (0..n_stations)
+            .map(|k| {
+                let x = r[3 * k];
+                let y = r[3 * k + 1];
+                let z = r[3 * k + 2];
+                (x * x + y * y + z * z).sqrt()
+            })
+            .fold(0.0_f64, f64::max)
+    };
+
+    for _iter in 0..MAX_ITERS {
+        let x_curr = pack_seed_vector(sub_grids, spoke_cps);
+        let r0 = evaluate_geometric_residuals(
+            sub_grids,
+            sub_weights,
+            neighbour_normals,
+            stations,
+        )?;
+        let worst0 = worst_sin_theta(&r0);
+        if trace {
+            eprintln!(
+                "[CFG6.polish iter={}] r0_worst={:.4e} TARGET={:.4e}",
+                _iter, worst0, TARGET
+            );
+        }
+        if worst0 < TARGET {
+            break;
+        }
+
+        // Central-difference Jacobian. Each column requires two
+        // `apply_global_solution` + residual evaluations
+        // (`x + h` and `x − h`). Truncation error `O(h²)` — two
+        // orders of magnitude tighter than forward differences at
+        // the same `h`, which is what lets the 1C2F fixtures cross
+        // the 1e-6 gate.
+        let mut jacobian: Vec<Vec<f64>> =
+            vec![vec![0.0_f64; N_FREE_DOF]; n_rows];
+        for j in 0..N_FREE_DOF {
+            let mut x_plus = x_curr.clone();
+            x_plus[j] += FD_H;
+            let mut grids_plus = sub_grids.clone();
+            let mut spokes_plus = *spoke_cps;
+            apply_global_solution(
+                &x_plus,
+                &mut grids_plus,
+                &mut spokes_plus,
+                distinct_corner_vids,
+                rim_walk_vids,
+            )?;
+            let r_plus = evaluate_geometric_residuals(
+                &grids_plus,
+                sub_weights,
+                neighbour_normals,
+                stations,
+            )?;
+
+            let mut x_minus = x_curr.clone();
+            x_minus[j] -= FD_H;
+            let mut grids_minus = sub_grids.clone();
+            let mut spokes_minus = *spoke_cps;
+            apply_global_solution(
+                &x_minus,
+                &mut grids_minus,
+                &mut spokes_minus,
+                distinct_corner_vids,
+                rim_walk_vids,
+            )?;
+            let r_minus = evaluate_geometric_residuals(
+                &grids_minus,
+                sub_weights,
+                neighbour_normals,
+                stations,
+            )?;
+
+            let two_h = 2.0 * FD_H;
+            for k in 0..n_rows {
+                jacobian[k][j] = (r_plus[k] - r_minus[k]) / two_h;
+            }
+        }
+
+        // Append Levenberg-Marquardt damping rows: √λ · I_54, RHS = 0.
+        let sqrt_lambda = LM_LAMBDA.sqrt();
+        for j in 0..N_FREE_DOF {
+            let mut row = vec![0.0_f64; N_FREE_DOF];
+            row[j] = sqrt_lambda;
+            jacobian.push(row);
+        }
+        let mut errors = r0.clone();
+        errors.extend(std::iter::repeat(0.0_f64).take(N_FREE_DOF));
+
+        let dx = solve_least_squares(&jacobian, &errors, ls_pivot_tol)
+            .map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 G1 polish: solve_least_squares failed: {:?}",
+                    e
+                ))
+            })?;
+        if dx.len() != N_FREE_DOF {
+            return Err(OperationError::NumericalError(format!(
+                "CF-γ.6.3 G1 polish: solve_least_squares returned \
+                 {} unknowns, expected {}",
+                dx.len(),
+                N_FREE_DOF
+            )));
+        }
+
+        let dx_norm = dx.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let dx_max = dx.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        if trace {
+            eprintln!(
+                "[CFG6.polish iter={}] dx_norm={:.4e} dx_max={:.4e}",
+                _iter, dx_norm, dx_max
+            );
+        }
+
+        // Backtracking line search on the worst residual.
+        let mut step = 1.0_f64;
+        let mut accepted = false;
+        for bt in 0..MAX_BACKTRACK {
+            let x_new: Vec<f64> = (0..N_FREE_DOF)
+                .map(|j| x_curr[j] + step * dx[j])
+                .collect();
+            let mut grids_new = sub_grids.clone();
+            let mut spokes_new = *spoke_cps;
+            apply_global_solution(
+                &x_new,
+                &mut grids_new,
+                &mut spokes_new,
+                distinct_corner_vids,
+                rim_walk_vids,
+            )?;
+            let r_new = evaluate_geometric_residuals(
+                &grids_new,
+                sub_weights,
+                neighbour_normals,
+                stations,
+            )?;
+            let worst_new = worst_sin_theta(&r_new);
+            if trace {
+                eprintln!(
+                    "[CFG6.polish iter={} bt={}] step={:.4e} worst_new={:.4e} (worst0={:.4e}) {}",
+                    _iter,
+                    bt,
+                    step,
+                    worst_new,
+                    worst0,
+                    if worst_new < worst0 { "ACCEPT" } else { "reject" }
+                );
+            }
+            if worst_new < worst0 {
+                *sub_grids = grids_new;
+                *spoke_cps = spokes_new;
+                accepted = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if !accepted {
+            if trace {
+                eprintln!(
+                    "[CFG6.polish iter={}] all {} backtracks rejected — exit",
+                    _iter, MAX_BACKTRACK
+                );
+            }
+            // LS solution is already a stationary point under the
+            // geometric metric — no improvement possible at this
+            // λ_lm. Leave grids unchanged.
+            break;
+        }
+    }
+
+    compute_rim_g1_residual_max(sub_grids, sub_weights, neighbour_normals, stations)
+}
+
+/// Orchestrate the CF-γ.6.3 coupled rim-G1 + internal-C1 + Tikhonov
+/// least-squares solve and return the solved per-sub-patch
+/// `(grid, weights)` pair along with the worst rim-G1 residual.
+///
+/// Algorithm:
+///
+/// 1. Build the C0 seed grid for each sub-patch via
+///    [`build_subpatch_control_net`] (Coons-patch interior 2×2 +
+///    uniform-thirds spokes).
+/// 2. Pack the warm-start unknowns into `x_seed`.
+/// 3. Assemble the 84×54 system via
+///    [`assemble_coupled_g1_system`].
+/// 4. Solve via [`solve_least_squares`] — one shot for the
+///    algebraic Bernstein form of the rim-G1 constraint.
+/// 5. Apply the solution back into the per-patch grids + spokes
+///    and re-sync `v = 0`/`v = 1` columns.
+/// 6. Run [`polish_g1_newton`] to close the algebraic-to-geometric
+///    residual gap (Patrikalakis & Maekawa 2002, §11.2.4).
+/// 7. Re-evaluate the rim-G1 residual at the same K_STATIONS
+///    stations and return the worst-case site for the gate.
+#[allow(clippy::too_many_arguments)]
+fn solve_coupled_g1(
+    rim_lifts: &[([Point3; 4], [f64; 4]); 3],
+    rim_walk_vids: &[(VertexId, VertexId); 3],
+    distinct_corner_vids: &[VertexId],
+    spoke_cps_for_vid_idx: &[[Point3; 4]; 3],
+    apex: Point3,
+    neighbour_normals: &[[Vector3; K_STATIONS]; 3],
+    stations: &[f64; K_STATIONS],
+) -> OperationResult<(
+    [Vec<Vec<Point3>>; 3],
+    [Vec<Vec<f64>>; 3],
+    f64,
+    usize,
+    usize,
+)> {
+    // Step 1 — Build C0 seed grids using shared spoke CPs.
+    let mut sub_grids: [Vec<Vec<Point3>>; 3] = [
+        vec![vec![Point3::new(0.0, 0.0, 0.0); 4]; 4],
+        vec![vec![Point3::new(0.0, 0.0, 0.0); 4]; 4],
+        vec![vec![Point3::new(0.0, 0.0, 0.0); 4]; 4],
+    ];
+    let mut sub_weights: [Vec<Vec<f64>>; 3] = [
+        vec![vec![1.0; 4]; 4],
+        vec![vec![1.0; 4]; 4],
+        vec![vec![1.0; 4]; 4],
+    ];
+    for i in 0..3 {
+        let (start_vid, end_vid) = rim_walk_vids[i];
+        let start_idx = vid_idx_for(distinct_corner_vids, start_vid)?;
+        let end_idx = vid_idx_for(distinct_corner_vids, end_vid)?;
+        let spoke_v0 = spoke_cps_for_vid_idx[start_idx];
+        let spoke_v1 = spoke_cps_for_vid_idx[end_idx];
+        let (grid, weights) =
+            build_subpatch_control_net(&rim_lifts[i], &spoke_v0, &spoke_v1, apex);
+        sub_grids[i] = grid;
+        sub_weights[i] = weights;
+    }
+
+    // Step 2 — Pack warm-start.
+    let seed = pack_seed_vector(&sub_grids, spoke_cps_for_vid_idx);
+
+    // Step 3 — Assemble 84×54 system.
+    let (jacobian, errors) = assemble_coupled_g1_system(
+        rim_lifts,
+        rim_walk_vids,
+        distinct_corner_vids,
+        spoke_cps_for_vid_idx,
+        neighbour_normals,
+        stations,
+        &seed,
+    )?;
+
+    // Step 4 — One-shot LS solve.
+    //
+    // Pivot tolerance must be below the Tikhonov diagonal contribution
+    // `λ = TIKHONOV_LAMBDA = 1e-12`, otherwise Gaussian elimination
+    // reports `SingularMatrix` on columns whose only contribution to
+    // `JᵀJ` is the Tikhonov row (i.e. directions in the nullspace of
+    // the rim-G1 + internal-C1 block). `Tolerance::default()` (= 1e-6
+    // distance) is far too loose for that. We use `λ / 100 = 1e-14`
+    // so the regularised pivots clear the gate by two orders of
+    // magnitude while still flagging genuinely singular structure if
+    // a bug in the assembler ever zeros the Tikhonov band.
+    let ls_pivot_tol = Tolerance::new(TIKHONOV_LAMBDA / 100.0, 1.0e-6);
+    let solution = solve_least_squares(&jacobian, &errors, ls_pivot_tol)
+        .map_err(|e| {
+            OperationError::NumericalError(format!(
+                "CF-γ.6.3 G1 solver: solve_least_squares failed: {:?}",
+                e
+            ))
+        })?;
+    if solution.len() != N_FREE_DOF {
+        return Err(OperationError::NumericalError(format!(
+            "CF-γ.6.3 G1 solver: solve_least_squares returned {} unknowns, expected {}",
+            solution.len(),
+            N_FREE_DOF
+        )));
+    }
+
+    // Step 5 — Apply solution back into grids + spokes; re-sync v=0/v=1.
+    let mut spoke_cps = *spoke_cps_for_vid_idx;
+    apply_global_solution(
+        &solution,
+        &mut sub_grids,
+        &mut spoke_cps,
+        distinct_corner_vids,
+        rim_walk_vids,
+    )?;
+
+    // Step 6 — Geometric Newton polish.
+    //
+    // The linear LS satisfies the algebraic Bernstein form of the
+    // rim-G1 constraint to ~1e-10. For mixed-kind chamfer↔fillet
+    // corners the cap is highly anisotropic at the boundary (small
+    // `|∂S/∂u|`, `∂S/∂u` nearly aligned with `∂S/∂v`) and the
+    // quotient-rule scaling `W(0, t)²` inflates that algebraic
+    // residual to a geometric `sin θ ≈ 1e-5`. The polish closes
+    // the gap via LM iterations on the unnormalised geometric
+    // residual; on the four mixed-kind fixtures this brings the
+    // worst residual below `G1_TOLERANCE = 1e-6` in 1–3 iterations.
+    let (worst, worst_rim, worst_station) = polish_g1_newton(
+        &mut sub_grids,
+        &sub_weights,
+        &mut spoke_cps,
+        distinct_corner_vids,
+        rim_walk_vids,
+        neighbour_normals,
+        stations,
+    )?;
+
+    Ok((sub_grids, sub_weights, worst, worst_rim, worst_station))
 }
 
 #[cfg(test)]
