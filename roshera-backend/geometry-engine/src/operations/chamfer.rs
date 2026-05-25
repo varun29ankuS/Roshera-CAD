@@ -2778,21 +2778,15 @@ fn handle_chamfer_vertices(
                     tolerance,
                     BlendKind::Chamfer,
                 )?,
-                SeamContinuity::G1 => {
-                    // cap_edges_with_kind is non-empty by the
-                    // `degree ≥ 3` corner-set invariant; indexing
-                    // through the file-wide
-                    // `#![allow(clippy::indexing_slicing)]`.
-                    let rim_edge = cap_edges_with_kind[0].0;
-                    return Err(OperationError::BlendFailed(Box::new(
-                        BlendFailure::SeamContinuityUnreachable {
-                            residual: f64::INFINITY,
-                            tolerance: 0.0,
-                            station: 0,
-                            rim_edge,
-                        },
-                    )));
-                }
+                SeamContinuity::G1 => super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                    model,
+                    solid_id,
+                    corner.vertex_id,
+                    &cap_edges_with_kind,
+                    corner.outward,
+                    tolerance,
+                    BlendKind::Chamfer,
+                )?,
             }
         } else {
             apply_planar_chamfer_cap(

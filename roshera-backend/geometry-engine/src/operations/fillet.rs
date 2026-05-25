@@ -5269,17 +5269,15 @@ fn create_fillet_transitions(
                     Tolerance::default().distance(),
                     BlendKind::Fillet,
                 )?,
-                SeamContinuity::G1 => {
-                    let rim_edge = cap_edges_with_kind[0].0;
-                    return Err(OperationError::BlendFailed(Box::new(
-                        BlendFailure::SeamContinuityUnreachable {
-                            residual: f64::INFINITY,
-                            tolerance: 0.0,
-                            station: 0,
-                            rim_edge,
-                        },
-                    )));
-                }
+                SeamContinuity::G1 => super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                    model,
+                    solid_id,
+                    corner.id,
+                    &cap_edges_with_kind,
+                    vertex_outward,
+                    Tolerance::default().distance(),
+                    BlendKind::Fillet,
+                )?,
             };
             new_faces.push(cap_face);
             continue;
@@ -5504,17 +5502,15 @@ fn create_fillet_transitions(
                     Tolerance::default().distance(),
                     BlendKind::Fillet,
                 )?,
-                SeamContinuity::G1 => {
-                    let rim_edge = cap_edges_with_kind[0].0;
-                    return Err(OperationError::BlendFailed(Box::new(
-                        BlendFailure::SeamContinuityUnreachable {
-                            residual: f64::INFINITY,
-                            tolerance: 0.0,
-                            station: 0,
-                            rim_edge,
-                        },
-                    )));
-                }
+                SeamContinuity::G1 => super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                    model,
+                    solid_id,
+                    corner.id,
+                    &cap_edges_with_kind,
+                    vertex_outward,
+                    Tolerance::default().distance(),
+                    BlendKind::Fillet,
+                )?,
             };
             new_faces.push(cap_face);
         } else if radii_equal {
