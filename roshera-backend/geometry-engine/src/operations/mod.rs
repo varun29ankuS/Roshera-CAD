@@ -132,6 +132,11 @@ pub mod blend_surface_carrier;
 // lands in CF-β.3.4 alongside the surgery-flag extension that
 // preserves the corner vertex during the first call.
 pub mod mixed_kind_corner_cap;
+// CF-γ.2 — opt-in G1 NURBS cap synthesizer; dispatched from the
+// chamfer / fillet mixed-kind dispatcher arms when the caller
+// selects `SeamContinuity::G1`. Default `C0` routes to the
+// CF-β planar synthesizer above.
+pub mod mixed_kind_corner_cap_g1;
 
 // AI integration
 pub mod ai_operations_registry;
