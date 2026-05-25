@@ -42,6 +42,7 @@ use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+use geometry_engine::primitives::vertex::VertexId;
 use session_manager::{
     AuthConfig, AuthManager, BroadcastManager, CacheConfig, CacheManager, DatabaseConfig,
     DatabasePersistence, DatabaseType, HierarchyManager, PasswordRequirements, PermissionManager,
@@ -1096,4 +1097,329 @@ async fn fillet_empty_partial_corner_vertices_is_noop_returns_200() {
         "empty partial_corner_vertices must be a no-op; body = {body}"
     );
     assert_eq!(body["success"], true);
+}
+
+// =====================================================================
+// CF-γ.5 — `seam_continuity` wire-shape round-trip
+// =====================================================================
+//
+// Pins the public HTTP contract for the CF-γ.1
+// `SeamContinuity { C0, G1 }` opt-in across both
+// `/api/geometry/fillet` and `/api/geometry/chamfer`:
+//
+// 1. **Missing / null → C0 (legacy)**: callers that never opt in
+//    must receive byte-identical pre-CF-γ behaviour. Asserted by
+//    omitting the field entirely and expecting 200.
+// 2. **`"g1"` happy path**: on a non-mixed-corner request the G1
+//    dispatcher arm is never entered (no cap is synthesized), so
+//    G1 is a no-op — the call returns 200 just like C0 would.
+//    This pins that the parser accepts `"g1"` and threads it
+//    through `FilletOptions`/`ChamferOptions` without breaking
+//    the standard path.
+// 3. **Malformed value → 400 `invalid_parameter`**: any string
+//    other than `"c0"` / `"g1"` (case-insensitive), or any
+//    non-string value, is rejected at the parser boundary with
+//    the typed `invalid_parameter` wire shape and a message that
+//    names the field. Pins the parser contract in
+//    `parse_seam_continuity` (main.rs:1599).
+// 4. **G1 mixed-kind cap dispatch → 400 `blend_failed` with
+//    typed `SeamContinuityUnreachable` payload**: the CF-γ
+//    backout sentinel. End-to-end check that
+//    `OperationError::BlendFailed(BlendFailure::
+//    SeamContinuityUnreachable { residual, tolerance, station,
+//    rim_edge })` survives the kernel → `ApiError::blend_failed`
+//    → `Json` chain with the right `type` discriminator and
+//    numeric fields.
+
+// ---- Fillet endpoint ------------------------------------------------
+
+/// (1, fillet) — omitting `seam_continuity` must still route through
+/// the legacy C0 path and return 200. Catches an accidental
+/// requirement-flip of the field in the parser.
+#[tokio::test]
+async fn fillet_seam_continuity_omitted_routes_to_c0_default() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [rim],
+        "radius": 0.1,
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "omitted seam_continuity must default to C0 and succeed; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// (2, fillet) — `seam_continuity: "g1"` on a non-mixed-corner
+/// fillet must succeed: the G1 dispatcher arm only fires at a
+/// mixed-kind 3-corner cap, which a single-rim cylinder fillet
+/// never produces. Pins that G1 is a no-op for the common case.
+/// Also accepts uppercase (`"G1"`) per the parser's
+/// `to_ascii_lowercase` normalisation.
+#[tokio::test]
+async fn fillet_seam_continuity_g1_round_trips_through_endpoint() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [rim],
+        "radius": 0.1,
+        "seam_continuity": "g1",
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "g1 opt-in must round-trip on a non-mixed-corner fillet; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+
+    // Case-insensitive — pins the parser's lowercase normalisation.
+    // Fresh state so `find_top_rim_edge` returns the new cylinder's
+    // pristine rim, not a previously-filleted edge from `state`.
+    let state2 = make_test_state().await;
+    let (uuid2, _solid_id2, rim2) = seed_cylinder(&state2, 1.0, 1.0).await;
+    let request = fillet_post(json!({
+        "object": uuid2.to_string(),
+        "edges":  [rim2],
+        "radius": 0.1,
+        "seam_continuity": "G1",
+    }));
+    let (status, body) = dispatch(&state2, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "uppercase G1 must normalise; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// (3a, fillet) — non-string `seam_continuity` is rejected at the
+/// parser boundary with the typed `invalid_parameter` wire shape.
+#[tokio::test]
+async fn fillet_seam_continuity_non_string_returns_invalid_parameter_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [0_u64],
+        "radius": 0.1,
+        "seam_continuity": 42,
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("seam_continuity"),
+        "error must name the offending field; got {error_str:?}"
+    );
+}
+
+/// (3b, fillet) — unknown string value (neither `"c0"` nor `"g1"`)
+/// is rejected at the parser boundary.
+#[tokio::test]
+async fn fillet_seam_continuity_unknown_string_returns_invalid_parameter_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _rim) = seed_cylinder(&state, 1.0, 1.0).await;
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [0_u64],
+        "radius": 0.1,
+        "seam_continuity": "g2",
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("seam_continuity") && error_str.contains("g2"),
+        "error must name field and offending value; got {error_str:?}"
+    );
+}
+
+// ---- Chamfer endpoint (mirrors of the fillet shape) -----------------
+
+/// (1, chamfer) — omitting `seam_continuity` must default to C0.
+#[tokio::test]
+async fn chamfer_seam_continuity_omitted_routes_to_c0_default() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 4.0).await;
+
+    let request = chamfer_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0]],
+        "distance": 0.1,
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "omitted seam_continuity must default to C0 on chamfer; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// (2, chamfer) — `seam_continuity: "g1"` on a single-edge chamfer
+/// (no mixed-corner cap) must succeed.
+#[tokio::test]
+async fn chamfer_seam_continuity_g1_round_trips_through_endpoint() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 4.0).await;
+
+    let request = chamfer_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0]],
+        "distance": 0.1,
+        "seam_continuity": "g1",
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "g1 opt-in must round-trip on a single-edge chamfer; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+}
+
+/// (3, chamfer) — malformed `seam_continuity` is a 400.
+#[tokio::test]
+async fn chamfer_seam_continuity_unknown_string_returns_invalid_parameter_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _edges) = seed_box(&state, 4.0).await;
+
+    let request = chamfer_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [0_u64],
+        "distance": 0.1,
+        "seam_continuity": "smooth",
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("seam_continuity") && error_str.contains("smooth"),
+        "error must name field and offending value; got {error_str:?}"
+    );
+}
+
+// ---- Mixed-corner G1 cap dispatch → typed reject end-to-end ---------
+
+/// (4) — End-to-end CF-γ backout sentinel through the HTTP stack.
+/// Driver: seed a box, chamfer one corner-incident edge with
+/// `seam_continuity: "g1"` AND `partial_corner_vertices: [corner]`
+/// (the opt-in that keeps the corner open without synthesizing a
+/// cap), then fillet the remaining two corner-incident edges with
+/// `seam_continuity: "g1"`. The fillet call reaches the mixed-kind
+/// dispatcher's G1 arm and surfaces the typed
+/// `BlendFailure::SeamContinuityUnreachable` reject. The full chain
+/// — kernel `OperationError::BlendFailed` → `ApiError::blend_failed`
+/// → `Json` serialization → HTTP 400 — must preserve the structured
+/// payload at `details.failure.type`, with all four fields
+/// (`residual`, `tolerance`, `station`, `rim_edge`) intact.
+#[tokio::test]
+async fn fillet_g1_mixed_corner_surfaces_seam_continuity_unreachable_400() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 4.0).await;
+
+    // Find the corner vertex shared by all three edges so we can
+    // pass it as `partial_corner_vertices` on the first call.
+    let corner_vertex_id: u32 = {
+        let guard = state.model.read().await;
+        let model: &BRepModel = &guard;
+        let mut shared: Option<VertexId> = None;
+        let candidates = [edges[0], edges[1], edges[2]];
+        for (vid, _) in model.vertices.iter() {
+            let count = candidates
+                .iter()
+                .filter(|&&eid| {
+                    let edge = model
+                        .edges
+                        .get(eid)
+                        .expect("seeded edge id must resolve");
+                    edge.start_vertex == vid || edge.end_vertex == vid
+                })
+                .count();
+            if count == 3 {
+                shared = Some(vid);
+                break;
+            }
+        }
+        shared.expect("box corner shared vertex must exist for seeded 3-edge set")
+    };
+
+    // First call: chamfer edge[0] with G1 + partial-corner opt-in.
+    // Lands (no cap synthesized yet — corner stays open).
+    let first_request = chamfer_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[0]],
+        "distance": 0.5,
+        "seam_continuity": "g1",
+        "partial_corner_vertices": [corner_vertex_id],
+    }));
+    let (first_status, first_body) = dispatch(&state, first_request).await;
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "G1 + partial-corner chamfer must land; body = {first_body}"
+    );
+
+    // Second call: fillet edge[1] + edge[2] with G1. Reaches the
+    // mixed-kind dispatcher → typed reject.
+    let second_request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [edges[1], edges[2]],
+        "radius": 0.5,
+        "seam_continuity": "g1",
+    }));
+    let (status, body) = dispatch(&state, second_request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "G1 mixed-corner fillet must surface 400 blend_failed; body = {body}"
+    );
+    assert_eq!(body["error_code"], "blend_failed");
+
+    let payload = &body["details"]["failure"];
+    assert_eq!(
+        payload["type"], "SeamContinuityUnreachable",
+        "typed payload must carry the SeamContinuityUnreachable discriminator; payload = {payload}"
+    );
+    // Sentinel field contract from chamfer.rs/fillet.rs G1 arms.
+    // `residual = f64::INFINITY` serialises to JSON `null` (IEEE
+    // ±inf has no JSON representation under serde_json's default
+    // policy); accept either `null` or a numeric infinity sentinel
+    // so the test is robust to a future serde-json policy change
+    // that adopts `"+Infinity"` / `Infinity` literals.
+    let residual = &payload["residual"];
+    assert!(
+        residual.is_null()
+            || residual.as_f64().map(|x| x.is_infinite()).unwrap_or(false)
+            || residual.as_str() == Some("inf")
+            || residual.as_str() == Some("+inf"),
+        "residual must surface as null / inf sentinel; got {residual}"
+    );
+    assert_eq!(payload["tolerance"], 0.0);
+    assert_eq!(payload["station"], 0);
+    assert!(
+        payload["rim_edge"].is_number(),
+        "rim_edge must be a numeric EdgeId; got {}",
+        payload["rim_edge"]
+    );
 }
