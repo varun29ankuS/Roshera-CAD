@@ -2778,15 +2778,37 @@ fn handle_chamfer_vertices(
                     tolerance,
                     BlendKind::Chamfer,
                 )?,
-                SeamContinuity::G1 => super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
-                    model,
-                    solid_id,
-                    corner.vertex_id,
-                    &cap_edges_with_kind,
-                    corner.outward,
-                    tolerance,
-                    BlendKind::Chamfer,
-                )?,
+                SeamContinuity::G1 => {
+                    // CF-γ backout (plan §"Backout plan"): the
+                    // single-degenerate-bicubic synthesizer in
+                    // `mixed_kind_corner_cap_g1` clears the 1e-4 rad
+                    // G1 bar only for 1C2F orderings and asymmetrically
+                    // fails 2C1F — fundamental rank limit of a 4×4
+                    // control net with one collapsed apex column
+                    // against 3 rims × 5 stations × 1 normal-direction
+                    // = 15 G1 constraints. The synthesizer module
+                    // stays in tree for a follow-up reformulation
+                    // (Gregory patch or 3-sub-patch split, both
+                    // explicitly rejected by the original plan).
+                    // Until then, every G1 request surfaces the typed
+                    // `SeamContinuityUnreachable` reject so callers
+                    // see a stable contract rather than a half-working
+                    // synthesizer.
+                    //
+                    // `cap_edges_with_kind` is non-empty by the
+                    // degree-≥-3 corner-set invariant; indexed access
+                    // through the file-wide
+                    // `#![allow(clippy::indexing_slicing)]`.
+                    let rim_edge = cap_edges_with_kind[0].0;
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SeamContinuityUnreachable {
+                            residual: f64::INFINITY,
+                            tolerance: 0.0,
+                            station: 0,
+                            rim_edge,
+                        },
+                    )));
+                }
             }
         } else {
             apply_planar_chamfer_cap(

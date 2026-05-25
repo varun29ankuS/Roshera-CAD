@@ -5269,15 +5269,24 @@ fn create_fillet_transitions(
                     Tolerance::default().distance(),
                     BlendKind::Fillet,
                 )?,
-                SeamContinuity::G1 => super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
-                    model,
-                    solid_id,
-                    corner.id,
-                    &cap_edges_with_kind,
-                    vertex_outward,
-                    Tolerance::default().distance(),
-                    BlendKind::Fillet,
-                )?,
+                SeamContinuity::G1 => {
+                    // CF-γ backout (plan §"Backout plan"): see the
+                    // matching arm in chamfer.rs::handle_chamfer_vertices
+                    // for the full rationale. The G1 synthesizer
+                    // module stays in tree for a follow-up
+                    // reformulation; until then, every G1 request
+                    // surfaces the typed `SeamContinuityUnreachable`
+                    // reject.
+                    let rim_edge = cap_edges_with_kind[0].0;
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SeamContinuityUnreachable {
+                            residual: f64::INFINITY,
+                            tolerance: 0.0,
+                            station: 0,
+                            rim_edge,
+                        },
+                    )));
+                }
             };
             new_faces.push(cap_face);
             continue;
@@ -5502,15 +5511,24 @@ fn create_fillet_transitions(
                     Tolerance::default().distance(),
                     BlendKind::Fillet,
                 )?,
-                SeamContinuity::G1 => super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
-                    model,
-                    solid_id,
-                    corner.id,
-                    &cap_edges_with_kind,
-                    vertex_outward,
-                    Tolerance::default().distance(),
-                    BlendKind::Fillet,
-                )?,
+                SeamContinuity::G1 => {
+                    // CF-γ backout (plan §"Backout plan"): see the
+                    // matching arm in chamfer.rs::handle_chamfer_vertices
+                    // for the full rationale. The G1 synthesizer
+                    // module stays in tree for a follow-up
+                    // reformulation; until then, every G1 request
+                    // surfaces the typed `SeamContinuityUnreachable`
+                    // reject.
+                    let rim_edge = cap_edges_with_kind[0].0;
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::SeamContinuityUnreachable {
+                            residual: f64::INFINITY,
+                            tolerance: 0.0,
+                            station: 0,
+                            rim_edge,
+                        },
+                    )));
+                }
             };
             new_faces.push(cap_face);
         } else if radii_equal {
