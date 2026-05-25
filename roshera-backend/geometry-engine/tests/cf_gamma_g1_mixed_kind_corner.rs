@@ -1,33 +1,26 @@
-//! CF-γ.3 — G1 mixed-kind corner integration suite (post-backout).
+//! CF-γ.6.2 — G1 mixed-kind corner integration suite.
 //!
-//! CF-γ.2 landed a single-degenerate-bicubic NURBS cap synthesizer
-//! (`operations::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1`).
-//! Field testing showed that a 4×4 control net with one collapsed
-//! apex column is rank-limited against the 3 rims × K=5 stations × 1
-//! normal-direction = 15 G1 constraints it must satisfy at a mixed
-//! chamfer × fillet box corner: it clears `G1_TOLERANCE = 1e-4` rad
-//! only for some 1C2F orderings and fails 2C1F by 3–4 orders of
-//! magnitude (asymmetric across construction order).
+//! The CF-γ.2 single-degenerate-bicubic synthesizer hit a structural
+//! rank limit (4×4 control net with one collapsed apex column vs 3
+//! rims × K=5 stations × 1 normal-direction = 15 G1 constraints) and
+//! was rolled back to the typed `SeamContinuityUnreachable` sentinel.
+//! CF-γ.6 replaces it with a **3-sub-patch** topology: three bicubic
+//! NURBS sub-patches sharing a central apex vertex, each sub-patch
+//! owning one rim's G1 constraint independently. γ.6.2 ships the
+//! watertight C0 topology with planar-fairing seed CPs; γ.6.3 lifts
+//! the seed to the coupled rim-G1 + internal-C1 solver and adds the
+//! 1e-6 rad residual gate.
 //!
-//! Per the CF-γ plan §"Backout plan", the dispatcher arms in
-//! `chamfer.rs::handle_chamfer_vertices` and the two
-//! `fillet.rs::create_fillet_transitions` mirrors are reverted to
-//! the CF-γ.1 sentinel: every `SeamContinuity::G1` cap request
-//! surfaces the typed
-//! [`BlendFailure::SeamContinuityUnreachable`] reject. The
-//! synthesizer module stays in tree for a follow-up reformulation
-//! (Gregory patch or 3-sub-patch split — both explicitly rejected
-//! by the original plan, so resurrection is a planning decision,
-//! not an implementation detail).
+//! This file pins the γ.6.2 contract end-to-end:
 //!
-//! This file pins the post-backout contract end-to-end:
-//!
-//! * Each of the 4 mixed-kind topologies the kernel supports today
-//!   on a box corner (1C2F × {chamfer-first, fillet-first} and
-//!   2C1F × {chamfer-first, fillet-first}) lands the first call
-//!   under the partial-mixed opt-in and surfaces
-//!   `BlendFailure::SeamContinuityUnreachable` on the second call
-//!   (the one that would synthesize the cap).
+//! * Each of the 4 mixed-kind topologies the kernel supports on a
+//!   box corner (1C2F × {chamfer-first, fillet-first} and 2C1F ×
+//!   {chamfer-first, fillet-first}) lands both calls successfully.
+//! * The second call (the one that synthesizes the cap) creates
+//!   **exactly 3 new NURBS-backed faces** in the shell (ΔF = +3)
+//!   with `non_manifold_edge_count == 0`.
+//! * Each cap face's outer loop has exactly 3 edges (1 rim + 2
+//!   spokes meeting at the central apex).
 //! * The C0 default path is unchanged — same fixture with
 //!   `SeamContinuity::C0` (the [`Default`] impl) still produces a
 //!   `Plane`-backed N-gon cap. Catches an accidental flip of the
@@ -44,10 +37,9 @@ use blend_fixtures::*;
 use geometry_engine::operations::chamfer::{
     chamfer_edges, ChamferOptions, ChamferType, PropagationMode as ChamferProp,
 };
-use geometry_engine::operations::diagnostics::BlendFailure;
 use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
 use geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity;
-use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions, OperationError};
+use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::surface::{GeneralNurbsSurface, Plane};
 use geometry_engine::primitives::topology_builder::BRepModel;
@@ -134,39 +126,114 @@ fn corner_edges(model: &BRepModel) -> Vec<EdgeId> {
     edges
 }
 
-/// Assert that `err` is the typed
-/// [`BlendFailure::SeamContinuityUnreachable`] payload — the only
-/// shape the G1 dispatcher arms produce after the CF-γ backout.
-fn assert_seam_continuity_unreachable(err: OperationError, label: &str) {
-    match err {
-        OperationError::BlendFailed(failure) => match *failure {
-            BlendFailure::SeamContinuityUnreachable { .. } => {}
-            other => panic!(
-                "{label}: expected BlendFailure::SeamContinuityUnreachable, got {:?}",
-                other
-            ),
-        },
-        other => panic!(
-            "{label}: expected OperationError::BlendFailed, got {:?}",
-            other
-        ),
+/// Count the NURBS-backed faces in the outer shell of `solid_id`.
+/// On a box, no other operation in these fixtures produces a
+/// `GeneralNurbsSurface` (cube faces are `Plane`; fillet faces are
+/// `Cylinder`; chamfer faces are `Plane`), so this count isolates
+/// the γ.6.2 sub-patch cap faces.
+fn count_nurbs_faces_in_shell(
+    model: &BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+) -> usize {
+    let solid = model.solids.get(solid_id).expect("solid exists");
+    let shell = model
+        .shells
+        .get(solid.outer_shell)
+        .expect("outer shell exists");
+    let mut n = 0;
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid).expect("face exists");
+        let surface = model
+            .surfaces
+            .get(face.surface_id)
+            .expect("surface exists");
+        if surface
+            .as_any()
+            .downcast_ref::<GeneralNurbsSurface>()
+            .is_some()
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Collect every NURBS-backed face in the outer shell paired with
+/// its outer-loop edge count. Used by the per-face loop assertion.
+fn nurbs_faces_with_loop_edge_counts(
+    model: &BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+) -> Vec<usize> {
+    let solid = model.solids.get(solid_id).expect("solid exists");
+    let shell = model
+        .shells
+        .get(solid.outer_shell)
+        .expect("outer shell exists");
+    let mut out = Vec::new();
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid).expect("face exists");
+        let surface = model
+            .surfaces
+            .get(face.surface_id)
+            .expect("surface exists");
+        if surface
+            .as_any()
+            .downcast_ref::<GeneralNurbsSurface>()
+            .is_some()
+        {
+            let outer = model
+                .loops
+                .get(face.outer_loop)
+                .expect("NURBS cap face outer loop exists");
+            out.push(outer.edges.len());
+        }
+    }
+    out
+}
+
+/// γ.6.2 success-contract assertion. After both calls land, the
+/// shell must contain exactly 3 NURBS-backed cap faces, each with
+/// an outer loop of 3 edges (1 rim + 2 spokes meeting at the apex),
+/// and the cap must be watertight (zero non-manifold edges).
+fn assert_three_subpatch_cap(
+    model: &BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    label: &str,
+) {
+    assert_eq!(
+        non_manifold_edge_count(model, solid_id),
+        0,
+        "{label}: 3-sub-patch G1 cap must be watertight",
+    );
+    let nurbs_count = count_nurbs_faces_in_shell(model, solid_id);
+    assert_eq!(
+        nurbs_count, 3,
+        "{label}: γ.6.2 must emit exactly 3 NURBS sub-patch faces; got {nurbs_count}",
+    );
+    let loop_sizes = nurbs_faces_with_loop_edge_counts(model, solid_id);
+    for size in &loop_sizes {
+        assert_eq!(
+            *size, 3,
+            "{label}: each γ.6.2 sub-patch face must have a 3-edge outer loop \
+             (1 rim + 2 spokes); got {size}",
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Headline tests — every G1 cap request routes to the typed reject
+// Headline tests — γ.6.2: 3 NURBS sub-patch faces, watertight, no G1 gate
 // ---------------------------------------------------------------------------
 //
 // In each test the first call (chamfer or fillet) opens the corner
 // under the `partial_corner_vertices` opt-in — no cap is synthesized
-// yet because the opt-in pins the corner vertex open — so the first
-// call succeeds regardless of `seam_continuity`. The second call
-// finalizes the mixed-kind corner and is the one routed through the
-// G1 dispatcher arm; with the backout in place it surfaces the
-// typed reject.
+// yet because the opt-in pins the corner vertex open. The second
+// call finalises the mixed-kind corner; γ.6.2 routes the G1 arm
+// through `synthesize_mixed_kind_corner_cap_g1`, emitting 3
+// bicubic-NURBS sub-patches sharing a central apex vertex. γ.6.3
+// will extend each test with a rim-G1 residual assertion.
 
 #[test]
-fn g1_1c2f_chamfer_first_routes_to_seam_continuity_unreachable() {
+fn g1_1c2f_chamfer_first_emits_three_subpatch_cap() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -178,20 +245,18 @@ fn g1_1c2f_chamfer_first_routes_to_seam_continuity_unreachable() {
         chamfer_g1_opts_with_partial(D, vec![corner]),
     )
     .expect("1C2F chamfer-first: first chamfer with partial-corner opt-in succeeds");
-    let err = fillet_edges(
+    fillet_edges(
         &mut model,
         solid_id,
         vec![edges[1], edges[2]],
         fillet_g1_opts(D),
     )
-    .expect_err(
-        "1C2F chamfer-first: second fillet must route the G1 cap request to the typed reject",
-    );
-    assert_seam_continuity_unreachable(err, "1C2F chamfer-first");
+    .expect("1C2F chamfer-first: second fillet must close the corner with 3-sub-patch G1 cap");
+    assert_three_subpatch_cap(&model, solid_id, "1C2F chamfer-first");
 }
 
 #[test]
-fn g1_1c2f_fillet_first_routes_to_seam_continuity_unreachable() {
+fn g1_1c2f_fillet_first_emits_three_subpatch_cap() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -203,20 +268,18 @@ fn g1_1c2f_fillet_first_routes_to_seam_continuity_unreachable() {
         fillet_g1_opts_with_partial(D, vec![corner]),
     )
     .expect("1C2F fillet-first: first fillet with partial-corner opt-in succeeds");
-    let err = chamfer_edges(
+    chamfer_edges(
         &mut model,
         solid_id,
         vec![edges[0]],
         chamfer_g1_opts(D),
     )
-    .expect_err(
-        "1C2F fillet-first: second chamfer must route the G1 cap request to the typed reject",
-    );
-    assert_seam_continuity_unreachable(err, "1C2F fillet-first");
+    .expect("1C2F fillet-first: second chamfer must close the corner with 3-sub-patch G1 cap");
+    assert_three_subpatch_cap(&model, solid_id, "1C2F fillet-first");
 }
 
 #[test]
-fn g1_2c1f_chamfer_first_routes_to_seam_continuity_unreachable() {
+fn g1_2c1f_chamfer_first_emits_three_subpatch_cap() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -228,20 +291,18 @@ fn g1_2c1f_chamfer_first_routes_to_seam_continuity_unreachable() {
         chamfer_g1_opts_with_partial(D, vec![corner]),
     )
     .expect("2C1F chamfer-first: first chamfer (two edges) with partial-corner opt-in succeeds");
-    let err = fillet_edges(
+    fillet_edges(
         &mut model,
         solid_id,
         vec![edges[2]],
         fillet_g1_opts(D),
     )
-    .expect_err(
-        "2C1F chamfer-first: second fillet must route the G1 cap request to the typed reject",
-    );
-    assert_seam_continuity_unreachable(err, "2C1F chamfer-first");
+    .expect("2C1F chamfer-first: second fillet must close the corner with 3-sub-patch G1 cap");
+    assert_three_subpatch_cap(&model, solid_id, "2C1F chamfer-first");
 }
 
 #[test]
-fn g1_2c1f_fillet_first_routes_to_seam_continuity_unreachable() {
+fn g1_2c1f_fillet_first_emits_three_subpatch_cap() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -253,16 +314,14 @@ fn g1_2c1f_fillet_first_routes_to_seam_continuity_unreachable() {
         fillet_g1_opts_with_partial(D, vec![corner]),
     )
     .expect("2C1F fillet-first: first fillet (one edge) with partial-corner opt-in succeeds");
-    let err = chamfer_edges(
+    chamfer_edges(
         &mut model,
         solid_id,
         vec![edges[0], edges[1]],
         chamfer_g1_opts(D),
     )
-    .expect_err(
-        "2C1F fillet-first: second chamfer must route the G1 cap request to the typed reject",
-    );
-    assert_seam_continuity_unreachable(err, "2C1F fillet-first");
+    .expect("2C1F fillet-first: second chamfer must close the corner with 3-sub-patch G1 cap");
+    assert_three_subpatch_cap(&model, solid_id, "2C1F fillet-first");
 }
 
 // ---------------------------------------------------------------------------

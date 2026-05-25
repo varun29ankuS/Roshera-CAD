@@ -2741,7 +2741,7 @@ fn handle_chamfer_vertices(
             .map(|set| set.contains(BlendKind::Fillet))
             .unwrap_or(false);
 
-        let cap_face_id = if has_prior_fillet {
+        let cap_face_ids: Vec<FaceId> = if has_prior_fillet {
             let fillet_rim_arcs = super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
                 model,
                 solid_id,
@@ -2759,68 +2759,52 @@ fn handle_chamfer_vertices(
                 cap_edges_with_kind
                     .push((*arc_eid, super::mixed_kind_corner_cap::RimKind::ArcRim));
             }
-            // CF-γ.1 dispatcher: branch on caller-selected seam
+            // CF-γ.6.2 dispatcher: branch on caller-selected seam
             // continuity. `C0` keeps CF-β planar cap synthesis
-            // byte-identical (the historical path). `G1` is a sentinel
-            // until CF-γ.2 lands the degenerate-bicubic NURBS
-            // synthesizer — the kernel surfaces a typed
-            // `SeamContinuityUnreachable` reject so the api-server
-            // round-trips a structured `BlendFailed` HTTP-400 carrying
-            // the contract surface. CF-γ.2 flips this arm to the real
-            // `synthesize_mixed_kind_corner_cap_g1` call.
+            // byte-identical (the historical path, single FaceId
+            // returned as a 1-element Vec). `G1` routes through the
+            // 3-sub-patch C0 synthesizer in
+            // `synthesize_mixed_kind_corner_cap_g1` — three bicubic
+            // NURBS sub-patches sharing a central apex vertex, each
+            // sub-patch owning one rim. CF-γ.6.3 lifts the seed CPs
+            // to the coupled rim-G1 + internal-C1 solver; γ.6.2 ships
+            // the watertight topology with planar-fairing CPs so the
+            // dispatcher contract stabilises before the solver lands.
             match seam_continuity {
-                SeamContinuity::C0 => super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                    model,
-                    solid_id,
-                    corner.vertex_id,
-                    &cap_edges_with_kind,
-                    corner.outward,
-                    tolerance,
-                    BlendKind::Chamfer,
-                )?,
+                SeamContinuity::C0 => vec![
+                    super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                        model,
+                        solid_id,
+                        corner.vertex_id,
+                        &cap_edges_with_kind,
+                        corner.outward,
+                        tolerance,
+                        BlendKind::Chamfer,
+                    )?,
+                ],
                 SeamContinuity::G1 => {
-                    // CF-γ backout (plan §"Backout plan"): the
-                    // single-degenerate-bicubic synthesizer in
-                    // `mixed_kind_corner_cap_g1` clears the 1e-4 rad
-                    // G1 bar only for 1C2F orderings and asymmetrically
-                    // fails 2C1F — fundamental rank limit of a 4×4
-                    // control net with one collapsed apex column
-                    // against 3 rims × 5 stations × 1 normal-direction
-                    // = 15 G1 constraints. The synthesizer module
-                    // stays in tree for a follow-up reformulation
-                    // (Gregory patch or 3-sub-patch split, both
-                    // explicitly rejected by the original plan).
-                    // Until then, every G1 request surfaces the typed
-                    // `SeamContinuityUnreachable` reject so callers
-                    // see a stable contract rather than a half-working
-                    // synthesizer.
-                    //
-                    // `cap_edges_with_kind` is non-empty by the
-                    // degree-≥-3 corner-set invariant; indexed access
-                    // through the file-wide
-                    // `#![allow(clippy::indexing_slicing)]`.
-                    let rim_edge = cap_edges_with_kind[0].0;
-                    return Err(OperationError::BlendFailed(Box::new(
-                        BlendFailure::SeamContinuityUnreachable {
-                            residual: f64::INFINITY,
-                            tolerance: 0.0,
-                            station: 0,
-                            rim_edge,
-                        },
-                    )));
+                    super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                        model,
+                        solid_id,
+                        corner.vertex_id,
+                        &cap_edges_with_kind,
+                        corner.outward,
+                        tolerance,
+                        BlendKind::Chamfer,
+                    )?
                 }
             }
         } else {
-            apply_planar_chamfer_cap(
+            vec![apply_planar_chamfer_cap(
                 model,
                 solid_id,
                 corner.vertex_id,
                 &cap_edges_at_vertex,
                 corner.outward,
                 tolerance,
-            )?
+            )?]
         };
-        cap_faces.push(cap_face_id);
+        cap_faces.extend(cap_face_ids);
     }
     Ok(cap_faces)
 }
