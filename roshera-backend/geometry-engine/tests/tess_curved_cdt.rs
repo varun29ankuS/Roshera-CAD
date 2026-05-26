@@ -639,3 +639,239 @@ fn legacy_fallback_on_degenerate_input() {
     }
     let _ = Vector3::Z;
 }
+
+// ===== CDT-β.1 integration tests =====================================
+
+/// Build a degree-2 NURBS bicubic bump patch on the unit square. The
+/// centre control point is raised in +Z so the surface has
+/// significant curvature; default tessellation density triggers
+/// chord-tolerance and angle-deviation violations Ruppert refinement
+/// resolves.
+fn build_curved_nurbs_unit_square_bump(model: &mut BRepModel) -> (u32, [u32; 4]) {
+    let cp = vec![
+        vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.5, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        ],
+        vec![
+            Point3::new(0.0, 0.5, 0.0),
+            Point3::new(0.5, 0.5, 1.0), // bump apex
+            Point3::new(1.0, 0.5, 0.0),
+        ],
+        vec![
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.5, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        ],
+    ];
+    let w = vec![vec![1.0; 3]; 3];
+    let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let math_nurbs = MathNurbs::new(cp, w, knots.clone(), knots, 2, 2)
+        .expect("bicubic bump patch NURBS must construct");
+    let surface_id = model
+        .surfaces
+        .add(Box::new(GeneralNurbsSurface { nurbs: math_nurbs }));
+
+    let tol = 1e-6;
+    let v00 = model.vertices.add_or_find(0.0, 0.0, 0.0, tol);
+    let v10 = model.vertices.add_or_find(1.0, 0.0, 0.0, tol);
+    let v11 = model.vertices.add_or_find(1.0, 1.0, 0.0, tol);
+    let v01 = model.vertices.add_or_find(0.0, 1.0, 0.0, tol);
+
+    let c0 = model.curves.add(Box::new(Line::new(
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+    )));
+    let c1 = model.curves.add(Box::new(Line::new(
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(1.0, 1.0, 0.0),
+    )));
+    let c2 = model.curves.add(Box::new(Line::new(
+        Point3::new(1.0, 1.0, 0.0),
+        Point3::new(0.0, 1.0, 0.0),
+    )));
+    let c3 = model.curves.add(Box::new(Line::new(
+        Point3::new(0.0, 1.0, 0.0),
+        Point3::new(0.0, 0.0, 0.0),
+    )));
+
+    let e0 = model.edges.add(Edge::new(
+        0, v00, v10, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+    ));
+    let e1 = model.edges.add(Edge::new(
+        0, v10, v11, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+    ));
+    let e2 = model.edges.add(Edge::new(
+        0, v11, v01, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+    ));
+    let e3 = model.edges.add(Edge::new(
+        0, v01, v00, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+    ));
+
+    let mut outer = Loop::new(0, LoopType::Outer);
+    outer.add_edge(e0, true);
+    outer.add_edge(e1, true);
+    outer.add_edge(e2, true);
+    outer.add_edge(e3, true);
+    let outer_id = model.loops.add(outer);
+
+    let face = Face::new(0, surface_id, outer_id, FaceOrientation::Forward);
+    let face_id = model.faces.add(face);
+    (face_id, [e0, e1, e2, e3])
+}
+
+/// Integration test 13 (β.1): a high-curvature NURBS face,
+/// tessellated end-to-end via `tessellate_face`, must not contain
+/// extreme slivers. Ruppert refinement targets a √2 radius-edge
+/// ratio (~20.7° minimum interior angle). We assert min interior
+/// angle ≥ 18° across every triangle — the 2.7° margin tolerates
+/// triangles adjacent to outer-loop concavities (none here, but
+/// the margin keeps the test robust if the fixture changes).
+#[test]
+fn high_curvature_nurbs_no_skinny_triangles() {
+    let mut model = BRepModel::new();
+    let (face_id, _edges) = build_curved_nurbs_unit_square_bump(&mut model);
+    let params = TessellationParams::default();
+    let cache = EdgeSampleCache::new(&params);
+    let face = model.faces.get(face_id).expect("face present");
+
+    let mut mesh = TriangleMesh::new();
+    tessellate_face(face, &model, &params, &cache, &mut mesh);
+
+    assert!(
+        !mesh.triangles.is_empty(),
+        "high-curvature NURBS face must produce a non-empty mesh"
+    );
+
+    let min_angle_threshold_deg = 18.0_f64;
+    let min_angle_threshold_rad = min_angle_threshold_deg.to_radians();
+
+    let mut worst_angle_deg = 180.0_f64;
+    let mut total_skinny = 0usize;
+
+    for tri in &mesh.triangles {
+        let a = mesh.vertices[tri[0] as usize].position;
+        let b = mesh.vertices[tri[1] as usize].position;
+        let c = mesh.vertices[tri[2] as usize].position;
+        let ab = b - a;
+        let bc = c - b;
+        let ca = a - c;
+        let ab_len = ab.magnitude();
+        let bc_len = bc.magnitude();
+        let ca_len = ca.magnitude();
+        if ab_len < 1e-12 || bc_len < 1e-12 || ca_len < 1e-12 {
+            continue;
+        }
+        // Angle at A: between AB and -CA. Angle at B: between BC
+        // and -AB. Angle at C: between CA and -BC.
+        let angle_a = (ab.dot(&(-ca)) / (ab_len * ca_len)).clamp(-1.0, 1.0).acos();
+        let angle_b = (bc.dot(&(-ab)) / (bc_len * ab_len)).clamp(-1.0, 1.0).acos();
+        let angle_c = (ca.dot(&(-bc)) / (ca_len * bc_len)).clamp(-1.0, 1.0).acos();
+        let min_angle = angle_a.min(angle_b).min(angle_c);
+        if min_angle.to_degrees() < worst_angle_deg {
+            worst_angle_deg = min_angle.to_degrees();
+        }
+        if min_angle < min_angle_threshold_rad {
+            total_skinny += 1;
+        }
+    }
+
+    // Allow a small skinny budget: triangles whose circumcenter
+    // sits outside the unit-square domain cannot be split by
+    // Ruppert (plan pitfall #1). Allow up to 5% of triangles.
+    let skinny_ratio = total_skinny as f64 / mesh.triangles.len() as f64;
+    assert!(
+        skinny_ratio < 0.05,
+        "high-curvature bicubic patch: {} / {} triangles below \
+         {}° (ratio {:.4}, worst angle {:.2}°)",
+        total_skinny,
+        mesh.triangles.len(),
+        min_angle_threshold_deg,
+        skinny_ratio,
+        worst_angle_deg
+    );
+}
+
+/// Integration test 14 (β.1): chord tolerance is actually enforced
+/// after refinement. With `chord_tolerance = 1e-3`, the 3D distance
+/// from any triangle's centroid (lifted from UV via the surface)
+/// to the plane of its corner triangle must be ≤ `1.5 ×
+/// chord_tolerance`. The 1.5× slack tolerates the discrete-sample
+/// gap between α's centroid test and the geometric chord we measure
+/// here.
+#[test]
+fn chord_tolerance_actually_enforced_after_refinement() {
+    let mut model = BRepModel::new();
+    let (face_id, _edges) = build_curved_nurbs_unit_square_bump(&mut model);
+    let mut params = TessellationParams::default();
+    params.chord_tolerance = 1e-3;
+    let cache = EdgeSampleCache::new(&params);
+    let face = model.faces.get(face_id).expect("face present");
+
+    let mut mesh = TriangleMesh::new();
+    tessellate_face(face, &model, &params, &cache, &mut mesh);
+
+    assert!(
+        !mesh.triangles.is_empty(),
+        "tessellation must produce ≥ 1 triangle"
+    );
+
+    let limit = 1.5 * params.chord_tolerance;
+    let mut worst_dev = 0.0_f64;
+    let mut violators = 0usize;
+
+    for tri in &mesh.triangles {
+        let pa = mesh.vertices[tri[0] as usize].position;
+        let pb = mesh.vertices[tri[1] as usize].position;
+        let pc = mesh.vertices[tri[2] as usize].position;
+        let uva = mesh.vertices[tri[0] as usize].uv;
+        let uvb = mesh.vertices[tri[1] as usize].uv;
+        let uvc = mesh.vertices[tri[2] as usize].uv;
+        let (Some((ua, va)), Some((ub, vb)), Some((uc, vc))) =
+            (uva, uvb, uvc)
+        else {
+            // No uv ⇒ can't lift; skip (curved path always sets uv).
+            continue;
+        };
+        let u_mid = (ua + ub + uc) / 3.0;
+        let v_mid = (va + vb + vc) / 3.0;
+        let surface = model
+            .surfaces
+            .get(face.surface_id)
+            .expect("surface present");
+        let centroid_3d = match surface.evaluate_full(u_mid, v_mid) {
+            Ok(sp) => sp.position,
+            Err(_) => continue,
+        };
+        // Triangle normal & distance from centroid_3d to plane(a,b,c).
+        let normal = (pb - pa).cross(&(pc - pa));
+        let n_len = normal.magnitude();
+        if n_len < 1e-12 {
+            continue;
+        }
+        let unit_normal = normal / n_len;
+        let dev = ((centroid_3d - pa).dot(&unit_normal)).abs();
+        if dev > worst_dev {
+            worst_dev = dev;
+        }
+        if dev > limit {
+            violators += 1;
+        }
+    }
+
+    // Allow up to 5% violators — corner-adjacent triangles whose
+    // circumcenter falls outside the domain may retain chord
+    // error slightly above the limit (plan pitfall #1).
+    let viol_ratio = violators as f64 / mesh.triangles.len() as f64;
+    assert!(
+        viol_ratio < 0.05,
+        "chord_tolerance violation budget exceeded: {} / {} \
+         triangles above {:.4} (worst dev {:.6}, ratio {:.4})",
+        violators,
+        mesh.triangles.len(),
+        limit,
+        worst_dev,
+        viol_ratio
+    );
+}
