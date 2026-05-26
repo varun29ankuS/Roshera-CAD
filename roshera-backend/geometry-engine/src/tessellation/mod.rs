@@ -5,6 +5,7 @@
 pub mod adaptive;
 pub mod cache;
 pub mod curve;
+pub(crate) mod curved_cdt;
 pub mod edge_cache;
 pub mod mesh;
 pub mod parallel;

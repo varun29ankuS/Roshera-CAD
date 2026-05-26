@@ -187,6 +187,30 @@ pub fn tessellate_face(
             {
                 tessellate_planar_face(face, model, params, cache, mesh);
             } else {
+                // CDT-α primary path; legacy quadtree as fallback. The
+                // fallback fires on degenerate input (zero-area UV
+                // bbox, projection failures), on `cdt` crate rejection
+                // of self-intersecting projected polygons, and on any
+                // surface type whose `closest_point` cannot recover a
+                // useful UV inverse for boundary samples.
+                match super::curved_cdt::tessellate_curved_cdt(
+                    surface, face, model, params, cache, mesh,
+                ) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                            eprintln!(
+                                "[tess] curved_cdt fallback (face={:?}): {:?}",
+                                face.id, e
+                            );
+                        }
+                        tracing::warn!(
+                            "curved_cdt fallback for face {:?}: {:?}",
+                            face.id,
+                            e
+                        );
+                    }
+                }
                 tessellate_curved_adaptive(
                     surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
                 );
@@ -1464,10 +1488,30 @@ fn tessellate_nurbs_face(
     // Get parameter bounds for the face
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
-    // For NURBS surfaces, we need adaptive tessellation based on curvature.
-    // The adaptive path is generic over `&dyn Surface` — it's also used
-    // for any other curved generic surface (see the `_ =>` arm in
-    // `tessellate_face`).
+    // For NURBS surfaces, we route through the CDT-α path first; on
+    // any failure (degenerate trim loop, `cdt` crate rejection, etc.)
+    // we fall through to the legacy curvature-adaptive quadtree.
+    // The adaptive path is generic over `&dyn Surface` — it's also
+    // used for any other curved generic surface (see the `_ =>` arm
+    // in `tessellate_face`).
+    match super::curved_cdt::tessellate_curved_cdt(
+        surface, face, model, params, cache, mesh,
+    ) {
+        Ok(()) => return,
+        Err(e) => {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[tess] curved_cdt fallback (face={:?}): {:?}",
+                    face.id, e
+                );
+            }
+            tracing::warn!(
+                "curved_cdt fallback for face {:?}: {:?}",
+                face.id,
+                e
+            );
+        }
+    }
     tessellate_curved_adaptive(
         surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
     );
@@ -2170,7 +2214,7 @@ fn project_loop_uv_unwrapped(
 /// Used by the degenerate-loop fallback in `is_point_inside_loop` to
 /// detect seam-only outer loops (sphere) whose unwrapped projection
 /// still collapses onto a single line in parameter space.
-fn polygon_signed_area_uv(polygon: &[(f64, f64)]) -> f64 {
+pub(crate) fn polygon_signed_area_uv(polygon: &[(f64, f64)]) -> f64 {
     let n = polygon.len();
     if n < 3 {
         return 0.0;
@@ -2185,7 +2229,7 @@ fn polygon_signed_area_uv(polygon: &[(f64, f64)]) -> f64 {
 }
 
 /// Calculate winding number for point-in-polygon test
-fn calculate_winding_number(point: &(f64, f64), polygon: &[(f64, f64)]) -> f64 {
+pub(crate) fn calculate_winding_number(point: &(f64, f64), polygon: &[(f64, f64)]) -> f64 {
     let mut winding_number = 0.0;
     let n = polygon.len();
 
