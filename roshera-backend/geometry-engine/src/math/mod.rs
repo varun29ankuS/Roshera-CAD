@@ -50,6 +50,10 @@ pub mod surface_plane_intersection;
 
 // Bracket-and-bisect root finding (Newton fallback for 1-D parameter searches)
 pub mod bisection;
+
+// 2D circumcircle / encroachment / radius-edge predicates for the
+// constrained-Delaunay refinement pipeline (tessellation::curved_cdt).
+pub mod circumcircle;
 use crate::math::constants::DEG_TO_RAD;
 use crate::math::constants::RAD_TO_DEG;
 
