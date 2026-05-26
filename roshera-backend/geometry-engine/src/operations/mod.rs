@@ -137,6 +137,12 @@ pub mod mixed_kind_corner_cap;
 // selects `SeamContinuity::G1`. Default `C0` routes to the
 // CF-β planar synthesizer above.
 pub mod mixed_kind_corner_cap_g1;
+// CF-γ — verify-only audit of face-adjacent seam continuity between
+// chamfer-face and fillet-face at mixed-kind corners. Pure
+// inspection (no geometry mutation); reports per-corner angular
+// residuals so callers can either log them or escalate via
+// `BlendFailure::MixedKindSeamResidualExceeded`.
+pub mod mixed_kind_seam_audit;
 
 // AI integration
 pub mod ai_operations_registry;
