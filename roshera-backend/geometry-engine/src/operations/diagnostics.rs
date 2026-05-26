@@ -60,6 +60,7 @@
 use super::blend_graph::BlendVertexKind;
 use super::OperationError;
 use crate::primitives::edge::EdgeId;
+use crate::primitives::face::FaceId;
 use crate::primitives::vertex::VertexId;
 
 // CF-β re-export so the mixed-kind reason variant + wire shape both
@@ -403,6 +404,38 @@ pub enum BlendFailure {
         /// Cap-rim edge whose tangent-plane match failed.
         rim_edge: EdgeId,
     },
+    /// CF-γ — the chamfer-face / fillet-face angular normal residual
+    /// at a mixed-kind corner vertex exceeded the requested
+    /// tolerance. Reported only when callers opt into strict G1
+    /// enforcement via
+    /// [`crate::operations::mixed_kind_seam_audit::assert_mixed_kind_seam_continuity_within`];
+    /// the kernel itself never raises this unsolicited — CF-γ.6
+    /// has its own per-rim
+    /// [`SeamContinuityUnreachable`][Self::SeamContinuityUnreachable]
+    /// gate; this variant measures the *per-rim* trim↔cap residual
+    /// the audit observes at the shared rim edge between a chamfer
+    /// or fillet trim face and the corner cap face.
+    ///
+    /// `residual = acos(|n_trim · n_cap|.clamp(0, 1))` in radians;
+    /// `tolerance` is the angular bar the audit compared against
+    /// (typically `Tolerance::angle()`).
+    MixedKindSeamResidualExceeded {
+        /// Mixed-kind corner vertex (registry id) the cap was
+        /// synthesised at.
+        vertex: VertexId,
+        /// Chamfer- or fillet- trim face whose normal participates
+        /// in the residual.
+        blend_face: FaceId,
+        /// Cap face whose normal participates in the residual.
+        cap_face: FaceId,
+        /// Which rim this residual was sampled on (chamfer-to-cap
+        /// or cap-to-fillet).
+        seam_kind: crate::operations::mixed_kind_seam_audit::MixedKindSeamKind,
+        /// Angular residual in radians.
+        residual: f64,
+        /// Angular tolerance the residual was compared against (radians).
+        tolerance: f64,
+    },
     /// Catch-all for irreducible failures not yet classified. The
     /// `detail` string is freeform; treat occurrences as a TODO to
     /// replace with a structured variant once the failure mode is
@@ -497,6 +530,18 @@ impl std::fmt::Display for BlendFailure {
                 "G1 seam-continuity unreachable at rim edge {} station {} (angular residual {} > tolerance {})",
                 rim_edge, station, residual, tolerance
             ),
+            BlendFailure::MixedKindSeamResidualExceeded {
+                vertex,
+                blend_face,
+                cap_face,
+                seam_kind,
+                residual,
+                tolerance,
+            } => write!(
+                f,
+                "mixed-kind {} seam residual at vertex {} between trim face {} and cap face {} exceeded tolerance (residual {} > {})",
+                seam_kind, vertex, blend_face, cap_face, residual, tolerance
+            ),
             BlendFailure::TopologyViolation { detail } => {
                 write!(f, "topology violation: {}", detail)
             }
@@ -544,6 +589,16 @@ impl From<BlendFailure> for OperationError {
             // `BlendFailed` variant rather than the legacy
             // stringly-typed `InvalidGeometry` bucket.
             BlendFailure::SeamContinuityUnreachable { .. } => {
+                OperationError::BlendFailed(Box::new(failure))
+            }
+            // CF-γ: MixedKindSeamResidualExceeded carries the
+            // typed audit payload (chamfer face, fillet face,
+            // vertex, residual, tolerance) so callers can
+            // localise the kink in the viewport and decide
+            // whether to retry with a tighter G1 cap. Route to
+            // BlendFailed for the same reason
+            // SeamContinuityUnreachable does.
+            BlendFailure::MixedKindSeamResidualExceeded { .. } => {
                 OperationError::BlendFailed(Box::new(failure))
             }
             BlendFailure::RadiusExceedsCurvature { .. }
@@ -1033,6 +1088,97 @@ mod tests {
         );
         assert_eq!(json.get("station").and_then(|v| v.as_u64()), Some(3));
         assert_eq!(json.get("rim_edge").and_then(|v| v.as_u64()), Some(17));
+        let back: BlendFailure = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(failure, back);
+    }
+
+    // ----------------------------------------------------------------
+    // CF-γ — pin the new `MixedKindSeamResidualExceeded` variant. The
+    // variant routes through `OperationError::BlendFailed` so the
+    // audit's typed cross-rim residual payload reaches frontend
+    // diagnostics + agents without string-parsing.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn mixed_kind_seam_residual_exceeded_maps_to_blend_failed_and_preserves_payload() {
+        let failure = BlendFailure::MixedKindSeamResidualExceeded {
+            vertex: 11,
+            blend_face: 22,
+            cap_face: 44,
+            seam_kind:
+                crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap,
+            residual: 0.01,
+            tolerance: 1.0e-6,
+        };
+        let err: OperationError = failure.clone().into();
+        match err {
+            OperationError::BlendFailed(boxed) => match *boxed {
+                BlendFailure::MixedKindSeamResidualExceeded {
+                    vertex,
+                    blend_face,
+                    cap_face,
+                    seam_kind,
+                    residual,
+                    tolerance,
+                } => {
+                    assert_eq!(vertex, 11);
+                    assert_eq!(blend_face, 22);
+                    assert_eq!(cap_face, 44);
+                    assert_eq!(
+                        seam_kind,
+                        crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap
+                    );
+                    assert_eq!(residual, 0.01);
+                    assert_eq!(tolerance, 1.0e-6);
+                }
+                other => panic!("expected MixedKindSeamResidualExceeded, got {:?}", other),
+            },
+            other => panic!("expected BlendFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mixed_kind_seam_residual_exceeded_display_carries_vertex_and_face_ids() {
+        let rendered = BlendFailure::MixedKindSeamResidualExceeded {
+            vertex: 11,
+            blend_face: 22,
+            cap_face: 44,
+            seam_kind:
+                crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::CapToFillet,
+            residual: 0.01,
+            tolerance: 1.0e-6,
+        }
+        .to_string();
+        assert!(rendered.contains("vertex 11"));
+        assert!(rendered.contains("trim face 22"));
+        assert!(rendered.contains("cap face 44"));
+        assert!(rendered.contains("cap-to-fillet"));
+        assert!(rendered.contains("mixed-kind"));
+    }
+
+    #[test]
+    fn mixed_kind_seam_residual_exceeded_serde_round_trip_internally_tagged() {
+        let failure = BlendFailure::MixedKindSeamResidualExceeded {
+            vertex: 11,
+            blend_face: 22,
+            cap_face: 44,
+            seam_kind:
+                crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap,
+            residual: 0.01,
+            tolerance: 1.0e-6,
+        };
+        let json = serde_json::to_value(&failure).expect("serialize");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("MixedKindSeamResidualExceeded")
+        );
+        assert_eq!(json.get("vertex").and_then(|v| v.as_u64()), Some(11));
+        assert_eq!(json.get("blend_face").and_then(|v| v.as_u64()), Some(22));
+        assert_eq!(json.get("cap_face").and_then(|v| v.as_u64()), Some(44));
+        assert_eq!(
+            json.get("seam_kind").and_then(|v| v.as_str()),
+            Some("ChamferToCap")
+        );
         let back: BlendFailure = serde_json::from_value(json).expect("deserialize");
         assert_eq!(failure, back);
     }

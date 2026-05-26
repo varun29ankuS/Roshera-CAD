@@ -667,6 +667,17 @@ impl Solid {
         self.blended_vertices.get(&vertex).copied()
     }
 
+    /// CF-γ — iterate every recorded `(vertex, kind set)` pair on this
+    /// solid. Used by the read-only seam-continuity audit
+    /// ([`crate::operations::mixed_kind_seam_audit`]) to enumerate
+    /// blended vertices without forcing callers to clone the
+    /// underlying map. Order is unspecified (`HashMap` iteration).
+    pub fn blended_vertices_iter(
+        &self,
+    ) -> impl Iterator<Item = (VertexId, VertexBlendKindSet)> + '_ {
+        self.blended_vertices.iter().map(|(&v, &set)| (v, set))
+    }
+
     /// CF-β.3 — record that the newly-emitted blend face `face` is of
     /// kind `kind`. Called by `chamfer::chamfer_edges` once per
     /// chamfer trim face (and once per planar cap face) and by
