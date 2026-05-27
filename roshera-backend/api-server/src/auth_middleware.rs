@@ -54,10 +54,33 @@ fn dev_mode_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true when the api-server should enforce a valid
+/// Authorization header on `/api/*` requests (AUDIT-C7). Gated by
+/// `ROSHERA_REQUIRE_AUTH=1`. When unset, the middleware logs missing
+/// auth as a `tracing::warn!` but passes the request through with an
+/// anonymous `AuthInfo` so existing development frontends that do not
+/// yet emit Authorization headers continue to function. Set in
+/// production deployments.
+fn require_auth_enabled() -> bool {
+    std::env::var("ROSHERA_REQUIRE_AUTH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Build a permissive AuthInfo for dev-mode requests. Every permission
 /// is granted; user_id is a stable sentinel so audit logs are still
 /// distinguishable from real users.
+///
+/// AUDIT-C7: every invocation emits a loud audit log so an operator
+/// running with `ROSHERA_DEV_BRIDGE=1` in production gets an unmissable
+/// signal in the journal. The fallback only fires when the env-var is
+/// explicitly set — never in default deployment.
 fn dev_auth_info() -> AuthInfo {
+    tracing::warn!(
+        target: "api_server.auth.dev_bridge",
+        "ROSHERA_DEV_BRIDGE active — granting full permissions without \
+         credential check. NEVER set this in production deployments."
+    );
     AuthInfo {
         user_id: "dev-bridge".to_string(),
         session_id: Some("dev-session".to_string()),
@@ -72,6 +95,32 @@ fn dev_auth_info() -> AuthInfo {
         roles: vec!["dev".to_string()],
         is_api_key: false,
     }
+}
+
+/// Build an anonymous AuthInfo for un-credentialed requests when
+/// `ROSHERA_REQUIRE_AUTH` is not set. No permissions are granted; the
+/// `is_api_key: false` flag combined with an empty permission list
+/// keeps `require_permission` failing closed on any protected handler.
+/// This is the transitional state — the audit recommends flipping
+/// `ROSHERA_REQUIRE_AUTH=1` and removing this path once every client
+/// emits Authorization headers (tracked under AUDIT-H7).
+fn anonymous_auth_info() -> AuthInfo {
+    AuthInfo {
+        user_id: "anonymous".to_string(),
+        session_id: None,
+        permissions: Vec::new(),
+        roles: Vec::new(),
+        is_api_key: false,
+    }
+}
+
+/// Returns true when `auth_middleware` should skip authentication for
+/// this path: liveness probes, the root handler, and the WebSocket
+/// upgrade. The WS path enforces auth in-band via
+/// `ClientMessage::Authenticate` (AUDIT-C2), not via a request header,
+/// so a `.layer()` would incorrectly 401 the upgrade handshake.
+fn path_is_exempt(path: &str) -> bool {
+    path == "/" || path == "/health" || path.starts_with("/ws")
 }
 
 /// Tower middleware that injects a permissive `AuthInfo` extension on
@@ -89,51 +138,146 @@ pub async fn dev_auth_layer(mut request: Request, next: Next) -> Response {
 
 /// Authentication middleware that validates JWT tokens or API keys.
 ///
-/// In dev mode (`ROSHERA_DEV_BRIDGE=1`) the middleware injects a
-/// permissive `AuthInfo` and skips header validation so the toolbar /
-/// debug bridge can drive the kernel without a real session.
+/// Layered globally onto the router (AUDIT-C7). Path-based exemptions
+/// (`path_is_exempt`) skip `/`, `/health`, and `/ws*` — the WebSocket
+/// upgrade has its own in-band `Authenticate` handler (AUDIT-C2) and a
+/// header-based 401 would break the handshake before the client can
+/// present its token.
+///
+/// Modes:
+///
+/// * `ROSHERA_DEV_BRIDGE=1` — inject a permissive dev `AuthInfo` and
+///   skip header validation. Loud audit log on every use (see
+///   `dev_auth_info`).
+/// * `ROSHERA_REQUIRE_AUTH=1` — strict mode. A missing or malformed
+///   Authorization header returns 401 immediately. JWT and API-key
+///   validation failures also return 401.
+/// * Neither set (default) — soft mode for the transitional period:
+///   a missing header is logged as `tracing::warn!` once per request,
+///   and the request proceeds with an anonymous `AuthInfo`. Protected
+///   handlers fail closed because the anonymous identity holds no
+///   permissions. This default keeps existing dev frontends working
+///   while making missing auth observable in the journal.
 pub async fn auth_middleware(
     State(auth_manager): State<Arc<AuthManager>>,
     mut request: Request,
     next: Next,
-) -> Result<Response, AuthError> {
-    if dev_mode_enabled() {
-        request.extensions_mut().insert(dev_auth_info());
-        return Ok(next.run(request).await);
+) -> Response {
+    match auth_middleware_inner(auth_manager, &mut request).await {
+        Ok(()) => next.run(request).await,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Internal helper that performs the credential check and mutates the
+/// request's extensions, returning `Ok(())` if the request should
+/// proceed (with `AuthInfo` injected) or `Err(AuthError)` if it should
+/// be rejected at the middleware boundary. Split out so the outer
+/// `auth_middleware` returns plain `Response` — axum's
+/// `from_fn_with_state` requires the middleware future's output to be
+/// `IntoResponse`, and a `Result<…, AuthError>` falls foul of the
+/// `FromFn` extractor-tuple resolver in axum 0.8 when mixed with the
+/// `State` extractor.
+async fn auth_middleware_inner(
+    auth_manager: Arc<AuthManager>,
+    request: &mut Request,
+) -> Result<(), AuthError> {
+    // Exempt the public surface (health checks, WS upgrade, root).
+    if path_is_exempt(request.uri().path()) {
+        return Ok(());
     }
 
-    // Extract authorization header
-    let auth_header = request
+    if dev_mode_enabled() {
+        request.extensions_mut().insert(dev_auth_info());
+        return Ok(());
+    }
+
+    let strict = require_auth_enabled();
+
+    // Extract authorization header. In strict mode a missing header is
+    // a 401; in soft mode we log + proceed with an anonymous AuthInfo.
+    let auth_header_opt = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| AuthError {
-            error: "Missing authorization header".to_string(),
-            code: "AUTH_MISSING".to_string(),
-            status: 401,
-        })?;
+        .map(|s| s.to_string());
+
+    let auth_header = match auth_header_opt {
+        Some(h) => h,
+        None => {
+            if strict {
+                return Err(AuthError {
+                    error: "Missing authorization header".to_string(),
+                    code: "AUTH_MISSING".to_string(),
+                    status: 401,
+                });
+            }
+            tracing::warn!(
+                target: "api_server.auth.missing",
+                "Request to {} has no Authorization header; \
+                 proceeding as anonymous (set ROSHERA_REQUIRE_AUTH=1 \
+                 to reject)",
+                request.uri().path()
+            );
+            request.extensions_mut().insert(anonymous_auth_info());
+            return Ok(());
+        }
+    };
 
     // Parse authorization header
-    let auth_info = if auth_header.starts_with("Bearer ") {
+    let auth_info = if let Some(token) = auth_header.strip_prefix("Bearer ") {
         // JWT token authentication
-        let token = &auth_header[7..];
-        validate_jwt(auth_manager.as_ref(), token).await?
-    } else if auth_header.starts_with("ApiKey ") {
+        match validate_jwt(auth_manager.as_ref(), token).await {
+            Ok(info) => info,
+            Err(e) => {
+                if strict {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    target: "api_server.auth.invalid",
+                    "JWT validation failed in soft mode; proceeding as \
+                     anonymous: {}",
+                    e.error
+                );
+                anonymous_auth_info()
+            }
+        }
+    } else if let Some(api_key) = auth_header.strip_prefix("ApiKey ") {
         // API key authentication
-        let api_key = &auth_header[7..];
-        validate_api_key(auth_manager.as_ref(), api_key).await?
-    } else {
+        match validate_api_key(auth_manager.as_ref(), api_key).await {
+            Ok(info) => info,
+            Err(e) => {
+                if strict {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    target: "api_server.auth.invalid",
+                    "API-key validation failed in soft mode; proceeding \
+                     as anonymous: {}",
+                    e.error
+                );
+                anonymous_auth_info()
+            }
+        }
+    } else if strict {
         return Err(AuthError {
             error: "Invalid authorization format".to_string(),
             code: "AUTH_INVALID_FORMAT".to_string(),
             status: 401,
         });
+    } else {
+        tracing::warn!(
+            target: "api_server.auth.invalid",
+            "Authorization header format unrecognised in soft mode; \
+             proceeding as anonymous"
+        );
+        anonymous_auth_info()
     };
 
     // Insert auth info into request extensions
     request.extensions_mut().insert(auth_info);
 
-    Ok(next.run(request).await)
+    Ok(())
 }
 
 /// Permission-checking middleware

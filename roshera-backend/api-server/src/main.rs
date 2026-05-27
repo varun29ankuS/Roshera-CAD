@@ -6233,15 +6233,30 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // when its state is its own.
     let idempotency_store = Arc::new(idempotency::IdempotencyStore::new());
 
-    // Add state, idempotency, and CORS. axum applies layers from
+    // AUDIT-C7: wire the canonical `auth_middleware` as a global
+    // layer. The middleware exempts `/`, `/health`, and `/ws*`
+    // internally (WS uses an in-band Authenticate handler per
+    // AUDIT-C2). Strict enforcement is gated by `ROSHERA_REQUIRE_AUTH`;
+    // when unset, missing / invalid credentials log a warn and the
+    // request proceeds as anonymous. See `auth_middleware.rs` for the
+    // mode matrix.
+    let auth_manager_arc = state.session_manager.auth_manager_arc();
+
+    // Add state, idempotency, auth, and CORS. axum applies layers from
     // innermost outward, so CORS sees every request first (including
-    // preflight OPTIONS, which the idempotency layer would otherwise
-    // pass through trivially), then idempotency intercepts mutating
-    // verbs, then the inner router dispatches to the handler.
+    // preflight OPTIONS, which auth + idempotency would otherwise
+    // pass through trivially), then `auth_middleware` enforces
+    // credentials (or, in soft mode, injects an anonymous AuthInfo),
+    // then idempotency intercepts mutating verbs, then the inner
+    // router dispatches to the handler.
     app.with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_manager_arc,
+            auth_middleware::auth_middleware,
         ))
         .layer(build_cors_layer())
 }
