@@ -69,6 +69,13 @@ impl SessionManager {
         &self.auth_manager
     }
 
+    /// Clone the shared `Arc<AuthManager>` for use by long-lived
+    /// extractors and middleware layers that need owned, `'static`
+    /// access (e.g. `axum::middleware::from_fn_with_state`).
+    pub fn auth_manager_arc(&self) -> std::sync::Arc<crate::auth::AuthManager> {
+        self.auth_manager.clone()
+    }
+
     /// Get permission manager for permission operations
     pub fn permission_manager(&self) -> &crate::permissions::PermissionManager {
         &self.permission_manager
