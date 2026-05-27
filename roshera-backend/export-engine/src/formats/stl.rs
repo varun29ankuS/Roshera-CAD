@@ -4,8 +4,16 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use shared_types::*;
 use std::io::Write;
 
+use crate::formats::validate_mesh_for_export;
+
 /// Generate binary STL content
 pub fn generate_binary_stl(mesh: &Mesh, name: &str) -> Result<Vec<u8>, ExportError> {
+    // AUDIT-H12: Validate mesh shape + size bounds before allocating /
+    // iterating. Catches non-multiple-of-3 vertex or index arrays,
+    // out-of-bounds indices, and oversized meshes as typed errors
+    // instead of letting them surface as in-loop panics.
+    let triangle_count_usize = validate_mesh_for_export(mesh)?;
+
     let mut buffer = Vec::new();
 
     // Write 80-byte header
@@ -18,8 +26,9 @@ pub fn generate_binary_stl(mesh: &Mesh, name: &str) -> Result<Vec<u8>, ExportErr
             reason: "Failed to write header".to_string(),
         })?;
 
-    // Write triangle count
-    let triangle_count = mesh.triangle_count() as u32;
+    // Write triangle count. Bounded above by validate_mesh_for_export
+    // to MAX_MESH_TRIANGLES (= 5,000,000), which fits comfortably in u32.
+    let triangle_count = triangle_count_usize as u32;
     buffer
         .write_u32::<LittleEndian>(triangle_count)
         .map_err(|_| ExportError::ExportFailed {
@@ -154,4 +163,43 @@ pub fn calculate_triangle_normal(v0: &[f32; 3], v1: &[f32; 3], v2: &[f32; 3]) ->
     }
 
     normal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit_triangle() -> Mesh {
+        Mesh {
+            vertices: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            indices: vec![0, 1, 2],
+            normals: Vec::new(),
+            uvs: None,
+            colors: None,
+            face_map: None,
+        }
+    }
+
+    #[test]
+    fn generate_binary_stl_happy_path() {
+        let bytes = generate_binary_stl(&unit_triangle(), "t").expect("valid mesh exports");
+        // 80-byte header + 4-byte tri count + 50-byte triangle record.
+        assert_eq!(bytes.len(), 80 + 4 + 50);
+    }
+
+    #[test]
+    fn generate_binary_stl_rejects_oob_index() {
+        let mut m = unit_triangle();
+        m.indices = vec![0, 1, 7]; // 7 ≥ vertex_count (3)
+        let err = generate_binary_stl(&m, "t").unwrap_err();
+        assert!(format!("{err}").contains("out of bounds"));
+    }
+
+    #[test]
+    fn generate_binary_stl_rejects_non_multiple_of_3_indices() {
+        let mut m = unit_triangle();
+        m.indices = vec![0, 1]; // length 2
+        let err = generate_binary_stl(&m, "t").unwrap_err();
+        assert!(format!("{err}").contains("indices"));
+    }
 }
