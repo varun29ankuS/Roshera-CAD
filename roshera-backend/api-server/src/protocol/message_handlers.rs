@@ -365,7 +365,12 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                         primitive_type,
                                         parameters,
                                     } => {
-                                        // Use the model from state and create geometry
+                                        // AUDIT-C5: the kernel mutation must complete and the
+                                        // write guard must drop before the response is awaited.
+                                        // Otherwise every concurrent request blocks on this
+                                        // future and a slow send (e.g. a saturated TCP buffer)
+                                        // pins the whole model.
+                                        let result = {
                                         let mut model = state.model.write().await;
                                         let mut builder = TopologyBuilder::new(&mut *model);
 
@@ -434,6 +439,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 "type": format!("{:?}", primitive_type)
                                             }),
                                         }
+                                        }; // end AUDIT-C5 scope: write lock released
+                                        result
                                     }
                                     _ => serde_json::json!({
                                         "error": "Unsupported command type",
@@ -533,12 +540,14 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                             }
                                                         }
 
-                                                        // Now create the geometry with plane context
+                                                        // AUDIT-C5: kernel work in its own scope so
+                                                        // the write guard drops before any await.
+                                                        let result = {
                                                         let mut model = state.model.write().await;
                                                         let mut builder = TopologyBuilder::new(&mut *model);
 
                                                         // Continue with normal creation...
-                                                        let result = match primitive {
+                                                        match primitive {
                                                             shared_types::PrimitiveType::Box => {
                                                                 let width = parameters.params.get("width").copied().unwrap_or(10.0);
                                                                 let height = parameters.params.get("height").copied().unwrap_or(10.0);
@@ -579,7 +588,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                                 value: "unsupported".to_string(),
                                                                 constraint: "must be box, sphere, cylinder, or cone".to_string(),
                                                             })
-                                                        };
+                                                        }
+                                                        }; // end AUDIT-C5 scope: write lock released before send
 
                                                         // Send response based on result
                                                         match result {
@@ -664,12 +674,15 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                     }
                                                     VoiceCommand::Create { primitive, parameters, .. } => {
                                                         // Legacy path - kept for backward compatibility
-                                                        // Create the primitive using geometry engine
+                                                        // Create the primitive using geometry engine.
+                                                        // AUDIT-C5: scope the write guard so it
+                                                        // drops before the response is awaited.
+                                                        let result = {
                                                         let mut model = state.model.write().await;
                                                         let mut builder = TopologyBuilder::new(&mut *model);
 
                                                         // Extract dimensions from parameters
-                                                        let result = match primitive {
+                                                        match primitive {
                                                             shared_types::PrimitiveType::Box => {
                                                                 let width = parameters.params.get("width").copied().unwrap_or(10.0);
                                                                 let height = parameters.params.get("height").copied().unwrap_or(10.0);
@@ -712,7 +725,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                                     5.0
                                                                 ).map(|id| ("sphere", id))
                                                             }
-                                                        };
+                                                        }
+                                                        }; // end AUDIT-C5 scope: write lock released before send
 
                                                         match result {
                                                             Ok((shape_name, LocalGeometryId::Solid(solid_id))) => {
@@ -1959,18 +1973,27 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             // Drain in-flight recorder ops so timeline_events
                                             // in the status payload matches the client's view.
                                             let _ = state.timeline_recorder.flush().await;
-                                            let model = state.model.read().await;
-                                            let timeline = state.timeline.read().await;
+                                            // AUDIT-C5: read guards scoped tight — drop them
+                                            // before the session_manager.list_sessions().await
+                                            // call below, otherwise a slow session lookup pins
+                                            // both the model and the timeline.
+                                            let solid_count = {
+                                                let model = state.model.read().await;
+                                                model.solids.len()
+                                            };
+                                            let event_count = {
+                                                let timeline = state.timeline.read().await;
+                                                timeline.get_stats().total_events
+                                            };
                                             let metrics = state.request_metrics.clone();
-                                            let solid_count = model.solids.len();
-                                            let event_count = timeline.get_stats().total_events;
+                                            let active_sessions = state.session_manager.list_sessions().await.len();
 
                                             ServerMessage::Success {
                                                 result: Some(serde_json::json!({
                                                     "status": "operational",
                                                     "model_objects": solid_count,
                                                     "timeline_events": event_count,
-                                                    "active_sessions": state.session_manager.list_sessions().await.len(),
+                                                    "active_sessions": active_sessions,
                                                     "request_count": metrics.len(),
                                                     "uptime_seconds": 0, // Would track actual uptime
                                                 })),
