@@ -1004,6 +1004,14 @@ fn create_fillet_chain(
     let mut edge_faces: Vec<(EdgeId, FaceId)> = Vec::new();
     let mut surgeries = Vec::new();
 
+    // AUDIT-H1: thread the caller's tolerance into every leaf helper.
+    // Previously these helpers hardcoded `1e-9` / `1e-6` literals at
+    // distance- and angle-comparison sites; with this plumbed through,
+    // setting `FilletOptions::common.tolerance` actually influences
+    // the kernel's near-degenerate gates and the surface-classifier's
+    // straight/constant decisions.
+    let tol = options.common.tolerance;
+
     for &edge_id in &edges {
         // Get the two faces adjacent to this edge
         let (face1_id, face2_id) = get_adjacent_faces(model, solid_id, edge_id)?;
@@ -1017,6 +1025,7 @@ fn create_fillet_chain(
                 face2_id,
                 *radius,
                 blend_graph,
+                tol,
             )?,
             FilletType::Variable(r1, r2) => create_variable_radius_fillet(
                 model,
@@ -1026,6 +1035,7 @@ fn create_fillet_chain(
                 *r1,
                 *r2,
                 blend_graph,
+                tol,
             )?,
             FilletType::VariableStations(samples) => {
                 // Per-station variable radius: build a piecewise-linear
@@ -1045,6 +1055,7 @@ fn create_fillet_chain(
                     face2_id,
                     &evaluator,
                     blend_graph,
+                    tol,
                 )?
             }
             FilletType::PerEdgeConstant(map) => {
@@ -1068,6 +1079,7 @@ fn create_fillet_chain(
                     face2_id,
                     r,
                     blend_graph,
+                    tol,
                 )?
             }
             FilletType::PerEdgeProfile(map) => {
@@ -1098,6 +1110,7 @@ fn create_fillet_chain(
                             face2_id,
                             *r,
                             blend_graph,
+                            tol,
                         )?
                     }
                     EdgeFilletProfile::Radius(BlendRadius::Linear { start, end }) => {
@@ -1109,6 +1122,7 @@ fn create_fillet_chain(
                             *start,
                             *end,
                             blend_graph,
+                            tol,
                         )?
                     }
                     EdgeFilletProfile::Radius(BlendRadius::Variable(samples)) => {
@@ -1122,6 +1136,7 @@ fn create_fillet_chain(
                             face2_id,
                             &evaluator,
                             blend_graph,
+                            tol,
                         )?
                     }
                     EdgeFilletProfile::Chord(c) => create_chord_fillet(
@@ -1131,15 +1146,16 @@ fn create_fillet_chain(
                         face2_id,
                         *c,
                         blend_graph,
+                        tol,
                     )?,
                 }
             }
-            FilletType::Function(f) => {
-                create_function_radius_fillet(model, edge_id, face1_id, face2_id, f, blend_graph)?
-            }
-            FilletType::Chord(chord) => {
-                create_chord_fillet(model, edge_id, face1_id, face2_id, *chord, blend_graph)?
-            }
+            FilletType::Function(f) => create_function_radius_fillet(
+                model, edge_id, face1_id, face2_id, f, blend_graph, tol,
+            )?,
+            FilletType::Chord(chord) => create_chord_fillet(
+                model, edge_id, face1_id, face2_id, *chord, blend_graph, tol,
+            )?,
         };
 
         edge_faces.push((edge_id, fillet_face));
@@ -1217,6 +1233,7 @@ fn create_constant_radius_fillet(
     face2_id: FaceId,
     radius: f64,
     blend_graph: &BlendGraph,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get edge and face data
     let edge = model
@@ -1233,7 +1250,7 @@ fn create_constant_radius_fillet(
     // now this surfaces a clean error so the caller sees an actionable
     // message instead of the cryptic numerical failure.
     if edge.is_loop() {
-        return create_closed_edge_fillet(model, edge_id, face1_id, face2_id, radius, radius);
+        return create_closed_edge_fillet(model, edge_id, face1_id, face2_id, radius, radius, tol);
     }
 
     // F3-δ.5: route every constant-radius chain through the spine
@@ -1255,7 +1272,7 @@ fn create_constant_radius_fillet(
                     edge_id
                 ))
             })?;
-    let rolling_ball_data = rolling_ball_data_from_spine_rail(&spine_rail);
+    let rolling_ball_data = rolling_ball_data_from_spine_rail(&spine_rail, tol);
 
     // F4-α: route through the typed BlendSurfaceCarrier derived from
     // `spine_rail.solver_kind` + per-station radius constancy.
@@ -1330,6 +1347,7 @@ fn create_variable_radius_fillet(
     start_radius: f64,
     end_radius: f64,
     _blend_graph: &BlendGraph,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Get edge and face data
     let edge = model
@@ -1350,6 +1368,7 @@ fn create_variable_radius_fillet(
             face2_id,
             start_radius,
             end_radius,
+            tol,
         );
     }
 
@@ -1362,6 +1381,7 @@ fn create_variable_radius_fillet(
         face2_id,
         start_radius,
         end_radius,
+        tol,
     )?;
 
     // Create variable radius fillet surface
@@ -1464,13 +1484,17 @@ fn create_closed_edge_fillet(
     face2_id: FaceId,
     start_radius: f64,
     end_radius: f64,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     use crate::primitives::surface::{Cylinder, Plane};
 
     // Variable radius on a closed edge requires a *periodic* radius
     // profile (same value at u=0 and u=2π) to avoid a discontinuity at
     // the seam. Slice A2 ships the constant case only.
-    if (start_radius - end_radius).abs() > 1e-9 {
+    //
+    // AUDIT-H1: equality check uses the caller-supplied distance
+    // tolerance.
+    if (start_radius - end_radius).abs() > tol.distance() {
         return Err(OperationError::NotImplemented(format!(
             "Variable-radius fillet on closed edges (edge {edge_id}) requires a \
              periodic radius profile and is not yet supported. Use a constant \
@@ -1530,6 +1554,7 @@ fn create_closed_edge_fillet(
         &plane,
         &cylinder,
         radius,
+        tol,
     )
 }
 
@@ -1548,6 +1573,7 @@ fn cylinder_rim_fillet(
     plane: &crate::primitives::surface::Plane,
     cylinder: &crate::primitives::surface::Cylinder,
     radius: f64,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     use crate::primitives::curve::Arc;
     use crate::primitives::edge::EdgeOrientation;
@@ -1576,14 +1602,19 @@ fn cylinder_rim_fillet(
     //     (Torus::new rejects minor >= major outright).
     //   - r < height keeps the lateral cylinder non-degenerate after
     //     it's shortened on the rim side.
-    if radius >= big_r * 0.5 - 1e-9 {
+    // AUDIT-H1: numerical safety margins use the caller-supplied
+    // distance tolerance instead of a hardcoded `1e-9`. This lets the
+    // user widen the gate (loose tolerance ⇒ reject borderline radii
+    // earlier) or tighten it (strict ⇒ accept tighter blends).
+    let margin = tol.distance();
+    if radius >= big_r * 0.5 - margin {
         return Err(OperationError::InvalidGeometry(format!(
             "Fillet radius {radius} too large for cylinder rim: must be strictly \
              less than half the cylinder radius ({big_r}); the resulting torus \
              would self-pinch (minor >= major)."
         )));
     }
-    if radius >= height - 1e-9 {
+    if radius >= height - margin {
         return Err(OperationError::InvalidGeometry(format!(
             "Fillet radius {radius} too large for cylinder rim: exceeds available \
              cylinder height ({height}); the lateral surface would collapse."
@@ -1974,6 +2005,7 @@ fn compute_variable_rolling_ball_positions(
     face2_id: FaceId,
     start_radius: f64,
     end_radius: f64,
+    tol: Tolerance,
 ) -> OperationResult<RollingBallData> {
     let num_samples = 20;
     let mut data = RollingBallData {
@@ -1982,6 +2014,7 @@ fn compute_variable_rolling_ball_positions(
         contacts2: Vec::with_capacity(num_samples + 1),
         parameters: Vec::with_capacity(num_samples + 1),
         radii: Vec::with_capacity(num_samples + 1),
+        tolerance: tol,
     };
 
     // Signed-dihedral classification at midpoint — see the matching
@@ -2031,7 +2064,12 @@ fn compute_variable_rolling_ball_positions(
             OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
         })?;
         let bisector_dot_n1 = bisector.dot(&normal1);
-        if bisector_dot_n1.abs() < 1e-9 {
+        // AUDIT-H1: bisector · n1 == sin(angle between bisector and the
+        // face plane); near zero means the bisector lies in the plane,
+        // i.e. the two face normals are anti-parallel (knife-edge
+        // dihedral). Threshold from the caller-supplied tolerance via
+        // `parallel_threshold` (= sin(angle()))).
+        if bisector_dot_n1.abs() < tol.parallel_threshold() {
             return Err(OperationError::NumericalError(
                 "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
             ));
@@ -2066,6 +2104,7 @@ fn create_function_radius_fillet(
     face2_id: FaceId,
     radius_fn: &Box<dyn Fn(f64) -> f64>,
     blend_graph: &BlendGraph,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Validate the function over the full edge parameter at the same
     // density used by the rolling-ball construction — we don't want
@@ -2100,6 +2139,7 @@ fn create_function_radius_fillet(
             face2_id,
             r_mean,
             blend_graph,
+            tol,
         );
     }
 
@@ -2111,8 +2151,9 @@ fn create_function_radius_fillet(
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
         .clone();
-    let rolling_ball_data =
-        compute_function_rolling_ball_positions(model, &edge, edge_id, face1_id, face2_id, &radii)?;
+    let rolling_ball_data = compute_function_rolling_ball_positions(
+        model, &edge, edge_id, face1_id, face2_id, &radii, tol,
+    )?;
     let fillet_surface = create_rolling_ball_surface(&rolling_ball_data)?;
 
     // Same surface-iso-curve cap-sampling as the linear variable-radius
@@ -2172,6 +2213,7 @@ fn compute_function_rolling_ball_positions(
     face1_id: FaceId,
     face2_id: FaceId,
     radii: &[f64],
+    tol: Tolerance,
 ) -> OperationResult<RollingBallData> {
     let num_samples = radii.len() - 1;
     let mut data = RollingBallData {
@@ -2180,6 +2222,7 @@ fn compute_function_rolling_ball_positions(
         contacts2: Vec::with_capacity(radii.len()),
         parameters: Vec::with_capacity(radii.len()),
         radii: Vec::with_capacity(radii.len()),
+        tolerance: tol,
     };
 
     // Same midpoint signed-dihedral classification as the variable /
@@ -2223,7 +2266,9 @@ fn compute_function_rolling_ball_positions(
             OperationError::NumericalError(format!("Bisector normalization failed: {:?}", e))
         })?;
         let bisector_dot_n1 = bisector.dot(&normal1);
-        if bisector_dot_n1.abs() < 1e-9 {
+        // AUDIT-H1: see matching block in
+        // `compute_variable_rolling_ball_positions`.
+        if bisector_dot_n1.abs() < tol.parallel_threshold() {
             return Err(OperationError::NumericalError(
                 "Bisector orthogonal to face normal — degenerate dihedral".to_string(),
             ));
@@ -2278,18 +2323,23 @@ fn create_chord_fillet(
     face2_id: FaceId,
     chord_length: f64,
     blend_graph: &BlendGraph,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Compute radius from chord length and face angle
     let angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     let half_sin = (angle / 2.0).sin();
-    if half_sin.abs() < 1e-10 {
+    // AUDIT-H1: flat/reflex gate. `half_sin = sin(angle/2)`; using
+    // `tol.parallel_threshold()` (= sin(angle())) keeps the comparison
+    // in sin-space where it's numerically robust at small angles, and
+    // honors the caller's angular tolerance configuration.
+    if half_sin.abs() < tol.parallel_threshold() {
         return Err(OperationError::InvalidGeometry(
             "Cannot fillet flat or reflex edge".into(),
         ));
     }
     let radius = chord_length / (2.0 * half_sin);
 
-    create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius, blend_graph)
+    create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius, blend_graph, tol)
 }
 
 /// Describes one filleted edge-blend surface adjacent to a vertex.
@@ -3904,6 +3954,15 @@ struct RollingBallData {
     parameters: Vec<f64>,
     /// Radius at each position
     radii: Vec<f64>,
+    /// Tolerance threaded from the caller's `FilletOptions::common.tolerance`.
+    ///
+    /// AUDIT-H1: replaces hardcoded `1e-6` literals previously embedded in
+    /// the `is_edge_straight` / `is_radius_constant` heuristics. Callers
+    /// (constant/variable/function/closed-edge paths) populate this from
+    /// the operation options so the user's tolerance setting flows through
+    /// the rolling-ball surface-type classifier instead of being silently
+    /// pinned at default.
+    tolerance: Tolerance,
 }
 
 /// Convert a F3-α [`SpineRail`](super::spine_solver::SpineRail) into the
@@ -3918,6 +3977,7 @@ struct RollingBallData {
 /// delete this converter.
 fn rolling_ball_data_from_spine_rail(
     spine_rail: &super::spine_solver::SpineRail,
+    tolerance: Tolerance,
 ) -> RollingBallData {
     let n = spine_rail.samples.len();
     let mut data = RollingBallData {
@@ -3926,6 +3986,7 @@ fn rolling_ball_data_from_spine_rail(
         contacts2: Vec::with_capacity(n),
         parameters: Vec::with_capacity(n),
         radii: Vec::with_capacity(n),
+        tolerance,
     };
     for s in &spine_rail.samples {
         data.parameters.push(s.edge_parameter);
@@ -4323,7 +4384,15 @@ fn read_sphere_face(
     None
 }
 
-/// Check if edge is straight within tolerance
+/// Check if edge is straight within tolerance.
+///
+/// AUDIT-H1: the parallel-vectors threshold is now derived from the
+/// caller-supplied tolerance via `Tolerance::parallel_threshold()`
+/// (which returns `sin(angle())`). For unit vectors `v1_norm`,
+/// `v2_norm` the cross-product magnitude equals `sin(θ)`, so
+/// comparing `|v1_norm × v2_norm|² > parallel_threshold²` reads
+/// "are these spine sample directions misaligned by more than the
+/// configured angle tolerance".
 fn is_edge_straight(data: &RollingBallData) -> bool {
     if data.centers.len() < 3 {
         return true;
@@ -4336,6 +4405,8 @@ fn is_edge_straight(data: &RollingBallData) -> bool {
         Err(_) => return true,
     };
 
+    let parallel_sq = data.tolerance.parallel_threshold().powi(2);
+
     for i in 2..data.centers.len() {
         let v2 = data.centers[i] - data.centers[0];
         let v2_norm = match v2.normalize() {
@@ -4344,7 +4415,7 @@ fn is_edge_straight(data: &RollingBallData) -> bool {
         };
 
         let cross = v1_norm.cross(&v2_norm);
-        if cross.magnitude_squared() > 1e-6 {
+        if cross.magnitude_squared() > parallel_sq {
             return false;
         }
     }
@@ -4352,15 +4423,20 @@ fn is_edge_straight(data: &RollingBallData) -> bool {
     true
 }
 
-/// Check if radius is constant
+/// Check if radius is constant within the caller-supplied distance
+/// tolerance.
+///
+/// AUDIT-H1: replaces hardcoded `1e-6` with `data.tolerance.distance()`,
+/// the value threaded through `FilletOptions::common.tolerance`.
 fn is_radius_constant(data: &RollingBallData) -> bool {
     if data.radii.is_empty() {
         return true;
     }
 
     let first_radius = data.radii[0];
+    let radius_tol = data.tolerance.distance();
     for &radius in &data.radii[1..] {
-        if (radius - first_radius).abs() > 1e-6 {
+        if (radius - first_radius).abs() > radius_tol {
             return false;
         }
     }
