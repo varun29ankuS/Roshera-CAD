@@ -31,8 +31,25 @@ chrono = "0.4"
 # structs from `espr` are intentionally NOT consumed. Our entity →
 # BRepModel mapping lives in `formats/step/handlers/`.
 #
-# Apache-2.0 licensed. ~7 KLoC.
-ruststep = "0.4"
+# Pinned to the post-fix commit `43931fb` on ricosjp/ruststep master.
+# The crates.io release 0.4.0 contains a bug in
+# `parser::exchange::list` — `comma_separated(parameter)` rejects
+# empty parameter lists `()` despite the ISO 10303-21 grammar
+# permitting them ("list = ( [ parameter { , parameter } ] )").
+# OCCT and other STEP exporters emit empty lists in the wild for
+# optional list-valued attributes (STYLED_ITEM.styles,
+# REPRESENTATION.items, GEOMETRIC_SET.elements, …); silently
+# rejecting them would force us into a brittle preprocess-layer
+# sentinel substitution. Upstream commit `90fdc93` (Feb 2025) wraps
+# the body with `opt_(...)` and resolves it cleanly. The next
+# commit (`43931fb`, Mar 2025, "cargo fmt, updates CHANGELOG") is
+# purely cosmetic and is the youngest revision before merge-commit
+# `cd89e5a` which brings in an unrelated ISO13399 work-stream we
+# don't want to depend on. Apache-2.0 licensed, ~7 KLoC.
+#
+# Remove the `git`/`rev` override once ruststep ships a release
+# (≥ 0.4.1) containing commit 90fdc93.
+ruststep = { git = "https://github.com/ricosjp/ruststep", rev = "43931fbaaed2e2aa51639ddafc27ef4ffda65c09" }
 
 [dev-dependencies]
 tempfile = "3.8"

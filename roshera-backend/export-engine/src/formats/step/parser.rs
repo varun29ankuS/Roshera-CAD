@@ -136,6 +136,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_empty_parameter_list() {
+        // Regression: ruststep 0.4.0 (crates.io) rejects empty `()`
+        // parameter lists despite ISO 10303-21 §13.5 permitting them.
+        // The Cargo.toml git pin to commit 43931fb resolves this via
+        // upstream commit 90fdc93 ("fix(exchange): handle empty
+        // parameter lists"). This test pins the contract so the gap
+        // is detected the moment ruststep is downgraded.
+        //
+        // STYLED_ITEM is used here because (a) it has a list-valued
+        // attribute (`styles`) that real-world OCCT exporters
+        // occasionally emit as `()` for un-styled items, and (b) the
+        // entity is tier-2+ in our handler tree, so the empty-list
+        // parse path stays independent of downstream semantics.
+        let input = "ISO-10303-21;\n\
+                     HEADER;\n\
+                     FILE_DESCRIPTION(('test'),'2;1');\n\
+                     FILE_NAME('t.step','2026-01-01T00:00:00',(''),(''),'','','');\n\
+                     FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\n\
+                     ENDSEC;\n\
+                     DATA;\n\
+                     #1=STYLED_ITEM('label',(),#2);\n\
+                     #2=CARTESIAN_POINT('',(0.,0.,0.));\n\
+                     ENDSEC;\n\
+                     END-ISO-10303-21;\n";
+        let parsed = parse_step(input, "empty-list test")
+            .expect("empty parameter list `()` must parse (ruststep 90fdc93)");
+        assert_eq!(parsed.data[0].entities.len(), 2);
+    }
+
+    #[test]
     fn parse_with_occt_style_comment() {
         // The shape that broke the hand-rolled parser.
         let input = "ISO-10303-21;\n\
