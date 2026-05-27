@@ -76,6 +76,11 @@
 //!   roughly 2× the cost of the planar CF-β counterpart because
 //!   of the coupled LS solve.
 
+// AUDIT-H13: Reason for `#![allow(clippy::expect_used)]` — test-only file.
+// `expect(...)` on fixture/scaffolding code surfaces invariant violations
+// with a clear message at the failure site, which is the desired failure
+// mode in tests. The workspace `expect_used = "deny"` lint targets
+// production panic-freedom; test scaffolding is exempt by design.
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
 // `edges[0..2]` indexing in the corner builders is guarded by the
