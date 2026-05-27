@@ -186,6 +186,38 @@ impl WsTokenBucket {
     }
 }
 
+// AUDIT-H4: RAII guard for the ACTIVE_WEBSOCKETS counter.
+//
+// The counter is consumed by `/healthz` and the metrics endpoint
+// (`api-server/src/metrics.rs:141`, `main.rs:5201`); a leak skews
+// operator visibility and the runbook's saturation alerts. The
+// previous code paired a `fetch_add` at the top of
+// `handle_websocket_connection` with a `fetch_sub` at the bottom,
+// which leaks the count whenever the future is dropped before
+// reaching the bottom — the standard Tokio cancellation case for
+// long-lived select-loop tasks (server shutdown, peer hard-close
+// surfacing as a future drop rather than a `Close` frame, panic
+// inside a `let _ = sender.send(...)` future, etc.). RAII via
+// `Drop` is cancel-safe by construction.
+//
+// `broadcast::Receiver` already cleans up via its own `Drop`, so
+// no extra plumbing is needed for the broadcast subscription —
+// the audit's concern was the counter, not the receiver.
+struct ActiveWebSocketGuard;
+
+impl ActiveWebSocketGuard {
+    fn new() -> Self {
+        crate::ACTIVE_WEBSOCKETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveWebSocketGuard {
+    fn drop(&mut self) {
+        crate::ACTIVE_WEBSOCKETS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // WebSocket upgrade handler
 pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     info!("🔌 WebSocket upgrade request received");
@@ -193,8 +225,9 @@ pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppStat
 }
 
 async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
-    // Track WebSocket connection
-    crate::ACTIVE_WEBSOCKETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // AUDIT-H4: counter bookkeeping via RAII so cancellation / drop
+    // paths can't leak the increment. Held for the whole function.
+    let _ws_guard = ActiveWebSocketGuard::new();
 
     let (mut sender, mut receiver) = socket.split();
     let user_id = Uuid::new_v4().to_string();
@@ -2150,9 +2183,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Decrement WebSocket counter on disconnect
-    crate::ACTIVE_WEBSOCKETS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
+    // AUDIT-H4: ACTIVE_WEBSOCKETS decrement is handled by
+    // `_ws_guard`'s `Drop`, which fires whether we exit via this
+    // path or via cancellation / panic.
     info!("WebSocket connection ended: user={}", user_id);
     crate::broadcast_log(
         "INFO",
@@ -2522,4 +2555,56 @@ fn subelement_error(object_id: &str, message: &str) -> serde_json::Value {
             "message": format!("SubElementPick({}): {}", object_id, message),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// AUDIT-H4 — `ActiveWebSocketGuard` increments on construction
+    /// and decrements on `Drop`, including when the scope ends via
+    /// an explicit `drop()` (the cancellation analogue at the unit
+    /// level — the Tokio runtime would drop the future, which would
+    /// drop locals, which would drop the guard).
+    #[test]
+    fn active_websocket_guard_balances_increment_and_decrement() {
+        let start = crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed);
+        {
+            let _g = ActiveWebSocketGuard::new();
+            assert_eq!(
+                crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed),
+                start + 1,
+                "ActiveWebSocketGuard::new() must increment counter"
+            );
+        }
+        assert_eq!(
+            crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed),
+            start,
+            "Drop must restore counter to its pre-construction value"
+        );
+    }
+
+    /// Two concurrent guards stack additively; both decrements must
+    /// fire when their scopes end. Sanity check for the relaxed
+    /// fetch_add / fetch_sub pairing — relaxed ordering is fine
+    /// because the counter is only consumed by metrics endpoints,
+    /// not by happens-before-dependent control flow.
+    #[test]
+    fn active_websocket_guard_stacks_additively() {
+        let start = crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed);
+        let g1 = ActiveWebSocketGuard::new();
+        let g2 = ActiveWebSocketGuard::new();
+        assert_eq!(
+            crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed),
+            start + 2
+        );
+        drop(g1);
+        assert_eq!(
+            crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed),
+            start + 1
+        );
+        drop(g2);
+        assert_eq!(crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), start);
+    }
 }
