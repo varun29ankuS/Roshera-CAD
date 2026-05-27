@@ -55,20 +55,7 @@ impl SessionManager {
             timeline,
             ot_engine,
             session_crdts: Arc::new(DashMap::new()),
-            auth_manager: Arc::new(
-                crate::auth::AuthManager::new(
-                    crate::auth::AuthConfig::default(),
-                    "default-jwt-secret",
-                )
-                // The literal "default-jwt-secret" is a non-empty
-                // ASCII string, which the HMAC-SHA256 constructor
-                // accepts unconditionally; the only failure path is
-                // an empty key, ruled out at this call site by the
-                // hard-coded value. The expect here documents the
-                // invariant rather than guarding against runtime
-                // input.
-                .expect("default-jwt-secret literal is a valid HMAC key"),
-            ),
+            auth_manager: build_auth_manager(),
             permission_manager: Arc::new(crate::permissions::PermissionManager::new()),
             cache_manager: Arc::new(crate::cache::CacheManager::new(
                 crate::cache::CacheConfig::default(),
@@ -572,6 +559,65 @@ impl SessionManager {
 /// Get current timestamp in milliseconds
 fn current_timestamp() -> u64 {
     shared_types::unix_millis_now()
+}
+
+/// Build the `Arc<AuthManager>` used by [`SessionManager::new`].
+///
+/// Separated into a free function so the `#[allow(clippy::expect_used)]`
+/// invariant comment lives at statement scope (Rust does not allow
+/// inner attributes on method-call expressions).
+fn build_auth_manager() -> Arc<crate::auth::AuthManager> {
+    let secret = load_jwt_secret();
+    // `load_jwt_secret` returns either the operator-supplied
+    // `ROSHERA_JWT_SECRET` (guaranteed non-empty by the selector) or a
+    // freshly-sampled 32-byte random hex string. Both branches yield a
+    // non-empty string, which is the only constraint HMAC-SHA256
+    // imposes; `AuthManager::new` can only fail on the empty case it
+    // explicitly screens out.
+    #[allow(clippy::expect_used)]
+    // Reason: invariant proved above — secret is non-empty by construction.
+    let mgr = crate::auth::AuthManager::new(crate::auth::AuthConfig::default(), &secret)
+        .expect("load_jwt_secret returns a non-empty HMAC key");
+    Arc::new(mgr)
+}
+
+/// Resolve the JWT signing secret.
+///
+/// Precedence:
+/// 1. `ROSHERA_JWT_SECRET` environment variable, if set and non-empty.
+///    This is the only way to produce a secret that survives a process
+///    restart or is shared across replicas — production deployments
+///    MUST set it.
+/// 2. A per-process random 32-byte secret (rendered as 64 hex chars),
+///    sampled from `OsRng` (the OS CSPRNG). This branch logs a
+///    `tracing::warn!` so the operator notices when running without
+///    a configured secret. JWTs issued under this fallback are
+///    invalidated on every restart and cannot be validated by any
+///    other process, which is the desired failure mode for local dev:
+///    insecure config does not silently leak into production.
+///
+/// The previous hard-coded literal (`"default-jwt-secret"`) allowed
+/// anyone with source-code access to forge valid JWTs against any
+/// running instance — an unrestricted privilege-escalation primitive.
+/// This function removes that primitive while keeping the dev
+/// workflow ergonomic.
+fn load_jwt_secret() -> String {
+    if let Ok(env_secret) = std::env::var("ROSHERA_JWT_SECRET") {
+        if !env_secret.is_empty() {
+            return env_secret;
+        }
+    }
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    tracing::warn!(
+        target: "session_manager.auth",
+        "ROSHERA_JWT_SECRET is unset or empty — generated an ephemeral \
+         per-process secret. Issued JWTs will be invalidated on restart \
+         and cannot be shared across replicas. Set ROSHERA_JWT_SECRET in \
+         production deployments."
+    );
+    hex
 }
 
 impl Default for SessionManager {
