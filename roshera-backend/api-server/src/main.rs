@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 // Import enhanced components
@@ -6243,10 +6243,118 @@ pub(crate) fn build_router(state: AppState) -> Router {
             idempotency_store,
             idempotency::idempotency_layer,
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(build_cors_layer())
+}
+
+/// Construct the outermost CORS layer.
+///
+/// Replaces the previous unconditional `allow_origin(Any)` /
+/// `allow_methods(Any)` / `allow_headers(Any)` policy (AUDIT-C1),
+/// which allowed any browser-origin to issue authenticated cross-site
+/// requests against the api-server — a CSRF + credential-replay
+/// primitive against any logged-in operator.
+///
+/// Policy:
+///
+/// * **Origins** — read from `ROSHERA_CORS_ALLOWED_ORIGINS`, a
+///   comma-separated list of origins (scheme + host + port). When
+///   unset, defaults to the standard Vite dev origins
+///   (`http://localhost:5173`, `http://127.0.0.1:5173`) so the
+///   bundled frontend works out of the box. The literal `*` is
+///   honoured as an explicit "any origin" escape hatch for operators
+///   who genuinely need it (e.g. a public read-only deployment);
+///   when `*` is used, credentials are *not* allowed (browsers
+///   reject `Access-Control-Allow-Credentials: true` together with
+///   `Access-Control-Allow-Origin: *`).
+/// * **Methods** — only the verbs the router actually serves: GET,
+///   POST, PUT, PATCH, DELETE, OPTIONS. Pre-flight `OPTIONS` is
+///   always permitted regardless of route existence; that is
+///   tower-http's standard behaviour.
+/// * **Headers** — `Content-Type`, `Authorization`, `Accept`, and
+///   `Idempotency-Key`. The first three are the standard set every
+///   browser SPA needs; `Idempotency-Key` is the api-server's
+///   custom mutation key (see `idempotency::IDEMPOTENCY_KEY_HEADER`).
+/// * **Credentials** — allowed when origins are explicit, disabled
+///   when origins are `*`. Required for cookie-based session auth
+///   to survive a cross-origin request.
+fn build_cors_layer() -> CorsLayer {
+    use axum::http::{HeaderName, HeaderValue, Method};
+
+    const DEFAULT_ORIGINS: &str = "http://localhost:5173,http://127.0.0.1:5173";
+    let raw = std::env::var("ROSHERA_CORS_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ORIGINS.to_string());
+
+    let methods = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ];
+
+    // `Idempotency-Key` is a custom header; the rest are standard.
+    let headers: Vec<HeaderName> = vec![
+        HeaderName::from_static("content-type"),
+        HeaderName::from_static("authorization"),
+        HeaderName::from_static("accept"),
+        HeaderName::from_static(idempotency::IDEMPOTENCY_KEY_HEADER),
+    ];
+
+    let base = CorsLayer::new()
+        .allow_methods(methods)
+        .allow_headers(headers);
+
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        // Explicit any-origin opt-in: credentials disabled by
+        // browser policy when combined with `*`.
+        tracing::warn!(
+            target: "api_server.cors",
+            "ROSHERA_CORS_ALLOWED_ORIGINS=`*` — CORS open to any origin. \
+             Credentials disabled for browser-policy compatibility."
+        );
+        return base.allow_origin(Any);
+    }
+
+    let parsed: Vec<HeaderValue> = trimmed
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<HeaderValue>() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    target: "api_server.cors",
+                    origin = %s,
+                    error = %e,
+                    "Ignoring malformed entry in ROSHERA_CORS_ALLOWED_ORIGINS"
+                );
+                None
+            }
+        })
+        .collect();
+
+    if parsed.is_empty() {
+        // Every entry rejected. Fall back to dev defaults rather
+        // than serving with `allow_origin([])` (which blocks every
+        // browser request).
+        tracing::warn!(
+            target: "api_server.cors",
+            "ROSHERA_CORS_ALLOWED_ORIGINS yielded zero valid origins — \
+             falling back to dev defaults ({DEFAULT_ORIGINS})"
+        );
+        let fallback: Vec<HeaderValue> = DEFAULT_ORIGINS
+            .split(',')
+            .filter_map(|s| s.parse::<HeaderValue>().ok())
+            .collect();
+        return base
+            .allow_origin(AllowOrigin::list(fallback))
+            .allow_credentials(true);
+    }
+
+    base.allow_origin(AllowOrigin::list(parsed))
+        .allow_credentials(true)
 }

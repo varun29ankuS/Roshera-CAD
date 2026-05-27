@@ -810,10 +810,13 @@ async fn fillet_radii_mixed_kinds_falls_through_to_per_edge_loop() {
 // =====================================================================
 
 /// CORS preflight (`OPTIONS`) must succeed against an arbitrary
-/// route. The router's outermost layer is `CorsLayer::new()` with
-/// `allow_origin(Any)` / `allow_methods(Any)` / `allow_headers(Any)`,
-/// so any preflight must complete with a `2xx` (`200` or `204`)
-/// regardless of the underlying route's existence.
+/// route. After AUDIT-C1 the router's outermost layer is
+/// `build_cors_layer()`, which restricts allowed origins to those in
+/// `ROSHERA_CORS_ALLOWED_ORIGINS` (default
+/// `http://localhost:5173,http://127.0.0.1:5173`). The test sends
+/// `Origin: http://localhost:5173` — in the default allow-list — so
+/// the preflight completes with `2xx` regardless of the underlying
+/// route's existence.
 #[tokio::test]
 async fn cors_preflight_succeeds_against_fillet_route() {
     let state = make_test_state().await;
@@ -831,7 +834,7 @@ async fn cors_preflight_succeeds_against_fillet_route() {
         .expect("router must dispatch the preflight");
     assert!(
         response.status().is_success(),
-        "CORS preflight must succeed (CorsLayer::new with Any) — got {}",
+        "CORS preflight must succeed for an allow-listed origin — got {}",
         response.status()
     );
 }
