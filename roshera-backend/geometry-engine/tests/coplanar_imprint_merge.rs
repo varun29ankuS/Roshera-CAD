@@ -25,6 +25,11 @@
 //! in `boolean.rs`, which pins the cut-count contract at the
 //! `intersect_faces` boundary.
 
+// AUDIT-H13: Reason for `#![allow(clippy::expect_used)]` — test-only file.
+// `expect(...)` on fixture/scaffolding code surfaces invariant violations
+// with a clear message at the failure site, which is the desired failure
+// mode in tests. The workspace `expect_used = "deny"` lint targets
+// production panic-freedom; test scaffolding is exempt by design.
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]

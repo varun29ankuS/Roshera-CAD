@@ -26,6 +26,11 @@
 //!   `Plane`-backed N-gon cap. Catches an accidental flip of the
 //!   default that would silently change CF-β semantics.
 
+// AUDIT-H13: Reason for `#![allow(clippy::expect_used)]` — test-only file.
+// `expect(...)` on fixture/scaffolding code surfaces invariant violations
+// with a clear message at the failure site, which is the desired failure
+// mode in tests. The workspace `expect_used = "deny"` lint targets
+// production panic-freedom; test scaffolding is exempt by design.
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
 
