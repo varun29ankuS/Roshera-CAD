@@ -67,6 +67,17 @@ use geometry_engine::primitives::edge::EdgeId;
 use serde_json::Value;
 use std::collections::HashMap;
 use timeline_engine::operations::blend_radius_dto_to_fillet_type;
+
+/// Absolute upper bound on any blend-dimension scalar surfaced by the
+/// public API (fillet radius, chamfer distance, variable-radius
+/// samples, chord lengths). 1e6 in the kernel's working units (mm)
+/// is 1 km — well past any reasonable CAD scale and inside the
+/// double-precision exact-integer band. The bound is a DoS / sanity
+/// gate, not a kernel constraint: the kernel will happily attempt a
+/// 1e9 mm radius on a 10 mm box and waste seconds of CPU before
+/// returning `RadiusExceedsCurvature`. Rejecting at the boundary
+/// turns that into a sub-microsecond 400. AUDIT-H3.
+pub const MAX_BLEND_DIMENSION: f64 = 1.0e6;
 use timeline_engine::BlendRadiusDto;
 
 /// Parsed + validated per-edge radius profiles, parallel to the
@@ -471,25 +482,30 @@ fn parse_dto(value: &Value, field_path: &str) -> Result<BlendRadiusDto, ApiError
 /// Range-check every numeric value the DTO carries.
 fn validate_dto(dto: &BlendRadiusDto, field_path: &str) -> Result<(), ApiError> {
     let invalid = |msg: String| ApiError::new(ErrorCode::InvalidParameter, msg);
+    // AUDIT-H3: every positive-finite numeric the DTO carries is also
+    // gated above by `MAX_BLEND_DIMENSION` to bound CPU spent in the
+    // kernel on absurd radii. The check sits next to the positivity
+    // gate so the two read as one validation phase.
+    let check_scalar = |x: f64, field: &str| -> Result<(), ApiError> {
+        if !x.is_finite() || x <= 0.0 {
+            return Err(invalid(format!(
+                "'{field}' must be a positive finite number, got {x}"
+            )));
+        }
+        if x > MAX_BLEND_DIMENSION {
+            return Err(invalid(format!(
+                "'{field}'={x} exceeds maximum blend dimension {MAX_BLEND_DIMENSION}"
+            )));
+        }
+        Ok(())
+    };
     match dto {
         BlendRadiusDto::Constant(r) => {
-            if !r.is_finite() || *r <= 0.0 {
-                return Err(invalid(format!(
-                    "'{field_path}' radius must be a positive finite number, got {r}"
-                )));
-            }
+            check_scalar(*r, &format!("{field_path}"))?;
         }
         BlendRadiusDto::Linear { start, end } => {
-            if !start.is_finite() || *start <= 0.0 {
-                return Err(invalid(format!(
-                    "'{field_path}.start' must be a positive finite number, got {start}"
-                )));
-            }
-            if !end.is_finite() || *end <= 0.0 {
-                return Err(invalid(format!(
-                    "'{field_path}.end' must be a positive finite number, got {end}"
-                )));
-            }
+            check_scalar(*start, &format!("{field_path}.start"))?;
+            check_scalar(*end, &format!("{field_path}.end"))?;
         }
         BlendRadiusDto::Variable(samples) => {
             if samples.is_empty() {
@@ -503,11 +519,7 @@ fn validate_dto(dto: &BlendRadiusDto, field_path: &str) -> Result<(), ApiError> 
                         "'{field_path}.samples[{i}].station' must lie in [0, 1], got {station}"
                     )));
                 }
-                if !radius.is_finite() || *radius <= 0.0 {
-                    return Err(invalid(format!(
-                        "'{field_path}.samples[{i}].radius' must be a positive finite number, got {radius}"
-                    )));
-                }
+                check_scalar(*radius, &format!("{field_path}.samples[{i}].radius"))?;
             }
         }
         // F5-β.5.7: the `Chord` DTO carries the raw chord length;
@@ -517,11 +529,7 @@ fn validate_dto(dto: &BlendRadiusDto, field_path: &str) -> Result<(), ApiError> 
         // follow-up slice; this arm exists so the validator remains
         // exhaustive after the DTO grew a fourth variant.
         BlendRadiusDto::Chord(c) => {
-            if !c.is_finite() || *c <= 0.0 {
-                return Err(invalid(format!(
-                    "'{field_path}' chord must be a positive finite number, got {c}"
-                )));
-            }
+            check_scalar(*c, &format!("{field_path}.chord"))?;
         }
     }
     Ok(())
@@ -1268,5 +1276,58 @@ mod tests {
             .validate_overrides_against_edges(&[7, 8])
             .expect_err("stray key 99 must be rejected");
         assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    // --- AUDIT-H3: MAX_BLEND_DIMENSION upper bound -----------------
+
+    #[test]
+    fn constant_radius_above_max_dimension_rejected() {
+        let p = json!({ "radius": MAX_BLEND_DIMENSION + 1.0 });
+        let err = parse_fillet_radii(&p, 1).expect_err("oversize radius must reject");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+        assert!(
+            err.error.contains("exceeds maximum blend dimension"),
+            "error must surface the cap; got: {}",
+            err.error
+        );
+    }
+
+    #[test]
+    fn linear_radius_start_above_max_dimension_rejected() {
+        let p = json!({
+            "radius": {
+                "kind": "linear",
+                "start": MAX_BLEND_DIMENSION * 2.0,
+                "end": 1.0
+            }
+        });
+        let err = parse_fillet_radii(&p, 1).expect_err("oversize start must reject");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+        assert!(err.error.contains("start"));
+    }
+
+    #[test]
+    fn variable_sample_radius_above_max_dimension_rejected() {
+        let p = json!({
+            "radius": {
+                "kind": "variable",
+                "samples": [
+                    [0.0, 1.0],
+                    [0.5, MAX_BLEND_DIMENSION + 1.0],
+                    [1.0, 1.0]
+                ]
+            }
+        });
+        let err = parse_fillet_radii(&p, 1).expect_err("oversize sample radius must reject");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+        assert!(err.error.contains("samples[1].radius"));
+    }
+
+    #[test]
+    fn radius_at_exact_max_dimension_accepted() {
+        // Boundary test: MAX_BLEND_DIMENSION itself is inclusive
+        // (the gate is `x > MAX`, not `x >= MAX`).
+        let p = json!({ "radius": MAX_BLEND_DIMENSION });
+        let _ = parse_fillet_radii(&p, 1).expect("exact max must parse");
     }
 }
