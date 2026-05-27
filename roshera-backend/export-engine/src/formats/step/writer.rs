@@ -308,6 +308,11 @@ impl<W: Write> StepWriter<W> {
 
         if rational && weights.is_some() {
             // Write as rational B-spline
+            #[allow(clippy::expect_used)]
+            // Reason: weights.is_some() is checked one line above in the
+            // enclosing `if` guard; the Option cannot be None here.
+            let weights_slice =
+                weights.expect("weights.is_some() verified by enclosing `if` guard");
             writeln!(self.writer,
                 "{}=RATIONAL_B_SPLINE_CURVE({},({}),.UNSPECIFIED.,.F.,.U.,({}),({}),.UNSPECIFIED.,({}));",
                 id,
@@ -315,9 +320,7 @@ impl<W: Write> StepWriter<W> {
                 format_id_list(&cp_ids),
                 format_real_list(knots),
                 format_int_list(multiplicities),
-                format_real_list(
-                    weights.expect("weights.is_some() verified by enclosing `if` guard")
-                )
+                format_real_list(weights_slice)
             )?;
         } else {
             // Write as non-rational B-spline

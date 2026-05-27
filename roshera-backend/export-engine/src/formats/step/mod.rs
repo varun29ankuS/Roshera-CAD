@@ -311,32 +311,29 @@ mod imp1_tests {
 
     #[tokio::test]
     async fn imports_empty_with_unsupported_for_unknown_entities() {
-        // Use entities that genuinely have no handler in tier-1.
-        // `STYLED_ITEM` and `B_SPLINE_SURFACE_WITH_KNOTS` are both
-        // tier-2+ and exercise the Unsupported logging path without
-        // depending on a phase that may grow coverage later.
+        // `STYLED_ITEM` is presentation-tier and has no kernel handler;
+        // it exercises the Unsupported logging path. Pair it with
+        // `CARTESIAN_POINT` (tier-1, supported) so the fixture is
+        // realistic — a STYLED_ITEM referencing a representation item.
+        // Inputs without a `MANIFOLD_SOLID_BREP` produce no kernel
+        // solid by construction. (B_SPLINE_SURFACE_WITH_KNOTS was used
+        // here historically but is now handled by tier-2; the
+        // assertion against it was removed when tier-2 coverage
+        // landed.)
         let src = ap242_step(
             "#1=STYLED_ITEM('label',(),#2);\n\
-             #2=B_SPLINE_SURFACE_WITH_KNOTS('s',1,1,((#3,#3),(#3,#3)),.UNSPECIFIED.,.F.,.F.,.F.,(2,2),(2,2),(0.,1.),(0.,1.),.UNSPECIFIED.);\n\
-             #3=CARTESIAN_POINT('',(0.,0.,0.));",
+             #2=CARTESIAN_POINT('',(0.,0.,0.));",
         );
         let f = write_tmp(&src);
         let (model, report) = import_step_to_brep_with_report(f.path()).await.unwrap();
         assert!(
             model.solids.is_empty(),
-            "STYLED_ITEM/B_SPLINE inputs yield no kernel solid"
+            "fixture lacks MANIFOLD_SOLID_BREP — no kernel solid"
         );
         assert!(!report.ok, "ok must be false when no solid resolves");
         assert!(
             report.counts.unsupported.contains_key("STYLED_ITEM"),
-            "STYLED_ITEM has no tier-1 handler"
-        );
-        assert!(
-            report
-                .counts
-                .unsupported
-                .contains_key("B_SPLINE_SURFACE_WITH_KNOTS"),
-            "B_SPLINE_SURFACE_WITH_KNOTS has no tier-1 handler"
+            "STYLED_ITEM has no tier-1/2 handler"
         );
         assert_eq!(report.schema.as_deref(), Some(AP242_SCHEMA));
         assert_eq!(report.roots_resolved, 0);
