@@ -214,6 +214,7 @@ pub fn chamfer_edges(
                 &corner_set,
                 &selected_edges,
                 options.distance1,
+                options.common.tolerance,
             )?
         };
         let miter_overrides: Option<&MiterOverrideMap> = if miter_map.is_empty() {
@@ -488,7 +489,15 @@ fn create_edge_chamfer(
             face2_id,
             &options.chamfer_type,
         )?;
-        return create_closed_edge_chamfer(model, edge_id, face1_id, face2_id, d_lat, d_cap);
+        return create_closed_edge_chamfer(
+            model,
+            edge_id,
+            face1_id,
+            face2_id,
+            d_lat,
+            d_cap,
+            options.common.tolerance,
+        );
     }
 
     // Create chamfer based on type. Open-edge creators return a
@@ -843,6 +852,7 @@ fn create_closed_edge_chamfer(
     face2_id: FaceId,
     d_lat: f64,
     d_cap: f64,
+    tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     use crate::primitives::curve::{Arc, Line, ParameterRange};
     use crate::primitives::r#loop::{Loop, LoopType};
@@ -900,14 +910,18 @@ fn create_closed_edge_chamfer(
     // d_cap < big_r keeps the inner cap circle non-degenerate.
     // d_lat < height keeps the lateral surface non-degenerate after
     // it's shortened on the rim side.
-    if d_cap >= big_r - 1e-9 {
+    //
+    // AUDIT-H1: numerical safety margins use the caller-supplied
+    // distance tolerance instead of a hardcoded `1e-9`.
+    let margin = tol.distance();
+    if d_cap >= big_r - margin {
         return Err(OperationError::InvalidGeometry(format!(
             "Chamfer cap distance {d_cap} is too large for cylinder rim: must \
              be strictly less than the cylinder radius ({big_r}); the inner \
              cap circle would collapse to (or invert through) the axis."
         )));
     }
-    if d_lat >= height - 1e-9 {
+    if d_lat >= height - margin {
         return Err(OperationError::InvalidGeometry(format!(
             "Chamfer lateral distance {d_lat} is too large for cylinder rim: \
              exceeds available cylinder height ({height}); the lateral \
@@ -2316,6 +2330,7 @@ fn compute_corner_miter_overrides(
     corner_set: &ChamferCornerSet,
     selected_edges: &[EdgeId],
     distance: f64,
+    tol: Tolerance,
 ) -> OperationResult<MiterOverrideMap> {
     let mut overrides: MiterOverrideMap = HashMap::new();
 
@@ -2342,7 +2357,12 @@ fn compute_corner_miter_overrides(
             // Near-collinear adjacent edges → miter blows up. Skip;
             // downstream coplanarity / cap-walker surfaces the issue
             // as a typed BlendFailure.
-            if s.abs() < 1e-9 {
+            //
+            // AUDIT-H1: `s = sin(theta/2)`; compare against
+            // `tol.parallel_threshold()` (= sin(angle())) so the
+            // caller's angular tolerance configuration governs which
+            // near-collinear corners get skipped.
+            if s.abs() < tol.parallel_threshold() {
                 continue;
             }
 
