@@ -124,6 +124,68 @@ pub struct CollaboratorInfo {
     pub last_activity: u64,
 }
 
+// AUDIT-C6: WebSocket DoS guards.
+//
+// `MAX_WS_MSG_BYTES` caps a single inbound Text frame at 64 KiB. The
+// largest legitimate client message in the current protocol is a
+// `JoinSession` plus a few kilobyte sketch payload (<2 KiB observed in
+// production logs); 64 KiB leaves an order-of-magnitude headroom while
+// stopping a peer from pushing the server toward OOM via, e.g., a
+// pathologically long `token` field. A frame above the cap is logged
+// and the connection is closed — the misbehaving client cannot recover
+// without re-handshaking.
+//
+// `WS_RATE_LIMIT_BURST` / `WS_RATE_LIMIT_REFILL_PER_SEC` configure a
+// per-connection token bucket so a flood of small valid frames can't
+// monopolise the runtime either. Burst of 100 absorbs a paste-heavy
+// edit storm; sustained 100 cmd/s covers any human-driven workflow with
+// margin and is well below what a single tokio worker can chew through.
+// Frames that exceed the budget are rejected with an in-band error
+// response — the connection stays up because a momentary burst is a UX
+// concern, not an attack.
+const MAX_WS_MSG_BYTES: usize = 64 * 1024;
+const WS_RATE_LIMIT_BURST: f64 = 100.0;
+const WS_RATE_LIMIT_REFILL_PER_SEC: f64 = 100.0;
+
+/// Simple monotonic-clock token bucket used by `handle_websocket_connection`.
+///
+/// Not exported because the policy (burst + refill) is tightly coupled
+/// to the constants above; a more general limiter would need an
+/// API-server-wide audit (AUDIT-H9 covers ApiKey rate limiting).
+struct WsTokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last_refill: std::time::Instant,
+}
+
+impl WsTokenBucket {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_per_sec,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    /// Returns true if a token was available and consumed.
+    fn try_consume(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            self.last_refill = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // WebSocket upgrade handler
 pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     info!("🔌 WebSocket upgrade request received");
@@ -190,6 +252,10 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     // viewport. Frames arrive pre-serialized; we just forward bytes.
     let mut broadcast_rx = crate::geometry_broadcaster().subscribe();
 
+    // Per-connection DoS guard (AUDIT-C6). See module constants above
+    // for the policy rationale.
+    let mut rate_limiter = WsTokenBucket::new(WS_RATE_LIMIT_BURST, WS_RATE_LIMIT_REFILL_PER_SEC);
+
     // Handle incoming messages
     loop {
         tokio::select! {
@@ -197,6 +263,41 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                 let Some(msg) = ws_msg else { break; };
                 match msg {
             Ok(Message::Text(text)) => {
+                // AUDIT-C6: cap inbound frame size before deserialising.
+                // A 100 MB JSON string would otherwise hand serde_json
+                // enough rope to spike the heap. Cap → log → drop the
+                // connection; the client must re-handshake.
+                if text.len() > MAX_WS_MSG_BYTES {
+                    warn!(
+                        "WS frame size {} exceeds cap {}; closing connection user={}",
+                        text.len(),
+                        MAX_WS_MSG_BYTES,
+                        user_id
+                    );
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+                // AUDIT-C6: per-connection token bucket. Reject frames
+                // that exceed the burst budget with an in-band error so
+                // the client knows it's being throttled (not silently
+                // dropped). The connection stays up — a momentary spike
+                // is a UX issue, not an attack signal.
+                if !rate_limiter.try_consume() {
+                    warn!(
+                        "WS rate limit exceeded for user={}; dropping frame",
+                        user_id
+                    );
+                    let throttle = ServerMessage::Error {
+                        error_code: "rate_limited".to_string(),
+                        message: "Rate limit exceeded; slow down and retry".to_string(),
+                        details: None,
+                        request_id: None,
+                    };
+                    if let Ok(throttle_json) = serde_json::to_string(&throttle) {
+                        let _ = sender.send(Message::Text(throttle_json.into())).await;
+                    }
+                    continue;
+                }
                 // Try to parse as ClientMessage from protocol.rs
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client_msg) => {
