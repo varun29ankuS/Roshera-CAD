@@ -1537,6 +1537,19 @@ async fn mirror_solid(
 /// the body event, matching SolidWorks / Fusion behaviour.
 ///
 /// CF-β.5.2-C — optional `partial_corner_vertices` (an array of
+/// Upper bound on the number of EdgeIds in a single fillet/chamfer
+/// request. A single blend call over thousands of edges is not a
+/// legitimate use case — even a 256-face brick has < 200 edges. The
+/// cap turns "agent typo: pasted vertex array into edges" into a
+/// fast 400 instead of a multi-second kernel walk. AUDIT-H3.
+const MAX_BLEND_EDGES: usize = 4096;
+
+/// Upper bound on `partial_corner_vertices`. Same rationale as
+/// `MAX_BLEND_EDGES`: the kernel's setback-aware corner gate is
+/// linear in this set's size, and a model with > 4 k mixed-kind
+/// corners would already be unworkable in the editor. AUDIT-H3.
+const MAX_PARTIAL_CORNER_VERTICES: usize = 4096;
+
 /// `VertexId` integers). Each entry opts the named vertex out of the
 /// F2-γ.1 setback-aware corner gate for the current call. The kernel
 /// V-side surgery preserves the vertex and registers it in
@@ -1567,6 +1580,16 @@ fn parse_partial_corner_vertices(
                 .to_string(),
         )
     })?;
+    if array.len() > MAX_PARTIAL_CORNER_VERTICES {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'partial_corner_vertices' has {} entries, exceeds maximum {}",
+                array.len(),
+                MAX_PARTIAL_CORNER_VERTICES
+            ),
+        ));
+    }
     let mut out: Vec<VertexId> = Vec::with_capacity(array.len());
     for (i, item) in array.iter().enumerate() {
         let n = item.as_u64().ok_or_else(|| {
@@ -1661,6 +1684,16 @@ async fn fillet_edges_endpoint(
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
             "'edges' must contain at least one EdgeId".to_string(),
+        ));
+    }
+    if edges_raw.len() > MAX_BLEND_EDGES {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'edges' has {} entries, exceeds maximum {}",
+                edges_raw.len(),
+                MAX_BLEND_EDGES
+            ),
         ));
     }
     let mut edges: Vec<EdgeId> = Vec::with_capacity(edges_raw.len());
@@ -2020,6 +2053,15 @@ async fn chamfer_edges_endpoint(
             format!("'distance' must be a positive finite number, got {distance}"),
         ));
     }
+    if distance > fillet_payload::MAX_BLEND_DIMENSION {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'distance'={distance} exceeds maximum blend dimension {}",
+                fillet_payload::MAX_BLEND_DIMENSION
+            ),
+        ));
+    }
 
     let edges_raw = payload
         .get("edges")
@@ -2029,6 +2071,16 @@ async fn chamfer_edges_endpoint(
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
             "'edges' must contain at least one EdgeId".to_string(),
+        ));
+    }
+    if edges_raw.len() > MAX_BLEND_EDGES {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "'edges' has {} entries, exceeds maximum {}",
+                edges_raw.len(),
+                MAX_BLEND_EDGES
+            ),
         ));
     }
     let mut edges: Vec<EdgeId> = Vec::with_capacity(edges_raw.len());
@@ -5436,6 +5488,36 @@ mod tests {
         let err = parse_partial_corner_vertices(&payload)
             .expect_err("u32 overflow must reject");
         assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
+    }
+
+    // AUDIT-H3: length cap on partial_corner_vertices to bound the
+    // kernel's per-call corner-gate work.
+    #[test]
+    fn parse_partial_corner_vertices_rejects_oversize_array() {
+        let oversized: Vec<u64> =
+            (0..=(MAX_PARTIAL_CORNER_VERTICES as u64)).collect();
+        let payload =
+            serde_json::json!({ "partial_corner_vertices": oversized });
+        let err = parse_partial_corner_vertices(&payload)
+            .expect_err("array longer than MAX_PARTIAL_CORNER_VERTICES must reject");
+        assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
+        assert!(
+            err.error.contains("exceeds maximum"),
+            "error must surface the cap; got: {}",
+            err.error
+        );
+    }
+
+    #[test]
+    fn parse_partial_corner_vertices_accepts_at_max_array_length() {
+        // Boundary: exactly MAX_PARTIAL_CORNER_VERTICES entries must
+        // parse (the gate is `len() > MAX`, not `len() >= MAX`).
+        let at_cap: Vec<u64> = (0..(MAX_PARTIAL_CORNER_VERTICES as u64)).collect();
+        let payload =
+            serde_json::json!({ "partial_corner_vertices": at_cap });
+        let parsed = parse_partial_corner_vertices(&payload)
+            .expect("array at exactly MAX_PARTIAL_CORNER_VERTICES must parse");
+        assert_eq!(parsed.len(), MAX_PARTIAL_CORNER_VERTICES);
     }
 }
 
