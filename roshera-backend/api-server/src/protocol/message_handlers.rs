@@ -137,7 +137,6 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let user_id = Uuid::new_v4().to_string();
     let mut current_session_id: Option<String> = None;
-
     info!("New WebSocket connection: user={}", user_id);
     crate::broadcast_log(
         "INFO",
@@ -213,11 +212,39 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 }
                             }
                             ClientMessage::Authenticate { token, request_id } => {
-                                // Simple authentication for now
-                                let auth_response = ServerMessage::Authenticated {
-                                    user_id: user_id.to_string(),
-                                    permissions: vec!["all".to_string()],
-                                    request_id,
+                                // AUDIT-C2: validate the JWT against the
+                                // SessionManager's AuthManager. Previously
+                                // this handler ignored the token entirely
+                                // and returned `permissions: ["all"]`
+                                // unconditionally — i.e. any client could
+                                // claim any identity simply by sending an
+                                // `Authenticate` frame. We now verify the
+                                // signature, expiration, and revocation
+                                // status, and reply with the subject and
+                                // roles from the verified claims.
+                                let auth_manager = state.session_manager.auth_manager();
+                                let auth_response = match auth_manager.verify_token(&token) {
+                                    Ok(claims) => {
+                                        info!(
+                                            "WebSocket auth ok: connection={} sub={}",
+                                            user_id, claims.sub
+                                        );
+                                        ServerMessage::Authenticated {
+                                            user_id: claims.sub,
+                                            permissions: claims.roles,
+                                            request_id,
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "WebSocket auth rejected: connection={} error={:?}",
+                                            user_id, e
+                                        );
+                                        ServerMessage::AuthenticationFailed {
+                                            reason: "Invalid or expired token".to_string(),
+                                            request_id,
+                                        }
+                                    }
                                 };
                                 if let Ok(auth_json) = serde_json::to_string(&auth_response) {
                                     let _ = sender.send(Message::Text(auth_json.into())).await;
