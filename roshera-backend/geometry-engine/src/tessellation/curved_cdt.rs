@@ -1,25 +1,34 @@
 //! Constrained Delaunay Triangulation (CDT) for curved B-Rep faces.
 //!
-//! Migrates the curved-surface tessellation path away from the legacy
-//! quadtree grid (`tessellate_curved_adaptive`) onto the same
-//! `cdt::triangulate_contours` pipeline the planar path uses. Each
-//! face's trim loops are projected from 3D into the surface's UV
-//! parameter space via `surface.closest_point`, interior Steiner
-//! points are sprinkled on a curvature-driven grid, and the resulting
-//! polygon + Steiner set is handed to the CDT crate as constraint
-//! segments. The returned 2D triangles are then lifted back to 3D
-//! through `surface.point_at` — except for boundary vertices, which
-//! must come from `EdgeSampleCache` so adjacent faces sharing an edge
-//! end up bit-identical at the seam.
+//! Curved-surface tessellation runs on the same `cdt::triangulate_contours`
+//! pipeline the planar path uses. Each face's trim loops are projected
+//! from 3D into the surface's UV parameter space via
+//! `surface.closest_point`, interior Steiner points are sprinkled on a
+//! curvature-driven grid, the polygon + Steiner set is handed to the
+//! CDT crate as constraint segments, and the resulting 2D triangulation
+//! is iteratively refined (Ruppert-style: chord/normal violations,
+//! skinny triangles, and boundary encroachment). The returned 2D
+//! triangles are then lifted back to 3D through `surface.point_at` —
+//! except for boundary vertices, which must come from
+//! `EdgeSampleCache` so adjacent faces sharing an edge end up
+//! bit-identical at the seam.
+//!
+//! Historical: CDT-α (commit `14bb061`) migrated the curved path off a
+//! legacy quadtree (`tessellate_curved_adaptive`) keeping the quadtree
+//! as a fallback. CDT-β.1 (`064762a`) added Ruppert refinement. CDT-β.2
+//! retired the legacy quadtree entirely once the test corpus showed
+//! zero fallback firings; an `Err` from this module now produces an
+//! empty per-face mesh and a `tracing::warn!`, and the caller
+//! (`tessellate_shell`) proceeds with the rest of the shell.
 //!
 //! See `plans/federated-soaring-nebula.md` for the design walk-through.
 //!
 //! ## Failure model
 //!
-//! Every failure produces `Err(CurvedCdtError::…)`; callers fall back
-//! to `tessellate_curved_adaptive` (legacy quadtree). The α slice
-//! never panics on bad input — the worst case is a stair-stepped
-//! boundary along whatever face the legacy path produces.
+//! Every failure produces `Err(CurvedCdtError::…)`. Post-β.2 the
+//! caller logs a `tracing::warn!` and leaves the per-face mesh empty;
+//! shell-level emission continues unaffected. This module never
+//! panics on bad input.
 //!
 //! Indexed access into projected boundary arrays and CDT-output
 //! triangle index triples is the canonical idiom — bounds are
@@ -38,8 +47,9 @@ use crate::primitives::topology_builder::BRepModel;
 
 /// Failure modes for `tessellate_curved_cdt`.
 ///
-/// Every variant triggers a fallback to `tessellate_curved_adaptive`
-/// at the call site; the α slice never panics on degenerate input.
+/// Post-CDT-β.2: every variant is logged via `tracing::warn!` at the
+/// call site and produces an empty per-face mesh; shell-level
+/// emission continues. This module never panics on degenerate input.
 #[derive(Debug)]
 pub(crate) enum CurvedCdtError {
     /// Outer loop sampled to fewer than 3 points, or every sample
@@ -961,8 +971,8 @@ fn refine_to_convergence(
 ///
 /// On `Ok(())` the caller's `mesh` has been populated with the face's
 /// triangles (vertices and indices both pushed). On `Err`, `mesh` is
-/// left untouched and the caller is expected to fall through to the
-/// legacy `tessellate_curved_adaptive` path.
+/// left untouched; post-CDT-β.2 the caller logs the error and the
+/// face contributes zero triangles to the shell.
 ///
 /// Pipeline: Step 0 boundary projection → Step 1 chart handedness →
 /// Step 2 Steiner candidates → Step 3 CDT call → Step 4 Ruppert-style

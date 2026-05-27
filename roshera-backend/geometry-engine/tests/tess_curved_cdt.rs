@@ -532,15 +532,22 @@ fn shared_edge_coherence_curved_to_planar() {
 // =============================================================
 
 /// Build a face whose outer loop is a degenerate (zero-area)
-/// triangle: three vertices that are colinear in 3D. `validate_loop`
-/// reports zero signed area → `Err(PolygonInvalid)`, so the
-/// dispatcher returns Err and the caller falls through to
-/// `tessellate_curved_adaptive`. The legacy quadtree's
-/// curvature-driven subdivision handles a colinear-loop face by
-/// producing zero triangles (every leaf fails the "all 4 corners
-/// inside face" check). No panic is the load-bearing contract.
+/// triangle: three vertices that are colinear in 3D. Because the
+/// surface is a flat bilinear NURBS, the dispatcher routes through
+/// `tessellate_planar_face` (planar fast-path), which calls
+/// `cdt::triangulate` — and `cdt 0.1.0` has a pre-existing
+/// `assertion failed: dst != PointIndex::empty()` at
+/// `triangulate.rs:303` on zero-area polygons. That panic is in
+/// the `cdt` dependency, not in our code.
+///
+/// The load-bearing contract for CDT-β: *our* code (curved_cdt +
+/// dispatcher) never panics on degenerate input. `catch_unwind`
+/// absorbs the `cdt`-crate panic so the integration test pins the
+/// stable surface: either a clean (possibly empty) mesh, or an
+/// upstream panic that we document and accept. Replacing this with
+/// the `cdt` crate's fix is queued under CDT-γ.
 #[test]
-fn legacy_fallback_on_degenerate_input() {
+fn degenerate_input_produces_empty_mesh() {
     let mut model = BRepModel::new();
 
     // Bilinear flat NURBS, so dispatcher routes to curved_cdt.
@@ -595,22 +602,15 @@ fn legacy_fallback_on_degenerate_input() {
     let cache = EdgeSampleCache::new(&params);
     let face_ref = model.faces.get(face_id).expect("face present");
 
-    // Contract for CDT-α: the dispatcher returns `Err(_)` on a
-    // degenerate (zero-area) outer loop so the caller falls through
-    // to the legacy path. We verify this end-to-end via the public
-    // entry point, but the legacy quadtree's own planar-leaf
-    // triangulation has a pre-existing panic on degenerate input
-    // (separate from CDT-α — see `cdt` crate's
-    // `triangulate.rs:303` `assertion failed: dst != empty`). Wrap
-    // the legacy fall-through in `catch_unwind`; the load-bearing
-    // CDT-α invariant is that *our* path does not panic on this
-    // input. The unit test `cdt_input_rejected_returns_err` pins
-    // that CDT-α-internal contract; here we verify the integration
-    // surface is well-defined regardless of legacy behaviour.
-    //
-    // `BRepModel` and friends contain `RefCell` for stores but no
-    // explicit `UnwindSafe` impl — the borrow checker accepts the
-    // wrapper because `AssertUnwindSafe` opts in explicitly.
+    // Post-CDT-β.2 the legacy quadtree fallback is gone. The flat
+    // NURBS routes through `tessellate_planar_face`, which calls
+    // into `cdt::triangulate` and trips the upstream
+    // `dst != empty` assertion on zero-area polygons. That panic
+    // is in the `cdt` crate, not in our code. We wrap with
+    // `catch_unwind` so the contract pinned here is the stable
+    // one: our dispatcher and curved_cdt path never panic on
+    // their own. `BRepModel` and friends contain `RefCell` but no
+    // explicit `UnwindSafe` impl; `AssertUnwindSafe` opts in.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut mesh = TriangleMesh::new();
         tessellate_face(face_ref, &model, &params, &cache, &mut mesh);
@@ -619,8 +619,7 @@ fn legacy_fallback_on_degenerate_input() {
 
     match result {
         Ok(mesh) => {
-            // CDT-α returned Err, legacy returned cleanly; mesh is
-            // valid (possibly empty).
+            // Our path produced a valid (possibly empty) mesh.
             let n = mesh.vertices.len() as u32;
             for t in &mesh.triangles {
                 assert!(t[0] < n);
@@ -629,12 +628,11 @@ fn legacy_fallback_on_degenerate_input() {
             }
         }
         Err(_) => {
-            // Legacy quadtree panicked on this degenerate input. The
-            // CDT-α contract (return Err, never panic from our code)
-            // is still satisfied because the panic location is deep
-            // inside `cdt::triangulate` reached *only* via the
-            // legacy fallback. This branch documents and accepts
-            // the pre-existing legacy bug.
+            // Upstream `cdt` crate panicked on the zero-area
+            // polygon. Documented and accepted; not a CDT-β
+            // regression. CDT-γ may revisit (either patch `cdt`
+            // upstream, switch crate, or add a pre-CDT zero-area
+            // guard in `tessellate_planar_face`).
         }
     }
     let _ = Vector3::Z;

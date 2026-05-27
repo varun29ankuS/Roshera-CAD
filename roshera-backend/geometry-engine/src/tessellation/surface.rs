@@ -152,7 +152,6 @@ pub fn tessellate_face(
             // (wasted triangles) depending on `max_edge_length`.
             let planar_tolerance =
                 Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
-            let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
             // Two-stage planarity classification:
             //
             // 1. **Surface-global** (`surface.is_planar`): tests the
@@ -175,45 +174,43 @@ pub fn tessellate_face(
             // false. But each side FACE is bounded to a single
             // polyline segment (`u ∈ [i/N, (i+1)/N]`), within which
             // the rails are colinear and the ruled patch is exactly
-            // planar. Routing that face through the curvature-adaptive
-            // quadtree (`tessellate_curved_adaptive`, MAX_DEPTH = 12)
-            // can cost up to 4^12 ≈ 16M recursive calls per face,
-            // which produces an apparent 15+ s "hang" on a polyline-
-            // extruded hex/L-shape. The face-restricted check pushes
-            // the side walls back onto `tessellate_planar_face`, which
-            // ear-clips a 4-vertex polygon in microseconds.
+            // planar. Historical: before CDT-β.2 the curved-surface
+            // fallback was the legacy quadtree
+            // (`tessellate_curved_adaptive`, MAX_DEPTH = 12, up to
+            // 4^12 ≈ 16M recursive calls per face), which produced
+            // an apparent 15+ s "hang" on a polyline-extruded
+            // hex/L-shape. The face-restricted planar check still
+            // matters post-β.2 because `tessellate_planar_face`
+            // ear-clips a 4-vertex polygon in microseconds, skipping
+            // the full CDT pipeline for trivially planar side walls.
             if surface.is_planar(planar_tolerance)
                 || is_face_loop_planar_in_3d(face, model, cache, planar_tolerance)
             {
                 tessellate_planar_face(face, model, params, cache, mesh);
             } else {
-                // CDT-α primary path; legacy quadtree as fallback. The
-                // fallback fires on degenerate input (zero-area UV
-                // bbox, projection failures), on `cdt` crate rejection
-                // of self-intersecting projected polygons, and on any
-                // surface type whose `closest_point` cannot recover a
-                // useful UV inverse for boundary samples.
+                // CDT-β.2: the legacy `tessellate_curved_adaptive`
+                // quadtree fallback has been retired. The empirical
+                // signal that motivated retirement: zero
+                // `[tess] curved_cdt fallback` lines on the full
+                // workspace test corpus (geometry-engine lib + all
+                // integration suites + export-engine + api-server)
+                // under `ROSHERA_TESS_TRACE=1`. On `Err(_)` the
+                // contract is "this face emits zero triangles"; the
+                // shell-level `tessellate_shell` continues with the
+                // rest of the shell.
                 match super::curved_cdt::tessellate_curved_cdt(
                     surface, face, model, params, cache, mesh,
                 ) {
                     Ok(()) => return,
                     Err(e) => {
-                        if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
-                            eprintln!(
-                                "[tess] curved_cdt fallback (face={:?}): {:?}",
-                                face.id, e
-                            );
-                        }
                         tracing::warn!(
-                            "curved_cdt fallback for face {:?}: {:?}",
+                            "curved_cdt failed for face {:?}: {:?}; emitting empty \
+                             mesh (CDT-β.2: legacy quadtree fallback retired)",
                             face.id,
                             e
                         );
                     }
                 }
-                tessellate_curved_adaptive(
-                    surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
-                );
             }
         }
     }
@@ -1485,36 +1482,23 @@ fn tessellate_nurbs_face(
         None => return,
     };
 
-    // Get parameter bounds for the face
-    let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
-
-    // For NURBS surfaces, we route through the CDT-α path first; on
-    // any failure (degenerate trim loop, `cdt` crate rejection, etc.)
-    // we fall through to the legacy curvature-adaptive quadtree.
-    // The adaptive path is generic over `&dyn Surface` — it's also
-    // used for any other curved generic surface (see the `_ =>` arm
-    // in `tessellate_face`).
-    match super::curved_cdt::tessellate_curved_cdt(
+    // For NURBS surfaces we route through `curved_cdt`. CDT-β.2
+    // retired the legacy `tessellate_curved_adaptive` quadtree
+    // fallback after the full workspace test corpus produced zero
+    // fallback firings under `ROSHERA_TESS_TRACE=1`. On `Err(_)`
+    // the contract is now "this face emits zero triangles" —
+    // the shell-level `tessellate_shell` proceeds with the rest
+    // of the shell.
+    if let Err(e) = super::curved_cdt::tessellate_curved_cdt(
         surface, face, model, params, cache, mesh,
     ) {
-        Ok(()) => return,
-        Err(e) => {
-            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
-                eprintln!(
-                    "[tess] curved_cdt fallback (face={:?}): {:?}",
-                    face.id, e
-                );
-            }
-            tracing::warn!(
-                "curved_cdt fallback for face {:?}: {:?}",
-                face.id,
-                e
-            );
-        }
+        tracing::warn!(
+            "curved_cdt failed for NURBS face {:?}: {:?}; emitting empty \
+             mesh (CDT-β.2: legacy quadtree fallback retired)",
+            face.id,
+            e
+        );
     }
-    tessellate_curved_adaptive(
-        surface, face, model, params, cache, mesh, u_min, u_max, v_min, v_max,
-    );
 }
 
 /// Tessellate a fillet face (CylindricalFillet, ToroidalFillet,
@@ -2306,360 +2290,6 @@ pub fn tessellate_surface(
     }
 
     mesh
-}
-
-/// Adaptive NURBS tessellation with curvature-based refinement
-/// Adaptive curvature-driven tessellation for any curved surface
-/// (NURBS, RuledSurface with non-linear profile, generic
-/// non-planar `&dyn Surface` implementations).
-///
-/// Initialises a UV quadtree over the face's parametric bounds and
-/// recursively subdivides whenever the chord-height, normal-deviation,
-/// or edge-length guards are violated (see `should_subdivide_curved`).
-/// Leaf quads are stamped into the mesh; samples outside the face's
-/// trim loops are skipped via `is_point_inside_face`.
-///
-/// **Watertightness**: relies on `weld_mesh_watertight_range` at the
-/// shell level to collapse coincident vertices. Adjacent faces sharing
-/// a B-Rep edge will produce 3D-coincident corner samples whenever the
-/// edge endpoint parameters align, which holds for the common case of
-/// untrimmed parametric boundaries. T-junctions between adjacent leaves
-/// at different subdivision levels are not currently healed; the welder
-/// tolerates them within `weld_tolerance` but they remain a known
-/// limitation of the adaptive path.
-fn tessellate_curved_adaptive(
-    surface: &dyn Surface,
-    face: &Face,
-    model: &BRepModel,
-    params: &TessellationParams,
-    _cache: &EdgeSampleCache,
-    mesh: &mut TriangleMesh,
-    u_min: f64,
-    u_max: f64,
-    v_min: f64,
-    v_max: f64,
-) {
-    // Initial quadtree subdivision based on surface complexity
-    let mut quad_tree = QuadTree::new(u_min, u_max, v_min, v_max);
-
-    // Perform adaptive subdivision
-    subdivide_curved_quad(
-        &mut quad_tree,
-        surface,
-        face,
-        model,
-        params,
-        u_min,
-        u_max,
-        v_min,
-        v_max,
-        0,
-    );
-
-    // Convert quadtree to triangles. The vertex map is kept locally for
-    // QuadTree->mesh stamping; watertight welding is handled at the
-    // shell level by `tessellate_shell`, so we don't run it here.
-    let _ = quad_tree_to_mesh(&quad_tree, surface, face, model, mesh);
-}
-
-/// Quadtree structure for adaptive subdivision
-struct QuadTree {
-    nodes: Vec<QuadNode>,
-}
-
-struct QuadNode {
-    u_min: f64,
-    u_max: f64,
-    v_min: f64,
-    v_max: f64,
-    children: Option<[usize; 4]>,
-}
-
-impl QuadTree {
-    fn new(u_min: f64, u_max: f64, v_min: f64, v_max: f64) -> Self {
-        let root = QuadNode {
-            u_min,
-            u_max,
-            v_min,
-            v_max,
-            children: None,
-        };
-        Self { nodes: vec![root] }
-    }
-
-    fn subdivide(&mut self, node_idx: usize) -> [usize; 4] {
-        // Copy the node data to avoid borrowing issues
-        let (u_min, u_max, v_min, v_max) = {
-            let node = &self.nodes[node_idx];
-            (node.u_min, node.u_max, node.v_min, node.v_max)
-        };
-
-        let u_mid = (u_min + u_max) / 2.0;
-        let v_mid = (v_min + v_max) / 2.0;
-
-        // Create 4 child nodes
-        let children = [
-            self.add_node(u_min, u_mid, v_min, v_mid), // SW
-            self.add_node(u_mid, u_max, v_min, v_mid), // SE
-            self.add_node(u_mid, u_max, v_mid, v_max), // NE
-            self.add_node(u_min, u_mid, v_mid, v_max), // NW
-        ];
-
-        self.nodes[node_idx].children = Some(children);
-        children
-    }
-
-    fn add_node(&mut self, u_min: f64, u_max: f64, v_min: f64, v_max: f64) -> usize {
-        let idx = self.nodes.len();
-        self.nodes.push(QuadNode {
-            u_min,
-            u_max,
-            v_min,
-            v_max,
-            children: None,
-        });
-        idx
-    }
-}
-
-/// Recursive subdivision based on curvature
-fn subdivide_curved_quad(
-    quad_tree: &mut QuadTree,
-    surface: &dyn Surface,
-    face: &Face,
-    model: &BRepModel,
-    params: &TessellationParams,
-    u_min: f64,
-    u_max: f64,
-    v_min: f64,
-    v_max: f64,
-    depth: usize,
-) {
-    const MAX_DEPTH: usize = 12;
-
-    // Check if we should subdivide based on curvature
-    if depth >= MAX_DEPTH
-        || !should_subdivide_curved(surface, face, model, params, u_min, u_max, v_min, v_max)
-    {
-        return;
-    }
-
-    // Get current node
-    let node_idx = quad_tree.nodes.len() - 1;
-
-    // Subdivide into 4 children
-    let _children = quad_tree.subdivide(node_idx);
-
-    // Recursively subdivide children
-    let u_mid = (u_min + u_max) / 2.0;
-    let v_mid = (v_min + v_max) / 2.0;
-
-    subdivide_curved_quad(
-        quad_tree,
-        surface,
-        face,
-        model,
-        params,
-        u_min,
-        u_mid,
-        v_min,
-        v_mid,
-        depth + 1,
-    );
-    subdivide_curved_quad(
-        quad_tree,
-        surface,
-        face,
-        model,
-        params,
-        u_mid,
-        u_max,
-        v_min,
-        v_mid,
-        depth + 1,
-    );
-    subdivide_curved_quad(
-        quad_tree,
-        surface,
-        face,
-        model,
-        params,
-        u_mid,
-        u_max,
-        v_mid,
-        v_max,
-        depth + 1,
-    );
-    subdivide_curved_quad(
-        quad_tree,
-        surface,
-        face,
-        model,
-        params,
-        u_min,
-        u_mid,
-        v_mid,
-        v_max,
-        depth + 1,
-    );
-}
-
-/// Check if a quad should be subdivided based on curvature
-fn should_subdivide_curved(
-    surface: &dyn Surface,
-    face: &Face,
-    model: &BRepModel,
-    params: &TessellationParams,
-    u_min: f64,
-    u_max: f64,
-    v_min: f64,
-    v_max: f64,
-) -> bool {
-    // Sample curvature at multiple points
-    let sample_points = [
-        (u_min, v_min),
-        (u_max, v_min),
-        (u_max, v_max),
-        (u_min, v_max),
-        ((u_min + u_max) / 2.0, (v_min + v_max) / 2.0),
-    ];
-
-    let mut max_curvature = 0.0f64;
-    let mut max_normal_deviation = 0.0f64;
-    let mut normals = Vec::new();
-
-    for &(u, v) in &sample_points {
-        if !is_point_inside_face(u, v, face, model) {
-            continue;
-        }
-
-        if let Ok(eval) = surface.evaluate_full(u, v) {
-            // Check curvature
-            let k = eval.k1.abs().max(eval.k2.abs());
-            max_curvature = max_curvature.max(k);
-
-            // Collect normals for deviation check
-            normals.push(eval.normal);
-        }
-    }
-
-    // Check normal deviation
-    for i in 0..normals.len() {
-        for j in i + 1..normals.len() {
-            if let Ok(angle) = normals[i].angle(&normals[j]) {
-                max_normal_deviation = max_normal_deviation.max(angle);
-            }
-        }
-    }
-
-    // Subdivision criteria
-    let patch_size = ((u_max - u_min).powi(2) + (v_max - v_min).powi(2)).sqrt();
-
-    // Curvature-based criterion
-    if max_curvature > 1e-10 {
-        let required_size = (8.0 * params.chord_tolerance / max_curvature).sqrt();
-        if patch_size > required_size {
-            return true;
-        }
-    }
-
-    // Normal deviation criterion
-    if max_normal_deviation > params.max_angle_deviation {
-        return true;
-    }
-
-    // Edge length criterion
-    let estimated_edge_length = patch_size
-        * surface
-            .point_at(u_min, v_min)
-            .map(|p1| {
-                surface
-                    .point_at(u_max, v_max)
-                    .map(|p2| p1.distance(&p2) / patch_size)
-                    .unwrap_or(1.0)
-            })
-            .unwrap_or(1.0);
-
-    estimated_edge_length > params.max_edge_length
-}
-
-/// Convert quadtree to triangle mesh
-fn quad_tree_to_mesh(
-    quad_tree: &QuadTree,
-    surface: &dyn Surface,
-    face: &Face,
-    model: &BRepModel,
-    mesh: &mut TriangleMesh,
-) -> HashMap<(usize, usize), u32> {
-    let mut vertex_map = HashMap::new();
-
-    // Process all leaf nodes
-    for node in quad_tree.nodes.iter() {
-        if node.children.is_none() {
-            // This is a leaf node - tessellate it
-            let vertices = [
-                (node.u_min, node.v_min),
-                (node.u_max, node.v_min),
-                (node.u_max, node.v_max),
-                (node.u_min, node.v_max),
-            ];
-
-            let mut indices = Vec::new();
-
-            for &(u, v) in &vertices {
-                if is_point_inside_face(u, v, face, model) {
-                    let key = discretize_uv(u, v);
-                    let vertex_idx = *vertex_map.entry(key).or_insert_with(|| {
-                        if let (Ok(point), Ok(normal)) = (
-                            surface.point_at(u, v),
-                            face.normal_at(u, v, &model.surfaces),
-                        ) {
-                            mesh.add_vertex(MeshVertex {
-                                position: point,
-                                normal,
-                                uv: Some((u, v)),
-                            })
-                        } else {
-                            0 // Should not happen with proper face boundaries
-                        }
-                    });
-                    indices.push(vertex_idx);
-                }
-            }
-
-            // Create triangles if we have all 4 vertices. Winding
-            // follows `face.orientation` so the geometric normal
-            // agrees with the stored vertex normal — see cylindrical
-            // path for the full rationale.
-            let forward = face.orientation.is_forward();
-            if indices.len() == 4 {
-                if forward {
-                    mesh.add_triangle(indices[0], indices[1], indices[2]);
-                    mesh.add_triangle(indices[0], indices[2], indices[3]);
-                } else {
-                    mesh.add_triangle(indices[0], indices[2], indices[1]);
-                    mesh.add_triangle(indices[0], indices[3], indices[2]);
-                }
-            } else if indices.len() == 3 {
-                if forward {
-                    mesh.add_triangle(indices[0], indices[1], indices[2]);
-                } else {
-                    mesh.add_triangle(indices[0], indices[2], indices[1]);
-                }
-            }
-        }
-    }
-
-    vertex_map
-}
-
-/// Discretize UV coordinates for vertex sharing
-fn discretize_uv(u: f64, v: f64) -> (usize, usize) {
-    const RESOLUTION: f64 = 1e6;
-    (
-        (u * RESOLUTION).round() as usize,
-        (v * RESOLUTION).round() as usize,
-    )
 }
 
 /// Weld coincident vertices into a single index, producing a watertight
