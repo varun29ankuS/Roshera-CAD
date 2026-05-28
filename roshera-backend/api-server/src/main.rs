@@ -3989,9 +3989,14 @@ async fn delete_geometry(
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
 
-    if !auth_info.permissions.contains(&Permission::DeleteGeometry) {
-        return Err(ApiError::permission_denied("DeleteGeometry"));
-    }
+    // AUDIT-H7: route through the canonical `enforce_permission`
+    // helper so this handler honours the same soft-mode-passthrough /
+    // strict-mode-enforce matrix as every other mutation endpoint.
+    // The prior unconditional check rejected anonymous callers in
+    // soft mode, which was inconsistent with how every other handler
+    // behaves and broke dev frontends that have not yet wired
+    // Authorization headers.
+    auth_middleware::enforce_permission(&auth_info, Permission::DeleteGeometry, "delete_geometry")?;
 
     // Two id forms accepted: canonical UUID (the form the WS frame
     // ships under `payload.id`) and the legacy numeric local solid id
@@ -5855,24 +5860,91 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // Metrics endpoint
         .route("/api/metrics", get(metrics::get_metrics))
         // Geometry endpoints
-        .route("/api/geometry", post(create_geometry))
+        // AUDIT-H7: every kernel-mutation route below is wrapped in
+        // a `route_layer` that gates the request on a typed scope
+        // from `session_manager::Permission`. In soft mode (default,
+        // `ROSHERA_REQUIRE_AUTH` unset) the layer is a no-op so dev
+        // frontends without Authorization headers continue working;
+        // flipping `ROSHERA_REQUIRE_AUTH=1` activates strict
+        // enforcement and any caller missing the listed scope gets a
+        // catalogued 403 (`permission_denied`). The choice of scope
+        // per route is fixed at the router definition site so that
+        // adding a new mutation forces an explicit policy decision.
+        .route(
+            "/api/geometry",
+            post(create_geometry).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        // NB: `/api/geometry/{id}` carries an inline
+        // `Permission::DeleteGeometry` check inside `delete_geometry`
+        // itself, so a `.route_layer(require_delete_geometry)` is not
+        // applied here (it would gate the read verb too). The inline
+        // check uses the same `enforce_permission` semantics in spirit
+        // — soft-mode-permissive, strict-mode-enforcing — via the
+        // AuthInfo populated by `auth_middleware`.
         .route(
             "/api/geometry/{id}",
             get(get_geometry).delete(delete_geometry),
         )
-        .route("/api/geometry/boolean", post(boolean_operation))
-        .route("/api/geometry/extrude", post(create_extrude))
-        .route("/api/geometry/face/extrude", post(extrude_face_endpoint))
+        .route(
+            "/api/geometry/boolean",
+            post(boolean_operation).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/extrude",
+            post(create_extrude).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/face/extrude",
+            post(extrude_face_endpoint).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
         .route(
             "/api/geometry/face/extrude/preview",
             post(preview_face_extrude),
         )
-        .route("/api/geometry/shell", post(shell_solid))
-        .route("/api/geometry/mirror", post(mirror_solid))
-        .route("/api/geometry/fillet", post(fillet_edges_endpoint))
-        .route("/api/geometry/chamfer", post(chamfer_edges_endpoint))
-        .route("/api/geometry/pattern/linear", post(pattern_linear_endpoint))
-        .route("/api/geometry/pattern/circular", post(pattern_circular_endpoint))
+        .route(
+            "/api/geometry/shell",
+            post(shell_solid).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/mirror",
+            post(mirror_solid).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/fillet",
+            post(fillet_edges_endpoint).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/chamfer",
+            post(chamfer_edges_endpoint).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/pattern/linear",
+            post(pattern_linear_endpoint).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/pattern/circular",
+            post(pattern_circular_endpoint).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
         .route("/api/section/preview", post(post_section_preview))
         // 2D sketch sessions — backend-owned source of truth for the
         // click-to-place workflow. Frontend creates a session, streams
@@ -6204,7 +6276,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{id}/join", post(join_session))
         .route("/api/sessions/{id}/leave", post(leave_session))
         // Export endpoints
-        .route("/api/export", post(export_mesh))
+        .route(
+            "/api/export",
+            post(export_mesh).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_export_geometry,
+            )),
+        )
         .route("/api/download/{filename}", get(download_file))
         // Auth endpoints
         .route("/api/auth/login", post(login))
