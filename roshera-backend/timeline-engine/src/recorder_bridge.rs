@@ -7,12 +7,26 @@
 //! (`Timeline::add_operation` is `async`), so this module owns the
 //! sync-to-async impedance matching:
 //!
-//! * `record()` is a non-blocking send into an unbounded MPSC channel.
-//!   It never stalls the calling geometry operation.
+//! * `record()` is a non-blocking `try_send` into a **bounded** MPSC
+//!   channel. It never stalls the calling geometry operation. If the
+//!   channel is full (drainer falling behind), the call returns
+//!   `RecorderError::Unavailable` rather than dropping the event
+//!   silently — surfacing backpressure loudly so the operator can act.
 //! * A background tokio task drains the channel in FIFO order and forwards
 //!   each event to `Timeline::add_operation`.
 //! * Ordering is preserved per recorder instance; events across different
 //!   recorder instances may interleave.
+//!
+//! # Channel capacity
+//!
+//! The channel capacity is [`RECORDER_CHANNEL_CAPACITY`] (16384). Under
+//! normal load — a human clicking through a CAD session at ≤10 ops/sec
+//! while the worker drains at >1000 ops/sec — the channel never carries
+//! more than a handful of pending events. The bound only fires when
+//! something is genuinely wrong (worker starved, timeline lock
+//! contention, or a misbehaving AI agent flooding ops); in those cases
+//! a typed error is strictly better than unbounded RAM growth followed
+//! by an OOM kill.
 //!
 //! The kernel does not learn about the async machinery — it only sees the
 //! trait. This is the dependency-inversion boundary that lets us wire
@@ -26,6 +40,12 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::timeline::Timeline;
 use crate::types::{Author, BranchId, Operation};
+
+/// Bounded channel capacity for the recorder MPSC. Sized to absorb the
+/// worst sustained burst from a fast AI agent (≈ thousands of ops/sec)
+/// without ever filling under normal interactive load. Hitting this
+/// bound is a system-health signal, not a normal-path event.
+pub const RECORDER_CHANNEL_CAPACITY: usize = 16_384;
 
 /// Internal command type for the recorder worker. The kernel only ever
 /// sends `Op`; `Flush` is reserved for the api-server to drain in-flight
@@ -59,8 +79,9 @@ pub type SharedTimeline = Arc<RwLock<Timeline>>;
 /// 2. Caller wraps the recorder in `Arc<dyn OperationRecorder>` and
 ///    attaches it to a `BRepModel`.
 /// 3. Every successful geometry operation calls `record()` which hands the
-///    `RecordedOperation` to the worker via a bounded-memory unbounded
-///    channel (bounded only by the receiver's drain rate).
+///    `RecordedOperation` to the worker via a bounded MPSC channel
+///    (`RECORDER_CHANNEL_CAPACITY`). On overflow `record()` returns
+///    `RecorderError::Unavailable` rather than silently dropping.
 /// 4. Dropping the `TimelineRecorder` closes the sender; the worker drains
 ///    remaining events and exits.
 ///
@@ -78,7 +99,7 @@ pub type SharedTimeline = Arc<RwLock<Timeline>>;
 /// that preserves every byte the kernel emitted.
 #[derive(Debug, Clone)]
 pub struct TimelineRecorder {
-    tx: mpsc::UnboundedSender<RecorderCmd>,
+    tx: mpsc::Sender<RecorderCmd>,
     author: Author,
     /// The branch every event is appended to. Wrapped in an
     /// `Arc<parking_lot::RwLock>` so the api-server can swap it in
@@ -105,7 +126,20 @@ impl TimelineRecorder {
     /// * `branch_id` — the initial branch events are appended to. May
     ///   be changed at any time via [`set_branch_id`](Self::set_branch_id).
     pub fn new(timeline: SharedTimeline, author: Author, branch_id: BranchId) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<RecorderCmd>();
+        Self::with_capacity(timeline, author, branch_id, RECORDER_CHANNEL_CAPACITY)
+    }
+
+    /// Construct a recorder with an explicit channel capacity. Tests
+    /// use a small capacity to exercise the overflow path; production
+    /// goes through [`TimelineRecorder::new`] which uses
+    /// [`RECORDER_CHANNEL_CAPACITY`].
+    pub fn with_capacity(
+        timeline: SharedTimeline,
+        author: Author,
+        branch_id: BranchId,
+        capacity: usize,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<RecorderCmd>(capacity);
         let branch_id = Arc::new(PlRwLock::new(branch_id));
 
         let worker_author = author.clone();
@@ -195,9 +229,18 @@ impl TimelineRecorder {
     /// sentinel.
     pub async fn flush(&self) -> Result<(), RecorderError> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx.send(RecorderCmd::Flush(resp_tx)).map_err(|e| {
-            RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
-        })?;
+        // `flush` is async — block-on-send is correct here; we want the
+        // sentinel to actually land even under backpressure rather than
+        // erroring out spuriously.
+        self.tx
+            .send(RecorderCmd::Flush(resp_tx))
+            .await
+            .map_err(|e| {
+                RecorderError::Unavailable(format!(
+                    "TimelineRecorder worker has shut down: {}",
+                    e
+                ))
+            })?;
         resp_rx.await.map_err(|e| {
             RecorderError::Unavailable(format!("TimelineRecorder flush response lost: {}", e))
         })?;
@@ -207,8 +250,19 @@ impl TimelineRecorder {
 
 impl OperationRecorder for TimelineRecorder {
     fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
-        self.tx.send(RecorderCmd::Op(operation)).map_err(|e| {
-            RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
+        // Sync entry point — must never block. `try_send` returns
+        // `Full` if the bounded channel is saturated (drainer falling
+        // behind) and `Closed` if the worker has exited. Both surface
+        // as `Unavailable` so the kernel's `record_operation` helper
+        // logs loudly and continues; silent event loss is forbidden.
+        self.tx.try_send(RecorderCmd::Op(operation)).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => RecorderError::Unavailable(format!(
+                "TimelineRecorder channel saturated (capacity={}); worker may be stalled",
+                self.tx.max_capacity()
+            )),
+            mpsc::error::TrySendError::Closed(_) => RecorderError::Unavailable(
+                "TimelineRecorder worker has shut down".to_string(),
+            ),
         })
     }
 }
@@ -354,5 +408,53 @@ mod tests {
             .get_branch_events(&main, None, None)
             .expect("branch events");
         assert_eq!(events.len(), 2, "both clones should forward events");
+    }
+
+    /// When the bounded MPSC channel saturates, `record()` must return
+    /// `RecorderError::Unavailable` rather than silently dropping the
+    /// event or panicking. The kernel relies on the typed error to
+    /// log and continue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_returns_unavailable_when_channel_full() {
+        // Tiny capacity (1) + a yield-only worker would still drain on
+        // each await point. To reliably fill the channel from the sync
+        // side, we never await: just spam `record()` synchronously in
+        // a single-threaded runtime so the worker never gets to run.
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder = TimelineRecorder::with_capacity(
+            Arc::clone(&timeline),
+            Author::System,
+            BranchId::main(),
+            1,
+        );
+
+        // First `record()` fills the channel; subsequent calls must
+        // see `Full` and surface as `Unavailable`. We loop a bounded
+        // number of times because the runtime might schedule the
+        // worker between calls under unusual conditions.
+        let mut got_unavailable = false;
+        for _ in 0..256 {
+            match recorder.record(RecordedOperation::new("flood")) {
+                Ok(_) => continue,
+                Err(RecorderError::Unavailable(msg)) => {
+                    assert!(
+                        msg.contains("saturated") || msg.contains("shut down"),
+                        "Unavailable message must explain the cause, got: {}",
+                        msg
+                    );
+                    got_unavailable = true;
+                    break;
+                }
+                Err(other) => panic!(
+                    "expected RecorderError::Unavailable on overflow, got {:?}",
+                    other
+                ),
+            }
+        }
+        assert!(
+            got_unavailable,
+            "256 synchronous sends with capacity=1 and no worker yield must saturate the channel"
+        );
     }
 }
