@@ -280,7 +280,13 @@ async fn auth_middleware_inner(
     Ok(())
 }
 
-/// Permission-checking middleware
+/// Permission-checking middleware (legacy `AuthError`-shaped variant).
+///
+/// Retained for callers that want the simple `AuthError` JSON shape.
+/// New mutation routes should layer one of the typed
+/// `require_*_geometry` middlewares below, which return the catalogued
+/// `ApiError::permission_denied(...)` so the failure participates in
+/// the stable error catalog the rest of the API exposes.
 pub async fn require_permission(
     required_permission: Permission,
 ) -> impl Fn(
@@ -315,6 +321,135 @@ pub async fn require_permission(
             Ok(next.run(request).await)
         })
     }
+}
+
+// =====================================================================
+// AUDIT-H7 — typed per-route permission gates for kernel mutations.
+//
+// Every mutation handler exposed by the api-server (fillet, chamfer,
+// boolean, extrude, delete-geometry, …) receives `AuthInfo` via the
+// `FromRequestParts` impl above but, prior to AUDIT-H7, never inspected
+// the `permissions` field. In soft mode (`ROSHERA_REQUIRE_AUTH` unset)
+// the anonymous `AuthInfo` carries an empty permission list, so no
+// caller is ever rejected; in strict mode the same handlers still
+// happily executed against any valid token regardless of the scopes
+// it actually carries. The middlewares below close that gap:
+//
+//   1. They are layered per-route via `.route_layer(...)` in
+//      `build_router`, so adding a new mutation route forces the
+//      developer to think about which permission gates it.
+//   2. They short-circuit with `ApiError::permission_denied(...)`,
+//      which serialises to the stable `permission_denied` code in
+//      the error catalog (HTTP 403, non-retryable). Agents
+//      pattern-matching on `error_code` get the same wire shape they
+//      already handle from `/api/permissions/*` and the explicit
+//      lock-conflict surface.
+//   3. They are *enforced only when `ROSHERA_REQUIRE_AUTH=1`*. In
+//      soft mode (development default) they pass through. This
+//      matches `auth_middleware`'s own soft/strict mode matrix and
+//      lets existing dev frontends that have not yet wired
+//      Authorization headers continue working until the operator
+//      flips the env var. The strict-mode toggle is the single
+//      switch that activates both layers of the protection.
+// =====================================================================
+
+/// Inner helper shared by every `require_*_geometry` middleware. In
+/// strict mode (`ROSHERA_REQUIRE_AUTH=1`) the request's `AuthInfo`
+/// extension must contain `required`; otherwise the layer short-
+/// circuits with `ApiError::permission_denied(name)`. In soft mode
+/// the layer is a no-op and forwards to `next`.
+async fn enforce_permission_layer(
+    required: Permission,
+    name: &'static str,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Soft mode: preserve compat with dev frontends that have not yet
+    // wired Authorization headers. The audit recommends flipping
+    // `ROSHERA_REQUIRE_AUTH=1` in any deployment that fronts real
+    // users — at which point this branch is dead and every mutation
+    // is gated.
+    if !require_auth_enabled() {
+        return next.run(request).await;
+    }
+
+    let has_auth = request.extensions().get::<AuthInfo>().cloned();
+    let auth_info = match has_auth {
+        Some(info) => info,
+        None => {
+            // auth_middleware should always inject AuthInfo (anonymous
+            // in soft mode, real in strict mode). If we ever observe
+            // a missing extension in strict mode, fail closed.
+            return crate::error_catalog::ApiError::permission_denied(name).into_response();
+        }
+    };
+
+    if auth_info.permissions.contains(&required) {
+        return next.run(request).await;
+    }
+
+    tracing::warn!(
+        target: "api_server.auth.permission_denied",
+        user_id = %auth_info.user_id,
+        required = %name,
+        "rejected mutation: caller lacks required permission",
+    );
+    crate::error_catalog::ApiError::permission_denied(name).into_response()
+}
+
+/// Direct in-handler check used by handlers that don't take a
+/// `route_layer` (typically because the same Axum path serves both a
+/// read and a mutate verb, and only the mutating verb should gate).
+/// Returns `Ok(())` to proceed, `Err(ApiError)` to short-circuit with
+/// a 403.
+///
+/// Mode matrix mirrors [`enforce_permission_layer`]: soft mode is a
+/// no-op; strict mode enforces. Use the route-layer form when
+/// possible — it keeps the policy at the router definition site
+/// rather than buried in handler bodies.
+pub fn enforce_permission(
+    auth: &AuthInfo,
+    required: Permission,
+    name: &'static str,
+) -> Result<(), crate::error_catalog::ApiError> {
+    if !require_auth_enabled() {
+        return Ok(());
+    }
+    if auth.permissions.contains(&required) {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "api_server.auth.permission_denied",
+        user_id = %auth.user_id,
+        required = %name,
+        "rejected mutation: caller lacks required permission",
+    );
+    Err(crate::error_catalog::ApiError::permission_denied(name))
+}
+
+/// Route layer for endpoints that introduce new geometry into the
+/// model: `/api/geometry` (POST), `/api/geometry/extrude` (POST),
+/// `/api/sketch/{id}/extrude` (POST), `/api/sketch/{id}/revolve`
+/// (POST), …
+pub async fn require_create_geometry(request: Request, next: Next) -> Response {
+    enforce_permission_layer(Permission::CreateGeometry, "create_geometry", request, next).await
+}
+
+/// Route layer for endpoints that mutate an existing solid in place:
+/// fillet, chamfer, shell, mirror, pattern, boolean, face-extrude,
+/// transform, …
+pub async fn require_modify_geometry(request: Request, next: Next) -> Response {
+    enforce_permission_layer(Permission::ModifyGeometry, "modify_geometry", request, next).await
+}
+
+/// Route layer for endpoints that delete a solid from the model.
+pub async fn require_delete_geometry(request: Request, next: Next) -> Response {
+    enforce_permission_layer(Permission::DeleteGeometry, "delete_geometry", request, next).await
+}
+
+/// Route layer for endpoints that export geometry to STL/OBJ/STEP/…
+pub async fn require_export_geometry(request: Request, next: Next) -> Response {
+    enforce_permission_layer(Permission::ExportGeometry, "export_geometry", request, next).await
 }
 
 /// Validate JWT token
@@ -472,5 +607,57 @@ mod tests {
     #[tokio::test]
     async fn test_auth_middleware() {
         // Test implementation
+    }
+
+    /// Mode/permission matrix for `enforce_permission`. Env-var
+    /// mutation is racy across the whole test process, so the
+    /// matrix is collapsed into one test that toggles
+    /// `ROSHERA_REQUIRE_AUTH` deterministically and asserts every
+    /// arm before restoring the prior state.
+    #[test]
+    fn enforce_permission_mode_matrix() {
+        // Snapshot + clear the env so the test is hermetic regardless
+        // of what the surrounding harness or other tests left behind.
+        let prior = std::env::var("ROSHERA_REQUIRE_AUTH").ok();
+        std::env::remove_var("ROSHERA_REQUIRE_AUTH");
+
+        let granted = AuthInfo {
+            user_id: "alice".into(),
+            session_id: None,
+            permissions: vec![Permission::ModifyGeometry],
+            roles: vec![],
+            is_api_key: false,
+        };
+        let anon = AuthInfo {
+            user_id: "anonymous".into(),
+            session_id: None,
+            permissions: vec![],
+            roles: vec![],
+            is_api_key: false,
+        };
+
+        // Soft mode (REQUIRE_AUTH unset): always permitted, even
+        // for anonymous identities. Preserves dev-frontend compat.
+        assert!(enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok());
+        assert!(enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry").is_ok());
+
+        // Strict mode (REQUIRE_AUTH=1): permission must be present.
+        std::env::set_var("ROSHERA_REQUIRE_AUTH", "1");
+        assert!(enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok());
+        let denied = enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry");
+        assert!(denied.is_err(), "strict mode must reject anonymous mutation");
+        // Mismatched permission also rejects: holding ModifyGeometry
+        // does not grant DeleteGeometry.
+        let mismatched = enforce_permission(&granted, Permission::DeleteGeometry, "delete_geometry");
+        assert!(
+            mismatched.is_err(),
+            "strict mode must reject when the held scope differs from the required scope"
+        );
+
+        // Restore env so neighbouring tests see the original state.
+        match prior {
+            Some(v) => std::env::set_var("ROSHERA_REQUIRE_AUTH", v),
+            None => std::env::remove_var("ROSHERA_REQUIRE_AUTH"),
+        }
     }
 }
