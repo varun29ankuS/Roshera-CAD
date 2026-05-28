@@ -306,17 +306,21 @@ impl TimelineHarness {
 
     /// Mark `branch` as Abandoned with a default reason. Tests that
     /// care about the reason string should use the timeline directly.
+    /// Passes `force = true` so harness-level tests can exercise the
+    /// abandon path on protected branches without per-test plumbing.
     pub fn abandon(&self, branch: BranchId) {
         self.timeline
-            .abandon_branch(branch, "harness: abandon".to_string())
+            .abandon_branch(branch, "harness: abandon".to_string(), true)
             .expect("harness: abandon must succeed");
     }
 
     /// Truncate `branch` at `cut_index`. Returns the number of events
     /// removed (same contract as [`Timeline::truncate_branch`]).
+    /// Passes `force = true` so harness-level tests can exercise the
+    /// truncate path on protected branches without per-test plumbing.
     pub fn truncate(&self, branch: BranchId, cut_index: EventIndex) -> usize {
         self.timeline
-            .truncate_branch(branch, cut_index)
+            .truncate_branch(branch, cut_index, true)
             .expect("harness: truncate must succeed")
     }
 

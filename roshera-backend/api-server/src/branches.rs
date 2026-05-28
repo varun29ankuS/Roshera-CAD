@@ -460,25 +460,27 @@ pub async fn get_branch(
 
 /// `DELETE /api/branches/{id}` — abandon a branch.
 ///
-/// Refuses to abandon `main`. Refuses to re-abandon a branch that is
-/// already abandoned / merged / completed (returns
-/// `branch_invalid_state`, 409). The branch's events stay in the
-/// timeline for forensics; only its `state` flips to
-/// `Abandoned { reason }`.
+/// Refuses to abandon `main` (or any other protected branch) via the
+/// kernel-level `Branch.protected` gate — surfaces as
+/// `branch_invalid_state` (409). Refuses to re-abandon a branch that
+/// is already abandoned / merged / completed with the same 409. The
+/// branch's events stay in the timeline for forensics; only its
+/// `state` flips to `Abandoned { reason }`.
 pub async fn delete_branch(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let bid = parse_branch_id(&id)?;
-    if bid.is_main() {
-        return Err(ApiError::new(
-            ErrorCode::BranchInvalidState,
-            "main branch cannot be abandoned".to_string(),
-        ));
-    }
     let timeline = state.timeline.read().await;
+    // `force = false` — HTTP DELETE never overrides protection. Admin
+    // tooling that needs to retire main goes through a separate code
+    // path with its own confirmation surface.
     timeline
-        .abandon_branch(bid, "abandoned via DELETE /api/branches".to_string())
+        .abandon_branch(
+            bid,
+            "abandoned via DELETE /api/branches".to_string(),
+            false,
+        )
         .map_err(map_timeline_err)?;
     Ok(StatusCode::NO_CONTENT)
 }

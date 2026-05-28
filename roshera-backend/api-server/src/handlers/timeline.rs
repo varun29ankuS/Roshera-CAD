@@ -1433,8 +1433,12 @@ pub async fn truncate_history(
     // following replay sees a consistent (position, branch_events) pair.
     let removed = {
         let timeline = state.timeline.read().await;
+        // `force = false` — HTTP-driven truncate never overrides the
+        // `Branch.protected` gate. Protected branches (main) reject
+        // truncation with a clean 500 here; admin tooling that needs
+        // to rewrite main's ledger goes through a separate path.
         timeline
-            .truncate_branch(branch_id, cut_index)
+            .truncate_branch(branch_id, cut_index, false)
             .map_err(|e| {
                 tracing::error!(
                     target: "timeline.truncate",
