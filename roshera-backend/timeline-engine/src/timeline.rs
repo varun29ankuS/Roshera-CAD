@@ -1,4 +1,41 @@
 //! Core Timeline implementation
+//!
+//! # Concurrency & atomicity boundary
+//!
+//! The Timeline is built on `DashMap` (shard-per-bucket) rather than a
+//! single coarse `RwLock`. This is what makes parallel AI branch
+//! exploration cheap: independent branches never contend on a global
+//! lock. The cost is that **no operation is atomic across more than one
+//! map** — `branches`, `branch_events`, `events`, `entity_events` and
+//! `session_positions` each linearize independently.
+//!
+//! Each public mutating method that touches more than one map documents
+//! the order in which it writes and the linearization point a concurrent
+//! reader can rely on. The general pattern is:
+//!
+//! 1. **Validate first, mutate later.** Read-only checks come before
+//!    any `insert` / `remove` / `state =`. A rejected request leaves
+//!    every map exactly as it was.
+//! 2. **Sequence-number burn is the linearization point for appends.**
+//!    `event_counter.fetch_add(SeqCst)` orders two concurrent
+//!    `add_operation` calls; subsequent `branch_events.insert(seq, …)`
+//!    is non-clobbering by construction.
+//! 3. **State flips are the linearization point for destructive ops.**
+//!    `truncate_branch` and `abandon_branch` flip `branch.state` last
+//!    so a reader who observes `Active` is guaranteed to see the
+//!    pre-truncate event prefix; a reader who observes `Abandoned`
+//!    sees the post-truncate prefix (with cascaded children scrubbed).
+//! 4. **`protected` is load-bearing.** Branches with `protected = true`
+//!    (currently only `BranchId::main`) reject destructive ops unless
+//!    the caller supplies `force = true`. The append path
+//!    (`add_operation`) does **not** check `protected` — main must
+//!    accept normal event appends — only the destructive paths do.
+//!
+//! This file intentionally does not introduce a per-branch `RwLock`.
+//! No known concurrency bug requires it, and adding one would
+//! re-introduce the contention the DashMap split was added to avoid.
+//! If a future invariant cannot be expressed with the above linearization
+//! points, revisit this comment first.
 
 use crate::branch::{MergeResult, MergeStatistics, MergeStrategy};
 use crate::error::{TimelineError, TimelineResult};
@@ -78,7 +115,8 @@ impl Timeline {
         let branches = DashMap::new();
 
         // Create main branch — protected by default. Truncate/abandon
-        // require force=true on protected branches.
+        // require force=true on protected branches (see
+        // `truncate_branch` / `abandon_branch`).
         let main_branch = Branch {
             id: BranchId::main(),
             name: "main".to_string(),
@@ -1064,15 +1102,30 @@ impl Timeline {
     ///    cascaded children are clamped the same way. Sessions on
     ///    untouched branches are not modified.
     ///
-    /// `BranchId::main` is allowed — truncation is a destructive but
-    /// well-defined ledger operation (the user has explicitly asked).
+    /// A `protected` branch (currently only `BranchId::main`) is
+    /// refused unless `force = true`. This is the runtime enforcement
+    /// of the previously-advisory `Branch.protected` flag — callers
+    /// that genuinely intend to rewrite main's ledger (admin tooling,
+    /// targeted tests of the cascade machinery) opt in explicitly.
     /// Returns the number of events removed from the *targeted* branch
     /// (cascaded removals from children are not counted).
     pub fn truncate_branch(
         &self,
         branch_id: BranchId,
         cut_index: EventIndex,
+        force: bool,
     ) -> TimelineResult<usize> {
+        // Protected-branch gate — fires *before* any read of
+        // `branch_events`, so a rejected call doesn't touch state.
+        if let Some(branch) = self.branches.get(&branch_id) {
+            if branch.protected && !force {
+                return Err(TimelineError::InvalidOperation(format!(
+                    "branch {} is protected; truncate requires force=true",
+                    branch_id
+                )));
+            }
+        }
+
         let to_remove: Vec<(EventIndex, EventId)> = {
             let branch_events = self
                 .branch_events
@@ -1206,17 +1259,27 @@ impl Timeline {
     /// `BranchState::Abandoned { reason }` so listing endpoints can
     /// filter it out and merge endpoints can refuse to operate on it.
     ///
-    /// `BranchId::main` is never allowed to be abandoned.
-    pub fn abandon_branch(&self, branch_id: BranchId, reason: String) -> TimelineResult<()> {
-        if branch_id.is_main() {
-            return Err(TimelineError::InvalidOperation(
-                "main branch cannot be abandoned".to_string(),
-            ));
-        }
+    /// A `protected` branch (currently only `BranchId::main`) is
+    /// refused unless `force = true`. This replaces the previous
+    /// hardcoded `is_main()` check with a load-bearing read of the
+    /// `Branch.protected` field, so any future protected branch (e.g.
+    /// a release-tagged baseline) is covered without further edits.
+    pub fn abandon_branch(
+        &self,
+        branch_id: BranchId,
+        reason: String,
+        force: bool,
+    ) -> TimelineResult<()> {
         let mut branch = self
             .branches
             .get_mut(&branch_id)
             .ok_or(TimelineError::BranchNotFound(branch_id))?;
+        if branch.protected && !force {
+            return Err(TimelineError::InvalidOperation(format!(
+                "branch {} is protected; abandon requires force=true",
+                branch_id
+            )));
+        }
         match branch.state {
             BranchState::Active => {
                 branch.state = BranchState::Abandoned { reason };
@@ -1719,7 +1782,7 @@ mod tests {
             .await
             .unwrap();
         timeline
-            .abandon_branch(side, "user discarded".to_string())
+            .abandon_branch(side, "user discarded".to_string(), false)
             .unwrap();
 
         let err = timeline
@@ -1914,7 +1977,11 @@ mod tests {
             .update_session_position(session, BranchId::main(), 3)
             .unwrap();
 
-        let removed = timeline.truncate_branch(BranchId::main(), 2).unwrap();
+        // force=true: this test exercises the cascade machinery on main,
+        // which is the protected branch.
+        let removed = timeline
+            .truncate_branch(BranchId::main(), 2, true)
+            .unwrap();
         assert_eq!(removed, 1, "exactly one event removed from main (key 2)");
 
         // Cascade: child's fork_point.event_index (2) >= cut_index (2),
@@ -2065,9 +2132,76 @@ mod tests {
             .await
             .unwrap();
         assert!(timeline.is_branch_active(&side));
-        timeline.abandon_branch(side, "drop".to_string()).unwrap();
+        timeline
+            .abandon_branch(side, "drop".to_string(), false)
+            .unwrap();
         assert!(!timeline.is_branch_active(&side));
         // Unknown branch — also not active.
         assert!(!timeline.is_branch_active(&BranchId::new()));
+    }
+
+    /// A protected branch (`main`) must refuse `abandon_branch` when
+    /// `force = false`, and the rejection must not flip its state.
+    #[tokio::test]
+    async fn abandon_branch_rejects_protected_without_force() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let err = timeline
+            .abandon_branch(BranchId::main(), "should be refused".to_string(), false)
+            .expect_err("protected branch must reject abandon without force");
+        assert!(matches!(err, TimelineError::InvalidOperation(_)));
+        assert!(
+            timeline.is_branch_active(&BranchId::main()),
+            "rejected abandon must not flip state"
+        );
+        timeline
+            .validate()
+            .expect("rejected abandon must not corrupt state");
+    }
+
+    /// A protected branch (`main`) accepts `abandon_branch` when the
+    /// caller opts in with `force = true`.
+    #[tokio::test]
+    async fn abandon_branch_accepts_protected_with_force() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        timeline
+            .abandon_branch(BranchId::main(), "admin override".to_string(), true)
+            .expect("force=true must override protection");
+        assert!(!timeline.is_branch_active(&BranchId::main()));
+        timeline
+            .validate()
+            .expect("forced abandon must leave timeline valid");
+    }
+
+    /// A protected branch (`main`) must refuse `truncate_branch` when
+    /// `force = false`, and no events may be removed.
+    #[tokio::test]
+    async fn truncate_branch_rejects_protected_without_force() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+
+        let err = timeline
+            .truncate_branch(BranchId::main(), 0, false)
+            .expect_err("protected branch must reject truncate without force");
+        assert!(matches!(err, TimelineError::InvalidOperation(_)));
+
+        // Event count unchanged.
+        let events = timeline
+            .get_branch_events(&BranchId::main(), None, None)
+            .expect("main branch events");
+        assert_eq!(
+            events.len(),
+            2,
+            "rejected truncate must leave event prefix intact"
+        );
+        timeline
+            .validate()
+            .expect("rejected truncate must not corrupt state");
     }
 }

@@ -101,7 +101,9 @@ async fn run(steps: Vec<Step>) {
                 if b == BranchId::main() {
                     continue;
                 }
-                let _ = h.timeline().abandon_branch(b, "proptest".to_string());
+                // Proptest filters out main above; non-main branches are
+                // unprotected and accept abandon without force.
+                let _ = h.timeline().abandon_branch(b, "proptest".to_string(), false);
                 live.remove(i);
             }
             Step::Truncate {
@@ -118,7 +120,10 @@ async fn run(steps: Vec<Step>) {
                     .map(|v| v.len())
                     .unwrap_or(0) as u64;
                 let cut = (cut_index as u64).min(len);
-                let _ = h.timeline().truncate_branch(b, cut);
+                // Truncate can target main (protected) — force=true so
+                // the proptest exercises the cascade machinery on every
+                // branch uniformly.
+                let _ = h.timeline().truncate_branch(b, cut, true);
             }
         }
 
