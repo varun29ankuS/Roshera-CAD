@@ -74,6 +74,42 @@ impl EdgeClassification {
     pub fn is_manifold(&self) -> bool {
         matches!(self.manifold_kind, ManifoldKind::Manifold)
     }
+
+    /// Typed convex / concave / G1 view of the cached signed dihedral.
+    /// `None` when no two-face dihedral exists (boundary, non-manifold,
+    /// or a robust-angle failure left `dihedral_angle` undefined).
+    pub fn dihedral_class(&self) -> Option<DihedralClass> {
+        self.dihedral_angle?;
+        Some(match self.convexity {
+            1 => DihedralClass::Convex,
+            -1 => DihedralClass::Concave,
+            _ => DihedralClass::G1Smooth,
+        })
+    }
+
+    /// `true` iff this edge is a G1-smooth (tangent-continuous) join —
+    /// the case that carries no LMD footpoint and is dropped from CD.
+    #[inline]
+    pub fn is_g1(&self) -> bool {
+        matches!(self.dihedral_class(), Some(DihedralClass::G1Smooth))
+    }
+}
+
+/// Convex / concave / G1 classification of a manifold edge's dihedral.
+///
+/// Sign convention matches thesis Eq 1.27 (`α = ⟨n₁ × n₂, t₁₂⟩`):
+/// `Convex` for `0 < α < π`, `Concave` for `−π < α < 0`, `G1Smooth` at
+/// `α ≈ 0` (the two faces share a tangent plane). G1 edges carry no LMD
+/// footpoint and are dropped from collision detection; convex and concave
+/// edges receive different normal-cone treatment downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DihedralClass {
+    /// Tangent-continuous join (`α ≈ 0`).
+    G1Smooth,
+    /// Convex edge (`0 < α < π`) — material removed at the join.
+    Convex,
+    /// Concave edge (`−π < α < 0`) — material added at the join.
+    Concave,
 }
 
 /// Find every face whose outer or inner loop references `edge_id`.
@@ -157,6 +193,17 @@ pub fn classify_edge(model: &BRepModel, edge_id: EdgeId) -> OperationResult<Edge
             sharpness: 1.0,
         }),
     }
+}
+
+/// Classify `edge_id` and return its typed [`DihedralClass`], or `None`
+/// for boundary / non-manifold / undefined edges. Read-only convenience
+/// over [`classify_edge`] for the topology consumers (supermaximal
+/// grouping, CD) that want the enum rather than the raw i8/f32.
+pub fn classify_dihedral(
+    model: &BRepModel,
+    edge_id: EdgeId,
+) -> OperationResult<Option<DihedralClass>> {
+    Ok(classify_edge(model, edge_id)?.dihedral_class())
 }
 
 /// Two-face dihedral classification. The convexity-sign convention
@@ -401,6 +448,50 @@ mod tests {
             classified += 1;
         }
         assert_eq!(classified, 12);
+    }
+
+    #[test]
+    fn box_edges_classify_as_convex_dihedral() {
+        let mut model = build_unit_box();
+        classify_all_unclassified_edges(&mut model).expect("classify");
+        for (eid, _) in model.edges.iter() {
+            let class = classify_dihedral(&model, eid)
+                .expect("classify_dihedral should succeed")
+                .expect("a box edge has a defined dihedral");
+            assert_eq!(class, DihedralClass::Convex, "box edge {} should be convex", eid);
+        }
+    }
+
+    #[test]
+    fn dihedral_class_maps_convexity_and_g1() {
+        let convex = EdgeClassification {
+            manifold_kind: ManifoldKind::Manifold,
+            dihedral_angle: Some(0.5),
+            convexity: 1,
+            sharpness: 1.0,
+        };
+        assert_eq!(convex.dihedral_class(), Some(DihedralClass::Convex));
+        assert!(!convex.is_g1());
+
+        let concave = EdgeClassification {
+            convexity: -1,
+            dihedral_angle: Some(-0.5),
+            ..convex
+        };
+        assert_eq!(concave.dihedral_class(), Some(DihedralClass::Concave));
+
+        let g1 = EdgeClassification {
+            convexity: 0,
+            dihedral_angle: Some(0.0),
+            sharpness: 0.0,
+            ..convex
+        };
+        assert_eq!(g1.dihedral_class(), Some(DihedralClass::G1Smooth));
+        assert!(g1.is_g1());
+
+        // Boundary / undefined edges have no dihedral class.
+        assert_eq!(EdgeClassification::UNCLASSIFIED.dihedral_class(), None);
+        assert!(!EdgeClassification::UNCLASSIFIED.is_g1());
     }
 
     #[test]
