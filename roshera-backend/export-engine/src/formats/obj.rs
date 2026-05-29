@@ -60,8 +60,13 @@ pub fn generate_obj(mesh: &Mesh, name: &str) -> Result<String, ExportError> {
     Ok(content)
 }
 
+// AUDIT-L: scoped `pub` → private. The function lives under
+// `#[cfg(test)]` and has no non-test caller anywhere in the workspace
+// (verified by grep). `pub` here promised an export surface that does
+// not exist outside of the local `mod tests` and would have leaked
+// into downstream crates' test builds if any were added.
 #[cfg(test)]
-pub fn export_obj_with_material(
+fn export_obj_with_material(
     mesh: &Mesh,
     material: &MaterialProperties,
     name: &str,

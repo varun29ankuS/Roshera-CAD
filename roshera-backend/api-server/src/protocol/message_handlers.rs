@@ -242,9 +242,12 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     info!("WebSocket connection established, waiting for JoinSession request...");
 
     // Send welcome message
+    // AUDIT-L: server_version sourced from the api-server crate's Cargo
+    // version rather than a "1.0.0" literal so the wire surface tracks
+    // actual releases instead of bit-rotting against the manifest.
     let welcome = ServerMessage::Welcome {
         connection_id: user_id.clone(),
-        server_version: "1.0.0".to_string(),
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
         capabilities: vec![
             "geometry".to_string(),
             "timeline".to_string(),

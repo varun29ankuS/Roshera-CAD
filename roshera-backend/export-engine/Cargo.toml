@@ -17,6 +17,10 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util"] }
 byteorder = "1.5"
+# AUDIT-L: advisory log on STL binary-header truncation in
+# `formats/stl.rs::generate_binary_stl`. No other call site in this
+# crate emits diagnostics today; this is the single sink.
+tracing = { workspace = true }
 
 # Format-level dependencies that remain after ros-format extraction —
 # `formats/ros.rs` and `formats/timeline_chunk.rs` still serialize

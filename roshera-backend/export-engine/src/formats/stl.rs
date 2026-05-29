@@ -16,9 +16,28 @@ pub fn generate_binary_stl(mesh: &Mesh, name: &str) -> Result<Vec<u8>, ExportErr
 
     let mut buffer = Vec::new();
 
-    // Write 80-byte header
+    // Write 80-byte header.
+    //
+    // AUDIT-L: binary STL fixes the header at exactly 80 bytes (per the
+    // de-facto spec — see e.g. <https://www.fabbers.com/tech/STL_Format>).
+    // `resize(80, 0)` will silently *truncate* any prefix longer than 80
+    // bytes. The `"Binary STL - "` prefix consumes 13 bytes, leaving 67
+    // bytes for the caller-supplied `name`. Warn (rather than fail) when
+    // the formatted header overflows so callers see the loss in logs
+    // without us synthesising an error on what is, contractually, a
+    // valid binary STL.
     let header = format!("Binary STL - {}", name);
-    let mut header_bytes = header.as_bytes().to_vec();
+    let header_bytes_raw = header.as_bytes();
+    if header_bytes_raw.len() > 80 {
+        tracing::warn!(
+            requested_len = header_bytes_raw.len(),
+            name_len = name.len(),
+            "STL binary header exceeds the 80-byte spec limit; \
+             truncating (lost {} bytes from caller-supplied name)",
+            header_bytes_raw.len() - 80
+        );
+    }
+    let mut header_bytes = header_bytes_raw.to_vec();
     header_bytes.resize(80, 0);
     buffer
         .write_all(&header_bytes)
