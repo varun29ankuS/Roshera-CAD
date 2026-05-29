@@ -659,54 +659,41 @@ impl NurbsCurve {
             ders[0][j] = ndu[j][self.degree];
         }
 
-        // Compute derivatives (optimized)
+        // Compute derivatives (Piegl & Tiller A2.3). This block is scalar:
+        // SIMD applies to the basis-function fill above, where four parameter
+        // lanes share the recurrence. `rk = r - k` and `pk = degree - k` are
+        // signed because they legitimately go negative; the `j1`/`j2` bounds
+        // keep every `ndu` access in range, so no `rk >= 0` guard is needed.
+        // (Such a guard silently drops valid terms whenever `rk < 0`, which
+        // only happens at order ≥ 2 — corrupting second derivatives.)
         if num_derivatives > 0 {
+            let kmax = num_derivatives.min(self.degree);
             for r in 0..=self.degree {
-                let mut s1 = 0;
-                let mut s2 = 1;
+                let mut s1 = 0usize;
+                let mut s2 = 1usize;
                 a[0][0] = 1.0;
 
-                for k in 1..=num_derivatives.min(self.degree) {
+                for k in 1..=kmax {
                     let mut d = 0.0;
                     let rk = r as i32 - k as i32;
                     let pk = self.degree as i32 - k as i32;
 
                     if r >= k {
-                        a[s2][0] = a[s1][0] / ndu[pk as usize + 1][rk as usize];
+                        a[s2][0] = a[s1][0] / ndu[(pk + 1) as usize][rk as usize];
                         d = a[s2][0] * ndu[rk as usize][pk as usize];
                     }
 
                     let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                    let j2 = if r == 0 || (r - 1) <= pk as usize {
-                        if k > 0 {
-                            k - 1
-                        } else {
-                            0
-                        }
-                    } else {
-                        self.degree.saturating_sub(r)
-                    };
+                    let j2 = if (r as i32 - 1) <= pk { k - 1 } else { self.degree - r };
 
                     for j in j1..=j2 {
-                        if j > 0
-                            && rk >= 0
-                            && (rk as usize + j) < ndu.len()
-                            && (pk as usize + 1) < ndu.len()
-                        {
-                            let rk_idx = rk as usize + j;
-                            let pk_idx = pk as usize + 1;
-                            if rk_idx < ndu[pk_idx].len()
-                                && (rk as usize + j) < ndu.len()
-                                && (pk as usize) < ndu[rk_idx].len()
-                            {
-                                a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk_idx][rk as usize + j];
-                                d += a[s2][j] * ndu[rk as usize + j][pk as usize];
-                            }
-                        }
+                        let idx = (rk + j as i32) as usize;
+                        a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[(pk + 1) as usize][idx];
+                        d += a[s2][j] * ndu[idx][pk as usize];
                     }
 
-                    if r <= pk as usize {
-                        a[s2][k] = -a[s1][k - 1] / ndu[pk as usize + 1][r];
+                    if (r as i32) <= pk {
+                        a[s2][k] = -a[s1][k - 1] / ndu[(pk + 1) as usize][r];
                         d += a[s2][k] * ndu[r][pk as usize];
                     }
 
@@ -717,13 +704,13 @@ impl NurbsCurve {
                 }
             }
 
-            // Multiply by factorial
-            let mut r = self.degree;
-            for k in 1..=num_derivatives.min(self.degree) {
+            // Multiply through by the falling factorial p·(p-1)···(p-k+1).
+            let mut acc = self.degree as f64;
+            for k in 1..=kmax {
                 for j in 0..=self.degree {
-                    ders[k][j] *= r as f64;
+                    ders[k][j] *= acc;
                 }
-                r -= 1;
+                acc *= (self.degree - k) as f64;
             }
         }
 
@@ -1003,58 +990,46 @@ impl NurbsCurve {
             ndu[j][j] = saved;
         }
 
-        // Load basis functions
+        // Row 0 holds the basis functions themselves.
         for j in 0..=self.degree {
             ders[0][j] = ndu[j][self.degree];
         }
 
-        // Compute derivatives
+        // Derivative rows (Piegl & Tiller A2.3). `rk = r - k` and
+        // `pk = degree - k` are signed because they legitimately go negative;
+        // the `j1`/`j2` bounds keep every `ndu` access (`rk + j`, `pk + 1`)
+        // inside `0..=degree`, so no index can escape the table. (A prior
+        // `rk >= 0` guard silently dropped valid terms whenever `rk < 0`,
+        // which only occurs at order ≥ 2 — corrupting second derivatives while
+        // leaving first ones intact.) Orders above `degree` stay zero: a
+        // degree-`p` basis is `C^{p-1}`.
+        let kmax = num_derivatives.min(self.degree);
         for r in 0..=self.degree {
-            let mut s1 = 0;
-            let mut s2 = 1;
+            let mut s1 = 0usize;
+            let mut s2 = 1usize;
             a[0][0] = 1.0;
 
-            for k in 1..=num_derivatives.min(self.degree) {
+            for k in 1..=kmax {
                 let mut d = 0.0;
                 let rk = r as i32 - k as i32;
                 let pk = self.degree as i32 - k as i32;
 
                 if r >= k {
-                    a[s2][0] = a[s1][0] / ndu[pk as usize + 1][rk as usize];
+                    a[s2][0] = a[s1][0] / ndu[(pk + 1) as usize][rk as usize];
                     d = a[s2][0] * ndu[rk as usize][pk as usize];
                 }
 
                 let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                let j2 = if r == 0 || (r - 1) <= pk as usize {
-                    if k > 0 {
-                        k - 1
-                    } else {
-                        0
-                    }
-                } else {
-                    self.degree.saturating_sub(r)
-                };
+                let j2 = if (r as i32 - 1) <= pk { k - 1 } else { self.degree - r };
 
                 for j in j1..=j2 {
-                    if j > 0
-                        && rk >= 0
-                        && (rk as usize + j) < ndu.len()
-                        && (pk as usize + 1) < ndu.len()
-                    {
-                        let rk_idx = rk as usize + j;
-                        let pk_idx = pk as usize + 1;
-                        if rk_idx < ndu[pk_idx].len()
-                            && (rk as usize + j) < ndu.len()
-                            && (pk as usize) < ndu[rk_idx].len()
-                        {
-                            a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk_idx][rk as usize + j];
-                            d += a[s2][j] * ndu[rk as usize + j][pk as usize];
-                        }
-                    }
+                    let idx = (rk + j as i32) as usize;
+                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[(pk + 1) as usize][idx];
+                    d += a[s2][j] * ndu[idx][pk as usize];
                 }
 
-                if r <= pk as usize {
-                    a[s2][k] = -a[s1][k - 1] / ndu[pk as usize + 1][r];
+                if (r as i32) <= pk {
+                    a[s2][k] = -a[s1][k - 1] / ndu[(pk + 1) as usize][r];
                     d += a[s2][k] * ndu[r][pk as usize];
                 }
 
@@ -1063,13 +1038,13 @@ impl NurbsCurve {
             }
         }
 
-        // Multiply by factorial
-        let mut r = self.degree as f64;
-        for k in 1..=num_derivatives.min(self.degree) {
+        // Multiply through by the falling factorial p·(p-1)···(p-k+1).
+        let mut acc = self.degree as f64;
+        for k in 1..=kmax {
             for i in 0..=self.degree {
-                ders[k][i] *= r;
+                ders[k][i] *= acc;
             }
-            r *= (self.degree - k) as f64;
+            acc *= (self.degree - k) as f64;
         }
 
         ders
@@ -3192,6 +3167,77 @@ mod tests {
 
         assert!(result.derivative1.is_some());
         assert!(result.derivative2.is_some());
+    }
+
+    /// Ground-truth check of 1st and 2nd derivatives against a closed form.
+    ///
+    /// A degree-2 Bézier over the clamped knots `[0,0,0,1,1,1]` reproduces a
+    /// field exactly from its degree-2 Bézier control values. The control
+    /// values of `f(t)=t` are `[0, 0.5, 1]` and of `f(t)=t²` are `[0, 0, 1]`.
+    /// Packing them into the x- and y-fields gives control points
+    /// `P0=(0,0,0)`, `P1=(0.5,0,0)`, `P2=(1,1,0)`, so the curve is exactly
+    /// `C(t) = (t, t², 0)`. Hence `C'(t) = (1, 2t, 0)` and `C''(t) = (0,2,0)`
+    /// for every `t`. With unit weights the rational quotient-rule path
+    /// collapses to the polynomial result, so both derivatives must match the
+    /// closed form to round-off. This pins the Piegl & Tiller A2.3 recurrence
+    /// at derivative order 2 — the order at which `rk = r - k` first goes
+    /// negative and a stray `rk >= 0` guard would corrupt the result.
+    #[test]
+    fn curve_second_derivative_exact_on_quadratic_bezier() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.5, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let curve = NurbsCurve::new(control_points, weights, knots, 2).unwrap();
+
+        for &u in &[0.1, 0.25, 0.5, 0.6, 0.75, 0.9] {
+            let res = curve.evaluate_derivatives(u, 2);
+
+            // Position C(u) = (u, u², 0).
+            assert!((res.point.x - u).abs() < 1e-9, "x at u={u}");
+            assert!((res.point.y - u * u).abs() < 1e-9, "y at u={u}");
+
+            // First derivative C'(u) = (1, 2u, 0).
+            let d1 = res.derivative1.expect("first derivative present");
+            assert!((d1.x - 1.0).abs() < 1e-9, "d1.x at u={u}: {}", d1.x);
+            assert!((d1.y - 2.0 * u).abs() < 1e-9, "d1.y at u={u}: {}", d1.y);
+            assert!(d1.z.abs() < 1e-9, "d1.z at u={u}");
+
+            // Second derivative C''(u) = (0, 2, 0) — constant.
+            let d2 = res.derivative2.expect("second derivative present");
+            assert!(d2.x.abs() < 1e-9, "d2.x at u={u}: {}", d2.x);
+            assert!((d2.y - 2.0).abs() < 1e-9, "d2.y at u={u}: {}", d2.y);
+            assert!(d2.z.abs() < 1e-9, "d2.z at u={u}");
+        }
+    }
+
+    /// Same ground truth through the SIMD evaluation path, which uses
+    /// `basis_functions_derivatives_simd`. The derivative recurrence there is
+    /// scalar (SIMD applies only to the basis-function fill), so it must yield
+    /// the identical `(0,2,0)` second derivative.
+    #[test]
+    fn curve_second_derivative_exact_on_quadratic_bezier_simd() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.5, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        ];
+        let weights = vec![1.0, 1.0, 1.0];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let curve = NurbsCurve::new(control_points, weights, knots, 2).unwrap();
+
+        for &u in &[0.1, 0.5, 0.9] {
+            let res = curve.evaluate_derivatives_simd(u, 2);
+            let d1 = res.derivative1.expect("first derivative present");
+            let d2 = res.derivative2.expect("second derivative present");
+            assert!((d1.x - 1.0).abs() < 1e-9, "simd d1.x at u={u}");
+            assert!((d1.y - 2.0 * u).abs() < 1e-9, "simd d1.y at u={u}");
+            assert!(d2.x.abs() < 1e-9, "simd d2.x at u={u}");
+            assert!((d2.y - 2.0).abs() < 1e-9, "simd d2.y at u={u}: {}", d2.y);
+        }
     }
 
     #[test]
