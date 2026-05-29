@@ -256,6 +256,155 @@ impl Default for AuthConfig {
     }
 }
 
+impl AuthConfig {
+    /// Build [`AuthConfig`] by reading the documented `ROSHERA_*`
+    /// environment variables, falling back to [`AuthConfig::default`]
+    /// for any unset or unparseable value (AUDIT-M5).
+    ///
+    /// # Environment variables
+    ///
+    /// | Variable                              | Field                                       | Default          |
+    /// |---------------------------------------|---------------------------------------------|------------------|
+    /// | `ROSHERA_AUTH_ISSUER`                 | `issuer`                                    | `"roshera-cad"`  |
+    /// | `ROSHERA_AUTH_AUDIENCE` (comma-list)  | `audience`                                  | `["roshera-api"]`|
+    /// | `ROSHERA_TOKEN_EXPIRY_SECONDS`        | `token_expiry_seconds`                      | `3600`           |
+    /// | `ROSHERA_REFRESH_EXPIRY_SECONDS`      | `refresh_expiry_seconds`                    | `604800`         |
+    /// | `ROSHERA_IDLE_TIMEOUT_SECONDS`        | `idle_timeout_seconds`                      | `1800`           |
+    /// | `ROSHERA_MAX_FAILED_ATTEMPTS`         | `max_failed_attempts`                       | `5`              |
+    /// | `ROSHERA_LOCKOUT_DURATION_SECONDS`    | `lockout_duration_seconds`                  | `900`            |
+    /// | `ROSHERA_REQUIRE_2FA_SENSITIVE`       | `require_2fa_for_sensitive`                 | `true`           |
+    /// | `ROSHERA_API_KEY_PREFIX`              | `api_key_prefix`                            | `"rosh_"`        |
+    /// | `ROSHERA_PASSWORD_MIN_LENGTH`         | `password_requirements.min_length`          | `8`              |
+    /// | `ROSHERA_PASSWORD_REQUIRE_UPPERCASE`  | `password_requirements.require_uppercase`   | `true`           |
+    /// | `ROSHERA_PASSWORD_REQUIRE_LOWERCASE`  | `password_requirements.require_lowercase`   | `true`           |
+    /// | `ROSHERA_PASSWORD_REQUIRE_NUMBERS`    | `password_requirements.require_numbers`     | `true`           |
+    /// | `ROSHERA_PASSWORD_REQUIRE_SPECIAL`    | `password_requirements.require_special`     | `true`           |
+    ///
+    /// Booleans parse `"true"`/`"false"`/`"1"`/`"0"`/`"yes"`/`"no"`
+    /// case-insensitively. Anything else falls back to the default.
+    /// Integer fields fall back to the default on parse failure rather
+    /// than panicking — startup must succeed even with a typoed env.
+    pub fn from_env() -> Self {
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Testing seam for [`AuthConfig::from_env`]. Caller supplies the
+    /// environment-getter closure so tests can drive deterministic
+    /// values without racing on real-process env mutation.
+    pub(crate) fn from_env_with<F>(get: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let default = Self::default();
+        Self {
+            issuer: env_string(&get, "ROSHERA_AUTH_ISSUER", default.issuer),
+            audience: env_csv(&get, "ROSHERA_AUTH_AUDIENCE", default.audience),
+            token_expiry_seconds: env_i64(
+                &get,
+                "ROSHERA_TOKEN_EXPIRY_SECONDS",
+                default.token_expiry_seconds,
+            ),
+            refresh_expiry_seconds: env_i64(
+                &get,
+                "ROSHERA_REFRESH_EXPIRY_SECONDS",
+                default.refresh_expiry_seconds,
+            ),
+            idle_timeout_seconds: env_i64(
+                &get,
+                "ROSHERA_IDLE_TIMEOUT_SECONDS",
+                default.idle_timeout_seconds,
+            ),
+            max_failed_attempts: env_u32(
+                &get,
+                "ROSHERA_MAX_FAILED_ATTEMPTS",
+                default.max_failed_attempts,
+            ),
+            lockout_duration_seconds: env_i64(
+                &get,
+                "ROSHERA_LOCKOUT_DURATION_SECONDS",
+                default.lockout_duration_seconds,
+            ),
+            require_2fa_for_sensitive: env_bool(
+                &get,
+                "ROSHERA_REQUIRE_2FA_SENSITIVE",
+                default.require_2fa_for_sensitive,
+            ),
+            api_key_prefix: env_string(&get, "ROSHERA_API_KEY_PREFIX", default.api_key_prefix),
+            password_requirements: PasswordRequirements {
+                min_length: env_usize(
+                    &get,
+                    "ROSHERA_PASSWORD_MIN_LENGTH",
+                    default.password_requirements.min_length,
+                ),
+                require_uppercase: env_bool(
+                    &get,
+                    "ROSHERA_PASSWORD_REQUIRE_UPPERCASE",
+                    default.password_requirements.require_uppercase,
+                ),
+                require_lowercase: env_bool(
+                    &get,
+                    "ROSHERA_PASSWORD_REQUIRE_LOWERCASE",
+                    default.password_requirements.require_lowercase,
+                ),
+                require_numbers: env_bool(
+                    &get,
+                    "ROSHERA_PASSWORD_REQUIRE_NUMBERS",
+                    default.password_requirements.require_numbers,
+                ),
+                require_special: env_bool(
+                    &get,
+                    "ROSHERA_PASSWORD_REQUIRE_SPECIAL",
+                    default.password_requirements.require_special,
+                ),
+            },
+        }
+    }
+}
+
+fn env_string<F: Fn(&str) -> Option<String>>(get: &F, var: &str, default: String) -> String {
+    get(var).filter(|s| !s.is_empty()).unwrap_or(default)
+}
+
+fn env_csv<F: Fn(&str) -> Option<String>>(get: &F, var: &str, default: Vec<String>) -> Vec<String> {
+    match get(var) {
+        Some(raw) => {
+            let parsed: Vec<String> = raw
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if parsed.is_empty() {
+                default
+            } else {
+                parsed
+            }
+        }
+        None => default,
+    }
+}
+
+fn env_i64<F: Fn(&str) -> Option<String>>(get: &F, var: &str, default: i64) -> i64 {
+    get(var).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_u32<F: Fn(&str) -> Option<String>>(get: &F, var: &str, default: u32) -> u32 {
+    get(var).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_usize<F: Fn(&str) -> Option<String>>(get: &F, var: &str, default: usize) -> usize {
+    get(var).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_bool<F: Fn(&str) -> Option<String>>(get: &F, var: &str, default: bool) -> bool {
+    get(var)
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 impl AuthManager {
     /// Create new auth manager.
     ///
@@ -580,6 +729,15 @@ impl AuthManager {
                     }
                 }
 
+                // AUDIT-H9: enforce the per-key configured rate limit
+                // *before* marking the key as used. If the window is
+                // exhausted, reject without recording last_used or
+                // bumping the request counter — otherwise a hammering
+                // caller could keep extending the window out from
+                // under itself. The check is keyed by the API key's
+                // UUID, so it scopes per credential, not per client IP.
+                self.enforce_api_key_rate_limit(api_key)?;
+
                 // Update last used
                 drop(api_key);
                 if let Some(mut key) = self.api_keys.get_mut(&entry.key().clone()) {
@@ -797,6 +955,47 @@ impl AuthManager {
             .retain(|_, attempts| !attempts.is_empty());
     }
 
+    /// Enforce the per-API-key rate limit configured on `api_key`.
+    ///
+    /// Sliding-window counter over `rate_limit.window_seconds`, sharing
+    /// the `rate_limits` DashMap with the IP-scoped
+    /// [`check_rate_limit`](Self::check_rate_limit). Bucket key is the
+    /// API key's UUID, which cannot collide with IP-style client IDs
+    /// in practice (UUIDs are not valid `IpAddr` strings).
+    ///
+    /// The prune + count + decide + record sequence runs inside a
+    /// single `DashMap::entry` write guard, eliminating the TOCTOU
+    /// window between "check count" and "record request" that the
+    /// legacy `check_rate_limit` path carries.
+    ///
+    /// When `api_key.rate_limit` is `None` (legacy persisted keys
+    /// minted before AUDIT-H9), the limit is treated as unbounded
+    /// and the method returns `Ok(())` without recording. Keys
+    /// produced by [`create_api_key`](Self::create_api_key) always
+    /// receive the 1000 req/h default, so this branch is dead in
+    /// production after a key rotation.
+    fn enforce_api_key_rate_limit(&self, api_key: &ApiKey) -> Result<(), SessionError> {
+        let rate_limit = match &api_key.rate_limit {
+            Some(rl) => rl,
+            None => return Ok(()),
+        };
+        let max_requests = rate_limit.requests as usize;
+        let window = Duration::seconds(rate_limit.window_seconds as i64);
+        let now = Utc::now();
+        let cutoff = now - window;
+
+        let mut bucket = self
+            .rate_limits
+            .entry(api_key.id.clone())
+            .or_insert_with(Vec::new);
+        bucket.retain(|&t| t > cutoff);
+        if bucket.len() >= max_requests {
+            return Err(SessionError::RateLimitExceeded);
+        }
+        bucket.push(now);
+        Ok(())
+    }
+
     /// Check rate limit for a client
     pub fn check_rate_limit(&self, client_id: &str) -> Result<(), SessionError> {
         let now = Utc::now();
@@ -955,6 +1154,107 @@ mod tests {
         );
     }
 
+    /// AUDIT-H9: verify_api_key must consult the per-key rate limit
+    /// and reject once the configured window's request budget is
+    /// exhausted. The default limit minted by create_api_key is
+    /// 1000 req/h — too high to drive in a unit test — so we
+    /// mutate the cached key's rate_limit down to a tiny budget
+    /// before hammering verify.
+    #[test]
+    fn verify_api_key_enforces_rate_limit_when_window_exhausted() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+        let (raw_key, api_key) = auth
+            .create_api_key("user-rate", "rate-test", vec!["read".to_string()], None)
+            .unwrap();
+
+        // Shrink the budget to 3 requests per hour so the test can
+        // exhaust it deterministically. Direct DashMap mutation is
+        // fine here because tests share the module privacy boundary.
+        {
+            let mut entry = auth
+                .api_keys
+                .get_mut(&api_key.id)
+                .expect("api key cached after create_api_key");
+            entry.rate_limit = Some(RateLimit {
+                requests: 3,
+                window_seconds: 3600,
+            });
+        }
+
+        for i in 0..3 {
+            auth.verify_api_key(&raw_key)
+                .unwrap_or_else(|e| panic!("verify {} should pass within budget: {:?}", i, e));
+        }
+
+        match auth.verify_api_key(&raw_key) {
+            Err(SessionError::RateLimitExceeded) => {}
+            other => panic!(
+                "fourth verify must trip the rate limit, got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+
+    /// AUDIT-H9: a request that trips the rate limit must not be
+    /// recorded in the bucket, otherwise a hammering caller could
+    /// keep pushing the window edge forward and never recover.
+    #[test]
+    fn verify_api_key_rate_limit_rejection_does_not_record_request() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+        let (raw_key, api_key) = auth
+            .create_api_key("user-rate-2", "rate-test", vec!["read".to_string()], None)
+            .unwrap();
+        {
+            let mut entry = auth.api_keys.get_mut(&api_key.id).unwrap();
+            entry.rate_limit = Some(RateLimit {
+                requests: 1,
+                window_seconds: 3600,
+            });
+        }
+
+        auth.verify_api_key(&raw_key).expect("first verify passes");
+
+        // Now exhaust the budget. The rejected attempt must not
+        // bump the bucket count beyond the configured maximum.
+        assert!(matches!(
+            auth.verify_api_key(&raw_key),
+            Err(SessionError::RateLimitExceeded)
+        ));
+
+        let bucket_len = auth
+            .rate_limits
+            .get(&api_key.id)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        assert_eq!(
+            bucket_len, 1,
+            "rejected requests must not be recorded; bucket should still hold only the successful call"
+        );
+    }
+
+    /// AUDIT-H9: when a key has no rate_limit configured (legacy
+    /// persisted keys minted before this audit), verify_api_key
+    /// must continue to accept requests indefinitely. The default
+    /// from create_api_key always populates rate_limit, so this
+    /// path exists purely for backward-compatible loading.
+    #[test]
+    fn verify_api_key_no_limit_when_rate_limit_none() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+        let (raw_key, api_key) = auth
+            .create_api_key("user-rate-3", "rate-test", vec!["read".to_string()], None)
+            .unwrap();
+        {
+            let mut entry = auth.api_keys.get_mut(&api_key.id).unwrap();
+            entry.rate_limit = None;
+        }
+
+        // Hammer it — none should fail.
+        for i in 0..50 {
+            auth.verify_api_key(&raw_key)
+                .unwrap_or_else(|e| panic!("verify {} must pass with no rate limit: {:?}", i, e));
+        }
+    }
+
     #[test]
     fn test_lockout() {
         let mut config = AuthConfig::default();
@@ -979,5 +1279,140 @@ mod tests {
         auth.record_login_attempt("user123", true, None, None)
             .unwrap();
         assert!(!auth.is_locked_out("user123"));
+    }
+
+    /// AUDIT-M5 contract: with an empty environment, every field of
+    /// `from_env_with` matches `AuthConfig::default()`. Catches a
+    /// regression where a new field is added to `AuthConfig` but the
+    /// env mapping forgets to read it (would silently produce a
+    /// `Default::default()` value at runtime — fine in this test, but
+    /// the test exists to force the author to add an override case
+    /// below as well).
+    #[test]
+    fn from_env_with_empty_environment_matches_default() {
+        let cfg = AuthConfig::from_env_with(|_| None);
+        let default = AuthConfig::default();
+        assert_eq!(cfg.issuer, default.issuer);
+        assert_eq!(cfg.audience, default.audience);
+        assert_eq!(cfg.token_expiry_seconds, default.token_expiry_seconds);
+        assert_eq!(cfg.refresh_expiry_seconds, default.refresh_expiry_seconds);
+        assert_eq!(cfg.idle_timeout_seconds, default.idle_timeout_seconds);
+        assert_eq!(cfg.max_failed_attempts, default.max_failed_attempts);
+        assert_eq!(
+            cfg.lockout_duration_seconds,
+            default.lockout_duration_seconds
+        );
+        assert_eq!(
+            cfg.require_2fa_for_sensitive,
+            default.require_2fa_for_sensitive
+        );
+        assert_eq!(cfg.api_key_prefix, default.api_key_prefix);
+        assert_eq!(
+            cfg.password_requirements.min_length,
+            default.password_requirements.min_length
+        );
+        assert_eq!(
+            cfg.password_requirements.require_uppercase,
+            default.password_requirements.require_uppercase
+        );
+        assert_eq!(
+            cfg.password_requirements.require_lowercase,
+            default.password_requirements.require_lowercase
+        );
+        assert_eq!(
+            cfg.password_requirements.require_numbers,
+            default.password_requirements.require_numbers
+        );
+        assert_eq!(
+            cfg.password_requirements.require_special,
+            default.password_requirements.require_special
+        );
+    }
+
+    /// AUDIT-M5: every `ROSHERA_*` knob round-trips through
+    /// `from_env_with` to the corresponding `AuthConfig` field. The
+    /// closure supplies a `HashMap`-backed fake env so we never touch
+    /// the real process environment (the canonical Rust env-test race
+    /// hazard).
+    #[test]
+    fn from_env_with_overrides_every_field() {
+        use std::collections::HashMap;
+        let mut env = HashMap::new();
+        env.insert("ROSHERA_AUTH_ISSUER", "test-issuer");
+        env.insert("ROSHERA_AUTH_AUDIENCE", "api-a, api-b , api-c");
+        env.insert("ROSHERA_TOKEN_EXPIRY_SECONDS", "7200");
+        env.insert("ROSHERA_REFRESH_EXPIRY_SECONDS", "1209600");
+        env.insert("ROSHERA_IDLE_TIMEOUT_SECONDS", "900");
+        env.insert("ROSHERA_MAX_FAILED_ATTEMPTS", "10");
+        env.insert("ROSHERA_LOCKOUT_DURATION_SECONDS", "600");
+        env.insert("ROSHERA_REQUIRE_2FA_SENSITIVE", "true");
+        env.insert("ROSHERA_API_KEY_PREFIX", "tst_");
+        env.insert("ROSHERA_PASSWORD_MIN_LENGTH", "12");
+        env.insert("ROSHERA_PASSWORD_REQUIRE_UPPERCASE", "false");
+        env.insert("ROSHERA_PASSWORD_REQUIRE_LOWERCASE", "1");
+        env.insert("ROSHERA_PASSWORD_REQUIRE_NUMBERS", "no");
+        env.insert("ROSHERA_PASSWORD_REQUIRE_SPECIAL", "yes");
+
+        let cfg = AuthConfig::from_env_with(|k| env.get(k).map(|s| s.to_string()));
+
+        assert_eq!(cfg.issuer, "test-issuer");
+        assert_eq!(cfg.audience, vec!["api-a", "api-b", "api-c"]);
+        assert_eq!(cfg.token_expiry_seconds, 7200);
+        assert_eq!(cfg.refresh_expiry_seconds, 1_209_600);
+        assert_eq!(cfg.idle_timeout_seconds, 900);
+        assert_eq!(cfg.max_failed_attempts, 10);
+        assert_eq!(cfg.lockout_duration_seconds, 600);
+        assert!(cfg.require_2fa_for_sensitive);
+        assert_eq!(cfg.api_key_prefix, "tst_");
+        assert_eq!(cfg.password_requirements.min_length, 12);
+        assert!(!cfg.password_requirements.require_uppercase);
+        assert!(cfg.password_requirements.require_lowercase);
+        assert!(!cfg.password_requirements.require_numbers);
+        assert!(cfg.password_requirements.require_special);
+    }
+
+    /// AUDIT-M5: unparseable values fall back to the default field
+    /// rather than panicking at startup. A typoed env var must not
+    /// take the server down.
+    #[test]
+    fn from_env_with_unparseable_values_fall_back_to_default() {
+        use std::collections::HashMap;
+        let mut env = HashMap::new();
+        env.insert("ROSHERA_TOKEN_EXPIRY_SECONDS", "not-a-number");
+        env.insert("ROSHERA_MAX_FAILED_ATTEMPTS", "-7");
+        env.insert("ROSHERA_REQUIRE_2FA_SENSITIVE", "maybe");
+        env.insert("ROSHERA_PASSWORD_MIN_LENGTH", "");
+
+        let cfg = AuthConfig::from_env_with(|k| env.get(k).map(|s| s.to_string()));
+        let default = AuthConfig::default();
+        assert_eq!(cfg.token_expiry_seconds, default.token_expiry_seconds);
+        assert_eq!(cfg.max_failed_attempts, default.max_failed_attempts);
+        assert_eq!(
+            cfg.require_2fa_for_sensitive,
+            default.require_2fa_for_sensitive
+        );
+        assert_eq!(
+            cfg.password_requirements.min_length,
+            default.password_requirements.min_length
+        );
+    }
+
+    /// AUDIT-M5: empty CSV / whitespace-only entries are pruned, and
+    /// a CSV that yields zero non-empty entries falls back to the
+    /// default audience list (rather than silently shipping an empty
+    /// audience claim).
+    #[test]
+    fn from_env_with_audience_csv_handles_edge_cases() {
+        use std::collections::HashMap;
+        let mut env = HashMap::new();
+        env.insert("ROSHERA_AUTH_AUDIENCE", " , , ,,");
+        let cfg = AuthConfig::from_env_with(|k| env.get(k).map(|s| s.to_string()));
+        // All entries pruned → fallback to default.
+        assert_eq!(cfg.audience, AuthConfig::default().audience);
+
+        let mut env = HashMap::new();
+        env.insert("ROSHERA_AUTH_AUDIENCE", "  one  ,,  two  ");
+        let cfg = AuthConfig::from_env_with(|k| env.get(k).map(|s| s.to_string()));
+        assert_eq!(cfg.audience, vec!["one", "two"]);
     }
 }
