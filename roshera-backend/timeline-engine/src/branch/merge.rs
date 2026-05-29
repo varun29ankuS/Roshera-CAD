@@ -383,14 +383,22 @@ impl BranchMerger {
                     // Leave unresolved for manual resolution
                 }
 
-                ConflictStrategy::AI { .. } => {
-                    // AI resolution would be implemented here
-                    // For now, prefer source
-                    conflict.resolution = Some(ConflictResolution::UseSource);
-                    if let Some(event) = &conflict.source_event {
-                        merged_events.push(event.clone());
-                        auto_resolved += 1;
-                    }
+                ConflictStrategy::AI { model, .. } => {
+                    // AUDIT-M3: the AI conflict-resolution path was
+                    // previously a silent fallback to `PreferSource`,
+                    // which lied to the caller: a `ConflictStrategy::AI`
+                    // request would `auto_resolved += 1` without ever
+                    // consulting a model. Fail loud instead — callers
+                    // who explicitly opt into AI must be told that the
+                    // model dispatcher isn't wired so they can either
+                    // retry with `PreferSource`/`PreferTarget`/`Manual`
+                    // or wait until the AI bridge ships.
+                    return Err(TimelineError::NotImplemented(format!(
+                        "ConflictStrategy::AI requested model '{model}' but no \
+                         model dispatcher is wired into the merger; use \
+                         PreferSource / PreferTarget / PreferNewest / Manual \
+                         instead",
+                    )));
                 }
             }
         }
@@ -727,5 +735,135 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.merged_events.len(), 1);
         assert_eq!(result.conflicts.len(), 0);
+    }
+
+    /// AUDIT-M3 contract: a `ConflictStrategy::AI` request surfaces a
+    /// typed `NotImplemented` error instead of silently downgrading
+    /// to `PreferSource`. The previous behaviour lied to callers — a
+    /// merge requested as AI-resolved would report
+    /// `auto_resolved = N` without consulting any model.
+    ///
+    /// This test exercises the path indirectly through `merge` with
+    /// a real conflict: source and target both modify the same
+    /// entity after the common ancestor.
+    #[tokio::test]
+    async fn three_way_with_ai_strategy_returns_not_implemented() {
+        let merger = BranchMerger::new();
+        let entity = EntityId::new();
+        let mk_event = |seq: u64| TimelineEvent {
+            id: EventId::new(),
+            sequence_number: seq,
+            timestamp: Utc::now(),
+            author: Author::System,
+            operation: Operation::Modify {
+                entity,
+                modifications: vec![],
+            },
+            inputs: OperationInputs {
+                required_entities: vec![],
+                optional_entities: vec![],
+                parameters: serde_json::json!({}),
+            },
+            outputs: OperationOutputs::default(),
+            metadata: EventMetadata {
+                description: None,
+                branch_id: BranchId::new(),
+                tags: vec![],
+                properties: HashMap::new(),
+            },
+        };
+
+        let source_events = DashMap::new();
+        source_events.insert(10, mk_event(10));
+        let target_events = DashMap::new();
+        target_events.insert(11, mk_event(11));
+
+        let err = merger
+            .merge(
+                &source_events,
+                &target_events,
+                5,
+                MergeStrategy::ThreeWay {
+                    conflict_strategy: ConflictStrategy::AI {
+                        model: "claude-opus-4-6".to_string(),
+                        criteria: vec!["minimize-volume-delta".to_string()],
+                    },
+                },
+            )
+            .await
+            .expect_err("AI conflict strategy must surface NotImplemented, not silently fall back");
+
+        match err {
+            TimelineError::NotImplemented(msg) => {
+                assert!(
+                    msg.contains("ConflictStrategy::AI"),
+                    "error message should name the strategy; got: {msg}"
+                );
+                assert!(
+                    msg.contains("claude-opus-4-6"),
+                    "error message should echo the requested model; got: {msg}"
+                );
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    /// AUDIT-M3: the documented fallback strategies must keep working
+    /// after the AI-path tightening — a regression here would mean we
+    /// accidentally broke a real merge path. Drive `PreferSource`
+    /// through the same conflicting fixture and assert success.
+    #[tokio::test]
+    async fn three_way_with_prefer_source_still_resolves_conflicts() {
+        let merger = BranchMerger::new();
+        let entity = EntityId::new();
+        let mk_event = |seq: u64| TimelineEvent {
+            id: EventId::new(),
+            sequence_number: seq,
+            timestamp: Utc::now(),
+            author: Author::System,
+            operation: Operation::Modify {
+                entity,
+                modifications: vec![],
+            },
+            inputs: OperationInputs {
+                required_entities: vec![],
+                optional_entities: vec![],
+                parameters: serde_json::json!({}),
+            },
+            outputs: OperationOutputs::default(),
+            metadata: EventMetadata {
+                description: None,
+                branch_id: BranchId::new(),
+                tags: vec![],
+                properties: HashMap::new(),
+            },
+        };
+
+        let source_events = DashMap::new();
+        source_events.insert(10, mk_event(10));
+        let target_events = DashMap::new();
+        target_events.insert(11, mk_event(11));
+
+        let result = merger
+            .merge(
+                &source_events,
+                &target_events,
+                5,
+                MergeStrategy::ThreeWay {
+                    conflict_strategy: ConflictStrategy::PreferSource,
+                },
+            )
+            .await
+            .expect("PreferSource must continue to succeed on a routine conflict");
+
+        // The resolver should have recorded the conflict and assigned
+        // a `UseSource` resolution to it.
+        assert!(
+            result.conflicts.iter().all(|c| matches!(
+                c.resolution,
+                Some(ConflictResolution::UseSource)
+            )),
+            "every conflict should be resolved as UseSource"
+        );
     }
 }
