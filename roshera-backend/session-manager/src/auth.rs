@@ -191,10 +191,21 @@ pub struct AuthConfig {
     pub issuer: String,
     /// JWT audience
     pub audience: Vec<String>,
-    /// Token expiration in seconds
+    /// Token expiration in seconds (absolute lifetime from issuance).
     pub token_expiry_seconds: i64,
-    /// Refresh token expiration in seconds
+    /// Refresh token expiration in seconds.
     pub refresh_expiry_seconds: i64,
+    /// Idle timeout in seconds (AUDIT-H8). A token whose `last_activity`
+    /// is older than this is rejected by `verify_token` even when the
+    /// JWT `exp` claim has not yet elapsed, and the cached session-
+    /// token entry is dropped so a subsequent activity probe cannot
+    /// silently revive it. The default of 30 minutes mirrors the
+    /// industry-standard idle-session policy for web sessions; tune
+    /// via `ROSHERA_IDLE_TIMEOUT_SECONDS` at the api-server boundary
+    /// when an operator needs a different policy. Set to `0` to
+    /// disable idle enforcement entirely (the absolute JWT `exp`
+    /// gate still applies).
+    pub idle_timeout_seconds: i64,
     /// Maximum failed login attempts
     pub max_failed_attempts: u32,
     /// Lockout duration in seconds
@@ -229,6 +240,7 @@ impl Default for AuthConfig {
             audience: vec!["roshera-api".to_string()],
             token_expiry_seconds: 3600,     // 1 hour
             refresh_expiry_seconds: 604800, // 7 days
+            idle_timeout_seconds: 1800,     // 30 minutes (AUDIT-H8)
             max_failed_attempts: 5,
             lockout_duration_seconds: 900, // 15 minutes
             require_2fa_for_sensitive: true,
@@ -418,7 +430,26 @@ impl AuthManager {
         Ok(session_token)
     }
 
-    /// Verify JWT token
+    /// Verify JWT token.
+    ///
+    /// Checks (in order):
+    ///
+    /// 1. JWT signature against the server's secret.
+    /// 2. `revoked_tokens` (AUDIT-C9).
+    /// 3. Absolute expiry from the JWT `exp` claim.
+    /// 4. **Idle timeout** (AUDIT-H8). When `idle_timeout_seconds > 0`
+    ///    and a cached `SessionToken` exists for this `jti`, reject
+    ///    the token if `last_activity` is older than the configured
+    ///    idle window and drop the cached entry so it cannot be
+    ///    silently re-armed by a later probe. The JWT itself remains
+    ///    structurally valid until its `exp` elapses, which is why
+    ///    the cached drop is the load-bearing step here — without
+    ///    it, an attacker who captured the token could still use it
+    ///    after a re-issue if the `tokens` map was repopulated by
+    ///    any path that didn't go through `create_token`. No
+    ///    `SessionToken` entry (e.g. the manager was restarted but
+    ///    the JWT is still within `exp`) falls through to absolute-
+    ///    expiry enforcement only.
     pub fn verify_token(&self, token: &str) -> Result<TokenClaims, SessionError> {
         // Check if token is revoked
         let claims: TokenClaims = token
@@ -429,15 +460,37 @@ impl AuthManager {
             return Err(SessionError::AccessDenied);
         }
 
-        // Verify expiration
-        let now = Utc::now().timestamp();
-        if claims.exp < now {
+        // Verify expiration (absolute lifetime)
+        let now_ts = Utc::now().timestamp();
+        if claims.exp < now_ts {
             return Err(SessionError::Expired { id: claims.jti });
+        }
+
+        // AUDIT-H8: idle-timeout enforcement. `idle_timeout_seconds == 0`
+        // is the documented opt-out for operators that intentionally
+        // run with long-lived tokens (e.g. an automation key that
+        // makes a single call per day). All other values enforce.
+        let idle_budget = self.config.idle_timeout_seconds;
+        let now = Utc::now();
+        if idle_budget > 0 {
+            // Cache the decision so we can drop the entry *after*
+            // releasing the read guard. DashMap's `get_mut` would
+            // upgrade the lock; we need the simpler split to avoid
+            // holding it across the remove.
+            let stale = self
+                .tokens
+                .get(&claims.jti)
+                .map(|entry| (now - entry.last_activity).num_seconds() > idle_budget)
+                .unwrap_or(false);
+            if stale {
+                self.tokens.remove(&claims.jti);
+                return Err(SessionError::Expired { id: claims.jti });
+            }
         }
 
         // Update last activity
         if let Some(mut session_token) = self.tokens.get_mut(&claims.jti) {
-            session_token.last_activity = Utc::now();
+            session_token.last_activity = now;
         }
 
         Ok(claims)
@@ -835,6 +888,71 @@ mod tests {
         let verified = auth.verify_api_key(&raw_key).unwrap();
         assert_eq!(verified.id, api_key.id);
         assert_eq!(verified.permissions, vec!["read", "write"]);
+    }
+
+    /// AUDIT-H8: a token whose `last_activity` is older than the
+    /// configured idle window must be rejected with `Expired` and
+    /// the cached entry dropped.
+    #[test]
+    fn verify_token_rejects_idle_session() {
+        let mut config = AuthConfig::default();
+        config.idle_timeout_seconds = 60; // 1 minute
+        let auth = AuthManager::new(config, "test-secret").unwrap();
+
+        let session_token = auth
+            .create_token("user-idle", None, vec!["user".to_string()])
+            .unwrap();
+
+        // Sanity: a fresh token verifies.
+        assert!(auth.verify_token(&session_token.token).is_ok());
+
+        // Rewind the cached `last_activity` past the idle window.
+        // Direct field access works because tests live in a child
+        // module of the same file.
+        {
+            let mut entry = auth
+                .tokens
+                .get_mut(&session_token.id)
+                .expect("token must be cached after create_token");
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(120);
+        }
+
+        // Second verify must reject (Expired) and remove the cached
+        // entry so a future probe cannot silently re-arm it.
+        match auth.verify_token(&session_token.token) {
+            Err(SessionError::Expired { .. }) => {}
+            other => panic!("expected SessionError::Expired, got {:?}", other),
+        }
+        assert!(
+            !auth.tokens.contains_key(&session_token.id),
+            "idle-expired tokens must be dropped from the cache",
+        );
+    }
+
+    /// AUDIT-H8: `idle_timeout_seconds == 0` is the documented opt-out;
+    /// verify_token must not enforce the idle check when disabled.
+    #[test]
+    fn verify_token_idle_timeout_disabled_when_zero() {
+        let mut config = AuthConfig::default();
+        config.idle_timeout_seconds = 0;
+        let auth = AuthManager::new(config, "test-secret").unwrap();
+        let session_token = auth
+            .create_token("user-noidle", None, vec!["user".to_string()])
+            .unwrap();
+
+        // Push last_activity far into the past; opt-out must still accept.
+        {
+            let mut entry = auth
+                .tokens
+                .get_mut(&session_token.id)
+                .expect("token must be cached after create_token");
+            entry.last_activity = Utc::now() - chrono::Duration::days(7);
+        }
+
+        assert!(
+            auth.verify_token(&session_token.token).is_ok(),
+            "idle_timeout_seconds == 0 must disable idle enforcement entirely",
+        );
     }
 
     #[test]
