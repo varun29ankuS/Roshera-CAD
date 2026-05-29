@@ -61,9 +61,11 @@
 //! face tessellator (`tessellate_solid_parallel`).
 
 use super::TessellationParams;
-use crate::math::Point3;
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::curve::Curve;
 use crate::primitives::edge::EdgeId;
+use crate::primitives::face::FaceId;
+use crate::primitives::surface::Surface;
 use crate::primitives::topology_builder::BRepModel;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -152,7 +154,7 @@ impl EdgeSampleCache {
         // positions just shy of a diameter). Always use the full
         // triple-guard count.
         let is_closed_edge = edge.start_vertex == edge.end_vertex;
-        let n = if is_closed_edge {
+        let n_curve = if is_closed_edge {
             compute_curve_sample_count(curve, t_start, t_end, &self.params)
         } else {
             let mid = (t_start + t_end) * 0.5;
@@ -173,6 +175,33 @@ impl EdgeSampleCache {
                 _ => 1,
             }
         };
+
+        // CDT-γ.1: face-aware densification. A boundary edge must be
+        // sampled finely enough to match the interior triangle density
+        // each adjacent face's surface curvature demands, or Ruppert
+        // refinement keeps hitting boundary encroachment near curved faces
+        // and drops the encroaching interior Steiner points (option (c)).
+        // Take the max over the edge's adjacent faces of a surface-
+        // curvature-driven count. This is a pure function of (edge curve,
+        // adjacent surfaces, params), so every face bounding the edge
+        // derives the same `n` and shares one bit-exact sample set —
+        // shared-edge coherence is preserved by construction. Flat /
+        // ruled-along-the-edge faces contribute zero, so straight edges
+        // keep their two-sample collapse.
+        let mut n = n_curve;
+        for face_id in adjacent_faces_of(model, edge_id) {
+            if let Some(face) = model.faces.get(face_id) {
+                if let Some(surface) = model.surfaces.get(face.surface_id) {
+                    n = n.max(compute_face_boundary_sample_count(
+                        curve,
+                        t_start,
+                        t_end,
+                        surface,
+                        &self.params,
+                    ));
+                }
+            }
+        }
 
         // Emit n+1 samples spanning [t_start, t_end] inclusive of both
         // endpoints. Any individual point_at failure leaves a gap; the
@@ -264,6 +293,20 @@ pub(crate) fn compute_curve_sample_count(
         }
     }
 
+    sample_count_from_length_angle(total_length, total_angle, params)
+}
+
+/// The triple-guard sample count from a polyline's total chord length and
+/// total turning angle: the strictest of the max-edge-length,
+/// max-angle-deviation, and chord-tolerance (sagitta) constraints, floored
+/// at `min_segments.max(3)` and capped at `max_segments`. Shared by the
+/// curve-only probe ([`compute_curve_sample_count`]) and — without the
+/// floor — by the face-curvature probe ([`compute_face_boundary_sample_count`]).
+fn sample_count_from_length_angle(
+    total_length: f64,
+    total_angle: f64,
+    params: &TessellationParams,
+) -> usize {
     // 1. Arc-length constraint.
     let n_len = if params.max_edge_length > 0.0 && total_length > 0.0 {
         (total_length / params.max_edge_length).ceil() as usize
@@ -304,6 +347,119 @@ pub(crate) fn compute_curve_sample_count(
         .max(n_sag)
         .max(params.min_segments.max(3))
         .min(params.max_segments)
+}
+
+/// Surface-curvature-driven boundary sample count contributed by ONE
+/// adjacent face (CDT-γ.1). Probes the edge curve, projects each probe
+/// point onto `surface`, and accumulates the turning of the surface unit
+/// normal along the boundary plus the chord length. Returns a count from
+/// the angle + sagitta constraints only — NO min-segment floor and NO
+/// length-only term — so a boundary lying on a flat (or ruled-along-the-
+/// edge) face contributes zero and the curve-only count governs, while a
+/// face that bends along the boundary contributes a count proportional to
+/// that bending. The caller takes the max over adjacent faces.
+fn compute_face_boundary_sample_count(
+    curve: &dyn Curve,
+    t_start: f64,
+    t_end: f64,
+    surface: &dyn Surface,
+    params: &TessellationParams,
+) -> usize {
+    const PROBE: usize = 16;
+    let tol = Tolerance::default();
+
+    let mut pts: Vec<Option<Point3>> = Vec::with_capacity(PROBE + 1);
+    let mut normals: Vec<Option<Vector3>> = Vec::with_capacity(PROBE + 1);
+    for i in 0..=PROBE {
+        let t = t_start + (i as f64) * (t_end - t_start) / (PROBE as f64);
+        match curve.point_at(t) {
+            Ok(p) => {
+                let n = surface
+                    .closest_point(&p, tol)
+                    .ok()
+                    .and_then(|(u, v)| surface.normal_at(u, v).ok());
+                pts.push(Some(p));
+                normals.push(n);
+            }
+            Err(_) => {
+                pts.push(None);
+                normals.push(None);
+            }
+        }
+    }
+
+    let mut total_length = 0.0_f64;
+    for i in 1..pts.len() {
+        if let (Some(a), Some(b)) = (pts[i - 1], pts[i]) {
+            total_length += (b - a).magnitude();
+        }
+    }
+    let mut total_angle = 0.0_f64;
+    for i in 1..normals.len() {
+        if let (Some(a), Some(b)) = (normals[i - 1], normals[i]) {
+            total_angle += a.dot(&b).clamp(-1.0, 1.0).acos();
+        }
+    }
+    // Flat / ruled-along-the-edge boundary: no surface-curvature demand.
+    if total_angle <= 1e-9 {
+        return 0;
+    }
+
+    let n_angle = if params.max_angle_deviation > 0.0 {
+        (total_angle / params.max_angle_deviation).ceil() as usize
+    } else {
+        0
+    };
+    let n_sag = if params.chord_tolerance > 0.0 && total_length > 0.0 {
+        let radius = total_length / total_angle;
+        if params.chord_tolerance < radius {
+            let theta_seg = 2.0 * (1.0 - params.chord_tolerance / radius).acos();
+            if theta_seg > 0.0 {
+                (total_angle / theta_seg).ceil() as usize
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    n_angle.max(n_sag).min(params.max_segments)
+}
+
+/// Faces whose outer or inner loop references `edge_id`, found by walking
+/// the model's shells. Kept local so the tessellation layer needs no
+/// dependency on `operations`; mirrors the model-wide adjacency walk used
+/// by edge classification.
+fn adjacent_faces_of(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
+    let mut faces: Vec<FaceId> = Vec::with_capacity(2);
+    for shell_entry in model.shells.iter() {
+        let (_shell_id, shell) = shell_entry;
+        for &face_id in &shell.faces {
+            if faces.contains(&face_id) {
+                continue;
+            }
+            let face = match model.faces.get(face_id) {
+                Some(f) => f,
+                None => continue,
+            };
+            let touches = model
+                .loops
+                .get(face.outer_loop)
+                .map_or(false, |l| l.edges.iter().any(|&e| e == edge_id))
+                || face.inner_loops.iter().any(|&il| {
+                    model
+                        .loops
+                        .get(il)
+                        .map_or(false, |l| l.edges.iter().any(|&e| e == edge_id))
+                });
+            if touches {
+                faces.push(face_id);
+            }
+        }
+    }
+    faces
 }
 
 #[cfg(test)]
@@ -434,6 +590,49 @@ mod tests {
             n >= params.min_segments.max(3),
             "closed circle should sample at least min_segments={} times; got {n}",
             params.min_segments.max(3)
+        );
+    }
+
+    #[test]
+    fn face_boundary_count_zero_on_flat_plane() {
+        // A straight edge lying on a flat plane: the surface normal is
+        // constant along it, so the face-curvature term contributes no
+        // extra boundary samples (the curve-only count governs, keeping
+        // straight box edges collapsed to two samples).
+        use crate::primitives::curve::Line;
+        use crate::primitives::surface::Plane;
+        let plane = Plane::xy(0.0);
+        let line = Line::new(Point3::new(-1.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0));
+        let params = TessellationParams::default();
+        let n = compute_face_boundary_sample_count(&line, 0.0, 1.0, &plane, &params);
+        assert_eq!(
+            n, 0,
+            "a straight edge on a flat plane needs no surface-curvature densification"
+        );
+    }
+
+    #[test]
+    fn face_boundary_count_positive_on_curved_surface() {
+        // The equator circle lies on the sphere; the surface normal
+        // (radial) turns through 2π as the curve is traversed, so the face
+        // demands a denser boundary than a flat face would.
+        use crate::primitives::curve::Circle;
+        use crate::primitives::surface::Sphere;
+        let r = 2.0;
+        let sphere = Sphere::new(Point3::new(0.0, 0.0, 0.0), r).expect("sphere must construct");
+        let circle =
+            Circle::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, r).expect("circle must construct");
+        let params = TessellationParams::default();
+        let n = compute_face_boundary_sample_count(
+            &circle,
+            0.0,
+            std::f64::consts::TAU,
+            &sphere,
+            &params,
+        );
+        assert!(
+            n > 0,
+            "a curved edge on a sphere should request surface-curvature densification, got {n}"
         );
     }
 }
