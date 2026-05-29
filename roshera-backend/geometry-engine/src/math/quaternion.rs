@@ -249,10 +249,26 @@ impl Quaternion {
         }
     }
 
-    /// Fast normalize without error checking
+    /// Fast normalize without error checking.
     ///
     /// # Safety
-    /// Caller must ensure quaternion magnitude is not near zero.
+    ///
+    /// Marked `unsafe` purely as a precondition gate — the body is pure
+    /// arithmetic and cannot cause memory unsafety. The caller must
+    /// uphold:
+    ///
+    /// - `self.magnitude() > f64::EPSILON.sqrt()` (≈ `1.49e-8`),
+    ///   equivalently `magnitude_squared() > f64::EPSILON`.
+    ///
+    /// Violating it yields `NaN` or `±∞`-tainted components and breaks
+    /// every downstream rotation. Use
+    /// [`normalize_or_identity`](Self::normalize_or_identity) when the
+    /// precondition cannot be proven statically — it returns the
+    /// identity quaternion (`w=1, x=y=z=0`) for under-tolerance input
+    /// instead of producing poisoned values.
+    ///
+    /// AUDIT-M2: documented precondition explicitly so reviewers can
+    /// audit each call site against this contract.
     #[inline(always)]
     pub unsafe fn normalize_unchecked(&self) -> Self {
         let inv_mag = 1.0 / self.magnitude();

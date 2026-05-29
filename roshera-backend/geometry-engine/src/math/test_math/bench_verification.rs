@@ -21,7 +21,16 @@ struct TimingResult {
     ops_per_sec: f64,
 }
 
-// Helper function to prevent compiler optimization
+// Helper function to prevent compiler optimization.
+//
+// AUDIT-M2 SAFETY: `ptr::read_volatile` performs a bitwise copy of `T`.
+// To avoid double-drop of any resources the original `val` owned, the
+// original binding is `mem::forget`-ten immediately after the read.
+// The volatile read is what the optimizer must not elide. Callers must
+// only pass values whose bitwise duplication is sound — every `T` in
+// this benchmark suite is either `Copy` (f64 / arrays / Point3) or
+// `Vec<f64>`-typed return where `forget` correctly suppresses the
+// original allocation drop.
 fn black_box_return<T>(val: T) -> T {
     let ret = unsafe { std::ptr::read_volatile(&val) };
     std::mem::forget(val);

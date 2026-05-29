@@ -171,7 +171,19 @@ macro_rules! perf_critical_loop {
         let iter = $iter;
         let size = iter.len();
 
-        // Pre-fetch hint for CPU
+        // Pre-fetch hint for CPU.
+        //
+        // AUDIT-M2 SAFETY: `_mm_prefetch` is a CPU hint, not a memory
+        // load. Per the Intel ISA reference and Rust's `core::arch`
+        // docs, the prefetch instruction is fault-suppressed — invalid
+        // or unmapped pointers do **not** trigger SIGSEGV; the CPU
+        // silently drops the request. The only precondition the
+        // `unsafe` block formally requires is that this binary was
+        // built for an x86_64 target that supports SSE (mandatory in
+        // x86_64 baseline since 2003), which the outer
+        // `#[cfg(target_arch = "x86_64")]` already guarantees. The
+        // strategy hint `3` is `_MM_HINT_T0` (prefetch to all cache
+        // levels), the standard choice for sequentially-consumed data.
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::_mm_prefetch;
