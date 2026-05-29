@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use shared_types::{ObjectId, SessionError};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::warn;
 
 /// User role in a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -148,8 +147,6 @@ pub struct PermissionManager {
     session_permissions: Arc<DashMap<String, SessionPermissions>>,
     /// Object permissions by object ID
     object_permissions: Arc<DashMap<ObjectId, ObjectPermissions>>,
-    /// Permission policies
-    policies: Arc<DashMap<String, PermissionPolicy>>,
 }
 
 /// Session-wide permissions
@@ -169,128 +166,31 @@ pub struct SessionPermissions {
     pub max_users: usize,
 }
 
-/// Permission policy
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PermissionPolicy {
-    /// Policy name
-    pub name: String,
-    /// Policy description
-    pub description: String,
-    /// Rules in the policy
-    pub rules: Vec<PolicyRule>,
-    /// Is policy active
-    pub active: bool,
-}
-
-/// Policy rule
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicyRule {
-    /// Rule condition
-    pub condition: RuleCondition,
-    /// Action to take
-    pub action: RuleAction,
-    /// Priority (higher = evaluated first)
-    pub priority: i32,
-}
-
-/// Rule conditions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RuleCondition {
-    /// User has role
-    UserHasRole(Role),
-    /// User is in group
-    UserInGroup(String),
-    /// Time-based condition
-    TimeBased {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    },
-    /// Resource limit
-    ResourceLimit { resource: String, limit: u64 },
-    /// Custom condition
-    Custom(String),
-}
-
-/// Rule actions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RuleAction {
-    /// Grant permission
-    Grant(Permission),
-    /// Deny permission
-    Deny(Permission),
-    /// Set role
-    SetRole(Role),
-    /// Execute custom action
-    Custom(String),
-}
+// AUDIT-M4: the policy-machinery types (`PermissionPolicy`,
+// `PolicyRule`, `RuleCondition`, `RuleAction`) and the
+// `PermissionManager::policies` / `register_default_policies` /
+// `apply_policy` / `evaluate_condition` / `apply_action` surfaces
+// were removed in this slice. Two reasons:
+//   1. The two seeded "default policies" (owner_policy, editor_policy)
+//      were strictly redundant with the role-grant table inside
+//      `role_has_permission` — `Role::Owner` already returns `true`
+//      for every permission, so the policy that "grants
+//      DeleteSession to Owners" added zero behaviour.
+//   2. `apply_policy` had no callers in the workspace. The
+//      conditions `UserInGroup`, `ResourceLimit`, and `Custom` had
+//      no backing schema (groups, counters, custom-predicate
+//      registry) and could only fail-closed.
+// A future policy layer should land alongside the schema it depends
+// on, not as a free-standing surface that cannot evaluate its own
+// conditions.
 
 impl PermissionManager {
     /// Create new permission manager
     pub fn new() -> Self {
-        let mut manager = Self {
+        Self {
             session_permissions: Arc::new(DashMap::new()),
             object_permissions: Arc::new(DashMap::new()),
-            policies: Arc::new(DashMap::new()),
-        };
-
-        // Register default policies
-        manager.register_default_policies();
-        manager
-    }
-
-    /// Register default permission policies
-    fn register_default_policies(&mut self) {
-        // Owner policy
-        let owner_policy = PermissionPolicy {
-            name: "owner_policy".to_string(),
-            description: "Default permissions for session owners".to_string(),
-            rules: vec![
-                PolicyRule {
-                    condition: RuleCondition::UserHasRole(Role::Owner),
-                    action: RuleAction::Grant(Permission::DeleteSession),
-                    priority: 100,
-                },
-                PolicyRule {
-                    condition: RuleCondition::UserHasRole(Role::Owner),
-                    action: RuleAction::Grant(Permission::InviteUsers),
-                    priority: 100,
-                },
-                PolicyRule {
-                    condition: RuleCondition::UserHasRole(Role::Owner),
-                    action: RuleAction::Grant(Permission::ChangeRoles),
-                    priority: 100,
-                },
-            ],
-            active: true,
-        };
-        self.policies
-            .insert("owner_policy".to_string(), owner_policy);
-
-        // Editor policy
-        let editor_policy = PermissionPolicy {
-            name: "editor_policy".to_string(),
-            description: "Default permissions for editors".to_string(),
-            rules: vec![
-                PolicyRule {
-                    condition: RuleCondition::UserHasRole(Role::Editor),
-                    action: RuleAction::Grant(Permission::CreateGeometry),
-                    priority: 90,
-                },
-                PolicyRule {
-                    condition: RuleCondition::UserHasRole(Role::Editor),
-                    action: RuleAction::Grant(Permission::ModifyGeometry),
-                    priority: 90,
-                },
-                PolicyRule {
-                    condition: RuleCondition::UserHasRole(Role::Editor),
-                    action: RuleAction::Grant(Permission::DeleteGeometry),
-                    priority: 90,
-                },
-            ],
-            active: true,
-        };
-        self.policies
-            .insert("editor_policy".to_string(), editor_policy);
+        }
     }
 
     /// Create session permissions
@@ -609,144 +509,6 @@ impl PermissionManager {
             .collect())
     }
 
-    /// Apply policy to session
-    pub fn apply_policy(&self, session_id: &str, policy_name: &str) -> Result<(), SessionError> {
-        let policy = self
-            .policies
-            .get(policy_name)
-            .ok_or_else(|| SessionError::NotFound {
-                id: policy_name.to_string(),
-            })?;
-
-        if !policy.active {
-            return Ok(());
-        }
-
-        let session_perms =
-            self.session_permissions
-                .get(session_id)
-                .ok_or_else(|| SessionError::NotFound {
-                    id: session_id.to_string(),
-                })?;
-
-        // Apply rules to all users
-        for user_entry in session_perms.users.iter() {
-            let user_perms = user_entry.value();
-
-            // Sort rules by priority
-            let mut rules = policy.rules.clone();
-            rules.sort_by_key(|r| -r.priority);
-
-            // Apply rules
-            for rule in rules {
-                if self.evaluate_condition(&rule.condition, &user_perms) {
-                    self.apply_action(session_id, &user_perms.user_id, &rule.action, "policy")?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Evaluate rule condition.
-    ///
-    /// Conditions whose evaluation requires data the current schema does
-    /// not carry (group membership, resource counters, custom predicate
-    /// registry) fail closed — they return `false` so the rule does not
-    /// fire. This is the safe default in an authorization context: an
-    /// unevaluable condition must never cause a `Grant` rule to apply.
-    /// Each unevaluable site emits a `warn!` so operators can detect rules
-    /// that depend on unimplemented capabilities.
-    fn evaluate_condition(&self, condition: &RuleCondition, user: &UserPermissions) -> bool {
-        match condition {
-            RuleCondition::UserHasRole(role) => user.role == *role,
-            RuleCondition::UserInGroup(group) => {
-                // `UserPermissions` has no `groups` field; group membership
-                // is not part of the v1 schema. Fail closed.
-                warn!(
-                    user_id = %user.user_id,
-                    group = %group,
-                    "RuleCondition::UserInGroup evaluated against schema with no group support; \
-                     rule will not fire"
-                );
-                false
-            }
-            RuleCondition::TimeBased { start, end } => {
-                let now = Utc::now();
-                now >= *start && now <= *end
-            }
-            RuleCondition::ResourceLimit { resource, limit } => {
-                // Per-user resource counters are not yet tracked in the
-                // permission manager. Fail closed (was previously `true`,
-                // which caused `Grant` rules with this condition to apply
-                // unconditionally — a security regression).
-                warn!(
-                    user_id = %user.user_id,
-                    resource = %resource,
-                    limit = limit,
-                    "RuleCondition::ResourceLimit evaluated without counter tracking; \
-                     rule will not fire"
-                );
-                false
-            }
-            RuleCondition::Custom(expr) => {
-                // No custom-predicate registry is plumbed in at this
-                // layer; a future extension would dispatch on `expr`.
-                // Fail closed.
-                warn!(
-                    user_id = %user.user_id,
-                    expression = %expr,
-                    "RuleCondition::Custom evaluated with no registered predicate; \
-                     rule will not fire"
-                );
-                false
-            }
-        }
-    }
-
-    /// Apply rule action
-    fn apply_action(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        action: &RuleAction,
-        applied_by: &str,
-    ) -> Result<(), SessionError> {
-        match action {
-            RuleAction::Grant(permission) => {
-                self.grant_permission(session_id, user_id, *permission, applied_by)
-            }
-            RuleAction::Deny(permission) => {
-                self.deny_permission(session_id, user_id, *permission, applied_by)
-            }
-            RuleAction::SetRole(role) => {
-                if let Some(session_perms) = self.session_permissions.get(session_id) {
-                    if let Some(mut user_perms) = session_perms.users.get_mut(user_id) {
-                        user_perms.role = *role;
-                        user_perms.updated_at = Utc::now();
-                        user_perms.granted_by = applied_by.to_string();
-                    }
-                }
-                Ok(())
-            }
-            RuleAction::Custom(name) => {
-                // No custom-action registry is plumbed in at this layer;
-                // a future extension would look `name` up against a table
-                // of `Box<dyn Fn(&PermissionManager, ...) -> Result>`.
-                // Until then we ignore it (the rule's condition has
-                // already passed evaluation) and emit a warn so operators
-                // see unbound action references.
-                warn!(
-                    session_id = %session_id,
-                    user_id = %user_id,
-                    action = %name,
-                    applied_by = %applied_by,
-                    "RuleAction::Custom referenced with no registered handler; action skipped"
-                );
-                Ok(())
-            }
-        }
-    }
 }
 
 impl Default for PermissionManager {
