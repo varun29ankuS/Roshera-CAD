@@ -5580,11 +5580,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize session management components
     let broadcast_manager = session_manager::broadcast::BroadcastManager::new();
     let session_manager = Arc::new(SessionManager::new(broadcast_manager));
+    // AUDIT-H8: idle timeout sourced from `ROSHERA_IDLE_TIMEOUT_SECONDS`
+    // so operators can tune the policy without rebuilding. Default
+    // 1800 (30 min) matches `AuthConfig::default()`. Set to 0 to
+    // disable idle enforcement.
+    let idle_timeout_seconds: i64 = std::env::var("ROSHERA_IDLE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1800);
+
     let auth_config = session_manager::auth::AuthConfig {
         issuer: "roshera-cad".to_string(),
         audience: vec!["roshera-api".to_string()],
         token_expiry_seconds: 3600,        // 1 hour
         refresh_expiry_seconds: 86400 * 7, // 7 days
+        idle_timeout_seconds,
         max_failed_attempts: 5,
         lockout_duration_seconds: 300, // 5 minutes
         require_2fa_for_sensitive: false,

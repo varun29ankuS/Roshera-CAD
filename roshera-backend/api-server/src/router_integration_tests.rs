@@ -99,6 +99,7 @@ async fn make_test_state() -> AppState {
         audience: vec!["roshera-api-test".to_string()],
         token_expiry_seconds: 3600,
         refresh_expiry_seconds: 86400,
+        idle_timeout_seconds: 1800,
         max_failed_attempts: 5,
         lockout_duration_seconds: 300,
         require_2fa_for_sensitive: false,
