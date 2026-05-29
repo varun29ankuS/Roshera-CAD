@@ -175,6 +175,81 @@ pub fn evaluate_biquartic(control: &[[Point3; 5]; 5], u: f64, v: f64) -> PatchEv
     evaluate_patch(&net, u, v)
 }
 
+/// A single rational tensor-product Bézier patch extracted from a NURBS
+/// surface: one polynomial/rational segment carrying no interior knots.
+///
+/// The control net is `(degree_u + 1) × (degree_v + 1)`, indexed
+/// `control_points[i][j]` with `i` running in u and `j` in v, each with a
+/// matching positive `weights[i][j]`. `domain_u` / `domain_v` record the
+/// `(start, end)` parameter interval this patch occupies in the parent NURBS
+/// surface, so a footpoint found in the patch's local `[0,1]²` coordinates can
+/// be mapped back to the parent surface (and vice versa).
+///
+/// Produced by [`crate::math::nurbs::NurbsSurface::to_bezier_patches`]. This is
+/// the substrate the CD-φ Bézier pipeline (de Casteljau split, control-net
+/// OBB, closest-point Newton) operates on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BezierPatch {
+    /// Degree in the u direction (`control_points.len() == degree_u + 1`).
+    pub degree_u: usize,
+    /// Degree in the v direction (`control_points[0].len() == degree_v + 1`).
+    pub degree_v: usize,
+    /// Control points, row-major `[i][j]` (i in u, j in v).
+    pub control_points: Vec<Vec<Point3>>,
+    /// Weights, same grid shape as `control_points`, all positive.
+    pub weights: Vec<Vec<f64>>,
+    /// `(start, end)` of this patch's interval in the parent surface's u param.
+    pub domain_u: (f64, f64),
+    /// `(start, end)` of this patch's interval in the parent surface's v param.
+    pub domain_v: (f64, f64),
+}
+
+impl BezierPatch {
+    /// Evaluate the patch at local parameters `(u, v) ∈ [0, 1]²` using the
+    /// rational Bernstein tensor form
+    /// `S = Σ_ij B_i(u) B_j(v) w_ij P_ij / Σ_ij B_i(u) B_j(v) w_ij`.
+    ///
+    /// `u`/`v` are the patch-local coordinates, *not* parent-surface
+    /// parameters; map via [`BezierPatch::local_u`] / [`local_v`] when starting
+    /// from a parent parameter.
+    pub fn evaluate(&self, u: f64, v: f64) -> Point3 {
+        let mut num = Vector3::ZERO;
+        let mut den = 0.0;
+        for i in 0..=self.degree_u {
+            let bu = bernstein(self.degree_u, i, u);
+            for j in 0..=self.degree_v {
+                let w = self.weights[i][j] * bu * bernstein(self.degree_v, j, v);
+                num = num + self.control_points[i][j] * w;
+                den += w;
+            }
+        }
+        // den > 0: positive weights and Bernstein partition of unity.
+        num / den
+    }
+
+    /// Map a parent-surface u parameter into this patch's local `[0,1]`.
+    #[inline]
+    pub fn local_u(&self, parent_u: f64) -> f64 {
+        let (a, b) = self.domain_u;
+        if (b - a).abs() < f64::EPSILON {
+            0.0
+        } else {
+            (parent_u - a) / (b - a)
+        }
+    }
+
+    /// Map a parent-surface v parameter into this patch's local `[0,1]`.
+    #[inline]
+    pub fn local_v(&self, parent_v: f64) -> f64 {
+        let (a, b) = self.domain_v;
+        if (b - a).abs() < f64::EPSILON {
+            0.0
+        } else {
+            (parent_v - a) / (b - a)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
