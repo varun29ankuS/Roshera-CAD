@@ -132,3 +132,6 @@ business-docs/
 test_websocket.html
 check_frontend.js
 roshera-app/.vite/
+
+# Pending peer-review artifacts (not for commit until reviewed)
+CD_API_DESIGN_SKETCH.md
