@@ -184,10 +184,23 @@ impl Vector2 {
         }
     }
 
-    /// Fast normalize without error checking
+    /// Fast normalize without error checking.
     ///
     /// # Safety
-    /// Caller must ensure vector magnitude is not near zero.
+    ///
+    /// Marked `unsafe` purely as a precondition gate — the body is pure
+    /// arithmetic and cannot cause memory unsafety. The caller must
+    /// uphold:
+    ///
+    /// - `self.magnitude() > f64::EPSILON.sqrt()` (≈ `1.49e-8`),
+    ///   equivalently `magnitude_squared() > f64::EPSILON`.
+    ///
+    /// Violating it yields `NaN` or `±∞`-tainted components that
+    /// propagate silently. Use [`try_normalize`](Self::try_normalize)
+    /// when the precondition cannot be proven statically.
+    ///
+    /// AUDIT-M2: documented precondition explicitly so reviewers can
+    /// audit each call site against this contract.
     #[inline(always)]
     pub unsafe fn normalize_unchecked(&self) -> Self {
         let inv_mag = 1.0 / self.magnitude();
