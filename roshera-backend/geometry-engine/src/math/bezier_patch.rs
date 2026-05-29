@@ -15,6 +15,7 @@
 //! buffer recurrences. Matches the numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use crate::math::bbox::BBox;
 use crate::math::Point3;
 use crate::math::Vector3;
 
@@ -204,6 +205,16 @@ pub struct BezierPatch {
     pub domain_v: (f64, f64),
 }
 
+/// An oriented bounding box: a center, three orthonormal axes, and the
+/// half-extent of the box along each axis. Tighter than an AABB for control
+/// nets that are not axis-aligned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Obb3 {
+    pub center: Point3,
+    pub axes: [Vector3; 3],
+    pub half_extents: [f64; 3],
+}
+
 impl BezierPatch {
     /// Evaluate the patch at local parameters `(u, v) ∈ [0, 1]²` using the
     /// rational Bernstein tensor form
@@ -248,11 +259,470 @@ impl BezierPatch {
             (parent_v - a) / (b - a)
         }
     }
+
+    /// Split the patch in u at local parameter `t ∈ [0, 1]` via rational de
+    /// Casteljau in homogeneous coordinates. Returns `(left, right)` covering
+    /// parent u-intervals `[domain_u.0, mid]` and `[mid, domain_u.1]` with
+    /// `mid = domain_u.0 + t·(domain_u.1 − domain_u.0)`. Each half is
+    /// re-parametrised to its own local `[0,1]`, shares the split boundary
+    /// exactly, and reproduces the original surface over its sub-rectangle; the
+    /// v-direction is untouched.
+    pub fn split_u(&self, t: f64) -> (BezierPatch, BezierPatch) {
+        let nu = self.degree_u + 1;
+        let nv = self.degree_v + 1;
+        let mut left_pts = vec![vec![Point3::ZERO; nv]; nu];
+        let mut left_w = vec![vec![1.0; nv]; nu];
+        let mut right_pts = vec![vec![Point3::ZERO; nv]; nu];
+        let mut right_w = vec![vec![1.0; nv]; nu];
+        let mut col = vec![[0.0f64; 4]; nu];
+        for j in 0..nv {
+            for i in 0..nu {
+                col[i] = homogenize(self.control_points[i][j], self.weights[i][j]);
+            }
+            let (l, r) = decasteljau_split_homogeneous(&col, t);
+            for i in 0..nu {
+                let (lp, lw) = dehomogenize(l[i]);
+                left_pts[i][j] = lp;
+                left_w[i][j] = lw;
+                let (rp, rw) = dehomogenize(r[i]);
+                right_pts[i][j] = rp;
+                right_w[i][j] = rw;
+            }
+        }
+        let (a, b) = self.domain_u;
+        let mid = a + t * (b - a);
+        (
+            BezierPatch {
+                degree_u: self.degree_u,
+                degree_v: self.degree_v,
+                control_points: left_pts,
+                weights: left_w,
+                domain_u: (a, mid),
+                domain_v: self.domain_v,
+            },
+            BezierPatch {
+                degree_u: self.degree_u,
+                degree_v: self.degree_v,
+                control_points: right_pts,
+                weights: right_w,
+                domain_u: (mid, b),
+                domain_v: self.domain_v,
+            },
+        )
+    }
+
+    /// Split the patch in v at local parameter `t ∈ [0, 1]`. Mirror of
+    /// [`BezierPatch::split_u`] in the v-direction; returns `(lower, upper)`.
+    pub fn split_v(&self, t: f64) -> (BezierPatch, BezierPatch) {
+        let nu = self.degree_u + 1;
+        let nv = self.degree_v + 1;
+        let mut lower_pts = vec![vec![Point3::ZERO; nv]; nu];
+        let mut lower_w = vec![vec![1.0; nv]; nu];
+        let mut upper_pts = vec![vec![Point3::ZERO; nv]; nu];
+        let mut upper_w = vec![vec![1.0; nv]; nu];
+        let mut row = vec![[0.0f64; 4]; nv];
+        for i in 0..nu {
+            for j in 0..nv {
+                row[j] = homogenize(self.control_points[i][j], self.weights[i][j]);
+            }
+            let (l, u) = decasteljau_split_homogeneous(&row, t);
+            for j in 0..nv {
+                let (lp, lw) = dehomogenize(l[j]);
+                lower_pts[i][j] = lp;
+                lower_w[i][j] = lw;
+                let (up, uw) = dehomogenize(u[j]);
+                upper_pts[i][j] = up;
+                upper_w[i][j] = uw;
+            }
+        }
+        let (a, b) = self.domain_v;
+        let mid = a + t * (b - a);
+        (
+            BezierPatch {
+                degree_u: self.degree_u,
+                degree_v: self.degree_v,
+                control_points: lower_pts,
+                weights: lower_w,
+                domain_u: self.domain_u,
+                domain_v: (a, mid),
+            },
+            BezierPatch {
+                degree_u: self.degree_u,
+                degree_v: self.degree_v,
+                control_points: upper_pts,
+                weights: upper_w,
+                domain_u: self.domain_u,
+                domain_v: (mid, b),
+            },
+        )
+    }
+
+    /// Hodograph in u: the scaled control-point differences
+    /// `degree_u · (P[i+1][j] − P[i][j])`, a `degree_u × (degree_v + 1)` grid of
+    /// direction vectors. For a non-rational patch (equal weights) this is
+    /// exactly the control net of `∂S/∂u`, a degree-`(p−1, q)` Bézier patch; its
+    /// vectors bound the u-tangent directions by the convex-hull property
+    /// (thesis Eq 3.31, used for tangent-cone generation §3.3.3). For a rational
+    /// patch the exact `∂S/∂u` additionally needs the weight quotient rule, but
+    /// these differences remain valid tangent-direction generators for cone
+    /// bounding. Empty when `degree_u == 0`.
+    pub fn hodograph_u(&self) -> Vec<Vec<Vector3>> {
+        if self.degree_u == 0 {
+            return Vec::new();
+        }
+        let scale = self.degree_u as f64;
+        let nv = self.degree_v + 1;
+        (0..self.degree_u)
+            .map(|i| {
+                (0..nv)
+                    .map(|j| (self.control_points[i + 1][j] - self.control_points[i][j]) * scale)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Hodograph in v: mirror of [`BezierPatch::hodograph_u`]; a
+    /// `(degree_u + 1) × degree_v` grid of `degree_v · (P[i][j+1] − P[i][j])`.
+    pub fn hodograph_v(&self) -> Vec<Vec<Vector3>> {
+        if self.degree_v == 0 {
+            return Vec::new();
+        }
+        let scale = self.degree_v as f64;
+        let nu = self.degree_u + 1;
+        (0..nu)
+            .map(|i| {
+                (0..self.degree_v)
+                    .map(|j| (self.control_points[i][j + 1] - self.control_points[i][j]) * scale)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Axis-aligned bounding box of the control net. The convex-hull property of
+    /// the Bézier form guarantees the patch lies inside it. `None` only if the
+    /// control net is empty.
+    pub fn aabb(&self) -> Option<BBox> {
+        let pts: Vec<Point3> = self.control_points.iter().flatten().copied().collect();
+        BBox::from_points(&pts)
+    }
+
+    /// Oriented bounding box of the control net via PCA: the principal axes are
+    /// the eigenvectors of the control-point covariance (3×3 symmetric, solved
+    /// by Jacobi rotation) and the extents are the projection ranges along them.
+    /// Tighter than [`BezierPatch::aabb`] for diagonal patches; the convex-hull
+    /// property guarantees the patch is contained.
+    pub fn obb(&self) -> Obb3 {
+        let pts: Vec<Point3> = self.control_points.iter().flatten().copied().collect();
+        obb_from_points(&pts)
+    }
+}
+
+/// Lift a Cartesian control point + weight into homogeneous coordinates
+/// `(w·x, w·y, w·z, w)` for rational de Casteljau.
+#[inline]
+fn homogenize(p: Point3, w: f64) -> [f64; 4] {
+    [w * p.x, w * p.y, w * p.z, w]
+}
+
+/// Project a homogeneous point back to `(Cartesian point, weight)`.
+#[inline]
+fn dehomogenize(h: [f64; 4]) -> (Point3, f64) {
+    let w = h[3];
+    if w.abs() < 1e-12 {
+        (Point3::ZERO, w)
+    } else {
+        (Point3::new(h[0] / w, h[1] / w, h[2] / w), w)
+    }
+}
+
+/// De Casteljau split of a homogeneous control polygon at `t`. Returns the
+/// control points of the two sub-curves: `left` is the original restricted to
+/// `[0, t]`, `right` to `[t, 1]`, each re-parametrised to `[0, 1]`. `left` is
+/// the left edge of the de Casteljau triangle (`b_0^(r)`), `right` its
+/// hypotenuse (`b_{p-r}^(r)`); they share the split point `left[p] == right[0]`.
+fn decasteljau_split_homogeneous(pts: &[[f64; 4]], t: f64) -> (Vec<[f64; 4]>, Vec<[f64; 4]>) {
+    let p = pts.len() - 1;
+    let mut work = pts.to_vec();
+    let mut left = vec![[0.0f64; 4]; p + 1];
+    let mut right = vec![[0.0f64; 4]; p + 1];
+    left[0] = work[0];
+    right[p] = work[p];
+    for r in 1..=p {
+        for i in 0..=(p - r) {
+            for c in 0..4 {
+                work[i][c] = (1.0 - t) * work[i][c] + t * work[i + 1][c];
+            }
+        }
+        left[r] = work[0];
+        right[p - r] = work[p - r];
+    }
+    (left, right)
+}
+
+/// Oriented bounding box of a point set by principal-component analysis.
+fn obb_from_points(pts: &[Point3]) -> Obb3 {
+    let n = pts.len();
+    if n == 0 {
+        return Obb3 {
+            center: Point3::ZERO,
+            axes: [Vector3::X, Vector3::Y, Vector3::Z],
+            half_extents: [0.0; 3],
+        };
+    }
+    let mut sum = Vector3::ZERO;
+    for p in pts {
+        sum = sum + *p;
+    }
+    let centroid = sum / (n as f64);
+
+    // Symmetric covariance matrix of the centered points.
+    let mut cov = [[0.0f64; 3]; 3];
+    for p in pts {
+        let d = *p - centroid;
+        let da = [d.x, d.y, d.z];
+        for a in 0..3 {
+            for b in 0..3 {
+                cov[a][b] += da[a] * da[b];
+            }
+        }
+    }
+    for row in &mut cov {
+        for entry in row {
+            *entry /= n as f64;
+        }
+    }
+
+    let (axes, _eigenvalues) = jacobi_eigen_3x3(cov);
+
+    // Project the points onto each axis to find the extents.
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in pts {
+        let d = *p - centroid;
+        for k in 0..3 {
+            let proj = d.dot(&axes[k]);
+            if proj < lo[k] {
+                lo[k] = proj;
+            }
+            if proj > hi[k] {
+                hi[k] = proj;
+            }
+        }
+    }
+
+    let mut center = centroid;
+    let mut half_extents = [0.0f64; 3];
+    for k in 0..3 {
+        center = center + axes[k] * (0.5 * (lo[k] + hi[k]));
+        half_extents[k] = 0.5 * (hi[k] - lo[k]);
+    }
+    Obb3 {
+        center,
+        axes,
+        half_extents,
+    }
+}
+
+/// Eigen-decomposition of a 3×3 symmetric matrix by cyclic Jacobi rotations.
+/// Returns the orthonormal eigenvectors (as three `Vector3` columns) and the
+/// corresponding eigenvalues. Converges in a handful of sweeps for 3×3.
+fn jacobi_eigen_3x3(mut a: [[f64; 3]; 3]) -> ([Vector3; 3], [f64; 3]) {
+    let mut v = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    for _sweep in 0..32 {
+        let off = a[0][1].abs() + a[0][2].abs() + a[1][2].abs();
+        if off < 1e-18 {
+            break;
+        }
+        for &(p, q) in &[(0usize, 1usize), (0, 2), (1, 2)] {
+            let apq = a[p][q];
+            if apq.abs() < 1e-300 {
+                continue;
+            }
+            let phi = 0.5 * (a[q][q] - a[p][p]) / apq;
+            let t = if phi == 0.0 {
+                1.0
+            } else {
+                phi.signum() / (phi.abs() + (phi * phi + 1.0).sqrt())
+            };
+            let cs = 1.0 / (t * t + 1.0).sqrt();
+            let sn = t * cs;
+            // A <- Gᵀ A G : rotate columns p,q then rows p,q.
+            for k in 0..3 {
+                let akp = a[k][p];
+                let akq = a[k][q];
+                a[k][p] = cs * akp - sn * akq;
+                a[k][q] = sn * akp + cs * akq;
+            }
+            for k in 0..3 {
+                let apk = a[p][k];
+                let aqk = a[q][k];
+                a[p][k] = cs * apk - sn * aqk;
+                a[q][k] = sn * apk + cs * aqk;
+            }
+            // V <- V G
+            for k in 0..3 {
+                let vkp = v[k][p];
+                let vkq = v[k][q];
+                v[k][p] = cs * vkp - sn * vkq;
+                v[k][q] = sn * vkp + cs * vkq;
+            }
+        }
+    }
+    let eigenvalues = [a[0][0], a[1][1], a[2][2]];
+    let axes = [
+        Vector3::new(v[0][0], v[1][0], v[2][0]),
+        Vector3::new(v[0][1], v[1][1], v[2][1]),
+        Vector3::new(v[0][2], v[1][2], v[2][2]),
+    ];
+    (axes, eigenvalues)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a biquadratic *rational* Bézier patch (non-unit weights) for
+    /// split/AABB/OBB tests.
+    fn sample_rational_patch() -> BezierPatch {
+        let mut cp = Vec::new();
+        let mut w = Vec::new();
+        for i in 0..3 {
+            let mut crow = Vec::new();
+            let mut wrow = Vec::new();
+            for j in 0..3 {
+                crow.push(Point3::new(i as f64, j as f64, (i * j) as f64 * 0.3));
+                wrow.push(if (i, j) == (1, 1) { 2.0 } else { 1.0 });
+            }
+            cp.push(crow);
+            w.push(wrow);
+        }
+        BezierPatch {
+            degree_u: 2,
+            degree_v: 2,
+            control_points: cp,
+            weights: w,
+            domain_u: (0.0, 1.0),
+            domain_v: (0.0, 1.0),
+        }
+    }
+
+    #[test]
+    fn bezier_split_u_reproduces_original() {
+        let patch = sample_rational_patch();
+        let t = 0.4;
+        let (left, right) = patch.split_u(t);
+        for &s in &[0.0, 0.3, 0.7, 1.0] {
+            for &v in &[0.2, 0.8] {
+                let exp_left = patch.evaluate(s * t, v);
+                assert!(
+                    (left.evaluate(s, v) - exp_left).magnitude() < 1e-9,
+                    "left u at s={s}, v={v}"
+                );
+                let exp_right = patch.evaluate(t + s * (1.0 - t), v);
+                assert!(
+                    (right.evaluate(s, v) - exp_right).magnitude() < 1e-9,
+                    "right u at s={s}, v={v}"
+                );
+            }
+        }
+        assert!((left.domain_u.1 - right.domain_u.0).abs() < 1e-12);
+        assert!((left.domain_u.1 - t).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bezier_split_v_reproduces_original() {
+        let patch = sample_rational_patch();
+        let t = 0.65;
+        let (lower, upper) = patch.split_v(t);
+        for &u in &[0.1, 0.5, 0.9] {
+            for &s in &[0.0, 0.4, 1.0] {
+                let exp_lower = patch.evaluate(u, s * t);
+                assert!((lower.evaluate(u, s) - exp_lower).magnitude() < 1e-9);
+                let exp_upper = patch.evaluate(u, t + s * (1.0 - t));
+                assert!((upper.evaluate(u, s) - exp_upper).magnitude() < 1e-9);
+            }
+        }
+        assert!((lower.domain_v.1 - upper.domain_v.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bezier_aabb_bounds_control_net_and_surface() {
+        let patch = sample_rational_patch();
+        let bb = patch.aabb().unwrap();
+        for row in &patch.control_points {
+            for p in row {
+                assert!(p.x >= bb.min.x - 1e-12 && p.x <= bb.max.x + 1e-12);
+                assert!(p.y >= bb.min.y - 1e-12 && p.y <= bb.max.y + 1e-12);
+                assert!(p.z >= bb.min.z - 1e-12 && p.z <= bb.max.z + 1e-12);
+            }
+        }
+        let s = patch.evaluate(0.5, 0.5);
+        assert!(s.x >= bb.min.x - 1e-9 && s.x <= bb.max.x + 1e-9);
+        assert!(s.y >= bb.min.y - 1e-9 && s.y <= bb.max.y + 1e-9);
+        assert!(s.z >= bb.min.z - 1e-9 && s.z <= bb.max.z + 1e-9);
+    }
+
+    #[test]
+    fn bezier_obb_axes_orthonormal_and_contains_control_net() {
+        let patch = sample_rational_patch();
+        let obb = patch.obb();
+        for k in 0..3 {
+            assert!((obb.axes[k].magnitude() - 1.0).abs() < 1e-9, "axis {k} unit");
+        }
+        assert!(obb.axes[0].dot(&obb.axes[1]).abs() < 1e-9);
+        assert!(obb.axes[0].dot(&obb.axes[2]).abs() < 1e-9);
+        assert!(obb.axes[1].dot(&obb.axes[2]).abs() < 1e-9);
+        for row in &patch.control_points {
+            for p in row {
+                let d = *p - obb.center;
+                for k in 0..3 {
+                    assert!(
+                        d.dot(&obb.axes[k]).abs() <= obb.half_extents[k] + 1e-9,
+                        "control point outside OBB on axis {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bezier_hodograph_u_matches_known_derivative() {
+        // S(u,v) = (u, v, u² + v²): Bézier control values of u are [0,0.5,1],
+        // of u² are [0,0,1]. ∂S/∂u = (1, 0, 2u); its degree-(1,2) hodograph net
+        // has rows (1,0,0) and (1,0,2).
+        let xc = [0.0, 0.5, 1.0];
+        let zc = [0.0, 0.0, 1.0];
+        let mut cp = Vec::new();
+        let mut w = Vec::new();
+        for i in 0..3 {
+            let mut crow = Vec::new();
+            let mut wrow = Vec::new();
+            for j in 0..3 {
+                crow.push(Point3::new(xc[i], xc[j], zc[i] + zc[j]));
+                wrow.push(1.0);
+            }
+            cp.push(crow);
+            w.push(wrow);
+        }
+        let patch = BezierPatch {
+            degree_u: 2,
+            degree_v: 2,
+            control_points: cp,
+            weights: w,
+            domain_u: (0.0, 1.0),
+            domain_v: (0.0, 1.0),
+        };
+        let h = patch.hodograph_u();
+        assert_eq!(h.len(), 2);
+        for j in 0..3 {
+            assert!((h[0][j] - Vector3::new(1.0, 0.0, 0.0)).magnitude() < 1e-12);
+            assert!((h[1][j] - Vector3::new(1.0, 0.0, 2.0)).magnitude() < 1e-12);
+        }
+    }
 
     #[test]
     fn bernstein_partition_of_unity_cubic() {
