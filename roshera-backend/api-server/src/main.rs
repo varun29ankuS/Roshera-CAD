@@ -13,7 +13,6 @@ mod auth_middleware;
 mod blend_failed_harness;
 mod branches;
 mod csketch;
-mod delta_handlers;
 mod drawing_mgr;
 mod error_catalog;
 mod fillet_payload;
@@ -21,7 +20,6 @@ mod fillet_payload;
 mod fillet_radius_harness;
 mod frame;
 mod handlers;
-mod handlers_impl;
 mod idempotency;
 mod kernel_state;
 mod metrics;
@@ -77,8 +75,10 @@ use shared_types::{CommandResult, GeometryId};
 // Import regex for pattern matching
 use regex::Regex;
 
-// Import handler implementations
-use handlers_impl::*;
+// AUDIT-M6: `handlers_impl` deleted; all of its `pub async fn`s were
+// shadowed by either `handlers/*` modules or in-file `main.rs` handlers
+// (cargo had flagged every one of them as never-used). The `use
+// handlers_impl::*` glob is gone with the module.
 use part_mgr::ActiveModel;
 
 // Import handlers - modules are now in separate files
@@ -311,141 +311,21 @@ struct EnhancedAICommandRequest {
     use_cache: Option<bool>,
 }
 
-#[derive(Serialize)]
-struct AuthenticationRequest {
-    username: String,
-    password: String,
-    remember_me: Option<bool>,
-}
-
-#[derive(Serialize)]
-struct AuthenticationResponse {
-    success: bool,
-    token: Option<String>,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
-    user_id: Option<String>,
-    permissions: Option<Vec<String>>,
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: String,
-    version: String,
-    capabilities: Vec<String>,
-    database_connected: bool,
-    ai_providers: Vec<String>,
-    cache_status: String,
-    active_sessions: usize,
-}
+// AUDIT-M6: the local `AuthenticationRequest`, `AuthenticationResponse`,
+// and `HealthResponse` structs were removed — none were ever
+// constructed. Auth payloads now flow through `handlers::auth::*` types
+// and the `/health` route uses an inline `Json` value.
 
 use std::error::Error as StdError;
 
-// Wrapper functions for handlers that take AuthInfo
-// These allow the handlers to work with axum's routing system
-
-async fn get_geometry_wrapper(
-    State(state): State<AppState>,
-    active_model: ActiveModel,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    get_geometry(Extension(auth_info), State(state), active_model, Path(id)).await
-}
-
-async fn update_geometry_wrapper(
-    State(state): State<AppState>,
-    active_model: ActiveModel,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, error_catalog::ApiError> {
-    update_geometry(State(state), active_model, Path(id), Json(payload), auth_info).await
-}
-
-async fn delete_geometry_wrapper(
-    State(state): State<AppState>,
-    active_model: ActiveModel,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
-    delete_geometry(Extension(auth_info), State(state), active_model, Path(id)).await
-}
-
-async fn process_enhanced_ai_command_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-    Json(payload): Json<EnhancedAICommandRequest>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    process_enhanced_ai_command(Extension(auth_info), State(state), Json(payload)).await
-}
-
-async fn process_voice_command_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    process_voice_command(Extension(auth_info), State(state)).await
-}
-
-async fn list_sessions_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    list_sessions(Extension(auth_info), State(state)).await
-}
-
-async fn create_session_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    create_session(Extension(auth_info), State(state)).await
-}
-
-async fn get_session_wrapper(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    get_session(Extension(auth_info), State(state), Path(id)).await
-}
-
-async fn delete_session_wrapper(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<StatusCode, StatusCode> {
-    delete_session(Extension(auth_info), State(state), Path(id)).await
-}
-
-async fn join_session_wrapper(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<StatusCode, StatusCode> {
-    join_session(Extension(auth_info), State(state), Path(id)).await
-}
-
-async fn leave_session_wrapper(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<StatusCode, StatusCode> {
-    leave_session(Extension(auth_info), State(state), Path(id)).await
-}
-
-async fn get_user_permissions_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    get_user_permissions(State(state), auth_info).await
-}
-
-async fn list_roles_wrapper(
-    State(state): State<AppState>,
-    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    list_roles(State(state), auth_info).await
-}
+// AUDIT-M6: the 13 `*_wrapper` shims (get_geometry, update_geometry,
+// delete_geometry, process_enhanced_ai_command, process_voice_command,
+// list_sessions, create_session, get_session, delete_session,
+// join_session, leave_session, get_user_permissions, list_roles) were
+// removed — every one was flagged dead by cargo because the router
+// mounts the underlying `handlers::*` functions directly. Keeping
+// untyped forwarders around invites future drift between the wrapper
+// arg order and the real handler signature.
 
 /// Create a primitive solid via the live B-Rep kernel and return its
 /// tessellated mesh in a shape the frontend can drop straight into the
@@ -3681,216 +3561,13 @@ fn extract_single_dimension(text: &str, keyword: &str) -> Option<f64> {
     None
 }
 
-/// Extract coordinates from text
-fn extract_coordinates_from_text(
-    text: &str,
-) -> Result<(f64, f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-    let dimensions = extract_dimensions_from_text(text, 3)?;
-    Ok((
-        dimensions.get(0).copied().unwrap_or(0.0),
-        dimensions.get(1).copied().unwrap_or(0.0),
-        dimensions.get(2).copied().unwrap_or(0.0),
-    ))
-}
-
-/// Extract intent from command text
-fn extract_intent_from_command(command_text: &str) -> String {
-    let lower = command_text.to_lowercase();
-    if lower.contains("create") || lower.contains("make") || lower.contains("add") {
-        "create".to_string()
-    } else if lower.contains("boolean")
-        || lower.contains("union")
-        || lower.contains("intersect")
-        || lower.contains("subtract")
-    {
-        "boolean".to_string()
-    } else if lower.contains("transform")
-        || lower.contains("move")
-        || lower.contains("rotate")
-        || lower.contains("scale")
-    {
-        "transform".to_string()
-    } else if lower.contains("delete") || lower.contains("remove") {
-        "delete".to_string()
-    } else {
-        "unknown".to_string()
-    }
-}
-
-/// Extract parameters from command text
-fn extract_parameters_from_command(command_text: &str) -> serde_json::Value {
-    let mut params = serde_json::Map::new();
-
-    // Try to extract numeric values
-    let words: Vec<&str> = command_text.split_whitespace().collect();
-    let mut numbers = Vec::new();
-
-    for word in &words {
-        if let Ok(num) = word.parse::<f64>() {
-            numbers.push(num);
-        }
-    }
-
-    if !numbers.is_empty() {
-        params.insert("values".to_string(), serde_json::json!(numbers));
-    }
-
-    // Extract keywords
-    let lower = command_text.to_lowercase();
-    if lower.contains("radius") {
-        params.insert("has_radius".to_string(), serde_json::json!(true));
-    }
-    if lower.contains("height") {
-        params.insert("has_height".to_string(), serde_json::json!(true));
-    }
-    if lower.contains("width") {
-        params.insert("has_width".to_string(), serde_json::json!(true));
-    }
-
-    serde_json::Value::Object(params)
-}
-
-/// Calculate confidence score for command parsing
-fn calculate_command_confidence(command_text: &str) -> f32 {
-    let lower = command_text.to_lowercase();
-    let mut confidence = 0.5; // Base confidence
-
-    // Known command keywords increase confidence
-    let keywords = [
-        "create",
-        "box",
-        "sphere",
-        "cylinder",
-        "cone",
-        "torus",
-        "boolean",
-        "union",
-        "intersect",
-        "subtract",
-        "difference",
-        "transform",
-        "move",
-        "rotate",
-        "scale",
-        "delete",
-        "remove",
-    ];
-
-    for keyword in &keywords {
-        if lower.contains(keyword) {
-            confidence += 0.1;
-            if confidence > 1.0 {
-                confidence = 1.0;
-            }
-        }
-    }
-
-    // Numeric values increase confidence
-    let words: Vec<&str> = command_text.split_whitespace().collect();
-    for word in &words {
-        if word.parse::<f64>().is_ok() {
-            confidence += 0.05;
-            if confidence > 1.0 {
-                confidence = 1.0;
-            }
-        }
-    }
-
-    confidence
-}
-
-/// Extract angle from text
-fn extract_angle_from_text(text: &str) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(angle) = extract_single_dimension(text, "angle") {
-        return Ok(angle);
-    }
-    if let Some(angle) = extract_single_dimension(text, "degrees") {
-        return Ok(angle);
-    }
-    if let Some(angle) = extract_single_dimension(text, "radians") {
-        return Ok(angle.to_degrees());
-    }
-
-    // Look for any number followed by degrees symbol
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for word in words {
-        if word.ends_with('°') {
-            if let Ok(num) = word[..word.len() - 1].parse::<f64>() {
-                return Ok(num);
-            }
-        }
-    }
-
-    Ok(90.0) // Default angle
-}
-
-/// Extract axis from text
-fn extract_axis_from_text(text: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let lower = text.to_lowercase();
-    if lower.contains("x-axis") || lower.contains("x axis") || lower.contains("about x") {
-        return Ok("x".to_string());
-    }
-    if lower.contains("y-axis") || lower.contains("y axis") || lower.contains("about y") {
-        return Ok("y".to_string());
-    }
-    if lower.contains("z-axis") || lower.contains("z axis") || lower.contains("about z") {
-        return Ok("z".to_string());
-    }
-    Ok("z".to_string()) // Default axis
-}
-
-/// Extract scale factor from text
-fn extract_scale_factor(text: &str) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(factor) = extract_single_dimension(text, "factor") {
-        return Ok(factor);
-    }
-    if let Some(factor) = extract_single_dimension(text, "by") {
-        return Ok(factor);
-    }
-    if text.contains("double") || text.contains("2x") {
-        return Ok(2.0);
-    }
-    if text.contains("triple") || text.contains("3x") {
-        return Ok(3.0);
-    }
-    if text.contains("half") {
-        return Ok(0.5);
-    }
-    Ok(1.5) // Default scale
-}
-
-/// Extract line points from text
-fn extract_line_points(
-    text: &str,
-) -> Result<((f64, f64), (f64, f64)), Box<dyn std::error::Error + Send + Sync>> {
-    let nums = extract_dimensions_from_text(text, 4)?;
-    Ok((
-        (
-            nums.get(0).copied().unwrap_or(0.0),
-            nums.get(1).copied().unwrap_or(0.0),
-        ),
-        (
-            nums.get(2).copied().unwrap_or(10.0),
-            nums.get(3).copied().unwrap_or(10.0),
-        ),
-    ))
-}
-
-/// Extract arc parameters from text
-fn extract_arc_parameters(
-    text: &str,
-) -> Result<((f64, f64), f64, f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-    let nums = extract_dimensions_from_text(text, 5)?;
-    Ok((
-        (
-            nums.get(0).copied().unwrap_or(0.0),
-            nums.get(1).copied().unwrap_or(0.0),
-        ),
-        nums.get(2).copied().unwrap_or(5.0),
-        nums.get(3).copied().unwrap_or(0.0),
-        nums.get(4).copied().unwrap_or(90.0),
-    ))
-}
+// AUDIT-M6: legacy keyword-scraping AI command parsers removed
+// (extract_coordinates_from_text, extract_intent_from_command,
+// extract_parameters_from_command, calculate_command_confidence,
+// extract_angle_from_text, extract_axis_from_text, extract_scale_factor,
+// extract_line_points, extract_arc_parameters). All nine were flagged
+// dead by cargo; intent / parameter extraction now flows through the
+// Claude provider's structured tool-call interface, not in-band regex.
 
 /// GET /api/geometry/:id — return a structured summary of the solid with the
 /// given numeric id. The path parameter must parse as a `u32` (SolidId);
@@ -5580,33 +5257,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize session management components
     let broadcast_manager = session_manager::broadcast::BroadcastManager::new();
     let session_manager = Arc::new(SessionManager::new(broadcast_manager));
-    // AUDIT-H8: idle timeout sourced from `ROSHERA_IDLE_TIMEOUT_SECONDS`
-    // so operators can tune the policy without rebuilding. Default
-    // 1800 (30 min) matches `AuthConfig::default()`. Set to 0 to
-    // disable idle enforcement.
-    let idle_timeout_seconds: i64 = std::env::var("ROSHERA_IDLE_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1800);
-
-    let auth_config = session_manager::auth::AuthConfig {
-        issuer: "roshera-cad".to_string(),
-        audience: vec!["roshera-api".to_string()],
-        token_expiry_seconds: 3600,        // 1 hour
-        refresh_expiry_seconds: 86400 * 7, // 7 days
-        idle_timeout_seconds,
-        max_failed_attempts: 5,
-        lockout_duration_seconds: 300, // 5 minutes
-        require_2fa_for_sensitive: false,
-        api_key_prefix: "rosh_".to_string(),
-        password_requirements: session_manager::auth::PasswordRequirements {
-            min_length: 8,
-            require_uppercase: true,
-            require_lowercase: true,
-            require_numbers: true,
-            require_special: false,
-        },
-    };
+    // AUDIT-M5: every field of `AuthConfig` is now sourced from
+    // `ROSHERA_*` environment variables with the prior hardcoded
+    // values preserved as `AuthConfig::default()` fallbacks. See
+    // `session_manager::auth::AuthConfig::from_env` for the full
+    // variable list. Subsumes the AUDIT-H8
+    // `ROSHERA_IDLE_TIMEOUT_SECONDS` knob.
+    let auth_config = session_manager::auth::AuthConfig::from_env();
     // JWT signing key. `AuthManager::new` is fallible (rejects empty
     // keys); we propagate any error out of `main` so a misconfigured
     // operator gets a typed startup failure rather than a panic.

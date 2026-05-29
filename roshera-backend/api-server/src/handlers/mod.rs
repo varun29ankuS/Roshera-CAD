@@ -5,23 +5,24 @@
 
 pub mod agent;
 pub mod auth;
-pub mod cache;
 pub mod capabilities;
 pub mod datums;
 pub mod export;
 pub mod geometry;
 pub mod hierarchy;
-pub mod scene;
 pub mod session;
 pub mod timeline;
 
+// AUDIT-M6: `handlers::cache` and `handlers::scene` removed — both
+// modules were fully orphan (zero refs outside the def-file even though
+// each handler was `pub use`d via the glob below). The router never
+// mounted a single one of their endpoints, so they had no runtime path.
+
 // Re-export commonly used handlers
 pub use auth::*;
-pub use cache::*;
 pub use capabilities::*;
 pub use export::*;
 pub use geometry::*;
 pub use hierarchy::*;
-pub use scene::*;
 pub use session::*;
 pub use timeline::*;
