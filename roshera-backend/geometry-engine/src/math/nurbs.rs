@@ -1923,62 +1923,107 @@ impl NurbsSurface {
             v,
         };
 
-        // Compute derivatives via central finite differences. We honour
-        // both first- and second-order requests; orders ≥ 3 fall back
-        // to whichever derivatives we *do* fill (du, dv, duu, dvv, duv)
-        // rather than panicking — callers needing C³ should use the
-        // analytic-recursion variant once that lands.
+        // Analytic rational surface derivatives up to second order in each
+        // parametric direction: the Piegl & Tiller A4.4 `RatSurfaceDerivs`
+        // quotient rule on top of the A2.3 `DersBasisFuns` basis-derivative
+        // recurrence. This replaces the previous central-finite-difference
+        // path (h ≈ 1e-6 / 1e-4) with machine-precision values — the φ.5
+        // closest-point Newton iteration depends on accurate second
+        // derivatives, where the finite-difference O(h²) error dominated.
         //
-        // Step size h chosen as ~sqrt(eps) for first derivatives and
-        // ~eps^(1/3) for second derivatives, balancing truncation error
-        // (∝ h^p) against round-off (∝ eps/h^q). For double precision
-        // these resolve to roughly 1e-6 (1st-order) and 1e-4 (2nd).
-        if du_order >= 1 || dv_order >= 1 {
-            let h1 = 1e-6;
-            if du_order >= 1 {
-                let p1 = self.evaluate(u - h1, v).point;
-                let p2 = self.evaluate(u + h1, v).point;
-                result.du = Some((p2 - p1) / (2.0 * h1));
+        // Orders ≥ 3 are clamped to 2 (the `NurbsSurfacePoint` carries up to
+        // second order); callers receive whichever of du/dv/duu/dvv/duv they
+        // requested, matching the prior contract.
+        let ku = du_order.min(2);
+        let kv = dv_order.min(2);
+        if ku >= 1 || kv >= 1 {
+            let nu_ders = self.compute_basis_functions_derivatives(
+                &self.knots_u,
+                self.degree_u,
+                span_u,
+                u,
+                ku,
+            );
+            let nv_ders = self.compute_basis_functions_derivatives(
+                &self.knots_v,
+                self.degree_v,
+                span_v,
+                v,
+                kv,
+            );
+
+            // Weighted homogeneous numerator A[k][l] = Σ (w·P) N^(k) M^(l) and
+            // weight-function derivatives W[k][l] = Σ w · N^(k) M^(l), over the
+            // (degree_u + 1) × (degree_v + 1) non-zero basis functions.
+            let mut aders = [[Vector3::ZERO; 3]; 3];
+            let mut wders = [[0.0f64; 3]; 3];
+            for i in 0..=self.degree_u {
+                let idx_u = span_u - self.degree_u + i;
+                for j in 0..=self.degree_v {
+                    let idx_v = span_v - self.degree_v + j;
+                    let w = self.weights[idx_u][idx_v];
+                    let wp = self.control_points[idx_u][idx_v].to_vec() * w;
+                    for k in 0..=ku {
+                        for l in 0..=kv {
+                            let basis = nu_ders[k][i] * nv_ders[l][j];
+                            aders[k][l] = aders[k][l] + wp * basis;
+                            wders[k][l] += w * basis;
+                        }
+                    }
+                }
             }
-            if dv_order >= 1 {
-                let p1 = self.evaluate(u, v - h1).point;
-                let p2 = self.evaluate(u, v + h1).point;
-                result.dv = Some((p2 - p1) / (2.0 * h1));
+
+            // Binomial coefficient C(a,b) over the small range a,b ∈ {0,1,2}.
+            let bin = |a: usize, b: usize| -> f64 {
+                match (a, b) {
+                    (_, 0) => 1.0,
+                    (1, 1) | (2, 2) => 1.0,
+                    (2, 1) => 2.0,
+                    _ => 0.0,
+                }
+            };
+
+            // Rational quotient rule. SKL[k][l] is built in increasing (k,l)
+            // order so every lower-order term it references is already solved.
+            let w00 = wders[0][0];
+            let mut skl = [[Vector3::ZERO; 3]; 3];
+            for k in 0..=ku {
+                for l in 0..=kv {
+                    let mut val = aders[k][l];
+                    for j in 1..=l {
+                        val = val - skl[k][l - j] * (bin(l, j) * wders[0][j]);
+                    }
+                    for i in 1..=k {
+                        val = val - skl[k - i][l] * (bin(k, i) * wders[i][0]);
+                        let mut inner = Vector3::ZERO;
+                        for j in 1..=l {
+                            inner = inner + skl[k - i][l - j] * (bin(l, j) * wders[i][j]);
+                        }
+                        val = val - inner * bin(k, i);
+                    }
+                    skl[k][l] = val / w00;
+                }
             }
-            // Right-hand rule: normal = dv × du keeps the standard
-            // outward orientation for surfaces parametrised
-            // (u increases right, v increases up).
+
+            if ku >= 1 {
+                result.du = Some(skl[1][0]);
+            }
+            if kv >= 1 {
+                result.dv = Some(skl[0][1]);
+            }
+            // Right-hand rule: normal = dv × du keeps the standard outward
+            // orientation for surfaces parametrised (u right, v up).
             if let (Some(du), Some(dv)) = (result.du, result.dv) {
                 result.normal = dv.cross(&du).normalize().ok();
             }
-        }
-        if du_order >= 2 || dv_order >= 2 {
-            let h2 = 1e-4;
-            let p_center = result.point;
-            if du_order >= 2 {
-                let p_minus = self.evaluate(u - h2, v).point;
-                let p_plus = self.evaluate(u + h2, v).point;
-                let acc =
-                    (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec()) / (h2 * h2);
-                result.duu = Some(acc);
+            if ku >= 2 {
+                result.duu = Some(skl[2][0]);
             }
-            if dv_order >= 2 {
-                let p_minus = self.evaluate(u, v - h2).point;
-                let p_plus = self.evaluate(u, v + h2).point;
-                let acc =
-                    (p_plus.to_vec() - p_center.to_vec() * 2.0 + p_minus.to_vec()) / (h2 * h2);
-                result.dvv = Some(acc);
+            if kv >= 2 {
+                result.dvv = Some(skl[0][2]);
             }
-            // Mixed partial only meaningful when both directions
-            // requested — uses the standard four-corner stencil.
-            if du_order >= 2 && dv_order >= 2 {
-                let pp = self.evaluate(u + h2, v + h2).point;
-                let pm = self.evaluate(u + h2, v - h2).point;
-                let mp = self.evaluate(u - h2, v + h2).point;
-                let mm = self.evaluate(u - h2, v - h2).point;
-                let mixed =
-                    (pp.to_vec() - pm.to_vec() - mp.to_vec() + mm.to_vec()) / (4.0 * h2 * h2);
-                result.duv = Some(mixed);
+            if ku >= 1 && kv >= 1 {
+                result.duv = Some(skl[1][1]);
             }
         }
 
@@ -2035,6 +2080,104 @@ impl NurbsSurface {
         }
 
         n
+    }
+
+    /// Basis-function derivatives via the Piegl & Tiller A2.3 `DersBasisFuns`
+    /// recurrence, parameterised by `(knots, degree)` so one routine serves
+    /// both parametric directions (mirrors the position-only
+    /// `compute_basis_functions` above). Returns a `(num_derivatives + 1) ×
+    /// (degree + 1)` table: row `k` holds the `k`-th derivatives of the
+    /// `degree + 1` non-zero basis functions over `span`. Rows of order
+    /// `> degree` stay zero — a degree-`p` B-spline basis is `C^{p-1}`, so its
+    /// derivatives above order `p` vanish identically. Same hardened index
+    /// guards as the curve-level `basis_functions_derivatives`.
+    fn compute_basis_functions_derivatives(
+        &self,
+        knots: &KnotVector,
+        degree: usize,
+        span: usize,
+        u: f64,
+        num_derivatives: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut ders = vec![vec![0.0; degree + 1]; num_derivatives + 1];
+        let mut ndu = vec![vec![0.0; degree + 1]; degree + 1];
+        let mut a = vec![vec![0.0; degree + 1]; 2];
+        let mut left = vec![0.0; degree + 1];
+        let mut right = vec![0.0; degree + 1];
+
+        ndu[0][0] = 1.0;
+
+        for j in 1..=degree {
+            left[j] = u - knots.values()[span + 1 - j];
+            right[j] = knots.values()[span + j] - u;
+
+            let mut saved = 0.0;
+            for r in 0..j {
+                ndu[j][r] = right[r + 1] + left[j - r];
+                let temp = ndu[r][j - 1] / ndu[j][r];
+                ndu[r][j] = saved + right[r + 1] * temp;
+                saved = left[j - r] * temp;
+            }
+            ndu[j][j] = saved;
+        }
+
+        // Row 0 holds the basis functions themselves.
+        for j in 0..=degree {
+            ders[0][j] = ndu[j][degree];
+        }
+
+        // Derivative rows. `rk = r - k` and `pk = degree - k` are signed
+        // because they legitimately go negative; the `j1`/`j2` bounds keep
+        // every `ndu` access (`rk + j`, `pk + 1`) inside `0..=degree`, so no
+        // index can escape the table. (The previous `rk >= 0` guard silently
+        // dropped valid terms whenever `rk < 0`, which only occurs at order
+        // ≥ 2 — corrupting second derivatives while leaving first ones intact.)
+        // Orders above `degree` stay zero: a degree-`p` basis is `C^{p-1}`.
+        let kmax = num_derivatives.min(degree);
+        for r in 0..=degree {
+            let mut s1 = 0usize;
+            let mut s2 = 1usize;
+            a[0][0] = 1.0;
+
+            for k in 1..=kmax {
+                let mut d = 0.0;
+                let rk = r as i32 - k as i32;
+                let pk = degree as i32 - k as i32;
+
+                if r >= k {
+                    a[s2][0] = a[s1][0] / ndu[(pk + 1) as usize][rk as usize];
+                    d = a[s2][0] * ndu[rk as usize][pk as usize];
+                }
+
+                let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
+                let j2 = if (r as i32 - 1) <= pk { k - 1 } else { degree - r };
+
+                for j in j1..=j2 {
+                    let idx = (rk + j as i32) as usize;
+                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[(pk + 1) as usize][idx];
+                    d += a[s2][j] * ndu[idx][pk as usize];
+                }
+
+                if (r as i32) <= pk {
+                    a[s2][k] = -a[s1][k - 1] / ndu[(pk + 1) as usize][r];
+                    d += a[s2][k] * ndu[r][pk as usize];
+                }
+
+                ders[k][r] = d;
+                std::mem::swap(&mut s1, &mut s2);
+            }
+        }
+
+        // Multiply through by the falling factorial p·(p-1)···(p-k+1).
+        let mut acc = degree as f64;
+        for k in 1..=kmax {
+            for i in 0..=degree {
+                ders[k][i] *= acc;
+            }
+            acc *= (degree - k) as f64;
+        }
+
+        ders
     }
 
     /// Get parameter bounds
@@ -2593,6 +2736,108 @@ pub enum ParameterizationType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Analytic NURBS surface second derivatives must be *exact* on a
+    /// polynomial patch (no finite-difference truncation). Build the
+    /// biquadratic Bézier patch whose image is `S(u,v) = (u, v, u² + v²)`:
+    /// the degree-2 Bézier control values of the field `u` over [0,1] are
+    /// `[0, 0.5, 1]` and of `u²` are `[0, 0, 1]` (Bernstein form of the
+    /// monomials). Unit weights ⇒ non-rational. Exact derivatives are
+    /// `Su=(1,0,2u)`, `Sv=(0,1,2v)`, `Suu=Svv=(0,0,2)`, `Suv=0`.
+    #[test]
+    fn surface_analytic_second_derivatives_exact_on_paraboloid() {
+        let xc = [0.0, 0.5, 1.0]; // Bézier control values of f(t) = t
+        let zc = [0.0, 0.0, 1.0]; // Bézier control values of f(t) = t²
+        let mut control_points = Vec::new();
+        let mut weights = Vec::new();
+        for i in 0..3 {
+            let mut row = Vec::new();
+            let mut wrow = Vec::new();
+            for j in 0..3 {
+                // x = u (xc_i), y = v (xc_j), z = u² + v² (zc_i + zc_j)
+                row.push(Point3::new(xc[i], xc[j], zc[i] + zc[j]));
+                wrow.push(1.0);
+            }
+            control_points.push(row);
+            weights.push(wrow);
+        }
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let surf =
+            NurbsSurface::new(control_points, weights, knots.clone(), knots, 2, 2).unwrap();
+
+        for &(u, v) in &[(0.25, 0.4), (0.5, 0.5), (0.8, 0.2), (0.1, 0.9)] {
+            let d = surf.evaluate_derivatives(u, v, 2, 2);
+            assert!(
+                (d.point.x - u).abs() < 1e-9
+                    && (d.point.y - v).abs() < 1e-9
+                    && (d.point.z - (u * u + v * v)).abs() < 1e-9,
+                "point at ({u},{v})"
+            );
+            assert!((d.du.unwrap() - Vector3::new(1.0, 0.0, 2.0 * u)).magnitude() < 1e-9);
+            assert!((d.dv.unwrap() - Vector3::new(0.0, 1.0, 2.0 * v)).magnitude() < 1e-9);
+            assert!(
+                (d.duu.unwrap() - Vector3::new(0.0, 0.0, 2.0)).magnitude() < 1e-9,
+                "Suu at ({u},{v})"
+            );
+            assert!(
+                (d.dvv.unwrap() - Vector3::new(0.0, 0.0, 2.0)).magnitude() < 1e-9,
+                "Svv at ({u},{v})"
+            );
+            assert!(d.duv.unwrap().magnitude() < 1e-9, "Suv at ({u},{v})");
+        }
+    }
+
+    /// On a *rational* patch the analytic second derivatives must track a
+    /// tight central finite difference of the position evaluator. This is the
+    /// cross-check that the quotient-rule wiring (weight derivatives, mixed
+    /// partial) is correct; the loose tolerance absorbs the O(h²) error of the
+    /// reference difference.
+    #[test]
+    fn surface_analytic_second_derivatives_match_finite_difference_rational() {
+        let cp = vec![
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.4),
+                Point3::new(0.0, 2.0, 0.0),
+            ],
+            vec![
+                Point3::new(1.0, 0.0, 0.5),
+                Point3::new(1.0, 1.0, 1.2),
+                Point3::new(1.0, 2.0, 0.5),
+            ],
+            vec![
+                Point3::new(2.0, 0.0, 0.0),
+                Point3::new(2.0, 1.0, 0.4),
+                Point3::new(2.0, 2.0, 0.0),
+            ],
+        ];
+        let weights = vec![
+            vec![1.0, 0.8, 1.0],
+            vec![1.3, 2.0, 1.3],
+            vec![1.0, 0.8, 1.0],
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let surf = NurbsSurface::new(cp, weights, knots.clone(), knots, 2, 2).unwrap();
+
+        let (u, v) = (0.45, 0.55);
+        let d = surf.evaluate_derivatives(u, v, 2, 2);
+        let h = 1e-3;
+        let c = surf.evaluate(u, v).point.to_vec();
+        let fd_uu = (surf.evaluate(u + h, v).point.to_vec() - c * 2.0
+            + surf.evaluate(u - h, v).point.to_vec())
+            / (h * h);
+        let fd_vv = (surf.evaluate(u, v + h).point.to_vec() - c * 2.0
+            + surf.evaluate(u, v - h).point.to_vec())
+            / (h * h);
+        let fd_uv = (surf.evaluate(u + h, v + h).point.to_vec()
+            - surf.evaluate(u + h, v - h).point.to_vec()
+            - surf.evaluate(u - h, v + h).point.to_vec()
+            + surf.evaluate(u - h, v - h).point.to_vec())
+            / (4.0 * h * h);
+        assert!((d.duu.unwrap() - fd_uu).magnitude() < 1e-2, "duu vs finite diff");
+        assert!((d.dvv.unwrap() - fd_vv).magnitude() < 1e-2, "dvv vs finite diff");
+        assert!((d.duv.unwrap() - fd_uv).magnitude() < 1e-2, "duv vs finite diff");
+    }
 
     /// Cross-parameter SIMD path must produce results identical to the scalar
     /// `evaluate` (up to floating-point rounding). Exercises a degree-3 NURBS

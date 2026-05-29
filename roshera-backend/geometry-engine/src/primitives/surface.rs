@@ -288,6 +288,151 @@ pub struct Matrix2x2 {
     pub m11: f64,
 }
 
+/// First fundamental form (metric tensor) coefficients at a surface point.
+///
+/// `I = E du² + 2F du dv + G dv²`, with `E = ⟨P_u, P_u⟩`, `F = ⟨P_u, P_v⟩`,
+/// `G = ⟨P_v, P_v⟩`. The discriminant `EG − F²` equals `|P_u × P_v|²` and is
+/// the squared area element; it vanishes only at a singular parametrization.
+///
+/// Reference: do Carmo, *Differential Geometry of Curves and Surfaces* §3.2;
+/// Piegl & Tiller, *The NURBS Book* §4.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FirstFundamentalForm {
+    pub e: f64,
+    pub f: f64,
+    pub g: f64,
+}
+
+impl FirstFundamentalForm {
+    /// Discriminant `EG − F²` (= squared area element `|P_u × P_v|²`).
+    #[inline]
+    pub fn determinant(&self) -> f64 {
+        self.e * self.g - self.f * self.f
+    }
+
+    /// As a symmetric 2×2 matrix `[[E, F], [F, G]]`.
+    #[inline]
+    pub fn as_matrix(&self) -> Matrix2x2 {
+        Matrix2x2 {
+            m00: self.e,
+            m01: self.f,
+            m10: self.f,
+            m11: self.g,
+        }
+    }
+}
+
+/// Second fundamental form coefficients, signed with respect to the unit
+/// surface normal `n`.
+///
+/// `II = L du² + 2M du dv + N dv²`, with `L = ⟨P_uu, n⟩`, `M = ⟨P_uv, n⟩`,
+/// `N = ⟨P_vv, n⟩`. The sign of every coefficient flips with the orientation
+/// of `n`; Gaussian curvature (which divides `LN − M²` by `EG − F²`) is
+/// invariant under that flip, mean and principal curvatures are not.
+///
+/// Reference: do Carmo §3.3; Piegl & Tiller §4.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SecondFundamentalForm {
+    pub l: f64,
+    pub m: f64,
+    pub n: f64,
+}
+
+impl SecondFundamentalForm {
+    /// Discriminant `LN − M²`.
+    #[inline]
+    pub fn determinant(&self) -> f64 {
+        self.l * self.n - self.m * self.m
+    }
+
+    /// As a symmetric 2×2 matrix `[[L, M], [M, N]]`.
+    #[inline]
+    pub fn as_matrix(&self) -> Matrix2x2 {
+        Matrix2x2 {
+            m00: self.l,
+            m01: self.m,
+            m10: self.m,
+            m11: self.n,
+        }
+    }
+}
+
+/// First and second fundamental forms evaluated together at one surface point,
+/// with the curvature quantities derived from the pair.
+///
+/// All curvature accessors fail with [`MathError::InvalidParameter`] when the
+/// first-form discriminant `EG − F²` is below [`consts::EPSILON`] — i.e. at a
+/// degenerate (rank-deficient) parametrization where the shape operator is
+/// undefined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FundamentalForms {
+    pub first: FirstFundamentalForm,
+    pub second: SecondFundamentalForm,
+}
+
+impl FundamentalForms {
+    /// Gaussian curvature `K = (LN − M²) / (EG − F²)`.
+    ///
+    /// Orientation-independent: invariant under a normal flip.
+    pub fn gaussian_curvature(&self) -> MathResult<f64> {
+        let det1 = self.first.determinant();
+        if det1.abs() < consts::EPSILON {
+            return Err(MathError::InvalidParameter(
+                "degenerate first fundamental form (EG - F^2 ~ 0)".to_string(),
+            ));
+        }
+        Ok(self.second.determinant() / det1)
+    }
+
+    /// Mean curvature `H = (EN − 2FM + GL) / (2 (EG − F²))`.
+    ///
+    /// Sign follows the unit normal the second form was measured against.
+    pub fn mean_curvature(&self) -> MathResult<f64> {
+        let det1 = self.first.determinant();
+        if det1.abs() < consts::EPSILON {
+            return Err(MathError::InvalidParameter(
+                "degenerate first fundamental form (EG - F^2 ~ 0)".to_string(),
+            ));
+        }
+        let (e, f, g) = (self.first.e, self.first.f, self.first.g);
+        let (l, m, n) = (self.second.l, self.second.m, self.second.n);
+        Ok((e * n - 2.0 * f * m + g * l) / (2.0 * det1))
+    }
+
+    /// Principal curvatures `(k_max, k_min) = H ± √(H² − K)`.
+    ///
+    /// Returned largest-first to match [`CurvatureAtPoint`]. The radicand is
+    /// clamped at zero to absorb round-off at umbilic points where `H² = K`.
+    pub fn principal_curvatures(&self) -> MathResult<(f64, f64)> {
+        let h = self.mean_curvature()?;
+        let k = self.gaussian_curvature()?;
+        let disc = (h * h - k).max(0.0).sqrt();
+        Ok((h + disc, h - disc))
+    }
+
+    /// Weingarten shape operator `S = I⁻¹ · II` in the `(u, v)` parameter
+    /// basis. Its eigenvalues are the principal curvatures and its
+    /// determinant/trace give Gaussian/2× mean curvature. Not symmetric
+    /// unless `F = 0` (the basis is orthogonal).
+    pub fn shape_operator(&self) -> MathResult<Matrix2x2> {
+        let det1 = self.first.determinant();
+        if det1.abs() < consts::EPSILON {
+            return Err(MathError::InvalidParameter(
+                "degenerate first fundamental form (EG - F^2 ~ 0)".to_string(),
+            ));
+        }
+        let (e, f, g) = (self.first.e, self.first.f, self.first.g);
+        let (l, m, n) = (self.second.l, self.second.m, self.second.n);
+        let inv = 1.0 / det1;
+        Ok(Matrix2x2 {
+            m00: (g * l - f * m) * inv,
+            m01: (g * m - f * n) * inv,
+            m10: (e * m - f * l) * inv,
+            m11: (e * n - f * m) * inv,
+        })
+    }
+}
+
 /// Surface continuity information
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceContinuity {
@@ -510,6 +655,45 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
             dir1: eval.dir1,
             dir2: eval.dir2,
         })
+    }
+
+    /// Second-order partial derivatives `(∂²P/∂u², ∂²P/∂u∂v, ∂²P/∂v²)`.
+    ///
+    /// Convenience accessor over [`Surface::evaluate_full`]. Analytic surfaces
+    /// return closed-form values; NURBS / free-form surfaces return the
+    /// analytic tensor-product rational derivatives.
+    fn second_partial_derivatives(
+        &self,
+        u: f64,
+        v: f64,
+    ) -> MathResult<(Vector3, Vector3, Vector3)> {
+        let p = self.evaluate_full(u, v)?;
+        Ok((p.duu, p.duv, p.dvv))
+    }
+
+    /// First and second fundamental forms at `(u, v)`.
+    ///
+    /// The first form `(E, F, G)` is the metric tensor `⟨P_i, P_j⟩`; the
+    /// second form `(L, M, N)` is `⟨P_ij, n⟩` signed against the unit normal
+    /// returned by [`Surface::evaluate_full`] (the `du × dv` orientation).
+    /// Gaussian curvature `K = (LN − M²)/(EG − F²)` is independent of that
+    /// sign; mean and principal curvatures follow the chosen normal.
+    ///
+    /// This is a uniform default over `evaluate_full`, so every surface type
+    /// — analytic and free-form alike — exposes it without bespoke code.
+    fn fundamental_forms_at(&self, u: f64, v: f64) -> MathResult<FundamentalForms> {
+        let p = self.evaluate_full(u, v)?;
+        let first = FirstFundamentalForm {
+            e: p.du.dot(&p.du),
+            f: p.du.dot(&p.dv),
+            g: p.dv.dot(&p.dv),
+        };
+        let second = SecondFundamentalForm {
+            l: p.duu.dot(&p.normal),
+            m: p.duv.dot(&p.normal),
+            n: p.dvv.dot(&p.normal),
+        };
+        Ok(FundamentalForms { first, second })
     }
 
     /// Create offset surface at specified distance
@@ -3562,8 +3746,10 @@ impl Surface for Torus {
         let duv = x_dir * (self.minor_radius * sin_v * sin_u)
             + y_dir * (-self.minor_radius * sin_v * cos_u);
 
-        // Principal curvatures
-        let k1 = -cos_v / (self.minor_radius * (self.major_radius + self.minor_radius * cos_v));
+        // Principal curvatures (outward normal). Along the major direction
+        // κ₁ = cos v / (R + r cos v); along the minor (tube) circle κ₂ = 1/r.
+        // do Carmo, *Differential Geometry of Curves and Surfaces* §3.3.
+        let k1 = -cos_v / (self.major_radius + self.minor_radius * cos_v);
         let k2 = -1.0 / self.minor_radius;
 
         Ok(SurfacePoint {
@@ -5471,6 +5657,99 @@ mod tests {
 
     fn default_tolerance() -> Tolerance {
         Tolerance::default()
+    }
+
+    // ===== Fundamental form tests (CD-φ.1.1) =====
+    //
+    // Ground truth from do Carmo, *Differential Geometry of Curves and
+    // Surfaces* §3.3. Gaussian curvature is orientation-independent and is the
+    // primary assertion; mean curvature is checked by magnitude because its
+    // sign tracks the chosen unit normal.
+
+    #[test]
+    fn fundamental_forms_plane_is_flat() {
+        let plane = Plane::xy(0.0);
+        let ff = plane.fundamental_forms_at(1.0, 2.0).unwrap();
+        assert!((ff.first.e - 1.0).abs() < 1e-12);
+        assert!(ff.first.f.abs() < 1e-12);
+        assert!((ff.first.g - 1.0).abs() < 1e-12);
+        assert!(ff.second.l.abs() < 1e-12);
+        assert!(ff.second.m.abs() < 1e-12);
+        assert!(ff.second.n.abs() < 1e-12);
+        assert!(ff.gaussian_curvature().unwrap().abs() < 1e-12);
+        assert!(ff.mean_curvature().unwrap().abs() < 1e-12);
+    }
+
+    #[test]
+    fn fundamental_forms_cylinder_k_zero_h_half_over_r() {
+        let r = 2.0;
+        let cyl = Cylinder::new(Point3::ZERO, Vector3::Z, r).unwrap();
+        let ff = cyl.fundamental_forms_at(0.7, 1.3).unwrap();
+        // Developable surface: Gaussian curvature is exactly zero.
+        assert!(ff.gaussian_curvature().unwrap().abs() < 1e-10);
+        // |H| = 1/(2R).
+        assert!((ff.mean_curvature().unwrap().abs() - 1.0 / (2.0 * r)).abs() < 1e-10);
+        // One principal curvature is zero ⇒ second-form discriminant vanishes.
+        assert!(ff.second.determinant().abs() < 1e-10);
+    }
+
+    #[test]
+    fn fundamental_forms_sphere_k_inv_r_squared() {
+        let r = 3.0;
+        let sphere = Sphere::new(Point3::ZERO, r).unwrap();
+        let ff = sphere.fundamental_forms_at(0.9, 1.1).unwrap();
+        assert!((ff.gaussian_curvature().unwrap() - 1.0 / (r * r)).abs() < 1e-9);
+        assert!((ff.mean_curvature().unwrap().abs() - 1.0 / r).abs() < 1e-9);
+        // Umbilic point: both principal curvatures equal in magnitude.
+        let (k1, k2) = ff.principal_curvatures().unwrap();
+        assert!((k1.abs() - 1.0 / r).abs() < 1e-9);
+        assert!((k2.abs() - 1.0 / r).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fundamental_forms_cone_is_developable() {
+        let cone = Cone::new(Point3::ZERO, Vector3::Z, 0.5).unwrap();
+        // Sampled away from the apex.
+        let ff = cone.fundamental_forms_at(0.8, 2.0).unwrap();
+        assert!(ff.gaussian_curvature().unwrap().abs() < 1e-9);
+    }
+
+    #[test]
+    fn fundamental_forms_match_stored_principal_curvatures() {
+        // Cross-check: the forms-derived Gaussian curvature must agree with
+        // the surface's own k1·k2 (computed independently inside
+        // evaluate_full) across analytic surface types and parameter samples.
+        // K is orientation-independent, so this holds regardless of normal
+        // convention differences between the two code paths.
+        let torus = Torus::new(Point3::ZERO, Vector3::Z, 5.0, 2.0).unwrap();
+        let sphere = Sphere::new(Point3::new(1.0, 0.0, 0.0), 4.0).unwrap();
+        let cyl = Cylinder::new(Point3::ZERO, Vector3::Z, 1.5).unwrap();
+        let surfaces: [&dyn Surface; 3] = [&torus, &sphere, &cyl];
+        for s in surfaces {
+            for &(u, v) in &[(0.3, 0.6), (1.2, 2.1), (2.5, 0.4)] {
+                let forms_k = s
+                    .fundamental_forms_at(u, v)
+                    .unwrap()
+                    .gaussian_curvature()
+                    .unwrap();
+                let stored_k = s.gaussian_curvature_at(u, v).unwrap();
+                assert!(
+                    (forms_k - stored_k).abs() < 1e-7,
+                    "{} K mismatch at ({u},{v}): forms={forms_k} stored={stored_k}",
+                    s.type_name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn second_partial_derivatives_accessor_matches_evaluate_full() {
+        let sphere = Sphere::new(Point3::ZERO, 2.0).unwrap();
+        let (duu, duv, dvv) = sphere.second_partial_derivatives(0.5, 0.8).unwrap();
+        let p = sphere.evaluate_full(0.5, 0.8).unwrap();
+        assert!((duu - p.duu).magnitude() < 1e-12);
+        assert!((duv - p.duv).magnitude() < 1e-12);
+        assert!((dvv - p.dvv).magnitude() < 1e-12);
     }
 
     // ===== Surface evaluation tests =====
