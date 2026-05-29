@@ -137,7 +137,11 @@ pub struct ViewportBridge {
     /// Sender to the connected frontend, if any.
     sender: Mutex<Option<mpsc::UnboundedSender<BridgeCommand>>>,
     /// Pending requests awaiting a frontend reply.
-    pending: DashMap<Uuid, oneshot::Sender<ResponseValue>>,
+    ///
+    /// AUDIT-M7: held inside an `Arc` so the per-request `PendingGuard`
+    /// can hold its own clone and remove its entry on drop (including
+    /// cancellation of the `dispatch` future).
+    pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>>,
 }
 
 impl ViewportBridge {
@@ -157,22 +161,40 @@ impl ViewportBridge {
 
         let (tx, rx) = oneshot::channel();
         self.pending.insert(request_id, tx);
+        // AUDIT-M7: RAII drop guard removes the pending entry on every
+        // exit path, including future cancellation (caller drops the
+        // returned future mid-await). Pre-fix only the `Ok(Err)` /
+        // `Err(_)` arms below removed; if the caller cancelled, the
+        // entry leaked into `self.pending` forever.
+        let _pending_guard = PendingGuard {
+            pending: self.pending.clone(),
+            request_id,
+        };
 
         sender.send(cmd).map_err(|_| BridgeError::SendFailed)?;
         // Drop the sender guard before awaiting so the WS task can use it.
         drop(sender_guard);
 
         match tokio::time::timeout(BRIDGE_TIMEOUT, rx).await {
+            // On the happy path the response was already removed by
+            // `deliver()`; the guard's `remove` is then a no-op.
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => {
-                self.pending.remove(&request_id);
-                Err(BridgeError::Cancelled)
-            }
-            Err(_) => {
-                self.pending.remove(&request_id);
-                Err(BridgeError::Timeout)
-            }
+            Ok(Err(_)) => Err(BridgeError::Cancelled),
+            Err(_) => Err(BridgeError::Timeout),
         }
+    }
+}
+
+/// RAII guard that removes a `pending` entry when dropped. See the
+/// call site in `dispatch` for the cancellation rationale.
+struct PendingGuard {
+    pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>>,
+    request_id: Uuid,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.remove(&self.request_id);
     }
 }
 
@@ -224,6 +246,13 @@ async fn run_socket(socket: WebSocket, bridge: Arc<ViewportBridge>) {
 
     // Replace any existing sender; old connection's commands will fail when
     // its socket eventually drops.
+    //
+    // AUDIT-M7: keep our own copy of `out_tx` (cheap clone — it's an
+    // `mpsc::UnboundedSender`) so the two teardown paths below can
+    // `same_channel`-gate the slot nullify. Without this gate, a
+    // newer connection that registered between our send-loop exit and
+    // our `.lock()` would have its sender silently wiped.
+    let our_tx = out_tx.clone();
     {
         let mut slot = bridge.sender.lock().await;
         *slot = Some(out_tx);
@@ -231,6 +260,7 @@ async fn run_socket(socket: WebSocket, bridge: Arc<ViewportBridge>) {
 
     // Forward outbound commands → socket sink.
     let outbound_bridge = bridge.clone();
+    let outbound_our_tx = our_tx.clone();
     let outbound = tokio::spawn(async move {
         while let Some(cmd) = out_rx.recv().await {
             let json = match serde_json::to_string(&cmd) {
@@ -245,9 +275,15 @@ async fn run_socket(socket: WebSocket, bridge: Arc<ViewportBridge>) {
                 break;
             }
         }
-        // Sink closed — clean up sender slot if it still points at us.
+        // Sink closed — clean up sender slot only if it still points at
+        // us (AUDIT-M7: a newer connection may have replaced us already).
         let mut slot = outbound_bridge.sender.lock().await;
-        *slot = None;
+        if slot
+            .as_ref()
+            .is_some_and(|s| s.same_channel(&outbound_our_tx))
+        {
+            *slot = None;
+        }
     });
 
     // Inbound responses from the frontend.
@@ -277,11 +313,17 @@ async fn run_socket(socket: WebSocket, bridge: Arc<ViewportBridge>) {
 
     info!("viewport bridge: client disconnected");
     outbound.abort();
-    // Clear sender if still ours (race with another connection is benign —
-    // worst case the new connection's slot survives only briefly).
+    // AUDIT-M7: only nullify the sender slot if it still points at *our*
+    // channel. A newer connection may have already replaced us; the
+    // previous unconditional `*slot = None` would silently wipe its
+    // sender. The pending-map is *not* cleared here either: cancelled
+    // dispatches now drop their entry via `PendingGuard`, and clearing
+    // unconditionally would also discard a coexisting new connection's
+    // pending requests.
     let mut slot = bridge.sender.lock().await;
-    *slot = None;
-    bridge.pending.clear();
+    if slot.as_ref().is_some_and(|s| s.same_channel(&our_tx)) {
+        *slot = None;
+    }
 }
 
 fn deliver(bridge: &Arc<ViewportBridge>, resp: BridgeResponse) {
@@ -590,4 +632,123 @@ fn expect_ack(value: ResponseValue) -> Result<(), (StatusCode, String)> {
 
 fn into_http_err(err: BridgeError) -> (StatusCode, String) {
     (err.status(), err.to_string())
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! AUDIT-M7 regressions. These exercise the two race paths that the
+    //! pre-fix `viewport_bridge.rs` would corrupt:
+    //!
+    //! 1. `PendingGuard` removes the pending-map entry on drop, including
+    //!    the cancellation arm where `dispatch`'s future is dropped before
+    //!    its `tokio::time::timeout` completes.
+    //! 2. Both socket-teardown paths nullify the sender slot only when it
+    //!    still references *their* channel. Pre-fix, the unconditional
+    //!    `*slot = None` would silently wipe a newer connection's sender.
+    use super::*;
+
+    #[test]
+    fn pending_guard_removes_entry_on_drop() {
+        let pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>> =
+            Arc::new(DashMap::new());
+        let request_id = Uuid::new_v4();
+        let (tx, _rx) = oneshot::channel::<ResponseValue>();
+        pending.insert(request_id, tx);
+        assert_eq!(pending.len(), 1);
+        {
+            let _guard = PendingGuard {
+                pending: pending.clone(),
+                request_id,
+            };
+        }
+        assert!(
+            pending.is_empty(),
+            "PendingGuard::drop must evict the pending entry"
+        );
+    }
+
+    #[test]
+    fn pending_guard_is_noop_when_entry_already_taken() {
+        // Happy path: `deliver()` removed the entry first; the guard's
+        // subsequent remove is a harmless no-op.
+        let pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>> =
+            Arc::new(DashMap::new());
+        let request_id = Uuid::new_v4();
+        let guard = PendingGuard {
+            pending: pending.clone(),
+            request_id,
+        };
+        assert!(pending.is_empty());
+        drop(guard);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sender_slot_survives_old_socket_teardown_when_replaced() {
+        // Two sequential "socket installs". The older socket's teardown
+        // must NOT wipe the newer socket's sender, because the
+        // `same_channel` gate sees the slot now points elsewhere.
+        let bridge = ViewportBridge::new();
+        let (old_tx, _old_rx) = mpsc::unbounded_channel::<BridgeCommand>();
+        let (new_tx, _new_rx) = mpsc::unbounded_channel::<BridgeCommand>();
+
+        // Old socket registers.
+        let old_clone = old_tx.clone();
+        {
+            let mut slot = bridge.sender.lock().await;
+            *slot = Some(old_tx);
+        }
+
+        // New socket replaces it.
+        {
+            let mut slot = bridge.sender.lock().await;
+            *slot = Some(new_tx.clone());
+        }
+
+        // Old socket's teardown runs the same `same_channel` gate the
+        // production code uses.
+        {
+            let mut slot = bridge.sender.lock().await;
+            if slot.as_ref().is_some_and(|s| s.same_channel(&old_clone)) {
+                *slot = None;
+            }
+        }
+
+        let slot = bridge.sender.lock().await;
+        let surviving = slot.as_ref().expect(
+            // Reason: this is the invariant under test — the new socket's
+            // sender slot must still be populated after the old socket
+            // ran its same-channel-gated teardown.
+            "newer socket's sender must survive older socket's teardown",
+        );
+        assert!(
+            surviving.same_channel(&new_tx),
+            "surviving sender must be the new socket's channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_slot_cleared_when_no_replacement_yet() {
+        // Solo socket teardown still nullifies the slot.
+        let bridge = ViewportBridge::new();
+        let (tx, _rx) = mpsc::unbounded_channel::<BridgeCommand>();
+        let our_tx = tx.clone();
+        {
+            let mut slot = bridge.sender.lock().await;
+            *slot = Some(tx);
+        }
+        {
+            let mut slot = bridge.sender.lock().await;
+            if slot.as_ref().is_some_and(|s| s.same_channel(&our_tx)) {
+                *slot = None;
+            }
+        }
+        let slot = bridge.sender.lock().await;
+        assert!(
+            slot.is_none(),
+            "solo socket teardown must clear the slot"
+        );
+    }
 }
