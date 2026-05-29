@@ -108,6 +108,30 @@ pub struct TimelineRecorder {
     /// value once per event, so a swap takes effect on the very next
     /// kernel operation.
     branch_id: Arc<PlRwLock<BranchId>>,
+    /// Transactional staging buffer for events recorded inside a
+    /// `with_rollback` window. While `depth > 0`, `record()` pushes
+    /// into `buffer` instead of forwarding to the worker. On
+    /// `commit_pending` the buffer drains to the channel in FIFO
+    /// order; on `abort_pending` it is discarded. This is the
+    /// timeline-side half of the H10 fix: failed kernel operations
+    /// must not leak partial events that the delete path cannot
+    /// reconcile.
+    staging: Arc<PlRwLock<StagingState>>,
+}
+
+/// Per-recorder transactional staging state. Cloned `TimelineRecorder`
+/// handles share this state via `Arc`, so a `with_rollback` wrapping a
+/// composite operation across recorder clones still buffers coherently.
+#[derive(Debug, Default)]
+struct StagingState {
+    /// Nesting depth. Supports nested `with_rollback` (e.g. a
+    /// composite operation that itself calls helpers wrapped in
+    /// `with_rollback`). Only when depth returns to zero do we
+    /// flush or discard the buffer.
+    depth: u32,
+    /// Events recorded while `depth > 0`. Drained to the MPSC on
+    /// commit; cleared on abort.
+    buffer: Vec<RecordedOperation>,
 }
 
 impl TimelineRecorder {
@@ -188,7 +212,25 @@ impl TimelineRecorder {
             tx,
             author,
             branch_id,
+            staging: Arc::new(PlRwLock::new(StagingState::default())),
         }
+    }
+
+    /// Push a record into the MPSC channel without consulting the
+    /// staging buffer. Shared between the immediate-record path and
+    /// the `commit_pending` drain path.
+    fn try_send_op(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+        self.tx
+            .try_send(RecorderCmd::Op(operation))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => RecorderError::Unavailable(format!(
+                    "TimelineRecorder channel saturated (capacity={}); worker may be stalled",
+                    self.tx.max_capacity()
+                )),
+                mpsc::error::TrySendError::Closed(_) => RecorderError::Unavailable(
+                    "TimelineRecorder worker has shut down".to_string(),
+                ),
+            })
     }
 
     /// The author this recorder attributes events to.
@@ -250,20 +292,85 @@ impl TimelineRecorder {
 
 impl OperationRecorder for TimelineRecorder {
     fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+        // Inside a staging window, divert into the buffer. This is the
+        // H10 bridge contract: a `with_rollback` body that fails must
+        // not leave partial events on the timeline. Lock scope kept
+        // tight — we either push and return, or drop the guard before
+        // hitting the channel.
+        {
+            let mut state = self.staging.write();
+            if state.depth > 0 {
+                state.buffer.push(operation);
+                return Ok(());
+            }
+        }
+        // Outside any staging window — commit immediately.
+        //
         // Sync entry point — must never block. `try_send` returns
         // `Full` if the bounded channel is saturated (drainer falling
         // behind) and `Closed` if the worker has exited. Both surface
         // as `Unavailable` so the kernel's `record_operation` helper
         // logs loudly and continues; silent event loss is forbidden.
-        self.tx.try_send(RecorderCmd::Op(operation)).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => RecorderError::Unavailable(format!(
-                "TimelineRecorder channel saturated (capacity={}); worker may be stalled",
-                self.tx.max_capacity()
-            )),
-            mpsc::error::TrySendError::Closed(_) => RecorderError::Unavailable(
-                "TimelineRecorder worker has shut down".to_string(),
-            ),
-        })
+        self.try_send_op(operation)
+    }
+
+    fn begin_pending(&self) {
+        // `saturating_add` is defensive only — realistic nesting depth
+        // is ≤ a handful (composite ops calling helpers); u32 overflow
+        // would require ~4.3B nested transactions.
+        let mut state = self.staging.write();
+        state.depth = state.depth.saturating_add(1);
+    }
+
+    fn commit_pending(&self) {
+        // Decrement depth and, if we just closed the outermost window,
+        // drain the buffer into the channel. Drain happens outside the
+        // staging lock so `try_send_op` can't deadlock with a concurrent
+        // `record()` on another thread.
+        let drained = {
+            let mut state = self.staging.write();
+            if state.depth == 0 {
+                tracing::warn!(
+                    target: "timeline.recorder_bridge",
+                    "commit_pending called with depth=0 (no matching begin_pending); ignoring"
+                );
+                return;
+            }
+            state.depth -= 1;
+            if state.depth == 0 {
+                std::mem::take(&mut state.buffer)
+            } else {
+                Vec::new()
+            }
+        };
+        for op in drained {
+            if let Err(err) = self.try_send_op(op) {
+                tracing::warn!(
+                    target: "timeline.recorder_bridge",
+                    error = %err,
+                    "failed to forward staged op on commit"
+                );
+            }
+        }
+    }
+
+    fn abort_pending(&self) {
+        // Decrement depth and, if we just closed the outermost window,
+        // discard every event recorded inside it. The kernel rolled
+        // back its mutations via `ModelSnapshot::restore`; the timeline
+        // must not see events for a state that no longer exists.
+        let mut state = self.staging.write();
+        if state.depth == 0 {
+            tracing::warn!(
+                target: "timeline.recorder_bridge",
+                "abort_pending called with depth=0 (no matching begin_pending); ignoring"
+            );
+            return;
+        }
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.buffer.clear();
+        }
     }
 }
 
@@ -456,5 +563,185 @@ mod tests {
             got_unavailable,
             "256 synchronous sends with capacity=1 and no worker yield must saturate the channel"
         );
+    }
+
+    /// H10 staging contract — happy path. Events recorded between
+    /// `begin_pending` and `commit_pending` must be forwarded to the
+    /// timeline in FIFO order once the window closes.
+    #[tokio::test]
+    async fn staging_commit_forwards_buffered_events() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder.begin_pending();
+        for i in 0..3u64 {
+            recorder
+                .record(
+                    RecordedOperation::new("staged")
+                        .with_parameters(serde_json::json!({ "i": i }))
+                        .with_output_solids([i]),
+                )
+                .expect("record buffers while staging");
+        }
+
+        // Before commit: nothing should have reached the timeline.
+        let main = BranchId::main();
+        let pre_commit = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(
+            pre_commit, 0,
+            "events staged inside a pending window must not reach the timeline before commit"
+        );
+
+        recorder.commit_pending();
+        drop(recorder);
+
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(
+            events.len(),
+            3,
+            "all 3 staged events should reach the timeline after commit"
+        );
+    }
+
+    /// H10 staging contract — abort path. Events recorded between
+    /// `begin_pending` and `abort_pending` must NOT reach the
+    /// timeline. This is the load-bearing guarantee that broken the
+    /// delete-after-failed-op repro.
+    #[tokio::test]
+    async fn staging_abort_drops_buffered_events() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder.begin_pending();
+        recorder
+            .record(RecordedOperation::new("doomed-1"))
+            .expect("record buffers while staging");
+        recorder
+            .record(RecordedOperation::new("doomed-2"))
+            .expect("record buffers while staging");
+        recorder.abort_pending();
+
+        // A follow-up successful op after abort must still go through.
+        recorder
+            .record(RecordedOperation::new("after-abort"))
+            .expect("record forwards once window is closed");
+
+        drop(recorder);
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(
+            events.len(),
+            1,
+            "only the post-abort event should reach the timeline; the two aborted events must be dropped"
+        );
+        match &events[0].operation {
+            Operation::Generic { command_type, .. } => {
+                assert_eq!(command_type, "after-abort");
+            }
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// H10 staging contract — nesting. A nested `begin_pending` must
+    /// not flush the outer window's buffer until the outer
+    /// `commit_pending` lands. Mirrors the case where a composite
+    /// kernel op calls a helper that itself wraps `with_rollback`.
+    #[tokio::test]
+    async fn staging_nested_windows_flush_on_outer_commit() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder.begin_pending(); // outer
+        recorder
+            .record(RecordedOperation::new("outer-pre"))
+            .expect("buffers");
+        recorder.begin_pending(); // inner
+        recorder
+            .record(RecordedOperation::new("inner"))
+            .expect("buffers");
+        recorder.commit_pending(); // close inner — still staged
+
+        let main = BranchId::main();
+        let mid = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(
+            mid, 0,
+            "inner commit must not flush while outer window is still open"
+        );
+
+        recorder
+            .record(RecordedOperation::new("outer-post"))
+            .expect("buffers");
+        recorder.commit_pending(); // close outer — flushes all 3
+        drop(recorder);
+
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 3, "all 3 events reach the timeline after outer commit");
     }
 }

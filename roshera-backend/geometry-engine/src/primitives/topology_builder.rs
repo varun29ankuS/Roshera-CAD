@@ -398,6 +398,34 @@ impl BRepModel {
         }
     }
 
+    /// Open a transactional recording scope on the attached recorder, if
+    /// any. Used by `operations::lifecycle::with_rollback` to defer event
+    /// commitment until the wrapped operation succeeds. No-op when no
+    /// recorder is attached.
+    pub fn begin_pending_record(&self) {
+        if let Some(rec) = self.recorder.as_ref() {
+            rec.begin_pending();
+        }
+    }
+
+    /// Commit every event staged since the matching `begin_pending_record`.
+    /// No-op when no recorder is attached.
+    pub fn commit_pending_record(&self) {
+        if let Some(rec) = self.recorder.as_ref() {
+            rec.commit_pending();
+        }
+    }
+
+    /// Discard every event staged since the matching `begin_pending_record`.
+    /// Called by `with_rollback` on the failure path so the timeline never
+    /// holds events for an operation whose model mutations were rolled
+    /// back. No-op when no recorder is attached.
+    pub fn abort_pending_record(&self) {
+        if let Some(rec) = self.recorder.as_ref() {
+            rec.abort_pending();
+        }
+    }
+
     /// Invalidate the cached `SolidMassProperties` of every solid
     /// whose outer shell currently contains `face_id`.
     ///
