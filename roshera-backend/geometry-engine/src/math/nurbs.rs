@@ -2194,6 +2194,117 @@ impl NurbsSurface {
         )
     }
 
+    /// Decompose this NURBS surface into rational Bézier patches (Piegl &
+    /// Tiller A5.7): raise every interior knot to multiplicity = degree, then
+    /// slice the refined control net into independent
+    /// `(degree_u + 1) × (degree_v + 1)` blocks. Lossless — each patch
+    /// reproduces the surface exactly over its parameter sub-rectangle, with
+    /// per-patch control net + weights + parent `(u, v)` domain recorded on the
+    /// returned [`BezierPatch`](crate::math::bezier_patch::BezierPatch).
+    ///
+    /// Assumes a clamped (open) knot vector, which every surface built through
+    /// `NurbsSurface::new` and the kernel's surface constructors satisfies. A
+    /// surface already in Bézier form (no interior knots) yields a single patch
+    /// spanning the full parameter domain.
+    pub fn to_bezier_patches(&self) -> Vec<crate::math::bezier_patch::BezierPatch> {
+        use crate::math::bezier_patch::BezierPatch;
+
+        let p_u = self.degree_u;
+        let p_v = self.degree_v;
+
+        // Work on a copy: raising each interior knot to full multiplicity makes
+        // the control net partition cleanly into Bézier segments. The set of
+        // distinct interior knot values is stable under insertion (insertion
+        // only raises multiplicity, never introduces new values), so the
+        // snapshot taken before the loop stays valid throughout.
+        let mut surf = self.clone();
+        for value in surf.distinct_interior_knots(true) {
+            let mult = surf.knots_u.multiplicity(value);
+            if mult < p_u {
+                let _ = surf.insert_knot_u(value, p_u - mult);
+            }
+        }
+        for value in surf.distinct_interior_knots(false) {
+            let mult = surf.knots_v.multiplicity(value);
+            if mult < p_v {
+                let _ = surf.insert_knot_v(value, p_v - mult);
+            }
+        }
+
+        let breaks_u = Self::distinct_knot_values(surf.knots_u.values());
+        let breaks_v = Self::distinct_knot_values(surf.knots_v.values());
+        let seg_u = breaks_u.len().saturating_sub(1);
+        let seg_v = breaks_v.len().saturating_sub(1);
+
+        let mut patches = Vec::with_capacity(seg_u * seg_v);
+        for su in 0..seg_u {
+            for sv in 0..seg_v {
+                let mut control_points = Vec::with_capacity(p_u + 1);
+                let mut weights = Vec::with_capacity(p_u + 1);
+                for i in 0..=p_u {
+                    let row = su * p_u + i;
+                    let mut crow = Vec::with_capacity(p_v + 1);
+                    let mut wrow = Vec::with_capacity(p_v + 1);
+                    for j in 0..=p_v {
+                        let col = sv * p_v + j;
+                        crow.push(surf.control_points[row][col]);
+                        wrow.push(surf.weights[row][col]);
+                    }
+                    control_points.push(crow);
+                    weights.push(wrow);
+                }
+                patches.push(BezierPatch {
+                    degree_u: p_u,
+                    degree_v: p_v,
+                    control_points,
+                    weights,
+                    domain_u: (breaks_u[su], breaks_u[su + 1]),
+                    domain_v: (breaks_v[sv], breaks_v[sv + 1]),
+                });
+            }
+        }
+        patches
+    }
+
+    /// Distinct interior knot values — strictly inside the clamped domain
+    /// endpoints — in the u direction when `u_dir` is true, otherwise v.
+    fn distinct_interior_knots(&self, u_dir: bool) -> Vec<f64> {
+        let (knots, degree) = if u_dir {
+            (&self.knots_u, self.degree_u)
+        } else {
+            (&self.knots_v, self.degree_v)
+        };
+        let vals = knots.values();
+        let lo = vals[degree];
+        let hi = vals[vals.len() - degree - 1];
+        let mut out: Vec<f64> = Vec::new();
+        for &k in vals {
+            let is_interior = k > lo + consts::EPSILON && k < hi - consts::EPSILON;
+            let is_new = out
+                .last()
+                .map_or(true, |last: &f64| (k - *last).abs() > consts::EPSILON);
+            if is_interior && is_new {
+                out.push(k);
+            }
+        }
+        out
+    }
+
+    /// Sorted distinct breakpoints from a non-decreasing knot vector, merging
+    /// runs of equal values within `consts::EPSILON`.
+    fn distinct_knot_values(values: &[f64]) -> Vec<f64> {
+        let mut out: Vec<f64> = Vec::new();
+        for &k in values {
+            if out
+                .last()
+                .map_or(true, |last: &f64| (k - *last).abs() > consts::EPSILON)
+            {
+                out.push(k);
+            }
+        }
+        out
+    }
+
     /// Tessellate surface into triangles
     pub fn tessellate(&self, tolerance: f64) -> (Vec<Point3>, Vec<[usize; 3]>) {
         let ((u_min, u_max), (v_min, v_max)) = self.parameter_bounds();
@@ -2480,28 +2591,35 @@ impl NurbsSurface {
         let n_v = self.control_points[0].len();
         let p = self.degree_u;
 
-        // Process each column
-        for col in 0..n_v {
-            let mut new_points = Vec::with_capacity(n_u + 1);
-            let mut new_weights = Vec::with_capacity(n_u + 1);
+        // Single-knot insertion (Piegl & Tiller A5.1) applied column by column
+        // in homogeneous coordinates. The refined grid is built in full and
+        // assigned once at the end: the previous implementation resized
+        // `self.control_points` to zeros while iterating columns, so it read
+        // back zeros for every column after the first (only manifests for
+        // surfaces, n_v > 1; never exercised at the value level until the
+        // Bézier-decomposition consumer landed). The suffix copy is also
+        // shifted (Q_i = P_{i-1}) so no control point is dropped.
+        let mut new_points = vec![vec![Point3::ZERO; n_v]; n_u + 1];
+        let mut new_weights = vec![vec![1.0; n_v]; n_u + 1];
 
-            // Copy unaffected control points
+        for col in 0..n_v {
+            // Unaffected prefix: Q_i = P_i for i in 0..=span-p.
             if span >= p {
                 for i in 0..=span - p {
-                    new_points.push(self.control_points[i][col]);
-                    new_weights.push(self.weights[i][col]);
+                    new_points[i][col] = self.control_points[i][col];
+                    new_weights[i][col] = self.weights[i][col];
                 }
             }
 
-            // Compute new control points
+            // Blended points: Q_i for i in span-p+1..=span.
             for i in span - p + 1..=span {
                 let knot_left = self.knots_u.values()[i];
                 let knot_right = self.knots_u.values()[i + p];
                 let denominator = knot_right - knot_left;
 
                 if denominator.abs() < 1e-12 {
-                    new_points.push(self.control_points[i][col]);
-                    new_weights.push(self.weights[i][col]);
+                    new_points[i][col] = self.control_points[i][col];
+                    new_weights[i][col] = self.weights[i][col];
                 } else {
                     let alpha = (u - knot_left) / denominator;
 
@@ -2511,7 +2629,8 @@ impl NurbsSurface {
                     let p_right = self.control_points[i][col];
 
                     let new_weight = (1.0 - alpha) * w_left + alpha * w_right;
-                    let new_point = if new_weight.abs() < 1e-12 {
+                    new_weights[i][col] = new_weight;
+                    new_points[i][col] = if new_weight.abs() < 1e-12 {
                         Point3::ZERO
                     } else {
                         Point3::from(
@@ -2520,30 +2639,18 @@ impl NurbsSurface {
                                 / new_weight,
                         )
                     };
-
-                    new_points.push(new_point);
-                    new_weights.push(new_weight);
                 }
             }
 
-            // Copy remaining control points
-            for i in span + 1..n_u {
-                new_points.push(self.control_points[i][col]);
-                new_weights.push(self.weights[i][col]);
-            }
-
-            // Update column
-            if col == 0 {
-                // Resize arrays on first column
-                self.control_points = vec![vec![Point3::ZERO; n_v]; n_u + 1];
-                self.weights = vec![vec![1.0; n_v]; n_u + 1];
-            }
-
-            for (i, (p, w)) in new_points.into_iter().zip(new_weights).enumerate() {
-                self.control_points[i][col] = p;
-                self.weights[i][col] = w;
+            // Shifted suffix: Q_i = P_{i-1} for i in span+1..=n_u.
+            for i in span + 1..=n_u {
+                new_points[i][col] = self.control_points[i - 1][col];
+                new_weights[i][col] = self.weights[i - 1][col];
             }
         }
+
+        self.control_points = new_points;
+        self.weights = new_weights;
 
         // Update knot vector
         let mut new_knot_values = self.knots_u.values().to_vec();
@@ -2837,6 +2944,100 @@ mod tests {
         assert!((d.duu.unwrap() - fd_uu).magnitude() < 1e-2, "duu vs finite diff");
         assert!((d.dvv.unwrap() - fd_vv).magnitude() < 1e-2, "dvv vs finite diff");
         assert!((d.duv.unwrap() - fd_uv).magnitude() < 1e-2, "duv vs finite diff");
+    }
+
+    /// Build a degree-2×2 rational NURBS surface with one interior knot in
+    /// each direction (at 0.5) for decomposition tests.
+    fn two_span_rational_surface() -> NurbsSurface {
+        let mut cp = Vec::new();
+        let mut w = Vec::new();
+        for i in 0..4 {
+            let mut crow = Vec::new();
+            let mut wrow = Vec::new();
+            for j in 0..4 {
+                crow.push(Point3::new(i as f64, j as f64, (i * j) as f64 * 0.1));
+                wrow.push(if (i, j) == (1, 1) {
+                    2.0
+                } else if (i, j) == (2, 2) {
+                    0.5
+                } else {
+                    1.0
+                });
+            }
+            cp.push(crow);
+            w.push(wrow);
+        }
+        let knots = vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0];
+        NurbsSurface::new(cp, w, knots.clone(), knots, 2, 2).unwrap()
+    }
+
+    /// Each extracted Bézier patch must reproduce the parent NURBS surface
+    /// exactly over its parameter sub-rectangle (knot insertion is lossless).
+    #[test]
+    fn bezier_decomposition_reproduces_nurbs_surface() {
+        let surf = two_span_rational_surface();
+        let patches = surf.to_bezier_patches();
+        assert_eq!(patches.len(), 4, "2×2 interior spans ⇒ 4 patches");
+        for patch in &patches {
+            for &s in &[0.15, 0.5, 0.85] {
+                for &t in &[0.2, 0.6, 0.95] {
+                    let pu = patch.domain_u.0 + s * (patch.domain_u.1 - patch.domain_u.0);
+                    let pv = patch.domain_v.0 + t * (patch.domain_v.1 - patch.domain_v.0);
+                    let from_patch = patch.evaluate(s, t);
+                    let from_nurbs = surf.evaluate(pu, pv).point;
+                    assert!(
+                        (from_patch - from_nurbs).magnitude() < 1e-7,
+                        "patch vs nurbs at parent ({pu},{pv}): {from_patch:?} vs {from_nurbs:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The patch domains must tile the parameter range contiguously in
+    /// row-major (u-outer, v-inner) order.
+    #[test]
+    fn bezier_decomposition_patch_domains_tile_parameter_space() {
+        let surf = two_span_rational_surface();
+        let patches = surf.to_bezier_patches();
+        let expected = [
+            ((0.0, 0.5), (0.0, 0.5)),
+            ((0.0, 0.5), (0.5, 1.0)),
+            ((0.5, 1.0), (0.0, 0.5)),
+            ((0.5, 1.0), (0.5, 1.0)),
+        ];
+        for (patch, (du, dv)) in patches.iter().zip(expected.iter()) {
+            assert!((patch.domain_u.0 - du.0).abs() < 1e-12 && (patch.domain_u.1 - du.1).abs() < 1e-12);
+            assert!((patch.domain_v.0 - dv.0).abs() < 1e-12 && (patch.domain_v.1 - dv.1).abs() < 1e-12);
+            assert_eq!(patch.degree_u, 2);
+            assert_eq!(patch.degree_v, 2);
+            assert_eq!(patch.control_points.len(), 3);
+            assert_eq!(patch.control_points[0].len(), 3);
+        }
+    }
+
+    /// A surface already in Bézier form (no interior knots) decomposes to a
+    /// single patch spanning the full parameter domain.
+    #[test]
+    fn bezier_decomposition_single_patch_when_already_bezier() {
+        let mut cp = Vec::new();
+        let mut w = Vec::new();
+        for i in 0..3 {
+            let mut crow = Vec::new();
+            let mut wrow = Vec::new();
+            for j in 0..3 {
+                crow.push(Point3::new(i as f64, j as f64, 0.0));
+                wrow.push(1.0);
+            }
+            cp.push(crow);
+            w.push(wrow);
+        }
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let surf = NurbsSurface::new(cp, w, knots.clone(), knots, 2, 2).unwrap();
+        let patches = surf.to_bezier_patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].domain_u, (0.0, 1.0));
+        assert_eq!(patches[0].domain_v, (0.0, 1.0));
     }
 
     /// Cross-parameter SIMD path must produce results identical to the scalar
