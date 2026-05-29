@@ -437,9 +437,10 @@ pub enum BlendFailure {
         tolerance: f64,
     },
     /// Catch-all for irreducible failures not yet classified. The
-    /// `detail` string is freeform; treat occurrences as a TODO to
-    /// replace with a structured variant once the failure mode is
-    /// understood.
+    /// `detail` string is freeform; when a recurring `detail` pattern
+    /// emerges in production telemetry, promote it to a structured
+    /// variant on this enum so callers can branch on the kind rather
+    /// than parse the string.
     TopologyViolation {
         /// Human-readable detail.
         detail: String,

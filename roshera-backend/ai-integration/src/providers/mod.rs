@@ -191,8 +191,12 @@ pub trait ASRProvider: Send + Sync + Debug {
     /// - Streaming supported for real-time transcription
     async fn transcribe(&self, audio: &[u8], format: AudioFormat) -> Result<String, ProviderError>;
 
-    // TODO: Add streaming support when needed
-    // Streaming methods with generic parameters break dyn compatibility
+    // Streaming transcription is intentionally out of scope for this
+    // trait: the natural shape (`-> impl Stream<Item = …>`) is not
+    // `dyn`-compatible, and the trait must stay object-safe because
+    // `ProviderManager` stores providers as `Arc<dyn ASRProvider>`.
+    // A streaming variant should live on a separate trait that
+    // concrete providers opt into.
 
     /// Get supported audio formats
     fn supported_formats(&self) -> Vec<AudioFormat>;

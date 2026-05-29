@@ -21,7 +21,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 /// Configuration for the Claude provider.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually so that the API key is never
+/// leaked through log streams, error reports, or the
+/// `{:?}` formatter used by debug-assertion failures. We render the
+/// `api_key` field as `Some("<redacted>")` or `None` — preserving
+/// presence information (often needed when triaging "is the provider
+/// configured at all?") while withholding the secret material itself.
+#[derive(Clone)]
 pub struct ClaudeConfig {
     /// Anthropic API key. When `None` (or empty) every method returns
     /// `ProviderError::ProviderUnavailable` — there is no offline fallback.
@@ -34,6 +41,22 @@ pub struct ClaudeConfig {
     pub tool_tier: ToolTier,
     /// API base URL (for proxies or self-hosted)
     pub api_base: String,
+}
+
+impl std::fmt::Debug for ClaudeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the API key. Presence is preserved (Some / None) so
+        // operators can still tell whether the provider is configured;
+        // the secret itself is replaced with a literal sentinel.
+        let api_key_redacted: Option<&str> = self.api_key.as_deref().map(|_| "<redacted>");
+        f.debug_struct("ClaudeConfig")
+            .field("api_key", &api_key_redacted)
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("tool_tier", &self.tool_tier)
+            .field("api_base", &self.api_base)
+            .finish()
+    }
 }
 
 impl Default for ClaudeConfig {
@@ -663,5 +686,43 @@ mod tests {
         let collected: Vec<_> = stream.collect::<Vec<_>>().await;
         let texts: Vec<String> = collected.into_iter().filter_map(Result::ok).collect();
         assert_eq!(texts.join(""), "foo bar");
+    }
+
+    /// AUDIT-M1 contract: the secret material must not appear in the
+    /// `Debug` output of `ClaudeConfig`. A regression would expose
+    /// every API key on the first `tracing::error!(?config, …)` line
+    /// the operator types.
+    #[test]
+    fn debug_redacts_api_key_when_present() {
+        let cfg = ClaudeConfig {
+            api_key: Some("sk-ant-real-secret-do-not-leak".to_string()),
+            ..ClaudeConfig::default()
+        };
+        let rendered = format!("{:?}", cfg);
+        assert!(
+            !rendered.contains("sk-ant-real-secret-do-not-leak"),
+            "Debug output must not contain the raw API key; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must mark the field as redacted; got: {rendered}"
+        );
+    }
+
+    /// AUDIT-M1: when no key is configured, `Debug` must preserve
+    /// `None` so operators can still see "provider not configured" in
+    /// triage. (Presence/absence is not secret; the key bytes are.)
+    #[test]
+    fn debug_preserves_none_when_api_key_absent() {
+        let cfg = ClaudeConfig::default();
+        let rendered = format!("{:?}", cfg);
+        assert!(
+            rendered.contains("api_key: None"),
+            "Debug output must surface absence as None; got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("<redacted>"),
+            "Absent key must not be labelled redacted; got: {rendered}"
+        );
     }
 }
