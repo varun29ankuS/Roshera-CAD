@@ -201,10 +201,41 @@ impl OperationImpl for DeleteOp {
                 }
             }
 
-            // Second pass: delete all entities
+            // Second pass: delete all entities.
+            //
+            // `find_dependent_entities` walks every entity's JSON for
+            // hardcoded reference fields (`parent_id`, `sketch_id`,
+            // `profile`, `path`, etc.). Two failure modes leave it
+            // returning IDs that the context no longer holds:
+            //   1. A prior cascade in this same pass already removed
+            //      the entity (the dependents set is union'd into
+            //      `all_to_delete`, but the underlying scanner has no
+            //      view into deletion progress).
+            //   2. The timeline replayed past a partial event from a
+            //      failed kernel operation (H10 root cause) and the
+            //      referenced entity never actually materialized in
+            //      the context.
+            // Either way, an "already gone" entity satisfies the
+            // delete intent. We log and skip rather than aborting the
+            // whole transaction — otherwise a single orphaned
+            // reference blocks the user from deleting anything that
+            // touched it.
             for entity_id in all_to_delete {
-                // Delete from context
-                context.delete_entity(entity_id)?;
+                match context.delete_entity(entity_id) {
+                    Ok(()) => {}
+                    Err(TimelineError::EntityNotFound(_)) => {
+                        tracing::debug!(
+                            target: "timeline.delete",
+                            entity_id = ?entity_id,
+                            "cascade target already absent from context; skipping"
+                        );
+                        // Mirror the cleanup the success path performs
+                        // so the mapping doesn't keep a stale entry.
+                        mapping.remove(entity_id);
+                        continue;
+                    }
+                    Err(other) => return Err(other),
+                }
 
                 // Remove from entity mapping
                 mapping.remove(entity_id);
@@ -252,5 +283,60 @@ impl OperationImpl for DeleteOp {
                 entities_modified: 0,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::EntityStateStore;
+    use crate::EntityId;
+    use std::sync::Arc;
+
+    /// H10 reconciliation contract: a Delete operation whose input
+    /// references an entity that no longer exists in the context must
+    /// complete successfully, skipping the missing entity rather than
+    /// hard-failing the entire transaction.
+    ///
+    /// Pre-fix: `context.delete_entity(missing)?` returned
+    /// `TimelineError::EntityNotFound`, propagating up and aborting
+    /// the whole delete. This made any orphaned-reference scenario
+    /// (partial-event predecessor in replay; cascade race) impossible
+    /// to recover from — the user could not delete anything that
+    /// touched the orphan.
+    ///
+    /// Post-fix: the second-pass loop matches on `EntityNotFound`,
+    /// logs at debug, and continues. Other delete errors still
+    /// propagate.
+    #[tokio::test]
+    async fn execute_tolerates_missing_entity_in_input_list() {
+        let op = DeleteOp;
+        let store = Arc::new(EntityStateStore::new());
+        let mut context = ExecutionContext::new(crate::BranchId::main(), store);
+
+        // Fabricate a UUID that was never added to the context.
+        // Simulates a partial-event predecessor: a Create that failed
+        // mid-execution left a Delete pointing at an ID the context
+        // never materialised.
+        let missing_id = EntityId::new();
+
+        let operation = Operation::Delete {
+            entities: vec![missing_id],
+        };
+
+        let result = op.execute(&operation, &mut context).await;
+        assert!(
+            result.is_ok(),
+            "execute must tolerate a missing entity (EntityNotFound), got {:?}",
+            result.err()
+        );
+
+        let outputs = result.expect("Ok branch verified above");
+        assert!(
+            outputs.deleted.is_empty(),
+            "no entity was actually deleted (the missing one was skipped); \
+             outputs.deleted = {:?}",
+            outputs.deleted
+        );
     }
 }

@@ -283,9 +283,19 @@ where
     F: FnOnce(&mut BRepModel) -> OperationResult<T>,
 {
     let snapshot = ModelSnapshot::take(model);
+    // Open a staging window on the attached recorder (if any) so that
+    // any `record_operation` calls inside `body` are buffered rather
+    // than committed to the timeline immediately. This is the bridge
+    // half of the H10 fix: failed kernel operations must not leak
+    // partial events that the delete path cannot reconcile.
+    model.begin_pending_record();
     match body(model) {
-        Ok(out) => Ok(out),
+        Ok(out) => {
+            model.commit_pending_record();
+            Ok(out)
+        }
         Err(e) => {
+            model.abort_pending_record();
             snapshot.restore(model);
             Err(e)
         }

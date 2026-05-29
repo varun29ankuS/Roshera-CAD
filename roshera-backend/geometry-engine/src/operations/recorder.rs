@@ -335,10 +335,46 @@ impl std::error::Error for RecorderError {}
 ///
 /// Implementations must be `Send + Sync` so a single recorder can be shared
 /// across threads holding `BRepModel`s.
+///
+/// # Transactional staging
+///
+/// The trio [`begin_pending`](Self::begin_pending) /
+/// [`commit_pending`](Self::commit_pending) /
+/// [`abort_pending`](Self::abort_pending) lets a transactional caller
+/// (typically `operations::lifecycle::with_rollback`) defer event
+/// commitment until the surrounding operation's success is known. When
+/// the operation fails and its model mutations are rolled back via
+/// `ModelSnapshot::restore`, the staged events must be discarded so the
+/// timeline never holds a record of an operation that "never happened".
+///
+/// The default implementations are no-ops: a recorder that commits
+/// events immediately at `record()` time will continue to do so. Only
+/// recorders backed by a remote / async sink (e.g. `TimelineRecorder`)
+/// need to override the staging hooks. This is what keeps `NullRecorder`,
+/// test captures, and audit-log recorders source-compatible.
 pub trait OperationRecorder: Send + Sync + fmt::Debug {
     /// Record a completed operation. Called after the `BRepModel` has
-    /// already been mutated successfully.
+    /// already been mutated successfully. When a transactional scope is
+    /// active (see [`begin_pending`](Self::begin_pending)), the event is
+    /// staged in-memory and only forwarded downstream on
+    /// [`commit_pending`](Self::commit_pending).
     fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError>;
+
+    /// Enter a transactional recording scope. Subsequent `record` calls
+    /// are staged until either [`commit_pending`](Self::commit_pending)
+    /// or [`abort_pending`](Self::abort_pending) resolves the scope.
+    /// Default impl: no-op (recorder commits immediately).
+    fn begin_pending(&self) {}
+
+    /// Commit and forward every event staged since the matching
+    /// [`begin_pending`](Self::begin_pending). Default impl: no-op.
+    fn commit_pending(&self) {}
+
+    /// Discard every event staged since the matching
+    /// [`begin_pending`](Self::begin_pending). Called by
+    /// `with_rollback` when the wrapped operation returned `Err` and
+    /// the model snapshot is about to be restored. Default impl: no-op.
+    fn abort_pending(&self) {}
 }
 
 /// Recorder that drops every event. Useful as a default for tests and
