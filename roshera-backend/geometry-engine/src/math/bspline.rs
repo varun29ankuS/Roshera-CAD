@@ -1033,8 +1033,13 @@ impl BSplineCurve {
                 };
 
                 for j in j1..=j2 {
-                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][rk as usize + j];
-                    d += a[s2][j] * ndu[rk as usize + j][pk as usize];
+                    // `rk` is signed and may be negative; add `j` in signed
+                    // space before casting so the index never wraps through
+                    // `usize` (which would overflow-panic in debug builds even
+                    // though `j1 = -rk` keeps the result `>= 0`).
+                    let idx = (rk + j as i32) as usize;
+                    a[s2][j] = (a[s1][j] - a[s1][j - 1]) / ndu[pk as usize + 1][idx];
+                    d += a[s2][j] * ndu[idx][pk as usize];
                 }
 
                 if r <= pk as usize {
@@ -1477,6 +1482,44 @@ mod tests {
         // Row 1 = first derivatives; sum should be ~0 (derivative of constant 1).
         let row1_sum: f64 = ders[1].iter().sum();
         assert!(row1_sum.abs() < 1e-9, "got {}", row1_sum);
+    }
+
+    /// Ground-truth check of 1st and 2nd derivatives against a closed form.
+    ///
+    /// A degree-2 Bézier over the clamped knots `[0,0,0,1,1,1]` reproduces a
+    /// field exactly from its degree-2 Bézier control values: `f(t)=t` →
+    /// `[0,0.5,1]`, `f(t)=t²` → `[0,0,1]`. Packed into the x-/y-fields the
+    /// control points are `(0,0,0)`, `(0.5,0,0)`, `(1,1,0)`, so the curve is
+    /// exactly `C(t) = (t, t², 0)`, giving `C'(t)=(1,2t,0)` and
+    /// `C''(t)=(0,2,0)`. This pins the A2.3 recurrence at order 2, where
+    /// `rk = r - k` first goes negative.
+    #[test]
+    fn bspline_second_derivative_exact_on_quadratic_bezier() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.5, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let curve = BSplineCurve::new(2, control_points, knots).expect("curve");
+
+        for &u in &[0.1, 0.25, 0.5, 0.6, 0.75, 0.9] {
+            let ders = curve.evaluate_derivatives(u, 2).expect("derivatives");
+
+            // Position C(u) = (u, u², 0).
+            assert!((ders[0].x - u).abs() < 1e-9, "pos.x at u={u}");
+            assert!((ders[0].y - u * u).abs() < 1e-9, "pos.y at u={u}");
+
+            // First derivative C'(u) = (1, 2u, 0).
+            assert!((ders[1].x - 1.0).abs() < 1e-9, "d1.x at u={u}: {}", ders[1].x);
+            assert!((ders[1].y - 2.0 * u).abs() < 1e-9, "d1.y at u={u}: {}", ders[1].y);
+            assert!(ders[1].z.abs() < 1e-9, "d1.z at u={u}");
+
+            // Second derivative C''(u) = (0, 2, 0) — constant.
+            assert!(ders[2].x.abs() < 1e-9, "d2.x at u={u}: {}", ders[2].x);
+            assert!((ders[2].y - 2.0).abs() < 1e-9, "d2.y at u={u}: {}", ders[2].y);
+            assert!(ders[2].z.abs() < 1e-9, "d2.z at u={u}");
+        }
     }
 
     // ------------------------------------------------------------------------
