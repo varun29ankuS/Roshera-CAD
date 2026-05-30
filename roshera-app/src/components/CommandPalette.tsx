@@ -337,7 +337,12 @@ export function CommandPalette() {
   }, [commands, query])
 
   // Keep the highlight inside the visible range as the user types.
+  // Resetting derived selection state when the query changes is the
+  // intended use of an effect here; the strict react-hooks rule flags the
+  // synchronous setState but there is no render-time derivation that
+  // expresses "reset to top on new query" without a remount.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveIndex(0)
   }, [query])
 

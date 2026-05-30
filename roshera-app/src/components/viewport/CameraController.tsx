@@ -193,6 +193,11 @@ export function CameraController() {
       const ortho = camera as THREE.OrthographicCamera
       const { height } = useSceneStore.getState().viewportSize
       if (ortho.isOrthographicCamera && height > 0) {
+        // Imperative Three.js camera mutation inside an effect (not React
+        // state) — required by the r3f/three API. The react-hooks
+        // immutability rule can't distinguish an external mutable object
+        // from frozen render state, so it false-positives here.
+        // eslint-disable-next-line react-hooks/immutability
         ortho.zoom = height / (maxDim * 1.5)
         ortho.updateProjectionMatrix()
       }

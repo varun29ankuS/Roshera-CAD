@@ -105,7 +105,7 @@ function fmtNum(n: number): string {
 
 function dimensionEchoMessage(proto: ProtocolCADObject): string | null {
   const props = proto.analytical_geometry?.properties
-  let bbox = props?.bounding_box ?? bboxFromVertices(proto.mesh.vertices)
+  const bbox = props?.bounding_box ?? bboxFromVertices(proto.mesh.vertices)
   if (!bbox) return null
   const dx = bbox.max[0] - bbox.min[0]
   const dy = bbox.max[1] - bbox.min[1]

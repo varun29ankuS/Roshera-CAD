@@ -862,7 +862,6 @@ export function DrawingsWorkspace() {
                     transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
                     willChange: 'transform',
                   }}
-                  // eslint-disable-next-line react/no-danger
                   dangerouslySetInnerHTML={svgMarkup}
                 />
               ) : (
