@@ -1018,11 +1018,16 @@ fn tessellate_conical_face(
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
     // Distinguish a true apex cone from a frustum by TOPOLOGY, not a v≈0
-    // test: the `Cone` surface's v-origin is the (possibly extrapolated)
-    // apex, so a frustum's `v_min` can also be ~0. An apex cone's lateral
-    // has a SINGLE base-circle loop (the apex is a point, not an edge); a
-    // frustum's lateral additionally carries an inner loop (the top circle).
-    let is_apex_cone = face.inner_loops.is_empty();
+    // test (the `Cone` v-origin is the extrapolated apex, so a frustum's
+    // v_min can also be ~0). An apex cone's lateral loop is a SINGLE
+    // base-circle edge (the apex is a point); a frustum's lateral loop is a
+    // seamed rectangle — bottom circle + seam + top circle + seam (4 edge
+    // entries) — exactly like the cylinder. So a >1-edge outer loop ⇒ frustum.
+    let is_apex_cone = model
+        .loops
+        .get(face.outer_loop)
+        .map(|l| l.edges.len() <= 1)
+        .unwrap_or(true);
 
     // Radial subdivision uses the MAXIMUM cross-section radius (at the
     // wide end) because chord-height demands more steps as radius grows.
@@ -1050,16 +1055,25 @@ fn tessellate_conical_face(
             face, model, surface, cache, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
         );
     } else {
-        // A cone face carrying an inner loop (e.g. a boolean-trimmed cone)
-        // is tessellated by the generic grid. NOTE: `create_cone_3d` does
-        // NOT produce a true two-ring frustum B-Rep — `create_cone_topology`
-        // approximates a frustum as an apex cone, so the seamless two-ring
-        // periodic case does not arise from the primitive path. If a real
-        // two-ring periodic frustum lands later it should route through a
-        // curved-CDT periodic-wrap path (CDT-γ.2; design in memory).
-        tessellate_conical_regular(
-            face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
-        );
+        // Seamed frustum: a Cone lateral with a single rectangular loop
+        // (shared circle edges + seam), structurally identical to the
+        // cylinder. Route it through the same curved-CDT path the cylinder
+        // uses — the cache-shared circle edges make the lateral↔cap seams
+        // bit-exact, and the seam (anchored to the circles' t=0) keeps the
+        // u-sweep a clean rectangle. On Err, fall back to the legacy grid so
+        // the face degrades to a visible (if non-watertight) mesh.
+        if let Err(e) =
+            super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
+        {
+            tracing::warn!(
+                "curved_cdt failed for cone frustum face {:?}: {:?}; falling back to grid",
+                face.id,
+                e
+            );
+            tessellate_conical_regular(
+                face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
+            );
+        }
     }
 }
 

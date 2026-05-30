@@ -3495,6 +3495,193 @@ impl<'a> TopologyBuilder<'a> {
         Ok(self.model.solids.add(solid))
     }
 
+    /// Create a true (seamed) frustum B-Rep: a truncated cone with two
+    /// distinct circular ends. Mirrors [`Self::create_cylinder_topology`]
+    /// exactly — shared circle edges + a seam line → a single rectangular
+    /// lateral loop, the proven watertight structure — but with two radii
+    /// and a `Cone` lateral surface, so the lateral tessellates through the
+    /// same curved-CDT path as the cylinder. Replaces the prior lossy
+    /// "approximate the frustum as an apex cone" path, which left the
+    /// truncation cap disconnected from the lateral (non-watertight).
+    ///
+    /// Precondition (enforced by the caller): `base_radius` and `top_radius`
+    /// are both positive and meaningfully different (a near-equal pair is
+    /// routed to `create_cylinder_topology`).
+    fn create_frustum_topology(
+        &mut self,
+        base_center: Point3,
+        axis: Vector3,
+        base_radius: f64,
+        top_radius: f64,
+        height: f64,
+    ) -> Result<SolidId, PrimitiveError> {
+        let topology_err = |msg: String| PrimitiveError::TopologyError {
+            message: msg,
+            euler_characteristic: None,
+        };
+
+        let top_center = base_center + axis * height;
+
+        // Lateral cone geometry: apex + half-angle from the two radii. The
+        // cone axis points apex → base (toward increasing radius): a cone
+        // narrowing along +axis has its apex beyond the top (cone axis =
+        // -axis); a widening one has its apex below the base (cone axis =
+        // +axis).
+        let tan_half = (base_radius - top_radius).abs() / height;
+        let half_angle = tan_half.atan();
+        let (apex, cone_axis) = if base_radius > top_radius {
+            (base_center + axis * (base_radius / tan_half), -axis)
+        } else {
+            (base_center - axis * (base_radius / tan_half), axis)
+        };
+
+        // ---- curves: two circles + one seam line. ----
+        let bottom_circle = Circle::new(base_center, axis, base_radius)
+            .map_err(|e| topology_err(format!("bottom circle: {e}")))?;
+        let top_circle = Circle::new(top_center, axis, top_radius)
+            .map_err(|e| topology_err(format!("top circle: {e}")))?;
+
+        // Seam at the circles' parametric origin (t = 0), same as the
+        // cylinder. Both circles share `axis`, hence the same canonical
+        // `x_axis`, so a single `ref_dir` anchors both seam vertices.
+        let ref_dir = bottom_circle.x_axis();
+
+        let v_bottom = self.model.vertices.add_or_find(
+            base_center.x + ref_dir.x * base_radius,
+            base_center.y + ref_dir.y * base_radius,
+            base_center.z + ref_dir.z * base_radius,
+            self.tolerance.distance(),
+        );
+        let v_top = self.model.vertices.add_or_find(
+            top_center.x + ref_dir.x * top_radius,
+            top_center.y + ref_dir.y * top_radius,
+            top_center.z + ref_dir.z * top_radius,
+            self.tolerance.distance(),
+        );
+
+        let seam_line = Line::new(
+            base_center + ref_dir * base_radius,
+            top_center + ref_dir * top_radius,
+        );
+        let bottom_circle_id = self.model.curves.add(Box::new(bottom_circle));
+        let top_circle_id = self.model.curves.add(Box::new(top_circle));
+        let seam_line_id = self.model.curves.add(Box::new(seam_line));
+
+        // ---- edges: closed circles (shared with caps) + linear seam. ----
+        let bottom_edge = self.model.edges.add(Edge::new(
+            0,
+            v_bottom,
+            v_bottom,
+            bottom_circle_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let top_edge = self.model.edges.add(Edge::new(
+            0,
+            v_top,
+            v_top,
+            top_circle_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let seam_edge = self.model.edges.add(Edge::new(
+            0,
+            v_bottom,
+            v_top,
+            seam_line_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+
+        // ---- surfaces: 2 planes + 1 cone. ----
+        let bottom_plane = Plane::from_point_normal(base_center, -axis)
+            .map_err(|e| topology_err(format!("bottom plane: {e}")))?;
+        let top_plane = Plane::from_point_normal(top_center, axis)
+            .map_err(|e| topology_err(format!("top plane: {e}")))?;
+        let v_base_d = (base_center - apex).dot(&cone_axis);
+        let v_top_d = (top_center - apex).dot(&cone_axis);
+        let lateral_cone = crate::primitives::surface::Cone {
+            apex,
+            axis: cone_axis,
+            half_angle,
+            ref_dir: cone_axis.perpendicular(),
+            height_limits: Some([v_base_d.min(v_top_d), v_base_d.max(v_top_d)]),
+            angle_limits: None,
+        };
+        let bottom_surface_id = self.model.surfaces.add(Box::new(bottom_plane));
+        let top_surface_id = self.model.surfaces.add(Box::new(top_plane));
+        let lateral_surface_id = self.model.surfaces.add(Box::new(lateral_cone));
+
+        // Orient the lateral so its outward normal points radially away
+        // from the axis (replicates `orient_cone_lateral_outward`): compare
+        // the surface normal at the parametric midpoint against the radial
+        // direction there; `Face::normal_at` applies `orientation.sign()`.
+        let lateral_orientation = {
+            let surface = self
+                .model
+                .surfaces
+                .get(lateral_surface_id)
+                .ok_or_else(|| topology_err("lateral cone surface missing".into()))?;
+            let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+            let (u_mid, v_mid) = (0.5 * (u_min + u_max), 0.5 * (v_min + v_max));
+            match (surface.point_at(u_mid, v_mid), surface.normal_at(u_mid, v_mid)) {
+                (Ok(mid), Ok(n)) => {
+                    let from_apex = mid - apex;
+                    let radial = from_apex - cone_axis * from_apex.dot(&cone_axis);
+                    if n.dot(&radial) >= 0.0 {
+                        FaceOrientation::Forward
+                    } else {
+                        FaceOrientation::Backward
+                    }
+                }
+                _ => FaceOrientation::Forward,
+            }
+        };
+
+        // ---- loops (identical structure to the cylinder). ----
+        let mut bottom_loop = Loop::new(0, LoopType::Outer);
+        bottom_loop.add_edge(bottom_edge, false);
+        let bottom_loop_id = self.model.loops.add(bottom_loop);
+
+        let mut top_loop = Loop::new(0, LoopType::Outer);
+        top_loop.add_edge(top_edge, true);
+        let top_loop_id = self.model.loops.add(top_loop);
+
+        // Lateral seamed face: bottom_circle(fwd) → seam(fwd) →
+        // top_circle(back) → seam(back), a CCW rectangle in (u, v).
+        let mut lateral_loop = Loop::new(0, LoopType::Outer);
+        lateral_loop.add_edge(bottom_edge, true);
+        lateral_loop.add_edge(seam_edge, true);
+        lateral_loop.add_edge(top_edge, false);
+        lateral_loop.add_edge(seam_edge, false);
+        let lateral_loop_id = self.model.loops.add(lateral_loop);
+
+        // ---- faces. ----
+        let mut bottom_face =
+            Face::new(0, bottom_surface_id, bottom_loop_id, FaceOrientation::Forward);
+        bottom_face.outer_loop = bottom_loop_id;
+        let bottom_face_id = self.model.faces.add(bottom_face);
+
+        let mut top_face = Face::new(0, top_surface_id, top_loop_id, FaceOrientation::Forward);
+        top_face.outer_loop = top_loop_id;
+        let top_face_id = self.model.faces.add(top_face);
+
+        let mut lateral_face =
+            Face::new(0, lateral_surface_id, lateral_loop_id, lateral_orientation);
+        lateral_face.outer_loop = lateral_loop_id;
+        let lateral_face_id = self.model.faces.add(lateral_face);
+
+        // ---- shell + solid. ----
+        let mut shell = Shell::new(0, ShellType::Closed);
+        shell.add_face(bottom_face_id);
+        shell.add_face(top_face_id);
+        shell.add_face(lateral_face_id);
+        let shell_id = self.model.shells.add(shell);
+
+        let solid = Solid::new(0, shell_id);
+        Ok(self.model.solids.add(solid))
+    }
+
     /// Create cone topology using the full cone primitive implementation
     fn create_cone_topology(
         &mut self,
@@ -3526,17 +3713,16 @@ impl<'a> TopologyBuilder<'a> {
             let apex = base_center + axis * height;
             (apex, half_angle, height)
         } else {
-            // Frustum - approximate with cone
+            // True frustum (both radii positive). A near-equal pair is a
+            // cylinder; otherwise build a real two-end frustum B-Rep (shared
+            // circle edges + seam, like the cylinder) rather than the prior
+            // lossy apex-cone approximation that left the truncation cap
+            // disconnected from the lateral.
             let slope = (top_radius - base_radius) / height;
             if slope.abs() < 1e-10 {
-                // Nearly cylindrical - treat as cylinder
                 return self.create_cylinder_topology(base_center, axis, base_radius, height);
             }
-            let apex_height = base_radius / slope.abs();
-            let apex = base_center - axis * apex_height;
-            let full_height = apex_height + height;
-            let half_angle = (top_radius / full_height).atan();
-            (apex, half_angle, full_height)
+            return self.create_frustum_topology(base_center, axis, base_radius, top_radius, height);
         };
 
         // Create cone parameters
