@@ -863,10 +863,9 @@ fn section_centroid(model: &BRepModel, section: &SweepSection) -> OperationResul
     }
     let mut sum = Vector3::ZERO;
     for &vid in &section.vertices {
-        let v = model
-            .vertices
-            .get(vid)
-            .ok_or_else(|| OperationError::InvalidGeometry("Section vertex not found".to_string()))?;
+        let v = model.vertices.get(vid).ok_or_else(|| {
+            OperationError::InvalidGeometry("Section vertex not found".to_string())
+        })?;
         sum = sum + Vector3::from(v.position);
     }
     Ok(sum * (1.0 / section.vertices.len() as f64))
@@ -1013,10 +1012,7 @@ fn create_bilinear_surface(
 /// We sample the path's unit tangent at t = 0 and return its negation.
 /// A degenerate path (zero-length tangent) is rejected because the
 /// sweep cannot proceed.
-fn sweep_start_cap_outward(
-    model: &BRepModel,
-    path_edge: &Edge,
-) -> OperationResult<Vector3> {
+fn sweep_start_cap_outward(model: &BRepModel, path_edge: &Edge) -> OperationResult<Vector3> {
     let curve = model
         .curves
         .get(path_edge.curve_id)
@@ -1357,12 +1353,7 @@ mod tests {
 
     #[test]
     fn build_sweep_transform_zero_twist_unit_scale_is_translation() {
-        let m = build_sweep_transform(
-            Point3::new(3.0, 4.0, 5.0),
-            Matrix4::identity(),
-            1.0,
-            0.0,
-        );
+        let m = build_sweep_transform(Point3::new(3.0, 4.0, 5.0), Matrix4::identity(), 1.0, 0.0);
         let p = m.transform_point(&Vector3::ZERO);
         assert!((p.x - 3.0).abs() < 1e-12);
         assert!((p.y - 4.0).abs() < 1e-12);
@@ -1463,8 +1454,7 @@ mod tests {
         let v2 = model.vertices.add(1.0, 0.0, 0.0);
         let v3 = model.vertices.add(1.0, 1.0, 0.0);
         let v4 = model.vertices.add(0.0, 1.0, 0.0);
-        let face_id =
-            create_quad_face(&mut model, v1, v2, v3, v4, Vector3::Z).expect("face");
+        let face_id = create_quad_face(&mut model, v1, v2, v3, v4, Vector3::Z).expect("face");
         let face = model.faces.get(face_id).expect("face in store");
         let outer = model.loops.get(face.outer_loop).expect("loop");
         assert_eq!(outer.edges.len(), 4);
@@ -1517,11 +1507,14 @@ mod tests {
         let v2 = model.vertices.add(1.0, 0.0, 0.0);
         let v3 = model.vertices.add(1.0, 1.0, 0.0);
         let v4 = model.vertices.add(0.0, 1.0, 0.0);
-        let face_id =
-            create_quad_face(&mut model, v1, v2, v3, v4, Vector3::Z).expect("face");
+        let face_id = create_quad_face(&mut model, v1, v2, v3, v4, Vector3::Z).expect("face");
         let original_orientation = model.faces.get(face_id).expect("face").orientation;
         let reversed_id = create_reversed_face(&mut model, face_id).expect("reversed");
-        let reversed_orientation = model.faces.get(reversed_id).expect("reversed face").orientation;
+        let reversed_orientation = model
+            .faces
+            .get(reversed_id)
+            .expect("reversed face")
+            .orientation;
         assert_ne!(original_orientation, reversed_orientation);
     }
 

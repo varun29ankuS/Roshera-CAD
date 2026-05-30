@@ -42,9 +42,7 @@ use geometry_engine::operations::chamfer::{
 };
 use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
 use geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity;
-use geometry_engine::operations::recorder::{
-    OperationRecorder, RecordedOperation, RecorderError,
-};
+use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
 use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;
@@ -125,7 +123,11 @@ fn corner_edges(model: &BRepModel) -> Vec<EdgeId> {
     let corner = vertex_at(model, HALF_BOX, HALF_BOX, HALF_BOX);
     let mut edges = edges_at_vertex(model, corner);
     edges.sort_unstable();
-    assert_eq!(edges.len(), 3, "box corner must have exactly 3 incident edges");
+    assert_eq!(
+        edges.len(),
+        3,
+        "box corner must have exactly 3 incident edges"
+    );
     edges
 }
 
@@ -171,10 +173,7 @@ fn collect_subpatch_bits(
     let mut nurbs_faces: Vec<FaceId> = Vec::new();
     for &fid in &shell.faces {
         let face = model.faces.get(fid).expect("face exists");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface exists");
+        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
         if surface
             .as_any()
             .downcast_ref::<GeneralNurbsSurface>()
@@ -189,10 +188,7 @@ fn collect_subpatch_bits(
     let mut w_bits: Vec<Vec<u64>> = Vec::with_capacity(nurbs_faces.len());
     for fid in &nurbs_faces {
         let face = model.faces.get(*fid).expect("face exists");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface exists");
+        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
         let nurbs = surface
             .as_any()
             .downcast_ref::<GeneralNurbsSurface>()
@@ -249,11 +245,8 @@ fn run_1c2f_chamfer_first_g1() -> RunSnapshot {
     let (sub_patch_cps_bits, sub_patch_weights_bits, sub_patch_count) =
         collect_subpatch_bits(&model, solid_id);
 
-    let recorded_op_kinds: Vec<String> = recorder
-        .snapshot()
-        .into_iter()
-        .map(|op| op.kind)
-        .collect();
+    let recorded_op_kinds: Vec<String> =
+        recorder.snapshot().into_iter().map(|op| op.kind).collect();
 
     RunSnapshot {
         sub_patch_cps_bits,

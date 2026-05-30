@@ -36,22 +36,23 @@ fn orient_torus_outward(
     axis: Vector3,
     major_radius: f64,
 ) -> Result<FaceOrientation, PrimitiveError> {
-    let surface = model.surfaces.get(torus_surface_id).ok_or_else(|| {
-        PrimitiveError::GeometryError {
-            operation: "Torus surface lookup".to_string(),
-            details: "torus surface missing from store".to_string(),
-        }
-    })?;
+    let surface =
+        model
+            .surfaces
+            .get(torus_surface_id)
+            .ok_or_else(|| PrimitiveError::GeometryError {
+                operation: "Torus surface lookup".to_string(),
+                details: "torus surface missing from store".to_string(),
+            })?;
     let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
     let u_mid = 0.5 * (u_min + u_max);
     let v_mid = 0.5 * (v_min + v_max);
-    let mid_point =
-        surface
-            .point_at(u_mid, v_mid)
-            .map_err(|e| PrimitiveError::GeometryError {
-                operation: "Torus mid-point evaluation".to_string(),
-                details: format!("{e:?}"),
-            })?;
+    let mid_point = surface
+        .point_at(u_mid, v_mid)
+        .map_err(|e| PrimitiveError::GeometryError {
+            operation: "Torus mid-point evaluation".to_string(),
+            details: format!("{e:?}"),
+        })?;
     // Compute the corresponding point on the major circle (centre of
     // the tube at angle u_mid). The outward target is from that point
     // to the surface mid-point.
@@ -63,11 +64,9 @@ fn orient_torus_outward(
         .unwrap_or_else(|_| axis.perpendicular());
     let major_circle_point = center + major_dir * major_radius;
     let radial_target = mid_point - major_circle_point;
-    orient_face_for_outward(surface, radial_target).map_err(|e| {
-        PrimitiveError::GeometryError {
-            operation: "Torus face orientation".to_string(),
-            details: format!("{e:?}"),
-        }
+    orient_face_for_outward(surface, radial_target).map_err(|e| PrimitiveError::GeometryError {
+        operation: "Torus face orientation".to_string(),
+        details: format!("{e:?}"),
     })
 }
 use serde::{Deserialize, Serialize};

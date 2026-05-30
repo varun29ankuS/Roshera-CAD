@@ -22,15 +22,8 @@
 //! coroutine; handlers receive it as `&mut`.
 
 use geometry_engine::primitives::{
-    curve::CurveId,
-    edge::EdgeId,
-    face::FaceId,
-    r#loop::LoopId,
-    shell::ShellId,
-    solid::SolidId,
-    surface::SurfaceId,
-    topology_builder::BRepModel,
-    vertex::VertexId,
+    curve::CurveId, edge::EdgeId, face::FaceId, r#loop::LoopId, shell::ShellId, solid::SolidId,
+    surface::SurfaceId, topology_builder::BRepModel, vertex::VertexId,
 };
 use std::collections::HashMap;
 

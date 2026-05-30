@@ -936,11 +936,7 @@ impl ConstraintSolver {
             // Project out the span of the existing basis.
             let mut residual = row.clone();
             for b in &basis {
-                let dot: f64 = residual
-                    .iter()
-                    .zip(b.iter())
-                    .map(|(r, v)| r * v)
-                    .sum();
+                let dot: f64 = residual.iter().zip(b.iter()).map(|(r, v)| r * v).sum();
                 for (rk, vk) in residual.iter_mut().zip(b.iter()) {
                     *rk -= dot * vk;
                 }
@@ -2302,8 +2298,7 @@ mod tests {
         // check_constraint_count reports it before iteration starts.
         assert!(matches!(
             r.status,
-            SolverStatus::UnderConstrained { .. }
-                | SolverStatus::Converged { .. }
+            SolverStatus::UnderConstrained { .. } | SolverStatus::Converged { .. }
         ));
     }
 
@@ -2357,7 +2352,9 @@ mod tests {
         s.set_constraints(constraints);
         let r = s.solve();
         match r.status {
-            SolverStatus::OverConstrained { conflicting_constraints } => {
+            SolverStatus::OverConstrained {
+                conflicting_constraints,
+            } => {
                 assert_eq!(conflicting_constraints, 3);
             }
             other => panic!("expected OverConstrained, got {:?}", other),
@@ -2409,10 +2406,7 @@ mod tests {
         let b = point_ref();
         s.add_entity(a, EntityState::point(Point2d::new(1.0, 2.0), false));
         s.add_entity(b, EntityState::point(Point2d::new(4.0, 7.0), false));
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Coincident,
-            &[a, b],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[a, b]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], -3.0, 1e-12));
         assert!(approx_eq(errs[1], -5.0, 1e-12));
@@ -2425,10 +2419,7 @@ mod tests {
         let b = point_ref();
         s.add_entity(a, EntityState::point(Point2d::new(2.0, 3.0), false));
         s.add_entity(b, EntityState::point(Point2d::new(2.0, 3.0), false));
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Coincident,
-            &[a, b],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[a, b]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
         assert!(approx_eq(errs[1], 0.0, 1e-12));
     }
@@ -2440,12 +2431,7 @@ mod tests {
         let l2 = line_ref();
         s.add_entity(
             l1,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::new(1.0, 0.0),
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), false, false),
         );
         s.add_entity(
             l2,
@@ -2456,10 +2442,7 @@ mod tests {
                 false,
             ),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Parallel,
-            &[l1, l2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Parallel, &[l1, l2]);
         assert_eq!(errs.len(), 1);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
     }
@@ -2471,26 +2454,13 @@ mod tests {
         let l2 = line_ref();
         s.add_entity(
             l1,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_X,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_X, false, false),
         );
         s.add_entity(
             l2,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_Y,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_Y, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Perpendicular,
-            &[l1, l2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Perpendicular, &[l1, l2]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
     }
 
@@ -2500,17 +2470,9 @@ mod tests {
         let l = line_ref();
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::new(1.0, 0.5),
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.5), false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Horizontal,
-            &[l],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Horizontal, &[l]);
         assert!(approx_eq(errs[0], 0.5, 1e-12));
     }
 
@@ -2520,17 +2482,9 @@ mod tests {
         let l = line_ref();
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::new(0.25, 1.0),
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(0.25, 1.0), false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Vertical,
-            &[l],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Vertical, &[l]);
         assert!(approx_eq(errs[0], 0.25, 1e-12));
     }
 
@@ -2543,21 +2497,13 @@ mod tests {
         let c = circle_ref();
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_X,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_X, false, false),
         );
         s.add_entity(
             c,
             EntityState::circle(Point2d::new(0.0, 5.0), 3.0, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Tangent,
-            &[l, c],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Tangent, &[l, c]);
         assert!(approx_eq(errs[0], 2.0, 1e-12));
     }
 
@@ -2574,10 +2520,7 @@ mod tests {
             c2,
             EntityState::circle(Point2d::new(4.0, 6.0), 5.0, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Concentric,
-            &[c1, c2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Concentric, &[c1, c2]);
         assert!(approx_eq(errs[0], -3.0, 1e-12));
         assert!(approx_eq(errs[1], -4.0, 1e-12));
     }
@@ -2587,18 +2530,9 @@ mod tests {
         let mut s = ConstraintSolver::new();
         let c1 = circle_ref();
         let c2 = circle_ref();
-        s.add_entity(
-            c1,
-            EntityState::circle(Point2d::ORIGIN, 7.0, false, false),
-        );
-        s.add_entity(
-            c2,
-            EntityState::circle(Point2d::ORIGIN, 4.0, false, false),
-        );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Equal,
-            &[c1, c2],
-        );
+        s.add_entity(c1, EntityState::circle(Point2d::ORIGIN, 7.0, false, false));
+        s.add_entity(c2, EntityState::circle(Point2d::ORIGIN, 4.0, false, false));
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Equal, &[c1, c2]);
         assert!(approx_eq(errs[0], 3.0, 1e-12));
     }
 
@@ -2610,17 +2544,9 @@ mod tests {
         s.add_entity(p, EntityState::point(Point2d::new(5.0, 0.0), false));
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_X,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_X, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, l],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, l]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
     }
 
@@ -2632,17 +2558,9 @@ mod tests {
         s.add_entity(p, EntityState::point(Point2d::new(5.0, 3.0), false));
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_X,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_X, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, l],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, l]);
         assert!(errs[0].abs() > 1e-6);
     }
 
@@ -2652,14 +2570,8 @@ mod tests {
         let p = point_ref();
         let c = circle_ref();
         s.add_entity(p, EntityState::point(Point2d::new(5.0, 0.0), false));
-        s.add_entity(
-            c,
-            EntityState::circle(Point2d::ORIGIN, 3.0, false, false),
-        );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, c],
-        );
+        s.add_entity(c, EntityState::circle(Point2d::ORIGIN, 3.0, false, false));
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, c]);
         assert!(approx_eq(errs[0], 2.0, 1e-12));
     }
 
@@ -2679,10 +2591,7 @@ mod tests {
         // = (0, 0), so a point exactly there sits on the curve.
         s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
         s.add_entity(sp, sample_bspline_state());
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, sp],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, sp]);
         // closest_point's Newton refinement converges to a tight
         // residual; the foot snaps to (0, 0) and the perpendicular
         // distance is at numerical noise.
@@ -2701,10 +2610,7 @@ mod tests {
         // on magnitude.
         s.add_entity(p, EntityState::point(Point2d::new(1.5, -3.0), false));
         s.add_entity(sp, sample_bspline_state());
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, sp],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, sp]);
         assert!(
             errs[0].abs() > 1.0,
             "expected large off-curve residual, got {}",
@@ -2756,7 +2662,10 @@ mod tests {
             Point2d::new(2.0, 0.0),
         ];
         let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        s.add_entity(sp, EntityState::spline_bspline(2, control_points, knots, true));
+        s.add_entity(
+            sp,
+            EntityState::spline_bspline(2, control_points, knots, true),
+        );
         assert_eq!(s.count_degrees_of_freedom(), 0);
     }
 
@@ -2776,7 +2685,10 @@ mod tests {
             Point2d::new(7.0, 0.25),
         ];
         let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        s.add_entity(sp, EntityState::spline_bspline(2, control_points, knots, false));
+        s.add_entity(
+            sp,
+            EntityState::spline_bspline(2, control_points, knots, false),
+        );
         let updates = s.get_entity_updates();
         let update = updates.get(&sp).expect("spline update missing");
         match update {
@@ -2839,10 +2751,7 @@ mod tests {
             EntityState::point(Point2d::new(half_sqrt2, half_sqrt2), false),
         );
         s.add_entity(sp, sample_nurbs_quarter_arc_state());
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, sp],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, sp]);
         // closest_point's Newton refinement converges to a tight
         // residual on the arc.
         assert!(
@@ -2861,10 +2770,7 @@ mod tests {
         let sp = spline_ref();
         s.add_entity(p, EntityState::point(Point2d::new(5.0, 5.0), false));
         s.add_entity(sp, sample_nurbs_quarter_arc_state());
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[p, sp],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[p, sp]);
         assert!(
             errs[0].abs() > 1.0,
             "expected large off-curve NURBS residual, got {}",
@@ -2897,20 +2803,16 @@ mod tests {
             spb,
             EntityState::spline_bspline(2, control_points.clone(), knots.clone(), false),
         );
-        let bs_err = s_bspline.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[pb, spb],
-        )[0];
+        let bs_err = s_bspline
+            .evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[pb, spb])[0];
 
         let mut s_nurbs = ConstraintSolver::new();
         let pn = point_ref();
         let spn = spline_ref();
         s_nurbs.add_entity(pn, EntityState::point(probe, false));
         s_nurbs.add_entity(spn, sample_nurbs_quarter_arc_state());
-        let nb_err = s_nurbs.evaluate_geometric_constraint(
-            &GeometricConstraint::PointOnCurve,
-            &[pn, spn],
-        )[0];
+        let nb_err = s_nurbs
+            .evaluate_geometric_constraint(&GeometricConstraint::PointOnCurve, &[pn, spn])[0];
 
         // NURBS arc passes through the probe → ~0; B-Spline parabola
         // does not → ≥ 0.1. Magnitudes must differ enough that the
@@ -2964,10 +2866,7 @@ mod tests {
         s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
         s.add_entity(b, EntityState::point(Point2d::new(1.0, 1.0), false));
         s.add_entity(c, EntityState::point(Point2d::new(2.0, 2.0), false));
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Collinear,
-            &[a, b, c],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Collinear, &[a, b, c]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
     }
 
@@ -2980,10 +2879,7 @@ mod tests {
         s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
         s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), false));
         s.add_entity(c, EntityState::point(Point2d::new(2.0, 1.0), false));
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Collinear,
-            &[a, b, c],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Collinear, &[a, b, c]);
         assert!(errs[0].abs() > 0.5);
     }
 
@@ -2997,17 +2893,9 @@ mod tests {
         s.add_entity(p, EntityState::point(Point2d::new(50.0, 0.0), false));
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_X,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_X, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Midpoint,
-            &[p, l],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Midpoint, &[p, l]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
         assert!(approx_eq(errs[1], 0.0, 1e-12));
     }
@@ -3024,17 +2912,9 @@ mod tests {
         s.add_entity(b, EntityState::point(Point2d::new(1.0, -1.0), false));
         s.add_entity(
             axis,
-            EntityState::line(
-                Point2d::ORIGIN,
-                Vector2d::UNIT_X,
-                false,
-                false,
-            ),
+            EntityState::line(Point2d::ORIGIN, Vector2d::UNIT_X, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Symmetric,
-            &[a, b, axis],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Symmetric, &[a, b, axis]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
         assert!(approx_eq(errs[1], 0.0, 1e-12));
     }
@@ -3044,10 +2924,7 @@ mod tests {
         let s = ConstraintSolver::new();
         let p = point_ref();
         // Only one entity passed
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Coincident,
-            &[p],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[p]);
         assert_eq!(errs, vec![0.0, 0.0]);
     }
 
@@ -3057,10 +2934,7 @@ mod tests {
         let s = ConstraintSolver::new();
         let l1 = line_ref();
         let l2 = line_ref();
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Parallel,
-            &[l1, l2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Parallel, &[l1, l2]);
         // The solver returns Vector2d::UNIT_X for missing line directions,
         // so both directions match → cross product = 0.
         assert!(approx_eq(errs[0], 0.0, 1e-12));
@@ -3075,10 +2949,8 @@ mod tests {
         let b = point_ref();
         s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
         s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), false));
-        let errs = s.evaluate_dimensional_constraint(
-            &DimensionalConstraint::Distance(2.0),
-            &[a, b],
-        );
+        let errs =
+            s.evaluate_dimensional_constraint(&DimensionalConstraint::Distance(2.0), &[a, b]);
         // Pythagorean distance is 5, target is 2 → error = 3
         assert!(approx_eq(errs[0], 3.0, 1e-12));
     }
@@ -3087,14 +2959,8 @@ mod tests {
     fn radius_error_is_actual_minus_target() {
         let mut s = ConstraintSolver::new();
         let c = circle_ref();
-        s.add_entity(
-            c,
-            EntityState::circle(Point2d::ORIGIN, 5.0, false, false),
-        );
-        let errs = s.evaluate_dimensional_constraint(
-            &DimensionalConstraint::Radius(3.0),
-            &[c],
-        );
+        s.add_entity(c, EntityState::circle(Point2d::ORIGIN, 5.0, false, false));
+        let errs = s.evaluate_dimensional_constraint(&DimensionalConstraint::Radius(3.0), &[c]);
         assert!(approx_eq(errs[0], 2.0, 1e-12));
     }
 
@@ -3103,10 +2969,8 @@ mod tests {
         let mut s = ConstraintSolver::new();
         let p = point_ref();
         s.add_entity(p, EntityState::point(Point2d::new(1.5, 0.0), false));
-        let errs = s.evaluate_dimensional_constraint(
-            &DimensionalConstraint::XCoordinate(1.0),
-            &[p],
-        );
+        let errs =
+            s.evaluate_dimensional_constraint(&DimensionalConstraint::XCoordinate(1.0), &[p]);
         assert!(approx_eq(errs[0], 0.5, 1e-12));
     }
 
@@ -3115,10 +2979,8 @@ mod tests {
         let mut s = ConstraintSolver::new();
         let p = point_ref();
         s.add_entity(p, EntityState::point(Point2d::new(0.0, -2.3), false));
-        let errs = s.evaluate_dimensional_constraint(
-            &DimensionalConstraint::YCoordinate(0.0),
-            &[p],
-        );
+        let errs =
+            s.evaluate_dimensional_constraint(&DimensionalConstraint::YCoordinate(0.0), &[p]);
         assert!(approx_eq(errs[0], -2.3, 1e-12));
     }
 
@@ -3127,10 +2989,8 @@ mod tests {
         let s = ConstraintSolver::new();
         let a = point_ref();
         let b = point_ref();
-        let errs = s.evaluate_dimensional_constraint(
-            &DimensionalConstraint::Distance(5.0),
-            &[a, b],
-        );
+        let errs =
+            s.evaluate_dimensional_constraint(&DimensionalConstraint::Distance(5.0), &[a, b]);
         assert_eq!(errs, vec![0.0]);
     }
 
@@ -3139,10 +2999,7 @@ mod tests {
         let mut s = ConstraintSolver::new();
         let p = point_ref();
         s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
-        let errs = s.evaluate_dimensional_constraint(
-            &DimensionalConstraint::Radius(1.0),
-            &[p],
-        );
+        let errs = s.evaluate_dimensional_constraint(&DimensionalConstraint::Radius(1.0), &[p]);
         assert_eq!(errs, vec![0.0]);
     }
 
@@ -3490,12 +3347,7 @@ mod tests {
         let l = line_ref();
         s.add_entity(
             l,
-            EntityState::line(
-                Point2d::new(1.0, 1.0),
-                Vector2d::new(0.0, 0.0),
-                true,
-                false,
-            ),
+            EntityState::line(Point2d::new(1.0, 1.0), Vector2d::new(0.0, 0.0), true, false),
         );
         // 2 free params (dx, dy); apply [10, 20] with full damping.
         s.apply_updates(&[10.0, 20.0], 1.0);
@@ -3635,10 +3487,7 @@ mod tests {
         let a = point_ref();
         let b = point_ref();
         s.add_entity(b, EntityState::point(Point2d::new(1.0, 2.0), false));
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Coincident,
-            &[a, b],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[a, b]);
         assert_eq!(errs, vec![0.0, 0.0]);
     }
 
@@ -3703,11 +3552,7 @@ mod tests {
             other => panic!("expected Converged, got {:?}", other),
         }
         // Verify the point landed at (3, 4).
-        match r
-            .entity_updates
-            .get(&p)
-            .expect("update for p present")
-        {
+        match r.entity_updates.get(&p).expect("update for p present") {
             EntityUpdate::Point(pt) => {
                 assert!(approx_eq(pt.x, 3.0, 1e-6));
                 assert!(approx_eq(pt.y, 4.0, 1e-6));
@@ -3761,12 +3606,7 @@ mod tests {
 
     #[test]
     fn entity_state_line_layout() {
-        let st = EntityState::line(
-            Point2d::new(1.0, 2.0),
-            Vector2d::new(3.0, 4.0),
-            false,
-            true,
-        );
+        let st = EntityState::line(Point2d::new(1.0, 2.0), Vector2d::new(3.0, 4.0), false, true);
         assert_eq!(st.parameters, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(st.fixed_mask, vec![false, false, true, true]);
     }
@@ -3801,10 +3641,7 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, std::f64::consts::FRAC_PI_4]
         );
         // `center_fixed = false` flows into BOTH x and y slots.
-        assert_eq!(
-            st.fixed_mask,
-            vec![false, false, true, false, true]
-        );
+        assert_eq!(st.fixed_mask, vec![false, false, true, false, true]);
     }
 
     #[test]
@@ -3831,20 +3668,13 @@ mod tests {
         let r2 = rect_ref();
         s.add_entity(
             r1,
-            EntityState::rectangle(
-                Point2d::ORIGIN, 5.0, 3.0, 0.0, false, false, false, false,
-            ),
+            EntityState::rectangle(Point2d::ORIGIN, 5.0, 3.0, 0.0, false, false, false, false),
         );
         s.add_entity(
             r2,
-            EntityState::rectangle(
-                Point2d::ORIGIN, 2.0, 7.0, 0.0, false, false, false, false,
-            ),
+            EntityState::rectangle(Point2d::ORIGIN, 2.0, 7.0, 0.0, false, false, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Equal,
-            &[r1, r2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Equal, &[r1, r2]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], 3.0, 1e-12));
         assert!(approx_eq(errs[1], -4.0, 1e-12));
@@ -3861,21 +3691,30 @@ mod tests {
         s.add_entity(
             r1,
             EntityState::rectangle(
-                Point2d::new(1.0, 2.0), 1.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(1.0, 2.0),
+                1.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         s.add_entity(
             r2,
             EntityState::rectangle(
-                Point2d::new(4.0, -1.0), 1.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(4.0, -1.0),
+                1.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Coincident,
-            &[r1, r2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[r1, r2]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], -3.0, 1e-12));
         assert!(approx_eq(errs[1], 3.0, 1e-12));
@@ -3891,21 +3730,30 @@ mod tests {
         s.add_entity(
             r1,
             EntityState::rectangle(
-                Point2d::new(2.0, 5.0), 1.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(2.0, 5.0),
+                1.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         s.add_entity(
             r2,
             EntityState::rectangle(
-                Point2d::new(2.0, 5.0), 4.0, 7.0, 1.0,
-                false, false, false, false,
+                Point2d::new(2.0, 5.0),
+                4.0,
+                7.0,
+                1.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Concentric,
-            &[r1, r2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Concentric, &[r1, r2]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
         assert!(approx_eq(errs[1], 0.0, 1e-12));
@@ -3919,18 +3767,21 @@ mod tests {
         s.add_entity(
             rect,
             EntityState::rectangle(
-                Point2d::new(1.0, 1.0), 2.0, 2.0, 0.0,
-                false, false, false, false,
+                Point2d::new(1.0, 1.0),
+                2.0,
+                2.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         s.add_entity(
             circ,
             EntityState::circle(Point2d::new(4.0, 5.0), 1.0, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Concentric,
-            &[rect, circ],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Concentric, &[rect, circ]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], -3.0, 1e-12));
         assert!(approx_eq(errs[1], -4.0, 1e-12));
@@ -3943,9 +3794,14 @@ mod tests {
         s.add_entity(
             r,
             EntityState::rectangle(
-                Point2d::new(1.5, 2.5), 3.5, 4.5,
+                Point2d::new(1.5, 2.5),
+                3.5,
+                4.5,
                 std::f64::consts::FRAC_PI_3,
-                false, false, false, false,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         let updates = s.get_entity_updates();
@@ -3973,15 +3829,11 @@ mod tests {
         let r2 = rect_ref();
         s.add_entity(
             r1,
-            EntityState::rectangle(
-                Point2d::ORIGIN, 1.0, 1.0, 0.0, false, false, false, false,
-            ),
+            EntityState::rectangle(Point2d::ORIGIN, 1.0, 1.0, 0.0, false, false, false, false),
         );
         s.add_entity(
             r2,
-            EntityState::rectangle(
-                Point2d::ORIGIN, 2.0, 2.0, 0.0, false, false, false, false,
-            ),
+            EntityState::rectangle(Point2d::ORIGIN, 2.0, 2.0, 0.0, false, false, false, false),
         );
         let c = Constraint::new_geometric(
             GeometricConstraint::Equal,
@@ -3999,14 +3851,8 @@ mod tests {
         let mut s = ConstraintSolver::new();
         let c1 = circle_ref();
         let c2 = circle_ref();
-        s.add_entity(
-            c1,
-            EntityState::circle(Point2d::ORIGIN, 1.0, false, false),
-        );
-        s.add_entity(
-            c2,
-            EntityState::circle(Point2d::ORIGIN, 2.0, false, false),
-        );
+        s.add_entity(c1, EntityState::circle(Point2d::ORIGIN, 1.0, false, false));
+        s.add_entity(c2, EntityState::circle(Point2d::ORIGIN, 2.0, false, false));
         let c = Constraint::new_geometric(
             GeometricConstraint::Equal,
             vec![c1, c2],
@@ -4038,10 +3884,7 @@ mod tests {
             vec![1.0, 2.0, 5.0, 3.0, std::f64::consts::FRAC_PI_6]
         );
         // `center_fixed = false` flows into BOTH x and y slots.
-        assert_eq!(
-            st.fixed_mask,
-            vec![false, false, true, false, true]
-        );
+        assert_eq!(st.fixed_mask, vec![false, false, true, false, true]);
     }
 
     #[test]
@@ -4070,20 +3913,13 @@ mod tests {
         let e2 = ellipse_ref();
         s.add_entity(
             e1,
-            EntityState::ellipse(
-                Point2d::ORIGIN, 5.0, 3.0, 0.0, false, false, false, false,
-            ),
+            EntityState::ellipse(Point2d::ORIGIN, 5.0, 3.0, 0.0, false, false, false, false),
         );
         s.add_entity(
             e2,
-            EntityState::ellipse(
-                Point2d::ORIGIN, 2.0, 7.0, 0.0, false, false, false, false,
-            ),
+            EntityState::ellipse(Point2d::ORIGIN, 2.0, 7.0, 0.0, false, false, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Equal,
-            &[e1, e2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Equal, &[e1, e2]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], 3.0, 1e-12));
         assert!(approx_eq(errs[1], -4.0, 1e-12));
@@ -4100,21 +3936,30 @@ mod tests {
         s.add_entity(
             e1,
             EntityState::ellipse(
-                Point2d::new(1.0, 2.0), 2.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(1.0, 2.0),
+                2.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         s.add_entity(
             e2,
             EntityState::ellipse(
-                Point2d::new(4.0, -1.0), 2.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(4.0, -1.0),
+                2.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Coincident,
-            &[e1, e2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[e1, e2]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], -3.0, 1e-12));
         assert!(approx_eq(errs[1], 3.0, 1e-12));
@@ -4130,21 +3975,30 @@ mod tests {
         s.add_entity(
             e1,
             EntityState::ellipse(
-                Point2d::new(2.0, 5.0), 2.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(2.0, 5.0),
+                2.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         s.add_entity(
             e2,
             EntityState::ellipse(
-                Point2d::new(2.0, 5.0), 4.0, 3.0, 1.0,
-                false, false, false, false,
+                Point2d::new(2.0, 5.0),
+                4.0,
+                3.0,
+                1.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Concentric,
-            &[e1, e2],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Concentric, &[e1, e2]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
         assert!(approx_eq(errs[1], 0.0, 1e-12));
@@ -4160,18 +4014,21 @@ mod tests {
         s.add_entity(
             ell,
             EntityState::ellipse(
-                Point2d::new(1.0, 1.0), 2.0, 1.0, 0.0,
-                false, false, false, false,
+                Point2d::new(1.0, 1.0),
+                2.0,
+                1.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         s.add_entity(
             circ,
             EntityState::circle(Point2d::new(4.0, 5.0), 1.0, false, false),
         );
-        let errs = s.evaluate_geometric_constraint(
-            &GeometricConstraint::Concentric,
-            &[ell, circ],
-        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Concentric, &[ell, circ]);
         assert_eq!(errs.len(), 2);
         assert!(approx_eq(errs[0], -3.0, 1e-12));
         assert!(approx_eq(errs[1], -4.0, 1e-12));
@@ -4184,9 +4041,14 @@ mod tests {
         s.add_entity(
             e,
             EntityState::ellipse(
-                Point2d::new(1.5, 2.5), 4.5, 3.5,
+                Point2d::new(1.5, 2.5),
+                4.5,
+                3.5,
                 std::f64::consts::FRAC_PI_3,
-                false, false, false, false,
+                false,
+                false,
+                false,
+                false,
             ),
         );
         let updates = s.get_entity_updates();
@@ -4214,15 +4076,11 @@ mod tests {
         let e2 = ellipse_ref();
         s.add_entity(
             e1,
-            EntityState::ellipse(
-                Point2d::ORIGIN, 2.0, 1.0, 0.0, false, false, false, false,
-            ),
+            EntityState::ellipse(Point2d::ORIGIN, 2.0, 1.0, 0.0, false, false, false, false),
         );
         s.add_entity(
             e2,
-            EntityState::ellipse(
-                Point2d::ORIGIN, 3.0, 2.0, 0.0, false, false, false, false,
-            ),
+            EntityState::ellipse(Point2d::ORIGIN, 3.0, 2.0, 0.0, false, false, false, false),
         );
         let c = Constraint::new_geometric(
             GeometricConstraint::Equal,
@@ -4235,10 +4093,20 @@ mod tests {
     #[test]
     fn solver_result_carries_status_constraint_type_arms() {
         // Just verifies all SolverStatus variants exist and are debug-printable.
-        let _converged = SolverStatus::Converged { iterations: 1, final_error: 0.0 };
-        let _not = SolverStatus::NotConverged { iterations: 99, final_error: 1.0 };
-        let _over = SolverStatus::OverConstrained { conflicting_constraints: 1 };
-        let _under = SolverStatus::UnderConstrained { degrees_of_freedom: 1 };
+        let _converged = SolverStatus::Converged {
+            iterations: 1,
+            final_error: 0.0,
+        };
+        let _not = SolverStatus::NotConverged {
+            iterations: 99,
+            final_error: 1.0,
+        };
+        let _over = SolverStatus::OverConstrained {
+            conflicting_constraints: 1,
+        };
+        let _under = SolverStatus::UnderConstrained {
+            degrees_of_freedom: 1,
+        };
         let _unstable = SolverStatus::Unstable;
         let _ct = ConstraintType::Geometric(GeometricConstraint::Coincident);
     }

@@ -43,12 +43,12 @@ use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::primitives::vertex::VertexId;
+use serde_json::{json, Value};
 use session_manager::{
     AuthConfig, AuthManager, BroadcastManager, CacheConfig, CacheManager, DatabaseConfig,
     DatabasePersistence, DatabaseType, HierarchyManager, PasswordRequirements, PermissionManager,
     SessionManager, SqliteDatabase,
 };
-use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use timeline_engine::{BranchManager, Timeline, TimelineConfig, TimelineRecorder};
@@ -85,11 +85,10 @@ async fn make_test_state() -> AppState {
         connect_timeout: 5,
         run_migrations: true,
     };
-    let database: Arc<dyn DatabasePersistence + Send + Sync> = Arc::new(
-        SqliteDatabase::new(&db_config)
-            .await
-            .expect("sqlite::memory: must initialise — sqlx + sqlite feature is in session-manager's deps"),
-    );
+    let database: Arc<dyn DatabasePersistence + Send + Sync> =
+        Arc::new(SqliteDatabase::new(&db_config).await.expect(
+            "sqlite::memory: must initialise — sqlx + sqlite feature is in session-manager's deps",
+        ));
 
     let broadcast_manager = BroadcastManager::new();
     let session_manager = Arc::new(SessionManager::new(broadcast_manager));
@@ -113,7 +112,8 @@ async fn make_test_state() -> AppState {
         },
     };
     let auth_manager = Arc::new(
-        AuthManager::new(auth_config, "test_secret_key").expect("AuthManager must accept non-empty signing key"),
+        AuthManager::new(auth_config, "test_secret_key")
+            .expect("AuthManager must accept non-empty signing key"),
     );
     let permission_manager = Arc::new(PermissionManager::new());
 
@@ -203,12 +203,18 @@ async fn make_test_state() -> AppState {
         transactions: Arc::new(transactions::TransactionManager::new()),
         sketches: Arc::new(sketch::SketchManager::new()),
         csketches: Arc::new(csketch::CSketchManager::new()),
-        assemblies: Arc::new(assembly_mgr::AssemblyManager::with_recorder(timeline_recorder.clone()
-            as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>)),
-        drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(timeline_recorder.clone()
-            as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>)),
-        parts: Arc::new(part_mgr::PartManager::with_recorder(timeline_recorder.clone()
-            as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>)),
+        assemblies: Arc::new(assembly_mgr::AssemblyManager::with_recorder(
+            timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+        )),
+        drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(
+            timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+        )),
+        parts: Arc::new(part_mgr::PartManager::with_recorder(
+            timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+        )),
     }
 }
 
@@ -257,9 +263,8 @@ fn find_top_rim_edge(model: &BRepModel, height: f64) -> Option<EdgeId> {
     model.edges.iter().find_map(|(id, e)| {
         let s = model.vertices.get(e.start_vertex)?.position;
         let t = model.vertices.get(e.end_vertex)?.position;
-        let closed = (s[0] - t[0]).abs() < 1e-7
-            && (s[1] - t[1]).abs() < 1e-7
-            && (s[2] - t[2]).abs() < 1e-7;
+        let closed =
+            (s[0] - t[0]).abs() < 1e-7 && (s[1] - t[1]).abs() < 1e-7 && (s[2] - t[2]).abs() < 1e-7;
         let on_top = (s[2] - height).abs() < 1e-7;
         if closed && on_top {
             Some(id)
@@ -1351,10 +1356,7 @@ async fn fillet_g1_mixed_corner_returns_200_with_three_subpatch_cap() {
             let count = candidates
                 .iter()
                 .filter(|&&eid| {
-                    let edge = model
-                        .edges
-                        .get(eid)
-                        .expect("seeded edge id must resolve");
+                    let edge = model.edges.get(eid).expect("seeded edge id must resolve");
                     edge.start_vertex == vid || edge.end_vertex == vid
                 })
                 .count();

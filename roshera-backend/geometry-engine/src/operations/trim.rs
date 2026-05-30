@@ -166,12 +166,7 @@ mod tests {
 
     #[test]
     fn try_new_accepts_sorted_disjoint_ranges() {
-        let t = TrimCurve::try_new(
-            7,
-            3,
-            vec![(0.0, 0.25), (0.5, 0.75)],
-            TrimSide::Discard,
-        );
+        let t = TrimCurve::try_new(7, 3, vec![(0.0, 0.25), (0.5, 0.75)], TrimSide::Discard);
         assert!(t.is_some());
         let t = t.unwrap_or_else(|| unreachable!("just asserted Some"));
         assert_eq!(t.curve_id, 7);
@@ -190,16 +185,12 @@ mod tests {
 
     #[test]
     fn try_new_rejects_overlapping_ranges() {
-        assert!(
-            TrimCurve::try_new(0, 0, vec![(0.0, 0.4), (0.3, 0.7)], TrimSide::Keep).is_none()
-        );
+        assert!(TrimCurve::try_new(0, 0, vec![(0.0, 0.4), (0.3, 0.7)], TrimSide::Keep).is_none());
     }
 
     #[test]
     fn try_new_rejects_unsorted_ranges() {
-        assert!(
-            TrimCurve::try_new(0, 0, vec![(0.5, 0.7), (0.0, 0.3)], TrimSide::Keep).is_none()
-        );
+        assert!(TrimCurve::try_new(0, 0, vec![(0.5, 0.7), (0.0, 0.3)], TrimSide::Keep).is_none());
     }
 
     #[test]

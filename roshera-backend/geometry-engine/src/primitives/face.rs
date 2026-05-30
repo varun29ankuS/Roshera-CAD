@@ -540,12 +540,8 @@ impl Face {
             let mut perimeter = 0.0;
             for &loop_id in &self.all_loops() {
                 if let Some(loop_) = loop_store.get_mut(loop_id) {
-                    let stats = loop_.compute_stats(
-                        vertex_store,
-                        edge_store,
-                        curve_store,
-                        &loop_normal,
-                    )?;
+                    let stats =
+                        loop_.compute_stats(vertex_store, edge_store, curve_store, &loop_normal)?;
                     perimeter += stats.perimeter;
                 }
             }
@@ -580,12 +576,8 @@ impl Face {
                 let mut weighted = Vector3::ZERO;
                 let mut signed_area = 0.0;
                 if let Some(outer) = loop_store.get_mut(self.outer_loop) {
-                    let outer_stats = outer.compute_stats(
-                        vertex_store,
-                        edge_store,
-                        curve_store,
-                        &loop_normal,
-                    )?;
+                    let outer_stats =
+                        outer.compute_stats(vertex_store, edge_store, curve_store, &loop_normal)?;
                     signed_area += outer_stats.area;
                     weighted += outer_stats.centroid.to_vec() * outer_stats.area;
                 }
@@ -674,10 +666,16 @@ impl Face {
         // Loop-vertex sampling: walk every outer + inner loop and
         // accumulate vertex positions.
         for loop_id in self.all_loops() {
-            let Some(loop_) = loop_store.get(loop_id) else { continue };
-            let Ok(vertex_ids) = loop_.vertices_cached(edge_store) else { continue };
+            let Some(loop_) = loop_store.get(loop_id) else {
+                continue;
+            };
+            let Ok(vertex_ids) = loop_.vertices_cached(edge_store) else {
+                continue;
+            };
             for vid in vertex_ids {
-                let Some(vertex) = vertex_store.get(vid) else { continue };
+                let Some(vertex) = vertex_store.get(vid) else {
+                    continue;
+                };
                 let p = vertex.position;
                 min.x = min.x.min(p[0]);
                 min.y = min.y.min(p[1]);
@@ -764,15 +762,14 @@ impl Face {
                     // area is preserved without rescaling.
                     let normal = self.normal_at(0.5, 0.5, surface_store)?;
                     let abs_normal = normal.abs();
-                    let (u_idx, v_idx) = if abs_normal.x >= abs_normal.y
-                        && abs_normal.x >= abs_normal.z
-                    {
-                        (1, 2) // X-dominant normal → project to YZ
-                    } else if abs_normal.y >= abs_normal.z {
-                        (0, 2) // Y-dominant normal → project to XZ
-                    } else {
-                        (0, 1) // Z-dominant normal → project to XY
-                    };
+                    let (u_idx, v_idx) =
+                        if abs_normal.x >= abs_normal.y && abs_normal.x >= abs_normal.z {
+                            (1, 2) // X-dominant normal → project to YZ
+                        } else if abs_normal.y >= abs_normal.z {
+                            (0, 2) // Y-dominant normal → project to XZ
+                        } else {
+                            (0, 1) // Z-dominant normal → project to XY
+                        };
 
                     let mut area = 0.0;
                     for i in 0..4 {
@@ -1519,9 +1516,7 @@ mod tests {
     /// loop is a closed polyline through the supplied 3D points. Edges share
     /// curve_id = 0 (fine — `is_degenerate` only uses the vertex stream from
     /// `Loop::vertices_cached`, which never reaches into the curve store).
-    fn build_polygon_loop(
-        points: &[[f64; 3]],
-    ) -> (VertexStore, EdgeStore, LoopStore, LoopId) {
+    fn build_polygon_loop(points: &[[f64; 3]]) -> (VertexStore, EdgeStore, LoopStore, LoopId) {
         let mut vertex_store = VertexStore::with_capacity(0);
         let mut edge_store = EdgeStore::new();
         let mut loop_store = LoopStore::new();
@@ -1745,11 +1740,8 @@ mod tests {
     #[test]
     fn is_degenerate_when_three_vertices_are_collinear() {
         // Three points on the X axis -> Newell area magnitude ≈ 0.
-        let (v, e, l, lid) = build_polygon_loop(&[
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-        ]);
+        let (v, e, l, lid) =
+            build_polygon_loop(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]);
         let face = Face::new(0, 0, lid, FaceOrientation::Forward);
         assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
     }
@@ -1759,11 +1751,8 @@ mod tests {
         // Sliver triangle: two long edges of length 10 with the apex offset
         // perpendicularly by 1e-15. Newell area = 0.5 · 10 · 1e-15 = 5e-15,
         // which sits well below the default tol² = (1e-6)² = 1e-12.
-        let (v, e, l, lid) = build_polygon_loop(&[
-            [0.0, 0.0, 0.0],
-            [10.0, 0.0, 0.0],
-            [5.0, 1e-15, 0.0],
-        ]);
+        let (v, e, l, lid) =
+            build_polygon_loop(&[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [5.0, 1e-15, 0.0]]);
         let face = Face::new(0, 0, lid, FaceOrientation::Forward);
         assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
     }
@@ -1783,11 +1772,8 @@ mod tests {
     #[test]
     fn is_not_degenerate_for_tilted_planar_triangle() {
         // Plane normal not aligned with any axis — Newell handles this.
-        let (v, e, l, lid) = build_polygon_loop(&[
-            [0.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 1.0],
-        ]);
+        let (v, e, l, lid) =
+            build_polygon_loop(&[[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 1.0]]);
         let face = Face::new(0, 0, lid, FaceOrientation::Forward);
         assert!(!face.is_degenerate(&l, &e, &v, Tolerance::default()));
     }
@@ -1796,11 +1782,8 @@ mod tests {
     fn is_degenerate_collapses_consecutive_duplicate_vertices() {
         // Tolerance::default() distance is large enough that nearly-coincident
         // points are collapsed; the residual loop has only 2 distinct points.
-        let (v, e, l, lid) = build_polygon_loop(&[
-            [0.0, 0.0, 0.0],
-            [1e-15, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ]);
+        let (v, e, l, lid) =
+            build_polygon_loop(&[[0.0, 0.0, 0.0], [1e-15, 0.0, 0.0], [1.0, 0.0, 0.0]]);
         let face = Face::new(0, 0, lid, FaceOrientation::Forward);
         assert!(face.is_degenerate(&l, &e, &v, Tolerance::default()));
     }

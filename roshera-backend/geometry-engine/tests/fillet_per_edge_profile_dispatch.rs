@@ -188,10 +188,7 @@ fn per_edge_profile_mixed_kinds_dispatch_through_fillet_edges() {
         .iter()
         .filter(|&&k| k == SurfaceType::Cylinder)
         .count();
-    let nurbs = kinds
-        .iter()
-        .filter(|&&k| k == SurfaceType::NURBS)
-        .count();
+    let nurbs = kinds.iter().filter(|&&k| k == SurfaceType::NURBS).count();
     assert_eq!(
         cylindrical, 1,
         "Constant profile on plane/plane edge must dispatch to \
@@ -207,8 +204,7 @@ fn per_edge_profile_mixed_kinds_dispatch_through_fillet_edges() {
 
     // Contract 4: solid validity.
     let validator = ParallelValidator::new();
-    let report =
-        validator.validate_model(&model, Tolerance::default(), ValidationLevel::Standard);
+    let report = validator.validate_model(&model, Tolerance::default(), ValidationLevel::Standard);
     assert!(
         report.errors.is_empty(),
         "post-fillet solid must validate clean; errors: {:?}",

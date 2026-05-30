@@ -93,20 +93,12 @@ fn bench_shape(c: &mut Criterion, label: &str, model: &BRepModel, sid: SolidId) 
 
     let mut group = c.benchmark_group(format!("tessellate_{label}"));
     for (quality, params) in presets.iter() {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(quality),
-            params,
-            |b, params| {
-                b.iter(|| {
-                    let mesh = tessellate_solid(
-                        black_box(solid),
-                        black_box(model),
-                        black_box(params),
-                    );
-                    black_box(mesh)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(quality), params, |b, params| {
+            b.iter(|| {
+                let mesh = tessellate_solid(black_box(solid), black_box(model), black_box(params));
+                black_box(mesh)
+            });
+        });
     }
     group.finish();
 }
@@ -219,16 +211,36 @@ fn build_curved_nurbs_bump_face(model: &mut BRepModel) -> Option<u32> {
     )));
 
     let e0 = model.edges.add(Edge::new(
-        0, v00, v10, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v00,
+        v10,
+        c0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e1 = model.edges.add(Edge::new(
-        0, v10, v11, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v10,
+        v11,
+        c1,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e2 = model.edges.add(Edge::new(
-        0, v11, v01, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v11,
+        v01,
+        c2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e3 = model.edges.add(Edge::new(
-        0, v01, v00, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v01,
+        v00,
+        c3,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
 
     let mut outer = Loop::new(0, LoopType::Outer);
@@ -324,9 +336,7 @@ fn chord_error_stats(mesh: &TriangleMesh, model: &BRepModel, face_id: u32) -> Op
 /// the criterion stdout (wall-clock means + confidence intervals)
 /// reads cleanly without interleaving stats lines.
 fn report_curved_face_quality(model: &BRepModel, face_id: u32) {
-    eprintln!(
-        "[tessellation_bench] CDT-γ.4 curved NURBS bump-patch quality report:"
-    );
+    eprintln!("[tessellation_bench] CDT-γ.4 curved NURBS bump-patch quality report:");
     for (quality, params) in [
         ("coarse", TessellationParams::coarse()),
         ("default", TessellationParams::default()),
@@ -344,9 +354,7 @@ fn report_curved_face_quality(model: &BRepModel, face_id: u32) {
                 );
             }
             None => {
-                eprintln!(
-                    "  {quality:>7}: tris={tris:>5}  chord_err: no non-degenerate triangles"
-                );
+                eprintln!("  {quality:>7}: tris={tris:>5}  chord_err: no non-degenerate triangles");
             }
         }
     }
@@ -370,24 +378,20 @@ fn bench_curved_face(c: &mut Criterion, label: &str, model: &BRepModel, face_id:
 
     let mut group = c.benchmark_group(format!("tessellate_{label}"));
     for (quality, params) in presets.iter() {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(quality),
-            params,
-            |b, params| {
-                b.iter(|| {
-                    let cache = EdgeSampleCache::new(params);
-                    let mut mesh = TriangleMesh::new();
-                    tessellate_face(
-                        black_box(face),
-                        black_box(model),
-                        black_box(params),
-                        black_box(&cache),
-                        black_box(&mut mesh),
-                    );
-                    black_box(mesh)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(quality), params, |b, params| {
+            b.iter(|| {
+                let cache = EdgeSampleCache::new(params);
+                let mut mesh = TriangleMesh::new();
+                tessellate_face(
+                    black_box(face),
+                    black_box(model),
+                    black_box(params),
+                    black_box(&cache),
+                    black_box(&mut mesh),
+                );
+                black_box(mesh)
+            });
+        });
     }
     group.finish();
 }

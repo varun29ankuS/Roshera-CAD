@@ -459,10 +459,7 @@ pub async fn delete_assembly(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .assemblies
-        .delete(&id)
-        .ok_or_else(|| not_found(id))?;
+    state.assemblies.delete(&id).ok_or_else(|| not_found(id))?;
     state.assemblies.record_event(
         RecordedOperation::new("assembly.delete")
             .with_parameters(serde_json::json!({}))
@@ -500,23 +497,19 @@ pub async fn add_component(
         let mut builder = TopologyBuilder::new(&mut model);
         match primitive {
             ComponentPrimitive::Box { dx, dy, dz } => {
-                builder.create_box_3d(dx, dy, dz).map_err(|e| {
-                    ApiError::new(ErrorCode::InvalidParameter, e.to_string())
-                })?;
+                builder
+                    .create_box_3d(dx, dy, dz)
+                    .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
             }
             ComponentPrimitive::Cylinder { radius, height } => {
                 builder
                     .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)
-                    .map_err(|e| {
-                        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
-                    })?;
+                    .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
             }
             ComponentPrimitive::Sphere { radius } => {
                 builder
                     .create_sphere_3d(Point3::ORIGIN, radius)
-                    .map_err(|e| {
-                        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
-                    })?;
+                    .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
             }
         }
     }
@@ -580,14 +573,12 @@ pub async fn get_component_mesh(
 ) -> Result<Json<ComponentMeshResponse>, ApiError> {
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let guard = handle.read().await;
-    let component = guard
-        .get_component(ComponentId(comp))
-        .ok_or_else(|| {
-            ApiError::new(
-                ErrorCode::SolidNotFound,
-                format!("component {} not found in assembly {}", comp, id),
-            )
-        })?;
+    let component = guard.get_component(ComponentId(comp)).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("component {} not found in assembly {}", comp, id),
+        )
+    })?;
     let params = TessellationParams::default();
     // Single canonical buffer per component — every solid in the
     // BRepModel contributes triangles to the same flat
@@ -1336,10 +1327,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, "assembly.create");
         assert_eq!(events[1].kind, "assembly.delete");
-        assert_eq!(
-            events[0].outputs,
-            vec![format!("assembly:{}", Uuid::nil())]
-        );
+        assert_eq!(events[0].outputs, vec![format!("assembly:{}", Uuid::nil())]);
         assert_eq!(events[1].inputs, vec![format!("assembly:{}", Uuid::nil())]);
     }
 

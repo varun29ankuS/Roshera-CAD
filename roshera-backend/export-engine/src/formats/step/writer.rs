@@ -1334,10 +1334,7 @@ mod tests {
         f(&mut w).expect("writer closure failed");
         w.flush().expect("flush failed");
         // Recover the inner Vec<u8> from the BufWriter.
-        let inner = w
-            .writer
-            .into_inner()
-            .expect("BufWriter::into_inner failed");
+        let inner = w.writer.into_inner().expect("BufWriter::into_inner failed");
         String::from_utf8(inner).expect("non-UTF8 STEP output")
     }
 
@@ -1417,8 +1414,7 @@ mod tests {
         // round-tripping with vendors that have not migrated yet.
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut w =
-                StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP214);
+            let mut w = StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP214);
             let h = StepHeader::default();
             w.write_header(&h).expect("AP214 header write must succeed");
         }
@@ -1433,8 +1429,7 @@ mod tests {
     fn write_header_honours_legacy_ap203_protocol() {
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut w =
-                StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP203);
+            let mut w = StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP203);
             let h = StepHeader::default();
             w.write_header(&h).expect("AP203 header write must succeed");
         }
@@ -1849,10 +1844,22 @@ mod tests {
 
     #[test]
     fn step_application_protocol_distinct() {
-        assert_ne!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP214);
-        assert_ne!(StepApplicationProtocol::AP214, StepApplicationProtocol::AP242);
-        assert_ne!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP242);
-        assert_eq!(StepApplicationProtocol::AP203, StepApplicationProtocol::AP203);
+        assert_ne!(
+            StepApplicationProtocol::AP203,
+            StepApplicationProtocol::AP214
+        );
+        assert_ne!(
+            StepApplicationProtocol::AP214,
+            StepApplicationProtocol::AP242
+        );
+        assert_ne!(
+            StepApplicationProtocol::AP203,
+            StepApplicationProtocol::AP242
+        );
+        assert_eq!(
+            StepApplicationProtocol::AP203,
+            StepApplicationProtocol::AP203
+        );
     }
 
     #[test]
@@ -1936,5 +1943,4 @@ mod tests {
         });
         assert!(out_p.contains("PARALLEL_CONSTRAINT"));
     }
-
 }

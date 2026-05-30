@@ -2598,15 +2598,9 @@ mod tests {
         let start = crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed);
         let g1 = ActiveWebSocketGuard::new();
         let g2 = ActiveWebSocketGuard::new();
-        assert_eq!(
-            crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed),
-            start + 2
-        );
+        assert_eq!(crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), start + 2);
         drop(g1);
-        assert_eq!(
-            crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed),
-            start + 1
-        );
+        assert_eq!(crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), start + 1);
         drop(g2);
         assert_eq!(crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), start);
     }

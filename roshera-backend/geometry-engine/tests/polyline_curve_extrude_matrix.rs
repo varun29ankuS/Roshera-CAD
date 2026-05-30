@@ -180,7 +180,13 @@ fn build_per_edge_line_loop_edges(model: &mut BRepModel, verts: &[Point3]) -> Ve
         let p_end = verts[(i + 1) % n];
         let line = Line::new(p_start, p_end);
         let curve_id = model.curves.add(Box::new(line));
-        let edge = Edge::new_auto_range(0, v_ids[i], v_ids[(i + 1) % n], curve_id, EdgeOrientation::Forward);
+        let edge = Edge::new_auto_range(
+            0,
+            v_ids[i],
+            v_ids[(i + 1) % n],
+            curve_id,
+            EdgeOrientation::Forward,
+        );
         edges.push(model.edges.add(edge));
     }
     edges
@@ -376,7 +382,8 @@ fn assert_polyline_extrusion_is_clean_at(
     let mesh = tessellate_solid(solid, &model, &params);
     let nm = count_mesh_non_manifold_edges(&mesh);
     assert_eq!(
-        nm, 0,
+        nm,
+        0,
         "[{}/{}] expected 0 non-manifold mesh edges, found {} (triangles={}, vertices={})",
         name,
         regime,
@@ -574,12 +581,7 @@ fn baseline_per_edge_line_lshape_is_clean() {
 /// as the *target* in cut tests so the cut variable is purely
 /// "polyline cutter" vs "per-edge-Line cutter".
 fn build_box_solid(model: &mut BRepModel, dx: f64, dy: f64, dz: f64) -> SolidId {
-    let verts = vec![
-        z0(0.0, 0.0),
-        z0(dx, 0.0),
-        z0(dx, dy),
-        z0(0.0, dy),
-    ];
+    let verts = vec![z0(0.0, 0.0), z0(dx, 0.0), z0(dx, dy), z0(0.0, dy)];
     let edges = build_per_edge_line_loop_edges(model, &verts);
     extrude_profile(model, edges, standard_extrude_opts(dz)).expect("box solid")
 }
@@ -669,11 +671,8 @@ fn polyline_lshape_cut_box_terminates() {
 /// Cut test driver parameterised on the cutter-loop builder so the
 /// polyline path and the per-edge-Line path share the same target box
 /// and the same boolean Difference call site.
-fn run_cut_test_with_builder<F>(
-    name: &'static str,
-    cutter_verts: Vec<Point3>,
-    build_cutter_loop: F,
-) where
+fn run_cut_test_with_builder<F>(name: &'static str, cutter_verts: Vec<Point3>, build_cutter_loop: F)
+where
     F: FnOnce(&mut BRepModel, &[Point3]) -> Vec<EdgeId> + Send + 'static,
 {
     run_with_watchdog(name, 30_000, move || {
@@ -719,12 +718,7 @@ fn baseline_rectangle_cut_box_terminates() {
     // Simplest possible cut: per-edge-Line rectangle cutter. If THIS
     // hangs, the boolean Difference path is broken independently of
     // polyline curves — the polyline tests are a distraction.
-    let rect = vec![
-        z0(0.0, 0.0),
-        z0(2.0, 0.0),
-        z0(2.0, 2.0),
-        z0(0.0, 2.0),
-    ];
+    let rect = vec![z0(0.0, 0.0), z0(2.0, 0.0), z0(2.0, 2.0), z0(0.0, 2.0)];
     run_cut_test_with_builder("baseline_rectangle_cut_box", rect, |model, verts| {
         build_per_edge_line_loop_edges(model, verts)
     });
@@ -918,13 +912,8 @@ fn polyline_then_baseline_rectangle_cut_terminates() {
 fn extrude_polyline_with_plane(verts: Vec<Point3>, height: f64) -> SolidId {
     let mut model = BRepModel::new();
     let edges = build_polyline_loop_edges(&mut model, &verts);
-    let face_id = create_face_from_profile_with_plane(
-        &mut model,
-        edges,
-        Point3::ZERO,
-        Vector3::Z,
-    )
-    .expect("create_face_from_profile_with_plane (api-server path)");
+    let face_id = create_face_from_profile_with_plane(&mut model, edges, Point3::ZERO, Vector3::Z)
+        .expect("create_face_from_profile_with_plane (api-server path)");
     extrude_face(&mut model, face_id, standard_extrude_opts(height))
         .expect("extrude_face on polyline-tool face")
 }
@@ -988,13 +977,9 @@ fn run_polyline_with_plane_cut_test(name: &'static str, cutter_verts: Vec<Point3
             .collect();
 
         let cutter_edges = build_polyline_loop_edges(&mut model, &cutter_verts);
-        let cutter_face = create_face_from_profile_with_plane(
-            &mut model,
-            cutter_edges,
-            Point3::ZERO,
-            Vector3::Z,
-        )
-        .expect("create_face_from_profile_with_plane (cutter)");
+        let cutter_face =
+            create_face_from_profile_with_plane(&mut model, cutter_edges, Point3::ZERO, Vector3::Z)
+                .expect("create_face_from_profile_with_plane (cutter)");
         let cutter = extrude_face(
             &mut model,
             cutter_face,
@@ -1023,10 +1008,7 @@ fn run_polyline_with_plane_cut_test(name: &'static str, cutter_verts: Vec<Point3
 
 #[test]
 fn polyline_pentagon_with_plane_cut_box_terminates() {
-    run_polyline_with_plane_cut_test(
-        "polyline_pentagon_with_plane_cut_box",
-        regular_ngon(5, 1.0),
-    );
+    run_polyline_with_plane_cut_test("polyline_pentagon_with_plane_cut_box", regular_ngon(5, 1.0));
 }
 
 #[test]
@@ -1106,13 +1088,18 @@ fn run_polyline_cut_and_tessellate(
             .collect();
         eprintln!(
             "[{}/{}] result solid: outer_shell={} inner_shells={}",
-            name, regime, solid.outer_shell, solid.inner_shells.len()
+            name,
+            regime,
+            solid.outer_shell,
+            solid.inner_shells.len()
         );
         for (s_idx, shell_id) in shell_ids.iter().enumerate() {
             if let Some(shell) = model.shells.get(*shell_id) {
                 eprintln!(
                     "  shell[{}] (id={}): faces={}",
-                    s_idx, shell_id, shell.faces.len()
+                    s_idx,
+                    shell_id,
+                    shell.faces.len()
                 );
                 for face_id in &shell.faces {
                     if let Some(face) = model.faces.get(*face_id) {
@@ -1125,7 +1112,10 @@ fn run_polyline_cut_and_tessellate(
                             .unwrap_or_else(|| "?".into());
                         eprintln!(
                             "    face[{}] surface={} outer_loop_edges={} inner_loops={}",
-                            face_id, surface_kind, n_edges, face.inner_loops.len()
+                            face_id,
+                            surface_kind,
+                            n_edges,
+                            face.inner_loops.len()
                         );
                     }
                 }
@@ -1135,7 +1125,10 @@ fn run_polyline_cut_and_tessellate(
         let mesh = tessellate_solid(solid, &model, &params);
         eprintln!(
             "[{}/{}] mesh: triangles={} vertices={}",
-            name, regime, mesh.triangles.len(), mesh.vertices.len()
+            name,
+            regime,
+            mesh.triangles.len(),
+            mesh.vertices.len()
         );
 
         // Finiteness: every emitted vertex must have finite coordinates.
@@ -1180,7 +1173,7 @@ fn baseline_hexagon_cutter_below_target_cuts_cleanly() {
         let target = build_box_solid(&mut model, 6.0, 6.0, 1.0);
         let cutter_verts: Vec<Point3> = regular_ngon(6, 1.0)
             .into_iter()
-            .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, -1.0))  // z=-1
+            .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, -1.0)) // z=-1
             .collect();
         let cutter_edges = build_per_edge_line_loop_edges(&mut model, &cutter_verts);
         let cutter = extrude_profile(
@@ -1222,14 +1215,18 @@ fn baseline_hexagon_cutter_below_target_cuts_cleanly() {
                     .unwrap_or_else(|| "?".into());
                 eprintln!(
                     "    face[{}] surface={} outer_edges={} inner_loops={}",
-                    face_id, surface_kind, n_edges, face.inner_loops.len()
+                    face_id,
+                    surface_kind,
+                    n_edges,
+                    face.inner_loops.len()
                 );
             }
         }
         let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
         eprintln!(
             "[cutter_below_target] mesh triangles={} vertices={}",
-            mesh.triangles.len(), mesh.vertices.len()
+            mesh.triangles.len(),
+            mesh.vertices.len()
         );
     });
 }
@@ -1239,71 +1236,80 @@ fn baseline_hexagon_per_edge_line_cut_box_tessellates_default() {
     // Per-edge-Line cutter version. If this also produces a degenerate
     // 11-triangle mesh, the bug is in the boolean Difference path
     // proper, NOT polyline-specific.
-    run_with_watchdog("baseline_hexagon_per_edge_line_cut_box_tess", 30_000, || {
-        let mut model = BRepModel::new();
-        let target = build_box_solid(&mut model, 6.0, 6.0, 1.0);
-        let cutter_verts: Vec<Point3> = regular_ngon(6, 1.0)
-            .into_iter()
-            .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, 0.0))
-            .collect();
-        let cutter_edges = build_per_edge_line_loop_edges(&mut model, &cutter_verts);
-        let cutter = extrude_profile(
-            &mut model,
-            cutter_edges,
-            ExtrudeOptions {
-                distance: 3.0,
-                direction: Vector3::Z,
-                common: CommonOptions {
-                    validate_result: false,
+    run_with_watchdog(
+        "baseline_hexagon_per_edge_line_cut_box_tess",
+        30_000,
+        || {
+            let mut model = BRepModel::new();
+            let target = build_box_solid(&mut model, 6.0, 6.0, 1.0);
+            let cutter_verts: Vec<Point3> = regular_ngon(6, 1.0)
+                .into_iter()
+                .map(|p| Point3::new(p.x + 3.0, p.y + 3.0, 0.0))
+                .collect();
+            let cutter_edges = build_per_edge_line_loop_edges(&mut model, &cutter_verts);
+            let cutter = extrude_profile(
+                &mut model,
+                cutter_edges,
+                ExtrudeOptions {
+                    distance: 3.0,
+                    direction: Vector3::Z,
+                    common: CommonOptions {
+                        validate_result: false,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-        )
-        .expect("per-edge-line cutter extrude_profile succeeds");
-        let result_solid = boolean_operation(
-            &mut model,
-            target,
-            cutter,
-            BooleanOp::Difference,
-            BooleanOptions::default(),
-        )
-        .expect("Difference succeeds");
-        let solid = model.solids.get(result_solid).expect("result solid");
+            )
+            .expect("per-edge-line cutter extrude_profile succeeds");
+            let result_solid = boolean_operation(
+                &mut model,
+                target,
+                cutter,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )
+            .expect("Difference succeeds");
+            let solid = model.solids.get(result_solid).expect("result solid");
 
-        let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
-            .chain(solid.inner_shells.iter().copied())
-            .collect();
-        eprintln!(
-            "[baseline_hexagon_per_edge_line] outer_shell={} inner_shells={}",
-            solid.outer_shell, solid.inner_shells.len()
-        );
-        for shell_id in &shell_ids {
-            if let Some(shell) = model.shells.get(*shell_id) {
-                eprintln!("  shell[{}]: faces={}", shell_id, shell.faces.len());
-                for face_id in &shell.faces {
-                    if let Some(face) = model.faces.get(*face_id) {
-                        let outer_loop = model.loops.get(face.outer_loop);
-                        let n_edges = outer_loop.map(|l| l.edges.len()).unwrap_or(0);
-                        let surface_kind = model
-                            .surfaces
-                            .get(face.surface_id)
-                            .map(|s| s.type_name().to_string())
-                            .unwrap_or_else(|| "?".into());
-                        eprintln!(
-                            "    face[{}] surface={} outer_loop_edges={} inner_loops={}",
-                            face_id, surface_kind, n_edges, face.inner_loops.len()
-                        );
+            let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .collect();
+            eprintln!(
+                "[baseline_hexagon_per_edge_line] outer_shell={} inner_shells={}",
+                solid.outer_shell,
+                solid.inner_shells.len()
+            );
+            for shell_id in &shell_ids {
+                if let Some(shell) = model.shells.get(*shell_id) {
+                    eprintln!("  shell[{}]: faces={}", shell_id, shell.faces.len());
+                    for face_id in &shell.faces {
+                        if let Some(face) = model.faces.get(*face_id) {
+                            let outer_loop = model.loops.get(face.outer_loop);
+                            let n_edges = outer_loop.map(|l| l.edges.len()).unwrap_or(0);
+                            let surface_kind = model
+                                .surfaces
+                                .get(face.surface_id)
+                                .map(|s| s.type_name().to_string())
+                                .unwrap_or_else(|| "?".into());
+                            eprintln!(
+                                "    face[{}] surface={} outer_loop_edges={} inner_loops={}",
+                                face_id,
+                                surface_kind,
+                                n_edges,
+                                face.inner_loops.len()
+                            );
+                        }
                     }
                 }
             }
-        }
-        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
-        eprintln!(
-            "[baseline_hexagon_per_edge_line] mesh triangles={} vertices={}",
-            mesh.triangles.len(), mesh.vertices.len()
-        );
-    });
+            let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+            eprintln!(
+                "[baseline_hexagon_per_edge_line] mesh triangles={} vertices={}",
+                mesh.triangles.len(),
+                mesh.vertices.len()
+            );
+        },
+    );
 }
 
 // The 3 polyline cut+tessellate tests below fail with
@@ -1385,5 +1391,10 @@ fn signed_area_regular_hexagon_matches_closed_form() {
     // Regular hexagon area = (3√3/2) r².
     let expected = (3.0 * 3.0_f64.sqrt() / 2.0) * r * r;
     let a = signed_polygon_area_xy(&regular_ngon(6, r));
-    assert!((a - expected).abs() < 1e-9, "expected {}, got {}", expected, a);
+    assert!(
+        (a - expected).abs() < 1e-9,
+        "expected {}, got {}",
+        expected,
+        a
+    );
 }

@@ -136,11 +136,7 @@ struct UnitScan {
 
 /// Walk every record of `records` (or the single Simple record) and
 /// populate the [`UnitScan`].
-fn scan_unit(
-    records: &[&Record],
-    instance: u64,
-    ctx: &mut ImportContext<'_>,
-) -> UnitScan {
+fn scan_unit(records: &[&Record], instance: u64, ctx: &mut ImportContext<'_>) -> UnitScan {
     let mut scan = UnitScan::default();
     for rec in records {
         match rec.name.as_str() {
@@ -228,10 +224,7 @@ fn parse_measure_with_unit(record: &Record) -> Option<(f64, u64)> {
 /// Gather every constituent record for `instance`, whether it lives
 /// in a `Simple` or a `Complex` entry. Returns `None` when the
 /// instance is missing.
-fn collect_records<'a>(
-    registry: &'a EntityRegistry,
-    instance: u64,
-) -> Option<Vec<&'a Record>> {
+fn collect_records<'a>(registry: &'a EntityRegistry, instance: u64) -> Option<Vec<&'a Record>> {
     let entity = registry.get(instance)?;
     Some(match &entity.kind {
         EntityKind::Simple(r) => vec![r],
@@ -302,7 +295,10 @@ impl EntityHandler for UnitDeclarationHandler {
             None => {
                 ctx.report.push_warning(Warning {
                     severity: Severity::Warn,
-                    entity: records_ref.first().map(|r| r.name.clone()).unwrap_or_default(),
+                    entity: records_ref
+                        .first()
+                        .map(|r| r.name.clone())
+                        .unwrap_or_default(),
                     instance: Some(instance),
                     message: "unit entity has no SI_UNIT constituent".to_string(),
                 });
@@ -445,18 +441,14 @@ fn resolve_conversion(
                     severity: Severity::Warn,
                     entity: "CONVERSION_BASED_UNIT".to_string(),
                     instance: Some(instance),
-                    message: format!(
-                        "length base unit #{base_unit_ref} did not resolve",
-                    ),
+                    message: format!("length base unit #{base_unit_ref} did not resolve",),
                 });
                 return HandlerOutcome::Failed {
                     message: "base length unit unresolved".to_string(),
                 };
             }
         };
-        ctx.caches
-            .length_units
-            .insert(instance, value * base_scale);
+        ctx.caches.length_units.insert(instance, value * base_scale);
         HandlerOutcome::Resolved
     } else if scan.has_plane_angle {
         let base_scale = match ctx.caches.angle_units.get(&base_unit_ref) {
@@ -466,18 +458,14 @@ fn resolve_conversion(
                     severity: Severity::Warn,
                     entity: "CONVERSION_BASED_UNIT".to_string(),
                     instance: Some(instance),
-                    message: format!(
-                        "plane-angle base unit #{base_unit_ref} did not resolve",
-                    ),
+                    message: format!("plane-angle base unit #{base_unit_ref} did not resolve",),
                 });
                 return HandlerOutcome::Failed {
                     message: "base angle unit unresolved".to_string(),
                 };
             }
         };
-        ctx.caches
-            .angle_units
-            .insert(instance, value * base_scale);
+        ctx.caches.angle_units.insert(instance, value * base_scale);
         HandlerOutcome::Resolved
     } else if scan.has_solid_angle {
         let base_scale = match ctx.caches.solid_angle_units.get(&base_unit_ref) {
@@ -709,7 +697,10 @@ fn resolve_uncertainty(
         EntityKind::Simple(r) => r,
         EntityKind::Complex(records) => records.first()?,
     };
-    if !record.name.eq_ignore_ascii_case("UNCERTAINTY_MEASURE_WITH_UNIT") {
+    if !record
+        .name
+        .eq_ignore_ascii_case("UNCERTAINTY_MEASURE_WITH_UNIT")
+    {
         ctx.report.push_warning(Warning {
             severity: Severity::Warn,
             entity: record.name.clone(),
@@ -749,11 +740,8 @@ pub fn register(dispatch: &mut EntityDispatch) {
 mod tests {
     use super::*;
     use crate::formats::step::{
-        context::ImportContext,
-        diagnostics::ImportReport,
-        dispatch::EntityDispatch,
-        parser::parse_step,
-        registry::EntityRegistry,
+        context::ImportContext, diagnostics::ImportReport, dispatch::EntityDispatch,
+        parser::parse_step, registry::EntityRegistry,
     };
     use geometry_engine::primitives::topology_builder::BRepModel;
 
@@ -774,9 +762,7 @@ mod tests {
 
     #[test]
     fn si_milli_metre_yields_scale_1mm() {
-        let src = wrap(
-            "#11=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));",
-        );
+        let src = wrap("#11=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));");
         let ex = parse_step(&src, "test").unwrap();
         let reg = EntityRegistry::build(&ex);
         let mut dispatch = EntityDispatch::new();
@@ -805,9 +791,7 @@ mod tests {
 
     #[test]
     fn si_radian_yields_angle_one() {
-        let src = wrap(
-            "#12=(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.));",
-        );
+        let src = wrap("#12=(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.));");
         let ex = parse_step(&src, "test").unwrap();
         let reg = EntityRegistry::build(&ex);
         let mut dispatch = EntityDispatch::new();
@@ -925,9 +909,7 @@ mod tests {
     fn malformed_si_unit_emits_warning_not_panic() {
         // SI_UNIT with wrong arity — the parser still produces a
         // List, but our parse_si_unit returns None.
-        let src = wrap(
-            "#11=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.METRE.));",
-        );
+        let src = wrap("#11=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.METRE.));");
         let ex = parse_step(&src, "test").unwrap();
         let reg = EntityRegistry::build(&ex);
         let mut dispatch = EntityDispatch::new();

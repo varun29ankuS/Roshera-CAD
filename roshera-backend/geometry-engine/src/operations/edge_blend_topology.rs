@@ -392,10 +392,7 @@ fn find_third_face_at_vertex(
         .get(solid_id)
         .ok_or_else(|| OperationError::InvalidGeometry(format!("Solid {} not found", solid_id)))?;
     let shell = model.shells.get(solid.outer_shell).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Outer shell {} not found",
-            solid.outer_shell
-        ))
+        OperationError::InvalidGeometry(format!("Outer shell {} not found", solid.outer_shell))
     })?;
 
     let mut matches = Vec::with_capacity(2);
@@ -407,13 +404,12 @@ fn find_third_face_at_vertex(
             .faces
             .get(face_id)
             .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} missing", face_id)))?;
-        let lp = model
-            .loops
-            .get(face.outer_loop)
-            .ok_or_else(|| OperationError::InvalidGeometry(format!(
+        let lp = model.loops.get(face.outer_loop).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
                 "Loop {} missing on face {}",
                 face.outer_loop, face_id
-            )))?;
+            ))
+        })?;
         for &edge_id in &lp.edges {
             let edge = model.edges.get(edge_id).ok_or_else(|| {
                 OperationError::InvalidGeometry(format!("Edge {} missing", edge_id))
@@ -476,9 +472,10 @@ fn splice_face_along_edge(
 
     // Locate old_edge in the loop.
     let (idx, old_orient, pred_edge, pred_orient, succ_edge, succ_orient) = {
-        let lp = model.loops.get(loop_id).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!("Loop {} missing", loop_id))
-        })?;
+        let lp = model
+            .loops
+            .get(loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("Loop {} missing", loop_id)))?;
         let n = lp.edges.len();
         if n < 3 {
             return Err(OperationError::InvalidGeometry(format!(
@@ -560,9 +557,10 @@ fn splice_face_along_edge(
     // the orientation flag so loop traversal still goes
     // (entry_new) → (exit_new).
     {
-        let lp = model.loops.get_mut(loop_id).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!("Loop {} missing", loop_id))
-        })?;
+        let lp = model
+            .loops
+            .get_mut(loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("Loop {} missing", loop_id)))?;
         lp.edges[idx] = new_edge;
         // orientations[idx] is already correct by construction of
         // new_edge: blend producers always create new_edge as
@@ -607,9 +605,10 @@ fn rewire_edge_vertex(
     // Snapshot the edge's curve + orientation + current range BEFORE we
     // mutate, so the curve projection runs against the unchanged geometry.
     let (curve_id, edge_orientation, mut param_range, current_at_terminal) = {
-        let edge = model.edges.get(edge_id).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!("Edge {} missing", edge_id))
-        })?;
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {} missing", edge_id)))?;
         // Pick the struct field:
         //   trailing terminal  + forward orient → end_vertex
         //   trailing terminal  + backward orient → start_vertex
@@ -654,15 +653,14 @@ fn rewire_edge_vertex(
                 edge_id, curve_id
             ))
         })?;
-        let (t, _projected) =
-            curve
-                .closest_point(&replacement_position, Tolerance::default())
-                .map_err(|e| {
-                    OperationError::InvalidGeometry(format!(
-                        "Curve {} closest_point failed during blend retrim: {:?}",
-                        curve_id, e
-                    ))
-                })?;
+        let (t, _projected) = curve
+            .closest_point(&replacement_position, Tolerance::default())
+            .map_err(|e| {
+                OperationError::InvalidGeometry(format!(
+                    "Curve {} closest_point failed during blend retrim: {:?}",
+                    curve_id, e
+                ))
+            })?;
         t
     };
 
@@ -697,9 +695,10 @@ fn rewire_edge_vertex(
     let new_range = ParameterRange::new(param_range.start, param_range.end);
 
     // Apply the mutation: vertex ID, parameter range, invalidate cache.
-    let edge = model.edges.get_mut(edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!("Edge {} missing", edge_id))
-    })?;
+    let edge = model
+        .edges
+        .get_mut(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {} missing", edge_id)))?;
     if touch_end {
         edge.end_vertex = replacement;
     } else {
@@ -744,9 +743,10 @@ fn insert_cap_into_face_loop(
     // where the trailing-traversal vertex of i and the leading-
     // traversal vertex of i+1 are the (vertex_a, vertex_b) pair.
     let (insert_at, cap_orient) = {
-        let lp = model.loops.get(loop_id).ok_or_else(|| {
-            OperationError::InvalidGeometry(format!("Loop {} missing", loop_id))
-        })?;
+        let lp = model
+            .loops
+            .get(loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("Loop {} missing", loop_id)))?;
         let n = lp.edges.len();
         if n < 3 {
             return Err(OperationError::InvalidGeometry(format!(

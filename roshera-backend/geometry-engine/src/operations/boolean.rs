@@ -281,10 +281,7 @@ pub fn boolean_operation(
 
     // F2-δ pre-flight.
     if options.common.validate_before {
-        lifecycle::validate_can_apply(
-            model,
-            OpSpec::Boolean { solid_a, solid_b },
-        )?;
+        lifecycle::validate_can_apply(model, OpSpec::Boolean { solid_a, solid_b })?;
     }
 
     // F2-δ rollback wrapper — boolean is the canonical example of an
@@ -310,8 +307,11 @@ pub fn boolean_operation(
             for fi in &intersections {
                 eprintln!(
                     "  pair face_a={} face_b={} curves={} cop_a={} cop_b={}",
-                    fi.face_a_id, fi.face_b_id, fi.curves.len(),
-                    fi.coplanar_curves_a.len(), fi.coplanar_curves_b.len(),
+                    fi.face_a_id,
+                    fi.face_b_id,
+                    fi.curves.len(),
+                    fi.coplanar_curves_a.len(),
+                    fi.coplanar_curves_b.len(),
                 );
             }
         }
@@ -326,14 +326,18 @@ pub fn boolean_operation(
         if pipeline_trace_enabled() {
             let mut per_origin: HashMap<(FaceId, SolidId), usize> = HashMap::new();
             for f in &split_faces {
-                *per_origin.entry((f.original_face, f.from_solid)).or_insert(0) += 1;
+                *per_origin
+                    .entry((f.original_face, f.from_solid))
+                    .or_insert(0) += 1;
             }
             let mut keys: Vec<_> = per_origin.keys().copied().collect();
             keys.sort();
             for (origin, solid) in keys {
                 eprintln!(
                     "  origin face={} solid={} fragments={}",
-                    origin, solid, per_origin[&(origin, solid)],
+                    origin,
+                    solid,
+                    per_origin[&(origin, solid)],
                 );
             }
         }
@@ -344,16 +348,28 @@ pub fn boolean_operation(
         pipeline_trace(format_args!(
             "stage=classify_split_faces fragments={} inside={} outside={} on_boundary={}",
             classified_faces.len(),
-            classified_faces.iter().filter(|f| matches!(f.classification, FaceClassification::Inside)).count(),
-            classified_faces.iter().filter(|f| matches!(f.classification, FaceClassification::Outside)).count(),
-            classified_faces.iter().filter(|f| matches!(f.classification, FaceClassification::OnBoundary)).count(),
+            classified_faces
+                .iter()
+                .filter(|f| matches!(f.classification, FaceClassification::Inside))
+                .count(),
+            classified_faces
+                .iter()
+                .filter(|f| matches!(f.classification, FaceClassification::Outside))
+                .count(),
+            classified_faces
+                .iter()
+                .filter(|f| matches!(f.classification, FaceClassification::OnBoundary))
+                .count(),
         ));
         if pipeline_trace_enabled() {
             for f in &classified_faces {
                 eprintln!(
                     "  fragment origin={} solid={} edges={} class={:?} inner_loops={}",
-                    f.original_face, f.from_solid, f.boundary_edges.len(),
-                    f.classification, f.inner_loops.len(),
+                    f.original_face,
+                    f.from_solid,
+                    f.boundary_edges.len(),
+                    f.classification,
+                    f.inner_loops.len(),
                 );
             }
         }
@@ -383,28 +399,35 @@ pub fn boolean_operation(
         ));
 
         // Step 4: Select faces based on boolean operation
-        let selected_faces =
-            select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
+        let selected_faces = select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
         pipeline_trace(format_args!(
             "stage=select_faces_for_operation fragments={} with_inner_loops={} inner_loop_total={}",
             selected_faces.len(),
-            selected_faces.iter().filter(|f| !f.inner_loops.is_empty()).count(),
-            selected_faces.iter().map(|f| f.inner_loops.len()).sum::<usize>(),
+            selected_faces
+                .iter()
+                .filter(|f| !f.inner_loops.is_empty())
+                .count(),
+            selected_faces
+                .iter()
+                .map(|f| f.inner_loops.len())
+                .sum::<usize>(),
         ));
         if pipeline_trace_enabled() {
             for f in &selected_faces {
                 eprintln!(
                     "  selected origin={} solid={} edges={} class={:?} inner_loops={}",
-                    f.original_face, f.from_solid, f.boundary_edges.len(),
-                    f.classification, f.inner_loops.len(),
+                    f.original_face,
+                    f.from_solid,
+                    f.boundary_edges.len(),
+                    f.classification,
+                    f.inner_loops.len(),
                 );
             }
         }
 
         // Step 5: Reconstruct topology from selected faces
-        let result_solid = reconstruct_topology(
-            model, selected_faces, &options, operation, solid_b,
-        )?;
+        let result_solid =
+            reconstruct_topology(model, selected_faces, &options, operation, solid_b)?;
         pipeline_trace(format_args!(
             "stage=reconstruct_topology result_solid={}",
             result_solid,
@@ -496,9 +519,8 @@ fn compute_face_intersections(
     };
 
     let candidate_pairs: Vec<(FaceId, FaceId)> = if use_broad_phase {
-        let index: RstarIndex<FaceId> = RstarIndex::bulk_load(
-            faces_b.iter().map(|&fb| (fb, bbox_for(model, fb))),
-        );
+        let index: RstarIndex<FaceId> =
+            RstarIndex::bulk_load(faces_b.iter().map(|&fb| (fb, bbox_for(model, fb))));
         let mut pairs = Vec::new();
         for &face_a in &faces_a {
             let query = bbox_for(model, face_a);
@@ -565,15 +587,21 @@ fn compute_face_intersections(
                 format!("{}-{}", tb, ta)
             }
         };
-        let entry = pair_curves_by_type.entry(pair_key.clone()).or_insert((0, 0));
+        let entry = pair_curves_by_type
+            .entry(pair_key.clone())
+            .or_insert((0, 0));
         entry.0 += 1; // pairs tested
         let result = intersect_faces(model, face_a, face_b, options)?;
         if pipeline_trace_enabled() {
             match &result {
                 Some(fi) => eprintln!(
                     "  tested face_a={} face_b={} types={} → curves={} cop_a={} cop_b={}",
-                    face_a, face_b, pair_key, fi.curves.len(),
-                    fi.coplanar_curves_a.len(), fi.coplanar_curves_b.len(),
+                    face_a,
+                    face_b,
+                    pair_key,
+                    fi.curves.len(),
+                    fi.coplanar_curves_a.len(),
+                    fi.coplanar_curves_b.len(),
                 ),
                 None => eprintln!(
                     "  tested face_a={} face_b={} types={} → None",
@@ -717,8 +745,7 @@ fn dedup_coplanar_imprint_duplicates(
     let mut skip_pairs: HashSet<(FaceId, FaceId)> = HashSet::new();
 
     for fi in intersections.iter() {
-        let coplanar =
-            !fi.coplanar_curves_a.is_empty() || !fi.coplanar_curves_b.is_empty();
+        let coplanar = !fi.coplanar_curves_a.is_empty() || !fi.coplanar_curves_b.is_empty();
         if !coplanar {
             continue;
         }
@@ -816,22 +843,24 @@ fn intersect_faces(
     // Scope the surface borrows so they release before the coplanar
     // overlap path takes a fresh `&BRepModel` borrow.
     let intersection_attempt = {
-        let surface_a = model
-            .surfaces
-            .get(surface_a_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "surface_a_id".to_string(),
-                expected: "valid surface ID".to_string(),
-                received: format!("{:?}", surface_a_id),
-            })?;
-        let surface_b = model
-            .surfaces
-            .get(surface_b_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "surface_b_id".to_string(),
-                expected: "valid surface ID".to_string(),
-                received: format!("{:?}", surface_b_id),
-            })?;
+        let surface_a =
+            model
+                .surfaces
+                .get(surface_a_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_a_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{:?}", surface_a_id),
+                })?;
+        let surface_b =
+            model
+                .surfaces
+                .get(surface_b_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "surface_b_id".to_string(),
+                    expected: "valid surface ID".to_string(),
+                    received: format!("{:?}", surface_b_id),
+                })?;
         surface_surface_intersection(surface_a, surface_b, &options.common.tolerance)
     };
 
@@ -855,18 +884,23 @@ fn intersect_faces(
             if !coplanar_faces_overlap(model, face_a, face_b, &options.common.tolerance)? {
                 return Ok(None);
             }
-            return imprint_merge_coplanar_overlap(model, face_a, face_b, &options.common.tolerance)
-                .map_err(|e| match e {
-                    // Surface a clear "still unimplemented" error when
-                    // the polygon-clip subroutine hits a degeneracy
-                    // (shared vertex, vertex on edge, collinear overlap)
-                    // — these need the Hormann-Agathos perturbation
-                    // extension, deferred to a follow-up sub-slice.
-                    OperationError::InvalidGeometry(detail) => OperationError::CoplanarFaces(
-                        format!("{msg}; imprint-merge degeneracy: {detail}"),
-                    ),
-                    other => other,
-                });
+            return imprint_merge_coplanar_overlap(
+                model,
+                face_a,
+                face_b,
+                &options.common.tolerance,
+            )
+            .map_err(|e| match e {
+                // Surface a clear "still unimplemented" error when
+                // the polygon-clip subroutine hits a degeneracy
+                // (shared vertex, vertex on edge, collinear overlap)
+                // — these need the Hormann-Agathos perturbation
+                // extension, deferred to a follow-up sub-slice.
+                OperationError::InvalidGeometry(detail) => OperationError::CoplanarFaces(format!(
+                    "{msg}; imprint-merge degeneracy: {detail}"
+                )),
+                other => other,
+            });
         }
         Err(e) => return Err(e),
     };
@@ -995,10 +1029,7 @@ enum AnalyticalSurfaceKind {
     Other,
 }
 
-fn analytical_surface_kind(
-    surface: &dyn Surface,
-    tolerance: &Tolerance,
-) -> AnalyticalSurfaceKind {
+fn analytical_surface_kind(surface: &dyn Surface, tolerance: &Tolerance) -> AnalyticalSurfaceKind {
     use crate::primitives::surface::SurfaceType;
     match surface.surface_type() {
         SurfaceType::Plane => AnalyticalSurfaceKind::Planar,
@@ -2900,10 +2931,7 @@ fn split_face_by_curves(
             if let Some(c) = model.curves.get(cid) {
                 let s = c.evaluate(0.0).ok().map(|p| p.position);
                 let e = c.evaluate(1.0).ok().map(|p| p.position);
-                eprintln!(
-                    "[bool]     cut curve={:?} start={:?} end={:?}",
-                    cid, s, e
-                );
+                eprintln!("[bool]     cut curve={:?} start={:?} end={:?}", cid, s, e);
             }
         }
     }
@@ -3326,11 +3354,7 @@ fn partition_outer_and_pre_existing_hole_cycles(
     if count == 0 {
         return (loops, no_holes());
     }
-    let anchor = Point3::new(
-        sx / count as f64,
-        sy / count as f64,
-        sz / count as f64,
-    );
+    let anchor = Point3::new(sx / count as f64, sy / count as f64, sz / count as f64);
 
     let tol = Tolerance::default();
     let (u0, v0) = match surface.closest_point(&anchor, tol) {
@@ -3396,8 +3420,7 @@ fn partition_outer_and_pre_existing_hole_cycles(
         .collect();
     let mut is_hole = vec![false; n];
     for i in 0..n {
-        let cycle_edges: HashSet<EdgeId> =
-            loops[i].iter().map(|(e, _)| *e).collect();
+        let cycle_edges: HashSet<EdgeId> = loops[i].iter().map(|(e, _)| *e).collect();
         for original in &original_edge_sets {
             if !original.is_empty() && cycle_edges == *original {
                 is_hole[i] = true;
@@ -3424,19 +3447,14 @@ fn partition_outer_and_pre_existing_hole_cycles(
         };
         let mut chosen: Option<usize> = None;
         for (pos, &o) in outer_indices.iter().enumerate() {
-            if cycle_polys_2d[o].len() >= 3
-                && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o])
-            {
+            if cycle_polys_2d[o].len() >= 3 && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o]) {
                 chosen = Some(pos);
                 break;
             }
         }
         if let Some(pos) = chosen {
-            let reversed: Vec<(EdgeId, bool)> = loops[h]
-                .iter()
-                .rev()
-                .map(|(e, fwd)| (*e, !*fwd))
-                .collect();
+            let reversed: Vec<(EdgeId, bool)> =
+                loops[h].iter().rev().map(|(e, fwd)| (*e, !*fwd)).collect();
             attachments[pos].push(reversed);
         }
     }
@@ -4543,14 +4561,15 @@ fn coplanar_faces_overlap(
             received: format!("{:?}", face_a),
         })?;
 
-    let surface_a = model
-        .surfaces
-        .get(face_a_data.surface_id)
-        .ok_or_else(|| OperationError::InvalidInput {
-            parameter: "surface_a_id".to_string(),
-            expected: "valid surface ID".to_string(),
-            received: format!("{:?}", face_a_data.surface_id),
-        })?;
+    let surface_a =
+        model
+            .surfaces
+            .get(face_a_data.surface_id)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "surface_a_id".to_string(),
+                expected: "valid surface ID".to_string(),
+                received: format!("{:?}", face_a_data.surface_id),
+            })?;
 
     if surface_a.surface_type() != SurfaceType::Plane {
         // The plane-plane short-circuit only fires on Plane×Plane, so
@@ -4610,14 +4629,15 @@ fn face_outer_polyline_2d(
             expected: "valid face ID".to_string(),
             received: format!("{:?}", face_id),
         })?;
-    let outer_loop = model
-        .loops
-        .get(face.outer_loop)
-        .ok_or_else(|| OperationError::InvalidInput {
-            parameter: "outer_loop_id".to_string(),
-            expected: "valid loop ID".to_string(),
-            received: format!("{:?}", face.outer_loop),
-        })?;
+    let outer_loop =
+        model
+            .loops
+            .get(face.outer_loop)
+            .ok_or_else(|| OperationError::InvalidInput {
+                parameter: "outer_loop_id".to_string(),
+                expected: "valid loop ID".to_string(),
+                received: format!("{:?}", face.outer_loop),
+            })?;
 
     const SAMPLES_PER_CURVED_EDGE: usize = 16;
 
@@ -4632,14 +4652,15 @@ fn face_outer_polyline_2d(
                 expected: "valid edge ID".to_string(),
                 received: format!("{:?}", eid),
             })?;
-        let curve = model
-            .curves
-            .get(edge.curve_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "curve_id".to_string(),
-                expected: "valid curve ID".to_string(),
-                received: format!("{:?}", edge.curve_id),
-            })?;
+        let curve =
+            model
+                .curves
+                .get(edge.curve_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "curve_id".to_string(),
+                    expected: "valid curve ID".to_string(),
+                    received: format!("{:?}", edge.curve_id),
+                })?;
 
         // Slice to the edge's actual carrier sub-range so the cutting
         // polygon is built from this edge's geometric extent, not the
@@ -4692,11 +4713,7 @@ fn face_outer_polyline_2d(
 /// `tolerance.distance()` is used as AABB slack so faces whose AABBs
 /// merely graze (e.g. two extrusions abutting along one edge) reject
 /// cleanly as disjoint.
-fn polygons_overlap_2d(
-    a: &[(f64, f64)],
-    b: &[(f64, f64)],
-    tolerance: &Tolerance,
-) -> bool {
+fn polygons_overlap_2d(a: &[(f64, f64)], b: &[(f64, f64)], tolerance: &Tolerance) -> bool {
     // AABB rejection.
     let (a_min_x, a_max_x, a_min_y, a_max_y) = polygon_aabb_2d(a);
     let (b_min_x, b_max_x, b_min_y, b_max_y) = polygon_aabb_2d(b);
@@ -5663,8 +5680,7 @@ fn presplit_boundary_t_junctions(
             // A second T-junction whose split vertex already sits on
             // one end of the remaining sub-edge is a no-op (an earlier
             // split in this loop already resolved it).
-            if *split_vid == remaining_edge.start_vertex
-                || *split_vid == remaining_edge.end_vertex
+            if *split_vid == remaining_edge.start_vertex || *split_vid == remaining_edge.end_vertex
             {
                 continue;
             }
@@ -6489,11 +6505,7 @@ fn merge_same_origin_fragments(
         let mut polygons: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
 
         for &idx in indices {
-            let edge_ids: Vec<EdgeId> = faces[idx]
-                .boundary_edges
-                .iter()
-                .map(|(e, _)| *e)
-                .collect();
+            let edge_ids: Vec<EdgeId> = faces[idx].boundary_edges.iter().map(|(e, _)| *e).collect();
             let cycle3d = extract_cycle_vertices_3d(&edge_ids, model);
             if cycle3d.len() < 3 {
                 continue;
@@ -7293,8 +7305,7 @@ fn is_point_in_face(
                 };
                 let span = edge.param_range.end - edge.param_range.start;
                 for i in 0..SAMPLES_PER_EDGE {
-                    let t = edge.param_range.start
-                        + span * (i as f64) / (SAMPLES_PER_EDGE as f64);
+                    let t = edge.param_range.start + span * (i as f64) / (SAMPLES_PER_EDGE as f64);
                     if let Ok(pt) = curve.point_at(t) {
                         samples.push(project(&pt));
                     }
@@ -7583,7 +7594,9 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
                     continue;
                 }
                 if let Some(edge) = model.edges.get(eid) {
-                    let cs = *canon_v.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+                    let cs = *canon_v
+                        .get(&edge.start_vertex)
+                        .unwrap_or(&edge.start_vertex);
                     let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
                     if cs == ce {
                         continue;
@@ -7604,7 +7617,9 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
             Some(e) => e,
             None => return entry,
         };
-        let cs = *canon_v.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+        let cs = *canon_v
+            .get(&edge.start_vertex)
+            .unwrap_or(&edge.start_vertex);
         let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
         if cs == ce {
             return entry;
@@ -7719,8 +7734,7 @@ fn build_shells_from_faces(
             ));
             for &idx in component {
                 let f = &faces[idx];
-                let edge_ids: Vec<EdgeId> =
-                    f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
+                let edge_ids: Vec<EdgeId> = f.boundary_edges.iter().map(|&(eid, _)| eid).collect();
                 let inner_edge_ids: Vec<Vec<EdgeId>> = f
                     .inner_loops
                     .iter()
@@ -7882,13 +7896,12 @@ fn build_shells_from_faces(
             // Intersection keep B-origin normals as-is because in
             // those results the cutter's outward direction is the
             // outward direction.
-            let inherited_orientation = if matches!(operation, BooleanOp::Difference)
-                && split_face.from_solid == solid_b
-            {
-                inherited_orientation.flipped()
-            } else {
-                inherited_orientation
-            };
+            let inherited_orientation =
+                if matches!(operation, BooleanOp::Difference) && split_face.from_solid == solid_b {
+                    inherited_orientation.flipped()
+                } else {
+                    inherited_orientation
+                };
 
             // Create face with surface and outer loop, then attach
             // any inner hole loops via `Face::add_inner_loop`. Mutate
@@ -8903,13 +8916,7 @@ mod tests {
 
     /// Build a square planar face in the XY plane with corners
     /// (x0,y0)-(x1,y1), CCW. Returns the face id.
-    fn add_xy_square_face(
-        model: &mut BRepModel,
-        x0: f64,
-        y0: f64,
-        x1: f64,
-        y1: f64,
-    ) -> FaceId {
+    fn add_xy_square_face(model: &mut BRepModel, x0: f64, y0: f64, x1: f64, y1: f64) -> FaceId {
         use crate::primitives::curve::{Line, ParameterRange};
         use crate::primitives::edge::EdgeOrientation;
         use crate::primitives::face::FaceOrientation;
@@ -8935,10 +8942,34 @@ mod tests {
             );
             model.edges.add(edge)
         };
-        let e0 = mk_edge(model, v0, v1, Point3::new(x0, y0, 0.0), Point3::new(x1, y0, 0.0));
-        let e1 = mk_edge(model, v1, v2, Point3::new(x1, y0, 0.0), Point3::new(x1, y1, 0.0));
-        let e2 = mk_edge(model, v2, v3, Point3::new(x1, y1, 0.0), Point3::new(x0, y1, 0.0));
-        let e3 = mk_edge(model, v3, v0, Point3::new(x0, y1, 0.0), Point3::new(x0, y0, 0.0));
+        let e0 = mk_edge(
+            model,
+            v0,
+            v1,
+            Point3::new(x0, y0, 0.0),
+            Point3::new(x1, y0, 0.0),
+        );
+        let e1 = mk_edge(
+            model,
+            v1,
+            v2,
+            Point3::new(x1, y0, 0.0),
+            Point3::new(x1, y1, 0.0),
+        );
+        let e2 = mk_edge(
+            model,
+            v2,
+            v3,
+            Point3::new(x1, y1, 0.0),
+            Point3::new(x0, y1, 0.0),
+        );
+        let e3 = mk_edge(
+            model,
+            v3,
+            v0,
+            Point3::new(x0, y1, 0.0),
+            Point3::new(x0, y0, 0.0),
+        );
 
         let mut l = TopoLoop::new(0, LoopType::Outer);
         l.add_edge(e0, true);
@@ -8947,7 +8978,8 @@ mod tests {
         l.add_edge(e3, true);
         let loop_id = model.loops.add(l);
 
-        let face = crate::primitives::face::Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+        let face =
+            crate::primitives::face::Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
         model.faces.add(face)
     }
 
@@ -9009,8 +9041,8 @@ mod tests {
         let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 2.0, 2.0);
         let face_b = add_xy_square_face(&mut model, 10.0, 10.0, 12.0, 12.0);
         let tol = Tolerance::default();
-        let overlap = coplanar_faces_overlap(&model, face_a, face_b, &tol)
-            .expect("coplanar overlap test ok");
+        let overlap =
+            coplanar_faces_overlap(&model, face_a, face_b, &tol).expect("coplanar overlap test ok");
         assert!(!overlap, "disjoint coplanar faces must report no overlap");
     }
 
@@ -9020,8 +9052,8 @@ mod tests {
         let face_a = add_xy_square_face(&mut model, 0.0, 0.0, 5.0, 5.0);
         let face_b = add_xy_square_face(&mut model, 3.0, 3.0, 8.0, 8.0);
         let tol = Tolerance::default();
-        let overlap = coplanar_faces_overlap(&model, face_a, face_b, &tol)
-            .expect("coplanar overlap test ok");
+        let overlap =
+            coplanar_faces_overlap(&model, face_a, face_b, &tol).expect("coplanar overlap test ok");
         assert!(overlap, "overlapping coplanar faces must report overlap");
     }
 
@@ -10476,7 +10508,10 @@ mod tests {
         );
         // Reversed walk: edges in opposite order with flipped `forward` bits.
         for (h, src) in hole.iter().zip(inner_edges.iter().rev()) {
-            assert_eq!(h.0, src.0, "hole edge id must match source (reversed order)");
+            assert_eq!(
+                h.0, src.0,
+                "hole edge id must match source (reversed order)"
+            );
             assert_eq!(h.1, !src.1, "hole edge forward bit must be flipped");
         }
     }
@@ -11170,7 +11205,11 @@ mod tests {
             &Tolerance::default(),
         );
 
-        assert_eq!(merged.len(), 1, "inner fragment must be absorbed under Union");
+        assert_eq!(
+            merged.len(),
+            1,
+            "inner fragment must be absorbed under Union"
+        );
         assert_eq!(merged[0].inner_loops.len(), 1, "outer carries one hole");
     }
 
@@ -11328,8 +11367,7 @@ mod tests {
         let mut model = BRepModel::new();
         let (face_id, outer_count, inner_count) = build_face_with_hole_on_xy(&mut model);
 
-        let (outer, inners) =
-            get_face_outer_and_inner_loops(&model, face_id).expect("face exists");
+        let (outer, inners) = get_face_outer_and_inner_loops(&model, face_id).expect("face exists");
 
         assert_eq!(outer.len(), outer_count, "outer edge count must round-trip");
         assert_eq!(inners.len(), 1, "exactly one inner loop must survive");

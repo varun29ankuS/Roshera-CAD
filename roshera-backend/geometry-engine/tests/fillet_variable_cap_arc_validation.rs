@@ -74,10 +74,7 @@ fn first_open_edge(model: &BRepModel) -> EdgeId {
 /// `NurbsCurve` for variable / function radius after the Task #84
 /// production fix).
 fn cap_edges(model: &BRepModel, fillet_face: FaceId) -> Vec<EdgeId> {
-    let face = model
-        .faces
-        .get(fillet_face)
-        .expect("fillet face exists");
+    let face = model.faces.get(fillet_face).expect("fillet face exists");
     let outer = model
         .loops
         .get(face.outer_loop)
@@ -136,10 +133,7 @@ fn variable_radius_cap_edges_lie_on_fillet_surface() {
 
     // Surface for the blend.
     let face = model.faces.get(fillet_face).expect("fillet face");
-    let surface = model
-        .surfaces
-        .get(face.surface_id)
-        .expect("fillet surface");
+    let surface = model.surfaces.get(face.surface_id).expect("fillet surface");
     let bounds = surface.parameter_bounds();
     let u_min = bounds.0 .0;
     let u_max = bounds.0 .1;
@@ -166,9 +160,7 @@ fn variable_radius_cap_edges_lie_on_fillet_surface() {
         // cases where one endpoint sits on the surface but the
         // mid-cap does not.
         for &t in &[0.0_f64, 0.5, 1.0] {
-            let p = cap_curve
-                .point_at(t)
-                .expect("cap point evaluable at t");
+            let p = cap_curve.point_at(t).expect("cap point evaluable at t");
 
             // (a) On-surface check.
             let (u, v) = surface
@@ -219,8 +211,8 @@ fn variable_radius_cap_edges_join_trim_endpoints() {
         propagation: PropagationMode::None,
         ..Default::default()
     };
-    let faces = fillet_edges(&mut model, solid, vec![edge], opts)
-        .expect("variable-radius fillet succeeds");
+    let faces =
+        fillet_edges(&mut model, solid, vec![edge], opts).expect("variable-radius fillet succeeds");
     let fillet_face = faces[0];
 
     let caps = cap_edges(&model, fillet_face);
@@ -239,7 +231,11 @@ fn variable_radius_cap_edges_join_trim_endpoints() {
             .get(cap_edge.start_vertex)
             .expect("v0")
             .position;
-        let v1_pos = model.vertices.get(cap_edge.end_vertex).expect("v1").position;
+        let v1_pos = model
+            .vertices
+            .get(cap_edge.end_vertex)
+            .expect("v1")
+            .position;
         let p_at_0 = cap_curve.point_at(0.0).expect("point at 0");
         let p_at_1 = cap_curve.point_at(1.0).expect("point at 1");
         let dist_to = |p: geometry_engine::math::Point3, q: [f64; 3]| -> f64 {

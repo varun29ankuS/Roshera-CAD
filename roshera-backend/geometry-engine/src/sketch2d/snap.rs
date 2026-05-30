@@ -115,10 +115,7 @@ impl SnapKind {
             | SnapKind::RectangleCenter
             | SnapKind::EllipseCenter
             | SnapKind::EllipseQuadrant => 1,
-            SnapKind::OnLine
-            | SnapKind::OnCircle
-            | SnapKind::OnArc
-            | SnapKind::OnEllipse => 2,
+            SnapKind::OnLine | SnapKind::OnCircle | SnapKind::OnArc | SnapKind::OnEllipse => 2,
         }
     }
 
@@ -354,14 +351,11 @@ impl Sketch {
         }
 
         out.sort_by(|a, b| {
-            a.kind
-                .priority()
-                .cmp(&b.kind.priority())
-                .then(
-                    a.distance
-                        .partial_cmp(&b.distance)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
+            a.kind.priority().cmp(&b.kind.priority()).then(
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
         out
     }
@@ -421,9 +415,7 @@ mod tests {
     fn nan_radius_returns_empty() {
         let s = fresh();
         s.add_point(Point2d::ORIGIN);
-        assert!(s
-            .find_snap_candidates(Point2d::ORIGIN, f64::NAN)
-            .is_empty());
+        assert!(s.find_snap_candidates(Point2d::ORIGIN, f64::NAN).is_empty());
     }
 
     #[test]
@@ -514,9 +506,7 @@ mod tests {
     #[test]
     fn circle_quadrant_at_zero_degrees_is_at_centre_plus_radius_x() {
         let s = fresh();
-        let cid = s
-            .add_circle(Point2d::new(3.0, 7.0), 2.0)
-            .expect("add");
+        let cid = s.add_circle(Point2d::new(3.0, 7.0), 2.0).expect("add");
         // Snap at (5, 7) → should hit the +x quadrant exactly.
         let best = s.best_snap(Point2d::new(5.0, 7.0), 0.01).expect("snap");
         assert_eq!(best.entity, EntityRef::Circle(cid));
@@ -531,12 +521,7 @@ mod tests {
         let s = fresh();
         // Quarter-arc on unit circle from 0° to 90°.
         let aid = s
-            .add_arc_center_angles(
-                Point2d::ORIGIN,
-                1.0,
-                0.0,
-                std::f64::consts::FRAC_PI_2,
-            )
+            .add_arc_center_angles(Point2d::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2)
             .expect("add");
         // Cursor at centre — all 4 candidates (centre, 2 endpoints,
         // midpoint, on-arc) lie within radius 2.
@@ -567,21 +552,27 @@ mod tests {
             .collect();
         // 4 corners + 4 edge midpoints + 1 centre = 9.
         assert_eq!(rect_cands.len(), 9);
-        assert!(rect_cands
-            .iter()
-            .filter(|c| c.kind == SnapKind::RectangleCorner)
-            .count()
-            == 4);
-        assert!(rect_cands
-            .iter()
-            .filter(|c| c.kind == SnapKind::RectangleEdgeMidpoint)
-            .count()
-            == 4);
-        assert!(rect_cands
-            .iter()
-            .filter(|c| c.kind == SnapKind::RectangleCenter)
-            .count()
-            == 1);
+        assert!(
+            rect_cands
+                .iter()
+                .filter(|c| c.kind == SnapKind::RectangleCorner)
+                .count()
+                == 4
+        );
+        assert!(
+            rect_cands
+                .iter()
+                .filter(|c| c.kind == SnapKind::RectangleEdgeMidpoint)
+                .count()
+                == 4
+        );
+        assert!(
+            rect_cands
+                .iter()
+                .filter(|c| c.kind == SnapKind::RectangleCenter)
+                .count()
+                == 1
+        );
     }
 
     // ── Ellipses ──────────────────────────────────────────────────
@@ -659,8 +650,7 @@ mod tests {
         let s = fresh();
         s.add_point(Point2d::new(1.0, 0.0));
         s.add_point(Point2d::new(2.0, 0.0));
-        s.add_circle(Point2d::new(5.0, 0.0), 1.0)
-            .expect("circle");
+        s.add_circle(Point2d::new(5.0, 0.0), 1.0).expect("circle");
         let head = s
             .find_snap_candidates(Point2d::ORIGIN, 10.0)
             .into_iter()

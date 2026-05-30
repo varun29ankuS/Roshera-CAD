@@ -148,10 +148,7 @@ fn count_nurbs_faces_in_shell(
     let mut n = 0;
     for &fid in &shell.faces {
         let face = model.faces.get(fid).expect("face exists");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface exists");
+        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
         if surface
             .as_any()
             .downcast_ref::<GeneralNurbsSurface>()
@@ -177,10 +174,7 @@ fn nurbs_faces_with_loop_edge_counts(
     let mut out = Vec::new();
     for &fid in &shell.faces {
         let face = model.faces.get(fid).expect("face exists");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface exists");
+        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
         if surface
             .as_any()
             .downcast_ref::<GeneralNurbsSurface>()
@@ -273,13 +267,8 @@ fn g1_1c2f_fillet_first_emits_three_subpatch_cap() {
         fillet_g1_opts_with_partial(D, vec![corner]),
     )
     .expect("1C2F fillet-first: first fillet with partial-corner opt-in succeeds");
-    chamfer_edges(
-        &mut model,
-        solid_id,
-        vec![edges[0]],
-        chamfer_g1_opts(D),
-    )
-    .expect("1C2F fillet-first: second chamfer must close the corner with 3-sub-patch G1 cap");
+    chamfer_edges(&mut model, solid_id, vec![edges[0]], chamfer_g1_opts(D))
+        .expect("1C2F fillet-first: second chamfer must close the corner with 3-sub-patch G1 cap");
     assert_three_subpatch_cap(&model, solid_id, "1C2F fillet-first");
 }
 
@@ -296,13 +285,8 @@ fn g1_2c1f_chamfer_first_emits_three_subpatch_cap() {
         chamfer_g1_opts_with_partial(D, vec![corner]),
     )
     .expect("2C1F chamfer-first: first chamfer (two edges) with partial-corner opt-in succeeds");
-    fillet_edges(
-        &mut model,
-        solid_id,
-        vec![edges[2]],
-        fillet_g1_opts(D),
-    )
-    .expect("2C1F chamfer-first: second fillet must close the corner with 3-sub-patch G1 cap");
+    fillet_edges(&mut model, solid_id, vec![edges[2]], fillet_g1_opts(D))
+        .expect("2C1F chamfer-first: second fillet must close the corner with 3-sub-patch G1 cap");
     assert_three_subpatch_cap(&model, solid_id, "2C1F chamfer-first");
 }
 
@@ -360,18 +344,12 @@ fn c0_default_still_produces_planar_cap() {
 
     assert_eq!(non_manifold_edge_count(&model, solid_id), 0);
     let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model
-        .shells
-        .get(solid.outer_shell)
-        .expect("shell exists");
+    let shell = model.shells.get(solid.outer_shell).expect("shell exists");
     let mut nurbs_cap_present = false;
     let mut planar_3gon_cap_present = false;
     for &fid in &shell.faces {
         let face = model.faces.get(fid).expect("face exists");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface exists");
+        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
         if surface
             .as_any()
             .downcast_ref::<GeneralNurbsSurface>()

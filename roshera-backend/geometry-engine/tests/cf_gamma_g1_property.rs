@@ -237,13 +237,8 @@ fn build_1c2f_fillet_first(d: f64) -> (BRepModel, SolidId) {
     )
     .expect("1C2F G1 fillet-first succeeds");
 
-    chamfer_edges(
-        &mut model,
-        solid_id,
-        vec![edges[0]],
-        chamfer_g1_opts(d),
-    )
-    .expect("1C2F G1 chamfer-second closes corner with G1 cap");
+    chamfer_edges(&mut model, solid_id, vec![edges[0]], chamfer_g1_opts(d))
+        .expect("1C2F G1 chamfer-second closes corner with G1 cap");
 
     (model, solid_id)
 }
@@ -266,13 +261,8 @@ fn build_2c1f_chamfer_first(d: f64) -> (BRepModel, SolidId) {
     )
     .expect("2C1F G1 chamfer-first (two edges) succeeds");
 
-    fillet_edges(
-        &mut model,
-        solid_id,
-        vec![edges[2]],
-        fillet_g1_opts(d),
-    )
-    .expect("2C1F G1 fillet-second closes corner with G1 cap");
+    fillet_edges(&mut model, solid_id, vec![edges[2]], fillet_g1_opts(d))
+        .expect("2C1F G1 fillet-second closes corner with G1 cap");
 
     (model, solid_id)
 }

@@ -217,11 +217,7 @@ impl Shell {
     /// left untouched and `sub_faces` are NOT appended — the caller's
     /// invariant "I'm replacing a known face" was violated and we
     /// surface that as a no-op rather than silently growing the shell).
-    pub fn replace_face_with_partition(
-        &mut self,
-        original: FaceId,
-        sub_faces: &[FaceId],
-    ) -> bool {
+    pub fn replace_face_with_partition(&mut self, original: FaceId, sub_faces: &[FaceId]) -> bool {
         let Some(pos) = self.faces.iter().position(|&id| id == original) else {
             return false;
         };
@@ -513,9 +509,8 @@ impl Shell {
                         let u_mid = (face.uv_bounds[0] + face.uv_bounds[1]) * 0.5;
                         let v_mid = (face.uv_bounds[2] + face.uv_bounds[3]) * 0.5;
                         let outward_normal = face.normal_at(u_mid, v_mid, surface_store)?;
-                        let contribution = stats.centroid.to_vec().dot(&outward_normal)
-                            * stats.area
-                            / 3.0;
+                        let contribution =
+                            stats.centroid.to_vec().dot(&outward_normal) * stats.area / 3.0;
                         volume += contribution;
                         center += stats.centroid.to_vec() * stats.area;
                     }

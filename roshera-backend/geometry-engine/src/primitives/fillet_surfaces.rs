@@ -1886,13 +1886,8 @@ mod kpart_tests {
         // from the spine — by definition of a rolling-ball blend.
         let radius = 0.7;
         let (spine, c1, c2) = plane_plane_inputs(radius);
-        let fillet = CylindricalFillet::from_analytic_kpart(
-            spine.clone_box(),
-            radius,
-            c1,
-            c2,
-        )
-        .unwrap();
+        let fillet =
+            CylindricalFillet::from_analytic_kpart(spine.clone_box(), radius, c1, c2).unwrap();
         for i in 0..5 {
             for j in 0..5 {
                 let u = i as f64 / 4.0;
@@ -1920,8 +1915,7 @@ mod kpart_tests {
         let radius = 0.5;
         let (spine_k, c1_k, c2_k) = plane_plane_inputs(radius);
         let (spine_l, c1_l, c2_l) = plane_plane_inputs(radius);
-        let kpart =
-            CylindricalFillet::from_analytic_kpart(spine_k, radius, c1_k, c2_k).unwrap();
+        let kpart = CylindricalFillet::from_analytic_kpart(spine_k, radius, c1_k, c2_k).unwrap();
         let legacy = CylindricalFillet::new(spine_l, radius, c1_l, c2_l).unwrap();
         // Sample a 5×5 grid and compare positions.
         for i in 0..5 {
@@ -2072,15 +2066,10 @@ mod kpart_tests {
         )
         .is_err());
         // NaN angle bound is invalid.
-        assert!(ToroidalFillet::from_analytic_kpart(
-            spine,
-            0.5,
-            c1,
-            c2,
-            major,
-            (0.0, f64::NAN),
-        )
-        .is_err());
+        assert!(
+            ToroidalFillet::from_analytic_kpart(spine, 0.5, c1, c2, major, (0.0, f64::NAN),)
+                .is_err()
+        );
     }
 
     #[test]

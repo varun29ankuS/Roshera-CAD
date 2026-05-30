@@ -227,9 +227,9 @@ impl TimelineRecorder {
                     "TimelineRecorder channel saturated (capacity={}); worker may be stalled",
                     self.tx.max_capacity()
                 )),
-                mpsc::error::TrySendError::Closed(_) => RecorderError::Unavailable(
-                    "TimelineRecorder worker has shut down".to_string(),
-                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    RecorderError::Unavailable("TimelineRecorder worker has shut down".to_string())
+                }
             })
     }
 
@@ -278,10 +278,7 @@ impl TimelineRecorder {
             .send(RecorderCmd::Flush(resp_tx))
             .await
             .map_err(|e| {
-                RecorderError::Unavailable(format!(
-                    "TimelineRecorder worker has shut down: {}",
-                    e
-                ))
+                RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
             })?;
         resp_rx.await.map_err(|e| {
             RecorderError::Unavailable(format!("TimelineRecorder flush response lost: {}", e))
@@ -742,6 +739,10 @@ mod tests {
             .await
             .get_branch_events(&main, None, None)
             .expect("branch events");
-        assert_eq!(events.len(), 3, "all 3 events reach the timeline after outer commit");
+        assert_eq!(
+            events.len(),
+            3,
+            "all 3 events reach the timeline after outer commit"
+        );
     }
 }

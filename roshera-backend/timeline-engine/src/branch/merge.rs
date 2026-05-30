@@ -859,10 +859,10 @@ mod tests {
         // The resolver should have recorded the conflict and assigned
         // a `UseSource` resolution to it.
         assert!(
-            result.conflicts.iter().all(|c| matches!(
-                c.resolution,
-                Some(ConflictResolution::UseSource)
-            )),
+            result
+                .conflicts
+                .iter()
+                .all(|c| matches!(c.resolution, Some(ConflictResolution::UseSource))),
             "every conflict should be resolved as UseSource"
         );
     }

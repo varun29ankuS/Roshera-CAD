@@ -138,13 +138,8 @@ fn cylinder_all_rims_succeed_with_torus_blend() {
 
     for which in 0..2 {
         let mut working_model = BRepModel::new();
-        let working_solid = make_cylinder(
-            &mut working_model,
-            Point3::ORIGIN,
-            Vector3::Z,
-            5.0,
-            10.0,
-        );
+        let working_solid =
+            make_cylinder(&mut working_model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
         // Each model has its own EdgeIds — recompute the closed-edge
         // list per iteration. Cylinder construction is deterministic,
         // so index `which` selects the same rim across runs.
@@ -368,9 +363,7 @@ fn fillet_closed_edge_torus_blend() {
         } else if curve.as_any().downcast_ref::<Line>().is_some() {
             line_refs += 1;
         } else {
-            panic!(
-                "edge {eid} in blend loop has unsupported curve type for a torus blend"
-            );
+            panic!("edge {eid} in blend loop has unsupported curve type for a torus blend");
         }
     }
     assert_eq!(

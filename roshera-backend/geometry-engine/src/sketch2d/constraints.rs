@@ -185,9 +185,7 @@ impl DimensionalConstraint {
                 reason: "value must be a finite real number",
             });
         }
-        let require_positive = |v: f64,
-                                kind: &'static str|
-         -> Result<(), DimensionalUpdateError> {
+        let require_positive = |v: f64, kind: &'static str| -> Result<(), DimensionalUpdateError> {
             if v <= 0.0 {
                 Err(DimensionalUpdateError::InvalidValue {
                     value: v,

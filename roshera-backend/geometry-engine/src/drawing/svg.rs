@@ -102,12 +102,8 @@ fn write_stylesheet(out: &mut String) {
     out.push_str("  <style>\n");
     out.push_str("    .sheet { fill: white; stroke: #aaa; stroke-width: 0.2; }\n");
     out.push_str("    .frame { fill: none; stroke: #111; stroke-width: 0.6; }\n");
-    out.push_str(
-        "    .titleblock { fill: none; stroke: #111; stroke-width: 0.45; }\n",
-    );
-    out.push_str(
-        "    .titleblock-inner { fill: none; stroke: #111; stroke-width: 0.2; }\n",
-    );
+    out.push_str("    .titleblock { fill: none; stroke: #111; stroke-width: 0.45; }\n");
+    out.push_str("    .titleblock-inner { fill: none; stroke: #111; stroke-width: 0.2; }\n");
     out.push_str(
         "    .view polyline { fill: none; stroke: #111; stroke-width: 0.2; \
          stroke-linejoin: round; stroke-linecap: round; }\n",
@@ -147,9 +143,7 @@ fn write_stylesheet(out: &mut String) {
         "    .logo-mark-r { font: 800 sans-serif; fill: #fff; text-anchor: middle; \
          dominant-baseline: middle; }\n",
     );
-    out.push_str(
-        "    .logo-mark-fill { fill: #111; stroke: #111; stroke-width: 0.2; }\n",
-    );
+    out.push_str("    .logo-mark-fill { fill: #111; stroke: #111; stroke-width: 0.2; }\n");
     out.push_str(
         "    .notes-strip { font: 500 2.4px sans-serif; fill: #333; \
          letter-spacing: 0.06px; }\n",
@@ -195,9 +189,7 @@ fn zone_target_width(sheet: &SheetSize) -> Option<f64> {
         SheetSize::A4 => None,
         SheetSize::A3 | SheetSize::A2 => Some(50.0),
         SheetSize::A1 | SheetSize::A0 => Some(60.0),
-        SheetSize::Custom { width, height } if *width >= 400.0 && *height >= 280.0 => {
-            Some(50.0)
-        }
+        SheetSize::Custom { width, height } if *width >= 400.0 && *height >= 280.0 => Some(50.0),
         SheetSize::Custom { .. } => None,
     }
 }
@@ -467,7 +459,14 @@ fn render_right_column(out: &mut String, drawing: &Drawing, x: f64, y: f64, w: f
         .map(|v| format_scale(v.scale))
         .unwrap_or_else(|| "1:1".to_string());
     render_cell(out, x, dwg_bot, cell_h, "SCALE", &scale_label);
-    render_cell(out, col_mid, dwg_bot, cell_h, "SIZE", &drawing.sheet_size.label());
+    render_cell(
+        out,
+        col_mid,
+        dwg_bot,
+        cell_h,
+        "SIZE",
+        &drawing.sheet_size.label(),
+    );
     let tb = &drawing.title_block;
     let sheet_label = format!(
         "{} OF {}",
@@ -572,14 +571,7 @@ fn render_roshera_logo(out: &mut String, x: f64, y: f64, w: f64, h: f64) {
 // Zone markers
 // ---------------------------------------------------------------------
 
-fn render_zone_markers(
-    out: &mut String,
-    fx: f64,
-    fy: f64,
-    fw: f64,
-    fh: f64,
-    target_width: f64,
-) {
+fn render_zone_markers(out: &mut String, fx: f64, fy: f64, fw: f64, fh: f64, target_width: f64) {
     let nx = (fw / target_width).round().max(2.0) as usize;
     let ny = (fh / target_width).round().max(2.0) as usize;
     let dx = fw / nx as f64;

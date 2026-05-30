@@ -33,30 +33,29 @@ fn orient_cone_lateral_outward(
     apex: Point3,
     axis: Vector3,
 ) -> Result<FaceOrientation, PrimitiveError> {
-    let surface = model.surfaces.get(cone_surface_id).ok_or_else(|| {
-        PrimitiveError::GeometryError {
-            operation: "Cone lateral surface lookup".to_string(),
-            details: "cone surface missing from store".to_string(),
-        }
-    })?;
+    let surface =
+        model
+            .surfaces
+            .get(cone_surface_id)
+            .ok_or_else(|| PrimitiveError::GeometryError {
+                operation: "Cone lateral surface lookup".to_string(),
+                details: "cone surface missing from store".to_string(),
+            })?;
     let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
     let u_mid = 0.5 * (u_min + u_max);
     let v_mid = 0.5 * (v_min + v_max);
-    let mid_point =
-        surface
-            .point_at(u_mid, v_mid)
-            .map_err(|e| PrimitiveError::GeometryError {
-                operation: "Cone mid-point evaluation".to_string(),
-                details: format!("{e:?}"),
-            })?;
+    let mid_point = surface
+        .point_at(u_mid, v_mid)
+        .map_err(|e| PrimitiveError::GeometryError {
+            operation: "Cone mid-point evaluation".to_string(),
+            details: format!("{e:?}"),
+        })?;
     let from_apex = mid_point - apex;
     let axial_component = from_apex.dot(&axis);
     let radial_target = from_apex - axis * axial_component;
-    orient_face_for_outward(surface, radial_target).map_err(|e| {
-        PrimitiveError::GeometryError {
-            operation: "Cone lateral orientation".to_string(),
-            details: format!("{e:?}"),
-        }
+    orient_face_for_outward(surface, radial_target).map_err(|e| PrimitiveError::GeometryError {
+        operation: "Cone lateral orientation".to_string(),
+        details: format!("{e:?}"),
     })
 }
 use serde::{Deserialize, Serialize};
@@ -273,12 +272,8 @@ impl ConePrimitive {
                 // normal points radially away from the cone's axis at the
                 // mid-height parametric sample. Slice 3 of the
                 // comprehensive face-orientation fix.
-                let cone_orientation = orient_cone_lateral_outward(
-                    model,
-                    cone_surface_id,
-                    params.apex,
-                    params.axis,
-                )?;
+                let cone_orientation =
+                    orient_cone_lateral_outward(model, cone_surface_id, params.apex, params.axis)?;
                 let face = Face::new(0, cone_surface_id, loop_id, cone_orientation);
                 model.faces.add(face)
             } else {
@@ -322,12 +317,8 @@ impl ConePrimitive {
                 inner_loop.add_edge(top_edge_id, false);
                 let inner_loop_id = model.loops.add(inner_loop);
 
-                let cone_orientation = orient_cone_lateral_outward(
-                    model,
-                    cone_surface_id,
-                    params.apex,
-                    params.axis,
-                )?;
+                let cone_orientation =
+                    orient_cone_lateral_outward(model, cone_surface_id, params.apex, params.axis)?;
                 let mut face = Face::new(0, cone_surface_id, outer_loop_id, cone_orientation);
                 face.add_inner_loop(inner_loop_id);
                 model.faces.add(face)
@@ -379,20 +370,21 @@ impl ConePrimitive {
         let top_loop_id = model.loops.add(top_loop);
         // Top cap outward target = +params.axis (the cone's axis points
         // from apex toward the base, so the top cap faces +axis).
-        let top_orientation = {
-            let surface = model.surfaces.get(top_plane_id).ok_or_else(|| {
-                PrimitiveError::GeometryError {
-                    operation: "Cone top-cap surface lookup".to_string(),
-                    details: "top plane surface missing from store".to_string(),
-                }
-            })?;
-            orient_face_for_outward(surface, params.axis).map_err(|e| {
-                PrimitiveError::GeometryError {
-                    operation: "Cone top-cap orientation".to_string(),
-                    details: format!("{e:?}"),
-                }
-            })?
-        };
+        let top_orientation =
+            {
+                let surface = model.surfaces.get(top_plane_id).ok_or_else(|| {
+                    PrimitiveError::GeometryError {
+                        operation: "Cone top-cap surface lookup".to_string(),
+                        details: "top plane surface missing from store".to_string(),
+                    }
+                })?;
+                orient_face_for_outward(surface, params.axis).map_err(|e| {
+                    PrimitiveError::GeometryError {
+                        operation: "Cone top-cap orientation".to_string(),
+                        details: format!("{e:?}"),
+                    }
+                })?
+            };
         let top_face = Face::new(0, top_plane_id, top_loop_id, top_orientation);
         let top_face_id = model.faces.add(top_face);
         faces.push(top_face_id);

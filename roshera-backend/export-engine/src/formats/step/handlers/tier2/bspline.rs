@@ -30,10 +30,7 @@
 use ruststep::ast::Record;
 
 use geometry_engine::math::{nurbs::NurbsSurface as MathNurbsSurface, Point3};
-use geometry_engine::primitives::{
-    curve::NurbsCurve,
-    surface::GeneralNurbsSurface,
-};
+use geometry_engine::primitives::{curve::NurbsCurve, surface::GeneralNurbsSurface};
 
 use crate::formats::step::{
     context::ImportContext,
@@ -111,11 +108,7 @@ impl EntityHandler for BSplineCurveHandler {
         ) {
             Ok(d) if d > 0 => d as usize,
             Ok(d) => {
-                push_warn(
-                    ctx,
-                    instance,
-                    format!("non-positive degree {d}"),
-                );
+                push_warn(ctx, instance, format!("non-positive degree {d}"));
                 return HandlerOutcome::Failed {
                     message: "non-positive degree".into(),
                 };
@@ -176,7 +169,11 @@ impl EntityHandler for BSplineCurveHandler {
             ctx,
         ) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "bad mults".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "bad mults".into(),
+                }
+            }
         };
         let distinct_knots = match parse_real_list(
             &fields[7],
@@ -186,7 +183,11 @@ impl EntityHandler for BSplineCurveHandler {
             ctx,
         ) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "bad knots".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "bad knots".into(),
+                }
+            }
         };
 
         let knots = match expand_knot_vector(&distinct_knots, &mults) {
@@ -291,11 +292,15 @@ impl EntityHandler for BSplineSurfaceHandler {
             Ok(d) if d > 0 => d as usize,
             Ok(d) => {
                 push_warn_surface(ctx, instance, format!("non-positive u_degree {d}"));
-                return HandlerOutcome::Failed { message: "bad u_degree".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad u_degree".into(),
+                };
             }
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad u_degree".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad u_degree".into(),
+                };
             }
         };
         let v_degree = match params::as_integer(
@@ -307,11 +312,15 @@ impl EntityHandler for BSplineSurfaceHandler {
             Ok(d) if d > 0 => d as usize,
             Ok(d) => {
                 push_warn_surface(ctx, instance, format!("non-positive v_degree {d}"));
-                return HandlerOutcome::Failed { message: "bad v_degree".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad v_degree".into(),
+                };
             }
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad v_degree".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad v_degree".into(),
+                };
             }
         };
 
@@ -325,12 +334,16 @@ impl EntityHandler for BSplineSurfaceHandler {
             Ok(v) => v,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad cp grid".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad cp grid".into(),
+                };
             }
         };
         if outer.is_empty() {
             push_warn_surface(ctx, instance, "control_points_list is empty".to_string());
-            return HandlerOutcome::Failed { message: "empty cp grid".into() };
+            return HandlerOutcome::Failed {
+                message: "empty cp grid".into(),
+            };
         }
         let mut grid: Vec<Vec<Point3>> = Vec::with_capacity(outer.len());
         let mut row_len: Option<usize> = None;
@@ -344,7 +357,9 @@ impl EntityHandler for BSplineSurfaceHandler {
                 Ok(v) => v,
                 Err(e) => {
                     ctx.report.push_warning(e.into_warning());
-                    return HandlerOutcome::Failed { message: "bad cp row".into() };
+                    return HandlerOutcome::Failed {
+                        message: "bad cp row".into(),
+                    };
                 }
             };
             if let Some(expected) = row_len {
@@ -357,7 +372,9 @@ impl EntityHandler for BSplineSurfaceHandler {
                             row_refs.len()
                         ),
                     );
-                    return HandlerOutcome::Failed { message: "non-rectangular cp grid".into() };
+                    return HandlerOutcome::Failed {
+                        message: "non-rectangular cp grid".into(),
+                    };
                 }
             } else {
                 row_len = Some(row_refs.len());
@@ -372,7 +389,9 @@ impl EntityHandler for BSplineSurfaceHandler {
                             instance,
                             format!("control point #{cp_ref} did not resolve"),
                         );
-                        return HandlerOutcome::Failed { message: "cp missing".into() };
+                        return HandlerOutcome::Failed {
+                            message: "cp missing".into(),
+                        };
                     }
                 }
             }
@@ -382,7 +401,9 @@ impl EntityHandler for BSplineSurfaceHandler {
         let n_v = row_len.unwrap_or(0);
         if n_v == 0 {
             push_warn_surface(ctx, instance, "control point rows are empty".to_string());
-            return HandlerOutcome::Failed { message: "empty cp row".into() };
+            return HandlerOutcome::Failed {
+                message: "empty cp row".into(),
+            };
         }
         // Uniform weights for the non-rational simple form.
         let weights = vec![vec![1.0; n_v]; n_u];
@@ -396,7 +417,11 @@ impl EntityHandler for BSplineSurfaceHandler {
             ctx,
         ) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "bad u mults".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "bad u mults".into(),
+                }
+            }
         };
         let v_mults = match parse_integer_list(
             &fields[9],
@@ -406,7 +431,11 @@ impl EntityHandler for BSplineSurfaceHandler {
             ctx,
         ) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "bad v mults".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "bad v mults".into(),
+                }
+            }
         };
         let u_knots_distinct = match parse_real_list(
             &fields[10],
@@ -416,7 +445,11 @@ impl EntityHandler for BSplineSurfaceHandler {
             ctx,
         ) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "bad u knots".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "bad u knots".into(),
+                }
+            }
         };
         let v_knots_distinct = match parse_real_list(
             &fields[11],
@@ -426,21 +459,29 @@ impl EntityHandler for BSplineSurfaceHandler {
             ctx,
         ) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "bad v knots".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "bad v knots".into(),
+                }
+            }
         };
 
         let u_knots = match expand_knot_vector(&u_knots_distinct, &u_mults) {
             Ok(k) => k,
             Err(e) => {
                 push_warn_surface(ctx, instance, format!("u knot expansion: {e}"));
-                return HandlerOutcome::Failed { message: "u knot expansion".into() };
+                return HandlerOutcome::Failed {
+                    message: "u knot expansion".into(),
+                };
             }
         };
         let v_knots = match expand_knot_vector(&v_knots_distinct, &v_mults) {
             Ok(k) => k,
             Err(e) => {
                 push_warn_surface(ctx, instance, format!("v knot expansion: {e}"));
-                return HandlerOutcome::Failed { message: "v knot expansion".into() };
+                return HandlerOutcome::Failed {
+                    message: "v knot expansion".into(),
+                };
             }
         };
         let expected_u = n_u + u_degree + 1;
@@ -451,7 +492,9 @@ impl EntityHandler for BSplineSurfaceHandler {
                 instance,
                 format!("|u_knots|={} ≠ n_u+p_u+1={}", u_knots.len(), expected_u),
             );
-            return HandlerOutcome::Failed { message: "u knot count".into() };
+            return HandlerOutcome::Failed {
+                message: "u knot count".into(),
+            };
         }
         if v_knots.len() != expected_v {
             push_warn_surface(
@@ -459,24 +502,24 @@ impl EntityHandler for BSplineSurfaceHandler {
                 instance,
                 format!("|v_knots|={} ≠ n_v+p_v+1={}", v_knots.len(), expected_v),
             );
-            return HandlerOutcome::Failed { message: "v knot count".into() };
+            return HandlerOutcome::Failed {
+                message: "v knot count".into(),
+            };
         }
 
-        let math_surface = match MathNurbsSurface::new(
-            grid,
-            weights,
-            u_knots,
-            v_knots,
-            u_degree,
-            v_degree,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                push_warn_surface(ctx, instance, format!("kernel rejected NurbsSurface: {e}"));
-                return HandlerOutcome::Failed { message: "kernel rejected surface".into() };
-            }
+        let math_surface =
+            match MathNurbsSurface::new(grid, weights, u_knots, v_knots, u_degree, v_degree) {
+                Ok(s) => s,
+                Err(e) => {
+                    push_warn_surface(ctx, instance, format!("kernel rejected NurbsSurface: {e}"));
+                    return HandlerOutcome::Failed {
+                        message: "kernel rejected surface".into(),
+                    };
+                }
+            };
+        let wrapper = GeneralNurbsSurface {
+            nurbs: math_surface,
         };
-        let wrapper = GeneralNurbsSurface { nurbs: math_surface };
         let sid = ctx.model.surfaces.add(Box::new(wrapper));
         ctx.caches.surfaces.insert(instance, sid);
         HandlerOutcome::Resolved
@@ -586,10 +629,7 @@ fn expand_knot_vector(knots: &[f64], mults: &[usize]) -> Result<Vec<f64>, String
     }
     for w in knots.windows(2) {
         if w[1] < w[0] {
-            return Err(format!(
-                "non-monotone knot sequence: {} > {}",
-                w[0], w[1]
-            ));
+            return Err(format!("non-monotone knot sequence: {} > {}", w[0], w[1]));
         }
     }
     let total: usize = mults.iter().sum();
@@ -615,7 +655,9 @@ fn field_count_error(
         instance: Some(instance),
         message: format!("{entity} has {got} fields: {detail}"),
     });
-    HandlerOutcome::Failed { message: "wrong arity".into() }
+    HandlerOutcome::Failed {
+        message: "wrong arity".into(),
+    }
 }
 
 fn push_warn(ctx: &mut ImportContext<'_>, instance: u64, message: String) {
@@ -737,9 +779,11 @@ mod tests {
     #[test]
     fn bspline_curve_cubic_bezier_resolves() {
         let (model, report, caches) = run(&cubic_bezier_curve_body());
-        let cid = caches.curves.get(&10).copied().expect(
-            "B_SPLINE_CURVE_WITH_KNOTS must allocate a kernel curve",
-        );
+        let cid = caches
+            .curves
+            .get(&10)
+            .copied()
+            .expect("B_SPLINE_CURVE_WITH_KNOTS must allocate a kernel curve");
         assert!(
             model.curves.get(cid).is_some(),
             "curve id must be valid in BRepModel"
@@ -836,9 +880,11 @@ mod tests {
     #[test]
     fn bspline_surface_bicubic_bezier_resolves() {
         let (model, report, caches) = run(&bicubic_bezier_patch_body());
-        let sid = caches.surfaces.get(&100).copied().expect(
-            "B_SPLINE_SURFACE_WITH_KNOTS must allocate a surface",
-        );
+        let sid = caches
+            .surfaces
+            .get(&100)
+            .copied()
+            .expect("B_SPLINE_SURFACE_WITH_KNOTS must allocate a surface");
         assert!(model.surfaces.get(sid).is_some());
         assert!(
             !report
@@ -867,8 +913,7 @@ mod tests {
         assert!(report
             .warnings
             .iter()
-            .any(|w| w.message.contains("non-rectangular")
-                || w.message.contains("expected")));
+            .any(|w| w.message.contains("non-rectangular") || w.message.contains("expected")));
     }
 
     #[test]

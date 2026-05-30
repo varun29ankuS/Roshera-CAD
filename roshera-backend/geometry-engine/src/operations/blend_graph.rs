@@ -1137,7 +1137,12 @@ mod tests {
     #[test]
     fn single_edge_yields_two_smooth_endpoint_vertices() {
         let mut model = build_unit_box();
-        let edge_id: EdgeId = model.edges.iter().next().map(|(id, _)| id).expect("≥ 1 edge");
+        let edge_id: EdgeId = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("≥ 1 edge");
         let selection = vec![(edge_id, BlendRadius::Constant(0.1))];
         let graph = build(&mut model, &selection).expect("build single-edge selection");
 
@@ -1223,7 +1228,12 @@ mod tests {
     #[test]
     fn duplicate_edge_in_selection_collapses() {
         let mut model = build_unit_box();
-        let edge_id: EdgeId = model.edges.iter().next().map(|(id, _)| id).expect("≥ 1 edge");
+        let edge_id: EdgeId = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("≥ 1 edge");
         let selection = vec![
             (edge_id, BlendRadius::Constant(0.1)),
             (edge_id, BlendRadius::Constant(0.2)),
@@ -1320,8 +1330,7 @@ mod tests {
             .iter()
             .map(|&e| (e, BlendRadius::Constant(r)))
             .collect();
-        let mut graph =
-            build(&mut model, &selection).expect("build three-edge corner selection");
+        let mut graph = build(&mut model, &selection).expect("build three-edge corner selection");
 
         compute_setbacks(&model, &mut graph).expect("compute_setbacks must succeed");
 
@@ -1386,7 +1395,12 @@ mod tests {
     #[test]
     fn setback_no_op_on_single_edge_selection() {
         let mut model = build_unit_box();
-        let edge_id: EdgeId = model.edges.iter().next().map(|(id, _)| id).expect("≥ 1 edge");
+        let edge_id: EdgeId = model
+            .edges
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("≥ 1 edge");
         let selection = vec![(edge_id, BlendRadius::Constant(0.1))];
         let mut graph = build(&mut model, &selection).expect("build single-edge selection");
         compute_setbacks(&model, &mut graph).expect("single edge: no corner ⇒ no-op");
@@ -1477,21 +1491,21 @@ mod tests {
     fn vertex_needs_setback_classification() {
         assert!(!vertex_needs_setback(BlendVertexKind::Smooth));
         assert!(!vertex_needs_setback(BlendVertexKind::Cliff));
-        assert!(!vertex_needs_setback(
-            BlendVertexKind::ConvexCorner { degree: 1 }
-        ));
-        assert!(!vertex_needs_setback(
-            BlendVertexKind::ConcaveCorner { degree: 1 }
-        ));
-        assert!(vertex_needs_setback(
-            BlendVertexKind::ConvexCorner { degree: 2 }
-        ));
-        assert!(vertex_needs_setback(
-            BlendVertexKind::ConvexCorner { degree: 3 }
-        ));
-        assert!(vertex_needs_setback(
-            BlendVertexKind::ConcaveCorner { degree: 2 }
-        ));
+        assert!(!vertex_needs_setback(BlendVertexKind::ConvexCorner {
+            degree: 1
+        }));
+        assert!(!vertex_needs_setback(BlendVertexKind::ConcaveCorner {
+            degree: 1
+        }));
+        assert!(vertex_needs_setback(BlendVertexKind::ConvexCorner {
+            degree: 2
+        }));
+        assert!(vertex_needs_setback(BlendVertexKind::ConvexCorner {
+            degree: 3
+        }));
+        assert!(vertex_needs_setback(BlendVertexKind::ConcaveCorner {
+            degree: 2
+        }));
         assert!(vertex_needs_setback(BlendVertexKind::Mixed));
     }
 
@@ -1500,7 +1514,10 @@ mod tests {
         let c = BlendRadius::Constant(0.5);
         assert_eq!(c.min_value(), 0.5);
         assert_eq!(c.max_value(), 0.5);
-        let l = BlendRadius::Linear { start: 0.1, end: 0.7 };
+        let l = BlendRadius::Linear {
+            start: 0.1,
+            end: 0.7,
+        };
         assert_eq!(l.min_value(), 0.1);
         assert_eq!(l.max_value(), 0.7);
         let v = BlendRadius::Variable(vec![(0.0, 0.3), (0.5, 0.9), (1.0, 0.2)]);

@@ -174,7 +174,11 @@ mod tests {
         let b = Vector2::new(1.0, 0.0);
         let c = Vector2::new(0.5, 3.0_f64.sqrt() / 2.0);
         let ratio_sq = radius_edge_ratio_sq(a, b, c);
-        assert!(ratio_sq < 2.0, "equilateral should be non-skinny, got {}", ratio_sq);
+        assert!(
+            ratio_sq < 2.0,
+            "equilateral should be non-skinny, got {}",
+            ratio_sq
+        );
         assert!((ratio_sq - 1.0 / 3.0).abs() < TOL);
     }
 

@@ -269,13 +269,12 @@ impl Primitive for CylinderPrimitive {
         // invoked so the invariant survives any future change to the
         // surface parameterisation. Slice 3 of the comprehensive
         // face-orientation fix.
-        let bottom_surface_ref = model.surfaces.get(bottom_surface_id).ok_or_else(|| {
-            topology_err("bottom_surface_lookup", "missing in store".to_string())
-        })?;
-        let bottom_orientation =
-            orient_face_for_outward(bottom_surface_ref, -z_axis).map_err(|e| {
-                topology_err("bottom_face_orientation", format!("{e:?}"))
-            })?;
+        let bottom_surface_ref = model
+            .surfaces
+            .get(bottom_surface_id)
+            .ok_or_else(|| topology_err("bottom_surface_lookup", "missing in store".to_string()))?;
+        let bottom_orientation = orient_face_for_outward(bottom_surface_ref, -z_axis)
+            .map_err(|e| topology_err("bottom_face_orientation", format!("{e:?}")))?;
         let mut bottom_face = crate::primitives::face::Face::new(
             0,
             bottom_surface_id,
@@ -285,19 +284,14 @@ impl Primitive for CylinderPrimitive {
         bottom_face.outer_loop = bottom_loop_id;
         let bottom_face_id = model.faces.add(bottom_face);
 
-        let top_surface_ref = model.surfaces.get(top_surface_id).ok_or_else(|| {
-            topology_err("top_surface_lookup", "missing in store".to_string())
-        })?;
-        let top_orientation =
-            orient_face_for_outward(top_surface_ref, z_axis).map_err(|e| {
-                topology_err("top_face_orientation", format!("{e:?}"))
-            })?;
-        let mut top_face = crate::primitives::face::Face::new(
-            0,
-            top_surface_id,
-            top_loop_id,
-            top_orientation,
-        );
+        let top_surface_ref = model
+            .surfaces
+            .get(top_surface_id)
+            .ok_or_else(|| topology_err("top_surface_lookup", "missing in store".to_string()))?;
+        let top_orientation = orient_face_for_outward(top_surface_ref, z_axis)
+            .map_err(|e| topology_err("top_face_orientation", format!("{e:?}")))?;
+        let mut top_face =
+            crate::primitives::face::Face::new(0, top_surface_id, top_loop_id, top_orientation);
         top_face.outer_loop = top_loop_id;
         let top_face_id = model.faces.add(top_face);
 
@@ -322,10 +316,8 @@ impl Primitive for CylinderPrimitive {
         );
         let axial_component = from_base.dot(&z_axis);
         let radial_target = from_base - z_axis * axial_component;
-        let lateral_orientation =
-            orient_face_for_outward(lateral_surface_ref, radial_target).map_err(|e| {
-                topology_err("lateral_face_orientation", format!("{e:?}"))
-            })?;
+        let lateral_orientation = orient_face_for_outward(lateral_surface_ref, radial_target)
+            .map_err(|e| topology_err("lateral_face_orientation", format!("{e:?}")))?;
         let mut lateral_face = crate::primitives::face::Face::new(
             0,
             lateral_surface_id,

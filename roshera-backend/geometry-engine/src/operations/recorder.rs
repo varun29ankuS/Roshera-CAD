@@ -444,7 +444,10 @@ mod tests {
         assert_eq!(entity_ref(ENTITY_SOLID, 7), "solid:7");
         assert_eq!(entity_ref(ENTITY_FACE, 42), "face:42");
         assert_eq!(entity_ref(ENTITY_EDGE, 0), "edge:0");
-        assert_eq!(entity_ref(ENTITY_VERTEX, u64::MAX), format!("vertex:{}", u64::MAX));
+        assert_eq!(
+            entity_ref(ENTITY_VERTEX, u64::MAX),
+            format!("vertex:{}", u64::MAX)
+        );
     }
 
     #[test]
@@ -457,14 +460,8 @@ mod tests {
             .with_input_edges([10u64, 11, 12])
             .with_output_solids([5u64])
             .with_output_faces([20u64, 21, 22]);
-        assert_eq!(
-            op.inputs,
-            vec!["solid:5", "edge:10", "edge:11", "edge:12"]
-        );
-        assert_eq!(
-            op.outputs,
-            vec!["solid:5", "face:20", "face:21", "face:22"]
-        );
+        assert_eq!(op.inputs, vec!["solid:5", "edge:10", "edge:11", "edge:12"]);
+        assert_eq!(op.outputs, vec!["solid:5", "face:20", "face:21", "face:22"]);
     }
 
     #[test]

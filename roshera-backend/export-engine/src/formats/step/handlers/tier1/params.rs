@@ -308,7 +308,9 @@ pub fn as_typed<'a>(
     path: &str,
 ) -> Result<&'a Parameter, ParamError> {
     match param {
-        Parameter::Typed { keyword, parameter } if keyword.eq_ignore_ascii_case(expected_keyword) => {
+        Parameter::Typed { keyword, parameter }
+            if keyword.eq_ignore_ascii_case(expected_keyword) =>
+        {
             Ok(parameter.as_ref())
         }
         Parameter::Typed { keyword, .. } => Err(ParamError {

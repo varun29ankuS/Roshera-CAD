@@ -437,9 +437,9 @@ mod tests {
         let arc = Arc::new(Point3::ZERO, Vector3::Z, 100.0, 0.0, consts::HALF_PI).unwrap();
 
         let params = TessellationParams {
-            chord_tolerance: 10.0,         // very loose curvature
-            max_angle_deviation: 1.0,      // very loose angle
-            max_edge_length: 1.0,          // tight length
+            chord_tolerance: 10.0,    // very loose curvature
+            max_angle_deviation: 1.0, // very loose angle
+            max_edge_length: 1.0,     // tight length
             min_segments: 3,
             max_segments: 10_000,
         };

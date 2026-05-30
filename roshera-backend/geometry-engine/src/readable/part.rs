@@ -576,7 +576,11 @@ mod tests {
     fn oneliner_caps_fractional_digits_at_three() {
         let d = descriptor_with("FrontPlane", [0.123456, 0.0, 0.0], [1.0, 1.0, 1.0]);
         let rendered = format_location_oneliner(&d);
-        assert!(rendered.starts_with("FrontPlane, offset (0.123, 0, 0)"), "got {}", rendered);
+        assert!(
+            rendered.starts_with("FrontPlane, offset (0.123, 0, 0)"),
+            "got {}",
+            rendered
+        );
     }
 
     #[test]
@@ -612,10 +616,7 @@ mod tests {
             format_datum_kind(DatumKind::Plane(PlaneOrientation::XY)),
             "plane"
         );
-        assert_eq!(
-            format_datum_kind(DatumKind::Axis(AxisDirection::Z)),
-            "axis"
-        );
+        assert_eq!(format_datum_kind(DatumKind::Axis(AxisDirection::Z)), "axis");
     }
 
     #[test]

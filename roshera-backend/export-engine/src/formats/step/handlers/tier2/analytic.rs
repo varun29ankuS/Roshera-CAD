@@ -77,19 +77,16 @@ impl EntityHandler for SphericalSurfaceHandler {
         dispatch: &EntityDispatch,
         ctx: &mut ImportContext<'_>,
     ) -> HandlerOutcome {
-        let fields = match params::record_fields(
-            &record.parameter,
-            names::SPHERICAL_SURFACE,
-            instance,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad record shape".into(),
-                };
-            }
-        };
+        let fields =
+            match params::record_fields(&record.parameter, names::SPHERICAL_SURFACE, instance) {
+                Ok(f) => f,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad record shape".into(),
+                    };
+                }
+            };
         if fields.len() < 3 {
             return field_count_error(
                 ctx,
@@ -99,34 +96,27 @@ impl EntityHandler for SphericalSurfaceHandler {
                 fields.len(),
             );
         }
-        let placement_ref = match params::as_entity_ref(
-            &fields[1],
-            names::SPHERICAL_SURFACE,
-            instance,
-            "position",
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad placement ref".into(),
-                };
-            }
-        };
-        let raw_radius = match params::as_real(
-            &fields[2],
-            names::SPHERICAL_SURFACE,
-            instance,
-            "radius",
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad radius".into(),
-                };
-            }
-        };
+        let placement_ref =
+            match params::as_entity_ref(&fields[1], names::SPHERICAL_SURFACE, instance, "position")
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad placement ref".into(),
+                    };
+                }
+            };
+        let raw_radius =
+            match params::as_real(&fields[2], names::SPHERICAL_SURFACE, instance, "radius") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad radius".into(),
+                    };
+                }
+            };
         if raw_radius <= 0.0 {
             push_warn(
                 ctx,
@@ -148,7 +138,11 @@ impl EntityHandler for SphericalSurfaceHandler {
         };
         let radius = raw_radius * ctx.unit.length;
         let sphere = match Sphere::new(
-            Point3::new(placement.origin[0], placement.origin[1], placement.origin[2]),
+            Point3::new(
+                placement.origin[0],
+                placement.origin[1],
+                placement.origin[2],
+            ),
             radius,
         ) {
             Ok(s) => s,
@@ -195,19 +189,16 @@ impl EntityHandler for ToroidalSurfaceHandler {
         dispatch: &EntityDispatch,
         ctx: &mut ImportContext<'_>,
     ) -> HandlerOutcome {
-        let fields = match params::record_fields(
-            &record.parameter,
-            names::TOROIDAL_SURFACE,
-            instance,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad record shape".into(),
-                };
-            }
-        };
+        let fields =
+            match params::record_fields(&record.parameter, names::TOROIDAL_SURFACE, instance) {
+                Ok(f) => f,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad record shape".into(),
+                    };
+                }
+            };
         if fields.len() < 4 {
             return field_count_error(
                 ctx,
@@ -299,7 +290,11 @@ impl EntityHandler for ToroidalSurfaceHandler {
         let major = raw_major * ctx.unit.length;
         let minor = raw_minor * ctx.unit.length;
         let torus = match Torus::new(
-            Point3::new(placement.origin[0], placement.origin[1], placement.origin[2]),
+            Point3::new(
+                placement.origin[0],
+                placement.origin[1],
+                placement.origin[2],
+            ),
             Vector3::new(placement.z[0], placement.z[1], placement.z[2]),
             major,
             minor,
@@ -352,19 +347,16 @@ impl EntityHandler for ConicalSurfaceHandler {
         dispatch: &EntityDispatch,
         ctx: &mut ImportContext<'_>,
     ) -> HandlerOutcome {
-        let fields = match params::record_fields(
-            &record.parameter,
-            names::CONICAL_SURFACE,
-            instance,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad record shape".into(),
-                };
-            }
-        };
+        let fields =
+            match params::record_fields(&record.parameter, names::CONICAL_SURFACE, instance) {
+                Ok(f) => f,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad record shape".into(),
+                    };
+                }
+            };
         if fields.len() < 4 {
             return field_count_error(
                 ctx,
@@ -374,48 +366,36 @@ impl EntityHandler for ConicalSurfaceHandler {
                 fields.len(),
             );
         }
-        let placement_ref = match params::as_entity_ref(
-            &fields[1],
-            names::CONICAL_SURFACE,
-            instance,
-            "position",
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad placement ref".into(),
-                };
-            }
-        };
-        let raw_radius = match params::as_real(
-            &fields[2],
-            names::CONICAL_SURFACE,
-            instance,
-            "radius",
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad radius".into(),
-                };
-            }
-        };
-        let semi_angle = match params::as_real(
-            &fields[3],
-            names::CONICAL_SURFACE,
-            instance,
-            "semi_angle",
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed {
-                    message: "bad semi_angle".into(),
-                };
-            }
-        };
+        let placement_ref =
+            match params::as_entity_ref(&fields[1], names::CONICAL_SURFACE, instance, "position") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad placement ref".into(),
+                    };
+                }
+            };
+        let raw_radius =
+            match params::as_real(&fields[2], names::CONICAL_SURFACE, instance, "radius") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad radius".into(),
+                    };
+                }
+            };
+        let semi_angle =
+            match params::as_real(&fields[3], names::CONICAL_SURFACE, instance, "semi_angle") {
+                Ok(a) => a,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad semi_angle".into(),
+                    };
+                }
+            };
         if raw_radius < 0.0 {
             push_warn(
                 ctx,
@@ -526,12 +506,7 @@ fn field_count_error(
     }
 }
 
-fn push_warn(
-    ctx: &mut ImportContext<'_>,
-    entity: &'static str,
-    instance: u64,
-    message: String,
-) {
+fn push_warn(ctx: &mut ImportContext<'_>, entity: &'static str, instance: u64, message: String) {
     ctx.report.push_warning(Warning {
         severity: Severity::Warn,
         entity: entity.into(),
@@ -751,8 +726,7 @@ mod tests {
             report
                 .warnings
                 .iter()
-                .any(|w| w.entity == "CONICAL_SURFACE"
-                    && w.message.contains("semi_angle")),
+                .any(|w| w.entity == "CONICAL_SURFACE" && w.message.contains("semi_angle")),
             "expected semi_angle warning; got: {:#?}",
             report.warnings
         );
@@ -770,8 +744,7 @@ mod tests {
             report
                 .warnings
                 .iter()
-                .any(|w| w.entity == "CONICAL_SURFACE"
-                    && w.message.contains("negative radius")),
+                .any(|w| w.entity == "CONICAL_SURFACE" && w.message.contains("negative radius")),
             "expected negative-radius warning; got: {:#?}",
             report.warnings
         );

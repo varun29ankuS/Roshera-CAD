@@ -254,8 +254,13 @@ fn create_top_face_shared(
         inner_loop_ids.push(model.loops.add(inner_top_loop));
     }
 
-    let mut face =
-        Face::with_capacity(0, new_surface_id, outer_loop_id, new_orientation, inner_loop_ids.len());
+    let mut face = Face::with_capacity(
+        0,
+        new_surface_id,
+        outer_loop_id,
+        new_orientation,
+        inner_loop_ids.len(),
+    );
     for loop_id in inner_loop_ids {
         face.add_inner_loop(loop_id);
     }
@@ -472,12 +477,7 @@ fn create_unified_extrusion(
     let outer_topology =
         build_extrusion_loop_topology(model, &outer_base_loop, direction, distance)?;
 
-    build_loop_side_faces(
-        model,
-        &outer_base_loop,
-        &outer_topology,
-        &mut unified_faces,
-    )?;
+    build_loop_side_faces(model, &outer_base_loop, &outer_topology, &mut unified_faces)?;
 
     let inner_loop_ids = base_face.inner_loops.clone();
     let mut inner_specs: Vec<(Loop, ExtrusionLoopTopology)> =
@@ -606,12 +606,9 @@ fn create_fresh_extrusion(
         // the borrow checker — even though the two stores are disjoint
         // fields of `BRepModel`.
         let correct_orientation = {
-            let base_surface = model
-                .surfaces
-                .get(base_face.surface_id)
-                .ok_or_else(|| {
-                    OperationError::InvalidGeometry("Base surface not found".to_string())
-                })?;
+            let base_surface = model.surfaces.get(base_face.surface_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Base surface not found".to_string())
+            })?;
             orient_face_for_outward(base_surface, -direction)?
         };
         if let Some(face_mut) = model.faces.get_mut(base_face_id) {
@@ -632,12 +629,7 @@ fn create_fresh_extrusion(
     let outer_topology =
         build_extrusion_loop_topology(model, &outer_base_loop, direction, distance)?;
 
-    build_loop_side_faces(
-        model,
-        &outer_base_loop,
-        &outer_topology,
-        &mut unified_faces,
-    )?;
+    build_loop_side_faces(model, &outer_base_loop, &outer_topology, &mut unified_faces)?;
 
     // Inner-loop side faces — one per edge of each inner loop. The same
     // helper builds them; the inner loop's own CW winding (relative to
@@ -750,7 +742,9 @@ fn build_loop_side_faces(
     let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
     for &vid in &unique_vertices {
         let v = model.vertices.get(vid).ok_or_else(|| {
-            OperationError::InvalidGeometry("Loop vertex not found while computing centroid".to_string())
+            OperationError::InvalidGeometry(
+                "Loop vertex not found while computing centroid".to_string(),
+            )
         })?;
         cx += v.position[0];
         cy += v.position[1];
@@ -778,12 +772,16 @@ fn build_loop_side_faces(
         };
 
         // Bottom-edge midpoint in 3D as the per-wall sample point.
-        let start_pos = model.vertices.get(loop_start).ok_or_else(|| {
-            OperationError::InvalidGeometry("Start vertex not found".to_string())
-        })?.position;
-        let end_pos = model.vertices.get(loop_end).ok_or_else(|| {
-            OperationError::InvalidGeometry("End vertex not found".to_string())
-        })?.position;
+        let start_pos = model
+            .vertices
+            .get(loop_start)
+            .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
+            .position;
+        let end_pos = model
+            .vertices
+            .get(loop_end)
+            .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?
+            .position;
         let edge_mid = crate::math::Point3::new(
             0.5 * (start_pos[0] + end_pos[0]),
             0.5 * (start_pos[1] + end_pos[1]),
@@ -832,20 +830,21 @@ fn build_loop_side_faces(
 /// loops are star-shaped relative to their centroid and the test is
 /// reliable. Pathological non-star-shaped inner loops can produce false
 /// rejections — refine the sampling strategy if that case ever arises.
-fn validate_inner_loops_inside_outer(
-    model: &BRepModel,
-    base_face: &Face,
-) -> OperationResult<()> {
+fn validate_inner_loops_inside_outer(model: &BRepModel, base_face: &Face) -> OperationResult<()> {
     if base_face.inner_loops.is_empty() {
         return Ok(());
     }
 
     let outer_loop = model.loops.get(base_face.outer_loop).ok_or_else(|| {
-        OperationError::InvalidGeometry("Outer loop not found during inner-loop validation".to_string())
+        OperationError::InvalidGeometry(
+            "Outer loop not found during inner-loop validation".to_string(),
+        )
     })?;
 
     let surface = model.surfaces.get(base_face.surface_id).ok_or_else(|| {
-        OperationError::InvalidGeometry("Surface not found during inner-loop validation".to_string())
+        OperationError::InvalidGeometry(
+            "Surface not found during inner-loop validation".to_string(),
+        )
     })?;
     let (u_bounds, v_bounds) = surface.parameter_bounds();
     let u_mid = 0.5 * (u_bounds.0 + u_bounds.1);
@@ -860,9 +859,9 @@ fn validate_inner_loops_inside_outer(
             .get(inner_loop_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Inner loop not found".to_string()))?;
 
-        let inner_vertex_ids = inner_loop
-            .vertices_cached(&model.edges)
-            .map_err(|e| OperationError::NumericalError(format!("Inner loop vertex query failed: {:?}", e)))?;
+        let inner_vertex_ids = inner_loop.vertices_cached(&model.edges).map_err(|e| {
+            OperationError::NumericalError(format!("Inner loop vertex query failed: {:?}", e))
+        })?;
         if inner_vertex_ids.is_empty() {
             return Err(OperationError::InvalidGeometry(
                 "Inner loop has no vertices".to_string(),
@@ -886,7 +885,10 @@ fn validate_inner_loops_inside_outer(
         let inside = outer_loop
             .contains_point(&centroid, &surface_normal, &model.vertices, &model.edges)
             .map_err(|e| {
-                OperationError::NumericalError(format!("Inner-loop containment test failed: {:?}", e))
+                OperationError::NumericalError(format!(
+                    "Inner-loop containment test failed: {:?}",
+                    e
+                ))
             })?;
         if !inside {
             return Err(OperationError::InvalidGeometry(format!(
@@ -1173,9 +1175,7 @@ fn create_ruled_surface(
     let covers_full = |edge: ParameterRange, full: ParameterRange| -> bool {
         (edge.start - full.start).abs() < 1e-9 && (edge.end - full.end).abs() < 1e-9
     };
-    if covers_full(bottom_range, bottom_full_range)
-        && covers_full(top_range, top_full_range)
-    {
+    if covers_full(bottom_range, bottom_full_range) && covers_full(top_range, top_full_range) {
         if let Some(cyl) = try_build_cylinder_from_circles(bottom_curve_full, top_curve_full) {
             return Ok(Box::new(cyl));
         }
@@ -1380,10 +1380,7 @@ pub fn create_face_from_profile_with_plane(
 ) -> OperationResult<FaceId> {
     validate_closed_profile(model, &profile_edges)?;
 
-    let mut profile_loop = Loop::new(
-        0,
-        crate::primitives::r#loop::LoopType::Outer,
-    );
+    let mut profile_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
     for &edge_id in &profile_edges {
         profile_loop.add_edge(edge_id, true);
     }
@@ -2040,18 +2037,11 @@ mod tests {
     fn create_face_with_supplied_plane_on_rectangle_succeeds() {
         let mut model = BRepModel::new();
         let edges = make_rectangle(&mut model, 10.0, 5.0);
-        let face_id = create_face_from_profile_with_plane(
-            &mut model,
-            edges,
-            Point3::ORIGIN,
-            Vector3::Z,
-        )
-        .expect("face built with supplied plane");
+        let face_id =
+            create_face_from_profile_with_plane(&mut model, edges, Point3::ORIGIN, Vector3::Z)
+                .expect("face built with supplied plane");
         let face = model.faces.get(face_id).expect("face stored");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface stored");
+        let surface = model.surfaces.get(face.surface_id).expect("surface stored");
         let plane = surface
             .as_any()
             .downcast_ref::<crate::primitives::surface::Plane>()
@@ -2100,13 +2090,9 @@ mod tests {
 
         // With the host plane supplied, the same polygon yields a
         // valid face.
-        let face_id = create_face_from_profile_with_plane(
-            &mut model,
-            edges,
-            Point3::ORIGIN,
-            Vector3::Z,
-        )
-        .expect("plane-aware path must accept degenerate polygons");
+        let face_id =
+            create_face_from_profile_with_plane(&mut model, edges, Point3::ORIGIN, Vector3::Z)
+                .expect("plane-aware path must accept degenerate polygons");
         assert!(model.faces.get(face_id).is_some());
     }
 
@@ -2120,12 +2106,8 @@ mod tests {
             add_line_edge(&mut model, v0, v1),
             add_line_edge(&mut model, v1, v2),
         ];
-        let result = create_face_from_profile_with_plane(
-            &mut model,
-            edges,
-            Point3::ORIGIN,
-            Vector3::Z,
-        );
+        let result =
+            create_face_from_profile_with_plane(&mut model, edges, Point3::ORIGIN, Vector3::Z);
         assert!(
             result.is_err(),
             "open profile must still be rejected with plane supplied"
@@ -2146,10 +2128,7 @@ mod tests {
         )
         .expect("face built with non-unit normal");
         let face = model.faces.get(face_id).expect("face stored");
-        let surface = model
-            .surfaces
-            .get(face.surface_id)
-            .expect("surface stored");
+        let surface = model.surfaces.get(face.surface_id).expect("surface stored");
         let plane = surface
             .as_any()
             .downcast_ref::<crate::primitives::surface::Plane>()
@@ -2544,9 +2523,6 @@ mod tests {
         let mut model = BRepModel::new();
         let v0 = model.vertices.add(0.0, 0.0, 0.0);
         let result = create_straight_edge(&mut model, v0, 99_999);
-        assert!(matches!(
-            result,
-            Err(OperationError::InvalidGeometry(_))
-        ));
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
     }
 }

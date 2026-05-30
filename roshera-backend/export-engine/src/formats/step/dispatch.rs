@@ -191,12 +191,13 @@ impl EntityDispatch {
                 match records.first() {
                     Some(r) => r,
                     None => {
-                        ctx.report.push_warning(crate::formats::step::diagnostics::Warning {
-                            severity: crate::formats::step::diagnostics::Severity::Warn,
-                            entity: name.to_string(),
-                            instance: Some(entity.instance),
-                            message: "empty complex entity".to_string(),
-                        });
+                        ctx.report
+                            .push_warning(crate::formats::step::diagnostics::Warning {
+                                severity: crate::formats::step::diagnostics::Severity::Warn,
+                                entity: name.to_string(),
+                                instance: Some(entity.instance),
+                                message: "empty complex entity".to_string(),
+                            });
                         return false;
                     }
                 }
@@ -209,21 +210,23 @@ impl EntityDispatch {
             }
             HandlerOutcome::Skipped { reason } => {
                 ctx.report.counts.add_skipped(name);
-                ctx.report.push_warning(crate::formats::step::diagnostics::Warning {
-                    severity: crate::formats::step::diagnostics::Severity::Info,
-                    entity: name.to_string(),
-                    instance: Some(entity.instance),
-                    message: reason.to_string(),
-                });
+                ctx.report
+                    .push_warning(crate::formats::step::diagnostics::Warning {
+                        severity: crate::formats::step::diagnostics::Severity::Info,
+                        entity: name.to_string(),
+                        instance: Some(entity.instance),
+                        message: reason.to_string(),
+                    });
                 false
             }
             HandlerOutcome::Failed { message } => {
-                ctx.report.push_warning(crate::formats::step::diagnostics::Warning {
-                    severity: crate::formats::step::diagnostics::Severity::Warn,
-                    entity: name.to_string(),
-                    instance: Some(entity.instance),
-                    message,
-                });
+                ctx.report
+                    .push_warning(crate::formats::step::diagnostics::Warning {
+                        severity: crate::formats::step::diagnostics::Severity::Warn,
+                        entity: name.to_string(),
+                        instance: Some(entity.instance),
+                        message,
+                    });
                 false
             }
         }

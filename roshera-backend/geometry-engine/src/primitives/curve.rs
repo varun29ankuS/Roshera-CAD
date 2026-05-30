@@ -4060,7 +4060,9 @@ impl Polyline {
 
     /// Sum of all segment lengths.
     fn total_length(&self) -> f64 {
-        (0..self.segment_count()).map(|i| self.segment_length(i)).sum()
+        (0..self.segment_count())
+            .map(|i| self.segment_length(i))
+            .sum()
     }
 
     /// Map `t ∈ [0, 1]` to `(segment_index, local_t ∈ [0, 1])`.

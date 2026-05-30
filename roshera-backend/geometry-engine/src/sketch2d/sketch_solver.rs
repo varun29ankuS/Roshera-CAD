@@ -894,7 +894,10 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     for entry in sketch.points().iter() {
         let id = *entry.key();
         let p: &ParametricPoint2d = entry.value();
-        solver.add_entity(EntityRef::Point(id), EntityState::point(p.position, p.is_fixed));
+        solver.add_entity(
+            EntityRef::Point(id),
+            EntityState::point(p.position, p.is_fixed),
+        );
         registered += 1;
     }
 
@@ -1110,7 +1113,8 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
             }
             (EntityRef::Line(id), EntityUpdate::Line(point, direction)) => {
                 if let Some(mut entry) = sketch.lines().get_mut(id) {
-                    let new_geometry = apply_line_update(&entry.value().geometry, *point, *direction);
+                    let new_geometry =
+                        apply_line_update(&entry.value().geometry, *point, *direction);
                     entry.value_mut().geometry = new_geometry;
                 }
             }
@@ -1122,10 +1126,7 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
                     };
                 }
             }
-            (
-                EntityRef::Arc(id),
-                EntityUpdate::Arc(center, radius, start_angle, end_angle),
-            ) => {
+            (EntityRef::Arc(id), EntityUpdate::Arc(center, radius, start_angle, end_angle)) => {
                 if let Some(mut entry) = sketch.arcs().get_mut(id) {
                     // ID and `ccw` flag are preserved — the solver
                     // does not own the orientation bit (see
@@ -1294,16 +1295,9 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
 /// For `Infinite` and `Ray` the parameters map straight back. For
 /// `Segment` the bridge stored `direction = end - start`, so the
 /// reconstructed end is `start + direction`.
-fn apply_line_update(
-    prior: &LineGeometry,
-    point: Point2d,
-    direction: Vector2d,
-) -> LineGeometry {
+fn apply_line_update(prior: &LineGeometry, point: Point2d, direction: Vector2d) -> LineGeometry {
     match prior {
-        LineGeometry::Infinite(_) => LineGeometry::Infinite(Line2d {
-            point,
-            direction,
-        }),
+        LineGeometry::Infinite(_) => LineGeometry::Infinite(Line2d { point, direction }),
         LineGeometry::Ray(_) => LineGeometry::Ray(Ray2d {
             origin: point,
             direction,
@@ -1338,8 +1332,7 @@ mod tests {
 
     use super::*;
     use crate::sketch2d::constraints::{
-        Constraint, ConstraintId, ConstraintPriority, DimensionalConstraint,
-        GeometricConstraint,
+        Constraint, ConstraintId, ConstraintPriority, DimensionalConstraint, GeometricConstraint,
     };
     use crate::sketch2d::line2d::{Line2d, LineSegment2d};
     use crate::sketch2d::sketch::{Sketch, SketchAnchor};
@@ -1419,8 +1412,8 @@ mod tests {
         // 0.25 is in range and distinct from the solver's default
         // 0.5; calling solve with it must not error.
         let opts = SolveOptions::new(50, 1e-10, 0.25);
-        let report = solve_with_options(&fresh_sketch(), opts)
-            .expect("damping 0.25 in (0, 1] is accepted");
+        let report =
+            solve_with_options(&fresh_sketch(), opts).expect("damping 0.25 in (0, 1] is accepted");
         let _ = report.status;
     }
 
@@ -1448,9 +1441,7 @@ mod tests {
     fn mixed_kinds_register_all_supported() {
         let sketch = fresh_sketch();
         sketch.add_point(Point2d::new(0.0, 0.0));
-        sketch
-            .add_circle(Point2d::new(1.0, 1.0), 0.5)
-            .expect("c");
+        sketch.add_circle(Point2d::new(1.0, 1.0), 0.5).expect("c");
         sketch
             .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(2.0, 1.0))
             .expect("rect");
@@ -1769,10 +1760,7 @@ mod tests {
             .expect("b");
         sketch.add_constraint(Constraint::new_geometric(
             GeometricConstraint::Coincident,
-            vec![
-                EntityRef::Rectangle(pinned),
-                EntityRef::Rectangle(free),
-            ],
+            vec![EntityRef::Rectangle(pinned), EntityRef::Rectangle(free)],
             ConstraintPriority::High,
         ));
 

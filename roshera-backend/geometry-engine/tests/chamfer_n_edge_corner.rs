@@ -259,10 +259,11 @@ fn chamfer_pyramid_apex_three_of_four_edges_subset() {
 
     // The apex vertex stays alive because the un-chamfered fourth
     // sloped edge still references it.
-    let apex_alive = model
-        .vertices
-        .iter()
-        .any(|(_, v)| v.position[2] == PYRAMID_HEIGHT && v.position[0].abs() < 1.0e-9 && v.position[1].abs() < 1.0e-9);
+    let apex_alive = model.vertices.iter().any(|(_, v)| {
+        v.position[2] == PYRAMID_HEIGHT
+            && v.position[0].abs() < 1.0e-9
+            && v.position[1].abs() < 1.0e-9
+    });
     assert!(
         apex_alive,
         "apex vertex must remain in the model — it's still incident \

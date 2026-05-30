@@ -190,10 +190,7 @@ pub enum ViewSource {
     /// Geometry from a standalone part. `part_id` selects the
     /// `BRepModel` stored in `PartManager`; `solid_id` indexes a
     /// solid inside that model.
-    Part {
-        part_id: Uuid,
-        solid_id: SolidId,
-    },
+    Part { part_id: Uuid, solid_id: SolidId },
 }
 
 impl ViewSource {
@@ -246,7 +243,10 @@ pub enum SheetSize {
     A1,
     A0,
     /// User-defined sheet dimensions (width × height in mm).
-    Custom { width: f64, height: f64 },
+    Custom {
+        width: f64,
+        height: f64,
+    },
 }
 
 impl SheetSize {

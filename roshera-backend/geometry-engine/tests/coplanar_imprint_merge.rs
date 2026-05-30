@@ -59,13 +59,7 @@ fn add_line_edge(model: &mut BRepModel, v_start: VertexId, v_end: VertexId) -> E
 }
 
 /// Build a CCW rectangle loop in the XY plane.
-fn add_outer_rect_loop(
-    model: &mut BRepModel,
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-) -> LoopId {
+fn add_outer_rect_loop(model: &mut BRepModel, x0: f64, y0: f64, x1: f64, y1: f64) -> LoopId {
     let v0 = model.vertices.add(x0, y0, 0.0);
     let v1 = model.vertices.add(x1, y0, 0.0);
     let v2 = model.vertices.add(x1, y1, 0.0);
@@ -129,7 +123,13 @@ fn union_of_coplanar_cap_overlap_no_longer_errors() {
     let mut model = BRepModel::new();
     let (a, b) = build_overlap_pair(&mut model);
 
-    let result = boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default());
+    let result = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    );
 
     match result {
         Ok(_) => {}
@@ -193,9 +193,9 @@ fn difference_of_coplanar_cap_overlap_no_longer_errors() {
 
     match result {
         Ok(_) => {}
-        Err(OperationError::CoplanarFaces(msg)) => panic!(
-            "difference should not surface CoplanarFaces after Slice E: {msg}"
-        ),
+        Err(OperationError::CoplanarFaces(msg)) => {
+            panic!("difference should not surface CoplanarFaces after Slice E: {msg}")
+        }
         Err(e) => panic!(
             "difference of coplanar-cap-overlapping box-extrusions surfaced unexpected error: {e:?}"
         ),
@@ -213,7 +213,13 @@ fn union_of_disjoint_coplanar_extrusions_still_succeeds() {
     let a = extrude_xy_rect(&mut model, 0.0, 0.0, 2.0, 2.0, 1.0);
     let b = extrude_xy_rect(&mut model, 10.0, 10.0, 12.0, 12.0, 1.0);
 
-    let result = boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default());
+    let result = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    );
 
     if let Err(e) = result {
         panic!("disjoint-coplanar union must succeed (Slice C contract): {e:?}");

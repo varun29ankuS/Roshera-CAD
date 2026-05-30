@@ -12,7 +12,7 @@
 use super::lifecycle::{self, OpSpec};
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
-use crate::math::{Point3, Vector3, Tolerance};
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
@@ -101,7 +101,10 @@ pub fn blend_faces(
     if options.common.validate_before {
         lifecycle::validate_can_apply(
             model,
-            OpSpec::BlendFaces { face_a: face1_id, face_b: face2_id },
+            OpSpec::BlendFaces {
+                face_a: face1_id,
+                face_b: face2_id,
+            },
         )?;
     }
     lifecycle::with_rollback(model, move |model| {

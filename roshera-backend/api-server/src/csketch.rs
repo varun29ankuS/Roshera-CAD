@@ -479,11 +479,7 @@ fn summarise(sketch: &Sketch) -> CSketchSummary {
                 Spline2d::BSpline(bs) => SplineSummary {
                     id: e.key().0,
                     degree: bs.degree,
-                    control_points: bs
-                        .control_points
-                        .iter()
-                        .map(|p| [p.x, p.y])
-                        .collect(),
+                    control_points: bs.control_points.iter().map(|p| [p.x, p.y]).collect(),
                     knots: bs.knots.clone(),
                     weights: None,
                     is_construction,
@@ -491,11 +487,7 @@ fn summarise(sketch: &Sketch) -> CSketchSummary {
                 Spline2d::Nurbs(nurbs) => SplineSummary {
                     id: e.key().0,
                     degree: nurbs.degree,
-                    control_points: nurbs
-                        .control_points
-                        .iter()
-                        .map(|p| [p.x, p.y])
-                        .collect(),
+                    control_points: nurbs.control_points.iter().map(|p| [p.x, p.y]).collect(),
                     knots: nurbs.knots.clone(),
                     weights: Some(nurbs.weights.clone()),
                     is_construction,
@@ -561,7 +553,10 @@ pub async fn add_point(
     if !req.x.is_finite() || !req.y.is_finite() {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!("point coordinates must be finite (got x={}, y={})", req.x, req.y),
+            format!(
+                "point coordinates must be finite (got x={}, y={})",
+                req.x, req.y
+            ),
         ));
     }
     let sketch = require_sketch(&state, id)?;
@@ -589,9 +584,8 @@ pub async fn add_line(
     let start = Point2dId(req.start);
     let end = Point2dId(req.end);
     let lid = sketch.add_line(start, end).map_err(|e| {
-        ApiError::new(ErrorCode::InvalidParameter, e.to_string()).with_details(
-            serde_json::json!({ "start": req.start, "end": req.end }),
-        )
+        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+            .with_details(serde_json::json!({ "start": req.start, "end": req.end }))
     })?;
     Ok(Json(EntityIdResponse { id: lid.0 }))
 }
@@ -762,7 +756,10 @@ pub async fn update_constraint_value(
     if !req.value.is_finite() {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!("constraint value must be a finite real number (got {})", req.value),
+            format!(
+                "constraint value must be a finite real number (got {})",
+                req.value
+            ),
         )
         .with_details(serde_json::json!({ "value": req.value })));
     }
@@ -1383,19 +1380,9 @@ mod tests {
         let id = m.create();
         let sketch = m.get(&id).expect("get");
         let p0 = sketch.add_point(Point2d::new(0.0, 0.0));
-        sketch
-            .points()
-            .get_mut(&p0)
-            .expect("p0")
-            .value_mut()
-            .fix();
+        sketch.points().get_mut(&p0).expect("p0").value_mut().fix();
         let p1 = sketch.add_point(Point2d::new(5.0, 0.0));
-        sketch
-            .points()
-            .get_mut(&p1)
-            .expect("p1")
-            .value_mut()
-            .fix();
+        sketch.points().get_mut(&p1).expect("p1").value_mut().fix();
         let cid = sketch.add_constraint(Constraint::new_dimensional(
             DimensionalConstraint::Distance(5.0),
             vec![EntityRef::Point(p0), EntityRef::Point(p1)],
@@ -1524,7 +1511,9 @@ mod tests {
         }
         // The one variant we explicitly cannot edit through a
         // single-scalar API.
-        assert!(dimensional_scalar(&DimensionalConstraint::CenterOfMass { x: 0.0, y: 0.0 }).is_none());
+        assert!(
+            dimensional_scalar(&DimensionalConstraint::CenterOfMass { x: 0.0, y: 0.0 }).is_none()
+        );
     }
 
     #[test]
@@ -1579,8 +1568,7 @@ mod tests {
     #[test]
     fn snap_request_deserialises_from_canonical_json() {
         let body = r#"{"cursor":{"x":1.5,"y":-2.0},"radius":5.0}"#;
-        let req: SnapRequest =
-            serde_json::from_str(body).expect("snap request must deserialise");
+        let req: SnapRequest = serde_json::from_str(body).expect("snap request must deserialise");
         assert_eq!(req.cursor.x, 1.5);
         assert_eq!(req.cursor.y, -2.0);
         assert_eq!(req.radius, 5.0);

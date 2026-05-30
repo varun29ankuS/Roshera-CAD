@@ -163,9 +163,7 @@ fn box_corner_one_chamfer_two_fillets_chamfer_first_then_fillet() {
         vec![edges[1], edges[2]],
         fillet_opts_constant(D),
     )
-    .expect(
-        "second-call fillet on the remaining two corner edges synthesises the mixed-kind cap",
-    );
+    .expect("second-call fillet on the remaining two corner edges synthesises the mixed-kind cap");
 
     assert_eq!(
         non_manifold_edge_count(&model, solid_id),
@@ -213,13 +211,8 @@ fn box_corner_two_fillets_then_chamfer_synthesises_mixed_cap() {
 
     // Second call auto-detects via pending_mixed_kind_corners +
     // opposite-kind blend records — no explicit opt-in needed.
-    chamfer_edges(
-        &mut model,
-        solid_id,
-        vec![edges[0]],
-        chamfer_opts_equal(D),
-    )
-    .expect("second-call chamfer on the remaining corner edge synthesises the mixed-kind cap");
+    chamfer_edges(&mut model, solid_id, vec![edges[0]], chamfer_opts_equal(D))
+        .expect("second-call chamfer on the remaining corner edge synthesises the mixed-kind cap");
 
     assert_eq!(
         non_manifold_edge_count(&model, solid_id),
@@ -257,9 +250,7 @@ fn box_corner_mixed_kind_intermediate_state_skips_watertight_validation() {
         vec![edges[1], edges[2]],
         fillet_opts_with_partial_corner(D, vec![corner]),
     )
-    .expect(
-        "first-call partial fillet must pass post-flight validation via the β.4.2 carve-out",
-    );
+    .expect("first-call partial fillet must pass post-flight validation via the β.4.2 carve-out");
 
     // Sanity-check the carve-out's premise: the shell is *actually*
     // non-watertight at this intermediate state.

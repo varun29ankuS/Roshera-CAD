@@ -37,8 +37,14 @@ use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder
 #[test]
 fn front_projection_drops_y() {
     let p = project_point(ProjectionType::Front, Point3::new(3.0, 99.0, 5.0));
-    assert!((p[0] - 3.0).abs() < 1e-12, "X should pass through; got {p:?}");
-    assert!((p[1] - 5.0).abs() < 1e-12, "Z should map to page Y; got {p:?}");
+    assert!(
+        (p[0] - 3.0).abs() < 1e-12,
+        "X should pass through; got {p:?}"
+    );
+    assert!(
+        (p[1] - 5.0).abs() < 1e-12,
+        "Z should map to page Y; got {p:?}"
+    );
 }
 
 /// Top view: world X → page X, world Y → page Y, world Z collapses.
@@ -126,21 +132,9 @@ fn every_preset_rotation_is_orthonormal() {
         let r2 = row(2);
         let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
         // Unit length.
-        assert!(
-            (dot(r0, r0) - 1.0).abs() < 1e-12,
-            "{:?}: row0 not unit",
-            pt
-        );
-        assert!(
-            (dot(r1, r1) - 1.0).abs() < 1e-12,
-            "{:?}: row1 not unit",
-            pt
-        );
-        assert!(
-            (dot(r2, r2) - 1.0).abs() < 1e-12,
-            "{:?}: row2 not unit",
-            pt
-        );
+        assert!((dot(r0, r0) - 1.0).abs() < 1e-12, "{:?}: row0 not unit", pt);
+        assert!((dot(r1, r1) - 1.0).abs() < 1e-12, "{:?}: row1 not unit", pt);
+        assert!((dot(r2, r2) - 1.0).abs() < 1e-12, "{:?}: row2 not unit", pt);
         // Mutually orthogonal.
         assert!(dot(r0, r1).abs() < 1e-12, "{:?}: r0·r1 ≠ 0", pt);
         assert!(dot(r0, r2).abs() < 1e-12, "{:?}: r0·r2 ≠ 0", pt);
@@ -174,13 +168,9 @@ fn build_box(w: f64, h: f64, d: f64) -> (BRepModel, crate::primitives::solid::So
 #[test]
 fn box_front_view_projects_to_eight_polylines() {
     let (model, solid) = build_box(10.0, 20.0, 30.0);
-    let polylines = project_solid_edges(
-        &model,
-        solid,
-        ProjectionType::Front,
-        DEFAULT_CURVE_SAMPLES,
-    )
-    .expect("box projection must succeed");
+    let polylines =
+        project_solid_edges(&model, solid, ProjectionType::Front, DEFAULT_CURVE_SAMPLES)
+            .expect("box projection must succeed");
     assert_eq!(
         polylines.len(),
         8,
@@ -351,10 +341,7 @@ fn svg_envelope_contains_sheet_size_and_views() {
         svg.contains("height=\"210mm\""),
         "A4 height should drive height attribute"
     );
-    assert!(
-        svg.contains("box-test"),
-        "drawing title should be rendered"
-    );
+    assert!(svg.contains("box-test"), "drawing title should be rendered");
     assert!(
         svg.contains("class=\"view\""),
         "every view should emit a class=\"view\" group"

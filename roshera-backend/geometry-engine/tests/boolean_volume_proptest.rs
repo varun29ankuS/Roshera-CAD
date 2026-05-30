@@ -54,8 +54,7 @@
 
 use geometry_engine::math::{Matrix4, Vector3};
 use geometry_engine::operations::{
-    boolean_operation, transform_solid, BooleanOp, BooleanOptions, OperationError,
-    TransformOptions,
+    boolean_operation, transform_solid, BooleanOp, BooleanOptions, OperationError, TransformOptions,
 };
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
@@ -106,9 +105,7 @@ fn arb_small_dims() -> impl Strategy<Value = (f64, f64, f64)> {
 /// — this guarantees `small ⊂ big` for both anchored at origin, with a
 /// 2-unit margin on each axis side that the kernel's coincidence
 /// tolerance (1e-8) cannot bridge.
-fn arb_strictly_containing(
-    small: (f64, f64, f64),
-) -> impl Strategy<Value = (f64, f64, f64)> {
+fn arb_strictly_containing(small: (f64, f64, f64)) -> impl Strategy<Value = (f64, f64, f64)> {
     let (sw, sh, sd) = small;
     (
         (sw + 4.0)..(sw + 20.0),
@@ -428,8 +425,7 @@ fn neg_control_containment_difference_volume_matches_diff() {
     );
     match diff {
         Ok(id) => {
-            let v = volume(&mut model, id)
-                .expect("difference volume calculable");
+            let v = volume(&mut model, id).expect("difference volume calculable");
             assert!(
                 within_rel(v, 992.0, 0.05),
                 "fixed-case difference: V = {}, expected ≈ 992",

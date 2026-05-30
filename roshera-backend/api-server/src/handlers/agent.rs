@@ -91,10 +91,7 @@ pub async fn query_part(
     Path(id): Path<SolidId>,
 ) -> Result<Json<PartReport>, StatusCode> {
     let mut model = model_handle.write().await;
-    model
-        .query_part(id)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    model.query_part(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// `GET /api/agent/parts/{id}/mass` — mass properties (volume, mass,
@@ -124,9 +121,7 @@ pub async fn part_mass_properties_by_uuid(
     ActiveModel(model_handle): ActiveModel,
     Path(uuid): Path<uuid::Uuid>,
 ) -> Result<Json<MassPropertiesReport>, StatusCode> {
-    let solid_id = state
-        .get_local_id(&uuid)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
     let mut model = model_handle.write().await;
     model
         .mass_properties_for(solid_id)

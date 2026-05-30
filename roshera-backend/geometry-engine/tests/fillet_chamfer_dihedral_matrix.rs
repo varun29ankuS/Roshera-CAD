@@ -38,13 +38,13 @@
 
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::{
-    chamfer_edges, fillet_edges,
     chamfer::{ChamferOptions, ChamferType, PropagationMode as ChamferProp},
-    fillet::{FilletOptions, FilletType, PropagationMode as FilletProp, FilletQuality},
-    OperationError,
+    chamfer_edges,
+    fillet::{FilletOptions, FilletQuality, FilletType, PropagationMode as FilletProp},
+    fillet_edges, OperationError,
 };
-use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::curve::Line;
+use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::primitives::validation::{ParallelValidator, ValidationLevel};
@@ -88,7 +88,10 @@ fn build_polygon_profile(model: &mut BRepModel, ring: &[(f64, f64)]) -> Vec<Edge
         let b = verts[(i + 1) % n];
         let pa = model.vertices.get(a).expect("vertex a exists").position;
         let pb = model.vertices.get(b).expect("vertex b exists").position;
-        let line = Line::new(Point3::new(pa[0], pa[1], pa[2]), Point3::new(pb[0], pb[1], pb[2]));
+        let line = Line::new(
+            Point3::new(pa[0], pa[1], pa[2]),
+            Point3::new(pb[0], pb[1], pb[2]),
+        );
         let curve_id = model.curves.add(Box::new(line));
         let edge = Edge::new_auto_range(0, a, b, curve_id, EdgeOrientation::Forward);
         edges.push(model.edges.add(edge));
@@ -167,7 +170,7 @@ fn make_l_shape_prism(model: &mut BRepModel, leg: f64, t: f64, height: f64) -> S
         (0.0, 0.0),
         (leg, 0.0),
         (leg, t),
-        (t, t),       // concave reflex corner
+        (t, t), // concave reflex corner
         (t, leg),
         (0.0, leg),
     ];
@@ -723,36 +726,33 @@ fn fillet_on_cylinder_top_rim_removes_quarter_torus_volume() {
             .create_cylinder_3d(Point3::ZERO, Vector3::Z, cyl_r, cyl_h)
             .expect("cylinder build"),
     );
-    let v0 = model.calculate_solid_volume(solid).expect("baseline volume");
+    let v0 = model
+        .calculate_solid_volume(solid)
+        .expect("baseline volume");
 
     // Locate the top-rim edge: a closed edge whose endpoints sit at
     // the same point at z = cyl_h.
-    let rim = model
-        .edges
-        .iter()
-        .find_map(|(id, e)| {
-            let s = model.vertices.get(e.start_vertex)?.position;
-            let t = model.vertices.get(e.end_vertex)?.position;
-            // Closed edge: start == end. Top rim: z ≈ cyl_h.
-            if (s[0] - t[0]).abs() < 1e-7
-                && (s[1] - t[1]).abs() < 1e-7
-                && (s[2] - t[2]).abs() < 1e-7
-                && (s[2] - cyl_h).abs() < 1e-7
-            {
-                Some(id)
-            } else {
-                None
-            }
-        });
+    let rim = model.edges.iter().find_map(|(id, e)| {
+        let s = model.vertices.get(e.start_vertex)?.position;
+        let t = model.vertices.get(e.end_vertex)?.position;
+        // Closed edge: start == end. Top rim: z ≈ cyl_h.
+        if (s[0] - t[0]).abs() < 1e-7
+            && (s[1] - t[1]).abs() < 1e-7
+            && (s[2] - t[2]).abs() < 1e-7
+            && (s[2] - cyl_h).abs() < 1e-7
+        {
+            Some(id)
+        } else {
+            None
+        }
+    });
     let rim = match rim {
         Some(id) => id,
         // Cylinders may carry their rims as parameter-circles without a
         // separate "closed edge" representation in every kernel build —
         // skip rather than fail if the helper can't locate one.
         None => {
-            eprintln!(
-                "cylinder_top_rim: kernel did not expose a closed top-rim edge — skipping"
-            );
+            eprintln!("cylinder_top_rim: kernel did not expose a closed top-rim edge — skipping");
             return;
         }
     };
@@ -780,14 +780,15 @@ fn fillet_on_cylinder_top_rim_removes_quarter_torus_volume() {
     if let Err(msg) = validate_solid_ok(&model, solid) {
         panic!("cylinder_top_rim: filleted solid invalid: {msg}");
     }
-    let vf = model.calculate_solid_volume(solid).expect("post-fillet volume");
+    let vf = model
+        .calculate_solid_volume(solid)
+        .expect("post-fillet volume");
     let dv = vf - v0;
     // Quarter-torus formula: subtract the cross-section area removed
     // (r² · (1 − π/4)) times the rim length (2π·R). Sign is negative
     // because we're removing material on a convex rim.
-    let expected = -2.0 * std::f64::consts::PI * cyl_r
-        * fillet_r.powi(2)
-        * (1.0 - std::f64::consts::PI / 4.0);
+    let expected =
+        -2.0 * std::f64::consts::PI * cyl_r * fillet_r.powi(2) * (1.0 - std::f64::consts::PI / 4.0);
     assert!(
         dv < 0.0,
         "cylinder_top_rim: fillet ADDED material (Δ={dv}) — opposite-side bug"
@@ -936,9 +937,10 @@ fn fillet_rejects_corner_meeting_edges_until_task_82() {
     );
     match result {
         Err(OperationError::NotImplemented(_)) => {} // expected
-        Err(OperationError::InvalidGeometry(msg)) if msg.to_lowercase().contains("corner")
-            || msg.to_lowercase().contains("vertex")
-            || msg.to_lowercase().contains("blend") => {}
+        Err(OperationError::InvalidGeometry(msg))
+            if msg.to_lowercase().contains("corner")
+                || msg.to_lowercase().contains("vertex")
+                || msg.to_lowercase().contains("blend") => {}
         Err(other) => panic!(
             "fillet on corner-meeting edges should return NotImplemented \
              or a corner/vertex/blend-related InvalidGeometry; got {:?}",
@@ -988,9 +990,10 @@ fn chamfer_rejects_corner_meeting_edges_until_task_82() {
     );
     match result {
         Err(OperationError::NotImplemented(_)) => {}
-        Err(OperationError::InvalidGeometry(msg)) if msg.to_lowercase().contains("corner")
-            || msg.to_lowercase().contains("vertex")
-            || msg.to_lowercase().contains("blend") => {}
+        Err(OperationError::InvalidGeometry(msg))
+            if msg.to_lowercase().contains("corner")
+                || msg.to_lowercase().contains("vertex")
+                || msg.to_lowercase().contains("blend") => {}
         Err(other) => panic!(
             "chamfer on corner-meeting edges should return NotImplemented \
              or a corner/vertex/blend-related InvalidGeometry; got {:?}",
@@ -1030,8 +1033,7 @@ fn fillet_and_chamfer_agree_on_concave_l_shape_reflex_edge() {
                 Some(v) => v.position,
                 None => return false,
             };
-            (s[0] - reflex_xy.0).abs() < 1e-7
-                && (s[1] - reflex_xy.1).abs() < 1e-7
+            (s[0] - reflex_xy.0).abs() < 1e-7 && (s[1] - reflex_xy.1).abs() < 1e-7
         })
     };
 
@@ -1272,10 +1274,7 @@ fn fillet_on_top_rim_of_extruded_box_removes_material() {
         // supported, but the kernel must never succeed-and-corrupt
         // (validated above) and the bug we're pinning manifests as a
         // material-direction error on a successful call.
-        Err(e) => eprintln!(
-            "extruded box top-rim fillet errored (acceptable): {:?}",
-            e
-        ),
+        Err(e) => eprintln!("extruded box top-rim fillet errored (acceptable): {:?}", e),
     }
 }
 
@@ -1383,9 +1382,6 @@ fn chamfer_on_top_rim_of_extruded_box_removes_material() {
                 vc - v0,
             );
         }
-        Err(e) => eprintln!(
-            "extruded box top-rim chamfer errored (acceptable): {:?}",
-            e
-        ),
+        Err(e) => eprintln!("extruded box top-rim chamfer errored (acceptable): {:?}", e),
     }
 }

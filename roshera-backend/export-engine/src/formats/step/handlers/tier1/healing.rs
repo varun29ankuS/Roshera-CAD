@@ -253,7 +253,10 @@ mod tests {
     use crate::formats::step::diagnostics::ImportReport;
     use geometry_engine::primitives::topology_builder::BRepModel;
 
-    fn ctx_with_report<'a>(model: &'a mut BRepModel, report: &'a mut ImportReport) -> ImportContext<'a> {
+    fn ctx_with_report<'a>(
+        model: &'a mut BRepModel,
+        report: &'a mut ImportReport,
+    ) -> ImportContext<'a> {
         let mut c = ImportContext::new(model, report);
         c.default_tolerance = 1e-6;
         c
@@ -279,7 +282,10 @@ mod tests {
         let d = heal_direction([0.0, 0.0, 0.0], "DIRECTION", 7, &mut ctx);
         assert_eq!(d, [0.0, 0.0, 1.0]);
         assert_eq!(ctx.report.healings.len(), 1);
-        assert_eq!(ctx.report.healings[0].kind, HealingKind::ZeroLengthDirection);
+        assert_eq!(
+            ctx.report.healings[0].kind,
+            HealingKind::ZeroLengthDirection
+        );
     }
 
     #[test]
@@ -322,12 +328,11 @@ mod tests {
         );
         assert!(dot(x, z).abs() < 1e-12);
         assert!((mag(x) - 1.0).abs() < 1e-12);
-        assert!(
-            ctx.report
-                .healings
-                .iter()
-                .any(|h| h.kind == HealingKind::PlacementAxisDegenerate)
-        );
+        assert!(ctx
+            .report
+            .healings
+            .iter()
+            .any(|h| h.kind == HealingKind::PlacementAxisDegenerate));
     }
 
     #[test]
@@ -393,11 +398,10 @@ mod tests {
         ];
         let worst = check_loop_closure(&chain, 1e-6, "EDGE_LOOP", 1, &mut ctx);
         assert!(worst > 0.5);
-        assert!(
-            ctx.report
-                .healings
-                .iter()
-                .any(|h| h.kind == HealingKind::LoopNotClosed)
-        );
+        assert!(ctx
+            .report
+            .healings
+            .iter()
+            .any(|h| h.kind == HealingKind::LoopNotClosed));
     }
 }

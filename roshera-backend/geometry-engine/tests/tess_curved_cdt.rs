@@ -19,8 +19,8 @@
 #![allow(clippy::panic)]
 #![allow(clippy::indexing_slicing)]
 
-use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::math::nurbs::NurbsSurface as MathNurbs;
+use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::{
     curve::{Line, ParameterRange},
     edge::{Edge, EdgeOrientation},
@@ -44,14 +44,8 @@ fn build_flat_nurbs_unit_square(
 ) -> (u32, [u32; 4]) {
     // ---- NURBS surface: bilinear flat patch -----------------------
     let control_points = vec![
-        vec![
-            Point3::new(x0, y0, 0.0),
-            Point3::new(x1, y0, 0.0),
-        ],
-        vec![
-            Point3::new(x0, y1, 0.0),
-            Point3::new(x1, y1, 0.0),
-        ],
+        vec![Point3::new(x0, y0, 0.0), Point3::new(x1, y0, 0.0)],
+        vec![Point3::new(x0, y1, 0.0), Point3::new(x1, y1, 0.0)],
     ];
     let weights = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
     let knots_u = vec![0.0, 0.0, 1.0, 1.0];
@@ -86,16 +80,36 @@ fn build_flat_nurbs_unit_square(
     )));
 
     let e0 = model.edges.add(Edge::new(
-        0, v00, v10, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v00,
+        v10,
+        c0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e1 = model.edges.add(Edge::new(
-        0, v10, v11, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v10,
+        v11,
+        c1,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e2 = model.edges.add(Edge::new(
-        0, v11, v01, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v11,
+        v01,
+        c2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e3 = model.edges.add(Edge::new(
-        0, v01, v00, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v01,
+        v00,
+        c3,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
 
     let mut outer = Loop::new(0, LoopType::Outer);
@@ -112,11 +126,7 @@ fn build_flat_nurbs_unit_square(
 
 /// Add an inner square hole loop (CW orientation against an outer
 /// CCW outer). Returns the loop id.
-fn add_inner_square_hole(
-    model: &mut BRepModel,
-    (x0, y0): (f64, f64),
-    (x1, y1): (f64, f64),
-) -> u32 {
+fn add_inner_square_hole(model: &mut BRepModel, (x0, y0): (f64, f64), (x1, y1): (f64, f64)) -> u32 {
     let tol = 1e-6;
     // CW walk inside the outer (which is CCW):
     // (x0,y0) → (x0,y1) → (x1,y1) → (x1,y0) → (x0,y0)
@@ -143,16 +153,36 @@ fn add_inner_square_hole(
     )));
 
     let e0 = model.edges.add(Edge::new(
-        0, v0, v1, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v0,
+        v1,
+        c0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e1 = model.edges.add(Edge::new(
-        0, v1, v2, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v1,
+        v2,
+        c1,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e2 = model.edges.add(Edge::new(
-        0, v2, v3, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v2,
+        v3,
+        c2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e3 = model.edges.add(Edge::new(
-        0, v3, v0, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v3,
+        v0,
+        c3,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
 
     let mut inner = Loop::new(0, LoopType::Inner);
@@ -169,8 +199,7 @@ fn add_inner_square_hole(
 /// trim is watertight when the count is 2 for every interior edge
 /// and 1 for every outer-loop boundary edge.
 fn edge_count_histogram(mesh: &TriangleMesh) -> std::collections::HashMap<(u32, u32), u32> {
-    let mut h: std::collections::HashMap<(u32, u32), u32> =
-        std::collections::HashMap::new();
+    let mut h: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
     for tri in &mesh.triangles {
         for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
             let key = if a < b { (a, b) } else { (b, a) };
@@ -274,8 +303,7 @@ fn nurbs_face_with_square_hole_watertight() {
         // (centroid coincident with the boundary line within
         // floating-point slop) aren't classified as "inside".
         let eps = 1e-9;
-        let inside_hole =
-            cx > 0.25 + eps && cx < 0.75 - eps && cy > 0.25 + eps && cy < 0.75 - eps;
+        let inside_hole = cx > 0.25 + eps && cx < 0.75 - eps && cy > 0.25 + eps && cy < 0.75 - eps;
         assert!(
             !inside_hole,
             "triangle centroid ({cx:.4}, {cy:.4}) sits inside the hole [0.25, 0.75]^2"
@@ -314,9 +342,9 @@ fn trimmed_nurbs_face_respects_trim_curve_as_constraint() {
     // the projected polygon's constraint segments.
     let eps = 1e-9;
     let mut bottom: Vec<(u32, f64)> = Vec::new(); // y ≈ 0, sort by x
-    let mut right: Vec<(u32, f64)> = Vec::new();  // x ≈ 1, sort by y
-    let mut top: Vec<(u32, f64)> = Vec::new();    // y ≈ 1, sort by x (decreasing)
-    let mut left: Vec<(u32, f64)> = Vec::new();   // x ≈ 0, sort by y (decreasing)
+    let mut right: Vec<(u32, f64)> = Vec::new(); // x ≈ 1, sort by y
+    let mut top: Vec<(u32, f64)> = Vec::new(); // y ≈ 1, sort by x (decreasing)
+    let mut left: Vec<(u32, f64)> = Vec::new(); // x ≈ 0, sort by y (decreasing)
 
     for (i, vtx) in mesh.vertices.iter().enumerate() {
         let p = vtx.position;
@@ -372,9 +400,11 @@ fn shared_edge_coherence_curved_to_planar() {
     ];
     let w = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
     let knots = vec![0.0, 0.0, 1.0, 1.0];
-    let nurbs_a = MathNurbs::new(cp_a, w.clone(), knots.clone(), knots.clone(), 1, 1)
-        .expect("nurbs A");
-    let surf_a = model.surfaces.add(Box::new(GeneralNurbsSurface { nurbs: nurbs_a }));
+    let nurbs_a =
+        MathNurbs::new(cp_a, w.clone(), knots.clone(), knots.clone(), 1, 1).expect("nurbs A");
+    let surf_a = model
+        .surfaces
+        .add(Box::new(GeneralNurbsSurface { nurbs: nurbs_a }));
 
     // Surface B: bilinear flat patch [1,2] × [0,1].
     let cp_b = vec![
@@ -382,7 +412,9 @@ fn shared_edge_coherence_curved_to_planar() {
         vec![Point3::new(1.0, 1.0, 0.0), Point3::new(2.0, 1.0, 0.0)],
     ];
     let nurbs_b = MathNurbs::new(cp_b, w, knots.clone(), knots, 1, 1).expect("nurbs B");
-    let surf_b = model.surfaces.add(Box::new(GeneralNurbsSurface { nurbs: nurbs_b }));
+    let surf_b = model
+        .surfaces
+        .add(Box::new(GeneralNurbsSurface { nurbs: nurbs_b }));
 
     // Shared vertices on the seam x = 1.
     let tol = 1e-6;
@@ -424,25 +456,60 @@ fn shared_edge_coherence_curved_to_planar() {
     )));
 
     let e_a0 = model.edges.add(Edge::new(
-        0, v_a00, v_a10, c_a0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_a00,
+        v_a10,
+        c_a0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e_shared = model.edges.add(Edge::new(
-        0, v_a10, v_a11, c_shared, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_a10,
+        v_a11,
+        c_shared,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e_a2 = model.edges.add(Edge::new(
-        0, v_a11, v_a01, c_a2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_a11,
+        v_a01,
+        c_a2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e_a3 = model.edges.add(Edge::new(
-        0, v_a01, v_a00, c_a3, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_a01,
+        v_a00,
+        c_a3,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e_b0 = model.edges.add(Edge::new(
-        0, v_a10, v_b20, c_b0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_a10,
+        v_b20,
+        c_b0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e_b1 = model.edges.add(Edge::new(
-        0, v_b20, v_b21, c_b1, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_b20,
+        v_b21,
+        c_b1,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e_b2 = model.edges.add(Edge::new(
-        0, v_b21, v_a11, c_b2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v_b21,
+        v_a11,
+        c_b2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
 
     // Loop A walks e_a0, e_shared, e_a2, e_a3 (CCW around face A).
@@ -585,13 +652,28 @@ fn degenerate_input_produces_empty_mesh() {
         Point3::new(0.0, 0.0, 0.0),
     )));
     let e0 = model.edges.add(Edge::new(
-        0, v0, v1, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v0,
+        v1,
+        c0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e1 = model.edges.add(Edge::new(
-        0, v1, v2, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v1,
+        v2,
+        c1,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e2 = model.edges.add(Edge::new(
-        0, v2, v0, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v2,
+        v0,
+        c2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
 
     let mut outer = Loop::new(0, LoopType::Outer);
@@ -700,16 +782,36 @@ fn build_curved_nurbs_unit_square_bump(model: &mut BRepModel) -> (u32, [u32; 4])
     )));
 
     let e0 = model.edges.add(Edge::new(
-        0, v00, v10, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v00,
+        v10,
+        c0,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e1 = model.edges.add(Edge::new(
-        0, v10, v11, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v10,
+        v11,
+        c1,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e2 = model.edges.add(Edge::new(
-        0, v11, v01, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v11,
+        v01,
+        c2,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
     let e3 = model.edges.add(Edge::new(
-        0, v01, v00, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+        0,
+        v01,
+        v00,
+        c3,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
     ));
 
     let mut outer = Loop::new(0, LoopType::Outer);
@@ -831,9 +933,7 @@ fn chord_tolerance_actually_enforced_after_refinement() {
         let uva = mesh.vertices[tri[0] as usize].uv;
         let uvb = mesh.vertices[tri[1] as usize].uv;
         let uvc = mesh.vertices[tri[2] as usize].uv;
-        let (Some((ua, va)), Some((ub, vb)), Some((uc, vc))) =
-            (uva, uvb, uvc)
-        else {
+        let (Some((ua, va)), Some((ub, vb)), Some((uc, vc))) = (uva, uvb, uvc) else {
             // No uv ⇒ can't lift; skip (curved path always sets uv).
             continue;
         };

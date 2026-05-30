@@ -111,11 +111,7 @@ impl EdgeSampleCache {
     ///   line); the cache emits the two endpoints only.
     /// * `n + 1` — curved or closed edge sampled at `n + 1` parametric
     ///   stations spanning `[param_range.start, param_range.end]`.
-    pub fn get_or_compute(
-        &self,
-        edge_id: EdgeId,
-        model: &BRepModel,
-    ) -> Arc<Vec<Point3>> {
+    pub fn get_or_compute(&self, edge_id: EdgeId, model: &BRepModel) -> Arc<Vec<Point3>> {
         // DashMap's `entry` API gives us "one writer per shard, lock-free
         // reads after insertion" semantics: a parallel face tessellator
         // hitting the same edge from two faces simultaneously will see
@@ -533,7 +529,11 @@ mod tests {
                 .vertices
                 .get(edge.end_vertex)
                 .expect("end vertex must exist for valid edge");
-            let p_start = Point3::new(v_start.position[0], v_start.position[1], v_start.position[2]);
+            let p_start = Point3::new(
+                v_start.position[0],
+                v_start.position[1],
+                v_start.position[2],
+            );
             let p_end = Point3::new(v_end.position[0], v_end.position[1], v_end.position[2]);
             let d_start = (samples[0] - p_start).magnitude();
             let d_end = (samples[samples.len() - 1] - p_end).magnitude();
@@ -580,12 +580,7 @@ mod tests {
         let params = TessellationParams::default();
         // Probe count over the full circle should respect min_segments
         // and exceed the trivial collinear case.
-        let n = compute_curve_sample_count(
-            &curve,
-            0.0,
-            std::f64::consts::TAU,
-            &params,
-        );
+        let n = compute_curve_sample_count(&curve, 0.0, std::f64::consts::TAU, &params);
         assert!(
             n >= params.min_segments.max(3),
             "closed circle should sample at least min_segments={} times; got {n}",

@@ -467,8 +467,7 @@ mod tests {
         )));
         let mut opts = ImprintOptions::default();
         opts.common.validate_result = false;
-        let result =
-            imprint_curves_on_face(&mut model, face_id, vec![bisector], opts).unwrap();
+        let result = imprint_curves_on_face(&mut model, face_id, vec![bisector], opts).unwrap();
 
         assert_eq!(result.sub_faces.len(), 2);
         assert_eq!(result.parent_shell, Some(shell_id));
@@ -484,7 +483,8 @@ mod tests {
         for &sf in &result.sub_faces {
             let m = model.shells.shells_with_face(sf);
             assert_eq!(
-                m, &[shell_id],
+                m,
+                &[shell_id],
                 "Sub-face {sf} should map to shell {shell_id}, got {m:?}"
             );
         }

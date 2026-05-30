@@ -203,13 +203,7 @@ fn make_box(model: &mut BRepModel, w: f64, h: f64, d: f64) -> SolidId {
     solid_of(builder.create_box_3d(w, h, d).expect("create_box_3d"))
 }
 
-fn make_cylinder(
-    model: &mut BRepModel,
-    centre: Point3,
-    axis: Vector3,
-    r: f64,
-    h: f64,
-) -> SolidId {
+fn make_cylinder(model: &mut BRepModel, centre: Point3, axis: Vector3, r: f64, h: f64) -> SolidId {
     let mut builder = TopologyBuilder::new(model);
     solid_of(
         builder
@@ -353,8 +347,14 @@ fn boolean_union_box_sphere_every_face_oriented_outward() {
     let mut model = BRepModel::new();
     let a = make_box(&mut model, 2.0, 2.0, 2.0);
     let b = make_sphere(&mut model, Point3::new(1.0, 1.0, 1.0), 1.2);
-    let id = boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default())
-        .expect("union(box, sphere) succeeds");
+    let id = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("union(box, sphere) succeeds");
     // Both inputs surround (1, 1, 1): the box centroid, also the
     // sphere centre. The union's interior contains this point by
     // construction.

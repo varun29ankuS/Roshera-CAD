@@ -1720,11 +1720,8 @@ fn intersect_general_surfaces(
     use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
     use crate::primitives::tolerance_propagation::intersection_tolerance;
 
-    let working_distance = intersection_tolerance(
-        face1.tolerance,
-        face2.tolerance,
-        tolerance.distance(),
-    );
+    let working_distance =
+        intersection_tolerance(face1.tolerance, face2.tolerance, tolerance.distance());
     let working_tolerance = Tolerance::new(working_distance, tolerance.angle());
 
     let raw = math_intersect(surface1, surface2, &working_tolerance).map_err(|e| {

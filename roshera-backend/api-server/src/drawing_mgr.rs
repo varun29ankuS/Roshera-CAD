@@ -288,7 +288,9 @@ pub async fn rename_drawing(
             .with_input_drawing(id)
             .with_output_drawing(id),
     );
-    Ok(Json(serde_json::json!({ "success": true, "id": id, "name": new_name })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "id": id, "name": new_name }),
+    ))
 }
 
 pub async fn update_title_block(
@@ -366,10 +368,7 @@ pub async fn delete_drawing(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .drawings
-        .delete(&id)
-        .ok_or_else(|| not_found(id))?;
+    state.drawings.delete(&id).ok_or_else(|| not_found(id))?;
     state.drawings.record_event(
         RecordedOperation::new("drawing.delete")
             .with_parameters(serde_json::json!({}))
@@ -495,12 +494,7 @@ pub async fn export_svg(
     } else {
         "image/svg+xml"
     };
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, content_type)],
-        svg,
-    )
-        .into_response())
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], svg).into_response())
 }
 
 /// Build a content-disposition value with a sanitised filename based on
@@ -509,7 +503,13 @@ pub async fn export_svg(
 fn content_disposition(name: &str, drawing_id: Uuid, extension: &str) -> String {
     let mut sanitised: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     sanitised = sanitised.trim_matches('_').to_string();
     if sanitised.is_empty() {
@@ -880,8 +880,7 @@ mod tests {
 
     #[test]
     fn create_request_rejects_missing_name() {
-        let res: Result<CreateDrawingRequest, _> =
-            serde_json::from_value(serde_json::json!({}));
+        let res: Result<CreateDrawingRequest, _> = serde_json::from_value(serde_json::json!({}));
         assert!(res.is_err());
     }
 
@@ -906,7 +905,10 @@ mod tests {
         assert_eq!(req.position_mm, [0.0, 0.0]);
         assert_eq!(req.scale, 1.0);
         match req.source {
-            ViewSource::Part { part_id: p, solid_id } => {
+            ViewSource::Part {
+                part_id: p,
+                solid_id,
+            } => {
                 assert_eq!(p, part_id);
                 assert_eq!(solid_id, 1);
             }
@@ -950,7 +952,9 @@ mod tests {
 
     #[test]
     fn add_view_response_serializes_uuid() {
-        let resp = AddViewResponse { view_id: Uuid::nil() };
+        let resp = AddViewResponse {
+            view_id: Uuid::nil(),
+        };
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(
             v["view_id"],
@@ -968,8 +972,7 @@ mod tests {
 
     #[test]
     fn svg_query_plain_true_parses() {
-        let q: SvgQuery =
-            serde_json::from_value(serde_json::json!({"plain": true})).unwrap();
+        let q: SvgQuery = serde_json::from_value(serde_json::json!({"plain": true})).unwrap();
         assert!(q.plain);
     }
 
@@ -1046,9 +1049,8 @@ mod tests {
     fn recorder_failure_does_not_unwind_call() {
         // Failing recorder must log+swallow so the mutation behind the
         // event is never rolled back.
-        let m = DrawingManager::with_recorder(
-            Arc::new(FailingRecorder) as Arc<dyn OperationRecorder>,
-        );
+        let m =
+            DrawingManager::with_recorder(Arc::new(FailingRecorder) as Arc<dyn OperationRecorder>);
         m.record_event(RecordedOperation::new("drawing.test"));
         // No panic, no propagated error — success.
     }

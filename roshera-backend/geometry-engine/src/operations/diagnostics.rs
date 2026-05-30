@@ -235,7 +235,10 @@ impl std::fmt::Display for VertexBlendUnsupportedReason {
                 write!(f, "non-manifold or seam edge incident at the vertex")
             }
             VertexBlendUnsupportedReason::MixedConvexity => {
-                write!(f, "mixed convex/concave incidence — sign change not supported")
+                write!(
+                    f,
+                    "mixed convex/concave incidence — sign change not supported"
+                )
             }
             VertexBlendUnsupportedReason::SmoothVertex => {
                 write!(f, "vertex is smooth — no corner to blend")
@@ -605,21 +608,15 @@ impl From<BlendFailure> for OperationError {
             BlendFailure::RadiusExceedsCurvature { .. }
             | BlendFailure::SetbackTooLong { .. }
             | BlendFailure::VertexBlendUnsupported { .. }
-            | BlendFailure::ConflictingBlendKind { .. } => {
-                OperationError::InvalidInput {
-                    parameter: "blend".to_string(),
-                    expected: "geometrically feasible blend parameters".to_string(),
-                    received: detail,
-                }
-            }
+            | BlendFailure::ConflictingBlendKind { .. } => OperationError::InvalidInput {
+                parameter: "blend".to_string(),
+                expected: "geometrically feasible blend parameters".to_string(),
+                received: detail,
+            },
             BlendFailure::DihedralInflection { .. }
             | BlendFailure::SewGapTooLarge { .. }
-            | BlendFailure::TopologyViolation { .. } => {
-                OperationError::InvalidGeometry(detail)
-            }
-            BlendFailure::SpineSolverDiverged { .. } => {
-                OperationError::NumericalError(detail)
-            }
+            | BlendFailure::TopologyViolation { .. } => OperationError::InvalidGeometry(detail),
+            BlendFailure::SpineSolverDiverged { .. } => OperationError::NumericalError(detail),
         }
     }
 }
@@ -807,7 +804,9 @@ mod tests {
             r_max: 1.25,
         };
         let json = serde_json::to_value(&failure).expect("serialize must succeed");
-        let obj = json.as_object().expect("serialised failure must be an object");
+        let obj = json
+            .as_object()
+            .expect("serialised failure must be an object");
         assert_eq!(
             obj.get("type").and_then(|v| v.as_str()),
             Some("RadiusExceedsCurvature"),
@@ -926,9 +925,8 @@ mod tests {
         // the boxed failure and emits the structured `details.failure`
         // JSON payload that downstream agents branch on; collapsing to
         // `InvalidInput` would lose the embedded `MixedKindRejectDetail`.
-        let failure = mixed_kind_failure_with(MixedKindRejectDetail::DegreeUnsupported {
-            degree: 4,
-        });
+        let failure =
+            mixed_kind_failure_with(MixedKindRejectDetail::DegreeUnsupported { degree: 4 });
         let rendered = failure.to_string();
         let err: OperationError = failure.into();
         match err {
@@ -962,7 +960,10 @@ mod tests {
                     assert!(rendered.contains("existing {chamfer}"));
                     assert!(rendered.contains("requested fillet"));
                 }
-                other => panic!("expected VertexBlendUnsupported{{MixedKindUnsupported}}, got {:?}", other),
+                other => panic!(
+                    "expected VertexBlendUnsupported{{MixedKindUnsupported}}, got {:?}",
+                    other
+                ),
             },
             other => panic!("expected BlendFailed, got {:?}", other),
         }
@@ -986,9 +987,15 @@ mod tests {
         for s in [&degree, &displ, &planar, &curved, &cliff] {
             assert!(!s.is_empty());
         }
-        let distinct: std::collections::HashSet<&str> =
-            [&degree, &displ, &planar, &curved, &cliff].iter().map(|s| s.as_str()).collect();
-        assert_eq!(distinct.len(), 5, "every MixedKindRejectDetail variant must Display distinctly");
+        let distinct: std::collections::HashSet<&str> = [&degree, &displ, &planar, &curved, &cliff]
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            5,
+            "every MixedKindRejectDetail variant must Display distinctly"
+        );
         assert!(degree.contains("degree 4"));
         assert!(displ.contains("[0.5]") && displ.contains("[0.8]"));
         assert!(planar.contains("0.01") && planar.contains("1e-6") || planar.contains("0.000001"));
@@ -1019,8 +1026,7 @@ mod tests {
                 !type_tag.is_empty(),
                 "internally-tagged enum must surface its tag on `type`"
             );
-            let back: MixedKindRejectDetail =
-                serde_json::from_value(json).expect("round-trip");
+            let back: MixedKindRejectDetail = serde_json::from_value(json).expect("round-trip");
             assert_eq!(*sample, back);
         }
     }
@@ -1106,8 +1112,7 @@ mod tests {
             vertex: 11,
             blend_face: 22,
             cap_face: 44,
-            seam_kind:
-                crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap,
+            seam_kind: crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap,
             residual: 0.01,
             tolerance: 1.0e-6,
         };
@@ -1144,8 +1149,7 @@ mod tests {
             vertex: 11,
             blend_face: 22,
             cap_face: 44,
-            seam_kind:
-                crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::CapToFillet,
+            seam_kind: crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::CapToFillet,
             residual: 0.01,
             tolerance: 1.0e-6,
         }
@@ -1163,8 +1167,7 @@ mod tests {
             vertex: 11,
             blend_face: 22,
             cap_face: 44,
-            seam_kind:
-                crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap,
+            seam_kind: crate::operations::mixed_kind_seam_audit::MixedKindSeamKind::ChamferToCap,
             residual: 0.01,
             tolerance: 1.0e-6,
         };
@@ -1198,7 +1201,10 @@ mod tests {
         let json = serde_json::to_value(&failure).expect("BlendFailure serialises");
         assert_eq!(json["type"], "VertexBlendUnsupported");
         assert_eq!(json["vertex"], 42);
-        assert_eq!(json["reason"]["MixedKindUnsupported"]["requested"], "fillet");
+        assert_eq!(
+            json["reason"]["MixedKindUnsupported"]["requested"],
+            "fillet"
+        );
         assert_eq!(
             json["reason"]["MixedKindUnsupported"]["detail"]["type"],
             "MixedDisplacements"

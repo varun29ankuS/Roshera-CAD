@@ -117,7 +117,13 @@ fn tagged_constant_round_trips() {
 fn tagged_linear_round_trips() {
     let v = json!({ "kind": "linear", "start": 0.2, "end": 0.7 });
     let dto: BlendRadiusDto = serde_json::from_value(v).expect("tagged linear deserialize");
-    assert_eq!(dto, BlendRadiusDto::Linear { start: 0.2, end: 0.7 });
+    assert_eq!(
+        dto,
+        BlendRadiusDto::Linear {
+            start: 0.2,
+            end: 0.7
+        }
+    );
 }
 
 #[test]
@@ -143,7 +149,10 @@ fn write_then_read_preserves_constant() {
 
 #[test]
 fn write_then_read_preserves_linear() {
-    let dto = BlendRadiusDto::Linear { start: 0.1, end: 0.9 };
+    let dto = BlendRadiusDto::Linear {
+        start: 0.1,
+        end: 0.9,
+    };
     let v = serde_json::to_value(&dto).unwrap();
     let back: BlendRadiusDto = serde_json::from_value(v).unwrap();
     assert_eq!(dto, back);
@@ -151,8 +160,7 @@ fn write_then_read_preserves_linear() {
 
 #[test]
 fn write_then_read_preserves_variable() {
-    let dto =
-        BlendRadiusDto::Variable(vec![(0.0, 0.2), (0.33, 0.6), (0.66, 0.6), (1.0, 0.2)]);
+    let dto = BlendRadiusDto::Variable(vec![(0.0, 0.2), (0.33, 0.6), (0.66, 0.6), (1.0, 0.2)]);
     let v = serde_json::to_value(&dto).unwrap();
     let back: BlendRadiusDto = serde_json::from_value(v).unwrap();
     assert_eq!(dto, back);
@@ -163,49 +171,70 @@ fn write_then_read_preserves_variable() {
 // ---------------------------------------------------------------------------
 
 fn err_message<T: serde::de::DeserializeOwned>(v: Value) -> String {
-    serde_json::from_value::<T>(v).err().map(|e| e.to_string()).unwrap_or_default()
+    serde_json::from_value::<T>(v)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default()
 }
 
 #[test]
 fn missing_kind_field_rejected_with_field_name() {
     let v = json!({ "value": 0.3 });
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(msg.contains("kind"), "error must mention 'kind' field, got: {msg}");
+    assert!(
+        msg.contains("kind"),
+        "error must mention 'kind' field, got: {msg}"
+    );
 }
 
 #[test]
 fn unknown_kind_value_rejected_with_received_value() {
     let v = json!({ "kind": "quadratic", "samples": [[0.0, 0.3]] });
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(msg.contains("quadratic"), "error must echo the bad kind, got: {msg}");
+    assert!(
+        msg.contains("quadratic"),
+        "error must echo the bad kind, got: {msg}"
+    );
 }
 
 #[test]
 fn constant_missing_value_rejected() {
     let v = json!({ "kind": "constant" });
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(msg.contains("value"), "error must mention 'value' field, got: {msg}");
+    assert!(
+        msg.contains("value"),
+        "error must mention 'value' field, got: {msg}"
+    );
 }
 
 #[test]
 fn linear_missing_start_rejected() {
     let v = json!({ "kind": "linear", "end": 0.5 });
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(msg.contains("start"), "error must mention 'start' field, got: {msg}");
+    assert!(
+        msg.contains("start"),
+        "error must mention 'start' field, got: {msg}"
+    );
 }
 
 #[test]
 fn linear_missing_end_rejected() {
     let v = json!({ "kind": "linear", "start": 0.3 });
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(msg.contains("end"), "error must mention 'end' field, got: {msg}");
+    assert!(
+        msg.contains("end"),
+        "error must mention 'end' field, got: {msg}"
+    );
 }
 
 #[test]
 fn variable_missing_samples_rejected() {
     let v = json!({ "kind": "variable" });
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(msg.contains("samples"), "error must mention 'samples' field, got: {msg}");
+    assert!(
+        msg.contains("samples"),
+        "error must mention 'samples' field, got: {msg}"
+    );
 }
 
 #[test]
@@ -240,7 +269,10 @@ fn non_object_non_number_rejected() {
 fn null_rejected() {
     let v = Value::Null;
     let msg = err_message::<BlendRadiusDto>(v);
-    assert!(!msg.is_empty(), "null must be rejected with a non-empty error");
+    assert!(
+        !msg.is_empty(),
+        "null must be rejected with a non-empty error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +288,10 @@ fn min_max_radius_constant() {
 
 #[test]
 fn min_max_radius_linear_ascending() {
-    let dto = BlendRadiusDto::Linear { start: 0.2, end: 0.8 };
+    let dto = BlendRadiusDto::Linear {
+        start: 0.2,
+        end: 0.8,
+    };
     assert_eq!(dto.min_radius(), 0.2);
     assert_eq!(dto.max_radius(), 0.8);
 }
@@ -264,7 +299,10 @@ fn min_max_radius_linear_ascending() {
 #[test]
 fn min_max_radius_linear_descending() {
     // `start.min(end)` and `start.max(end)` must not assume start ≤ end.
-    let dto = BlendRadiusDto::Linear { start: 0.8, end: 0.2 };
+    let dto = BlendRadiusDto::Linear {
+        start: 0.8,
+        end: 0.2,
+    };
     assert_eq!(dto.min_radius(), 0.2);
     assert_eq!(dto.max_radius(), 0.8);
 }
@@ -339,14 +377,18 @@ fn operation_fillet_constant_round_trips() {
         per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).expect("serialize Operation::Fillet/Constant");
-    let back: Operation = serde_json::from_value(v).expect("deserialize Operation::Fillet/Constant");
+    let back: Operation =
+        serde_json::from_value(v).expect("deserialize Operation::Fillet/Constant");
     assert_fillet_matches(back, &edges, &radius);
 }
 
 #[test]
 fn operation_fillet_linear_round_trips() {
     let edges = vec![EntityId::new()];
-    let radius = BlendRadiusDto::Linear { start: 0.1, end: 0.4 };
+    let radius = BlendRadiusDto::Linear {
+        start: 0.1,
+        end: 0.4,
+    };
     let op = Operation::Fillet {
         edges: edges.clone(),
         radius: radius.clone(),
@@ -367,7 +409,8 @@ fn operation_fillet_variable_round_trips() {
         per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).expect("serialize Operation::Fillet/Variable");
-    let back: Operation = serde_json::from_value(v).expect("deserialize Operation::Fillet/Variable");
+    let back: Operation =
+        serde_json::from_value(v).expect("deserialize Operation::Fillet/Variable");
     assert_fillet_matches(back, &edges, &radius);
 }
 
@@ -388,7 +431,10 @@ fn operation_fillet_event_serialised_shape_is_flat_tagged() {
         per_edge_overrides: None,
     };
     let v = serde_json::to_value(&op).unwrap();
-    assert_eq!(v["type"], "Fillet", "Operation tag must be the variant name");
+    assert_eq!(
+        v["type"], "Fillet",
+        "Operation tag must be the variant name"
+    );
     assert_eq!(v["edges"][0], serde_json::to_value(edge_id).unwrap());
     assert_eq!(v["radius"]["kind"], "constant");
     assert_eq!(v["radius"]["value"], 0.5);
@@ -449,7 +495,10 @@ fn operation_fillet_event_array_round_trips() {
     let edge_id = EntityId::new();
     let radii = vec![
         BlendRadiusDto::Constant(0.3),
-        BlendRadiusDto::Linear { start: 0.2, end: 0.5 },
+        BlendRadiusDto::Linear {
+            start: 0.2,
+            end: 0.5,
+        },
         BlendRadiusDto::Variable(vec![(0.0, 0.2), (1.0, 0.4)]),
     ];
     let ops: Vec<Operation> = radii

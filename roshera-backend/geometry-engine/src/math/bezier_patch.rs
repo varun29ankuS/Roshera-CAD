@@ -527,11 +527,7 @@ fn obb_from_points(pts: &[Point3]) -> Obb3 {
 /// Returns the orthonormal eigenvectors (as three `Vector3` columns) and the
 /// corresponding eigenvalues. Converges in a handful of sweeps for 3×3.
 fn jacobi_eigen_3x3(mut a: [[f64; 3]; 3]) -> ([Vector3; 3], [f64; 3]) {
-    let mut v = [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ];
+    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     for _sweep in 0..32 {
         let off = a[0][1].abs() + a[0][2].abs() + a[1][2].abs();
         if off < 1e-18 {
@@ -671,7 +667,10 @@ mod tests {
         let patch = sample_rational_patch();
         let obb = patch.obb();
         for k in 0..3 {
-            assert!((obb.axes[k].magnitude() - 1.0).abs() < 1e-9, "axis {k} unit");
+            assert!(
+                (obb.axes[k].magnitude() - 1.0).abs() < 1e-9,
+                "axis {k} unit"
+            );
         }
         assert!(obb.axes[0].dot(&obb.axes[1]).abs() < 1e-9);
         assert!(obb.axes[0].dot(&obb.axes[2]).abs() < 1e-9);

@@ -64,8 +64,8 @@ use crate::operations::{OperationError, OperationResult};
 use crate::primitives::face::FaceId;
 use crate::primitives::shell::ShellId;
 use crate::primitives::solid::SolidId;
-use crate::primitives::topology_builder::BRepModel;
 use crate::primitives::surface::SurfaceType;
+use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::adaptive::compute_plane_axes;
 use crate::tessellation::surface::{
     get_face_parameter_bounds, point_inside_face_uv, triangulate_planar_polygon,
@@ -115,14 +115,16 @@ pub fn section_solid_by_plane(
     plane_normal: Vector3,
     tolerance: Tolerance,
 ) -> OperationResult<Vec<SectionCap>> {
-    let normal = plane_normal.normalize().map_err(|_| OperationError::InvalidInput {
-        parameter: "plane_normal".to_string(),
-        expected: "non-zero vector".to_string(),
-        received: format!(
-            "({:.6}, {:.6}, {:.6})",
-            plane_normal.x, plane_normal.y, plane_normal.z
-        ),
-    })?;
+    let normal = plane_normal
+        .normalize()
+        .map_err(|_| OperationError::InvalidInput {
+            parameter: "plane_normal".to_string(),
+            expected: "non-zero vector".to_string(),
+            received: format!(
+                "({:.6}, {:.6}, {:.6})",
+                plane_normal.x, plane_normal.y, plane_normal.z
+            ),
+        })?;
 
     let solid = match model.get_solid(solid_id) {
         Some(s) => s,
@@ -149,13 +151,7 @@ pub fn section_solid_by_plane(
             None => continue,
         };
         for face_id in &shell.faces {
-            collect_face_fragments(
-                model,
-                *face_id,
-                plane_origin,
-                normal,
-                &mut fragments,
-            );
+            collect_face_fragments(model, *face_id, plane_origin, normal, &mut fragments);
         }
     }
 
@@ -195,7 +191,10 @@ pub fn section_solid_by_plane(
     // the same circle). Two loops are the same iff their signed areas
     // and bbox centres match within tolerance.
     let dedup_indices: Vec<usize> = dedup_loops_by_signature(&projected, simplify_eps);
-    let projected: Vec<Loop2D> = dedup_indices.iter().map(|&i| projected[i].clone()).collect();
+    let projected: Vec<Loop2D> = dedup_indices
+        .iter()
+        .map(|&i| projected[i].clone())
+        .collect();
     let loops: Vec<Vec<Point3>> = dedup_indices.iter().map(|&i| loops[i].clone()).collect();
 
     let nesting = classify_loop_nesting(&projected);
@@ -427,30 +426,29 @@ fn trim_curve_to_face(
     // tests inside-face and the other tests outside-face). At most 30
     // iterations — 2^-30 ≈ 1e-9 of the segment length, well below any
     // realistic UV scale.
-    let boundary_3d = |a: &ParametricIntersectionPoint,
-                       b: &ParametricIntersectionPoint|
-     -> Point3 {
-        let mut t_lo = 0.0;
-        let mut t_hi = 1.0;
-        let a_inside = inside_face(a);
-        for _ in 0..30 {
-            let t_mid = 0.5 * (t_lo + t_hi);
-            let u_mid = a.u + (b.u - a.u) * t_mid;
-            let v_mid = a.v + (b.v - a.v) * t_mid;
-            let mid_inside = u_mid >= u_min
-                && u_mid <= u_max
-                && v_mid >= v_min
-                && v_mid <= v_max
-                && point_inside_face_uv(u_mid, v_mid, face, model);
-            if mid_inside == a_inside {
-                t_lo = t_mid;
-            } else {
-                t_hi = t_mid;
+    let boundary_3d =
+        |a: &ParametricIntersectionPoint, b: &ParametricIntersectionPoint| -> Point3 {
+            let mut t_lo = 0.0;
+            let mut t_hi = 1.0;
+            let a_inside = inside_face(a);
+            for _ in 0..30 {
+                let t_mid = 0.5 * (t_lo + t_hi);
+                let u_mid = a.u + (b.u - a.u) * t_mid;
+                let v_mid = a.v + (b.v - a.v) * t_mid;
+                let mid_inside = u_mid >= u_min
+                    && u_mid <= u_max
+                    && v_mid >= v_min
+                    && v_mid <= v_max
+                    && point_inside_face_uv(u_mid, v_mid, face, model);
+                if mid_inside == a_inside {
+                    t_lo = t_mid;
+                } else {
+                    t_hi = t_mid;
+                }
             }
-        }
-        let t = 0.5 * (t_lo + t_hi);
-        a.position + (b.position - a.position) * t
-    };
+            let t = 0.5 * (t_lo + t_hi);
+            a.position + (b.position - a.position) * t
+        };
 
     let mut current: Vec<Point3> = Vec::new();
     let mut prev_inside = false;
@@ -529,10 +527,7 @@ fn clip_segment_to_bbox(
 // Internal: fragment chaining
 // ---------------------------------------------------------------------------
 
-fn chain_fragments_into_loops(
-    fragments: &[Polyline3D],
-    tolerance: &Tolerance,
-) -> Vec<Vec<Point3>> {
+fn chain_fragments_into_loops(fragments: &[Polyline3D], tolerance: &Tolerance) -> Vec<Vec<Point3>> {
     let weld_eps = tolerance.distance().max(1e-9);
     let mut frags: Vec<Polyline3D> = fragments
         .iter()
@@ -577,7 +572,11 @@ fn chain_fragments_into_loops(
                 .windows(2)
                 .map(|w| (w[1] - w[0]).magnitude())
                 .sum::<f64>();
-            let rel = if perim > 0.0 { gap / perim } else { f64::INFINITY };
+            let rel = if perim > 0.0 {
+                gap / perim
+            } else {
+                f64::INFINITY
+            };
             if gap <= weld_eps || rel < 0.01 {
                 chain.pop();
                 if chain.len() >= 3 {
@@ -1109,12 +1108,7 @@ mod tests {
         let geom = {
             let mut builder = TopologyBuilder::new(&mut model);
             builder
-                .create_cylinder_3d(
-                    Vector3::ZERO,
-                    Vector3::new(0.0, 0.0, 1.0),
-                    radius,
-                    height,
-                )
+                .create_cylinder_3d(Vector3::ZERO, Vector3::new(0.0, 0.0, 1.0), radius, height)
                 .expect("create_cylinder_3d")
         };
         let solid_id = match geom {
@@ -1163,14 +1157,8 @@ mod tests {
     fn section_oblique_plane_through_box() {
         let (model, solid_id) = build_box_model(10.0);
         let n = Vector3::new(1.0, 1.0, 0.0);
-        let caps = section_solid_by_plane(
-            &model,
-            solid_id,
-            Vector3::ZERO,
-            n,
-            Tolerance::default(),
-        )
-        .expect("section call");
+        let caps = section_solid_by_plane(&model, solid_id, Vector3::ZERO, n, Tolerance::default())
+            .expect("section call");
         assert_eq!(caps.len(), 1, "expected one cap for oblique cut");
         let cap = &caps[0];
         assert!(
@@ -1219,7 +1207,11 @@ mod tests {
             cap.vertices.len()
         );
         for v in &cap.vertices {
-            assert!((v.z - 5.0).abs() < 1e-4, "cap vertex off plane: z = {}", v.z);
+            assert!(
+                (v.z - 5.0).abs() < 1e-4,
+                "cap vertex off plane: z = {}",
+                v.z
+            );
             let r = (v.x * v.x + v.y * v.y).sqrt();
             assert!(r <= 2.0 + 1e-3, "cap vertex outside cylinder: r = {}", r);
         }

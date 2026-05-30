@@ -113,8 +113,7 @@ fn loft_profiles_body(
     validate_loft_inputs(model, &profiles, &options)?;
 
     // Capture profile edges (flattened) before they're consumed, for recording.
-    let profile_edges_for_record: Vec<u32> =
-        profiles.iter().flatten().copied().collect();
+    let profile_edges_for_record: Vec<u32> = profiles.iter().flatten().copied().collect();
     let profile_count = profiles.len();
 
     // Convert edge profiles to face profiles if needed
@@ -841,8 +840,7 @@ fn create_ruled_surfaces_between_profiles(
             }
         };
 
-        let face_id =
-            create_ruled_face(model, v1_start, v1_end, v2_start, v2_end, outward_target)?;
+        let face_id = create_ruled_face(model, v1_start, v1_end, v2_start, v2_end, outward_target)?;
         faces.push(face_id);
     }
 
@@ -1322,9 +1320,7 @@ fn create_cap_face_outward_oriented(
     let surface = model
         .surfaces
         .get(face.surface_id)
-        .ok_or_else(|| {
-            OperationError::InvalidGeometry("Profile surface not found".to_string())
-        })?;
+        .ok_or_else(|| OperationError::InvalidGeometry("Profile surface not found".to_string()))?;
     let orientation = orient_face_for_outward(surface, outward_target)?;
     let mut cap_face = face;
     cap_face.id = 0; // ID will be assigned by store
@@ -1783,8 +1779,7 @@ mod tests {
         let v1e = model.vertices.add(1.0, 0.0, 0.0);
         let v2s = model.vertices.add(0.0, 0.0, 1.0);
         let v2e = model.vertices.add(1.0, 0.0, 1.0);
-        let face_id =
-            create_ruled_face(&mut model, v1s, v1e, v2s, v2e, Vector3::Z).expect("face");
+        let face_id = create_ruled_face(&mut model, v1s, v1e, v2s, v2e, Vector3::Z).expect("face");
         let face = model.faces.get(face_id).expect("face");
         let outer = model.loops.get(face.outer_loop).expect("loop");
         assert_eq!(outer.edges.len(), 4);
@@ -1827,8 +1822,7 @@ mod tests {
         let v10 = model.vertices.add(1.0, 0.0, 0.0);
         let v01 = model.vertices.add(0.0, 1.0, 0.0);
         let v11 = model.vertices.add(1.0, 1.0, 0.0);
-        let face_id =
-            create_ruled_face(&mut model, v00, v10, v01, v11, Vector3::Z).expect("face");
+        let face_id = create_ruled_face(&mut model, v00, v10, v01, v11, Vector3::Z).expect("face");
         let original = model.faces.get(face_id).expect("face").orientation;
         let reversed_id = create_reversed_face(&mut model, &face_id).expect("reversed");
         let reversed = model.faces.get(reversed_id).expect("reversed").orientation;

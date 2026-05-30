@@ -476,11 +476,7 @@ pub async fn delete_branch(
     // tooling that needs to retire main goes through a separate code
     // path with its own confirmation surface.
     timeline
-        .abandon_branch(
-            bid,
-            "abandoned via DELETE /api/branches".to_string(),
-            false,
-        )
+        .abandon_branch(bid, "abandoned via DELETE /api/branches".to_string(), false)
         .map_err(map_timeline_err)?;
     Ok(StatusCode::NO_CONTENT)
 }

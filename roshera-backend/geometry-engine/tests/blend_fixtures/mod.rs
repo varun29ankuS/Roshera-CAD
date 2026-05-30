@@ -256,7 +256,10 @@ pub fn topology_hash(model: &BRepModel, solid_id: SolidId) -> u64 {
                 .entry(e.start_vertex)
                 .or_default()
                 .push(e.end_vertex);
-            adjacency.entry(e.end_vertex).or_default().push(e.start_vertex);
+            adjacency
+                .entry(e.end_vertex)
+                .or_default()
+                .push(e.start_vertex);
         }
     }
 

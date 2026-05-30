@@ -931,10 +931,7 @@ async fn boolean_operation(
     // operands reappear under new identities and lose selection /
     // outliner placement / AI references.
     if let Some(event_id) = handlers::timeline::latest_event_id_on_active_branch(&state).await {
-        state.tombstone_consumed_uuids(
-            event_id,
-            [(solid_a, uuid_a), (solid_b, uuid_b)],
-        );
+        state.tombstone_consumed_uuids(event_id, [(solid_a, uuid_a), (solid_b, uuid_b)]);
     }
 
     // Drop the consumed operands from the id-mapping table. The kernel
@@ -1049,9 +1046,7 @@ async fn shell_solid(
     if !thickness.is_finite() || thickness.abs() < 1e-9 {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!(
-                "'thickness' must be a non-zero finite number, got {thickness}"
-            ),
+            format!("'thickness' must be a non-zero finite number, got {thickness}"),
         ));
     }
 
@@ -1072,9 +1067,7 @@ async fn shell_solid(
             let n = item.as_u64().ok_or_else(|| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
-                    format!(
-                        "'faces_to_remove[{i}]' must be a non-negative integer, got {item}"
-                    ),
+                    format!("'faces_to_remove[{i}]' must be a non-negative integer, got {item}"),
                 )
             })?;
             if n > u32::MAX as u64 {
@@ -1456,8 +1449,7 @@ fn parse_partial_corner_vertices(
     let array = value.as_array().ok_or_else(|| {
         ApiError::new(
             ErrorCode::InvalidParameter,
-            "'partial_corner_vertices' must be an array of vertex ids (u32 integers)"
-                .to_string(),
+            "'partial_corner_vertices' must be an array of vertex ids (u32 integers)".to_string(),
         )
     })?;
     if array.len() > MAX_PARTIAL_CORNER_VERTICES {
@@ -1515,9 +1507,7 @@ fn parse_seam_continuity(
     let s = value.as_str().ok_or_else(|| {
         ApiError::new(
             ErrorCode::InvalidParameter,
-            format!(
-                "'seam_continuity' must be a string (\"c0\" or \"g1\"), got {value}"
-            ),
+            format!("'seam_continuity' must be a string (\"c0\" or \"g1\"), got {value}"),
         )
     })?;
     match s.to_ascii_lowercase().as_str() {
@@ -1525,9 +1515,7 @@ fn parse_seam_continuity(
         "g1" => Ok(SeamContinuity::G1),
         other => Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!(
-                "'seam_continuity' must be \"c0\" or \"g1\", got \"{other}\""
-            ),
+            format!("'seam_continuity' must be \"c0\" or \"g1\", got \"{other}\""),
         )),
     }
 }
@@ -1718,8 +1706,7 @@ async fn fillet_edges_endpoint(
                 seam_continuity,
                 ..FilletOptions::default()
             };
-            kernel_fillet(&mut model, solid_id, edges.clone(), opts)
-                .map_err(ApiError::from)?;
+            kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
         } else if radii_parsed.uniform_constant {
             let opts = FilletOptions {
                 fillet_type: radii_parsed.to_fillet_type(0),
@@ -1728,8 +1715,7 @@ async fn fillet_edges_endpoint(
                 seam_continuity,
                 ..FilletOptions::default()
             };
-            kernel_fillet(&mut model, solid_id, edges.clone(), opts)
-                .map_err(ApiError::from)?;
+            kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
         } else if radii_parsed.all_constant {
             // F5-β.5.3 — distinct per-edge constants in one atomic
             // call. `to_per_edge_constant_map` returns `Some` iff
@@ -1741,8 +1727,7 @@ async fn fillet_edges_endpoint(
                 .ok_or_else(|| {
                     ApiError::new(
                         ErrorCode::InvalidParameter,
-                        "internal: all_constant flag set but per-edge map empty"
-                            .to_string(),
+                        "internal: all_constant flag set but per-edge map empty".to_string(),
                     )
                 })?;
             let radius_repr = map.values().copied().fold(f64::INFINITY, f64::min);
@@ -1754,8 +1739,7 @@ async fn fillet_edges_endpoint(
                 seam_continuity,
                 ..FilletOptions::default()
             };
-            kernel_fillet(&mut model, solid_id, edges.clone(), opts)
-                .map_err(ApiError::from)?;
+            kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
         } else {
             // Per-edge variable-profile loop. The opt-in vector is
             // cloned per iteration: at each kernel call the same
@@ -1770,8 +1754,7 @@ async fn fillet_edges_endpoint(
                     seam_continuity,
                     ..FilletOptions::default()
                 };
-                kernel_fillet(&mut model, solid_id, vec![edge_id], opts)
-                    .map_err(ApiError::from)?;
+                kernel_fillet(&mut model, solid_id, vec![edge_id], opts).map_err(ApiError::from)?;
             }
         }
     };
@@ -1831,8 +1814,7 @@ async fn fillet_edges_endpoint(
         if let Some(obj) = parameters.as_object_mut() {
             obj.insert(
                 "partial_corner_vertices".to_string(),
-                serde_json::to_value(&partial_corner_vertices)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(&partial_corner_vertices).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -1847,8 +1829,7 @@ async fn fillet_edges_endpoint(
         if let Some(obj) = parameters.as_object_mut() {
             obj.insert(
                 "seam_continuity".to_string(),
-                serde_json::to_value(seam_continuity)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(seam_continuity).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -2050,8 +2031,7 @@ async fn chamfer_edges_endpoint(
         if let Some(obj) = parameters.as_object_mut() {
             obj.insert(
                 "partial_corner_vertices".to_string(),
-                serde_json::to_value(&partial_corner_vertices)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(&partial_corner_vertices).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -2065,8 +2045,7 @@ async fn chamfer_edges_endpoint(
         if let Some(obj) = parameters.as_object_mut() {
             obj.insert(
                 "seam_continuity".to_string(),
-                serde_json::to_value(seam_continuity)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(seam_continuity).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -2220,8 +2199,8 @@ async fn pattern_linear_endpoint(
         // Tessellation runs under a read lock immediately after.
         let new_solid_id = {
             let mut model = model_handle.write().await;
-            let cloned = deep_clone_solid(&mut model, solid_id, None)
-                .map_err(ApiError::kernel_error)?;
+            let cloned =
+                deep_clone_solid(&mut model, solid_id, None).map_err(ApiError::kernel_error)?;
             transform_solid(
                 &mut model,
                 cloned,
@@ -2355,11 +2334,7 @@ async fn pattern_circular_endpoint(
             "'axis' must be a non-zero finite vector".to_string(),
         ));
     }
-    let axis_norm = Vector3::new(
-        axis[0] / axis_len,
-        axis[1] / axis_len,
-        axis[2] / axis_len,
-    );
+    let axis_norm = Vector3::new(axis[0] / axis_len, axis[1] / axis_len, axis[2] / axis_len);
 
     let count = payload
         .get("count")
@@ -2405,8 +2380,8 @@ async fn pattern_circular_endpoint(
 
         let new_solid_id = {
             let mut model = model_handle.write().await;
-            let cloned = deep_clone_solid(&mut model, solid_id, None)
-                .map_err(ApiError::kernel_error)?;
+            let cloned =
+                deep_clone_solid(&mut model, solid_id, None).map_err(ApiError::kernel_error)?;
             transform_solid(&mut model, cloned, rot, TransformOptions::default())
                 .map_err(ApiError::kernel_error)?;
             cloned
@@ -3265,10 +3240,7 @@ async fn post_section_preview(
         let caps = match section_solid_by_plane(&model, solid_id, origin, normal, tolerance) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
-                    "section_preview: solid {solid_id} ({uuid}) failed: {:?}",
-                    e
-                );
+                tracing::warn!("section_preview: solid {solid_id} ({uuid}) failed: {:?}", e);
                 continue;
             }
         };
@@ -5121,8 +5093,8 @@ mod tests {
             "edges": [1],
             "partial_corner_vertices": serde_json::Value::Null,
         });
-        let parsed = parse_partial_corner_vertices(&payload)
-            .expect("null field must default to empty vec");
+        let parsed =
+            parse_partial_corner_vertices(&payload).expect("null field must default to empty vec");
         assert!(parsed.is_empty());
     }
 
@@ -5131,8 +5103,7 @@ mod tests {
         let payload = serde_json::json!({
             "partial_corner_vertices": [0_u64, 1, 42, u32::MAX as u64],
         });
-        let parsed = parse_partial_corner_vertices(&payload)
-            .expect("valid u32 array must parse");
+        let parsed = parse_partial_corner_vertices(&payload).expect("valid u32 array must parse");
         assert_eq!(parsed, vec![0_u32, 1, 42, u32::MAX]);
     }
 
@@ -5146,29 +5117,23 @@ mod tests {
 
     #[test]
     fn parse_partial_corner_vertices_rejects_non_integer_entry() {
-        let payload =
-            serde_json::json!({ "partial_corner_vertices": [1, "two", 3] });
-        let err = parse_partial_corner_vertices(&payload)
-            .expect_err("string entry must reject");
+        let payload = serde_json::json!({ "partial_corner_vertices": [1, "two", 3] });
+        let err = parse_partial_corner_vertices(&payload).expect_err("string entry must reject");
         assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
     }
 
     #[test]
     fn parse_partial_corner_vertices_rejects_negative_entry() {
-        let payload =
-            serde_json::json!({ "partial_corner_vertices": [1, -2, 3] });
-        let err = parse_partial_corner_vertices(&payload)
-            .expect_err("negative entry must reject");
+        let payload = serde_json::json!({ "partial_corner_vertices": [1, -2, 3] });
+        let err = parse_partial_corner_vertices(&payload).expect_err("negative entry must reject");
         assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
     }
 
     #[test]
     fn parse_partial_corner_vertices_rejects_overflow_entry() {
         let overflow = (u32::MAX as u64) + 1;
-        let payload =
-            serde_json::json!({ "partial_corner_vertices": [overflow] });
-        let err = parse_partial_corner_vertices(&payload)
-            .expect_err("u32 overflow must reject");
+        let payload = serde_json::json!({ "partial_corner_vertices": [overflow] });
+        let err = parse_partial_corner_vertices(&payload).expect_err("u32 overflow must reject");
         assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
     }
 
@@ -5176,10 +5141,8 @@ mod tests {
     // kernel's per-call corner-gate work.
     #[test]
     fn parse_partial_corner_vertices_rejects_oversize_array() {
-        let oversized: Vec<u64> =
-            (0..=(MAX_PARTIAL_CORNER_VERTICES as u64)).collect();
-        let payload =
-            serde_json::json!({ "partial_corner_vertices": oversized });
+        let oversized: Vec<u64> = (0..=(MAX_PARTIAL_CORNER_VERTICES as u64)).collect();
+        let payload = serde_json::json!({ "partial_corner_vertices": oversized });
         let err = parse_partial_corner_vertices(&payload)
             .expect_err("array longer than MAX_PARTIAL_CORNER_VERTICES must reject");
         assert_eq!(err.code, error_catalog::ErrorCode::InvalidParameter);
@@ -5195,8 +5158,7 @@ mod tests {
         // Boundary: exactly MAX_PARTIAL_CORNER_VERTICES entries must
         // parse (the gate is `len() > MAX`, not `len() >= MAX`).
         let at_cap: Vec<u64> = (0..(MAX_PARTIAL_CORNER_VERTICES as u64)).collect();
-        let payload =
-            serde_json::json!({ "partial_corner_vertices": at_cap });
+        let payload = serde_json::json!({ "partial_corner_vertices": at_cap });
         let parsed = parse_partial_corner_vertices(&payload)
             .expect("array at exactly MAX_PARTIAL_CORNER_VERTICES must parse");
         assert_eq!(parsed.len(), MAX_PARTIAL_CORNER_VERTICES);
@@ -5223,8 +5185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to INFO when unset — verbose enough to capture every mutating
     // request without drowning in DEBUG noise.
     use tracing_subscriber::{fmt::time::ChronoUtc, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_timer(ChronoUtc::rfc_3339())
         .with_target(true)
@@ -5431,19 +5392,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // branch via the same sync→async bridge, no duplicate
         // recorder needed. See assembly_mgr::AssemblyManager docs.
         assemblies: Arc::new(assembly_mgr::AssemblyManager::with_recorder(
-            timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+            timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
         // Drawings share the same timeline recorder so view-add /
         // view-remove events land on the active branch alongside
         // every other kernel mutation. See drawing_mgr.rs.
         drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(
-            timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+            timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
         // Per-tab Part manager. Shares the same `TimelineRecorder` so
         // kernel mutations in any open part land on the active
         // branch — see the note above on assemblies.
         parts: Arc::new(part_mgr::PartManager::with_recorder(
-            timeline_recorder.clone() as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
+            timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
     };
 
@@ -5660,14 +5624,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // clients that materialise their own shapes. WS clients also
         // receive `SketchRegionsUpdated` frames on every mutation,
         // so polling these endpoints is not required.
-        .route(
-            "/api/sketch/{id}/regions",
-            get(sketch::get_sketch_regions),
-        )
-        .route(
-            "/api/sketch/regions/preview",
-            post(sketch::preview_regions),
-        )
+        .route("/api/sketch/{id}/regions", get(sketch::get_sketch_regions))
+        .route("/api/sketch/regions/preview", post(sketch::preview_regions))
         // Multi-shape control — a sketch session may carry multiple
         // shapes; outer/hole classification is decided geometrically
         // at extrude time, so there is no per-shape role tag. The
@@ -5764,8 +5722,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/assemblies/{id}/mates", post(assembly_mgr::add_mate))
         .route(
             "/api/assemblies/{id}/mates/{mate}",
-            delete(assembly_mgr::remove_mate)
-                .patch(assembly_mgr::patch_mate),
+            delete(assembly_mgr::remove_mate).patch(assembly_mgr::patch_mate),
         )
         .route("/api/assemblies/{id}/solve", post(assembly_mgr::solve))
         .route("/api/assemblies/{id}/explode", post(assembly_mgr::explode))
@@ -5785,8 +5742,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/drawings/{id}",
-            get(drawing_mgr::get_drawing)
-                .delete(drawing_mgr::delete_drawing),
+            get(drawing_mgr::get_drawing).delete(drawing_mgr::delete_drawing),
         )
         .route(
             "/api/drawings/{id}/rename",
@@ -5796,10 +5752,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/drawings/{id}/title-block",
             axum::routing::patch(drawing_mgr::update_title_block),
         )
-        .route(
-            "/api/drawings/{id}/views",
-            post(drawing_mgr::add_view),
-        )
+        .route("/api/drawings/{id}/views", post(drawing_mgr::add_view))
         .route(
             "/api/drawings/{id}/views/{view_id}",
             delete(drawing_mgr::remove_view),
