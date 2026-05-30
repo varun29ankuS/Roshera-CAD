@@ -53,10 +53,13 @@ fn loop_vertex_centroid(
     loop_id: crate::primitives::r#loop::LoopId,
 ) -> Result<Point3, crate::primitives::datum::DatumError> {
     use crate::primitives::datum::DatumError;
-    let lp = model.loops.get(loop_id).ok_or(DatumError::UnknownReference {
-        kind: "loop",
-        id: loop_id as u64,
-    })?;
+    let lp = model
+        .loops
+        .get(loop_id)
+        .ok_or(DatumError::UnknownReference {
+            kind: "loop",
+            id: loop_id as u64,
+        })?;
     if lp.edges.is_empty() {
         return Err(DatumError::DegenerateSource("loop has no edges"));
     }
@@ -68,10 +71,13 @@ fn loop_vertex_centroid(
     let mut sz = 0.0_f64;
     let mut count: usize = 0;
     for &edge_id in &lp.edges {
-        let edge = model.edges.get(edge_id).ok_or(DatumError::UnknownReference {
-            kind: "edge",
-            id: edge_id as u64,
-        })?;
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or(DatumError::UnknownReference {
+                kind: "edge",
+                id: edge_id as u64,
+            })?;
         let v = model
             .vertices
             .get(edge.start_vertex)
@@ -85,7 +91,9 @@ fn loop_vertex_centroid(
         count += 1;
     }
     if count == 0 {
-        return Err(DatumError::DegenerateSource("loop has no resolvable vertices"));
+        return Err(DatumError::DegenerateSource(
+            "loop has no resolvable vertices",
+        ));
     }
     let inv = 1.0 / count as f64;
     Ok(Point3::new(sx * inv, sy * inv, sz * inv))
@@ -738,11 +746,7 @@ impl BRepModel {
         match self.evaluate_datum_source(&d.source) {
             Ok(fresh) => {
                 if let Err(e) = self.datums.refresh_derived_transform(id, fresh) {
-                    tracing::warn!(
-                        "datum {} refresh_derived_transform rejected: {}",
-                        id,
-                        e
-                    );
+                    tracing::warn!("datum {} refresh_derived_transform rejected: {}", id, e);
                 }
             }
             Err(e) => {
@@ -910,13 +914,10 @@ impl BRepModel {
         match *source {
             DatumSource::Manual { transform } => Ok(DatumSource::unpack_matrix(transform)),
             DatumSource::OffsetPlane { base, distance } => {
-                let base_d = self
-                    .datums
-                    .get(base)
-                    .ok_or(DatumError::UnknownReference {
-                        kind: "datum",
-                        id: base as u64,
-                    })?;
+                let base_d = self.datums.get(base).ok_or(DatumError::UnknownReference {
+                    kind: "datum",
+                    id: base as u64,
+                })?;
                 let normal = frame_z_axis(&base_d.transform);
                 // Translate base origin along its +Z by `distance`.
                 let new_origin = Point3::new(
@@ -927,27 +928,23 @@ impl BRepModel {
                 frame_from_origin_and_z(new_origin, normal)
             }
             DatumSource::AnglePlane { base, axis, angle } => {
-                let base_d = self
-                    .datums
-                    .get(base)
-                    .ok_or(DatumError::UnknownReference {
-                        kind: "datum",
-                        id: base as u64,
-                    })?;
-                let axis_d = self
-                    .datums
-                    .get(axis)
-                    .ok_or(DatumError::UnknownReference {
-                        kind: "datum",
-                        id: axis as u64,
-                    })?;
+                let base_d = self.datums.get(base).ok_or(DatumError::UnknownReference {
+                    kind: "datum",
+                    id: base as u64,
+                })?;
+                let axis_d = self.datums.get(axis).ok_or(DatumError::UnknownReference {
+                    kind: "datum",
+                    id: axis as u64,
+                })?;
                 let axis_dir = frame_z_axis(&axis_d.transform);
                 let base_normal = frame_z_axis(&base_d.transform);
                 let rotation = Matrix4::from_axis_angle(&axis_dir, angle).map_err(|e| {
                     DatumError::EvaluationFailed(format!("angle-plane axis-angle: {e}"))
                 })?;
-                let rotated_normal =
-                    rotation.transform_vector(&base_normal).normalize().map_err(|e| {
+                let rotated_normal = rotation
+                    .transform_vector(&base_normal)
+                    .normalize()
+                    .map_err(|e| {
                         DatumError::EvaluationFailed(format!("angle-plane normal: {e}"))
                     })?;
                 frame_from_origin_and_z(base_d.origin, rotated_normal)
@@ -1077,7 +1074,9 @@ impl BRepModel {
                         id: vertex as u64,
                     })?;
                 let pos = Point3::new(v.position[0], v.position[1], v.position[2]);
-                Ok(Matrix4::from_translation(&Vector3::new(pos.x, pos.y, pos.z)))
+                Ok(Matrix4::from_translation(&Vector3::new(
+                    pos.x, pos.y, pos.z,
+                )))
             }
             DatumSource::CurveMidpoint { edge } => {
                 let edge_data = self.edges.get(edge).ok_or(DatumError::UnknownReference {
@@ -1087,7 +1086,9 @@ impl BRepModel {
                 let mid = edge_data
                     .evaluate(0.5, &self.curves)
                     .map_err(|e| DatumError::EvaluationFailed(format!("edge midpoint: {e}")))?;
-                Ok(Matrix4::from_translation(&Vector3::new(mid.x, mid.y, mid.z)))
+                Ok(Matrix4::from_translation(&Vector3::new(
+                    mid.x, mid.y, mid.z,
+                )))
             }
             DatumSource::FaceCentroid { face } => {
                 let face_data = self.faces.get(face).ok_or(DatumError::UnknownReference {
@@ -1422,7 +1423,7 @@ impl BRepModel {
         // and absolute surface area.
         let mut six_volume = 0.0_f64;
         let mut first_moment_sum = Vector3::ZERO; // Σ V_t · (v0 + v1 + v2)
-        // Second moments accumulator: integrals ∫x², ∫y², ∫z², ∫xy, ∫xz, ∫yz over the solid.
+                                                  // Second moments accumulator: integrals ∫x², ∫y², ∫z², ∫xy, ∫xz, ∫yz over the solid.
         let mut m_xx = 0.0_f64;
         let mut m_yy = 0.0_f64;
         let mut m_zz = 0.0_f64;
@@ -1987,7 +1988,9 @@ impl BRepModel {
         root_id: u64,
         report: &CascadeReport,
     ) {
-        use crate::operations::recorder::{entity_ref, RecordedOperation, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX};
+        use crate::operations::recorder::{
+            entity_ref, RecordedOperation, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX,
+        };
         let outputs: Vec<String> = report
             .removed_vertices
             .iter()
@@ -3424,8 +3427,19 @@ impl<'a> TopologyBuilder<'a> {
             .map_err(|e| topology_err(format!("bottom plane: {e}")))?;
         let top_plane = Plane::from_point_normal(top_center, axis)
             .map_err(|e| topology_err(format!("top plane: {e}")))?;
-        let lateral_cyl = Cylinder::new_finite(base_center, axis, radius, height)
+        let mut lateral_cyl = Cylinder::new_finite(base_center, axis, radius, height)
             .map_err(|e| topology_err(format!("lateral cylinder: {e}")))?;
+        // INVARIANT: the cylinder surface's parametric origin (`ref_dir`,
+        // i.e. u=0) must coincide with the topological seam vertex. The seam
+        // sits at `bottom_circle.x_axis()` (see `ref_dir` above), but
+        // `Cylinder::new_finite` defaults `ref_dir` to `axis.perpendicular()`,
+        // which is π/2 away for a canonical-axis circle. Consumers that read
+        // `cylinder.ref_dir` to locate the seam — notably
+        // `operations::fillet::cylinder_rim_fillet`, which places the blend's
+        // new seam vertices off this direction — otherwise compute positions
+        // π/2 out of phase with the real seam vertex and tear the shell.
+        // Realign the surface frame to the seam.
+        lateral_cyl.ref_dir = ref_dir;
         let bottom_surface_id = self.model.surfaces.add(Box::new(bottom_plane));
         let top_surface_id = self.model.surfaces.add(Box::new(top_plane));
         let lateral_surface_id = self.model.surfaces.add(Box::new(lateral_cyl));
@@ -3624,7 +3638,10 @@ impl<'a> TopologyBuilder<'a> {
                 .ok_or_else(|| topology_err("lateral cone surface missing".into()))?;
             let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
             let (u_mid, v_mid) = (0.5 * (u_min + u_max), 0.5 * (v_min + v_max));
-            match (surface.point_at(u_mid, v_mid), surface.normal_at(u_mid, v_mid)) {
+            match (
+                surface.point_at(u_mid, v_mid),
+                surface.normal_at(u_mid, v_mid),
+            ) {
                 (Ok(mid), Ok(n)) => {
                     let from_apex = mid - apex;
                     let radial = from_apex - cone_axis * from_apex.dot(&cone_axis);
@@ -3657,8 +3674,12 @@ impl<'a> TopologyBuilder<'a> {
         let lateral_loop_id = self.model.loops.add(lateral_loop);
 
         // ---- faces. ----
-        let mut bottom_face =
-            Face::new(0, bottom_surface_id, bottom_loop_id, FaceOrientation::Forward);
+        let mut bottom_face = Face::new(
+            0,
+            bottom_surface_id,
+            bottom_loop_id,
+            FaceOrientation::Forward,
+        );
         bottom_face.outer_loop = bottom_loop_id;
         let bottom_face_id = self.model.faces.add(bottom_face);
 
@@ -3722,7 +3743,13 @@ impl<'a> TopologyBuilder<'a> {
             if slope.abs() < 1e-10 {
                 return self.create_cylinder_topology(base_center, axis, base_radius, height);
             }
-            return self.create_frustum_topology(base_center, axis, base_radius, top_radius, height);
+            return self.create_frustum_topology(
+                base_center,
+                axis,
+                base_radius,
+                top_radius,
+                height,
+            );
         };
 
         // Create cone parameters
@@ -4898,9 +4925,7 @@ mod anchor_tests {
 
     // ───────────────────── 4b: derived datum evaluation ────────────────────────
 
-    use crate::primitives::datum::{
-        AxisDirection, DatumError, DatumSource, INVALID_DATUM_ID,
-    };
+    use crate::primitives::datum::{AxisDirection, DatumError, DatumSource, INVALID_DATUM_ID};
     use crate::primitives::vertex::VertexId;
 
     fn box_with_seeded_datums() -> (BRepModel, SolidId) {
@@ -5022,14 +5047,8 @@ mod anchor_tests {
     fn evaluate_three_points_collinear_is_degenerate() {
         let (model, _sid) = box_with_seeded_datums();
         let p0 = vertex_at(&model, [-1.0, -1.0, -1.0]);
-        let source = DatumSource::ThreePoints {
-            p0,
-            p1: p0,
-            p2: p0,
-        };
-        let err = model
-            .evaluate_datum_source(&source)
-            .expect_err("collinear");
+        let source = DatumSource::ThreePoints { p0, p1: p0, p2: p0 };
+        let err = model.evaluate_datum_source(&source).expect_err("collinear");
         assert!(matches!(err, DatumError::DegenerateSource(_)));
     }
 
@@ -5056,10 +5075,7 @@ mod anchor_tests {
             .datums
             .create_plane("NegZ".to_string(), flip)
             .expect("flip plane created");
-        let source = DatumSource::MidPlane {
-            a: 1,
-            b: neg_z_id,
-        };
+        let source = DatumSource::MidPlane { a: 1, b: neg_z_id };
         let err = model
             .evaluate_datum_source(&source)
             .expect_err("antiparallel");
@@ -5123,10 +5139,7 @@ mod anchor_tests {
     fn evaluate_curve_midpoint_lies_on_box_edge() {
         let (model, _sid) = box_with_seeded_datums();
         let edge = model.edges.get(0).expect("at least one edge");
-        let start = model
-            .vertices
-            .get(edge.start_vertex)
-            .expect("start vertex");
+        let start = model.vertices.get(edge.start_vertex).expect("start vertex");
         let end = model.vertices.get(edge.end_vertex).expect("end vertex");
         let expected = [
             0.5 * (start.position[0] + end.position[0]),
@@ -5241,10 +5254,7 @@ mod anchor_tests {
         let (model, _sid) = box_with_seeded_datums();
         let p = vertex_at(&model, [1.0, 1.0, 1.0]);
         let id = model
-            .create_derived_datum(
-                "Corner".to_string(),
-                DatumSource::VertexPoint { vertex: p },
-            )
+            .create_derived_datum("Corner".to_string(), DatumSource::VertexPoint { vertex: p })
             .expect("create_derived succeeds");
         let datum = model.datums.get(id).expect("datum present");
         assert!(matches!(datum.kind, DatumKind::Origin));
@@ -5442,10 +5452,7 @@ mod anchor_tests {
         assert!((model.datums.get(c).expect("C").transform.get(2, 3) - 3.0).abs() < 1e-9);
         // Move A by +Z=10. Expected: B at z=11, C at z=13.
         model
-            .set_datum_transform(
-                a,
-                Matrix4::from_translation(&Vector3::new(0.0, 0.0, 10.0)),
-            )
+            .set_datum_transform(a, Matrix4::from_translation(&Vector3::new(0.0, 0.0, 10.0)))
             .expect("move A");
         let b_after = model.datums.get(b).expect("B").transform;
         let c_after = model.datums.get(c).expect("C").transform;
@@ -5478,8 +5485,8 @@ mod anchor_tests {
         // visited-set guard inside propagate_datum_change keeps the
         // walk finite.
         model.datum_graph.register_solid_anchor(0, b); // unrelated edge to keep graph non-empty
-        // Use the public push helper indirectly via a fake source —
-        // we just need a (b → a) edge in datum_to_datums:
+                                                       // Use the public push helper indirectly via a fake source —
+                                                       // we just need a (b → a) edge in datum_to_datums:
         let fake_source = DatumSource::OffsetPlane {
             base: b,
             distance: 0.0,
@@ -5490,7 +5497,9 @@ mod anchor_tests {
         // a thread join in a real harness; here the test just
         // returning is the success condition (cargo test default
         // timeout is on the order of seconds).
-        model.set_datum_transform(a, Matrix4::identity()).expect("move A");
+        model
+            .set_datum_transform(a, Matrix4::identity())
+            .expect("move A");
     }
 
     #[test]
