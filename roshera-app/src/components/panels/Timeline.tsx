@@ -3,7 +3,6 @@ import { useWSStore } from '@/stores/ws-store'
 import { cn } from '@/lib/utils'
 import {
   type EventSummary,
-  type AuthorKind,
   normalizeKind,
   symbolForOperation,
   shortLabel,
@@ -15,21 +14,10 @@ import {
   authorTextClass,
 } from '@/lib/timeline-events'
 
-// Re-export so any external consumer that previously pulled these from
-// `panels/Timeline` keeps compiling. Both panels now share the same
-// source-of-truth in `lib/timeline-events.ts`.
-export type { EventSummary, AuthorKind }
-export {
-  normalizeKind,
-  symbolForOperation,
-  shortLabel,
-  formatTimestamp,
-  relativeTime,
-  formatAuthor,
-  authorKind,
-  authorGlyph,
-  authorTextClass,
-}
+// NOTE: these helpers + types are NOT re-exported from here. Consumers must
+// import them directly from `@/lib/timeline-events` (the source of truth).
+// Re-exporting non-component values from a component module breaks Vite
+// fast-refresh (react-refresh/only-export-components).
 
 // ─── Preview mode (opt-in via ?preview URL param) ───────────────────
 

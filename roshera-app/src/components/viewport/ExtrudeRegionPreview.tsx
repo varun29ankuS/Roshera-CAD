@@ -27,7 +27,7 @@ import { Line } from '@react-three/drei'
 import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
 import { buildProfile2D } from '@/lib/sketch-extrude'
-import { uvToWorld } from './SketchOverlay'
+import { uvToWorld } from './sketch-plane-uv'
 
 const OUTER_COLOR = '#3b82f6' // tailwind blue-500
 const HOLE_COLOR = '#ef4444' // tailwind red-500

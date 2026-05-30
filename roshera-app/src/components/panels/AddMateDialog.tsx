@@ -14,7 +14,7 @@
  * responsible for refreshing the snapshot.
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import {
   addMate,
   makeMateType,
@@ -297,12 +297,11 @@ function ReferenceInput({
   slots: string[]
   onChange: (s: string) => void
 }) {
-  // Unique datalist id per render to avoid cross-row collision when
-  // both A and B inputs are on screen.
-  const listId = useMemo(
-    () => `ref-slots-${Math.random().toString(36).slice(2, 9)}`,
-    [],
-  )
+  // Unique datalist id to avoid cross-row collision when both A and B
+  // inputs are on screen. `useId` is the pure, SSR-safe replacement for
+  // the previous `Math.random()` (which made render impure —
+  // react-hooks/purity).
+  const listId = `ref-slots-${useId()}`
   return (
     <>
       <input

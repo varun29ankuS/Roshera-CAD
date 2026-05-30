@@ -28,6 +28,10 @@ export function ExtrudeHoverTooltip() {
   // would render.
   useEffect(() => {
     if (!hoveredId) {
+      // Clearing the cached pointer when the hover ends is the intended
+      // use of an effect; the strict react-hooks rule flags the
+      // synchronous setState but there is no render-time equivalent.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPointer(null)
       return
     }
