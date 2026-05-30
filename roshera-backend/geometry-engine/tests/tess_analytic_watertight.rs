@@ -44,18 +44,17 @@ fn cylinder_solid(model: &mut BRepModel, radius: f64, height: f64) -> u32 {
     }
 }
 
-// KNOWN GAP (CDT-γ.3, target of the analytic fast-paths migration).
-// The grid cylinder tessellator samples its lateral boundary
-// independently of `EdgeSampleCache`, so the lateral and the planar caps
-// disagree on the shared circular seam → 284 T-junction (count-1) edges
-// that the vertex-weld cannot repair. Routing the lateral through the
-// curved-CDT path (cache-based boundary) halves it to ~142, but a closed
-// cylinder is periodic in u (seam at 0/2π) and the CDT path — built for
-// non-periodic NURBS patches — does not stitch that seam. The fix is
-// periodic-seam stitching in `curved_cdt`; until then this is `#[ignore]`d
-// as the tracked regression target rather than reddening the suite.
+// CDT-γ.3: the cylinder lateral face is tessellated through the curved-CDT
+// path (cache-based boundary), so the lateral and the planar caps agree on
+// the shared circular seam bit-exactly. The previous grid tessellator
+// sampled the lateral boundary independently of `EdgeSampleCache`, leaving
+// 284 T-junction (count-1) edges the vertex-weld could not repair. The
+// remaining periodic-u degeneracy (the circle's t=0 sweeping across the
+// seam, which made the CDT reject a non-simple polygon) is resolved at the
+// source: `create_cylinder_topology` now anchors the seam to the circles'
+// `t=0` direction, so the lateral projects to a clean `[u₀, u₀+2π]`
+// rectangle.
 #[test]
-#[ignore = "CDT-γ.3: analytic cylinder non-watertight pending periodic-seam stitching in curved_cdt"]
 fn cylinder_solid_tessellation_is_watertight() {
     let mut model = BRepModel::new();
     let solid_id = cylinder_solid(&mut model, 1.0, 2.0);
@@ -82,8 +81,17 @@ fn cylinder_solid_tessellation_is_watertight() {
         non_manifold.iter().take(5).collect::<Vec<_>>()
     );
 
-    // Closed orientable genus-0 surface: V - E + F == 2.
-    let v = mesh.vertices.len() as i64;
+    // Closed orientable genus-0 surface: V - E + F == 2. Count only the
+    // vertices actually referenced by triangles — the shared-edge weld
+    // remaps indices but leaves the merged-away vertex slots in
+    // `mesh.vertices`, so the raw length over-counts.
+    let mut referenced = std::collections::HashSet::new();
+    for tri in &mesh.triangles {
+        referenced.insert(tri[0]);
+        referenced.insert(tri[1]);
+        referenced.insert(tri[2]);
+    }
+    let v = referenced.len() as i64;
     let e = hist.len() as i64;
     let f = mesh.triangles.len() as i64;
     assert_eq!(

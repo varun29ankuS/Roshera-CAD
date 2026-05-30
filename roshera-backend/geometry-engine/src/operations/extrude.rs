@@ -1159,8 +1159,9 @@ fn create_ruled_surface(
     // on closed-circle boundaries because the 2D loop projection wraps the
     // parameter space — the side face emits zero triangles and the user
     // sees the cone/disk caps but no cylindrical wall between them.
-    // Cylinder routes to `tessellate_cylindrical_face`, which knows the
-    // seam convention and tessellates correctly.
+    // Cylinder routes to the cache-based curved-CDT tessellation path,
+    // which shares the seam-circle samples with the caps and tessellates
+    // the lateral watertight (CDT-γ.3).
     //
     // Detection runs on the underlying full curves: a closed-disk profile
     // registers one Circle and one edge with `param_range = [0, 1]`, so

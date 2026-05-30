@@ -3426,6 +3426,15 @@ impl Circle {
     pub fn radius(&self) -> f64 {
         self.arc.radius
     }
+
+    /// Get the parametric origin direction (the unit `x_axis` at which
+    /// `t = 0` sits). For a `+Z` normal this is `+X` by the canonical CAD
+    /// convention (see `Arc::new`), which is NOT `normal.perpendicular()`
+    /// in general — callers that must align a seam with the circle's
+    /// `t = 0` (e.g. cylinder topology) need this exact direction.
+    pub fn x_axis(&self) -> Vector3 {
+        self.arc.x_axis
+    }
 }
 
 impl Curve for Circle {

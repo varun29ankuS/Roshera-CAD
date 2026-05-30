@@ -68,6 +68,13 @@ pub(crate) enum CurvedCdtError {
     /// after dedup, contour self-intersections that we didn't catch
     /// in `PolygonInvalid`).
     CdtFailed(cdt::Error),
+    /// The `cdt` crate panicked internally on a degenerate input (an
+    /// `assert!` in its constraint-insertion walk, e.g. a contour
+    /// vertex lying exactly on another fixed edge). Caught via
+    /// `catch_unwind` so a third-party assert never aborts the whole
+    /// tessellation pass — this module's "never panics" contract holds
+    /// regardless of the `cdt` crate's internal robustness.
+    CdtPanicked,
 }
 
 impl std::fmt::Display for CurvedCdtError {
@@ -79,6 +86,9 @@ impl std::fmt::Display for CurvedCdtError {
             }
             CurvedCdtError::PolygonInvalid => write!(f, "projected polygon is invalid"),
             CurvedCdtError::CdtFailed(e) => write!(f, "cdt crate rejected input: {:?}", e),
+            CurvedCdtError::CdtPanicked => {
+                write!(f, "cdt crate panicked internally on degenerate input")
+            }
         }
     }
 }
@@ -535,13 +545,21 @@ fn run_cdt(
     // CDT treats them as floating constraint anchors.
     pts2d.extend_from_slice(steiner);
 
-    match cdt::triangulate_contours(&pts2d, &contours) {
-        Ok(tris) => {
+    // The `cdt` crate `assert!`s on some degenerate inputs (a contour
+    // vertex lying on another fixed edge) rather than returning `Err`.
+    // Catch the unwind so a third-party panic degrades to a recoverable
+    // per-face error instead of aborting the entire tessellation pass.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cdt::triangulate_contours(&pts2d, &contours)
+    }));
+    match outcome {
+        Ok(Ok(tris)) => {
             let triangles: Vec<[usize; 3]> =
                 tris.into_iter().map(|(a, b, c)| [a, b, c]).collect();
             Ok((pts2d, triangles))
         }
-        Err(e) => Err(CurvedCdtError::CdtFailed(e)),
+        Ok(Err(e)) => Err(CurvedCdtError::CdtFailed(e)),
+        Err(_) => Err(CurvedCdtError::CdtPanicked),
     }
 }
 
@@ -667,7 +685,19 @@ fn collect_refinement_centroids(
         };
         let max_dev = ang(normal_a).max(ang(normal_b)).max(ang(normal_c));
 
-        if chord_error > params.chord_tolerance || max_dev > params.max_angle_deviation {
+        // A non-positive tolerance DISABLES that criterion (the
+        // project-wide `TessellationParams` convention; see the `> 0.0`
+        // guards in `edge_cache::sample_count_from_length_angle`). Comparing
+        // directly against `0.0` would instead flag *every* curved triangle
+        // — on an analytic face like a cylinder the centroid normal always
+        // deviates from the corner normals, so refinement would never
+        // converge and would subdivide maximally through all
+        // `RUPPERT_MAX_PASSES`, exploding the triangle count.
+        let chord_fail =
+            params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
+        let angle_fail =
+            params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
+        if chord_fail || angle_fail {
             out.push((u_c, v_c));
         }
     }
@@ -681,6 +711,20 @@ fn collect_refinement_centroids(
 /// against the resulting potential for unbounded refinement; in
 /// practice well-behaved curved faces converge in 1–3 passes.
 const RUPPERT_MAX_PASSES: usize = 12;
+
+/// Cumulative interior-Steiner budget, as a multiple of the boundary
+/// vertex count. For a chord-tolerance surface mesh the interior vertex
+/// count scales with the boundary's, so a healthy refinement converges
+/// well under this. Exceeding it means refinement is NOT converging —
+/// the classic case is a boundary already sampled *at* `chord_tolerance`
+/// (so boundary-adjacent triangles sit at the threshold) on a high-aspect
+/// face: interior insertion cannot beat the immutable per-edge cache
+/// resolution, so the same borderline triangles are re-flagged every
+/// pass. We then freeze on the densest valid triangulation rather than
+/// pile on an ever-denser, near-degenerate point set (which also tips the
+/// `cdt` crate into its internal `assert!`). 16× is generous: real faces
+/// converge far below it.
+const STEINER_BUDGET_FACTOR: usize = 16;
 
 /// Skinny-triangle threshold: squared radius-edge ratio. Triangles
 /// with `circumradius² / shortest_edge² > 2.0` (equivalent to min
@@ -917,6 +961,8 @@ fn refine_to_convergence(
 ) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
     let outer_uv_len = outer.points_uv.len();
     let inner_uv_lens: Vec<usize> = inners.iter().map(|p| p.points_uv.len()).collect();
+    let boundary_points = outer_uv_len + inner_uv_lens.iter().sum::<usize>();
+    let steiner_budget = boundary_points.saturating_mul(STEINER_BUDGET_FACTOR);
 
     let mut steiner = initial_steiner;
     let mut pts2d = initial_pts2d;
@@ -948,6 +994,14 @@ fn refine_to_convergence(
         steiner.dedup_by(|a, b| {
             (a.0 - b.0).abs() < STEINER_DEDUP_TOL && (a.1 - b.1).abs() < STEINER_DEDUP_TOL
         });
+
+        // Non-convergence guard: refinement that blows past the budget is
+        // churning on borderline triangles it cannot improve. Freeze on
+        // the last successful triangulation rather than re-running CDT on
+        // an ever-denser, near-degenerate set. See `STEINER_BUDGET_FACTOR`.
+        if steiner.len() > steiner_budget {
+            return (pts2d, triangles);
+        }
 
         match run_cdt(&outer.points_uv, inner_polygons, &steiner) {
             Ok((next_pts, next_tris)) => {
@@ -1739,10 +1793,12 @@ mod tests {
             }
             Err(e) => match e {
                 CurvedCdtError::CdtFailed(_)
+                | CurvedCdtError::CdtPanicked
                 | CurvedCdtError::PolygonInvalid
                 | CurvedCdtError::DegenerateLoop => {
                     // Expected: CDT crate rejected the self-
-                    // intersecting input or our pre-check did.
+                    // intersecting input (or panicked on it, caught
+                    // via catch_unwind), or our pre-check did.
                 }
                 CurvedCdtError::ProjectionFailed => panic!(
                     "self-intersecting bowtie should not surface \

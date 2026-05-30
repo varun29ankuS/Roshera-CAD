@@ -117,7 +117,27 @@ pub fn tessellate_face(
 
     match surface.type_name() {
         "Plane" => tessellate_planar_face(face, model, params, cache, mesh),
-        "Cylinder" => tessellate_cylindrical_face(face, model, params, cache, mesh),
+        // CDT-γ.3: route the cylinder lateral face through the constraint-
+        // aware curved-CDT path (the same one NURBS uses). The grid
+        // tessellator sampled its boundary independently of the
+        // EdgeSampleCache, so the lateral and the planar caps disagreed on
+        // the shared circular seam — leaving T-junctions the vertex-weld
+        // cannot repair (a closed cylinder came out non-watertight). The CDT
+        // path consumes the cache for boundary 3D, so lateral and caps share
+        // the seam samples bit-exactly. (Requires the seam to coincide with
+        // the circles' t=0 — see create_cylinder_topology.) Empty-mesh-on-Err
+        // contract, as for NURBS / generic curved faces.
+        "Cylinder" => {
+            if let Err(e) =
+                super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
+            {
+                tracing::warn!(
+                    "curved_cdt failed for cylinder face {:?}: {:?}; emitting empty mesh",
+                    face.id,
+                    e
+                );
+            }
+        }
         "Sphere" => tessellate_spherical_face(face, model, params, cache, mesh),
         "Cone" => tessellate_conical_face(face, model, params, cache, mesh),
         "Torus" => tessellate_toroidal_face(face, model, params, cache, mesh),
@@ -672,93 +692,6 @@ fn polygon_signed_area_2d(vertices_2d: &[(f64, f64)], polygon: &[usize]) -> f64 
         area += x1 * y2 - x2 * y1;
     }
     area * 0.5
-}
-
-/// Tessellate a cylindrical face
-fn tessellate_cylindrical_face(
-    face: &Face,
-    model: &BRepModel,
-    params: &TessellationParams,
-    _cache: &EdgeSampleCache,
-    mesh: &mut TriangleMesh,
-) {
-    // Tessellation is void-return; if the face's surface has gone missing
-    // from the model (invariant violation), we skip silently rather than
-    // panicking the entire tessellation pass.
-    let Some(surface) = model.surfaces.get(face.surface_id) else {
-        return;
-    };
-
-    // Get parameter bounds from face loops
-    let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
-
-    // Extract actual cylinder radius from surface
-    let radius = surface
-        .as_any()
-        .downcast_ref::<crate::primitives::surface::Cylinder>()
-        .map(|c| c.radius)
-        .unwrap_or(1.0);
-    let u_span = u_max - u_min;
-    let v_span = v_max - v_min;
-
-    // Radial subdivision is driven by curvature: `arc_steps_for_quality`
-    // combines chord-height (sagitta), chord-length, and angle-deviation
-    // and picks the strictest. Chord-height is the size-invariant quality
-    // driver — segments grow as √radius instead of radius, so a 100 mm
-    // cylinder doesn't get 10× the triangles of a 10 mm one for the same
-    // visual quality. Axial subdivision uses chord-length only because a
-    // cylinder has zero curvature along its axis.
-    let u_steps = arc_steps_for_quality(u_span, radius, params);
-    let v_steps = linear_steps_for_quality(v_span, params);
-
-    // Generate vertices
-    let mut vertex_grid = Vec::new();
-    for v_idx in 0..=v_steps {
-        let v = v_min + (v_idx as f64) * (v_max - v_min) / (v_steps as f64);
-        let mut row = Vec::new();
-
-        for u_idx in 0..=u_steps {
-            let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
-
-            if let (Ok(point), Ok(normal)) = (
-                surface.point_at(u, v),
-                face.normal_at(u, v, &model.surfaces),
-            ) {
-                let index = mesh.add_vertex(MeshVertex {
-                    position: point,
-                    normal,
-                    uv: Some((u, v)),
-                });
-                row.push(index);
-            }
-        }
-        vertex_grid.push(row);
-    }
-
-    // Generate triangles. Winding follows `face.orientation` so the
-    // emitted geometric normal (CCW cross product) agrees with the
-    // stored vertex normal (which `Face::normal_at` already flips for
-    // backward faces); without this, downstream back-face culling
-    // would invert reversed faces.
-    let forward = face.orientation.is_forward();
-    for v_idx in 0..v_steps {
-        for u_idx in 0..u_steps {
-            if vertex_grid[v_idx].len() > u_idx + 1 && vertex_grid[v_idx + 1].len() > u_idx + 1 {
-                let v0 = vertex_grid[v_idx][u_idx];
-                let v1 = vertex_grid[v_idx][u_idx + 1];
-                let v2 = vertex_grid[v_idx + 1][u_idx];
-                let v3 = vertex_grid[v_idx + 1][u_idx + 1];
-
-                if forward {
-                    mesh.add_triangle(v0, v1, v2);
-                    mesh.add_triangle(v1, v3, v2);
-                } else {
-                    mesh.add_triangle(v0, v2, v1);
-                    mesh.add_triangle(v1, v2, v3);
-                }
-            }
-        }
-    }
 }
 
 /// Tessellate a spherical face with adaptive refinement
@@ -2796,8 +2729,8 @@ mod tests {
     /// End-to-end integration test: tightening `chord_tolerance` on a
     /// cylinder must produce strictly more triangles than a looser one
     /// (with all other quality knobs disabled). This verifies that the
-    /// chord-height path is actually wired into `tessellate_cylindrical_face`,
-    /// not just available as a helper.
+    /// chord-height path actually drives the cylinder's tessellation
+    /// (now the cache-based curved-CDT path), not just available as a helper.
     #[test]
     fn cylinder_tessellation_density_grows_with_chord_tolerance() {
         use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};

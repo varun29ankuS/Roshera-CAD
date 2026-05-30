@@ -3340,13 +3340,25 @@ impl<'a> TopologyBuilder<'a> {
             euler_characteristic: None,
         };
 
-        // Reference direction must match the one Cylinder::new uses so
-        // the seam vertex lands at u=0 in the lateral face's parametric
-        // frame. `axis.perpendicular()` returns a unit-length vector.
-        let ref_dir = axis.perpendicular();
         let top_center = base_center + axis * height;
 
-        // ---- vertices: one seam vertex per cap. ----
+        // ---- curves: two circles + one line. ----
+        let bottom_circle = Circle::new(base_center, axis, radius)
+            .map_err(|e| topology_err(format!("bottom circle: {e}")))?;
+        let top_circle = Circle::new(top_center, axis, radius)
+            .map_err(|e| topology_err(format!("top circle: {e}")))?;
+
+        // The seam MUST coincide with the circles' parametric origin
+        // (their `t = 0`), or the lateral face's u-parameter sweeps a full
+        // 2π that *straddles* the seam — and the curved-CDT path then
+        // projects a non-simple polygon and fails with
+        // `CdtFailed(PointOnFixedEdge)` (CDT-γ.3). `Circle`/`Arc` choose a
+        // canonical `x_axis` (e.g. `+X` for a `+Z` normal) that is NOT
+        // `axis.perpendicular()` in general, so anchor the seam to the
+        // circle's actual `x_axis` rather than to `axis.perpendicular()`.
+        let ref_dir = bottom_circle.x_axis();
+
+        // ---- vertices: one seam vertex per cap, on the circles' t=0. ----
         let v_bottom = self.model.vertices.add_or_find(
             base_center.x + ref_dir.x * radius,
             base_center.y + ref_dir.y * radius,
@@ -3360,11 +3372,6 @@ impl<'a> TopologyBuilder<'a> {
             self.tolerance.distance(),
         );
 
-        // ---- curves: two circles + one line. ----
-        let bottom_circle = Circle::new(base_center, axis, radius)
-            .map_err(|e| topology_err(format!("bottom circle: {e}")))?;
-        let top_circle = Circle::new(top_center, axis, radius)
-            .map_err(|e| topology_err(format!("top circle: {e}")))?;
         let seam_line = Line::new(
             base_center + ref_dir * radius,
             top_center + ref_dir * radius,
