@@ -176,7 +176,10 @@ pub async fn export_brep_to_ros(
     // Header -----------------------------------------------------------
     let mut header = ros_format::FileHeader::builder();
     if encrypt {
-        header = header.with_encryption(1, 2, 10_000, salt, file_iv);
+        // KDF id 2 = Argon2id; the third arg is Argon2's t_cost (passes),
+        // recorded so the importer reproduces the exact derivation.
+        header =
+            header.with_encryption(1, 2, ros_format::keys::ROSHERA_KDF_TIME_COST, salt, file_iv);
     }
     // PROV is always present in v3.1, so the AI-provenance flag is
     // unconditionally set. The tracking level is taken from options.
@@ -351,7 +354,10 @@ pub async fn import_ros(
         let password = password.ok_or_else(|| ExportError::ExportFailed {
             reason: "Password required for encrypted file".to_string(),
         })?;
-        let key_manager = SoftwareKeyManager::default();
+        // Reproduce the derivation recorded in the header. The t_cost is
+        // clamped against a hostile/corrupt header so import fails cleanly
+        // (key mismatch) rather than hanging on an absurd pass count.
+        let key_manager = SoftwareKeyManager::with_clamped_time_cost(header.kdf_iterations);
         let key_set = key_manager
             .generate_key_set(password, &header.kdf_salt)
             .map_err(|e| ExportError::ExportFailed {

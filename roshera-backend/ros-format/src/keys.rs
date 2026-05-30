@@ -303,15 +303,59 @@ pub trait KeyManager: Send + Sync {
     fn rotate_keys(&self, key_set: &mut KeySet) -> Result<()>;
 }
 
+/// Argon2id memory cost (KiB) — 64 MiB. Paired with [`ROSHERA_KDF_TIME_COST`]
+/// this is an OWASP-aligned configuration that derives in ~100 ms.
+pub const ROSHERA_KDF_MEMORY_KIB: u32 = 64 * 1024;
+
+/// Argon2id time cost (number of passes over memory).
+///
+/// This is Argon2's `t_cost`, **not** a PBKDF2 iteration count. With the
+/// 64 MiB memory cost above, each pass is expensive; OWASP recommends a
+/// `t_cost` of 1–4 for Argon2id, not the 10k–600k typical of PBKDF2.
+/// A value in the thousands here means tens of minutes per derivation —
+/// the parameters are not interchangeable across the two KDFs.
+pub const ROSHERA_KDF_TIME_COST: u32 = 3;
+
+/// Upper bound enforced when an Argon2 `t_cost` is read back from an
+/// untrusted file header. A corrupt or hostile header could otherwise
+/// request billions of passes and wedge the importer; clamping to this
+/// ceiling turns that into a clean decryption failure (the derived key
+/// simply won't match) instead of an unbounded hang.
+pub const ROSHERA_KDF_TIME_COST_MAX: u32 = 16;
+
+/// FourCCs of every standard .ros chunk type, kept in lockstep with
+/// [`crate::chunk::ChunkType`]. A per-chunk key is derived for each so
+/// that any standard chunk written to a file can be encrypted. A type
+/// missing from this list surfaces at export time as a
+/// `Missing encryption key` error — which is exactly how the v3.1
+/// `HIST`/`PROV` chunks failed when this list still named the
+/// pre-rename `AIPR` and omitted both mandatory chunks.
+pub const STANDARD_CHUNK_FOURCCS: [&[u8; 4]; 11] = [
+    b"META", b"HIST", b"PROV", b"GEOM", b"TOPO", b"FEAT", b"CONS", b"KEYS", b"BCHN", b"ACLS",
+    b"SIGN",
+];
+
 /// Default software-only key manager using Argon2 + HKDF
 pub struct SoftwareKeyManager {
     pub kdf_iterations: u32,
 }
 
+impl SoftwareKeyManager {
+    /// Construct a manager pinned to a specific Argon2 `t_cost`, clamped
+    /// to `[1, ROSHERA_KDF_TIME_COST_MAX]`. Used on the import path to
+    /// reproduce the derivation recorded in a file header without
+    /// trusting the header to be benign.
+    pub fn with_clamped_time_cost(time_cost: u32) -> Self {
+        SoftwareKeyManager {
+            kdf_iterations: time_cost.clamp(1, ROSHERA_KDF_TIME_COST_MAX),
+        }
+    }
+}
+
 impl Default for SoftwareKeyManager {
     fn default() -> Self {
         SoftwareKeyManager {
-            kdf_iterations: 10_000,
+            kdf_iterations: ROSHERA_KDF_TIME_COST,
         }
     }
 }
@@ -321,10 +365,10 @@ impl KeyManager for SoftwareKeyManager {
         use argon2::{Algorithm, Argon2, Params, Version};
 
         let params = Params::new(
-            64 * 1024, // 64 MB memory
-            iterations,
-            4,        // parallelism
-            Some(32), // output length
+            ROSHERA_KDF_MEMORY_KIB, // 64 MiB memory cost
+            iterations,             // Argon2 t_cost (passes), NOT a PBKDF2 count
+            4,                      // parallelism
+            Some(32),               // output length
         )
         .map_err(|e| KeyManagementError::KeyDerivationFailed {
             reason: format!("Invalid Argon2 params: {}", e),
@@ -404,8 +448,8 @@ impl KeyManager for SoftwareKeyManager {
         let mut key_set = KeySet::new(master, file_id);
         key_set.file_key = file_key;
 
-        // Derive chunk keys for standard chunks
-        for chunk_type in [b"GEOM", b"TOPO", b"FEAT", b"AIPR", b"META", b"KEYS"].iter() {
+        // Derive chunk keys for every standard chunk type.
+        for chunk_type in STANDARD_CHUNK_FOURCCS.iter() {
             let chunk_key = self.derive_chunk_key(&key_set.file_key, chunk_type)?;
             key_set.add_chunk_key(**chunk_type, chunk_key);
         }
@@ -429,7 +473,7 @@ impl KeyManager for SoftwareKeyManager {
         key_set.metadata.clear();
 
         // Derive new chunk keys
-        for chunk_type in [b"GEOM", b"TOPO", b"FEAT", b"AIPR", b"META", b"KEYS"].iter() {
+        for chunk_type in STANDARD_CHUNK_FOURCCS.iter() {
             let chunk_key = self.derive_chunk_key(&key_set.file_key, chunk_type)?;
             key_set.add_chunk_key(**chunk_type, chunk_key);
         }
@@ -583,8 +627,12 @@ mod tests {
 
         let key_set = manager.generate_key_set("test_password", &salt).unwrap();
 
-        assert_eq!(key_set.chunk_keys.len(), 6);
+        assert_eq!(key_set.chunk_keys.len(), STANDARD_CHUNK_FOURCCS.len());
         assert!(key_set.get_chunk_key(b"GEOM").is_some());
+        // v3.1 mandatory chunks must have derived keys (regression: these
+        // were absent, so encrypting HIST/PROV failed at export time).
+        assert!(key_set.get_chunk_key(b"HIST").is_some());
+        assert!(key_set.get_chunk_key(b"PROV").is_some());
         assert!(key_set.get_chunk_key(b"XXXX").is_none());
     }
 
@@ -601,7 +649,7 @@ mod tests {
 
         assert_ne!(key_set.file_id, old_file_id);
         assert_ne!(key_set.get_chunk_key(b"GEOM").unwrap().id, old_geom_key);
-        assert_eq!(key_set.chunk_keys.len(), 6);
+        assert_eq!(key_set.chunk_keys.len(), STANDARD_CHUNK_FOURCCS.len());
     }
 
     #[test]
