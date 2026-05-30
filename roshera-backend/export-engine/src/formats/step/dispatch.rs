@@ -183,6 +183,14 @@ impl EntityDispatch {
         if handler.phase() != phase {
             return false;
         }
+        // Idempotence: if this instance was already dispatched (e.g.
+        // on-demand via `ensure_resolved` when a peer followed a `#N`
+        // reference into it during an earlier entity's resolution),
+        // do NOT run the handler again — a second run mints duplicate
+        // kernel entities. See `ImportContext::resolved`.
+        if ctx.is_resolved(entity.instance) {
+            return false;
+        }
         let record = match &entity.kind {
             EntityKind::Simple(r) => r,
             EntityKind::Complex(records) => {
@@ -203,6 +211,10 @@ impl EntityDispatch {
                 }
             }
         };
+        // Mark before dispatch so a re-entrant `ensure_resolved` on the
+        // same instance (cycle back-edge) also short-circuits; the
+        // `is_resolving` stack guards true cycles, this guards repeats.
+        ctx.mark_resolved(entity.instance);
         match handler.handle(entity.instance, record, registry, self, ctx) {
             HandlerOutcome::Resolved => {
                 ctx.report.counts.add_resolved(name);

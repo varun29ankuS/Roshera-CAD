@@ -47,6 +47,10 @@ pub enum ResolveOutcome {
     /// `Skipped`. The caller should re-check its cache to discover
     /// whether the resolution populated it.
     Dispatched,
+    /// The instance's handler had already run this import (idempotence
+    /// guard); no dispatch occurred. The caller re-reads its caches
+    /// exactly as for [`Self::Dispatched`].
+    AlreadyResolved,
     /// The entity was already in the resolution stack — a cycle. A
     /// warning has been appended to the report; no recursion occurred.
     CycleDetected,
@@ -83,6 +87,15 @@ pub fn ensure_resolved(
     dispatch: &EntityDispatch,
     ctx: &mut ImportContext<'_>,
 ) -> ResolveOutcome {
+    // Idempotence guard: if this instance's handler already ran (either
+    // here on-demand or via the top-level `run_all` sweep), do not
+    // dispatch again — a repeat run mints duplicate kernel entities.
+    // Callers re-read the resolution caches (e.g. `caches.edges`) after
+    // this returns, so reporting `AlreadyResolved` is sufficient.
+    if ctx.is_resolved(instance) {
+        return ResolveOutcome::AlreadyResolved;
+    }
+
     // Cycle guard.
     if ctx.is_resolving(instance) {
         ctx.report.push_warning(Warning {
@@ -160,6 +173,12 @@ pub fn ensure_resolved(
     // future handlers use `?` internally on a result type that the
     // compiler turns into an early return).
     ctx.resolution_stack.push(instance);
+    // Mark resolved BEFORE handing off so the later `run_all` sweep
+    // skips this instance (it was dispatched here on-demand). Marking
+    // before dispatch is safe: the `is_resolving` stack still guards
+    // genuine cycles, and a re-entrant `ensure_resolved` on the same
+    // instance now short-circuits at the `is_resolved` guard above.
+    ctx.mark_resolved(instance);
     let outcome = handler.handle(instance, record, registry, dispatch, ctx);
     let popped = ctx.resolution_stack.pop();
     debug_assert_eq!(popped, Some(instance), "resolution stack imbalance");

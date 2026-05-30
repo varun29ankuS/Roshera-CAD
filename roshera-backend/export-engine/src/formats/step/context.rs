@@ -25,7 +25,7 @@ use geometry_engine::primitives::{
     curve::CurveId, edge::EdgeId, face::FaceId, r#loop::LoopId, shell::ShellId, solid::SolidId,
     surface::SurfaceId, topology_builder::BRepModel, vertex::VertexId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::formats::step::diagnostics::ImportReport;
 
@@ -201,6 +201,17 @@ pub struct ImportContext<'a> {
     /// an instance is already on the stack the cycle is reported
     /// as a structured warning instead of recursing to overflow.
     pub resolution_stack: Vec<u64>,
+    /// Instances whose handler has already run to a terminal outcome
+    /// (Resolved / Failed / Skipped) this import. Resolution is
+    /// idempotent: an entity may be reached both on-demand (a peer
+    /// follows a `#N` reference via [`ensure_resolved`]) and again by
+    /// the top-level `run_all` sweep. Without this guard the second
+    /// dispatch re-runs the handler and mints DUPLICATE kernel entities
+    /// — e.g. an EDGE_CURVE shared by two faces would create two kernel
+    /// edges, splitting a manifold edge into two single-use (dangling)
+    /// halves. The dup count depended on registry (HashMap) iteration
+    /// order, which is why the symptom was nondeterministic across runs.
+    pub resolved: HashSet<u64>,
     /// Diagnostics accumulator.
     pub report: &'a mut ImportReport,
 }
@@ -215,6 +226,7 @@ impl<'a> ImportContext<'a> {
             default_tolerance: 1e-6,
             caches: ResolutionCaches::default(),
             resolution_stack: Vec::with_capacity(16),
+            resolved: HashSet::new(),
             report,
         }
     }
@@ -223,5 +235,17 @@ impl<'a> ImportContext<'a> {
     /// the call stack — used by the lazy resolver to break cycles.
     pub fn is_resolving(&self, instance: u64) -> bool {
         self.resolution_stack.iter().any(|&i| i == instance)
+    }
+
+    /// `true` once `instance`'s handler has run to a terminal outcome
+    /// this import (see [`Self::resolved`]).
+    pub fn is_resolved(&self, instance: u64) -> bool {
+        self.resolved.contains(&instance)
+    }
+
+    /// Record that `instance`'s handler has run; returns `false` if it
+    /// was already recorded (caller should skip re-dispatch).
+    pub fn mark_resolved(&mut self, instance: u64) -> bool {
+        self.resolved.insert(instance)
     }
 }
