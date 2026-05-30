@@ -3,12 +3,16 @@
 //! Since BRepModel uses DashMap for concurrent access, we need a
 //! serializable representation for export/import
 
+use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::{
-    curve::Curve,
-    edge::EdgeOrientation,
-    face::FaceOrientation,
-    r#loop::LoopType,
-    shell::ShellType as GeoShellType,
+    curve::{
+        Arc as GeoArc, Circle as GeoCircle, Curve, Line as GeoLine, NurbsCurve as GeoNurbsCurve,
+    },
+    edge::{Edge, EdgeOrientation},
+    face::{Face, FaceOrientation},
+    r#loop::{Loop, LoopType},
+    shell::{Shell, ShellType as GeoShellType},
+    solid::Solid,
     surface::{
         Cone as GeoCone, Cylinder as GeoCylinder, GeneralNurbsSurface, Plane as GeoPlane,
         Sphere as GeoSphere, Surface, Torus as GeoTorus,
@@ -346,9 +350,285 @@ impl BRepSnapshot {
     }
 
     /// Convert from snapshot to BRepModel (import path)
+    /// Reconstruct a [`BRepModel`] from this snapshot — the inverse of
+    /// [`Self::from_model`].
+    ///
+    /// The snapshot keys every entity by a deterministic source UUID (see
+    /// [`id_to_uuid`]); the kernel stores mint their own fresh ids on
+    /// insertion, so we build a UUID→new-id map per entity type and walk
+    /// the topology in dependency order
+    /// (vertices → curves → surfaces → edges → loops → faces → shells →
+    /// solids), translating each reference through the maps. References
+    /// that fail to resolve (a malformed or partial snapshot) cause that
+    /// entity to be skipped rather than panicking — import is best-effort
+    /// and the [`Default`]-derived empty grids degrade gracefully.
     pub fn to_model(&self) -> BRepModel {
-        // Import is not yet implemented — requires adding entities with specific IDs
-        BRepModel::new()
+        use geometry_engine::primitives::r#loop::LoopType;
+        use std::collections::HashMap;
+
+        let mut model = BRepModel::new();
+
+        let pt = |a: [f64; 3]| Point3::new(a[0], a[1], a[2]);
+        let vec = |a: [f64; 3]| Vector3::new(a[0], a[1], a[2]);
+
+        // ── Vertices ── (no dependencies)
+        let mut vmap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, v) in &self.vertices {
+            let id = model.vertices.add_unchecked_with_tolerance(
+                v.position[0],
+                v.position[1],
+                v.position[2],
+                v.tolerance,
+            );
+            vmap.insert(*uuid, id);
+        }
+
+        // ── Curves ──
+        let mut cmap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, c) in &self.curves {
+            let curve: Option<Box<dyn Curve>> = match c {
+                CurveData::Line { start, end } => {
+                    Some(Box::new(GeoLine::new(pt(*start), pt(*end))))
+                }
+                CurveData::Circle {
+                    center,
+                    normal,
+                    radius,
+                } => GeoCircle::new(pt(*center), vec(*normal), *radius)
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn Curve>),
+                CurveData::Arc {
+                    center,
+                    normal,
+                    radius,
+                    start_angle,
+                    end_angle,
+                } => GeoArc::new(
+                    pt(*center),
+                    vec(*normal),
+                    *radius,
+                    *start_angle,
+                    *end_angle - *start_angle,
+                )
+                .ok()
+                .map(|a| Box::new(a) as Box<dyn Curve>),
+                CurveData::BSpline {
+                    control_points,
+                    knots,
+                    degree,
+                } => {
+                    let cps: Vec<Point3> = control_points.iter().map(|p| pt(*p)).collect();
+                    let weights = vec![1.0; cps.len()];
+                    GeoNurbsCurve::new(*degree as usize, cps, weights, knots.clone())
+                        .ok()
+                        .map(|n| Box::new(n) as Box<dyn Curve>)
+                }
+                CurveData::Nurbs {
+                    control_points,
+                    weights,
+                    knots,
+                    degree,
+                } => {
+                    let cps: Vec<Point3> = control_points.iter().map(|p| pt(*p)).collect();
+                    GeoNurbsCurve::new(*degree as usize, cps, weights.clone(), knots.clone())
+                        .ok()
+                        .map(|n| Box::new(n) as Box<dyn Curve>)
+                }
+            };
+            if let Some(curve) = curve {
+                let id = model.curves.add(curve);
+                cmap.insert(*uuid, id);
+            }
+        }
+
+        // ── Surfaces ──
+        let mut smap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, s) in &self.surfaces {
+            let surface: Option<Box<dyn Surface>> = match s {
+                SurfaceData::Plane { origin, normal } => {
+                    GeoPlane::from_point_normal(pt(*origin), vec(*normal))
+                        .ok()
+                        .map(|p| Box::new(p) as Box<dyn Surface>)
+                }
+                SurfaceData::Cylinder {
+                    origin,
+                    axis,
+                    radius,
+                } => GeoCylinder::new(pt(*origin), vec(*axis), *radius)
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn Surface>),
+                SurfaceData::Sphere { center, radius } => GeoSphere::new(pt(*center), *radius)
+                    .ok()
+                    .map(|s| Box::new(s) as Box<dyn Surface>),
+                SurfaceData::Cone {
+                    apex,
+                    axis,
+                    half_angle,
+                } => GeoCone::new(pt(*apex), vec(*axis), *half_angle)
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn Surface>),
+                SurfaceData::Torus {
+                    center,
+                    axis,
+                    major_radius,
+                    minor_radius,
+                } => GeoTorus::new(pt(*center), vec(*axis), *major_radius, *minor_radius)
+                    .ok()
+                    .map(|t| Box::new(t) as Box<dyn Surface>),
+                SurfaceData::BSpline {
+                    control_points,
+                    knots_u,
+                    knots_v,
+                    degree_u,
+                    degree_v,
+                } => {
+                    let cps: Vec<Vec<Point3>> = control_points
+                        .iter()
+                        .map(|row| row.iter().map(|p| pt(*p)).collect())
+                        .collect();
+                    let weights: Vec<Vec<f64>> =
+                        cps.iter().map(|row| vec![1.0; row.len()]).collect();
+                    geometry_engine::math::nurbs::NurbsSurface::new(
+                        cps,
+                        weights,
+                        knots_u.clone(),
+                        knots_v.clone(),
+                        *degree_u as usize,
+                        *degree_v as usize,
+                    )
+                    .ok()
+                    .map(|nurbs| Box::new(GeneralNurbsSurface { nurbs }) as Box<dyn Surface>)
+                }
+                SurfaceData::Nurbs {
+                    control_points,
+                    weights,
+                    knots_u,
+                    knots_v,
+                    degree_u,
+                    degree_v,
+                } => {
+                    let cps: Vec<Vec<Point3>> = control_points
+                        .iter()
+                        .map(|row| row.iter().map(|p| pt(*p)).collect())
+                        .collect();
+                    geometry_engine::math::nurbs::NurbsSurface::new(
+                        cps,
+                        weights.clone(),
+                        knots_u.clone(),
+                        knots_v.clone(),
+                        *degree_u as usize,
+                        *degree_v as usize,
+                    )
+                    .ok()
+                    .map(|nurbs| Box::new(GeneralNurbsSurface { nurbs }) as Box<dyn Surface>)
+                }
+            };
+            if let Some(surface) = surface {
+                let id = model.surfaces.add(surface);
+                smap.insert(*uuid, id);
+            }
+        }
+
+        // ── Edges ── (depend on vertices + curves)
+        use geometry_engine::primitives::curve::ParameterRange;
+        let mut emap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, e) in &self.edges {
+            let (Some(&start), Some(&end)) = (vmap.get(&e.start_vertex), vmap.get(&e.end_vertex))
+            else {
+                continue;
+            };
+            let curve_id = match e.curve.and_then(|c| cmap.get(&c).copied()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let orientation = if e.orientation {
+                EdgeOrientation::Forward
+            } else {
+                EdgeOrientation::Backward
+            };
+            let edge = Edge::new(0, start, end, curve_id, orientation, ParameterRange::unit());
+            let id = model.edges.add(edge);
+            emap.insert(*uuid, id);
+        }
+
+        // ── Loops ── (depend on edges)
+        let mut lmap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, l) in &self.loops {
+            let loop_type = if l.is_outer {
+                LoopType::Outer
+            } else {
+                LoopType::Inner
+            };
+            let mut lp = Loop::with_capacity(0, loop_type, l.edges.len());
+            for (i, edge_uuid) in l.edges.iter().enumerate() {
+                if let Some(&eid) = emap.get(edge_uuid) {
+                    let fwd = l.orientations.get(i).copied().unwrap_or(true);
+                    lp.add_edge(eid, fwd);
+                }
+            }
+            let id = model.loops.add(lp);
+            lmap.insert(*uuid, id);
+        }
+
+        // ── Faces ── (depend on surfaces + loops)
+        let mut fmap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, f) in &self.faces {
+            let surface_id = match f.surface.and_then(|s| smap.get(&s).copied()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let outer_loop = match f.outer_loop.and_then(|l| lmap.get(&l).copied()) {
+                Some(l) => l,
+                None => continue,
+            };
+            let orientation = if f.orientation {
+                FaceOrientation::Forward
+            } else {
+                FaceOrientation::Backward
+            };
+            let mut face = Face::new(0, surface_id, outer_loop, orientation);
+            for inner_uuid in &f.inner_loops {
+                if let Some(&lid) = lmap.get(inner_uuid) {
+                    face.add_inner_loop(lid);
+                }
+            }
+            let id = model.faces.add(face);
+            fmap.insert(*uuid, id);
+        }
+
+        // ── Shells ── (depend on faces)
+        let mut shmap: HashMap<Uuid, u32> = HashMap::new();
+        for (uuid, sh) in &self.shells {
+            let shell_type = match sh.shell_type {
+                ShellType::Closed => GeoShellType::Closed,
+                ShellType::Open => GeoShellType::Open,
+                ShellType::Compound => GeoShellType::Open,
+            };
+            let mut shell = Shell::new(0, shell_type);
+            for face_uuid in &sh.faces {
+                if let Some(&fid) = fmap.get(face_uuid) {
+                    shell.add_face(fid);
+                }
+            }
+            let id = model.shells.add(shell);
+            shmap.insert(*uuid, id);
+        }
+
+        // ── Solids ── (depend on shells; shells[0] is the outer shell)
+        for (_uuid, sd) in &self.solids {
+            let mut shell_ids = sd.shells.iter().filter_map(|u| shmap.get(u).copied());
+            let Some(outer) = shell_ids.next() else {
+                continue;
+            };
+            let mut solid = Solid::new(0, outer);
+            for inner in shell_ids {
+                solid.add_inner_shell(inner);
+            }
+            solid.name = sd.feature_type.clone();
+            model.solids.add(solid);
+        }
+
+        model
     }
 }
 
