@@ -37,6 +37,6 @@ pub mod query;
 
 pub use part::{
     format_datum_kind, format_datum_subkind, format_location_oneliner, DatumSummary,
-    DistanceReport, EdgeReport, FaceReport, ListPartsFilter, MassPropertiesReport,
+    DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter, MassPropertiesReport,
     MaterialSummary, OrientedBBox, PartProximity, PartReport, PartSummary, TopologyFingerprint,
 };

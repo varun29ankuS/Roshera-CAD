@@ -205,6 +205,35 @@ pub struct FaceReport {
     pub neighbour_face_ids: Vec<u32>,
 }
 
+/// Agent-facing "what is the cursor pointing at" record for
+/// `BRepModel::query_hover`.
+///
+/// The viewport raycasts a hover to a kernel `FaceId` (via the mesh's
+/// per-triangle `face_map`); this report turns that bare id into the
+/// signal an agent actually needs: the face's own geometry PLUS its
+/// host part's identity and datum-anchored location. That join is the
+/// point — per the `readable/` architectural rule, agents address
+/// geometry by **part identity + anchor datum**, so a hover signal that
+/// returned only `surface_type`/`area` would force a second round-trip
+/// to discover *which part, anchored where*. `host_part_name` +
+/// `location_oneliner` close that gap in one call.
+///
+/// `host_part_name` / `location_oneliner` are `None` when the face is
+/// not attached to a solid (transient construction state) — `face` is
+/// still fully populated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HoverReport {
+    /// The hovered face's own report (surface type, area, boundary).
+    pub face: FaceReport,
+    /// Name of the solid that owns this face (or `solid_<id>`
+    /// placeholder). `None` when the face is not attached to a solid.
+    pub host_part_name: Option<String>,
+    /// One-line datum-anchored summary of the host part, e.g.
+    /// `"FrontPlane, offset (10, 0, 5), 20×15×10"`. `None` when the
+    /// face has no host solid or its location can't be resolved.
+    pub location_oneliner: Option<String>,
+}
+
 /// Per-edge report for `BRepModel::query_edge`.
 ///
 /// Edge-level introspection lets agents reason about specific
